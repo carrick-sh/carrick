@@ -273,11 +273,7 @@ impl ThreadIdentity {
                     .map_err(|_| KernelOperationError::PidNamespaceMembership(task.key().id))?;
                 let parent_id = u32::try_from(task.key().id.raw())
                     .map_err(|_| KernelOperationError::PidNamespaceMembership(task.key().id))?;
-                Some(
-                    region
-                        .reserve_identity(kernel.ids(), internal, parent_id)
-                        .ok_or(KernelOperationError::PidNamespaceMembership(task.key().id))?,
-                )
+                Some(region.reserve_identity(kernel.ids(), internal, parent_id)?)
             }
             None => None,
         };

@@ -1,6 +1,6 @@
 use carrick_sched_core::process::identity_allocator::{
-    ClaimKind, InternalIdentity, NamespaceState, TransferredNamespaceState, VisibleIdentity,
-    VisibleNamespace,
+    ClaimKind, InternalIdentity, NamespaceState, NamespaceView, TransferredNamespaceState,
+    VisibleIdentity, VisibleNamespace,
 };
 pub use carrick_sched_core::process::identity_allocator::{IdError, IdRegistryCounts};
 use std::sync::Arc;
@@ -16,7 +16,124 @@ use super::ids::{LinuxTid, ProcessGroupId, SessionId, TaskId};
 /// IDs, and session IDs all claim numbers from this one collision domain.
 #[derive(Clone, Debug)]
 pub struct IdRegistry {
-    state: Arc<Mutex<NamespaceState>>,
+    state: Arc<Mutex<HostNamespaceAuthority>>,
+}
+
+#[derive(Debug)]
+enum HostNamespaceAuthority {
+    Local(NamespaceState),
+    Zone(Arc<dyn carrick_hal::birth_serial::BirthSerialSource>),
+}
+
+impl HostNamespaceAuthority {
+    fn zone_view<R>(
+        source: &Arc<dyn carrick_hal::birth_serial::BirthSerialSource>,
+        mut operation: impl FnMut(&mut NamespaceView<'_>) -> R,
+    ) -> Result<R, IdError> {
+        let mut result = None;
+        source
+            .with_namespace(source.identity(), &mut |view| {
+                result = Some(operation(view));
+            })
+            .map_err(|_| IdError::AuthorityTransferred)?;
+        result.ok_or(IdError::AuthorityTransferred)
+    }
+    fn bind_visible_domain(
+        &mut self,
+        raw: i32,
+        namespace: VisibleNamespace,
+    ) -> Result<(), IdError> {
+        match self {
+            Self::Local(state) => state.bind_visible_domain(raw, namespace),
+            Self::Zone(source) => {
+                Self::zone_view(source, |view| view.bind_visible_domain(raw, namespace))?
+            }
+        }
+    }
+    fn reserve_next(&mut self, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
+        match self {
+            Self::Local(state) => state.reserve_next(kind),
+            Self::Zone(source) => Self::zone_view(source, |view| view.reserve_next(kind))?,
+        }
+    }
+    fn reserve_exact(&mut self, raw: i32, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
+        match self {
+            Self::Local(state) => state.reserve_exact(raw, kind),
+            Self::Zone(source) => Self::zone_view(source, |view| view.reserve_exact(raw, kind))?,
+        }
+    }
+    fn claim_related(&mut self, raw: i32, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
+        match self {
+            Self::Local(state) => state.claim_related(raw, kind),
+            Self::Zone(source) => Self::zone_view(source, |view| view.claim_related(raw, kind))?,
+        }
+    }
+    fn release(&mut self, raw: InternalIdentity, kind: ClaimKind) {
+        match self {
+            Self::Local(state) => state.release(raw, kind),
+            Self::Zone(source) => {
+                let _ = Self::zone_view(source, |view| view.release(raw, kind));
+            }
+        }
+    }
+    fn reserve_visible(&mut self, namespace: VisibleNamespace) -> Result<VisibleIdentity, IdError> {
+        match self {
+            Self::Local(state) => state.reserve_visible(namespace).ok_or(IdError::Exhausted),
+            Self::Zone(source) => Self::zone_view(source, |view| view.reserve_visible(namespace))?,
+        }
+    }
+    fn retire_visible_namespace(&mut self, namespace: VisibleNamespace) {
+        match self {
+            Self::Local(state) => state.retire_visible_namespace(namespace),
+            Self::Zone(source) => {
+                let _ = Self::zone_view(source, |view| view.retire_visible_namespace(namespace));
+            }
+        }
+    }
+    fn is_reserved_number(&self, raw: i32) -> bool {
+        match self {
+            Self::Local(state) => state.is_reserved_number(raw),
+            Self::Zone(source) => {
+                Self::zone_view(source, |view| view.is_reserved_number(raw)).unwrap_or(false)
+            }
+        }
+    }
+    fn counts(&self) -> IdRegistryCounts {
+        match self {
+            Self::Local(state) => state.counts(),
+            Self::Zone(source) => Self::zone_view(source, |view| view.counts()).unwrap_or_default(),
+        }
+    }
+    fn refused_attempts(&self) -> Option<u64> {
+        match self {
+            Self::Local(state) => state.refused_attempts(),
+            Self::Zone(_) => Some(0),
+        }
+    }
+    fn transfer(&mut self) -> Option<TransferredNamespaceState> {
+        match self {
+            Self::Local(state) => state.transfer(),
+            Self::Zone(_) => None,
+        }
+    }
+    #[cfg(test)]
+    fn set_next(&mut self, raw: i32) {
+        match self {
+            Self::Local(state) => state.set_next(raw),
+            Self::Zone(source) => {
+                let _ = Self::zone_view(source, |view| view.set_next(raw));
+            }
+        }
+    }
+    #[cfg(test)]
+    fn visible_namespace_count(&self) -> usize {
+        match self {
+            Self::Local(state) => state.visible_namespace_count(),
+            Self::Zone(source) => {
+                Self::zone_view(source, |view| view.visible_namespace_count()).unwrap_or_default()
+            }
+        }
+    }
 }
 
 impl Default for IdRegistry {
@@ -39,6 +156,35 @@ impl IdRegistry {
         Ok((registry, reservation.commit()))
     }
 
+    /// Switch once while local issuance is excluded. Existing host tokens
+    /// retain this same authority cell, so their releases follow the switch.
+    pub fn bind_namespace_source(
+        &self,
+        source: Arc<dyn carrick_hal::birth_serial::BirthSerialSource>,
+    ) -> Result<(), IdError> {
+        let mut authority = self.state.lock();
+        match &*authority {
+            HostNamespaceAuthority::Zone(old) => {
+                return if old.identity() == source.identity() {
+                    Ok(())
+                } else {
+                    Err(IdError::AuthorityTransferred)
+                };
+            }
+            HostNamespaceAuthority::Local(local) => {
+                HostNamespaceAuthority::zone_view(&source, |view| local.adopt_into(view))??;
+            }
+        }
+        *authority = HostNamespaceAuthority::Zone(source);
+        Ok(())
+    }
+    pub fn bind_visible_domain(
+        &self,
+        task: TaskId,
+        namespace: VisibleNamespace,
+    ) -> Result<(), IdError> {
+        self.state.lock().bind_visible_domain(task.raw(), namespace)
+    }
     pub fn reserve_task(&self) -> Result<(TaskId, TaskReservation), IdError> {
         let reservation = self.reserve_next(ClaimKind::Task)?;
         let id = TaskId::from_registry_allocation(reservation.raw.nonzero());
@@ -75,7 +221,10 @@ impl IdRegistry {
             .map(SessionClaim)
     }
 
-    pub(crate) fn reserve_visible(&self, namespace: VisibleNamespace) -> Option<VisibleIdentity> {
+    pub(crate) fn reserve_visible(
+        &self,
+        namespace: VisibleNamespace,
+    ) -> Result<VisibleIdentity, IdError> {
         self.state.lock().reserve_visible(namespace)
     }
     #[cfg(test)]
@@ -143,7 +292,9 @@ impl IdRegistry {
     }
     fn with_range(first: i32, last: i32, next: i32) -> Self {
         Self {
-            state: Arc::new(Mutex::new(NamespaceState::new(first, last, next))),
+            state: Arc::new(Mutex::new(HostNamespaceAuthority::Local(
+                NamespaceState::new(first, last, next),
+            ))),
         }
     }
 
@@ -161,14 +312,18 @@ impl IdRegistry {
 
 #[derive(Debug)]
 struct ReservationToken {
-    state: Arc<Mutex<NamespaceState>>,
+    state: Arc<Mutex<HostNamespaceAuthority>>,
     raw: InternalIdentity,
     kind: ClaimKind,
     active: bool,
 }
 
 impl ReservationToken {
-    fn new(state: Arc<Mutex<NamespaceState>>, raw: InternalIdentity, kind: ClaimKind) -> Self {
+    fn new(
+        state: Arc<Mutex<HostNamespaceAuthority>>,
+        raw: InternalIdentity,
+        kind: ClaimKind,
+    ) -> Self {
         Self {
             state,
             raw,
@@ -193,14 +348,18 @@ impl Drop for ReservationToken {
 
 #[derive(Debug)]
 struct ClaimToken {
-    state: Arc<Mutex<NamespaceState>>,
+    state: Arc<Mutex<HostNamespaceAuthority>>,
     raw: InternalIdentity,
     kind: ClaimKind,
     active: bool,
 }
 
 impl ClaimToken {
-    fn new(state: Arc<Mutex<NamespaceState>>, raw: InternalIdentity, kind: ClaimKind) -> Self {
+    fn new(
+        state: Arc<Mutex<HostNamespaceAuthority>>,
+        raw: InternalIdentity,
+        kind: ClaimKind,
+    ) -> Self {
         Self {
             state,
             raw,

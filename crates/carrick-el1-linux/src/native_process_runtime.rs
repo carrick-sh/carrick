@@ -43,7 +43,7 @@ use carrick_sched_core::process::{
     birth::BirthAttachment,
     exit::ExitMember,
     identity_allocator::{
-        ClaimKind, InternalIdentity, NamespaceState, SerialAllocator, VisibleIdentity,
+        ClaimKind, InternalIdentity, NamespaceTable, SerialAllocator, VisibleIdentity,
         VisibleNamespace,
     },
     wait::{TaskWakeGeneration, WaitJobControl, WaitPrecheck, WaitQuery, WaitSelection},
@@ -717,16 +717,42 @@ pub struct NativeExecSuccessor<M, C: ProcessContext> {
     pub address: AddressContext<RootGpa>,
     pub words: Box<C>,
 }
-pub struct NativeClaim {
-    namespace: Arc<SpinLock<NamespaceState>>,
+fn namespace_error(
+    error: carrick_sched_core::process::identity_allocator::IdError,
+) -> NativeProcessError {
+    use carrick_sched_core::process::identity_allocator::IdError;
+    match error {
+        IdError::StorageRequired | IdError::Exhausted => NativeProcessError::Exhausted,
+        _ => NativeProcessError::Stale,
+    }
+}
+pub struct NativeClaim<'a> {
+    namespace: &'a NamespaceTable,
     claims: Vec<(InternalIdentity, ClaimKind)>,
 }
-impl Drop for NativeClaim {
-    fn drop(&mut self) {
-        let mut ns = self.namespace.lock();
-        for &(number, kind) in &self.claims {
-            ns.release(number, kind);
+impl NativeClaim<'_> {
+    fn release_thread(&mut self, raw: i32) {
+        if let Some(index) = self
+            .claims
+            .iter()
+            .position(|(id, kind)| id.get() == raw && matches!(kind, ClaimKind::Thread))
+        {
+            let (number, kind) = self.claims.swap_remove(index);
+            self.namespace
+                .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+                    ns.release(number, kind)
+                });
         }
+    }
+}
+impl Drop for NativeClaim<'_> {
+    fn drop(&mut self) {
+        self.namespace
+            .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+                for &(number, kind) in &self.claims {
+                    ns.release(number, kind);
+                }
+            });
     }
 }
 /// Exact in-zone key retained by the parent wait owner through terminal wake.
@@ -939,7 +965,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     /// Consumed on the child's first return to user mode, after its MM split.
     pending_child_tid: Option<UserVa>,
     signals: NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo>,
-    _thread_claim: NativeClaim,
+    _thread_claim: NativeClaim<'a>,
     channel: Option<Arc<WaitChannel>>,
     usage: TaskRusage,
     file_table: u64,
@@ -952,7 +978,7 @@ pub type NativeForkPreparation<'a, M, P, C> = PreparedFork<
 >;
 impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M, C> {
     type Context = C;
-    type Claim = NativeClaim;
+    type Claim = NativeClaim<'a>;
     type Event = ();
     type Transaction = NonZeroU64;
     type Member = NativeMember<'a, C>;
@@ -1404,11 +1430,11 @@ impl<'a> PendingTable<'a> {
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
     root_key: TaskKey,
-    namespace: Arc<SpinLock<NamespaceState>>,
+    namespace: &'a NamespaceTable,
     visible_namespace: VisibleNamespace,
     serials: SerialAllocator,
     pending: PendingTable<'a>,
-    _root_roles: NativeClaim,
+    _root_roles: NativeClaim<'a>,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
     ipc: Arc<SpinLock<IpcNamespace>>,
     /// vfork children whose parent is still suspended, keyed by the exact
@@ -1730,6 +1756,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 // A thread that died between the venue's reply and its retry:
                 // its sources stay in the carrier until the MM is torn down.
                 resources.map_stash.remove(record);
+                resources._thread_claim.release_thread(key.task.id().raw());
                 row.native_mut().resources_mut().members.retain(|member| {
                     member.record != *record && member.thread.id() != key.task.id()
                 });
@@ -2724,6 +2751,24 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 None
             };
 
+            // Claim the member's tid in the shared namespace table before the
+            // birth is consumed; dropping the claim on refusal releases it.
+            let mut namespace_claim = if already_owned {
+                None
+            } else {
+                let number = source
+                    .zone
+                    .namespace()
+                    .with_view(&carrick_sched_core::ShortLockSpin, |view| {
+                        view.claim_related(key.task.id().raw(), ClaimKind::Thread)
+                    })
+                    .map_err(namespace_error)?;
+                Some(NativeClaim {
+                    namespace: source.zone.namespace(),
+                    claims: vec![(number, ClaimKind::Thread)],
+                })
+            };
+
             // Commit. No contended or fallible acquisition follows the birth
             // consumption; a refusal above drops all provisional custody.
             if host_issued.is_some() && !page.release_adopted_host_birth(host_identity) {
@@ -2766,6 +2811,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     control: retained,
                     expected_host: host_identity,
                 });
+            }
+            if let Some(claim) = namespace_claim.as_mut() {
+                row.native_mut()
+                    .resources_mut()
+                    ._thread_claim
+                    .claims
+                    .append(&mut claim.claims);
             }
             row.native().resources().sync_non_interrupting_signals();
             (graph.pending.has_exit(&process), registry_control)
@@ -3243,15 +3295,21 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         self.graph
             .lock()
             .namespace
-            .lock()
-            .is_reserved_number(id.raw())
+            .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+                ns.is_reserved_number(id.raw())
+            })
     }
 
     /// Force cursor wrap without creating or releasing any identity. Tests
     /// still allocate through the production fork entry point.
     #[cfg(test)]
     pub(super) fn set_next_identity_for_test(&self, id: TaskId) {
-        self.graph.lock().namespace.lock().set_next(id.raw());
+        self.graph
+            .lock()
+            .namespace
+            .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+                ns.set_next(id.raw())
+            });
     }
 
     #[cfg(test)]
@@ -3508,55 +3566,54 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             binding.mm.raw(),
             identity.file_table,
         )?;
-        let ns = Arc::new(SpinLock::new(NamespaceState::new(1, i32::MAX, id.raw())));
-        let visible_namespace = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
-        let (task_claim, mut thread_claim, root_roles) = {
-            let mut n = ns.lock();
-            let number = n
-                .reserve_exact(id.raw(), ClaimKind::Task)
-                .map_err(|_| NativeProcessError::Exhausted)?;
-            n.claim_related(id.raw(), ClaimKind::Thread)
-                .map_err(|_| NativeProcessError::Exhausted)?;
-            n.claim_related(id.raw(), ClaimKind::ProcessGroup)
-                .map_err(|_| NativeProcessError::Exhausted)?;
-            n.claim_related(id.raw(), ClaimKind::Session)
-                .map_err(|_| NativeProcessError::Exhausted)?;
-            n.advance_visible_past(
-                visible_namespace,
-                VisibleIdentity::from_existing_member(visible),
-            )
-            .ok_or(NativeProcessError::Exhausted)?;
-            (
-                NativeClaim {
-                    namespace: ns.clone(),
-                    claims: vec![(number, ClaimKind::Task)],
-                },
-                NativeClaim {
-                    namespace: ns.clone(),
-                    claims: vec![(number, ClaimKind::Thread)],
-                },
-                NativeClaim {
-                    namespace: ns.clone(),
-                    claims: vec![
-                        (number, ClaimKind::ProcessGroup),
-                        (number, ClaimKind::Session),
-                    ],
-                },
-            )
-        };
-        {
-            let mut n = ns.lock();
-            for (member, visible_tid, _) in &imported {
-                let number = n
-                    .reserve_exact(member.thread.id().raw(), ClaimKind::Thread)
-                    .map_err(|_| NativeProcessError::Exhausted)?;
-                n.advance_visible_past(
-                    visible_namespace,
-                    VisibleIdentity::from_existing_member(*visible_tid),
-                )
-                .ok_or(NativeProcessError::Exhausted)?;
-                thread_claim.claims.push((number, ClaimKind::Thread));
+        let ns = source.zone.namespace();
+        let visible_namespace = ns
+            .with_view(&carrick_sched_core::ShortLockSpin, |view| {
+                view.visible_domain(id.raw())
+            })
+            .ok_or(NativeProcessError::Stale)?;
+        let number = ns.with_view(&carrick_sched_core::ShortLockSpin, |view| {
+            let kinds = [
+                ClaimKind::Task,
+                ClaimKind::Thread,
+                ClaimKind::ProcessGroup,
+                ClaimKind::Session,
+            ];
+            let number = view
+                .claim_related(id.raw(), kinds[0])
+                .map_err(namespace_error)?;
+            for (index, kind) in kinds.iter().enumerate().skip(1) {
+                if let Err(error) = view.claim_related(id.raw(), *kind) {
+                    for previous in &kinds[..index] {
+                        view.release(number, *previous);
+                    }
+                    return Err(namespace_error(error));
+                }
             }
+            Ok(number)
+        })?;
+        let task_claim = NativeClaim {
+            namespace: ns,
+            claims: vec![(number, ClaimKind::Task)],
+        };
+        let mut thread_claim = NativeClaim {
+            namespace: ns,
+            claims: vec![(number, ClaimKind::Thread)],
+        };
+        let root_roles = NativeClaim {
+            namespace: ns,
+            claims: vec![
+                (number, ClaimKind::ProcessGroup),
+                (number, ClaimKind::Session),
+            ],
+        };
+        for (member, _, _) in &imported {
+            let number = ns
+                .with_view(&carrick_sched_core::ShortLockSpin, |view| {
+                    view.claim_related(member.thread.id().raw(), ClaimKind::Thread)
+                })
+                .map_err(namespace_error)?;
+            thread_claim.claims.push((number, ClaimKind::Thread));
         }
         // Births were issued by this carrier before publication. Admission
         // authenticates the exact member; it does not reconstruct issuance
@@ -4088,8 +4145,8 @@ struct ForkReservation<'a, M> {
     thread_serial: NonZeroU64,
     child_mm: MmGeneration,
     visible: VisibleIdentity,
-    claim: NativeClaim,
-    thread_claim: NativeClaim,
+    claim: NativeClaim<'a>,
+    thread_claim: NativeClaim<'a>,
     parent_mm: M,
     identity: TaskIdentity,
     group: u32,
@@ -7137,24 +7194,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .serials
                 .allocate()
                 .ok_or(NativeProcessError::Exhausted)?;
-            let namespace = graph.namespace.clone();
+            let namespace = graph.namespace;
             let visible_namespace = graph.visible_namespace;
-            let (number, visible) = {
-                let mut ns = namespace.lock();
-                let number = ns
-                    .reserve_next(ClaimKind::Task)
-                    .map_err(|_| NativeProcessError::Exhausted)?;
-                if ns.claim_related(number.get(), ClaimKind::Thread).is_err() {
-                    ns.release(number, ClaimKind::Task);
-                    return Err(NativeProcessError::Exhausted);
-                }
-                let Some(visible) = ns.reserve_visible(visible_namespace) else {
-                    ns.release(number, ClaimKind::Thread);
-                    ns.release(number, ClaimKind::Task);
-                    return Err(NativeProcessError::Exhausted);
-                };
-                (number, visible)
-            };
+            let (number, visible) =
+                namespace.with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+                    let number = ns
+                        .reserve_next(ClaimKind::Task)
+                        .map_err(|_| NativeProcessError::Exhausted)?;
+                    if ns.claim_related(number.get(), ClaimKind::Thread).is_err() {
+                        ns.release(number, ClaimKind::Task);
+                        return Err(NativeProcessError::Exhausted);
+                    }
+                    let Ok(visible) = ns.reserve_visible(visible_namespace) else {
+                        ns.release(number, ClaimKind::Thread);
+                        ns.release(number, ClaimKind::Task);
+                        return Err(NativeProcessError::Exhausted);
+                    };
+                    if let Err(error) = ns.bind_visible_domain(number.get(), visible_namespace) {
+                        ns.release(number, ClaimKind::Thread);
+                        ns.release(number, ClaimKind::Task);
+                        return Err(namespace_error(error));
+                    }
+                    Ok((number, visible))
+                })?;
             let child_key = TaskKey {
                 id: carrick_personality_linux::identity::task_id_from_linux_pid(number.get())
                     .map_err(|_| NativeProcessError::Invalid)?,
@@ -7162,7 +7224,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .ok_or(NativeProcessError::Invalid)?,
             };
             let claim = NativeClaim {
-                namespace: namespace.clone(),
+                namespace,
                 claims: vec![(number, ClaimKind::Task)],
             };
             let thread_claim = NativeClaim {
@@ -8366,7 +8428,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
             return;
         };
-        self.retire_thread_identity(tid);
         if let Some(notification) = notification {
             let service = &mut self.service;
             if publish_terminal_notification(
@@ -8383,8 +8444,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .is_err()
             {
                 self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
+                return;
             }
         }
+        // Reuse follows clear-child-tid publication and its wake. Replenishing
+        // stock may drop the final namespace claim, so it belongs after both.
+        self.retire_thread_identity(tid);
     }
 
     fn retire_thread_identity(&mut self, tid: u32) {
@@ -8396,6 +8461,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return;
             }
             task.remove_thread(tid);
+            task.native_mut()
+                .resources_mut()
+                ._thread_claim
+                .release_thread(self.binding.task.raw() as i32);
             task.native_mut().resources_mut().members.retain(|member| {
                 let matches_caller = tid == self.calling_tid
                     && (member.record == self.record
@@ -11324,10 +11393,11 @@ mod tests {
 
         // Model the allocator custody held by the thread birth owner. Use
         // the real namespace claim/release path, not just a visible TID.
-        let namespace = runtime.graph.lock().namespace.clone();
+        let namespace = runtime.graph.lock().namespace;
         let number = namespace
-            .lock()
-            .reserve_exact(42, ClaimKind::Thread)
+            .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+                ns.reserve_exact(42, ClaimKind::Thread)
+            })
             .unwrap();
         let observer_claim = NativeClaim {
             namespace,

@@ -50,7 +50,6 @@ fn try_run_pool_fixture_with_loaded_pre_entry_hook(
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     let root = dispatcher.capture_one_task_context().expect("issued root");
     root.kernel()
-        .object_ids()
         .bind_initial_birth_source(
             carrier
                 .birth_serial_source()
@@ -292,7 +291,6 @@ fn native_exit_workers(
         .expect("publish exact root descriptor table");
     issued
         .kernel()
-        .object_ids()
         .bind_initial_birth_source(
             carrier
                 .birth_serial_source()

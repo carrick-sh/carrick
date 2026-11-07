@@ -78,6 +78,7 @@ pub struct NamespaceHeader {
 #[repr(C)]
 pub struct NamespaceNode {
     key: u64,
+    namespace: u64,
     claims: ClaimCounts,
     visible_next: u32,
     left: u32,
@@ -94,7 +95,7 @@ pub struct NamespaceView<'a> {
 }
 
 /// Shared namespace storage protocol, included in the image ABI fingerprint.
-pub const NAMESPACE_TABLE_PROTOCOL: u64 = 1;
+pub const NAMESPACE_TABLE_PROTOCOL: u64 = 2;
 /// Includes the null-link sentinel; 8191 nodes are available for claims/cursors.
 pub const NAMESPACE_TABLE_NODES: usize = 8192;
 
@@ -354,6 +355,7 @@ impl NamespaceView<'_> {
             }
             let successor = self.nodes[index as usize];
             self.nodes[target].key = successor.key;
+            self.nodes[target].namespace = successor.namespace;
             self.nodes[target].claims = successor.claims;
             self.nodes[target].visible_next = successor.visible_next;
         }
@@ -400,6 +402,27 @@ impl NamespaceView<'_> {
         } else {
             self.header.next + 1
         };
+    }
+    /// Attach the host-admitted visible namespace to an existing claim.
+    pub fn bind_visible_domain(
+        &mut self,
+        raw: i32,
+        namespace: VisibleNamespace,
+    ) -> Result<(), IdError> {
+        let index = self
+            .find(Self::internal_key(raw))
+            .ok_or(IdError::UnknownNamespaceId(raw))?;
+        let old = self.nodes[index].namespace;
+        if old != 0 && old != namespace.0.get() {
+            return Err(IdError::AlreadyReserved(raw));
+        }
+        self.visible_entry(namespace)?;
+        self.nodes[index].namespace = namespace.0.get();
+        Ok(())
+    }
+    pub fn visible_domain(&self, raw: i32) -> Option<VisibleNamespace> {
+        let index = self.find(Self::internal_key(raw))?;
+        NonZeroU64::new(self.nodes[index].namespace).map(VisibleNamespace)
     }
     pub fn release(&mut self, raw: InternalIdentity, kind: ClaimKind) {
         let key = Self::internal_key(raw.get());
@@ -646,6 +669,53 @@ impl NamespaceState {
             refused: 0,
         }
     }
+    /// Adopt all bootstrap claims and visible cursors into retained zone
+    /// storage. The caller excludes local issuance and revokes local custody
+    /// after success, before dropping that exclusion. No allocation occurs.
+    pub fn adopt_into(&self, destination: &mut NamespaceView<'_>) -> Result<(), IdError> {
+        let source = self.owner.as_ref().ok_or(IdError::AuthorityTransferred)?;
+        let mut needed = 0_usize;
+        for node in source.nodes.iter().filter(|node| node.height != 0) {
+            if destination.find(node.key).is_some() {
+                if node.key >> 32 == 0 {
+                    return Err(IdError::AlreadyReserved(node.key as i32));
+                }
+            } else {
+                needed += 1;
+            }
+        }
+        let occupied =
+            destination.header.counts[0] as usize + destination.header.visible_count as usize;
+        if needed > destination.nodes.len().saturating_sub(occupied + 1) {
+            return Err(IdError::StorageRequired);
+        }
+        // Preflight above makes all following entry operations infallible:
+        // there are enough free slots and exclusion prevents intervening use.
+        for node in source.nodes.iter().filter(|node| node.height != 0) {
+            let existing = destination.find(node.key).is_some();
+            let index = destination.entry(node.key)?;
+            if node.key >> 32 == 0 {
+                destination.nodes[index].namespace = node.namespace;
+                destination.nodes[index].claims = node.claims;
+            } else {
+                destination.nodes[index].visible_next =
+                    destination.nodes[index].visible_next.max(node.visible_next);
+                if !existing {
+                    destination.header.visible_count += 1;
+                }
+            }
+        }
+        for (target, count) in destination
+            .header
+            .counts
+            .iter_mut()
+            .zip(source.header.counts)
+        {
+            *target += count;
+        }
+        destination.header.next = destination.header.next.max(source.header.next);
+        Ok(())
+    }
     fn refuse(&mut self) {
         self.refused = self.refused.saturating_add(1);
     }
@@ -667,6 +737,15 @@ impl NamespaceState {
             return Err(IdError::AuthorityTransferred);
         }
         self.owner.as_mut().ok_or(IdError::AuthorityTransferred)
+    }
+    pub fn bind_visible_domain(
+        &mut self,
+        raw: i32,
+        namespace: VisibleNamespace,
+    ) -> Result<(), IdError> {
+        self.allocation()?
+            .view()
+            .bind_visible_domain(raw, namespace)
     }
     pub fn reserve_next(&mut self, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
         self.allocation()?.reserve_next(kind)

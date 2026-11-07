@@ -1023,11 +1023,7 @@ impl Kernel {
                     .map_err(|_| KernelOperationError::PidNamespaceMembership(child_id))?;
                 let parent_id = u32::try_from(parent.task().key().id.raw())
                     .map_err(|_| KernelOperationError::PidNamespaceMembership(child_id))?;
-                Some(
-                    region
-                        .reserve_identity(self.ids(), child, parent_id)
-                        .ok_or(KernelOperationError::PidNamespaceMembership(child_id))?,
-                )
+                Some(region.reserve_identity(self.ids(), child, parent_id)?)
             }
             None => None,
         };

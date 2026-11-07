@@ -230,24 +230,31 @@ impl NsSharedRegion {
         identities: &crate::kernel::IdRegistry,
         internal_id: u32,
         parent_internal_id: u32,
-    ) -> Option<PreparedNamespaceIdentity> {
+    ) -> Result<PreparedNamespaceIdentity, crate::kernel::IdError> {
+        use crate::kernel::IdError;
         let _guard = self
             .lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !self.claim_is_live() {
-            return None;
+            return Err(IdError::AuthorityTransferred);
         }
         let owner = self.visible_owner.get_or_init(|| identities.clone());
         if !owner.same_owner(identities) {
-            return None;
+            return Err(IdError::AuthorityTransferred);
         }
         let domain = carrick_sched_core::process::identity_allocator::VisibleNamespace::new(
             self.claim.ns_id,
-            std::num::NonZeroU32::new(self.claim.generation.raw())?,
+            std::num::NonZeroU32::new(self.claim.generation.raw())
+                .ok_or(IdError::AuthorityTransferred)?,
         );
+        let task = carrick_personality_linux::identity::task_id_from_linux_pid(
+            i32::try_from(internal_id).map_err(|_| IdError::Exhausted)?,
+        )
+        .map_err(|_| IdError::AuthorityTransferred)?;
+        identities.bind_visible_domain(task, domain)?;
         let visible_id = identities.reserve_visible(domain)?.get();
-        Some(PreparedNamespaceIdentity {
+        Ok(PreparedNamespaceIdentity {
             region: Arc::clone(self),
             internal_id,
             visible_id,
@@ -1718,7 +1725,7 @@ mod tests {
         assert!(region.arena.layout().pid_namespaces.release(region.claim));
         assert!(!Arc::clone(&region).retire());
         assert_eq!(ids.visible_namespace_count(), 0);
-        assert!(region.reserve_identity(&ids, 43, 41).is_none());
+        assert!(region.reserve_identity(&ids, 43, 41).is_err());
     }
 
     #[test]
@@ -1729,12 +1736,12 @@ mod tests {
         assert_eq!(first.visible_id(), 2);
         drop(first);
         let foreign = crate::kernel::IdRegistry::new();
-        assert!(region.reserve_identity(&foreign, 43, 41).is_none());
+        assert!(region.reserve_identity(&foreign, 43, 41).is_err());
         let second = region.reserve_identity(&ids, 43, 41).unwrap();
         assert_eq!(second.visible_id(), 3);
         drop(second);
         assert!(Arc::clone(&region).retire());
-        assert!(region.reserve_identity(&ids, 44, 41).is_none());
+        assert!(region.reserve_identity(&ids, 44, 41).is_err());
     }
 
     #[test]
