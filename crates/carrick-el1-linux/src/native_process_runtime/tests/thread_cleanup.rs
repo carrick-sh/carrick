@@ -213,3 +213,169 @@ fn parked_cleanup(unadopted: bool, head_wait: bool, refused: bool, service_refus
             .has_cleanup(sibling.record)
     );
 }
+
+#[test]
+fn two_raw_exits_finish_when_parked_cleanup_becomes_last() {
+    let fixture = native_exec_fixture();
+    let first = add_signal_sibling_at(&fixture, None, false, 42, 0, SlotId::new(1));
+    let second = add_signal_sibling_at(&fixture, None, false, 43, 1, SlotId::new(2));
+    // Establish the reachable precondition: the leader has already retired,
+    // leaving two live pooled members. Use the neutral terminal transaction,
+    // not a synthetic live-word write, and remove its actual graph membership.
+    let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+        crate::common_entry::execution_binding(fixture.task),
+        None,
+        carrick_sched_core::process::TerminationStatus::exited(0),
+    )
+    .unwrap();
+    let (custody, mut membership) = carrick_core::terminal::TerminalCustody::<
+        carrick_core::terminal::Thread,
+        carrick_core::terminal::Live,
+    >::admitted(identity)
+    .begin()
+    .reserve_member(fixture.page, fixture.control)
+    .unwrap_or_else(|_| panic!("leader terminal setup"));
+    let _receipt = custody
+        .retire_zone_current(
+            fixture.control,
+            &mut membership,
+            identity.binding(),
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.record.id,
+        )
+        .unwrap();
+    membership.publish();
+    let key = fixture.runtime.graph.lock().root_key;
+    {
+        let mut graph = fixture.runtime.graph.lock();
+        let task = graph.owner.task_mut(key).unwrap();
+        task.remove_thread(41);
+        task.native_mut()
+            .resources_mut()
+            .members
+            .retain(|member| member.record != fixture.record);
+    }
+    fixture
+        .registry
+        .unregister_member(&fixture.runtime, key, fixture.record);
+    assert!(fixture.zone.live(fixture.record).is_none());
+    assert_eq!(fixture.page.live(), 2);
+
+    let word = carrick_test_support::GuestUserBuffer::from_value(43_u32);
+    second.control.set_clear_child_tid(word.arg());
+    let mut service = fixture.service();
+    service.tid_words.insert((1, word.arg()), 43);
+    let handle = service.service_mm_handle(&fixture.address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.defer_handbacks();
+            },
+        )
+        .unwrap();
+    let observed = space
+        .notifications(handle.incarnation())
+        .unwrap()
+        .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    let access = crate::sched::object_wait::space_access(fixture.zone, second.slot);
+    access.raise(space.index());
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
+    service.child_copy_error_at = Some(word.arg());
+    let second_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: second.slot,
+    };
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                second_source,
+                second.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry
+                .exit_thread(carrick_sched_core::process::TerminationStatus::exited(7))
+                .unwrap(),
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+        assert!(entry.take_run_failure().is_none());
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    assert_eq!(fixture.page.live(), 2);
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: first.slot,
+                },
+                first.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry
+                .exit_thread(carrick_sched_core::process::TerminationStatus::exited(3))
+                .unwrap(),
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+        assert!(entry.take_run_failure().is_none());
+    }
+    assert_eq!(fixture.page.live(), 1);
+    service.child_copy_error = None;
+    access.lower(space.index());
+    assert_eq!(
+        fixture.zone.switch_in_full(second.slot).unwrap().record,
+        second.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(second.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            second_source,
+            second.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), NativeResume::Left(Some(status)) if status.raw() == LinuxWaitStatus::exited(7).raw())
+    );
+    assert!(entry.take_run_failure().is_none());
+    assert_eq!(fixture.page.live(), 0);
+}

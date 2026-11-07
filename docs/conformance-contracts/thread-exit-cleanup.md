@@ -46,3 +46,20 @@ Acceptance still requires the final focused suites and independent review.
 VM-free observations do not establish signed HVF execution, live KVM backing
 supply, a Docker comparison or a runtime ratio. Those gates must be recorded
 separately; no signed acceptance is claimed by this note.
+
+## Remaining P0 from independent review
+
+The cursor is retained, but the nonfinal membership and ABI exit admission
+are currently acquired after cleanup. If a fork changes the lifecycle gate
+to ForkClosing while a copy is parked, the later begin_exit refusal becomes
+Quarantined. HostOnly and AwaitingExecBinding also reach that refusal arm.
+This is not valid terminal custody. The next change must retain the admitted
+terminal membership/admission across memory waits and, where admission itself
+contends, enroll on the holder's existing release notification and reprobe.
+An unadopted thread cannot fall back to a host adopter. Add a production
+Busy-once/holder-release witness before claiming acceptance.
+
+The two-raw-exit final-member witness is now green. Its initial leader
+retirement uses neutral terminal custody, then removes the actual graph and
+registry member; its two worker exits use production native entry and a real
+MM producer queue. This does not resolve the lifecycle-gate defect above.
