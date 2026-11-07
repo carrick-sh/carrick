@@ -1798,10 +1798,10 @@ mod overlay_dispatch_tests {
     fn synthetic_and_executable_read_refusals_preserve_offsets() {
         use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
         use crate::dispatch::executable_authority::{ExecSource, ExecutableAuthorityRegistry};
-        for nr in [63, 67] {
+        for nr in [63, 65, 67, 69] {
             for kind in 0..3 {
                 for refuse_input in [false, true] {
-                    if refuse_input && kind != 2 { continue; }
+                    if refuse_input && (kind != 2 || nr == 65 || nr == 69) { continue; }
                     let mut h = Harness::new();
                     let initial_offset = if kind == 2 { 0x1801 } else { 1 };
                     let open = if kind == 1 {
@@ -1826,7 +1826,11 @@ mod overlay_dispatch_tests {
                     let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0);
                     memory.seed(0x1800, b"abcdef");
                     let wait = if refuse_input { memory.refuse_next_read() } else { memory.refuse_next() };
-                    let request = SyscallRequest::new(nr, SyscallArgs([fd as u64, 0x1100, 3, initial_offset as u64, 0, 0]));
+                    let vector = nr == 65 || nr == 69;
+                    memory.seed(0x1000, &0x1100u64.to_ne_bytes());
+                    memory.seed(0x1008, &3u64.to_ne_bytes());
+                    let request = SyscallRequest::new(nr, SyscallArgs([fd as u64,
+                        if vector { 0x1000 } else { 0x1100 }, if vector { 1 } else { 3 }, initial_offset as u64, 0, 0]));
                     assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
                         DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }, "nr={nr} kind={kind} input={refuse_input}");
                     assert_eq!(returned(h.call(62, [fd as u64, 0, 1, 0, 0, 0])), initial_offset as i64);
@@ -1835,7 +1839,7 @@ mod overlay_dispatch_tests {
                         DispatchOutcome::Returned { value: 3 });
                     assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), b"bcd");
                     assert_eq!(returned(h.call(62, [fd as u64, 0, 1, 0, 0, 0])),
-                        (initial_offset + if nr == 63 { 3 } else { 0 }) as i64);
+                        (initial_offset + if nr == 63 || nr == 65 { 3 } else { 0 }) as i64);
                 }
             }
         }
