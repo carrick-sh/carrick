@@ -925,11 +925,47 @@ fn storage_lock_timeout(message: &str) -> bool {
         })
 }
 
-fn classify_task(result: &Value) -> TaskState {
+const TASK_LOG_LIMIT: usize = 500;
+
+fn task_warning_count(exitstatus: &str) -> Option<usize> {
+    exitstatus
+        .strip_prefix("WARNINGS: ")
+        .and_then(|count| count.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+}
+
+fn warnings_are_storage_lock_timeouts(expected: usize, log: &Value) -> bool {
+    let Some(entries) = log.as_array() else {
+        return false;
+    };
+    if entries.len() >= TASK_LOG_LIMIT {
+        return false;
+    }
+    let mut matched = 0usize;
+    for entry in entries {
+        let Some(line) = entry["t"].as_str() else {
+            return false;
+        };
+        if let Some(warning) = line.strip_prefix("WARN: ") {
+            if !storage_lock_timeout(warning) {
+                return false;
+            }
+            matched += 1;
+        }
+    }
+    matched == expected
+}
+
+fn classify_task_with_log(result: &Value, log: Option<&Value>) -> TaskState {
     if result["status"] == "stopped" {
-        if result["exitstatus"] == "OK" {
+        let exitstatus = result["exitstatus"].as_str().unwrap_or("");
+        if exitstatus == "OK" {
             TaskState::Succeeded
-        } else if storage_lock_timeout(result["exitstatus"].as_str().unwrap_or("")) {
+        } else if storage_lock_timeout(exitstatus) {
+            TaskState::Busy
+        } else if let (Some(expected), Some(log)) = (task_warning_count(exitstatus), log)
+            && warnings_are_storage_lock_timeouts(expected, log)
+        {
             TaskState::Busy
         } else {
             TaskState::Failed
@@ -937,6 +973,11 @@ fn classify_task(result: &Value) -> TaskState {
     } else {
         TaskState::Running
     }
+}
+
+#[cfg(test)]
+fn classify_task(result: &Value) -> TaskState {
+    classify_task_with_log(result, None)
 }
 
 impl Pve {
@@ -949,14 +990,27 @@ impl Pve {
         }
     }
     fn task_state(&self, task: &str) -> Result<TaskState, ScalerError> {
-        if !task.starts_with(&self.site.task_prefix()) || task.contains('/') {
+        if !task.starts_with(&self.site.task_prefix()) || task.contains(['/', '?', '#', '&']) {
             return Err(ScalerError::Guard("task belongs to another node"));
         }
         let result = self.request(
             PveCall::Get,
             &format!("/nodes/{}/tasks/{task}/status", self.site.node),
         )?;
-        Ok(classify_task(&result))
+        let log = if result["status"] == "stopped"
+            && task_warning_count(result["exitstatus"].as_str().unwrap_or("")).is_some()
+        {
+            Some(self.request(
+                PveCall::Get,
+                &format!(
+                    "/nodes/{}/tasks/{task}/log?limit={TASK_LOG_LIMIT}",
+                    self.site.node
+                ),
+            )?)
+        } else {
+            None
+        };
+        Ok(classify_task_with_log(&result, log.as_ref()))
     }
 
     fn wait_task(&self, task: &str) -> Result<(), ScalerError> {
