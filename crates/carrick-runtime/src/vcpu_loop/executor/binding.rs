@@ -403,6 +403,37 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
             cow_invalidation_observer: None,
         }
     }
+    pub(crate) fn bind_parked_lifecycle(
+        &mut self,
+        identity: &mut carrick_el1_abi::ThreadIdentity,
+    ) -> Result<(), TrapError> {
+        let Some(aliases) = self.lifecycle_aliases else {
+            return Ok(());
+        };
+        let lease = self.execution_lease_mut()?;
+        let key = lease.thread_key();
+        let (mm, _) = lease
+            .task_state_authority()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        if identity.tid != carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw()
+            || identity.serial != key.serial.raw()
+            || identity.generation != lease.generation().raw()
+            || identity.mm != mm.raw()
+        {
+            return Err(TrapError::Hypervisor(
+                "park lifecycle execution identity mismatch".into(),
+            ));
+        }
+        let control = lease
+            .control_lease()
+            .ok_or_else(|| TrapError::Hypervisor("park lifecycle lost its control lease".into()))?;
+        if let Some((page, slot)) = aliases.aliases(&control) {
+            identity.lifecycle_page = page.raw();
+            identity.control_slot = slot.raw();
+        }
+        Ok(())
+    }
+
     pub(crate) fn need_resched(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
             || carrick_hal::vcpu_run::current_shutdown_requested()

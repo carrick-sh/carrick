@@ -336,3 +336,27 @@ No new runtime repair or reproduction is claimed by this continuation. This
 is unfinished implementation work, independently of the unavailable signed
 HVF acceptance lane. In particular, a host-park-only correction would leave
 first publication refusal open and would not satisfy this issue.
+
+## Retained-alias host-park correction
+
+The continuation now lends the carrier-retained lifecycle mapping owner to
+quantum control. Each of the three host-park constructors authenticates the
+record's tid, serial, MM and execution generation against its execution lease
+and resolves the exact retained control's guest aliases. It does not read a
+possibly switched CurrentTask. The carrier keeps mapping custody until all
+executors have stopped; parked records do not depend on a quantum borrow.
+
+The production owner-memory wait fixture now retains actual control backing
+through a VM-free direct-alias provider and checks the published record before
+releasing the blocked owner. With the admitted-main park constructors restored,
+exactly one test runs and fails: `host park lost its retained lifecycle aliases
+before owner release`, observed `(0, 0)`. With the binding calls installed,
+that same fixture passes, including its physical-wait branch. This attributes
+a reproducible producer defect; it does not attribute every signed failure.
+
+Independent review found no P0/P1 in this correction and noted supplemental
+resolver offset/mismatch coverage as P2. First-publication refusal remains
+unresolved. The Linux worker cannot run signed HVF; the director's paired
+population and two consecutive main signed runs remain acceptance work. The
+shared binding introduces no per-ISA policy; CPL0's separate existing host-wait
+path is not exercised by this owner-wait fixture.
