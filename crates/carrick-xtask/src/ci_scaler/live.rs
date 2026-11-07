@@ -5666,6 +5666,194 @@ printf '{"data":%s}\n200' "$body"
         assert_eq!(status["admission_frozen"], false);
     }
 
+    #[test]
+    fn serial_host_reconcile_clone_busy_recovers_and_bounds_retries() {
+        const CHILD: &str = "CARRICK_BUSY_BOUNDS_1821";
+        if std::env::var_os(CHILD).is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ci_scaler::live::tests::serial_host_reconcile_clone_busy_recovers_and_bounds_retries",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stderr}");
+            assert!(
+                stderr.contains("vm=308 state=Cloning task=UPID:willow:busy308 deferred"),
+                "StorageBusy deferral log must identify vm, state, and task: {stderr}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_provision_fixture_tools(dir.path());
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            );
+            std::env::set_var("CARRICK_BURST_DIR", dir.path());
+        }
+        let roomy = HostSample {
+            busy: 0.05,
+            threads: 32,
+            available: 128 << 30,
+        };
+        let pve = Pve::test_fixture(site::WILLOW, Some(roomy));
+        let prep_keys = |state_dir: &Path, r: &Record| {
+            let (key, _) = key_paths(state_dir, r);
+            std::fs::write(&key, "private\n").unwrap();
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(
+                key.with_extension("key.pub"),
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture runner@test\n",
+            )
+            .unwrap();
+        };
+
+        // 1. Busy once, then success through reconcile_all reaches State::Running.
+        let dir_recover = dir.path().join("recover");
+        std::fs::create_dir_all(&dir_recover).unwrap();
+        let mut ledger = Ledger::default();
+        let mut r = row();
+        r.state = State::Cloning;
+        r.task = Some("UPID:willow:busy308".into());
+        prep_keys(&dir_recover, &r);
+        std::fs::write(dir.path().join("name_308"), &r.name).unwrap();
+        std::fs::write(dir.path().join("busy_once_308"), "").unwrap();
+        ledger.rows.push(r.clone());
+        let path = dir_recover.join("ledger.json");
+        ledger.save(&path).unwrap();
+
+        let pass1 = reconcile_all(
+            &pve,
+            &Github,
+            &mut ledger,
+            &dir_recover,
+            &path,
+            (1, &Admission::Standing),
+        )
+        .unwrap();
+        assert!(pass1.frozen.is_none());
+        assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Cloning);
+
+        let pass2 = reconcile_all(
+            &pve,
+            &Github,
+            &mut ledger,
+            &dir_recover,
+            &path,
+            (1, &Admission::Standing),
+        )
+        .unwrap();
+        assert!(pass2.frozen.is_none());
+        assert_eq!(
+            Ledger::load(&path).unwrap().rows[0].state,
+            State::Running,
+            "Busy clone retry must recover to Running once contention clears"
+        );
+
+        // 2. Repeated ResumeClone Busy deferrals deduplicate failure notes and
+        // bound retries, reaping the owned VM cleanly without freezing admission.
+        let dir_boot = dir.path().join("boot_bound");
+        std::fs::create_dir_all(&dir_boot).unwrap();
+        let mut boot_ledger = Ledger::default();
+        let mut boot_row = row();
+        boot_row.created = now().unwrap();
+        boot_row.state = State::Booting;
+        boot_row.task = Some("UPID:willow:busy308".into());
+        prep_keys(&dir_boot, &boot_row);
+        std::fs::write(dir.path().join("name_308"), &boot_row.name).unwrap();
+        std::fs::write(dir.path().join("present_308"), "").unwrap();
+        std::fs::write(dir.path().join("busy_start_308"), "").unwrap();
+        boot_ledger.rows.push(boot_row);
+        let boot_path = dir_boot.join("ledger.json");
+        boot_ledger.save(&boot_path).unwrap();
+
+        for step in 0..3 {
+            let pass = reconcile_all(
+                &pve,
+                &Github,
+                &mut boot_ledger,
+                &dir_boot,
+                &boot_path,
+                (1, &Admission::Standing),
+            )
+            .unwrap();
+            assert!(pass.frozen.is_none(), "step {step} froze admission");
+        }
+        let mid = Ledger::load(&boot_path).unwrap();
+        let note = mid.rows[0].failure.as_deref().unwrap_or("");
+        assert!(
+            note.matches("resume:").count() <= 1,
+            "repeated ResumeClone deferrals must deduplicate failure history: {note}"
+        );
+        for _ in 0..5 {
+            let pass = reconcile_all(
+                &pve,
+                &Github,
+                &mut boot_ledger,
+                &dir_boot,
+                &boot_path,
+                (1, &Admission::Standing),
+            )
+            .unwrap();
+            assert!(pass.frozen.is_none());
+            if Ledger::load(&boot_path).unwrap().rows[0].state == State::Destroyed {
+                break;
+            }
+        }
+        assert_eq!(
+            Ledger::load(&boot_path).unwrap().rows[0].state,
+            State::Destroyed,
+            "persistent Booting Busy contention must bound retries and reap the owned VM"
+        );
+        std::fs::remove_file(dir.path().join("busy_start_308")).unwrap();
+
+        // 3. Persistent Cloning Busy contention with an absent VM stops retrying
+        // after the retry cap and closes the reservation cleanly.
+        let dir_clone = dir.path().join("clone_bound");
+        std::fs::create_dir_all(&dir_clone).unwrap();
+        let mut clone_ledger = Ledger::default();
+        let mut clone_row = row();
+        clone_row.created = now().unwrap();
+        clone_row.state = State::Cloning;
+        clone_row.task = Some("UPID:willow:busy308".into());
+        prep_keys(&dir_clone, &clone_row);
+        std::fs::write(dir.path().join("name_308"), &clone_row.name).unwrap();
+        std::fs::write(dir.path().join("busy_always_308"), "").unwrap();
+        clone_ledger.rows.push(clone_row);
+        let clone_path = dir_clone.join("ledger.json");
+        clone_ledger.save(&clone_path).unwrap();
+
+        for _ in 0..8 {
+            let pass = reconcile_all(
+                &pve,
+                &Github,
+                &mut clone_ledger,
+                &dir_clone,
+                &clone_path,
+                (1, &Admission::Standing),
+            )
+            .unwrap();
+            assert!(pass.frozen.is_none());
+            if Ledger::load(&clone_path).unwrap().rows[0].state == State::Destroyed {
+                break;
+            }
+        }
+        assert_eq!(
+            Ledger::load(&clone_path).unwrap().rows[0].state,
+            State::Destroyed,
+            "persistent Cloning Busy contention must stop retrying after bounded attempts"
+        );
+    }
+
     fn row() -> Record {
         Ledger::default()
             .reserve(
