@@ -58,9 +58,10 @@ The deterministic red witness was
 `each_vcpu_covers_a_foreign_cow_publication_for_itself`. Slot 1 invalidated
 publication 1 and advanced the address-space-global coverage word; slot 2's
 production install then incorrectly returned `cow_owed=None`. The missed
-operation was slot 2's own local invalidation of publication 1. A guest
-broadcast invalidation was being recorded as coverage for virtual CPUs on
-which it had not completed.
+operation was slot 2's own local invalidation of publication 1. This proves
+that the global coverage ledger suppressed a per-slot entry obligation. It
+does not prove that the earlier hardware broadcast failed to complete on
+slot 2: the VM-free witness models the ledger, not HVF's translation caches.
 
 ## Earlier candidate signed population
 
