@@ -3853,6 +3853,8 @@ pub(crate) mod tests {
                 && let Some(wait) = if self.capture_owns_gate {
                     // The gate was raised after the fixture's initial sample.
                     // Observe its current producer revision, as an owner does.
+                    // SAFETY: the fixture retains the exact carrier region
+                    // until every capture read and release has completed.
                     let zone = unsafe { &*(probe.zone as *const carrick_el1_abi::ZoneTables) };
                     let mm = std::num::NonZeroU64::new(probe.wait.handle().mm().raw()).unwrap();
                     let index = zone.spaces.find(mm.get()).unwrap();

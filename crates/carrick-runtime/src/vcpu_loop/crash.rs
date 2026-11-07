@@ -1580,40 +1580,41 @@ mod tests {
         .unwrap();
         let handle = portal.admitted_handle(mm, 0).unwrap();
         let index = zone.spaces.find(mm.raw()).unwrap();
-        let excluded = zone.spaces.raise_and_wait_for_editor(index, || {});
-        let wait = portal
-            .observe_wait(handle, PortalWaitCause::Gate)
-            .unwrap()
-            .unwrap();
-        let address = 0x2000;
-        let engine = CrashCaptureTestEngine {
-            guest_memory: [(address, vec![0x5a; 4096])].into(),
-            capture_owns_gate: true,
-            copyout_owner_probe: Some(super::super::tests::CopyoutOwnerProbe {
-                wait,
-                zone: zone as *const _ as usize,
-            }),
-            ..CrashCaptureTestEngine::default()
-        };
-        assert!(matches!(
-            carrick_guest_mem::GuestMemory::read_bytes_raw(&engine, address, 4096),
-            Err(carrick_guest_mem::MemoryError::ReadSuspended(_))
-        ));
-        // The core read must complete without lowering the very gate that
-        // authenticates its stable memory snapshot.
-        assert_eq!(
-            engine
-                .read_core_bytes(Some(&excluded), address, 4096)
-                .unwrap(),
-            vec![0x5a; 4096]
-        );
-        assert!(
-            portal
+        {
+            let excluded = zone.spaces.raise_and_wait_for_editor(index, || {});
+            let wait = portal
                 .observe_wait(handle, PortalWaitCause::Gate)
                 .unwrap()
-                .is_some()
-        );
-        drop(excluded);
+                .unwrap();
+            let address = 0x2000;
+            let engine = CrashCaptureTestEngine {
+                guest_memory: [(address, vec![0x5a; 4096])].into(),
+                capture_owns_gate: true,
+                copyout_owner_probe: Some(super::super::tests::CopyoutOwnerProbe {
+                    wait,
+                    zone: zone as *const _ as usize,
+                }),
+                ..CrashCaptureTestEngine::default()
+            };
+            assert!(matches!(
+                carrick_guest_mem::GuestMemory::read_bytes_raw(&engine, address, 4096),
+                Err(carrick_guest_mem::MemoryError::ReadSuspended(_))
+            ));
+            // The core read must complete without lowering the very gate that
+            // authenticates its stable memory snapshot.
+            assert_eq!(
+                engine
+                    .read_core_bytes(Some(&excluded), address, 4096)
+                    .unwrap(),
+                vec![0x5a; 4096]
+            );
+            assert!(
+                portal
+                    .observe_wait(handle, PortalWaitCause::Gate)
+                    .unwrap()
+                    .is_some()
+            );
+        }
         carrick_el1_linux::sched::object_wait::space_access(
             zone,
             carrick_sched_core::SlotId::new(1),
