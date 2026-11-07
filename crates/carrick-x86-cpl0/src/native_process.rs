@@ -738,14 +738,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         parent_table: u64,
         child_table: u64,
     ) -> Result<(), NativeProcessError> {
-        let files = crate::linux_personality::file_tables(
-            carrick_el1::isa::x86::context::current_cpu_binding()
-                .ok_or(NativeProcessError::Stale)?,
-        );
+        let binding = carrick_el1::isa::x86::context::current_cpu_binding()
+            .ok_or(NativeProcessError::Stale)?;
+        let files = crate::linux_personality::file_tables(binding);
         carrick_el1_linux::file_table::DescriptorNamespace {
             fd_map: files.fd_map(),
             open_table: files.opens(),
-            ipc: carrick_el1_linux::ipc::guest_venue(self.slot.raw() as u32)
+            ipc: crate::linux_personality::ipc_venue(binding, self.slot.raw() as u32)
                 .map(|venue| (venue.region, files.ipc_table_map())),
         }
         .fork(parent_table, child_table)
@@ -757,7 +756,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         carrick_el1_linux::file_table::DescriptorNamespace {
             fd_map: files.fd_map(),
             open_table: files.opens(),
-            ipc: carrick_el1_linux::ipc::guest_venue(self.slot.raw() as u32)
+            ipc: crate::linux_personality::ipc_venue(binding, self.slot.raw() as u32)
                 .map(|venue| (venue.region, files.ipc_table_map())),
         }
         .retire(table, self.task)

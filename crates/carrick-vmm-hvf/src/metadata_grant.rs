@@ -3694,8 +3694,50 @@ mod tests {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
 pub(crate) struct BirthZoneBacking {
+    // Withdraw registration before releasing its mapping, including when an
+    // issuance handle retains backing after the carrier's row retires.
+    registration: parking_lot::Mutex<carrick_el1_abi::FileRegionRegistration>,
     pub(crate) mapping: OwnedHostMapping,
     pub(crate) live: AtomicBool,
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl BirthZoneBacking {
+    /// # Safety
+    /// Boot has exclusive custody of the unpublished initialized extent and
+    /// has not admitted any guest or host table consumer yet.
+    pub(crate) unsafe fn initialize(
+        mapping: OwnedHostMapping,
+        binding: carrick_el1_abi::FileRegionBinding,
+    ) -> Result<Self, TrapError> {
+        if mapping.len() < binding.bytes().raw() as usize {
+            return Err(TrapError::Hypervisor("short file-region backing".into()));
+        }
+        let mapped = core::ptr::NonNull::new(mapping.as_ptr())
+            .ok_or_else(|| TrapError::Hypervisor("null file-region backing".into()))?;
+        // SAFETY: exclusive boot custody; this owner retains mapping until
+        // after registration destruction, and retirement stops guest access.
+        let registration =
+            unsafe { carrick_el1_abi::FileRegionRegistration::initialize(mapped, binding) }
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("ARM file registration: {error:?}"))
+                })?;
+        Ok(Self {
+            registration: parking_lot::Mutex::new(registration),
+            mapping,
+            live: AtomicBool::new(true),
+        })
+    }
+
+    pub(crate) fn retire(&self) {
+        self.live.store(false, Ordering::Release);
+        self.registration.lock().retire();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_region_is_live(&self) -> bool {
+        let registration = self.registration.lock();
+        registration.tables(registration.binding()).is_ok()
+    }
 }
 // SAFETY: this is the fixed initialized EL1 MAP_SHARED region, which cannot
 // become exclusive exec backing after promotion. Cross-thread byte access uses
@@ -3841,19 +3883,14 @@ impl crate::trap::HvfVmState {
                     "invalid carrier EL1 zone backing".into(),
                 ));
             }
-            let owner = row
-                .host_mapping
-                .take()
-                .ok_or_else(|| TrapError::Hypervisor("carrier zone host custody absent".into()))?;
-            let backing = match owner {
-                RegionHostOwner::BirthZone(backing) => backing,
-                RegionHostOwner::Exclusive(mapping) => Arc::new(BirthZoneBacking {
-                    mapping,
-                    live: AtomicBool::new(true),
-                }),
-            };
-            row.host_mapping = Some(RegionHostOwner::BirthZone(backing.clone()));
-            backing
+            match row.host_mapping.as_ref() {
+                Some(RegionHostOwner::BirthZone(backing)) => backing.clone(),
+                _ => {
+                    return Err(TrapError::Hypervisor(
+                        "carrier region has no boot file registration".into(),
+                    ));
+                }
+            }
         };
         let identity = carrick_hal::birth_serial::BirthSourceIdentity::from_backend_identity(
             custody.clone(),
@@ -3889,14 +3926,27 @@ mod birth_source_tests {
             custody.transfer_carrier,
             core::num::NonZeroU64::new(generation.0).unwrap(),
         );
+        // SAFETY: fixture owns fresh storage with no table or guest users.
+        let backing = Arc::new(
+            unsafe {
+                BirthZoneBacking::initialize(
+                    mapping,
+                    carrick_el1_abi::FileRegionBinding::new(
+                        carrick_el1_abi::FileRegionId::from_carrier(custody.transfer_carrier),
+                        carrick_guest_arch::KernelVa::new(carrick_el1_abi::EL1_REGION_BASE),
+                        carrick_guest_arch::FrameGpa::new(carrick_el1_abi::EL1_REGION_BASE),
+                        carrick_guest_arch::GuestLen::new(carrick_el1_abi::EL1_REGION_SIZE),
+                    )
+                    .unwrap(),
+                )
+            }
+            .unwrap(),
+        );
         CarrierBirthSource {
             custody,
             generation,
             identity,
-            backing: Arc::new(BirthZoneBacking {
-                mapping,
-                live: AtomicBool::new(true),
-            }),
+            backing,
         }
     }
     #[test]

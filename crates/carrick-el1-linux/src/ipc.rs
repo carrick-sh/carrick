@@ -251,54 +251,69 @@ pub unsafe fn guest_venue<'a>(
     layout: carrick_guest_arch::KernelLayout,
     binding: carrick_el1_abi::IpcWindowBinding,
 ) -> Option<IpcVenue<'a>> {
-    binding.table_map_address(layout).ok()?;
-    // SAFETY: the caller retains the exact guest mapping. Attachment checks
-    // the existing registration's complete identity and address domains.
-    let tables = unsafe { carrick_el1_abi::FileTables::in_guest(binding.region()) }.ok()?;
-    let map = tables.into_ipc_table_map();
-    // SAFETY: the authenticated map and both IPC ranges are retained for 'a.
-    unsafe { attach_venue(map, carrick_el1_abi::GuestIpcWindow::from_binding(binding)) }
+    // SAFETY: the caller retains the exact supervisor mappings for 'a.
+    let (region, tables) = unsafe { guest_namespace(layout, binding) }?;
+    Some(IpcVenue { region, tables })
 }
 
-unsafe fn attach_venue<'a>(
-    map: &'a IpcTableMap,
-    window: carrick_el1_abi::GuestIpcWindow,
-) -> Option<IpcVenue<'a>> {
+unsafe fn guest_namespace<'a>(
+    layout: carrick_guest_arch::KernelLayout,
+    binding: carrick_el1_abi::IpcWindowBinding,
+) -> Option<(IpcRegion<'a>, &'a IpcTableMap)> {
+    binding.table_map_address(layout).ok()?;
+    // SAFETY: the caller retains the exact guest mapping. Attachment checks
+    // the registration's complete identity and address domains.
+    let tables = unsafe { carrick_el1_abi::FileTables::in_guest(binding.region()) }.ok()?;
+    let map = tables.into_ipc_table_map();
     // This acquire precedes the first directory/pool access. The carrier
     // publishes only after both mappings and the operation slots are ready.
     if !map.window_published() {
         return None;
     }
-    // SAFETY: both admitted ranges are retained by the caller for 'a.
-    let region = unsafe { window.attach() }
+    // SAFETY: authenticated map and both admitted IPC ranges are retained for 'a.
+    let region = unsafe { carrick_el1_abi::GuestIpcWindow::from_binding(binding).attach() }
         .ok()?
         .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
-    Some(IpcVenue {
+    Some((region, map))
+}
+
+/// ARM's mapping adapter. Registration and attachment use the same shared
+/// constructor as the other ISA; only the image's fixed address geometry is
+/// selected here. An absent or retired registration cannot claim service.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn current_guest_namespace() -> Option<(IpcRegion<'static>, &'static IpcTableMap)> {
+    use carrick_el1_abi::{FileRegionBinding, IpcWindowBinding};
+    use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa, LayoutBackend};
+    let layout = <carrick_el1::isa::aarch64::Aarch64Backend as LayoutBackend>::KERNEL_LAYOUT;
+    // SAFETY: boot retains and initializes this image's supervisor region
+    // before admitting a CPU, and stops every consumer before retiring it.
+    let region = unsafe { FileRegionBinding::in_guest_layout(layout) }.ok()?;
+    let binding = IpcWindowBinding::new(
         region,
-        tables: map,
+        KernelVa::new(carrick_el1_abi::EL1_IPC_BASE),
+        FrameGpa::new(carrick_el1_abi::EL1_IPC_BASE),
+        GuestLen::new(carrick_el1_abi::EL1_IPC_DIRECTORY_SPAN),
+        KernelVa::new(carrick_el1_abi::EL1_IPC_POOL_BASE),
+        FrameGpa::new(carrick_el1_abi::EL1_IPC_POOL_BASE),
+        GuestLen::new(carrick_el1_abi::EL1_IPC_POOL_SPAN),
+    )
+    .ok()?;
+    // SAFETY: boot maps these fixed ARM supervisor ranges and retains them
+    // until all guest consumers stop. Publication is checked before IPC access.
+    unsafe { guest_namespace(layout, binding) }
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn current_guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
+    let (region, tables) = current_guest_namespace()?;
+    Some(IpcVenue {
+        region: region.for_el1_slot(slot),
+        tables,
     })
 }
 
-/// The shared IPC authority EL1 serves from: the window the runtime maps at
-/// `EL1_IPC_BASE`, once the host authority has published its directory.
-/// Unmapped or unpublished, the attach fails and every call forwards.
-#[cfg(target_os = "none")]
-pub fn current_guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
-    // SAFETY: the existing ARM mapping owner retains the published window.
-    // Registration migration is still required before this entry can use the
-    // authenticated binding constructor above.
-    let mut venue = unsafe {
-        attach_venue(
-            carrick_el1_abi::ipc_table_map_guest(),
-            carrick_el1_abi::ipc_window_guest()?,
-        )
-    }?;
-    venue.region = venue.region.for_el1_slot(slot);
-    Some(venue)
-}
-
-/// Host builds serve no guest: there is no EL1 window to attach.
-#[cfg(not(target_os = "none"))]
+/// Other execution lanes require their own retained binding at admission.
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
 pub fn current_guest_venue(_slot: u32) -> Option<IpcVenue<'static>> {
     None
 }
@@ -5852,8 +5867,11 @@ mod bound_venue_tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn relocated_x86_layout_attaches_registered_ipc_venue() {
+    fn attach_registered_layout(
+        layout: carrick_guest_arch::KernelLayout,
+        directory_va: u64,
+        pool_va: u64,
+    ) {
         use carrick_el1_abi::*;
         use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
         struct Mapping(*mut u8, usize);
@@ -5882,16 +5900,9 @@ mod bound_venue_tests {
                 assert_eq!(unsafe { libc::munmap(self.0.cast(), self.1) }, 0);
             }
         }
-        // The real x86 region is an upper-canonical supervisor VA, which a
-        // host userspace fixture cannot map. Relocate only the region while
-        // retaining the x86 layout's other venues and all shared ABI offsets.
-        let layout = carrick_guest_arch::KernelLayout {
-            region: KernelVa::new(0x3_0000_0000),
-            ..carrick_el1::isa::x86_kernel_layout()
-        };
         let storage = Mapping::new(layout.region.raw(), EL1_REGION_SIZE);
-        let directory = Mapping::new(0x4_0000_0000, EL1_IPC_DIRECTORY_SPAN);
-        let pool = Mapping::new(0x5_0000_0000, EL1_IPC_POOL_SPAN);
+        let directory = Mapping::new(directory_va, EL1_IPC_DIRECTORY_SPAN);
+        let pool = Mapping::new(pool_va, EL1_IPC_POOL_SPAN);
         let region = FileRegionBinding::new(
             FileRegionId::from_carrier(core::num::NonZeroU64::MIN),
             layout.region,
@@ -5952,6 +5963,39 @@ mod bound_venue_tests {
         assert!(
             unsafe { guest_venue(layout, binding) }.is_none(),
             "retired identity"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relocated_x86_layout_attaches_registered_ipc_venue() {
+        // The upper-canonical x86 VA requires KVM; relocate its region only.
+        attach_registered_layout(
+            carrick_guest_arch::KernelLayout {
+                region: carrick_guest_arch::KernelVa::new(0x3_0000_0000),
+                ..carrick_el1::isa::x86_kernel_layout()
+            },
+            0x4_0000_0000,
+            0x5_0000_0000,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn arm_layout_attaches_the_same_registered_ipc_venue() {
+        use carrick_el1_abi::*;
+        use carrick_guest_arch::{KernelLayout, KernelVa};
+        // ARM's lower-canonical supervisor geometry is host-mappable. This
+        // authenticates registration and attachment, not guest execution.
+        attach_registered_layout(
+            KernelLayout {
+                region: KernelVa::new(EL1_REGION_BASE),
+                zone: KernelVa::new(EL1_ZONE_BASE),
+                portal: KernelVa::new(EL1_MM_PORTAL_BASE),
+                dynamic_metadata: KernelVa::new(EL1_DYNAMIC_METADATA_BASE),
+            },
+            EL1_IPC_BASE,
+            EL1_IPC_POOL_BASE,
         );
     }
 

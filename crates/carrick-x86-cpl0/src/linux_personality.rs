@@ -46,6 +46,30 @@ pub fn file_tables(binding: &CpuBinding) -> FileTables<'static> {
     })
 }
 
+pub fn ipc_venue(
+    binding: &CpuBinding,
+    slot: u32,
+) -> Option<carrick_el1_linux::ipc::IpcVenue<'static>> {
+    use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
+    let window = carrick_el1_abi::IpcWindowBinding::new(
+        binding.file_region,
+        KernelVa::new(carrick_el1_abi::X86_CPL0_IPC_BASE),
+        FrameGpa::new(carrick_el1_abi::X86_CPL0_IPC_GPA),
+        GuestLen::new(carrick_el1_abi::EL1_IPC_DIRECTORY_SPAN),
+        KernelVa::new(carrick_el1_abi::X86_CPL0_IPC_POOL_BASE),
+        FrameGpa::new(carrick_el1_abi::X86_CPL0_IPC_POOL_GPA),
+        GuestLen::new(carrick_el1_abi::EL1_IPC_POOL_SPAN),
+    )
+    .ok()?;
+    // SAFETY: stopped carrier bootstrap maps the file region and, when window
+    // publication is set, both supervisor IPC ranges for every guest CPU's lifetime.
+    let mut venue = unsafe {
+        carrick_el1_linux::ipc::guest_venue(carrick_el1::isa::x86_kernel_layout(), window)
+    }?;
+    venue.region = venue.region.for_el1_slot(slot);
+    Some(venue)
+}
+
 /// One stdio admission policy for production and the hardware fixture lane.
 pub fn admit_stdio_cached(binding: &CpuBinding, task: &CurrentTask, files: &FileTables<'_>) {
     let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
@@ -965,7 +989,7 @@ impl Personality for LinuxPersonality {
         }
 
         let files = file_tables(binding);
-        let ipc = carrick_el1_linux::ipc::guest_venue(binding.cpu_slot);
+        let ipc = ipc_venue(binding, binding.cpu_slot);
         let cache_lookup = |handle: u32| {
             files
                 .cache(handle)

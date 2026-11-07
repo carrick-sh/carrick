@@ -74,7 +74,9 @@ impl X86AnonymousVenue<'_> {
             return Ok(None);
         };
         let slot = self.frame.slot();
-        let venue = carrick_el1_linux::ipc::guest_venue(slot.index() as u32)
+        let binding = carrick_el1::isa::x86::context::current_cpu_binding()
+            .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))?;
+        let venue = crate::linux_personality::ipc_venue(binding, slot.index() as u32)
             .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))?;
         let table = carrick_el1_linux::ipc::native_table(&venue, self.task)
             .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))?;

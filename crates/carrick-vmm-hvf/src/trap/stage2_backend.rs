@@ -556,6 +556,7 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
         usize::try_from(physical_size).map_err(|_| TrapError::MappingTooLarge(physical_size))?;
     let backing_started = std::time::Instant::now();
     let (host, size, host_mapping) = map_exclusive_region(mapping, requested_size)?;
+    let host_mapping = register_file_region_backing(custody, mapping, host_mapping)?;
     let elapsed_ns = backing_started
         .elapsed()
         .as_nanos()
@@ -589,7 +590,7 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
         physical_size: size,
         perms: exec_mapping_stage2_perms(mapping),
         memory: None,
-        host_mapping: Some(host_mapping.into()),
+        host_mapping: Some(host_mapping),
         structural_owner: None,
         stage2_lease: None,
         is_dynamic_alias: false,
@@ -762,6 +763,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
     // (never snapshotted); all other regions are private guest RAM.
     let backing_started = std::time::Instant::now();
     let (host, size, host_mapping) = map_exclusive_region(mapping, size)?;
+    let host_mapping = register_file_region_backing(custody, mapping, host_mapping)?;
     if emit_exec_backing_census {
         let elapsed_ns = backing_started
             .elapsed()
@@ -832,7 +834,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         physical_size: size,
         perms,
         memory: None,
-        host_mapping: Some(host_mapping.into()),
+        host_mapping: Some(host_mapping),
         structural_owner: None,
         stage2_lease: None,
         is_dynamic_alias: false,
@@ -910,6 +912,29 @@ pub(crate) fn map_exclusive_region(
         TrapError::Hypervisor(format!("mmap guest image (size={size}) failed: {error}"))
     })?;
     Ok((host_mapping.as_ptr(), host_mapping.len(), host_mapping))
+}
+
+/// Retain the shared file registration in the existing mapping owner before
+/// stage-2 publication or any host aperture pointer becomes observable.
+fn register_file_region_backing(
+    custody: &CarrierVmCustody,
+    mapping: &GuestMapping,
+    owner: crate::host_mapping::OwnedHostMapping,
+) -> Result<RegionHostOwner, TrapError> {
+    if mapping.guest_start != carrick_el1_abi::EL1_REGION_BASE {
+        return Ok(RegionHostOwner::Exclusive(owner));
+    }
+    let binding = carrick_el1_abi::FileRegionBinding::new(
+        carrick_el1_abi::FileRegionId::from_carrier(custody.transfer_carrier),
+        carrick_guest_arch::KernelVa::new(mapping.guest_start),
+        carrick_guest_arch::FrameGpa::new(mapping.ipa_start),
+        carrick_guest_arch::GuestLen::new(mapping.mapped_size),
+    )
+    .map_err(|error| TrapError::Hypervisor(format!("ARM file-region geometry: {error:?}")))?;
+    // SAFETY: boot exclusively owns this freshly prepared mapping. The Arc
+    // retains registration and mapping together until all consumers retire.
+    let backing = unsafe { crate::metadata_grant::BirthZoneBacking::initialize(owner, binding) }?;
+    Ok(RegionHostOwner::BirthZone(std::sync::Arc::new(backing)))
 }
 
 fn publish_el1_region_host_ptr(mapping: &GuestMapping, host: *mut u8) {
@@ -1261,9 +1286,22 @@ mod tests {
             private_file_backing: None,
         };
         let region = prepare_exec_region_raw(&mapping).expect("EL1 host mapping");
+        let retained = region
+            .host_mapping
+            .as_ref()
+            .and_then(|owner| match owner {
+                RegionHostOwner::BirthZone(backing) => Some(backing.clone()),
+                RegionHostOwner::Exclusive(_) => None,
+            })
+            .expect("ARM boot must retain the shared file registration");
+        assert!(retained.file_region_is_live());
         let stale = region.host_addr as usize;
         assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), stale);
         drop(region);
+        assert!(
+            !retained.file_region_is_live(),
+            "retirement withdraws registration even while an issuance handle retains backing"
+        );
         let actual = carrick_el1_abi::get_el1_region_host_ptr();
         reset_el1_counters();
         assert_eq!(

@@ -48,7 +48,7 @@ pub const ALLOCATOR_GPA: u64 = 0x20_00000;
 pub const INITIAL_EXTENT_GPA: u64 = X86_CPL0_INITIAL_EXTENT_GPA;
 pub const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
 /// Reserved before dynamic grants, including carriers with no IPC authority.
-pub const IPC_WINDOW_GPA: u64 = 0x2_0000_0000;
+pub const IPC_WINDOW_GPA: u64 = carrick_el1_abi::X86_CPL0_IPC_GPA;
 pub const DYNAMIC_GRANT_GPA: u64 = IPC_WINDOW_GPA + carrick_el1_abi::EL1_IPC_SIZE;
 pub const INITIAL_MM_KEY: u64 = 301;
 pub const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
