@@ -1032,3 +1032,33 @@ fn workers_verify_the_template_toolchain_without_installing_it() {
     let launcher = include_str!("../../../scripts/ci/runner-once.sh");
     assert!(launcher.contains("export RUSTUP_HOME=/opt/carrick-rust/rustup"));
 }
+
+#[test]
+fn scope_refusal_guard_token_can_comment_on_issues_and_prs() {
+    let documents = yaml_rust2::YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let guard = &documents[0]["jobs"]["guard"];
+    assert_eq!(guard["permissions"].as_hash().unwrap().len(), 3);
+    for permission in ["issues", "pull-requests"] {
+        assert_eq!(guard["permissions"][permission].as_str(), Some("write"));
+    }
+    assert_eq!(guard["permissions"]["contents"].as_str(), Some("read"));
+    let validate = guard["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"].as_str() == Some("validate"))
+        .unwrap();
+    assert_eq!(
+        validate["env"]["GH_TOKEN"].as_str(),
+        Some("${{ github.token }}")
+    );
+    assert!(
+        validate["run"]
+            .as_str()
+            .unwrap()
+            .contains("dispatch-worker guard")
+    );
+}
