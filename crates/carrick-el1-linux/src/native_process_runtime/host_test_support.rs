@@ -409,6 +409,20 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         _: &Self::Mm,
         request: carrick_core::mm::transaction::CopyoutRequest,
     ) -> Result<(), NativeProcessError> {
+        #[cfg(test)]
+        ENTROPY_PREPARES.with(|count| count.set(count.get() + 1));
+        #[cfg(test)]
+        if ENTROPY_WRITABLE_END.with(|limit| {
+            limit.get().is_some_and(|limit| {
+                request
+                    .address
+                    .raw()
+                    .checked_add(request.len.raw())
+                    .is_none_or(|end| end > limit.raw())
+            })
+        }) {
+            return Err(NativeProcessError::Fault);
+        }
         if let Some(error) = self.prepare_copy_error.or(self.child_copy_error)
             && self
                 .child_copy_error_at
@@ -6708,6 +6722,12 @@ fn entropy_service_cancellation_after_reply_keeps_generated_bytes() {
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static ENTROPY_WRITABLE_END: core::cell::Cell<Option<UserVa>> = const { core::cell::Cell::new(None) };
+    static ENTROPY_PREPARES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 fn entropy_service_result(case: EntropyReplyCase) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation, entropy};
     let fixture = native_exec_fixture();
@@ -6725,6 +6745,10 @@ fn entropy_service_result(case: EntropyReplyCase) {
     if fault {
         service.prepare_copy_error = Some(NativeProcessError::Fault);
     }
+    let prefix = matches!(case, EntropyReplyCase::Prefix);
+    let address = UserVa::new(if prefix { 0x10ff8 } else { 0x10000 });
+    ENTROPY_WRITABLE_END.with(|limit| limit.set(prefix.then_some(UserVa::new(0x11000))));
+    ENTROPY_PREPARES.with(|count| count.set(0));
     take_signal_copies();
     {
         let mut entry = fixture
@@ -6741,15 +6765,26 @@ fn entropy_service_result(case: EntropyReplyCase) {
         assert!(matches!(
             entry
                 .begin_entropy_service(
-                    UserVa::new(0x10000),
-                    8,
+                    address,
+                    if prefix { 13 } else { 8 },
                     if invalid { 6 } else { 0 },
-                    carrick_guest_arch::GuestLen::new(16)
+                    carrick_guest_arch::GuestLen::new(if prefix { 13 } else { 16 })
                 )
                 .unwrap(),
             NativeResume::Left(None)
         ));
     }
+    assert_eq!(
+        ENTROPY_PREPARES.with(|count| count.get()),
+        if invalid {
+            0
+        } else if prefix {
+            2
+        } else {
+            1
+        },
+        "prepare each accessible page once before requesting entropy"
+    );
     let notice = fixture.task.service_notice.take().unwrap().unwrap();
     let queue = fixture
         .zone
@@ -6852,7 +6887,7 @@ fn entropy_service_result(case: EntropyReplyCase) {
     let copied = take_signal_copies();
     if expected > 0 {
         assert_eq!(copied.len(), 1);
-        assert_eq!(copied[0].0, UserVa::new(0x10000));
+        assert_eq!(copied[0].0, address);
         assert_eq!(copied[0].1.len(), 8);
     } else {
         assert!(copied.is_empty());
