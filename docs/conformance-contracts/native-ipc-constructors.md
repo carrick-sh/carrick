@@ -319,3 +319,23 @@ update. Rearm and final release cancel deadlines by exact object generation;
 member updates precede epoll updates, and notification follows unlocking.
 These are implementation requirements, not a missing owner semantic decision.
 No production timerfd service was added in this finishing-round witness.
+
+
+## Shared timer state continuation
+
+The host timerfd now stores the interval, next deadline and unread count in
+`carrick_timer_core::timerfd::State`. Arming (relative, absolute and disarm),
+refreshing and count consumption use that one implementation; the old host
+expiry wrapper is removed. Only the core mutates those three fields. The
+host still selects the captured creator `ClockDomain`, owns its lock and
+publishes rearm notifications after unlocking. The refactor does not change
+clock selection, copyout admission, expiration consumption on EFAULT, IPC
+layout or deadline enrollment. It is a state/transition prerequisite, not an
+in-ring timerfd implementation or a new clock authority.
+
+The core scenarios cover periodic missed counts across a read and rearm or
+disarm with unread expirations. Existing production dispatcher tests cover
+creator-clock isolation, EFAULT consumption and fd reuse; these remain the
+host authority witnesses. The native constructor witness remains red until
+shared clock-domain publication, the timer IPC object and scheduler expiry
+and rearm enrollment exist. No signed or constructor acceptance is claimed.

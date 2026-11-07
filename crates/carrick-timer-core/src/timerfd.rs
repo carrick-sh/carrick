@@ -1,14 +1,79 @@
-//! Timerfd expiration arithmetic shared by host and ring callers.
+//! Timerfd state transitions shared by host and ring owners.
 //!
 //! The caller samples the timer creator’s clock domain and serializes state
 //! updates. This module neither selects a clock nor owns readiness delivery.
 
 use core::time::Duration;
 
+/// Timerfd state independent of its storage and clock authority.
+///
+/// The owner serializes access and supplies samples from the clock captured
+/// at creation. Neither an fd lookup nor the reading task selects the clock.
+/// Readiness delivery and deadline enrollment belong to that owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct State {
+    interval: Option<Duration>,
+    deadline: Option<Duration>,
+    expirations: u64,
+}
+
+/// Interpretation of a nonzero initial expiration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineMode {
+    Absolute,
+    Relative,
+}
+
+impl State {
+    /// Configured repeat interval, retained even when the timer is disarmed.
+    pub const fn interval(&self) -> Option<Duration> {
+        self.interval
+    }
+
+    /// Next expiration in the creator's clock domain, or a disarmed timer.
+    pub const fn deadline(&self) -> Option<Duration> {
+        self.deadline
+    }
+
+    /// Already accounted expirations; sampling time is an explicit refresh.
+    pub const fn pending(&self) -> u64 {
+        self.expirations
+    }
+
+    /// Account for all due periods using a single creator-clock sample.
+    pub fn refresh(&mut self, now: Option<Duration>) -> u64 {
+        (self.expirations, self.deadline) =
+            expirations(now, self.interval, self.deadline, self.expirations);
+        self.expirations
+    }
+
+    /// Replace the arm and discard unread expirations, including on disarm.
+    /// A zero initial value is represented by `None` by the ABI decoder.
+    pub fn arm(
+        &mut self,
+        now: Duration,
+        interval: Option<Duration>,
+        value: Option<Duration>,
+        mode: DeadlineMode,
+    ) {
+        self.interval = interval;
+        self.deadline = value.map(|value| match mode {
+            DeadlineMode::Absolute => value,
+            DeadlineMode::Relative => now.saturating_add(value),
+        });
+        self.expirations = 0;
+    }
+
+    /// Consume the accumulated count once the output operation owns delivery.
+    pub fn consume(&mut self) -> u64 {
+        core::mem::take(&mut self.expirations)
+    }
+}
+
 /// Refresh a timer against one sample from its creator's clock domain.
 /// An unavailable sample preserves the previous state. Missed periodic
 /// expirations are accumulated in constant work, with saturating counts.
-pub fn expirations(
+fn expirations(
     now: Option<Duration>,
     interval: Option<Duration>,
     deadline: Option<Duration>,
@@ -62,6 +127,53 @@ mod tests {
     use super::*;
 
     const DEADLINE: Duration = Duration::from_nanos(100);
+
+    #[test]
+    fn rearm_and_disarm_discard_unread_expirations() {
+        let mut timer = State::default();
+        timer.arm(
+            DEADLINE,
+            Some(Duration::from_nanos(10)),
+            Some(DEADLINE),
+            DeadlineMode::Absolute,
+        );
+        assert_eq!(timer.refresh(Some(Duration::from_nanos(130))), 4);
+        timer.arm(
+            DEADLINE,
+            None,
+            Some(Duration::from_nanos(50)),
+            DeadlineMode::Relative,
+        );
+        assert_eq!(timer.expirations, 0);
+        assert_eq!(timer.refresh(Some(Duration::from_nanos(149))), 0);
+        assert_eq!(timer.refresh(Some(Duration::from_nanos(150))), 1);
+        timer.arm(
+            DEADLINE,
+            Some(Duration::from_nanos(10)),
+            None,
+            DeadlineMode::Absolute,
+        );
+        assert_eq!(timer.refresh(Some(Duration::MAX)), 0);
+        assert_eq!(timer.deadline, None);
+    }
+
+    #[test]
+    fn reading_a_periodic_count_keeps_the_next_deadline() {
+        let mut timer = State::default();
+        timer.arm(
+            DEADLINE,
+            Some(Duration::from_nanos(10)),
+            Some(DEADLINE),
+            DeadlineMode::Absolute,
+        );
+        assert_eq!(timer.refresh(Some(Duration::from_nanos(130))), 4);
+        assert_eq!(timer.consume(), 4);
+        assert_eq!(timer.consume(), 0);
+        assert_eq!(timer.refresh(None), 0);
+        assert_eq!(timer.refresh(Some(Duration::from_nanos(139))), 0);
+        assert_eq!(timer.refresh(Some(Duration::from_nanos(140))), 1);
+        assert_eq!(timer.consume(), 1);
+    }
 
     #[test]
     fn disarmed_unavailable_and_early_samples_preserve_state() {

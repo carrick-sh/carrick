@@ -127,7 +127,7 @@ impl BlockingTimerFdRead {
             return TimerFdReadStep::Wait(self);
         }
         let value = LinuxTimerfdExpirations {
-            expirations: timer.expirations,
+            expirations: timer.state.pending(),
         };
         let out = match super::copyout::prepare(
             context,
@@ -142,7 +142,7 @@ impl BlockingTimerFdRead {
         // Linux consumes the ready expiration before attempting the guest
         // copyout: a bad destination returns EFAULT, and a later nonblocking
         // read observes EAGAIN rather than the old count.
-        timer.expirations = 0;
+        timer.state.consume();
         if out
             .commit([carrick_abi::KernelAbi::abi_bytes(&value)])
             .is_err()
@@ -200,7 +200,7 @@ fn timerfd_plan(state: &TimerFdState) -> TimerFdReadPlan {
     let (clock_generation, plan) = state.clock.with_clock_change_snapshot(|| {
         let mut timer = state.inner.lock();
         let ready = refresh_timerfd_locked(&state.clock, &mut timer) > 0;
-        let deadline = timer.deadline;
+        let deadline = timer.state.deadline();
         let host_timeout = if ready {
             Some(Duration::ZERO)
         } else if state.clock.is_deterministic()
@@ -237,7 +237,7 @@ fn timerfd_plan(state: &TimerFdState) -> TimerFdReadPlan {
             virtual_due,
             ready,
             deadline,
-            expirations: timer.expirations,
+            expirations: timer.state.pending(),
             timer_generation: state.change_generation(),
             clock_generation: 0,
         }
@@ -875,16 +875,11 @@ pub(super) fn refresh_timerfd_locked(
     clock: &crate::kernel::container::ClockDomain,
     timer: &mut TimerFdInner,
 ) -> u64 {
-    let (ready, next_deadline) = timerfd_expirations(
-        clock,
-        timer.clock_id,
-        timer.interval,
-        timer.deadline,
-        timer.expirations,
-    );
-    timer.expirations = ready;
-    timer.deadline = next_deadline;
-    ready
+    let now = timer
+        .state
+        .deadline()
+        .and_then(|_| linux_clock_duration(clock, timer.clock_id));
+    timer.state.refresh(now)
 }
 
 pub(super) fn timerfd_ready_count(state: &TimerFdState) -> u64 {
@@ -903,21 +898,6 @@ pub(super) fn timerfd_itimerspec(
     LinuxItimerspec::new(
         linux_timespec_from_optional_duration(interval),
         linux_timespec_from_optional_duration(remaining),
-    )
-}
-
-pub(super) fn timerfd_expirations(
-    clock: &crate::kernel::container::ClockDomain,
-    clock_id: u64,
-    interval: Option<Duration>,
-    deadline: Option<Duration>,
-    expirations: u64,
-) -> (u64, Option<Duration>) {
-    carrick_timer_core::timerfd::expirations(
-        deadline.and_then(|_| linux_clock_duration(clock, clock_id)),
-        interval,
-        deadline,
-        expirations,
     )
 }
 
