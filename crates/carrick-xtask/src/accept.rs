@@ -145,6 +145,13 @@ impl StepResult {
     /// Recompute from evidence, including old receipts, rather than trusting
     /// a candidate's declared outcome.
     pub fn execution_outcome(&self) -> StepOutcome {
+        // KVM is an execution gate: a failed recipe or an empty selection
+        // cannot provide evidence, even when the baseline did the same.
+        if self.name == "kvm-tests" && self.started_tests.is_empty() {
+            return StepOutcome::Failed {
+                tests: self.failed_tests.clone(),
+            };
+        }
         if !self.requires_tests() {
             return if self.passed
                 && self.failed_tests.is_empty()
@@ -1117,6 +1124,15 @@ pub fn populate_step_from_log(step: &mut StepResult, log: &str, failures: &mut V
         && !step.unitemized_failures.iter().any(|u| u == "signal")
     {
         step.unitemized_failures.push("signal".into());
+    }
+    if step.name == "kvm-tests" && step.started_tests.is_empty() {
+        let message = format!(
+            "step '{}' failed: no tests executed (exit {:?})",
+            step.name, step.exit_code
+        );
+        step.passed = false;
+        step.error = Some(message.clone());
+        failures.push(message);
     }
     let outcome = step.execution_outcome();
     if let StepOutcome::NotRun { reason } = &outcome {

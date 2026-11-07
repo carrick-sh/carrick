@@ -3177,3 +3177,154 @@ fn retirement_scan_resolves_the_real_el1_linux_crate() {
     .expect("carrick-el1-linux sources must resolve for test retirement");
     assert!(!found);
 }
+
+#[test]
+fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
+    for code in [101, 0] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "/target/\n").unwrap();
+        std::fs::write(
+            root.join("justfile"),
+            format!("test-kvm:\n    @exit {code}\n"),
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("crates")).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", ".gitignore", "justfile"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let path = root.join("target/receipt.json");
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .arg("--root")
+            .arg(root)
+            .args(["accept", "--profile", "kvm", "--receipt"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted exit {code}");
+        let receipt: AcceptReceipt =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(receipt.overall, "FAIL");
+        let step = &receipt.steps[0];
+        assert_eq!(step.exit_code, Some(code));
+        assert!(step.started_tests.is_empty());
+        assert!(
+            matches!(
+                step.execution_outcome(),
+                carrick_xtask::accept::StepOutcome::Failed { .. }
+            ),
+            "{step:?}"
+        );
+        assert!(
+            receipt
+                .failures
+                .iter()
+                .any(|f| f.contains("no tests executed"))
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["ci-receipt", "diff", "--baseline"])
+            .arg(&path)
+            .arg("--candidate")
+            .arg(&path)
+            .arg("--fail-on-new")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "zero execution grandfathered");
+    }
+}
+
+#[test]
+fn kvm_workflow_rejects_zero_execution_but_preserves_named_failures() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let workflow = ".github/workflows/kernel-runtime.yml";
+    std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    let source = include_str!("../../../.github/workflows/kernel-runtime.yml");
+    std::fs::write(root.join(workflow), source).unwrap();
+    // The dispatch App cannot publish workflow changes. Exercise the exact
+    // owner handoff until it has been applied, then the checked-in workflow.
+    if !source.contains("just xtask ci-receipt diff --baseline target/ci-receipts/receipt.json") {
+        let patch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harvest.patch");
+        let output = Command::new("git")
+            .arg("apply")
+            .arg(patch)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let source = std::fs::read_to_string(root.join(workflow)).unwrap();
+    let docs = yaml_rust2::YamlLoader::load_from_str(&source).unwrap();
+    let steps = docs[0]["jobs"]["kvm-tests-willow"]["steps"]
+        .as_vec()
+        .unwrap();
+    let script = steps
+        .iter()
+        .filter_map(|s| s["run"].as_str())
+        .find(|s| s.contains("xtask accept exited"))
+        .unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let just = bin.join("just");
+    std::fs::write(&just, "#!/bin/sh\nif [ \"$1\" = accept ]; then\n  cp \"$SOURCE_RECEIPT\" target/ci-receipts/receipt.json\n  exit 101\nfi\nif [ \"$1\" = xtask ]; then\n  shift\n  exec \"$XTASK\" \"$@\"\nfi\nexit 99\n").unwrap();
+    std::fs::set_permissions(&just, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    for executed in [false, true] {
+        let mut s = step("kvm-tests", false, &[]);
+        s.command = "just test-kvm".into();
+        if executed {
+            s.started_tests = vec!["kvm::witness".into()];
+            s.failed_tests = s.started_tests.clone();
+            s.finished_binaries = vec!["kvm".into()];
+        }
+        let mut r = receipt(vec![s]);
+        r.profile = "kvm".into();
+        r.phase = "host".into();
+        let input = root.join("source-receipt.json");
+        std::fs::write(&input, serde_json::to_vec(&r).unwrap()).unwrap();
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .current_dir(root)
+            .env("PATH", &path)
+            .env("SOURCE_RECEIPT", &input)
+            .env("XTASK", env!("CARGO_BIN_EXE_carrick-xtask"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            executed,
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(root.join("target/ci-receipts/receipt.json").is_file());
+    }
+}
