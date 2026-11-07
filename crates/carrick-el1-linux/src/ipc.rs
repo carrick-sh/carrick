@@ -5904,6 +5904,11 @@ mod bound_venue_tests {
             FileRegionRegistration::initialize(core::ptr::NonNull::new(storage.0).unwrap(), region)
         }
         .unwrap();
+        // SAFETY: the fixture retains its registered supervisor mapping.
+        assert_eq!(
+            unsafe { FileRegionBinding::in_guest_layout(layout) },
+            Ok(region)
+        );
         let binding = IpcWindowBinding::new(
             region,
             KernelVa::new(directory.0 as u64),
@@ -5938,6 +5943,11 @@ mod bound_venue_tests {
             assert_eq!(venue.tables.table_for_file_table(20), None);
         }
         registration.retire();
+        // SAFETY: storage remains mapped after withdrawing the registration.
+        assert_eq!(
+            unsafe { FileRegionBinding::in_guest_layout(layout) },
+            Err(FileRegionError::Retired),
+        );
         // SAFETY: storage is retained, but the registration is now retired.
         assert!(
             unsafe { guest_venue(layout, binding) }.is_none(),
