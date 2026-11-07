@@ -156,6 +156,14 @@ cd /mnt/carrick-seed
 if [[ $(cat profile) == agent ]]; then
   /usr/sbin/useradd --system --user-group --no-create-home --shell /usr/sbin/nologin carrick-dispatch-agent
   /usr/sbin/usermod -aG kvm carrick-dispatch-agent
+  # Native amd64 Docker, the conformance oracle, for x86 ecosystem rows run
+  # inside worker VMs (owner decision 2026-11-07, #1837). Membership in
+  # `docker` is root-equivalent inside the VM; worker VMs are disposable and
+  # hold one job. Never run Docker and a carrick guest concurrently: the
+  # worker runs the two as separate phases.
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends docker.io
+  systemctl enable docker
+  /usr/sbin/usermod -aG docker carrick-dispatch-agent
   /usr/sbin/usermod -aG carrick-dispatch-agent runner
   printf '%s\n' 'runner ALL=(carrick-dispatch-agent) NOPASSWD: ALL' > /etc/sudoers.d/carrick-dispatch-agent
   chmod 0440 /etc/sudoers.d/carrick-dispatch-agent
@@ -294,6 +302,8 @@ systemctl daemon-reload
 runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
 if [[ $(cat profile) == agent ]]; then
   id -nG carrick-dispatch-agent | tr ' ' '\n' | grep -qx kvm
+  id -nG carrick-dispatch-agent | tr ' ' '\n' | grep -qx docker
+  runuser -u carrick-dispatch-agent -- docker info >/dev/null
   runuser -u carrick-dispatch-agent -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
   # Allowed capture commands run non-interactively (including a live
   # SIGKILL capture through carrick-capture); sudo -n true, sudo -n bash,
