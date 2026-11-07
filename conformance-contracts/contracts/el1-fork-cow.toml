@@ -58,7 +58,7 @@ vm_free = [
 ]
 embed = [
   "carrick-embed::el1_sched::el1_owner_cow_preserves_host_image_readonly_protection (actual EL0 denied store to mprotected host image page before fork and after neighboring COW with a live child; SIGSEGV required, signed red/green pending)",
-  "carrick-embed::el1_sched::el1_fork_cow_parent_replenishes_used_grants (initial owner MM: two live sibling writers, 96 distinct 16 KiB compounds each with no syscall in either write loop; child stays alive and verifies source isolation; complete carrier observations require >64 grants provisioned, >=192 completions settled and EL1 resolutions, zero owner stage-fault host COW; signed red with only refill exclusion removed remains pending)",
+  "carrick-embed::el1_sched::el1_fork_cow_parent_replenishes_used_grants (initial owner MM: two live sibling writers, 96 distinct 16 KiB compounds each with no syscall in either write loop; child stays alive and verifies source isolation; complete carrier observations require >64 grants provisioned, >=192 completions settled and EL1 resolutions, zero carrier stage-fault host COW; signed red with only refill exclusion removed remains pending)",
   "carrick-embed::el1_sched::{el1_fork_cow_resolves_in_guest,el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes} (prepared-fork: inherited untouched page reads zero, PROT_NONE data survives, child writes remain private while parent stays live, parent write remains private while child stays live; new binding awaits signed acceptance)",
 ]
 
