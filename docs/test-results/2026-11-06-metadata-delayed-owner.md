@@ -405,3 +405,49 @@ The director-owned 20-run signed HVF population, paired signed proof and two
 consecutive main signed passes remain outstanding. The previously documented
 first-publication refusal defect also remains unresolved; passing host-park
 checks cannot discharge it. This continuation does not close #1572.
+
+## Admitted-main continuation, 2026-11-07
+
+Rebased the 19 incoming commits onto the dispatch-admitted main without
+conflicts. `git range-diff` matched every incoming patch with `=`. No earlier
+implementation or witness was intentionally dropped; this round changes only
+this verification note.
+
+The production owner-wait witness was re-proven with exactly one selected
+test. Temporarily removing the three host-park alias-binding calls made
+`serial_host_completion_owner_wait_resumes_through_zone_and_physical` fail
+at `host park lost its retained lifecycle aliases before owner release`,
+with aliases `(0, 0)` (exit 101). Restoring the original file made the same
+test pass (exit 0). Source restoration was checked before committing.
+
+Current Linux verification passed:
+
+- `just _test-unit-runtime`: 741 passed, six ignored, serial execution.
+- Scheduler-core regular partition: 270 passed; serial partition: zero
+  selected tests, exit 0.
+- Kernel `lifecycle_`: 40 passed; kernel-example `admission_interleavings`:
+  nine passed.
+- Formatting, contract-change against dispatch-admitted main, source-only
+  authority debt, and the PR-base authority-debt ratchet passed. Live host
+  discovery executed Linux CLI/runtime; other host profiles remain pending.
+- `just cross-check-macos` (check and clippy), `just build-cpl0`,
+  `just check-linux`, native `cargo check -p carrick-vmm-kvm`, and
+  `just clippy` passed.
+
+Raw logs and individual batch exit statuses are under
+`/var/tmp/carrick-1572-round3/` on this ephemeral runner. Builds reused the
+job's VM-local lease environment; no hypervisor lease was acquired.
+
+The requested director-owned 20-run signed HVF population cannot execute on
+this Linux x86_64 host. Docker is not installed. A KVM device is present,
+but full KVM runtime acceptance was not run; it belongs to the merge queue.
+Whole-workspace CI, lint-domains and test-kernel were left to CI as directed.
+No signed smoke, signed A/B, final-head signed population or consecutive main
+signed passes are claimed. The previously documented first-publication
+refusal remains unresolved: `publish_resolved` clears aliases and returns
+HostServed on Busy. This host-park witness does not discharge that defect.
+
+GitHub CLI had no authentication, so historical owner comments could not be
+retrieved. The supplied owner-comment inbox remained empty during the run.
+No push, PR creation or comment was performed. The handoff review is worker
+self-review requesting changes, not independent approval or issue closure.
