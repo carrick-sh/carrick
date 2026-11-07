@@ -379,6 +379,9 @@ pub(super) trait Remote {
     fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError>;
     fn runs(&mut self) -> Result<Vec<Value>, ScalerError>;
     fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError>;
+    fn capacity(&mut self) -> Option<Value> {
+        None
+    }
 }
 impl Remote for Live<'_> {
     fn get(&mut self, endpoint: &str) -> Result<Value, ScalerError> {
@@ -405,6 +408,9 @@ impl Remote for Live<'_> {
     }
     fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError> {
         Github::post(self, pr, body)
+    }
+    fn capacity(&mut self) -> Option<Value> {
+        Github::capacity(self)
     }
 }
 
@@ -1498,7 +1504,10 @@ mod tests {
     struct FakeRemote {
         prs: BTreeMap<u64, Value>,
         comments: Vec<Value>,
+        reviews: Vec<Value>,
         closing: Vec<u64>,
+        issues: BTreeMap<u64, Value>,
+        capacity: Option<Value>,
         runs: Vec<Value>,
         posted: Vec<(u64, String)>,
         diff: String,
@@ -1523,6 +1532,8 @@ mod tests {
         fn list(&mut self, endpoint: &str) -> Result<Vec<Value>, ScalerError> {
             Ok(if endpoint.contains("/issues/") {
                 self.comments.clone()
+            } else if endpoint.contains("/reviews") {
+                self.reviews.clone()
             } else {
                 Vec::new()
             })
@@ -1541,6 +1552,7 @@ mod tests {
         fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError> {
             let mut fake = FakeGh {
                 closing: self.closing.clone(),
+                issues: self.issues.clone(),
                 ..FakeGh::default()
             };
             Github::adoption(&mut fake, read)
@@ -1551,6 +1563,9 @@ mod tests {
         fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError> {
             self.posted.push((pr, body.into()));
             Ok(())
+        }
+        fn capacity(&mut self) -> Option<Value> {
+            self.capacity.clone()
         }
     }
     fn remote() -> FakeRemote {
@@ -2336,4 +2351,175 @@ mod tests {
         assert_eq!(events_in(&replies(&buffer, 1)[0]), ["comment:3"]);
     }
     const SHA_HEAD: &str = "1fcdaac3c5322b601f362a5aa5f915781456c7c7";
+
+    #[test]
+    fn replay_1825_mcp_request_round_enforces_ecosystem_wait_single_review_and_fix_chain() {
+        let fx: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/dispatch-1825-outcomes.json"
+        ))
+        .unwrap();
+
+        // 1. Ecosystem PR (#1506) without signed scoreboard records a named wait and refuses review.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("eco.json");
+        let eco_done = &fx["pr_1740_ecosystem_impl_done"];
+        let eco_head = eco_done["head"].as_str().unwrap();
+        let mut fake = remote();
+        let mut eco_pr = pr(1740, "work/dispatch-1506-42205586763");
+        eco_pr["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        eco_pr["head"]["sha"] = json!(eco_head);
+        eco_pr["body"] = json!("Closes #1506");
+        fake.prs.insert(1740, eco_pr);
+        fake.closing = vec![1506];
+        fake.comments = vec![json!({
+            "id": 7201,
+            "html_url": eco_done["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-30T23:59:00Z",
+            "body": eco_done["body"],
+        })];
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "request_round",
+            json!({
+                "pr": 1740,
+                "brief": "Independent review of PR #1740 (review only; push nothing).\nWorker tier: standard\nPublish a verdict or make it the first line of the summary."
+            }),
+        );
+        assert!(
+            err && text.contains("waiting on signed scoreboard"),
+            "{text}"
+        );
+        assert!(fake.posted.is_empty());
+        let saved: ToolState = load(&state).unwrap();
+        assert!(
+            saved.prs[&1740]
+                .waiting_on
+                .as_deref()
+                .is_some_and(|w| w.contains("signed scoreboard") && w.contains("#1506")),
+            "{:?}",
+            saved.prs[&1740].waiting_on
+        );
+
+        // Once director records a signed scoreboard on eco_head, review round is admitted.
+        fake.comments.push(json!({
+            "id": 7202,
+            "html_url": "https://github.com/carrick-sh/carrick/pull/1740#issuecomment-7202",
+            "user": {"login": "tjfontaine", "type": "User"},
+            "created_at": "2026-10-31T00:02:00Z",
+            "body": format!("Signed scoreboard on `{}`: smoke-signed PASS.", &eco_head[..12]),
+        }));
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "request_round",
+            json!({
+                "pr": 1740,
+                "brief": "Independent review of PR #1740 (review only; push nothing).\nWorker tier: standard\nPublish a verdict or make it the first line of the summary."
+            }),
+        );
+        assert!(!err, "{text}");
+        assert_eq!(fake.posted.len(), 1);
+        let saved: ToolState = load(&state).unwrap();
+        assert_eq!(saved.prs[&1740].waiting_on, None);
+
+        // 2. Review round ending Done (APPROVED) refuses another review round;
+        //    CHANGES REQUESTED permits one fix round on the same head, capped by UNATTENDED_ROUNDS.
+        let chain_state = dir.path().join("chain.json");
+        let impl_done = &fx["pr_1781_impl_done"];
+        let rev_ok = &fx["pr_1781_review_approved"];
+        let rev_cr = &fx["pr_1781_review_changes_requested"];
+        let fix_done = &fx["pr_1781_fix_done"];
+        let rev2_cr = &fx["pr_1781_review2_changes_requested"];
+        let h1 = impl_done["head"].as_str().unwrap();
+        let h2 = fix_done["head"].as_str().unwrap();
+
+        let mut rev_ok_remote = remote();
+        let mut p1781 = pr(1781, "work/dispatch-1780-42300000001");
+        p1781["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        p1781["head"]["sha"] = json!(h1);
+        rev_ok_remote.prs.insert(1781, p1781.clone());
+        rev_ok_remote.closing = vec![1780];
+        rev_ok_remote.comments = vec![
+            json!({"id": 7001, "html_url": impl_done["url"], "user": {"login": "carrick-workers[bot]", "type": "Bot"}, "created_at": "2026-10-30T23:50:00Z", "body": impl_done["body"]}),
+            json!({"id": 7003, "html_url": rev_ok["url"], "user": {"login": "carrick-workers[bot]", "type": "Bot"}, "created_at": "2026-10-30T23:59:00Z", "body": rev_ok["body"]}),
+        ];
+        let (err, text) = call(
+            &mut rev_ok_remote,
+            &dir.path().join("approved.json"),
+            "request_round",
+            json!({"pr": 1781, "brief": "Independent review again (review only; push nothing)."}),
+        );
+        assert!(err, "approved review Done must refuse another review: {text}");
+
+        // Chain: Review 1 (H1) -> Fix 2 (H1) -> Review 3 (H2) -> Fix 4 refused by UNATTENDED_ROUNDS.
+        let mut chain_remote = remote();
+        chain_remote.prs.insert(1781, p1781);
+        chain_remote.closing = vec![1780];
+        chain_remote.comments = vec![json!({
+            "id": 7001,
+            "html_url": impl_done["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-30T23:50:00Z",
+            "body": impl_done["body"],
+        })];
+        // Round 1: review on H1.
+        let (err, text) = call(
+            &mut chain_remote,
+            &chain_state,
+            "request_round",
+            json!({"pr": 1781, "brief": "Independent review of PR #1781 (review only; push nothing).\nWorker tier: standard"}),
+        );
+        assert!(!err, "{text}");
+
+        // Round 2: review requested changes on H1 -> fix round on H1 is allowed!
+        chain_remote.comments.push(json!({
+            "id": 7004,
+            "html_url": rev_cr["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-31T00:06:00Z",
+            "body": rev_cr["body"],
+        }));
+        let (err, text) = call(
+            &mut chain_remote,
+            &chain_state,
+            "request_round",
+            json!({"pr": 1781, "brief": "Fix off-by-one boundary validation from review and add regression test."}),
+        );
+        assert!(!err, "CHANGES REQUESTED must allow fix round on H1: {text}");
+
+        // Round 3: fix round pushes H2 -> review round on H2.
+        chain_remote.prs.get_mut(&1781).unwrap()["head"]["sha"] = json!(h2);
+        chain_remote.comments.push(json!({
+            "id": 7006,
+            "html_url": fix_done["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-31T00:16:00Z",
+            "body": fix_done["body"],
+        }));
+        let (err, text) = call(
+            &mut chain_remote,
+            &chain_state,
+            "request_round",
+            json!({"pr": 1781, "brief": "Independent review of H1..H2 (review only; push nothing).\nWorker tier: standard"}),
+        );
+        assert!(!err, "{text}");
+
+        // Round 4: second CHANGES REQUESTED hits UNATTENDED_ROUNDS = 3 cap.
+        chain_remote.comments.push(json!({
+            "id": 7008,
+            "html_url": rev2_cr["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-31T00:26:00Z",
+            "body": rev2_cr["body"],
+        }));
+        let (err, text) = call(
+            &mut chain_remote,
+            &chain_state,
+            "request_round",
+            json!({"pr": 1781, "brief": "Fix empty-slice edge case."}),
+        );
+        assert!(err && text.contains("unattended round limit"), "{text}");
+    }
 }
