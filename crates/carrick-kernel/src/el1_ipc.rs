@@ -212,6 +212,15 @@ pub enum InstallHostDescriptionError {
     Unavailable,
 }
 
+/// Linux pipe results stay distinct from shared-authority failures. The
+/// service owner fails the run on an invariant error, including settlement
+/// after a committed resize; it must not publish an ordinary guest errno.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativePipeCapacityError {
+    Linux(carrick_abi::LinuxErrno),
+    Shared(IpcError),
+}
+
 /// Why a native host-file service could not reach a host resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PinnedHostResourceError {
@@ -441,6 +450,8 @@ pub struct HostIpc {
     /// Host wake targets by object index, sized to the highest index used.
     host_wakes: Mutex<Vec<Option<HostWakeEntry>>>,
     limits: IpcLimits,
+    #[cfg(test)]
+    resize_prepared: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Serializes store growth (the one growth venue) and counts its work.
     growth: Mutex<IpcGrowth>,
     /// The carrier descriptor ceiling every host-side install raises first
@@ -522,6 +533,8 @@ impl HostIpc {
                 live: BTreeMap::new(),
             }),
             limits,
+            #[cfg(test)]
+            resize_prepared: Mutex::new(None),
             growth: Mutex::new(IpcGrowth::default()),
             ceiling,
         };
@@ -923,9 +936,20 @@ impl HostIpc {
             } else {
                 None
             };
+            #[cfg(test)]
+            {
+                let prepared = self.resize_prepared.lock().take();
+                if let Some(prepared) = prepared {
+                    prepared();
+                }
+            }
             let result = (|| {
                 let mut guard = region.lock(object, &HostLockWait)?;
-                if let Some(storage) = &mut replacement {
+                // A concurrent grow can turn this prepared growth into a
+                // shrink. Its larger live backing already covers this call;
+                // never replace it with a stale, smaller prepared extent.
+                let needs_storage = rounded > guard.pipe()?.capacity();
+                if needs_storage && let Some(storage) = &mut replacement {
                     guard.replace_pipe_storage(storage)?;
                 }
                 let step = guard.pipe()?.set_capacity(requested, limit);
@@ -1090,6 +1114,106 @@ impl HostIpc {
         }
     }
 
+    /// Resolve a descriptor while consuming any pin acquired during OFD
+    /// reuse. A raced pin owns the replacement description until unpinned;
+    /// it cannot be discarded as an ordinary failed lookup.
+    fn pin_native_description(
+        &self,
+        table: fd::TableId,
+        number: fd::Fd,
+    ) -> Result<(fd::OfdPin, fd::Description), IpcError> {
+        self.pin_native_description_with(|| self.region().fd(HostLockWait).pin(table, number))
+    }
+
+    fn pin_native_description_with(
+        &self,
+        mut admit: impl FnMut() -> Result<(fd::OfdPin, fd::Description), fd::Error>,
+    ) -> Result<(fd::OfdPin, fd::Description), IpcError> {
+        let region = self.region();
+        let authority = region.fd(HostLockWait);
+        loop {
+            match admit() {
+                Err(fd::Error::PinRaced(raw)) => {
+                    if let Some(last) = authority
+                        .unpin(fd::OfdPin::from_raw(raw))
+                        .map_err(IpcError::Fd)?
+                    {
+                        self.release(last.backing)?;
+                    }
+                }
+                result => return result.map_err(IpcError::Fd),
+            }
+        }
+    }
+
+    /// Serve a pipe capacity request against one exact shared description.
+    /// No table or object lock spans provisioning; the pin retains its pipe
+    /// across concurrent close, replacement and backing allocation.
+    pub(crate) fn native_pipe_capacity(
+        &self,
+        table: fd::TableId,
+        number: fd::Fd,
+        requested: Option<u64>,
+    ) -> Result<usize, NativePipeCapacityError> {
+        use NativePipeCapacityError::{Linux, Shared};
+        use carrick_abi::{LINUX_EBADF, LINUX_EBUSY, LINUX_EINVAL, LINUX_ENOMEM, LINUX_EPERM};
+        let region = self.region();
+        let authority = region.fd(HostLockWait);
+        let (pin, description) = self
+            .pin_native_description(table, number)
+            .map_err(|error| match error {
+                IpcError::Fd(fd::Error::BadFd | fd::Error::StaleTable) => Linux(LINUX_EBADF),
+                error => Shared(error),
+            })?;
+        let result = (|| {
+            let object = match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {
+                Some(carrick_el1_abi::ipc::IpcBacking::Pipe { object, .. }) => object,
+                Some(_) => return Err(Linux(LINUX_EBADF)),
+                None => return Err(Shared(IpcError::Corrupt)),
+            };
+            if let Some(requested) = requested {
+                // fcntl's argument is an int, with the shared growth ceiling.
+                let requested = requested as u32 as i32;
+                if requested < 0 {
+                    return Err(Linux(LINUX_EINVAL));
+                }
+                let result = self
+                    .resize_pipe(
+                        object,
+                        requested as usize,
+                        crate::dispatch::fs::pipe::MAX_PIPE_CAPACITY,
+                    )
+                    .map_err(|error| match error {
+                        AdmissionError::NoMemory => Linux(LINUX_ENOMEM),
+                        AdmissionError::Shared(IpcError::Object(pipe::Error::Busy)) => {
+                            Linux(LINUX_EBUSY)
+                        }
+                        AdmissionError::Shared(IpcError::Object(pipe::Error::Permission)) => {
+                            Linux(LINUX_EPERM)
+                        }
+                        AdmissionError::Shared(IpcError::Object(pipe::Error::Invalid)) => {
+                            Linux(LINUX_EINVAL)
+                        }
+                        AdmissionError::Shared(IpcError::Object(pipe::Error::Storage)) => {
+                            Linux(LINUX_ENOMEM)
+                        }
+                        AdmissionError::Shared(error) => Shared(error),
+                    });
+                self.service_host_wake(object);
+                result
+            } else {
+                let mut guard = region.lock(object, &HostLockWait).map_err(Shared)?;
+                Ok(guard.pipe().map_err(Shared)?.capacity())
+            }
+        })();
+        // Settle the exact pin even if the operation failed. Settlement
+        // failure supersedes success/errno, so no committed result is replayed.
+        if let Some(last) = authority.unpin(pin).map_err(IpcError::Fd).map_err(Shared)? {
+            self.release(last.backing).map_err(Shared)?;
+        }
+        result
+    }
+
     /// Pin the exact open description `fd` names in ring table `table` and
     /// hand its host resource to `serve`. The pin lasts for the whole service,
     /// so a concurrent close cannot retire the resource underneath it; a
@@ -1102,10 +1226,12 @@ impl HostIpc {
     ) -> Result<R, PinnedHostResourceError> {
         let region = self.region();
         let authority = region.fd(HostLockWait);
-        let (pin, description) = authority.pin(table, number).map_err(|error| match error {
-            fd::Error::BadFd => PinnedHostResourceError::BadFd,
-            _ => PinnedHostResourceError::Unavailable,
-        })?;
+        let (pin, description) = self
+            .pin_native_description(table, number)
+            .map_err(|error| match error {
+                IpcError::Fd(fd::Error::BadFd) => PinnedHostResourceError::BadFd,
+                _ => PinnedHostResourceError::Unavailable,
+            })?;
         let resource = match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {
             Some(carrick_el1_abi::ipc::IpcBacking::Host(token)) => self
                 .resources
@@ -1201,6 +1327,123 @@ impl HostIpc {
 mod tests {
     use super::*;
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
+
+    #[test]
+    fn native_resize_revalidates_prepared_backing_after_competing_growth() {
+        let owner = std::sync::Arc::new(HostIpc::new(4 << 20).unwrap());
+        let object = owner.create_pipe(65536).unwrap();
+        owner.ensure_pipe_storage(object).unwrap();
+        let competitor = std::sync::Arc::clone(&owner);
+        *owner.resize_prepared.lock() = Some(Box::new(move || {
+            assert_eq!(competitor.resize_pipe(object, 262144, 1048576), Ok(262144));
+        }));
+        assert_eq!(owner.resize_pipe(object, 131072, 1048576), Ok(131072));
+        assert_eq!(
+            owner
+                .region()
+                .lock(object, &HostLockWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .capacity(),
+            131072
+        );
+        assert!(
+            owner.resize_prepared.lock().is_none(),
+            "one competing publication, no retries"
+        );
+    }
+
+    #[test]
+    fn native_pin_raced_once_releases_exact_description_then_admits_target() {
+        let owner = HostIpc::new(1 << 20).unwrap();
+        let table = owner.create_table(64, 64).unwrap();
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        let object = owner.create_pipe(65536).unwrap();
+        let install = |end, access| {
+            authority
+                .open(
+                    table,
+                    fd::Fd(0),
+                    fd::Description::new(
+                        IpcBacking::Pipe { object, end }.encode(),
+                        access,
+                        fd::StatusFlags::default(),
+                    ),
+                    false,
+                )
+                .unwrap()
+        };
+        let reader = install(pipe::End::Reader, fd::AccessMode::ReadOnly);
+        let writer = install(pipe::End::Writer, fd::AccessMode::WriteOnly);
+        // This is the owned pin returned by the real fd core on a raced
+        // replacement. Remove its numeric fd so settlement owns final close.
+        let (raced, _) = authority.pin(table, writer).unwrap();
+        assert!(authority.close(table, writer).unwrap().is_none());
+        let replacement_object = owner.create_eventfd(0, pipe::EventMode::Counter).unwrap();
+        let replacement = authority
+            .open(
+                table,
+                writer,
+                fd::Description::new(
+                    IpcBacking::EventFd {
+                        object: replacement_object,
+                    }
+                    .encode(),
+                    fd::AccessMode::ReadWrite,
+                    fd::StatusFlags::default(),
+                ),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            replacement, writer,
+            "reuse the exact numeric fd before cleanup"
+        );
+        let mut raced = Some(raced.into_raw());
+        let mut admissions = 0;
+        let (target, _) = owner
+            .pin_native_description_with(|| {
+                admissions += 1;
+                match raced.take() {
+                    Some(raw) => Err(fd::Error::PinRaced(raw)),
+                    None => authority.pin(table, replacement),
+                }
+            })
+            .unwrap();
+        assert_eq!(admissions, 2);
+        assert_eq!(
+            region
+                .lock(object, &HostLockWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .references(pipe::End::Writer),
+            0
+        );
+        assert!(
+            authority.get(table, replacement).is_ok(),
+            "raced cleanup leaves reused numeric fd alive"
+        );
+        assert!(authority.unpin(target).unwrap().is_none());
+        owner
+            .release(
+                authority
+                    .close(table, replacement)
+                    .unwrap()
+                    .unwrap()
+                    .backing,
+            )
+            .unwrap();
+        owner
+            .release(authority.close(table, reader).unwrap().unwrap().backing)
+            .unwrap();
+        assert!(
+            region.lock(object, &HostLockWait).is_err(),
+            "both endpoint references were released once"
+        );
+    }
 
     #[test]
     fn serial_host_el1_ipc_host_subscription_lifetime_is_exact() {

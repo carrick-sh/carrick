@@ -2412,6 +2412,7 @@ impl<
                 carrick_personality_linux::crossing::nr::DUP,
                 carrick_personality_linux::crossing::nr::DUP3,
                 carrick_personality_linux::crossing::nr::CLOSE,
+                carrick_personality_linux::crossing::nr::CLOSE_RANGE,
             ]
             .iter()
             .any(|nr| nr.raw() == ordinal)
@@ -3591,6 +3592,44 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     FamilyCompletion::CommitOwed(0)
                 }
             }
+            nr if nr == carrick_personality_linux::crossing::nr::CLOSE_RANGE.raw() => {
+                let first = self.frame.argument(0).unwrap_or(0) as u32;
+                let last = self.frame.argument(1).unwrap_or(0) as u32;
+                let flags = self.frame.argument(2).unwrap_or(0) as u32;
+                if first > last
+                    || flags
+                        & !(carrick_abi::LINUX_CLOSE_RANGE_UNSHARE
+                            | carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC)
+                        != 0
+                {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                    );
+                }
+                // Closing requires retained per-description host effects; replaying
+                // the numeric range could close a sibling's reused descriptor.
+                // UNSHARE also needs a process-resource publication transaction.
+                // Decline these operations before touching either authority.
+                if flags != carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC {
+                    return FamilyCompletion::Forward;
+                }
+                let result = super::file_table::with_host_binding_cloexec_range(
+                    self.fd_map,
+                    file_table,
+                    first,
+                    last,
+                    || {
+                        venue
+                            .region
+                            .fd(NativeFdWait)
+                            .close_range(table, first, last, true, |_| {})
+                    },
+                );
+                match result {
+                    Ok(()) => FamilyCompletion::Complete(0),
+                    Err(error) => map_fd_error(error),
+                }
+            }
             nr if nr == carrick_personality_linux::crossing::nr::FCNTL.raw() => {
                 let cmd = self.frame.argument(1).unwrap_or(u64::MAX);
                 let arg = self.frame.argument(2).unwrap_or(0);
@@ -3630,21 +3669,14 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     }
                     carrick_abi::LINUX_F_SETFD => {
                         let cloexec = arg & carrick_abi::LINUX_FD_CLOEXEC != 0;
-                        if let Err(err) = venue.region.fd(NativeFdWait).setfd(table, old, cloexec) {
+                        if let Err(err) = super::file_table::with_host_binding_setfd(
+                            self.fd_map,
+                            file_table,
+                            old.0,
+                            cloexec,
+                            || venue.region.fd(NativeFdWait).setfd(table, old, cloexec),
+                        ) {
                             return map_fd_error(err);
-                        }
-                        if let Some((_, index)) = fd_map_lookup(self.fd_map, file_table, old.0) {
-                            if cloexec {
-                                self.fd_map[index].fd_flags.fetch_or(
-                                    super::file_table::GUEST_FD_CLOEXEC,
-                                    Ordering::Release,
-                                );
-                            } else {
-                                self.fd_map[index].fd_flags.fetch_and(
-                                    !super::file_table::GUEST_FD_CLOEXEC,
-                                    Ordering::Release,
-                                );
-                            }
                         }
                         FamilyCompletion::Complete(0)
                     }

@@ -207,6 +207,44 @@ pub struct OfdPin {
     authority: u64,
     key: OfdKey,
 }
+/// Retained admission for one exact descriptor close. Cancellation releases
+/// its pin without changing the descriptor table.
+#[must_use = "commit or cancel the retained close"]
+#[derive(Debug)]
+pub struct PreparedClose {
+    table: TableId,
+    fd: Fd,
+    pin: OfdPin,
+    effects: CloseEffects,
+}
+
+impl PreparedClose {
+    /// Admission snapshot only: effect registration may race this read.
+    /// This does not authorize a venue to omit retained cleanup custody.
+    pub fn effects(&self) -> CloseEffects {
+        self.effects
+    }
+}
+
+/// Cleanup custody after the descriptor has been removed. The descriptor
+/// number can be reused immediately; cleanup addresses only this retained OFD.
+#[must_use = "settle the exact description after consuming its close effects"]
+#[derive(Debug)]
+pub struct CloseReceipt {
+    pin: OfdPin,
+    effects: CloseEffects,
+}
+
+impl CloseReceipt {
+    pub fn key(&self) -> OfdKey {
+        self.pin.key()
+    }
+
+    pub fn effects(&self) -> CloseEffects {
+        self.effects
+    }
+}
+
 /// Plain-data form of an [`OfdPin`] held in an owned continuation.
 /// Converting either way transfers the one ownership; a copy of the raw
 /// value is not a second pin.
@@ -1939,6 +1977,107 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         let (_guard, t) = self.lock(table)?;
         let entry = t.entry(old)?;
         self.replace_exact_filtered(&t, entry.ofd, new, cloexec, release_here)
+    }
+
+    /// Retain the exact description before admitting a close. No descriptor
+    /// mutation occurs here, so a service-capacity refusal can roll back.
+    pub fn prepare_close(&self, table: TableId, fd: Fd) -> Result<PreparedClose, Error> {
+        let (_guard, t) = self.lock(table)?;
+        let entry = t.entry(fd)?;
+        let ofd = self.ofd(entry.ofd)?;
+        if t.storage.reserved(fd.0 as usize) {
+            return Err(Error::Busy);
+        }
+        self.retain(entry.ofd, PIN)?;
+        t.storage.reserve(fd.0 as usize);
+        Ok(PreparedClose {
+            table,
+            fd,
+            effects: CloseEffects::from_bits(ofd.close_effects.load(Ordering::Acquire)),
+            pin: OfdPin {
+                authority: self.core.identity.load(Ordering::Relaxed),
+                key: OfdKey {
+                    index: entry.ofd,
+                    generation: ofd.generation.load(Ordering::Acquire),
+                },
+            },
+        })
+    }
+
+    /// Remove only the admitted incarnation, retaining cleanup ownership. A
+    /// failed commit returns custody for cancellation; it cannot close a new
+    /// descriptor that reused the number while admission was suspended.
+    pub fn commit_close(
+        &self,
+        prepared: PreparedClose,
+    ) -> Result<CloseReceipt, (Error, PreparedClose)> {
+        let result = (|| {
+            self.check_pin(&prepared.pin)?;
+            let (_guard, t) = self.lock(prepared.table)?;
+            if !t.storage.reserved(prepared.fd.0 as usize) {
+                return Err(Error::InvalidArgument);
+            }
+            let entry = t.entry(prepared.fd)?;
+            if entry.ofd != prepared.pin.key.index {
+                return Err(Error::StalePin);
+            }
+            let effects =
+                CloseEffects::from_bits(self.ofd(entry.ofd)?.close_effects.load(Ordering::Acquire));
+            // The retained pin guarantees this cannot finalize the OFD.
+            self.close_locked(&t, prepared.fd)?;
+            t.storage.unreserve(prepared.fd.0 as usize);
+            Ok(effects)
+        })();
+        match result {
+            Ok(effects) => Ok(CloseReceipt {
+                pin: prepared.pin,
+                effects,
+            }),
+            Err(error) => Err((error, prepared)),
+        }
+    }
+
+    pub fn cancel_close(
+        &self,
+        prepared: PreparedClose,
+    ) -> Result<Option<Description>, (Error, PreparedClose)> {
+        let result = (|| {
+            self.check_pin(&prepared.pin)?;
+            match self.lock(prepared.table) {
+                Ok((_guard, t)) => {
+                    if !t.storage.reserved(prepared.fd.0 as usize) {
+                        return Err(Error::InvalidArgument);
+                    }
+                    t.storage.unreserve(prepared.fd.0 as usize);
+                    self.drop_hold(prepared.pin.key.index, PIN)
+                }
+                // Revocation transfers slot and extent custody to the table
+                // retirement owner. Only the exact OFD pin remains ours; do
+                // not touch storage that may now belong to a successor.
+                Err(Error::StaleTable) => self.drop_hold(prepared.pin.key.index, PIN),
+                Err(error) => Err(error),
+            }
+        })();
+        result.map_err(|error| (error, prepared))
+    }
+
+    pub fn close_receipt_description(&self, receipt: &CloseReceipt) -> Result<Description, Error> {
+        self.pinned(&receipt.pin)
+    }
+
+    /// Finish cleanup and defer host-backed final releases to the existing
+    /// retirement owner. No numeric descriptor is resolved during settlement.
+    pub fn settle_close_filtered(
+        &self,
+        receipt: CloseReceipt,
+        release_here: impl FnOnce(Description) -> bool,
+    ) -> Result<DeferredRelease, Error> {
+        self.unpin_filtered(receipt.pin, release_here)
+    }
+
+    /// Finish cleanup without resolving any numeric descriptor.
+    pub fn settle_close(&self, receipt: CloseReceipt) -> Result<Option<Description>, Error> {
+        self.unpin(receipt.pin)
     }
 
     /// Ring-side `close` that defers physical release of host-backed OFDs to

@@ -3099,8 +3099,7 @@ pub const LINUX_F_RDLCK: i32 = 0;
 pub const LINUX_F_WRLCK: i32 = 1;
 pub const LINUX_F_UNLCK: i32 = 2;
 pub const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
-pub const LINUX_F_SETPIPE_SZ: u64 = 1031;
-pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
+pub use carrick_syscall_abi::{LINUX_F_GETPIPE_SZ, LINUX_F_SETPIPE_SZ};
 /// `close_range(2)` flags.
 pub const LINUX_CLOSE_RANGE_UNSHARE: u32 = 2;
 pub const LINUX_CLOSE_RANGE_CLOEXEC: u32 = 4;

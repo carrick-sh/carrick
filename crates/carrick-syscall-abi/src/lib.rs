@@ -471,3 +471,7 @@ impl LinuxWaitOptions {
 
 /// Linux 64-bit rusage contains two timevals and fourteen signed counters.
 pub const LINUX_RUSAGE_BYTES: usize = 144;
+
+/// Linux pipe capacity fcntl commands.
+pub const LINUX_F_SETPIPE_SZ: u64 = 1031;
+pub const LINUX_F_GETPIPE_SZ: u64 = 1032;

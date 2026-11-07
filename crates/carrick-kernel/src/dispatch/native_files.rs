@@ -31,9 +31,13 @@ const _: () = assert!(
         == carrick_personality_linux::native_host_file::LINUX_STATX_BYTES
 );
 
-/// The carrier refused a staged record; the ring answers counted ENOSYS.
+/// Unsupported records may be refused as counted ENOSYS; shared-authority
+/// failures must fail the run through the service adapter, without a reply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeHostFileRefusal;
+pub enum NativeHostFileRefusal {
+    Unsupported,
+    Invariant(carrick_el1_abi::ipc::IpcError),
+}
 
 /// A served record. A private-mapping record also hands the carrier the
 /// retained byte source, which it must register for the caller's MM before
@@ -269,7 +273,7 @@ impl SyscallDispatcher {
         record: &mut [u8],
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let Some(owner) = self.kernel_binding.read().kernel().existing_ipc() else {
-            return Err(NativeHostFileRefusal);
+            return Err(NativeHostFileRefusal::Unsupported);
         };
         self.serve_native_host_file_in(&owner, record)
     }
@@ -319,7 +323,8 @@ impl SyscallDispatcher {
         owner: &Arc<HostIpc>,
         record: &mut [u8],
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
-        let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal)?;
+        let view =
+            HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal::Unsupported)?;
         let header = view.header();
         let table = fd::TableId::from_raw(fd::RawTableId {
             authority: header.table[0],
@@ -329,13 +334,13 @@ impl SyscallDispatcher {
         let served = if header.op.resolves_path() {
             // Every path record leads with its caller's access context.
             let (context, path) =
-                AccessContext::decode(view.input()).ok_or(NativeHostFileRefusal)?;
+                AccessContext::decode(view.input()).ok_or(NativeHostFileRefusal::Unsupported)?;
             let authority = self
                 .native_access_authority(&context)
-                .ok_or(NativeHostFileRefusal)?;
+                .ok_or(NativeHostFileRefusal::Unsupported)?;
             // Carrick's VFS names paths as UTF-8; any other byte string is
             // not served rather than altered.
-            let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal)?;
+            let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal::Unsupported)?;
             let capacity = view.output_capacity();
             if path.is_empty() {
                 // The descriptor form of a path call (`statx(fd, "",
@@ -346,7 +351,27 @@ impl SyscallDispatcher {
                 super::resources::with_native_fs_scope(&authority, || {
                     self.serve_native_path(owner, table, header, path, capacity)
                 })
-                .ok_or(NativeHostFileRefusal)?
+                .ok_or(NativeHostFileRefusal::Unsupported)?
+            }
+        } else if header.op == HostFileOp::PipeCapacity {
+            if header.flags != 0
+                || !view.input().is_empty()
+                || view.output_capacity() != 0
+                || header.args[2..] != [0, 0]
+            {
+                return Err(NativeHostFileRefusal::Unsupported);
+            }
+            let requested = match header.args[0] {
+                carrick_abi::LINUX_F_GETPIPE_SZ => None,
+                carrick_abi::LINUX_F_SETPIPE_SZ => Some(header.args[1]),
+                _ => return Err(NativeHostFileRefusal::Unsupported),
+            };
+            match owner.native_pipe_capacity(table, fd::Fd(header.fd), requested) {
+                Ok(capacity) => Served::value(capacity as i64),
+                Err(crate::el1_ipc::NativePipeCapacityError::Linux(errno)) => Served::errno(errno),
+                Err(crate::el1_ipc::NativePipeCapacityError::Shared(error)) => {
+                    return Err(NativeHostFileRefusal::Invariant(error));
+                }
             }
         } else if header.op == HostFileOp::Poll {
             self.serve_native_poll(owner, table, header, view.input(), view.output_capacity())
@@ -366,10 +391,10 @@ impl SyscallDispatcher {
         let (result, output, retained_source) = match served {
             Served::Reply(result, output) => (result, output, None),
             Served::Source(source, reply) => (0, reply.encode().to_vec(), Some(source)),
-            Served::Refused => return Err(NativeHostFileRefusal),
+            Served::Refused => return Err(NativeHostFileRefusal::Unsupported),
         };
         view.reply(result, &output)
-            .map_err(|_| NativeHostFileRefusal)?;
+            .map_err(|_| NativeHostFileRefusal::Unsupported)?;
         Ok(NativeHostFileServed { retained_source })
     }
 
@@ -568,7 +593,8 @@ impl SyscallDispatcher {
             HostFileOp::Openat
             | HostFileOp::Faccessat
             | HostFileOp::Newfstatat
-            | HostFileOp::Poll => Served::Refused,
+            | HostFileOp::Poll
+            | HostFileOp::PipeCapacity => Served::Refused,
         }
     }
 
@@ -1016,6 +1042,161 @@ mod tests {
     }
 
     #[test]
+    fn native_pipe_capacity_authority_failure_is_not_a_guest_reply() {
+        use carrick_el1_abi::ipc::{
+            IpcBacking, IpcError,
+            fd::{AccessMode, Description, Fd, RawTableId, StatusFlags, TableId},
+            pipe,
+        };
+        let fixture = fixture();
+        let table = TableId::from_raw(RawTableId {
+            authority: fixture.table[0],
+            index: fixture.table[1],
+            generation: fixture.table[2],
+        });
+        fixture.owner.ensure_capacity(table, 16).unwrap();
+        let object = fixture.owner.create_pipe(65536).unwrap();
+        fixture
+            .owner
+            .release(
+                IpcBacking::Pipe {
+                    object,
+                    end: pipe::End::Reader,
+                }
+                .encode(),
+            )
+            .unwrap();
+        fixture
+            .owner
+            .release(
+                IpcBacking::Pipe {
+                    object,
+                    end: pipe::End::Writer,
+                }
+                .encode(),
+            )
+            .unwrap();
+        // Inject a stale shared backing at the real venue boundary. This is
+        // an authority defect, never a Linux fd error or an unsupported call.
+        let region = fixture.owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        let number = authority
+            .open(
+                table,
+                Fd(4),
+                Description::new(
+                    IpcBacking::Pipe {
+                        object,
+                        end: pipe::End::Reader,
+                    }
+                    .encode(),
+                    AccessMode::ReadOnly,
+                    StatusFlags::default(),
+                ),
+                false,
+            )
+            .unwrap();
+        let mut bytes = record(
+            fixture.table,
+            HostFileOp::PipeCapacity,
+            number.0,
+            [carrick_abi::LINUX_F_GETPIPE_SZ, 0, 0, 0],
+            &[],
+            0,
+        );
+        assert_eq!(
+            fixture.serve(None, &mut bytes),
+            Err(NativeHostFileRefusal::Invariant(IpcError::Stale))
+        );
+        assert!(
+            host_file::reply(&bytes).is_none(),
+            "authority failure publishes no ordinary guest result"
+        );
+        assert!(
+            authority.close(table, number).unwrap().is_some(),
+            "error settled its exact pin, leaving no hidden pin custody"
+        );
+    }
+
+    #[test]
+    fn native_pipe_capacity_uses_shared_owner_and_both_ends() {
+        use carrick_el1_abi::ipc::{
+            IpcBacking,
+            fd::{AccessMode, Description, Fd, RawTableId, StatusFlags, TableId},
+            pipe,
+        };
+        let fixture = fixture();
+        let table = TableId::from_raw(RawTableId {
+            authority: fixture.table[0],
+            index: fixture.table[1],
+            generation: fixture.table[2],
+        });
+        fixture.owner.ensure_capacity(table, 16).unwrap();
+        let object = fixture.owner.create_pipe(65536).unwrap();
+        // Provision backing first, so growth exercises the real allocator,
+        // rather than merely changing an unbacked record's capacity.
+        fixture.owner.ensure_pipe_storage(object).unwrap();
+        let region = fixture.owner.region();
+        let fd_owner = region.fd(crate::el1_zone::HostLockWait);
+        let open = |end, access| {
+            fd_owner
+                .open(
+                    table,
+                    Fd(4),
+                    Description::new(
+                        IpcBacking::Pipe { object, end }.encode(),
+                        access,
+                        StatusFlags::default(),
+                    ),
+                    false,
+                )
+                .unwrap()
+                .0
+        };
+        let read = open(pipe::End::Reader, AccessMode::ReadOnly);
+        let write = open(pipe::End::Writer, AccessMode::WriteOnly);
+        let capacity = |fd, command, arg| {
+            fixture
+                .result(
+                    None,
+                    record(
+                        fixture.table,
+                        HostFileOp::PipeCapacity,
+                        fd,
+                        [command, arg, 0, 0],
+                        &[],
+                        0,
+                    ),
+                )
+                .0
+        };
+        assert_eq!(capacity(read, carrick_abi::LINUX_F_GETPIPE_SZ, 0), 65536);
+        assert_eq!(
+            capacity(write, carrick_abi::LINUX_F_SETPIPE_SZ, 131072),
+            131072
+        );
+        assert_eq!(capacity(read, carrick_abi::LINUX_F_GETPIPE_SZ, 0), 131072);
+        assert_eq!(capacity(read, carrick_abi::LINUX_F_SETPIPE_SZ, 4096), 4096);
+        assert_eq!(capacity(write, carrick_abi::LINUX_F_GETPIPE_SZ, 0), 4096);
+        assert_eq!(
+            capacity(read, carrick_abi::LINUX_F_SETPIPE_SZ, u64::MAX),
+            carrick_abi::LINUX_EINVAL.guest_retval()
+        );
+        assert_eq!(
+            capacity(read, carrick_abi::LINUX_F_SETPIPE_SZ, 1048577),
+            carrick_abi::LINUX_EPERM.guest_retval()
+        );
+        assert_eq!(
+            capacity(3, carrick_abi::LINUX_F_SETPIPE_SZ, 4096),
+            carrick_abi::LINUX_EBADF.guest_retval()
+        );
+        assert_eq!(
+            capacity(99, carrick_abi::LINUX_F_GETPIPE_SZ, 0),
+            carrick_abi::LINUX_EBADF.guest_retval()
+        );
+    }
+
+    #[test]
     fn native_stdout_write_reaches_the_runs_stdio_route() {
         let fixture = fixture();
         let bytes = record(
@@ -1061,12 +1242,15 @@ mod tests {
         let mut regular = record(fixture.table, HostFileOp::Write, 3, [0; 4], b"x", 0);
         assert_eq!(
             fixture.serve(None, &mut regular),
-            Err(NativeHostFileRefusal)
+            Err(NativeHostFileRefusal::Unsupported)
         );
         assert_eq!(host_file::reply(&regular), None);
         // The run's stdin stream is not written through this venue yet.
         let mut stdin = record(fixture.table, HostFileOp::Write, 0, [0; 4], b"x", 0);
-        assert_eq!(fixture.serve(None, &mut stdin), Err(NativeHostFileRefusal));
+        assert_eq!(
+            fixture.serve(None, &mut stdin),
+            Err(NativeHostFileRefusal::Unsupported)
+        );
         assert!(fixture.dispatcher.stdout().is_empty());
     }
 
@@ -1156,7 +1340,10 @@ mod tests {
             host_file::PollWait::MayWait.raw(),
             &[(1, LINUX_POLLIN, 0)],
         );
-        assert_eq!(fixture.serve(None, &mut empty), Err(NativeHostFileRefusal));
+        assert_eq!(
+            fixture.serve(None, &mut empty),
+            Err(NativeHostFileRefusal::Unsupported)
+        );
         assert_eq!(host_file::reply(&empty), None);
         // A resource this venue does not observe refuses the whole set.
         let mut unobserved = poll_record(
@@ -1166,14 +1353,14 @@ mod tests {
         );
         assert_eq!(
             fixture.serve(None, &mut unobserved),
-            Err(NativeHostFileRefusal)
+            Err(NativeHostFileRefusal::Unsupported)
         );
         assert_eq!(host_file::reply(&unobserved), None);
         // Unknown wait words and torn arrays are not guessed at.
         let mut unknown = poll_record(fixture.table, 7, &[(1, LINUX_POLLOUT, 0)]);
         assert_eq!(
             fixture.serve(None, &mut unknown),
-            Err(NativeHostFileRefusal)
+            Err(NativeHostFileRefusal::Unsupported)
         );
         let mut torn = record(
             fixture.table,
@@ -1183,7 +1370,10 @@ mod tests {
             &[1, 0, 0],
             3,
         );
-        assert_eq!(fixture.serve(None, &mut torn), Err(NativeHostFileRefusal));
+        assert_eq!(
+            fixture.serve(None, &mut torn),
+            Err(NativeHostFileRefusal::Unsupported)
+        );
     }
 
     /// A description the venue opened is polled through its own
@@ -1267,7 +1457,7 @@ mod tests {
         );
         assert_eq!(
             fixture.serve(None, &mut replaced),
-            Err(NativeHostFileRefusal)
+            Err(NativeHostFileRefusal::Unsupported)
         );
         assert_eq!(host_file::reply(&replaced), None);
     }
@@ -1283,7 +1473,10 @@ mod tests {
             b"/etc/ld.so.cache",
             0,
         );
-        assert_eq!(fixture.serve(None, &mut open), Err(NativeHostFileRefusal));
+        assert_eq!(
+            fixture.serve(None, &mut open),
+            Err(NativeHostFileRefusal::Unsupported)
+        );
         assert_eq!(host_file::reply(&open), None);
     }
 
@@ -1784,7 +1977,7 @@ mod tests {
         );
         assert_eq!(
             fixture.serve(Some(&authority), &mut proc),
-            Err(NativeHostFileRefusal)
+            Err(NativeHostFileRefusal::Unsupported)
         );
     }
 
@@ -2057,7 +2250,7 @@ mod tests {
         );
         assert_eq!(
             fixture.serve(Some(&authority), &mut create),
-            Err(NativeHostFileRefusal),
+            Err(NativeHostFileRefusal::Unsupported),
             "a create in the watched directory would owe IN_CREATE"
         );
         let mut truncate = record(
@@ -2075,7 +2268,7 @@ mod tests {
         );
         assert_eq!(
             fixture.serve(Some(&authority), &mut truncate),
-            Err(NativeHostFileRefusal),
+            Err(NativeHostFileRefusal::Unsupported),
             "a truncate of a watched file would owe IN_MODIFY"
         );
         // A path no watch covers is created and written as without one.
@@ -2099,7 +2292,7 @@ mod tests {
                 let mut write = fixture.stamped_write(fd, limit, b"bytes");
                 assert_eq!(
                     fixture.serve(None, &mut write),
-                    Err(NativeHostFileRefusal),
+                    Err(NativeHostFileRefusal::Unsupported),
                     "{upper:?}: limit {limit}"
                 );
             }
@@ -2204,7 +2397,7 @@ mod tests {
             );
             assert_eq!(
                 fixture.serve(Some(&authority), &mut open),
-                Err(NativeHostFileRefusal),
+                Err(NativeHostFileRefusal::Unsupported),
                 "{}",
                 String::from_utf8_lossy(path)
             );
@@ -2361,7 +2554,10 @@ mod tests {
 
         // A path record without its caller's access context is refused.
         let mut bare = record(fixture.table, HostFileOp::Openat, FDCWD, [0; 4], b"/tmp", 0);
-        assert_eq!(fixture.serve(None, &mut bare), Err(NativeHostFileRefusal));
+        assert_eq!(
+            fixture.serve(None, &mut bare),
+            Err(NativeHostFileRefusal::Unsupported)
+        );
     }
 
     /// #1392: a caller's installed group list, even an empty one
@@ -2595,7 +2791,7 @@ mod tests {
         );
         assert_eq!(
             fixture.serve(None, &mut map_stdio),
-            Err(NativeHostFileRefusal)
+            Err(NativeHostFileRefusal::Unsupported)
         );
     }
 

@@ -232,3 +232,158 @@ binaries or signed receipts blocks implementation acceptance. A docs review
 can approve an approach with those measurements pending; it cannot declare
 #1335 fixed or conformance restored. Keep the design PR draft until independent
 review and the director's implementation ordering are recorded.
+
+## Descriptor cleanup admission (#1678)
+
+The retained fd-core close transaction supplies the descriptor lifetime half
+of this slice: preparation reserves the exact slot and pins its description;
+commit removes that slot and returns cleanup custody; cancellation releases
+both without changing the descriptor. Cleanup settlement addresses the retained
+description, never the old descriptor number. Range cleanup needs one such
+receipt per removed description, including aliases of the same description.
+
+Production integration is blocked on the other half: the existing native
+host-file continuation has no typed close-cleanup operation that owns those
+receipts through publication, cancellation and completion. `CarrierWork` drains
+retired OFDs for final physical releases, but a close effect can apply while
+other aliases remain. It therefore cannot replace per-close cleanup custody.
+The current native descriptor close uses `CommitOwed(0)` when close effects
+are present. Replaying the original numeric close after the slot is reusable
+can act on a successor descriptor and is not a valid cleanup implementation.
+
+The carrier cleanup venue must retain the exact description and the closing
+caller's task and file-table identities, reserve service capacity before the
+slot is removed, and consume record-lock, epoll and inotify effects exactly
+once. It must use the existing crossing owner on both ISA adapters. Existing
+host close helpers that capture an ambient host `FileTable` cannot establish
+that authority for a native fork child. A final-release queue alone cannot
+carry the per-close effect, and a second native descriptor table is excluded.
+
+A check that effects are empty before closing is insufficient: registration
+uses `require_pinned_close_effects` on an existing pin and can race the check.
+An effect-free admission must either synchronize with registration or retain a
+cleanup receipt when an effect appears; it cannot discard the receipt or
+convert a committed close to an unrouted answer. `CLOSE_RANGE_UNSHARE` also
+needs native successor-table publication rather than mutation of a shared
+`CLONE_FILES` table. Keep `close` and `close_range` in the Forward allowlist
+until these ownership paths and their production witnesses are implemented.
+
+Required production witnesses close an old descriptor, reuse its number, then
+settle or replay the old cleanup and assert the successor survives. Cover
+single close and several range members, cancellation before publication,
+service-capacity refusal, Busy once then success, late effect registration,
+shared-table unshare and both ISA adapters. VM-free fd-core receipt tests prove
+lifetime and rollback only; they do not establish production cleanup acceptance
+or a signed census result.
+
+`CLOSE_RANGE_CLOEXEC` uses the existing ring descriptor owner without removing
+slots or creating cleanup receipts. Its fd-core mutation and host-binding
+projection share the fd-map mutation guard with `F_SETFD` and descriptor
+replacement, in fd-map to fd-core order. Forked tables retain independent
+flags; a sparse range is bounded by allocated descriptor storage and the fixed
+projection capacity. Plain range close, retained close-effect delivery and
+successor-table publication for `UNSHARE` remain unfinished. This flag-only
+operation does not authorize removing `close_range` from the Forward allowlist.
+
+### Production cleanup cutover required before routing retirement
+
+The continuation audit on admitted main plus the retained-close commits found
+that the service cannot yet consume a close receipt. This is a production
+ownership gap, not a missing call to `settle_close_filtered`. In particular:
+
+- `serve_owned_ipc_descriptor` removes the slot and selects
+  `ServedBoundary::ReplayOriginal`. The native two-child descriptor fixture
+  explicitly expects that boundary. It therefore witnesses the unsafe replay,
+  not successful retained cleanup. Its green result cannot authorize routing
+  retirement.
+- `PendingHostFile` owns the staged bytes through service acknowledgement but
+  owns no `PreparedClose` or `CloseReceipt`. Its cancellation without a reply
+  returns `RetrySyscall`, which is valid only before a close commits.
+- The carrier's `serve_native_host_file` takes a record without an exact
+  closing `TaskKey`. POSIX lock release needs that task generation. Inotify's
+  existing close helper first consults a numeric path in the captured host
+  file table. Calling either helper with ambient carrier state would recreate
+  the second descriptor path excluded by this design.
+- The host-file decoder and venue are shared, but native staging still takes
+  the AArch64 `TrapFrame`. The x86 guest adapter needs the same retained
+  operation entry; a shared decoder alone does not establish that binding.
+
+The next implementation must extend the existing operation owner, with these
+states made explicit in its owned payload:
+
+1. **Admitted:** reserve service storage and retain exact caller, thread,
+   table and execution identities before preparing any slot. Refusal at this
+   point changes no descriptor. A range reserves capacity for every selected
+   close receipt before its first committed removal.
+2. **Prepared:** retain `PreparedClose` custody. Cancellation releases each
+   claim without closing a slot. Busy retains custody and enrolls on the
+   existing release notification; it cannot become an ordinary errno.
+3. **Committed:** move each resulting `CloseReceipt` into that same pending
+   operation. Publish a typed cleanup request naming the retained OFD and
+   closing task, rather than a syscall ordinal and reusable fd. The carrier
+   borrows the exact description through that retained authority. It must not
+   resolve the old fd in any table.
+4. **Cleanup acknowledged:** consume record-lock, epoll and inotify effects
+   exactly once, then settle the ring-owned receipts. A cancellation after
+   commitment joins cleanup and cannot return `RetrySyscall`. Lost reply or
+   refused transport retains the obligation instead of discarding its pin.
+
+The fixed host-file header has room for operation-specific words, so this
+does not require another descriptor namespace or necessarily a larger wire
+layout. A new operation tag and identity encoding still change protocol
+semantics and require the cross-crate interface review before implementation.
+Keep the actual receipt owned in ring memory; encoded identity words are a
+borrow authenticated by the existing service ticket, never another receipt.
+Refactor cleanup helpers around an exact retained description and caller
+identity before adding the carrier arm. Do not call the numeric host `close`
+handler from that arm.
+
+`UNSHARE` is a separate publication within the same operation: prepare a
+private successor using the existing fd authority, then publish its resource
+custody, IPC table binding, delegated projection and calling task's file-table
+identity together. A peer sharing the old table must retain every old entry,
+including a peer in the same thread group. Failure
+before publication leaves the source unchanged; after publication, cleanup
+belongs to the successor operation. A copied table ID alone is insufficient.
+
+The decisive production schedule has two live native threads admitted with
+`CLONE_FILES`: pause cleanup after committed removal, replace that number
+through production `dup3`, acknowledge old cleanup, and prove the replacement
+and peer's unrelated entries survive. Repeat for multiple range members,
+late effect registration and cancellation on either side of commitment.
+Neither direct fd-core receipt tests nor a synthetic carrier reply establish
+this claim. The current code has not passed this schedule; the five Forward
+entries remain pending that implementation, independent review and the signed
+population gate. No signed or oracle acceptance is claimed by this audit.
+
+## Pipe capacity allocation service (#1678)
+
+`HostFileOp::PipeCapacity` extends the existing retained native service record.
+Its fixed header carries the caller's table, fd, fcntl command and integer
+argument; it carries no user pointer. The Linux decoder and carrier venue are
+shared; the current native staging caller is AArch64-only. x86 has no native
+host-file staging bridge on this main, so its pipe-capacity adapter remains
+unimplemented and requires a neutral staging entry before acceptance. This is
+an allocation crossing for an
+in-zone object, not delegation of Linux pipe semantics to a host pipe.
+
+The carrier pins the selected shared description through the fd authority,
+without retaining a descriptor-table lock across pipe access or provisioning.
+The exact pin spans allocation, capacity publication and wake delivery; a
+concurrent numeric close/reuse cannot redirect it to a successor description.
+The existing shared pipe core performs rounding, shrink/occupancy checks,
+growth limits and revision/wake publication. The existing IPC owner provisions
+backing and reclaims replaced extents. No new fd table or pipe path is added.
+
+The VM-free child witness proves retained request/acknowledgement custody;
+the shared production venue witness separately exercises backed growth and
+both endpoints. Those compositional tests do not prove signed execution or
+Linux oracle parity, which remain director acceptance requirements.
+
+Pipe-capacity service errors keep Linux results separate from authority
+failure. Ordinary unsupported requests retain counted ENOSYS. A stale object,
+invalid backing, or failed exact-pin settlement is an invariant result that
+passes through the runtime service boundary and becomes a carrier run error,
+without publishing a guest reply. Settlement failure after a committed resize
+overrides the provisional success; it cannot turn into ENOSYS or a replay.
+This uses the adapter's existing Result error path, without new fatal sites.

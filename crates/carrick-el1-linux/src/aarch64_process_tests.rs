@@ -7,6 +7,8 @@ mod native_child_handoff_tests;
 mod native_exec_pipe_tests;
 #[cfg(test)]
 mod native_fault_supply_tests;
+#[cfg(all(test, not(target_os = "macos")))]
+mod native_fd_shell_tests;
 #[cfg(test)]
 mod native_host_owned_signal_resume_tests;
 #[cfg(all(test, not(target_os = "macos")))]
@@ -10192,6 +10194,36 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof() {
+    native_fork_descriptor_mutations(NativeDescriptorWitness::Lifecycle);
+}
+
+// This is deliberately a production-dispatch acceptance witness, rather than
+// another fd-core receipt test: a committed close must never ask the carrier
+// to resolve a descriptor number that another operation can already reuse.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_committed_close_never_replays_reused_fd() {
+    native_fork_descriptor_mutations(NativeDescriptorWitness::CleanupReuse);
+}
+
+// Even an effect-free pipe range must enter the production native owner.
+// This is a refusal witness only; retained host cleanup and shared-table
+// UNSHARE require separate schedules before routing retirement.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_plain_close_range_is_served() {
+    native_fork_descriptor_mutations(NativeDescriptorWitness::PlainRange);
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+enum NativeDescriptorWitness {
+    Lifecycle,
+    CleanupReuse,
+    PlainRange,
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_fork_descriptor_mutations(witness: NativeDescriptorWitness) {
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
         LINUX_F_SETFL, LINUX_O_NONBLOCK, LINUX_O_WRONLY,
@@ -10403,6 +10435,23 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         assert!(runtime.task_binding(binding.key).is_some());
     }
 
+    if matches!(witness, NativeDescriptorWitness::PlainRange) {
+        // Keep another alias live, so this cannot pass merely because a
+        // final-description drain happened to retire the pipe endpoint.
+        assert_eq!(run_in_child(0, sys_dup3, [3, 20, 0]).1, 20);
+        let ordinal = carrick_personality_linux::crossing::nr::CLOSE_RANGE.raw();
+        let (route, result) = run_in_child(0, ordinal, [20, 20, 0]);
+        assert_eq!(
+            route,
+            CompletionRoute::Served,
+            "plain close_range of an in-zone pipe must be served by the native descriptor owner"
+        );
+        assert_eq!(result, 0);
+        assert_eq!(run_in_child(0, sys_fcntl, [20, LINUX_F_GETFD, 0]).1, -9);
+        assert_eq!(run_in_child(0, sys_fcntl, [3, LINUX_F_GETFD, 0]).1, 0);
+        return;
+    }
+
     // 1. dup(4) allocates lowest free slot 0 and clears FD_CLOEXEC.
     let (route, ret) = run_in_child(0, sys_dup, [4, 0, 0]);
     assert!(
@@ -10519,10 +10568,35 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     let (close_effect_route, close_effect_result) = run_in_child(0, sys_close, [5, 0, 0]);
     assert_eq!(close_effect_result, 0);
     assert_eq!(close_effect_route, CompletionRoute::WithWork);
+    let cleanup_boundary = task.linux.take_served_boundary();
+    if matches!(witness, NativeDescriptorWitness::CleanupReuse) {
+        // Reuse the exact number through production dup3 while both children
+        // remain alive. Fd 2 retains the old host OFD, so final-OFD retirement
+        // cannot stand in for this close's record-lock effects. The successor
+        // names a different description (the pipe reader), not another alias
+        // of the description whose cleanup is outstanding.
+        assert_eq!(run_in_child(0, sys_dup3, [3, 5, 0]).1, 5);
+        assert_eq!(run_in_child(0, sys_fcntl, [5, LINUX_F_GETFD, 0]).1, 0);
+        let region = owner.region();
+        let authority = region.fd(carrick_kernel::el1_zone::HostLockWait);
+        assert_ne!(
+            authority.get(child0_table, fd::Fd(5)).unwrap().backing,
+            authority.get(child0_table, fd::Fd(2)).unwrap().backing,
+            "reuse must name a different description from the pending cleanup"
+        );
+        assert!(
+            !matches!(
+                cleanup_boundary,
+                Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { .. })
+            ),
+            "committed close cleanup must retain its description; numeric replay can close the live replacement fd 5: {cleanup_boundary:?}"
+        );
+        return;
+    }
     assert_eq!(
-        task.linux.take_served_boundary(),
+        cleanup_boundary,
         Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 5 }),
-        "host-owned close effects must replay the already-committed numeric close"
+        "historical route only; the cleanup-reuse acceptance witness rejects this replay"
     );
     assert_eq!(
         run_in_child(0, sys_close, [5, 0, 0]).1,

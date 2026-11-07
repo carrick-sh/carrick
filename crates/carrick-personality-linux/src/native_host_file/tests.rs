@@ -939,3 +939,37 @@ fn ppoll_arrays_need_readable_input_and_writable_output_before_crossing() {
         })
     );
 }
+
+#[test]
+fn native_pipe_capacity_fcntl_stages_one_shared_owner_operation() {
+    let mut user = memory(&[]);
+    for command in [
+        carrick_syscall_abi::LINUX_F_GETPIPE_SZ,
+        carrick_syscall_abi::LINUX_F_SETPIPE_SZ,
+    ] {
+        let call = HostFileCall::decode(crate::crossing::nr::FCNTL, &[0, command, 131072, 0, 0, 0])
+            .unwrap();
+        let Some(HostFileStage::Request {
+            mut record, output, ..
+        }) = run(call, &mut user)
+        else {
+            panic!("pipe capacity must stage its shared owner operation");
+        };
+        assert!(output.is_none());
+        let view = HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(view.header().op, HostFileOp::PipeCapacity);
+        assert_eq!(view.header().table, TABLE);
+        assert_eq!(view.header().args, [command, 131072, 0, 0]);
+        assert_eq!(
+            run(
+                HostFileCall::PipeCapacity {
+                    fd: 4,
+                    command,
+                    argument: 4096
+                },
+                &mut user
+            ),
+            returned(carrick_syscall_abi::LINUX_EBADF)
+        );
+    }
+}
