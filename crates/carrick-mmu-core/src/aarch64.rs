@@ -1530,6 +1530,10 @@ impl TerminalRule {
                 fork_arm: true,
                 adopt_private: true,
                 ..
+            } | Self::Pt {
+                op: Some(PtOp::ForkReadOnly),
+                adopt_private: true,
+                ..
             }
         )
     }
@@ -5501,6 +5505,12 @@ impl PageTableManager {
         if e0 & VALID == 0 || e0 & TYPE_BITS != child_type {
             return None;
         }
+        // EL1-private authority is defined per 4 KiB leaf. Even an offline
+        // graph must retain that shape: a uniform fork-COW table is not a
+        // coarse block that the guest COW resolver can authenticate.
+        if e0 & SW_EL1_PRIVATE != 0 {
+            return None;
+        }
         let base_pa = e0 & child_pa_mask;
         let parent_span = child_stride.checked_mul(512)?;
         if !base_pa.is_multiple_of(parent_span) {
@@ -6229,8 +6239,9 @@ impl PageTableManager {
     }
 
     /// [`Self::set_fork_readonly`], first adopting host-published writable
-    /// 4 KiB leaves as EL1-private so EL1 can resolve their COW itself (a
-    /// guest-lane MM's compound-granule, non-kernel ranges only).
+    /// leaves as EL1-private so EL1 can resolve their COW itself. Fully
+    /// covered host blocks are split to 4 KiB leaves, retaining that authority
+    /// in both the live parent and an offline child image.
     pub fn set_fork_readonly_adopting(
         &mut self,
         va: u64,
