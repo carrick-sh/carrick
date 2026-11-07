@@ -6182,6 +6182,11 @@ fn raw_exit_clear_tid(address: u64, unavailable: bool, unadopted: bool) {
         unadopted
     );
     control.set_clear_child_tid(address);
+    assert_eq!(
+        control.clear_child_tid(),
+        address,
+        "fixture retained the address"
+    );
     let entry = control.entry().unwrap();
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[8] = 93;
@@ -6215,7 +6220,9 @@ fn raw_exit_clear_tid(address: u64, unavailable: bool, unadopted: bool) {
 #[test]
 fn arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted() {
     for unadopted in [false, true] {
-        raw_exit_clear_tid(u64::MAX, false, unadopted);
+        // The slot admits addresses below 2^48, while user copy rejects
+        // the range starting at 2^47. Unlike u64::MAX, this reaches copyout.
+        raw_exit_clear_tid(1 << 47, false, unadopted);
     }
 }
 

@@ -89,3 +89,11 @@ exercise a robust entry's atomic owner-death update, prove exactly-once wakeups
 for parked copies, or confer signed acceptance. They must become green through
 the retained owner rather than by accepting HostCustody, returning errno 14,
 or treating NotYet as Fault.
+
+The production clear-TID terminal-fault control must register an address the
+slot actually retains. `u64::MAX` is normalized to `ClearChildTidState::None`
+and therefore never reaches copyout. The control now uses `1 << 47`, below the
+slot codec's `1 << 48` bound but outside the guest lower-half copy domain, and
+asserts that the slot retained the exact address before dispatch. The shared
+policy's injected-Fault/joiner witness remains the separate exactly-once wake
+check.
