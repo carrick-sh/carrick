@@ -1098,31 +1098,163 @@ fn bounded_reset(command: &mut Command, limit: Duration, context: &str) -> Resul
         .spawn()?;
     let pid = child.id();
     let deadline = Instant::now() + limit;
+    match wait_child_deadline(&mut child, deadline) {
+        Ok(Some(status)) if status.success() => Ok(()),
+        Ok(Some(status)) => Err(ScalerError::CommandFailed(format!("{context}: {status}"))),
+        result => {
+            // Never turn timeout cleanup into another unbounded wait.
+            // The helper and any chmod child share this private group.
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            let _ = child.kill();
+            let reap_deadline = Instant::now() + Duration::from_secs(1);
+            let reaped = matches!(wait_child_deadline(&mut child, reap_deadline), Ok(Some(_)));
+            Err(ScalerError::CommandFailed(format!(
+                "{context}: reset exceeded {limit:?} or wait failed ({result:?}); helper pid={pid}, reaped={reaped}"
+            )))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_child_deadline(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
+
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: kqueue creates a uniquely owned descriptor.
+    let fd = unsafe { libc::kqueue() };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a valid, uniquely owned kqueue descriptor.
+    let queue = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: setting FD_CLOEXEC on the newly opened descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // SAFETY: zeroed kevent struct initialized for EVFILT_PROC exit observation.
+    let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+    event.ident = child.id() as usize;
+    event.filter = libc::EVFILT_PROC;
+    event.flags = libc::EV_ADD | libc::EV_ENABLE;
+    event.fflags = libc::NOTE_EXIT;
+
+    // SAFETY: registering an EVFILT_PROC exit event for the child on the owned kqueue.
+    let res = unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &event,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if res < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return child.try_wait();
+        }
+        return Err(err);
+    }
+
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => {
-                return Err(ScalerError::CommandFailed(format!("{context}: {status}")));
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        let remaining = deadline - now;
+        let timeout = libc::timespec {
+            tv_sec: remaining.as_secs() as _,
+            tv_nsec: remaining.subsec_nanos() as _,
+        };
+        // SAFETY: out_event is initialized stack storage for the returned kevent.
+        let mut out_event = unsafe { std::mem::zeroed::<libc::kevent>() };
+        // SAFETY: waiting for the exit event on the owned kqueue with a bounded timeout.
+        let ret = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut out_event,
+                1,
+                &timeout,
+            )
+        };
+        if ret > 0 {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
             }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            result => {
-                // Never turn timeout cleanup into another unbounded wait.
-                // The helper and any chmod child share this private group.
-                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-                let _ = child.kill();
-                let reap_deadline = Instant::now() + Duration::from_secs(1);
-                let mut reaped = false;
-                while Instant::now() < reap_deadline {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        reaped = true;
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                return Err(ScalerError::CommandFailed(format!(
-                    "{context}: reset exceeded {limit:?} or wait failed ({result:?}); helper pid={pid}, reaped={reaped}"
-                )));
+        } else if ret == 0 {
+            return Ok(None);
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_child_deadline(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
+
+    use std::os::fd::AsRawFd;
+    let pid = libc::pid_t::try_from(child.id())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let pidfd = match carrick_portable::process_exit_fd(
+        carrick_portable::HostProcessId::from_native(pid)?,
+    ) {
+        Ok(fd) => fd,
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
+            return child.try_wait();
+        }
+        Err(err) => return Err(err),
+    };
+
+    let mut pfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        let remaining = deadline - now;
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: pfd points to a valid pollfd with the open pidfd.
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret > 0 {
+            return child.try_wait();
+        } else if ret == 0 {
+            return Ok(None);
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
         }
     }
 }
