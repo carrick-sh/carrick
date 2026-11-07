@@ -1232,6 +1232,24 @@ fn reset_job_area_in_place(
     }
     let mut created = Vec::new();
     copy_tree(skeleton, home, &mut created)?;
+    // The retained home inode can carry job-controlled extended attributes.
+    // Clear the complete restored tree too, including symlinks themselves (-s),
+    // without touching their targets. Keep the reset lock inherited just as for
+    // chmod: this subprocess remains inside the helper's bounded custody.
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("/usr/bin/xattr")
+            .args(["-c", "-r", "-s"])
+            .arg(home)
+            .stdin(Stdio::from(_lock.try_clone()?))
+            .status()?;
+        if !status.success() {
+            return Err(ScalerError::CommandFailed(format!(
+                "clear job-home extended attributes {}: {status}",
+                home.display()
+            )));
+        }
+    }
     for path in created.iter().rev() {
         lchown(path, uid, gid)?;
     }

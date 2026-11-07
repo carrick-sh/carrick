@@ -530,7 +530,11 @@ fn reset_clears_home_acl_and_xattrs_without_replacing_inode() {
     std::os::unix::fs::symlink(&outside, home.join("outside-link")).unwrap();
     std::os::unix::fs::symlink(&outside, skel.join("outside-link")).unwrap();
     let xattr = |args: &[&str], path: &std::path::Path| {
-        let out = Command::new("/usr/bin/xattr").args(args).arg(path).output().unwrap();
+        let out = Command::new("/usr/bin/xattr")
+            .args(args)
+            .arg(path)
+            .output()
+            .unwrap();
         assert!(out.status.success(), "{}: {:?}", path.display(), out);
         out.stdout
     };
@@ -540,11 +544,25 @@ fn reset_clears_home_acl_and_xattrs_without_replacing_inode() {
     }
     let inode = std::fs::metadata(&home).unwrap().ino();
     reset_job_area(&skel, &home, &[], uid, uid, gid).unwrap();
-    for path in [&home, &home.join("config"), &home.join("config/clean"), &home.join("outside-link")] {
-        assert!(xattr(&["-s"], path).is_empty(), "{} retains xattrs", path.display());
+    for path in [
+        &home,
+        &home.join("config"),
+        &home.join("config/clean"),
+        &home.join("outside-link"),
+    ] {
+        assert!(
+            xattr(&["-s"], path).is_empty(),
+            "{} retains xattrs",
+            path.display()
+        );
     }
     assert!(!home.join("stale").exists());
-    assert_eq!(xattr(&["-p", "com.carrick.reset-test"], &outside), b"old job");
+    assert_eq!(
+        String::from_utf8(xattr(&["-p", "com.carrick.reset-test"], &outside))
+            .unwrap()
+            .trim_end(),
+        "old job"
+    );
     assert_eq!(std::fs::metadata(&home).unwrap().ino(), inode);
     for path in [&home, &home.join("config"), &home.join("config/clean")] {
         let acl = listing(path);
