@@ -79,8 +79,6 @@ pub enum CreateError {
     FileTableFull,
     /// A queue lock was contended while binding a new object's wait keys.
     ObjectWaitBusy,
-    /// The object cannot be represented in the scheduler's wait-key domain.
-    ObjectWaitKeyOutOfRange,
 }
 impl CreateError {
     /// Classify an admission refusal. The zone ceiling is ENFILE; any other
@@ -91,8 +89,8 @@ impl CreateError {
         match error {
             AdmissionError::Shared(IpcError::ZoneLimit) => Self::FileTableFull,
             AdmissionError::ObjectWaitBusy => Self::ObjectWaitBusy,
-            AdmissionError::ObjectWaitKeyOutOfRange => Self::ObjectWaitKeyOutOfRange,
-            error @ (AdmissionError::NoMemory
+            error @ (AdmissionError::ObjectWaitKeyOutOfRange
+            | AdmissionError::NoMemory
             | AdmissionError::ObjectWaitInvariant(_)
             | AdmissionError::ObjectRollbackInvariant(_)
             | AdmissionError::Shared(_)) => {
@@ -106,7 +104,7 @@ impl CreateError {
     pub fn errno(self) -> carrick_abi::LinuxErrno {
         match self {
             Self::FileTableFull => carrick_abi::LINUX_ENFILE,
-            Self::ObjectWaitBusy | Self::ObjectWaitKeyOutOfRange => carrick_abi::LINUX_EAGAIN,
+            Self::ObjectWaitBusy => carrick_abi::LINUX_EAGAIN,
         }
     }
 }
@@ -837,14 +835,10 @@ impl HostIpc {
                 #[cfg(not(test))]
                 let key = carrick_el1_abi::ipc::object_wait_key(object, direction);
                 let Some(key) = key else {
-                    while bound_count > 0 {
-                        bound_count -= 1;
-                        let Some(key) = bound[bound_count] else {
-                            continue;
-                        };
-                        zone.unbind_object_wait(key, &HostLockWait)?;
-                    }
-                    return Err(carrick_sched_core::object_wait::ObjectWaitError::Exhausted);
+                    carrick_fatal::carrick_fatal!(
+                        "ipc::admission",
+                        "admitted object has no readiness wait key: {object:?}"
+                    );
                 };
                 #[cfg(test)]
                 let result = if INJECT_OBJECT_WAIT_BIND_BUSY.swap(false, Ordering::AcqRel) {

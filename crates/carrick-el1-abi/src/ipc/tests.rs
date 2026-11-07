@@ -1136,19 +1136,13 @@ fn el1_ipc_wait_census_names_each_waiter_object_and_its_readiness() {
 #[test]
 fn ipc_wait_keys_end_before_the_metadata_queue_domain() {
     let last = IpcObjectHandle::from_raw(RawIpcObject {
-        index: (carrick_sched_core::ZONE_RECORDS as u32 - 3) / 2,
+        index: IPC_MAX_OBJECTS as u32 - 1,
         generation: 7,
     });
     let readable = object_wait_key(last, pipe::WaitFor::Readable).unwrap();
     let writable = object_wait_key(last, pipe::WaitFor::Writable).unwrap();
-    assert_eq!(
-        readable.index(),
-        carrick_sched_core::ZONE_RECORDS as u32 - 3
-    );
-    assert_eq!(
-        writable.index(),
-        carrick_sched_core::ZONE_RECORDS as u32 - 2
-    );
+    assert_eq!(readable.index(), 2 * IPC_MAX_OBJECTS as u32 - 1);
+    assert_eq!(writable.index(), 2 * IPC_MAX_OBJECTS as u32);
     assert_eq!(readable.generation(), 8);
     assert_eq!(writable.generation(), 8);
 

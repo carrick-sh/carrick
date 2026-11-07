@@ -118,7 +118,7 @@ pub const IPC_OFD_SEGMENT: usize = 2048;
 pub const IPC_OPERATIONS: usize = 1024;
 /// Zone-wide ceiling on pipe and eventfd objects: the elastic object store's
 /// reservation (ENFILE beyond it).
-pub const IPC_MAX_OBJECTS: usize = 1 << 18;
+pub const IPC_MAX_OBJECTS: usize = carrick_sched_core::object_wait::IPC_OBJECT_CAPACITY;
 /// Object records published per growth step.
 pub const IPC_OBJECT_SEGMENT: usize = 1024;
 /// Default-capacity rings the host keeps provisioned in the shared ring
@@ -195,7 +195,7 @@ pub fn object_wait_key(
     direction: pipe::WaitFor,
 ) -> Option<carrick_sched_core::object_wait::ObjectWaitKey> {
     let base = object.index().checked_mul(2)?.checked_add(1)?;
-    if base.checked_add(1)? as usize >= carrick_sched_core::ZONE_RECORDS {
+    if base.checked_add(1)? as usize >= carrick_sched_core::object_wait::IPC_WAIT_QUEUES {
         return None;
     }
     let lane = u32::from(direction == pipe::WaitFor::Writable);
@@ -223,8 +223,8 @@ pub fn write_ipc_wait_census<C: crate::EntryContext>(
     region: &IpcRegion<'_>,
     out: &mut impl core::fmt::Write,
 ) -> core::fmt::Result {
-    // Zone queues name only objects below ZONE_RECORDS / 2 (two lanes each).
-    const QUEUED_OBJECTS: usize = carrick_sched_core::ZONE_RECORDS / 2;
+    // Two readiness lanes exist for every admitted object.
+    const QUEUED_OBJECTS: usize = IPC_MAX_OBJECTS;
     let mut seen = [0u64; QUEUED_OBJECTS.div_ceil(64)];
     for id in 1..carrick_sched_core::ZONE_RECORDS as u32 {
         let Some(record) = carrick_sched_core::RecordId::from_raw(id) else {

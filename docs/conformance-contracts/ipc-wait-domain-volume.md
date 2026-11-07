@@ -12,13 +12,25 @@ that only the initial descriptors remain. A bound carrier metadata queue
 must retain its identity throughout. The two rounds exercise both many live
 objects and generation advancement on recycled slots.
 
-IPC readiness indices are `1 + 2 * object.index + lane`, strictly below
-ZONE_RECORDS. Index ZONE_RECORDS belongs to metadata, followed by MM queues.
-The shared object-key constructor must reject indices outside IPC's domain,
-matching the existing in-ring eligibility rule. Objects outside this domain
-remain host-served, as before; no new queue allocation or population scan is
-introduced. Each admitted IPC lane retains object generation + 1, so slot
-reuse advances its exact incarnation without entering another owner's domain.
+IPC readiness indices are `1 + 2 * object.index + lane`. The scheduler
+owns the shared `IPC_OBJECT_CAPACITY` ceiling (262144 objects), and the IPC
+object store derives `IPC_MAX_OBJECTS` from it. Its readiness domain therefore
+contains `1 + 2 * IPC_OBJECT_CAPACITY` queues, including reserved index zero.
+Metadata begins after that whole domain, followed by MM queues. Thread-record
+capacity does not bound object capacity: one thread can own many pipes.
+
+Every object admitted by the elastic store has both readiness lanes, including
+objects above index 2046. An unrepresentable key is an authority invariant and
+fails closed, never a capacity errno. Each admitted IPC lane retains object
+generation + 1, so slot reuse advances its exact incarnation without entering
+another owner's domain. Queue storage is provisioned with the carrier; no
+per-transfer queue allocation or object-population scan is introduced.
+The scheduler reservation is page-rounded from `size_of::<ZoneTables>()`;
+the carrier region is rounded to its 64 MiB mapping granule after all fixed
+tables and the scheduler. It now occupies 128 MiB. Dynamic metadata follows
+that region, so it cannot alias the larger scheduler. The shared ARM/CPL0
+layout checks and ABI fingerprint cover this geometry; signed execution of
+this larger artifact remains required.
 
 Restoring admitted main's shared constructor while retaining the production
 dispatcher witness reproduces `ipc::admission: object wait generation

@@ -5306,29 +5306,42 @@ fn serial_host_pipe_create_busy_wait_binding_is_not_fatal() {
         let recovered_object = crate::el1_ipc::take_last_object_wait_bind_object().unwrap();
         assert_eq!(recovered_object.index, busy_object.index);
         assert_eq!(recovered_object.generation, busy_object.generation + 1);
-
-        let before_out_of_range = h.dispatcher.captured_file_table().slot_count();
-        crate::el1_ipc::inject_object_wait_key_out_of_range_once();
-        assert_eq!(
-            h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
-            DispatchOutcome::errno(carrick_abi::LINUX_EAGAIN),
-            "an unrepresentable wait key refuses pipe2 cleanly",
-        );
-        let out_of_range_object = crate::el1_ipc::take_last_object_wait_bind_object().unwrap();
-        assert_eq!(
-            h.dispatcher.captured_file_table().slot_count(),
-            before_out_of_range,
-            "an out-of-range wait key must not leak descriptors",
-        );
-        assert_eq!(
-            h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
-            DispatchOutcome::Returned { value: 0 },
-            "the pipe object was reclaimed after an out-of-range wait key",
-        );
-        let reused_object = crate::el1_ipc::take_last_object_wait_bind_object().unwrap();
-        assert_eq!(reused_object.index, out_of_range_object.index);
-        assert_eq!(reused_object.generation, out_of_range_object.generation + 1);
     });
+}
+
+#[test]
+fn serial_host_pipe_create_out_of_range_wait_key_is_fatal() {
+    const CHILD: &str = "CARRICK_TEST_IPC_WAIT_KEY_INVARIANT";
+    if std::env::var_os(CHILD).is_some() {
+        // SAFETY: aligned zeroed storage is the scheduler's empty state.
+        let zone = unsafe {
+            let ptr =
+                std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>());
+            assert!(!ptr.is_null());
+            Box::leak(Box::from_raw(ptr.cast::<carrick_el1_abi::ZoneTables>()))
+        };
+        crate::el1_zone::with_test_zone(zone, || {
+            let mut h = SpliceTestRig::new(4096);
+            crate::el1_ipc::inject_object_wait_key_out_of_range_once();
+            h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]);
+        });
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "dispatch::fs::tests::serial_host_pipe_create_out_of_range_wait_key_is_fatal",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(output.status.signal(), Some(libc::SIGABRT));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("admitted object has no readiness wait key")
+    );
 }
 
 #[test]
