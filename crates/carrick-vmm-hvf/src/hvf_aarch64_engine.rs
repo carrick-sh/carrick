@@ -2962,11 +2962,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn translated_read_excluded(
         &self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
         va: u64,
         _ipa: u64,
         len: usize,
     ) -> Result<Vec<u8>, MemoryError> {
-        self.state.read_guest_bytes_excluded(va, len)
+        self.state.read_guest_bytes_excluded(excluded, va, len)
     }
 
     fn translated_read_into(&self, va: u64, _ipa: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
