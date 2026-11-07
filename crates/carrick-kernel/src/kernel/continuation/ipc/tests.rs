@@ -31,6 +31,12 @@ fn host_ipc_completion_regions_retain_their_exact_kernel_owner() {
     assert!(first_region.same_mapping(&first_owner.region()));
     assert!(second_region.same_mapping(&second_owner.region()));
     assert!(!first_region.same_mapping(&second_region));
+    drop(first_owner);
+    drop(second_owner);
+    drop(first_context);
+    drop(second_context);
+    drop(first);
+    drop(second);
     let token = first_region.begin_operation(IpcOperation::EMPTY).unwrap();
     let raw = token.into_raw();
     assert_eq!(first_service.validate_region(&first_region), Ok(()));

@@ -104,6 +104,13 @@ impl ZoneHostServices {
     ) -> Result<Self, IpcError> {
         Self::new(dispatcher.kernel_binding.read().kernel())
     }
+
+    /// Borrow the operation storage retained by this completion owner.
+    /// A different carrier's latest window publication cannot redirect it,
+    /// and the view cannot outlive the owner which keeps its mappings alive.
+    pub fn region(&self) -> IpcRegion<'_> {
+        self.owner.region()
+    }
 }
 
 impl IpcHostServices for ZoneHostServices {
@@ -198,7 +205,7 @@ pub fn publish_file_table(context: &crate::kernel::KernelContext) {
     if !map.window_published() {
         return;
     }
-    let Some(region) = host_region() else {
+    let Some(region) = published_window_region() else {
         return;
     };
     let Some(owner) = context.kernel().existing_ipc() else {
@@ -217,10 +224,10 @@ pub fn deliver_owed_host_wakes(kernel: &crate::kernel::Kernel) {
     kernel.deliver_ipc_host_wakes();
 }
 
-/// The host's view of the shared IPC authority, once the carrier mapped
-/// its window and the authority published its directory; `None` otherwise
-/// (every IPC path then stays closed).
-pub fn host_region() -> Option<IpcRegion<'static>> {
+// Admission still authenticates the carrier's mapped window against the
+// candidate kernel. Completion instead borrows ZoneHostServices::region;
+// it must not select operation storage through this publication.
+fn published_window_region() -> Option<IpcRegion<'static>> {
     carrick_el1_abi::ipc_window_host()?.attach().ok()
 }
 
