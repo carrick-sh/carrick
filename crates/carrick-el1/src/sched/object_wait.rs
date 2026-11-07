@@ -267,7 +267,8 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
                 // home record. Only this CPU owns its context until publish below.
                 let ctx = unsafe { zone.record(record).ctx_mut() };
                 replaced = Some((record, fresh, *ctx));
-                self.cpu.save(frame, ctx, super::CpuExitCause::Svc);
+                self.cpu
+                    .save(frame, ctx, crate::substrate::sched::CpuExitCause::Svc);
                 ctx.replace_saved_pc(resume.raw(), carrick_sched_core::SavedSyscallPc::AtSyscall);
                 Ok((record, fresh))
             });
