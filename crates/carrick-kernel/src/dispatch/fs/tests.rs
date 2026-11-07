@@ -5297,11 +5297,37 @@ fn serial_host_pipe_create_busy_wait_binding_is_not_fatal() {
 
         assert_eq!(outcome, DispatchOutcome::errno(carrick_abi::LINUX_EAGAIN));
         assert_eq!(h.dispatcher.captured_file_table().slot_count(), before);
+        let busy_object = crate::el1_ipc::take_last_object_wait_bind_object().unwrap();
         assert_eq!(
             h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
             DispatchOutcome::Returned { value: 0 },
             "the next production pipe2 succeeds after the one-shot Busy refusal",
         );
+        let recovered_object = crate::el1_ipc::take_last_object_wait_bind_object().unwrap();
+        assert_eq!(recovered_object.index, busy_object.index);
+        assert_eq!(recovered_object.generation, busy_object.generation + 1);
+
+        let before_out_of_range = h.dispatcher.captured_file_table().slot_count();
+        crate::el1_ipc::inject_object_wait_key_out_of_range_once();
+        assert_eq!(
+            h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_EAGAIN),
+            "an unrepresentable wait key refuses pipe2 cleanly",
+        );
+        let out_of_range_object = crate::el1_ipc::take_last_object_wait_bind_object().unwrap();
+        assert_eq!(
+            h.dispatcher.captured_file_table().slot_count(),
+            before_out_of_range,
+            "an out-of-range wait key must not leak descriptors",
+        );
+        assert_eq!(
+            h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+            "the pipe object was reclaimed after an out-of-range wait key",
+        );
+        let reused_object = crate::el1_ipc::take_last_object_wait_bind_object().unwrap();
+        assert_eq!(reused_object.index, out_of_range_object.index);
+        assert_eq!(reused_object.generation, out_of_range_object.generation + 1);
     });
 }
 

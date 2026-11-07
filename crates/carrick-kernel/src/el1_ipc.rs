@@ -22,16 +22,42 @@ static NEXT_REGION: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 static INJECT_OBJECT_WAIT_BIND_BUSY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static INJECT_OBJECT_WAIT_KEY_OUT_OF_RANGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static LAST_OBJECT_WAIT_BIND_OBJECT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 pub(crate) fn inject_object_wait_bind_busy_once() {
     INJECT_OBJECT_WAIT_BIND_BUSY.store(true, Ordering::Release);
 }
 
+#[cfg(test)]
+pub(crate) fn inject_object_wait_key_out_of_range_once() {
+    INJECT_OBJECT_WAIT_KEY_OUT_OF_RANGE.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn take_last_object_wait_bind_object() -> Option<carrick_el1_abi::ipc::RawIpcObject> {
+    let Some(raw) = LAST_OBJECT_WAIT_BIND_OBJECT
+        .swap(0, Ordering::AcqRel)
+        .checked_sub(1)
+    else {
+        return None;
+    };
+    Some(carrick_el1_abi::ipc::RawIpcObject {
+        index: raw as u32,
+        generation: (raw >> 32) as u32,
+    })
+}
+
 /// Admission failure, before any descriptor or host reservation is published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
     NoMemory,
+    ObjectWaitBusy,
+    ObjectWaitKeyOutOfRange,
     Shared(IpcError),
 }
 impl From<IpcError> for AdmissionError {
@@ -52,6 +78,10 @@ impl From<fd::Error> for AdmissionError {
 pub enum CreateError {
     /// The zone-wide file table is full (ENFILE, `fs.file-max`).
     FileTableFull,
+    /// A queue lock was contended while binding a new object's wait keys.
+    ObjectWaitBusy,
+    /// The object cannot be represented in the scheduler's wait-key domain.
+    ObjectWaitKeyOutOfRange,
 }
 impl CreateError {
     /// Classify an admission refusal. The zone ceiling is ENFILE; any other
@@ -61,6 +91,8 @@ impl CreateError {
     pub fn from_admission(error: AdmissionError) -> Self {
         match error {
             AdmissionError::Shared(IpcError::ZoneLimit) => Self::FileTableFull,
+            AdmissionError::ObjectWaitBusy => Self::ObjectWaitBusy,
+            AdmissionError::ObjectWaitKeyOutOfRange => Self::ObjectWaitKeyOutOfRange,
             error @ (AdmissionError::NoMemory | AdmissionError::Shared(_)) => {
                 carrick_fatal::carrick_fatal!(
                     "ipc::admission",
@@ -72,6 +104,7 @@ impl CreateError {
     pub fn errno(self) -> carrick_abi::LinuxErrno {
         match self {
             Self::FileTableFull => carrick_abi::LINUX_ENFILE,
+            Self::ObjectWaitBusy | Self::ObjectWaitKeyOutOfRange => carrick_abi::LINUX_EAGAIN,
         }
     }
 }
@@ -779,30 +812,112 @@ impl HostIpc {
         &self.ceiling
     }
 
-    fn bind_waits(&self, object: IpcObjectHandle) {
+    fn bind_waits(
+        &self,
+        object: IpcObjectHandle,
+    ) -> Result<(), carrick_sched_core::object_wait::ObjectWaitError> {
+        #[cfg(test)]
+        LAST_OBJECT_WAIT_BIND_OBJECT.store(
+            ((u64::from(object.generation()) << 32) | u64::from(object.index())) + 1,
+            Ordering::Release,
+        );
         if let Some(zone) = crate::el1_zone::zone() {
+            let mut bound: [Option<carrick_sched_core::object_wait::ObjectWaitKey>; 2] =
+                [None, None];
+            let mut bound_count = 0;
             for direction in [pipe::WaitFor::Readable, pipe::WaitFor::Writable] {
-                if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, direction) {
-                    #[cfg(test)]
-                    let result = if INJECT_OBJECT_WAIT_BIND_BUSY
-                        .swap(false, Ordering::AcqRel)
-                    {
-                        Err(carrick_sched_core::object_wait::ObjectWaitError::Busy)
-                    } else {
-                        zone.bind_object_wait(key, &HostLockWait)
-                    };
-                    #[cfg(not(test))]
-                    let result = zone.bind_object_wait(key, &HostLockWait);
-                    result
-                        .unwrap_or_else(|_| {
-                            carrick_fatal::carrick_fatal!(
-                                "ipc::admission",
-                                "object wait generation collision"
-                            )
-                        });
+                #[cfg(test)]
+                let key = if INJECT_OBJECT_WAIT_KEY_OUT_OF_RANGE.swap(false, Ordering::AcqRel) {
+                    None
+                } else {
+                    carrick_el1_abi::ipc::object_wait_key(object, direction)
+                };
+                #[cfg(not(test))]
+                let key = carrick_el1_abi::ipc::object_wait_key(object, direction);
+                let Some(key) = key else {
+                    while bound_count > 0 {
+                        bound_count -= 1;
+                        let Some(key) = bound[bound_count] else {
+                            continue;
+                        };
+                        zone.unbind_object_wait(key, &HostLockWait)
+                            .unwrap_or_else(|error| {
+                                carrick_fatal::carrick_fatal!(
+                                    "ipc::admission",
+                                    "object wait rollback invariant failed: {error:?}"
+                                )
+                            });
+                    }
+                    return Err(carrick_sched_core::object_wait::ObjectWaitError::Exhausted);
+                };
+                #[cfg(test)]
+                let result = if INJECT_OBJECT_WAIT_BIND_BUSY.swap(false, Ordering::AcqRel) {
+                    Err(carrick_sched_core::object_wait::ObjectWaitError::Busy)
+                } else {
+                    zone.bind_object_wait(key, &HostLockWait)
+                };
+                #[cfg(not(test))]
+                let result = zone.bind_object_wait(key, &HostLockWait);
+                if let Err(error) = result {
+                    while bound_count > 0 {
+                        bound_count -= 1;
+                        let Some(key) = bound[bound_count] else {
+                            continue;
+                        };
+                        zone.unbind_object_wait(key, &HostLockWait)
+                            .unwrap_or_else(|rollback| {
+                                carrick_fatal::carrick_fatal!(
+                                    "ipc::admission",
+                                    "object wait rollback invariant failed: {rollback:?}"
+                                )
+                            });
+                    }
+                    return Err(error);
                 }
+                bound[bound_count] = Some(key);
+                bound_count += 1;
             }
         }
+        Ok(())
+    }
+    fn discard_unpublished_pipe(&self, object: IpcObjectHandle) {
+        let region = self.region();
+        for end in [pipe::End::Reader, pipe::End::Writer] {
+            let backing = carrick_el1_abi::ipc::IpcBacking::Pipe { object, end }.encode();
+            region
+                .release_backing(backing, &HostLockWait)
+                .unwrap_or_else(|error| {
+                    carrick_fatal::carrick_fatal!(
+                        "ipc::admission",
+                        "unpublished pipe rollback invariant failed ({error:?})"
+                    )
+                });
+        }
+    }
+    fn wait_bind_error(error: carrick_sched_core::object_wait::ObjectWaitError) -> AdmissionError {
+        match error {
+            carrick_sched_core::object_wait::ObjectWaitError::Busy => {
+                AdmissionError::ObjectWaitBusy
+            }
+            carrick_sched_core::object_wait::ObjectWaitError::Exhausted => {
+                AdmissionError::ObjectWaitKeyOutOfRange
+            }
+            error => carrick_fatal::carrick_fatal!(
+                "ipc::admission",
+                "object wait binding invariant failed ({error:?})"
+            ),
+        }
+    }
+    fn discard_unpublished_eventfd(&self, object: IpcObjectHandle) {
+        let backing = carrick_el1_abi::ipc::IpcBacking::EventFd { object }.encode();
+        self.region()
+            .release_backing(backing, &HostLockWait)
+            .unwrap_or_else(|error| {
+                carrick_fatal::carrick_fatal!(
+                    "ipc::admission",
+                    "unpublished eventfd rollback invariant failed ({error:?})"
+                )
+            });
     }
     fn provision_pipe(
         &self,
@@ -829,7 +944,10 @@ impl HostIpc {
             self.rings.lock().release(retired.offset);
         }
         let object = object?;
-        self.bind_waits(object);
+        if let Err(error) = self.bind_waits(object) {
+            self.discard_unpublished_pipe(object);
+            return Err(Self::wait_bind_error(error));
+        }
         self.top_up_ring_stock();
         Ok(object)
     }
@@ -905,7 +1023,10 @@ impl HostIpc {
     ) -> Result<IpcObjectHandle, AdmissionError> {
         let object =
             self.with_object(|region| region.create_eventfd(initial, mode, &HostLockWait))?;
-        self.bind_waits(object);
+        if let Err(error) = self.bind_waits(object) {
+            self.discard_unpublished_eventfd(object);
+            return Err(Self::wait_bind_error(error));
+        }
         Ok(object)
     }
 
@@ -913,7 +1034,17 @@ impl HostIpc {
     /// interest list. Its `Readable` wait key is bound like an object's.
     pub fn create_epoll(&self) -> Result<IpcObjectHandle, AdmissionError> {
         let object = self.with_object(|region| region.create_epoll(&HostLockWait))?;
-        self.bind_waits(object);
+        if let Err(error) = self.bind_waits(object) {
+            self.region()
+                .epoll_destroy(object, &HostLockWait)
+                .unwrap_or_else(|rollback| {
+                    carrick_fatal::carrick_fatal!(
+                        "ipc::admission",
+                        "unpublished epoll rollback invariant failed ({rollback:?})"
+                    )
+                });
+            return Err(Self::wait_bind_error(error));
+        }
         Ok(object)
     }
 
