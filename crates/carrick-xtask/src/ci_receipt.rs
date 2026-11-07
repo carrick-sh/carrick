@@ -1029,6 +1029,14 @@ pub fn diff_with_retired(
     }
     // Missing execution is fatal even when main is missing the same evidence.
     let mut new: BTreeSet<String> = next.difference(&base).cloned().collect();
+    if candidate.profile == "kvm"
+        && !candidate
+            .steps
+            .iter()
+            .any(|step| step.name == "kvm-tests" && !step.started_tests.is_empty())
+    {
+        new.insert("not-run:lane:kvm:zero executed tests".into());
+    }
     for step in &candidate.steps {
         if let crate::accept::StepOutcome::NotRun { reason } = step.execution_outcome() {
             new.insert(format!("not-run:{}:{reason}", step.name));
