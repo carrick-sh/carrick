@@ -24,6 +24,11 @@ enum Phase {
 /// retains this operation on refusal, including Busy, and enrolls with its
 /// execution owner before retrying. Never translate contention into an errno.
 ///
+/// Each call supplies its current region view, authenticated against the
+/// retained mapping before custody changes. Its holder slot and descriptor
+/// ceiling belong to this entry, so a migrated operation never reuses its
+/// original execution-lane metadata.
+///
 /// Prepare, copy `fds()` to userspace, then publish and finish. A copy fault
 /// cancels claims rather than closing numbers. `finish` and `cancel` deliver
 /// physical release effects outside the descriptor and object locks.
@@ -68,13 +73,15 @@ impl<'a> PendingPipePair<'a> {
     /// Re-entry resumes the admitted stage without creating another object.
     pub fn prepare<W: LockWait>(
         &mut self,
+        current: &IpcRegion<'_>,
         storage: &mut IpcPipeStorage,
         wait: &W,
     ) -> Result<(), IpcError> {
+        self.check_view(current)?;
         if self.phase != Phase::Preparing {
             return Err(IpcError::Corrupt);
         }
-        let authority = self.region.fd(BorrowedWait(wait));
+        let authority = current.fd(BorrowedWait(wait));
         if self.claim.is_none() {
             self.claim = Some(
                 authority
@@ -83,9 +90,7 @@ impl<'a> PendingPipePair<'a> {
             );
         }
         if !self.created {
-            let object = self
-                .region
-                .create_backed_pipe(self.capacity, storage, wait)?;
+            let object = current.create_backed_pipe(self.capacity, storage, wait)?;
             self.backings = [
                 Some(
                     IpcBacking::Pipe {
@@ -132,7 +137,12 @@ impl<'a> PendingPipePair<'a> {
 
     /// Commit the pair with the fd authority's one sequence write. The caller
     /// must have completed copyout; refusal preserves the exact claims/pins.
-    pub fn publish<W: LockWait>(&mut self, wait: &W) -> Result<(), IpcError> {
+    pub fn publish<W: LockWait>(
+        &mut self,
+        current: &IpcRegion<'_>,
+        wait: &W,
+    ) -> Result<(), IpcError> {
+        self.check_view(current)?;
         if self.phase != Phase::Preparing {
             return Err(IpcError::Corrupt);
         }
@@ -140,8 +150,7 @@ impl<'a> PendingPipePair<'a> {
             return Err(IpcError::Corrupt);
         };
         let claim = self.claim.take().ok_or(IpcError::Corrupt)?;
-        match self
-            .region
+        match current
             .fd(BorrowedWait(wait))
             .commit_pair(claim, [reader, writer], self.cloexec)
         {
@@ -162,9 +171,11 @@ impl<'a> PendingPipePair<'a> {
     /// through this receipt. Cancellation cannot undo a published pair.
     pub fn cancel<W: LockWait>(
         &mut self,
+        current: &IpcRegion<'_>,
         wait: &W,
         deliver: impl FnMut(IpcReleased),
     ) -> Result<(), IpcError> {
+        self.check_view(current)?;
         match self.phase {
             Phase::Preparing => self.phase = Phase::Cancelling,
             Phase::Cancelling => {}
@@ -172,14 +183,14 @@ impl<'a> PendingPipePair<'a> {
             _ => return Err(IpcError::Corrupt),
         }
         if let Some(claim) = self.claim.take()
-            && let Err(refusal) = self.region.fd(BorrowedWait(wait)).cancel_pair(claim)
+            && let Err(refusal) = current.fd(BorrowedWait(wait)).cancel_pair(claim)
             && refusal.error() != carrick_fd_core::Error::StaleTable
         {
             let error = refusal.error();
             self.claim = Some(refusal.into_reservation());
             return Err(IpcError::Fd(error));
         }
-        self.release(wait, deliver)?;
+        self.release(current, wait, deliver)?;
         self.phase = Phase::SettledCancelled;
         Ok(())
     }
@@ -188,21 +199,24 @@ impl<'a> PendingPipePair<'a> {
     /// operation owning the final backing; retain it on object-lock refusal.
     pub fn finish<W: LockWait>(
         &mut self,
+        current: &IpcRegion<'_>,
         wait: &W,
         deliver: impl FnMut(IpcReleased),
     ) -> Result<(), IpcError> {
+        self.check_view(current)?;
         match self.phase {
             Phase::Published => {}
             Phase::SettledPublished => return Ok(()),
             _ => return Err(IpcError::Corrupt),
         }
-        self.release(wait, deliver)?;
+        self.release(current, wait, deliver)?;
         self.phase = Phase::SettledPublished;
         Ok(())
     }
 
     fn release<W: LockWait>(
         &mut self,
+        current: &IpcRegion<'_>,
         wait: &W,
         mut deliver: impl FnMut(IpcReleased),
     ) -> Result<(), IpcError> {
@@ -210,8 +224,7 @@ impl<'a> PendingPipePair<'a> {
             // Invalid pins are broken invariants, never a retryable lock
             // refusal: unpin is atomic and does not acquire a table lock.
             if let Some(pin) = self.pins[index].take()
-                && let Some(description) = self
-                    .region
+                && let Some(description) = current
                     .fd(BorrowedWait(wait))
                     .unpin(pin)
                     .map_err(IpcError::Fd)?
@@ -219,12 +232,20 @@ impl<'a> PendingPipePair<'a> {
                 self.backings[index] = Some(description.backing);
             }
             if let Some(backing) = self.backings[index] {
-                let released = self.region.release_backing(backing, wait)?;
+                let released = current.release_backing(backing, wait)?;
                 self.backings[index] = None;
                 deliver(released);
             }
         }
         Ok(())
+    }
+
+    fn check_view(&self, current: &IpcRegion<'_>) -> Result<(), IpcError> {
+        if self.region.same_mapping(current) {
+            Ok(())
+        } else {
+            Err(IpcError::BadRegion)
+        }
     }
 
     pub fn is_settled(&self) -> bool {

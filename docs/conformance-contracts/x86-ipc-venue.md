@@ -12,12 +12,20 @@ physical release remains owned across object-lock contention, including when
 another thread closes and reuses a published number before creation pins are
 released. Every call returns without holding a table or object lock.
 
-Six VM-free witnesses exercise this production API, including two live
+Nine VM-free witnesses exercise this production API, including two live
 tables, partial OFD exhaustion, Busy once then success, and table retirement.
 The first four are compile-red before the API exists. This is shared
 creation custody, not x86 syscall wiring: the production x86 mapping, root
 namespace, execution adapter and pipe2 entry still need implementation.
 There is no external blocker and the real-KVM acceptance remains unmet.
+
+A retained creation keeps its original mapping alive, but each method takes
+the current execution view. It authenticates that mapping before changing
+custody and uses the current holder slot and descriptor ceiling. The
+migration witness was semantic-red at holder slot 1 instead of slot 2 while
+a final release held the pipe lock and encountered a held epoll lock. A
+foreign mapping must refuse before changing claims or pins; a refused
+current ceiling must preserve both publication claims.
 
 ## Owned descriptor-pair admission
 
