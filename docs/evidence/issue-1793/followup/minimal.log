@@ -1,0 +1,4 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.83s
+     Running `target/debug/carrick-xtask worktree-run -- cargo --locked --config 'build.rustc-wrapper=""' run --locked -p carrick-xtask -- host-lease --mode gate -- bash docs/evidence/issue-1793/launch-diagnostics.sh docs/evidence/issue-1793/followup/minimal`
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running `target/debug/carrick-xtask host-lease --mode gate -- bash docs/evidence/issue-1793/launch-diagnostics.sh docs/evidence/issue-1793/followup/minimal`

@@ -1,0 +1,3 @@
+case	run_id	exit	elapsed_seconds
+alpine	i1793-launch-20261107T014821-alpine	0	2
+busybox	i1793-launch-20261107T014823-busybox	127	2

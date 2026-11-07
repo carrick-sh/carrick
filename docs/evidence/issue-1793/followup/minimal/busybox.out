@@ -1,0 +1,90 @@
+{
+  "command": [
+    "/bin/echo",
+    "hi"
+  ],
+  "exit_code": 127,
+  "image": "busybox",
+  "report": {
+    "deferred_syscalls": [],
+    "execution_witness": {
+      "anonymous_private_mms": [
+        {
+          "cpu_mask": 1,
+          "generation": 10,
+          "incarnation": 1,
+          "mm": 1,
+          "private_pages": 2,
+          "root": 68440064
+        }
+      ],
+      "anonymous_private_pages": 2,
+      "backend": "kvm-x86-cpl0",
+      "cross_mm_private_aliases": 0,
+      "guest_entries": 27,
+      "guest_refusal_families": [
+        {
+          "count": 1,
+          "family": "unclassified"
+        }
+      ],
+      "host_forward_families": [
+        {
+          "count": 20,
+          "family": "host_crossing"
+        }
+      ],
+      "host_forwards": 20,
+      "peer_active_private_grants": 1,
+      "physical_crossing_families": [
+        {
+          "count": 2,
+          "family": "owner_grant"
+        },
+        {
+          "count": 1,
+          "family": "root_exit"
+        }
+      ],
+      "portal_exits": 24
+    },
+    "partial_syscalls": [
+      {
+        "count": 1,
+        "name": "x86_native_21",
+        "number": 48,
+        "reason": "cpl0_unclassified_owner_unbound"
+      }
+    ],
+    "proc_read_unimplemented": [],
+    "summary": {
+      "deferred_syscall_invocations": 0,
+      "distinct_deferred_syscalls": 0,
+      "distinct_partial_syscalls": 1,
+      "distinct_proc_read_unimplemented": 0,
+      "distinct_sys_read_unimplemented": 0,
+      "distinct_unhandled_ioctls": 0,
+      "distinct_unhandled_syscalls": 0,
+      "distinct_unknown_syscall_flags": 0,
+      "distinct_unsupported_signals": 0,
+      "fast_path_blind_spots": 0,
+      "partial_syscall_invocations": 1,
+      "syscall_invocations": 20,
+      "syscall_returns_errno": 0,
+      "syscall_returns_ok": 0,
+      "unhandled_ioctl_invocations": 0,
+      "unhandled_syscall_invocations": 0,
+      "unknown_syscall_flag_invocations": 0
+    },
+    "sys_read_unimplemented": [],
+    "unhandled_ioctls": [],
+    "unhandled_syscalls": [],
+    "unknown_syscall_flags": [],
+    "unsupported_signals": []
+  },
+  "stderr": "",
+  "stdout": "",
+  "store": "/var/tmp/carrick-dispatch-zbe4Cx/agent/home/.carrick",
+  "trap_limit_hit": false,
+  "traps": 25
+}

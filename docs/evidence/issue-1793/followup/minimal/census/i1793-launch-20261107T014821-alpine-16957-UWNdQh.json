@@ -1,0 +1,116 @@
+{
+  "refusal_evidence": {
+    "schema": 1,
+    "isa": "x86_64",
+    "complete": true,
+    "rows": [
+      {
+        "nr": 10,
+        "caller": "root",
+        "refused": 2,
+        "venue_refused": 0,
+        "allowlisted": false
+      }
+    ]
+  },
+  "schema": 2,
+  "run_id": "i1793-launch-20261107T014821-alpine",
+  "pid": 16957,
+  "el1_counters": true,
+  "process_user_ns": 109444000,
+  "process_sys_ns": 70018000,
+  "wall_ns": 24555122,
+  "rows": [
+    {
+      "nr": 64,
+      "name": "write",
+      "el1_served": 0,
+      "el1_forwarded": 1,
+      "refused": 0,
+      "venue_refused": 0,
+      "host_services": 0,
+      "host_cpu_ns": 0,
+      "redispatches": 0,
+      "redispatch_cpu_ns": 0,
+      "el1_boundaries": 0
+    },
+    {
+      "nr": 94,
+      "name": "exit_group",
+      "el1_served": 1,
+      "el1_forwarded": 0,
+      "refused": 0,
+      "venue_refused": 0,
+      "host_services": 0,
+      "host_cpu_ns": 0,
+      "redispatches": 0,
+      "redispatch_cpu_ns": 0,
+      "el1_boundaries": 0
+    },
+    {
+      "nr": 96,
+      "name": "set_tid_address",
+      "el1_served": 1,
+      "el1_forwarded": 0,
+      "refused": 0,
+      "venue_refused": 0,
+      "host_services": 0,
+      "host_cpu_ns": 0,
+      "redispatches": 0,
+      "redispatch_cpu_ns": 0,
+      "el1_boundaries": 0
+    },
+    {
+      "nr": 174,
+      "name": "getuid",
+      "el1_served": 1,
+      "el1_forwarded": 0,
+      "refused": 0,
+      "venue_refused": 0,
+      "host_services": 0,
+      "host_cpu_ns": 0,
+      "redispatches": 0,
+      "redispatch_cpu_ns": 0,
+      "el1_boundaries": 0
+    },
+    {
+      "nr": 214,
+      "name": "brk",
+      "el1_served": 2,
+      "el1_forwarded": 0,
+      "refused": 0,
+      "venue_refused": 0,
+      "host_services": 0,
+      "host_cpu_ns": 0,
+      "redispatches": 0,
+      "redispatch_cpu_ns": 0,
+      "el1_boundaries": 0
+    },
+    {
+      "nr": 222,
+      "name": "mmap",
+      "el1_served": 1,
+      "el1_forwarded": 0,
+      "refused": 0,
+      "venue_refused": 0,
+      "host_services": 0,
+      "host_cpu_ns": 0,
+      "redispatches": 0,
+      "redispatch_cpu_ns": 0,
+      "el1_boundaries": 0
+    },
+    {
+      "nr": 226,
+      "name": "mprotect",
+      "el1_served": 0,
+      "el1_forwarded": 0,
+      "refused": 2,
+      "venue_refused": 0,
+      "host_services": 0,
+      "host_cpu_ns": 0,
+      "redispatches": 0,
+      "redispatch_cpu_ns": 0,
+      "el1_boundaries": 0
+    }
+  ]
+}
