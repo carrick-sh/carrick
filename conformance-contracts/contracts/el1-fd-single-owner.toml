@@ -1,8 +1,8 @@
 schema_version = 1
 id = "kernel.el1.fd-single-owner"
 title = "EL1 descriptor authority has one writer and no host slot selection"
-guest_surfaces = ["kernel:filetable", "syscall:close", "syscall:dup2", "syscall:clone", "syscall:execve"]
-semantic_authority = ["man 2 fork", "man 2 clone", "man 2 dup", "man 2 execve"]
+guest_surfaces = ["kernel:filetable", "syscall:close", "syscall:close_range", "syscall:dup2", "syscall:clone", "syscall:execve"]
+semantic_authority = ["man 2 close_range", "man 2 fork", "man 2 clone", "man 2 dup", "man 2 execve"]
 fixture = "kernel:two live FileTables with shared IPC publication and bare stdio"
 scale_points = [65, 4096, 65536]
 rationale = "Shared authority mutations must be visible to every observer. Host custody must not select numeric descriptors. Enforced by one_table_writer and no_host_slot_selection."
@@ -15,6 +15,8 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}",
+  "carrick-el1-linux::file_table::tests::range_cloexec_projects_live_incarnation_one_only_after_authority_success",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_child_close_range_cloexec_is_served",
 ]
 
 [bindings.unresolved]

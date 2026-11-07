@@ -880,7 +880,7 @@ pub const fn descriptor_ordinal(ordinal: CanonicalNr) -> bool {
     use crate::crossing::nr;
     matches!(
         owner_ordinal(ordinal),
-        nr::DUP | nr::DUP3 | nr::FCNTL | nr::CLOSE
+        nr::DUP | nr::DUP3 | nr::FCNTL | nr::CLOSE | nr::CLOSE_RANGE
     )
 }
 

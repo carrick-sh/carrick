@@ -4,6 +4,144 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use std::{boxed::Box, vec, vec::Vec};
 
+#[test]
+fn retained_range_cleanup_survives_reused_gap_and_late_effects() {
+    let c = authority::<2, 8>();
+    let table = c.create_table(8, &mut storage(8)).unwrap();
+    let peer = c.create_table(8, &mut storage(8)).unwrap();
+    let fd = c.open(table, Fd(3), description(71), false).unwrap();
+    assert_eq!(fd, Fd(3));
+    let (observer, _) = c.pin(table, fd).unwrap();
+    c.install_pin(peer, Fd(1), &observer, false).unwrap();
+    let mut receipts = [None, None];
+    assert_eq!(
+        c.close_range_retained(table, 2, u32::MAX, &mut receipts),
+        Ok(1)
+    );
+    let replacement = c.open(table, Fd(3), description(72), true).unwrap();
+    assert_eq!(replacement, fd);
+    c.set_offset(table, replacement, Offset(23)).unwrap();
+    c.require_pinned_close_effects(&observer, CloseEffects::POSIX_RECORD_LOCKS)
+        .unwrap();
+    let receipt = receipts[0].take().unwrap();
+    assert_eq!(receipt.table(), table);
+    assert_eq!(receipt.fd(), fd);
+    assert_eq!(c.pinned(receipt.pin()).unwrap().backing, BackingToken(71));
+    assert_eq!(
+        c.pinned_close_effects(receipt.pin()),
+        Ok(CloseEffects::POSIX_RECORD_LOCKS)
+    );
+    // Settlement transfers the retained incarnation, without another numeric
+    // lookup. Consuming custody also prevents settling this receipt twice.
+    assert_eq!(
+        c.unpin_filtered(receipt.into_pin(), |_| panic!("peer still owns original")),
+        Ok(DeferredRelease::None)
+    );
+    assert_eq!(c.get(table, replacement).unwrap().backing, BackingToken(72));
+    assert_eq!(c.getfd(table, replacement), Ok(true));
+    assert_eq!(c.get(table, replacement).unwrap().offset, Offset(23));
+    assert_eq!(c.unpin(observer), Ok(None));
+    assert_eq!(
+        c.close(peer, Fd(1)).unwrap().unwrap().backing,
+        BackingToken(71)
+    );
+    assert_eq!(
+        c.close(table, replacement).unwrap().unwrap().backing,
+        BackingToken(72)
+    );
+}
+
+#[test]
+fn retained_range_admission_refusal_preserves_every_slot_and_releases_prefix_pins() {
+    let c = authority::<1, 4>();
+    let table = c.create_table(8, &mut storage(8)).unwrap();
+    let first = c.open(table, Fd(2), description(81), false).unwrap();
+    let second = c.open(table, Fd(5), description(82), true).unwrap();
+    let mut short = [None];
+    assert_eq!(
+        c.close_range_retained(table, 0, u32::MAX, &mut short),
+        Err(Error::NoMemory)
+    );
+    assert!(short[0].is_none());
+    let (pin, _) = c.pin(table, second).unwrap();
+    let ofd = c.ofd(pin.key().index).unwrap();
+    ofd.holds.store(REF | FREE_INDEX, Ordering::Relaxed);
+    let mut receipts = [None, None];
+    assert_eq!(
+        c.close_range_retained(table, 0, u32::MAX, &mut receipts),
+        Err(Error::NoMemory)
+    );
+    assert!(receipts.iter().all(Option::is_none));
+    assert_eq!(c.get(table, first).unwrap().backing, BackingToken(81));
+    assert_eq!(c.get(table, second).unwrap().backing, BackingToken(82));
+    assert_eq!(c.getfd(table, second), Ok(true));
+    ofd.holds.store(REF | PIN, Ordering::Relaxed);
+    assert_eq!(c.unpin(pin), Ok(None));
+    assert_eq!(
+        c.close_range_retained(table, 0, u32::MAX, &mut receipts),
+        Ok(2)
+    );
+    for receipt in receipts.into_iter().flatten() {
+        assert!(c.unpin(receipt.into_pin()).unwrap().is_some());
+    }
+}
+
+#[test]
+fn retained_single_close_cleanup_cannot_close_reused_number() {
+    let c = authority::<1, 4>();
+    let table = c.create_table(8, &mut storage(8)).unwrap();
+    let fd = c.open(table, Fd(3), description(91), false).unwrap();
+    let (observer, _) = c.pin(table, fd).unwrap();
+    let receipt = c.close_retained(table, fd).unwrap();
+    assert_eq!(c.close_retained(table, fd), Err(Error::BadFd));
+    let replacement = c.open(table, fd, description(92), true).unwrap();
+    assert_eq!(replacement, fd);
+    c.set_offset(table, replacement, Offset(37)).unwrap();
+    // Effects may be published after numeric removal by a pre-existing pin.
+    c.require_pinned_close_effects(&observer, CloseEffects::POSIX_RECORD_LOCKS)
+        .unwrap();
+    assert_eq!(receipt.table(), table);
+    assert_eq!(receipt.fd(), fd);
+    assert_eq!(c.pinned(receipt.pin()).unwrap().backing, BackingToken(91));
+    assert_eq!(
+        c.pinned_close_effects(receipt.pin()),
+        Ok(CloseEffects::POSIX_RECORD_LOCKS)
+    );
+    assert_eq!(c.unpin(observer), Ok(None));
+    // Consume the exact old description rather than replaying close(fd).
+    assert_eq!(
+        c.unpin(receipt.into_pin()).unwrap().unwrap().backing,
+        BackingToken(91)
+    );
+    assert_eq!(c.get(table, replacement).unwrap().backing, BackingToken(92));
+    assert_eq!(c.getfd(table, replacement), Ok(true));
+    assert_eq!(c.get(table, replacement).unwrap().offset, Offset(37));
+    assert_eq!(
+        c.close(table, replacement).unwrap().unwrap().backing,
+        BackingToken(92)
+    );
+}
+
+#[test]
+fn retained_single_close_pin_refusal_preserves_slot() {
+    let c = authority::<1, 4>();
+    let table = c.create_table(8, &mut storage(8)).unwrap();
+    let fd = c.open(table, Fd(3), description(93), true).unwrap();
+    let (observer, _) = c.pin(table, fd).unwrap();
+    let ofd = c.ofd(observer.key().index).unwrap();
+    ofd.holds.store(REF | FREE_INDEX, Ordering::Relaxed);
+    assert_eq!(c.close_retained(table, fd), Err(Error::NoMemory));
+    assert_eq!(c.get(table, fd).unwrap().backing, BackingToken(93));
+    assert_eq!(c.getfd(table, fd), Ok(true));
+    ofd.holds.store(REF | PIN, Ordering::Relaxed);
+    assert_eq!(c.unpin(observer), Ok(None));
+    let receipt = c.close_retained(table, fd).unwrap();
+    assert_eq!(
+        c.unpin(receipt.into_pin()).unwrap().unwrap().backing,
+        BackingToken(93)
+    );
+}
+
 // Reservation custody stays in one authority, including across backing growth.
 #[test]
 fn owned_reservations_two_live_tables_keep_targets_and_fork_private() {

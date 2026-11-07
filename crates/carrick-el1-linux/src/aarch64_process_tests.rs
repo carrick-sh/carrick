@@ -10149,6 +10149,31 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof() {
+    native_child_descriptor_family(NativeDescriptorScenario::Mutations);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_pipe_size_commands_lack_ring_handler() {
+    native_child_descriptor_family(NativeDescriptorScenario::PipeSize);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_child_close_range_cloexec_is_served() {
+    native_child_descriptor_family(NativeDescriptorScenario::CloseRange);
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeDescriptorScenario {
+    Mutations,
+    PipeSize,
+    CloseRange,
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_child_descriptor_family(scenario: NativeDescriptorScenario) {
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
         LINUX_F_SETFL, LINUX_O_NONBLOCK, LINUX_O_WRONLY,
@@ -10358,6 +10383,75 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     activate_target(source, &task, &child_bindings[0]);
     for binding in &child_bindings {
         assert!(runtime.task_binding(binding.key).is_some());
+    }
+
+    if scenario == NativeDescriptorScenario::PipeSize {
+        for (cmd, arg) in [
+            (carrick_abi::LINUX_F_GETPIPE_SZ, 0),
+            (carrick_abi::LINUX_F_SETPIPE_SZ, 12288),
+            (carrick_abi::LINUX_F_SETPIPE_SZ, 131072),
+        ] {
+            let (route, result) = run_in_child(0, sys_fcntl, [4, cmd, arg]);
+            // Defect baseline, not the acceptance target. The red-first target
+            // requires Served and Linux capacities 65536/16384/131072.
+            assert_eq!(route, CompletionRoute::Forward, "pipe-size cmd {cmd}");
+            assert_eq!(result, 4, "unclaimed call preserves its input fd");
+        }
+        return;
+    }
+    if scenario == NativeDescriptorScenario::CloseRange {
+        let close_range = carrick_personality_linux::crossing::nr::CLOSE_RANGE.raw();
+        assert_eq!(run_in_child(0, sys_fcntl, [1, LINUX_F_SETFD, 0]).1, 0);
+        // A sparse, enormous range is bounded by allocated descriptor storage.
+        assert_eq!(
+            run_in_child(
+                0,
+                close_range,
+                [
+                    3,
+                    u64::from(u32::MAX),
+                    u64::from(carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC)
+                ]
+            ),
+            (CompletionRoute::Served, 0)
+        );
+        assert_eq!(run_in_child(0, sys_fcntl, [3, LINUX_F_GETFD, 0]).1, 1);
+        assert_eq!(run_in_child(0, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 1);
+        assert_eq!(run_in_child(0, sys_fcntl, [5, LINUX_F_GETFD, 0]).1, 1);
+        assert_eq!(run_in_child(0, sys_fcntl, [1, LINUX_F_GETFD, 0]).1, 0);
+        for args in [[4, 3, 0], [0, 4, 1]] {
+            assert_eq!(
+                run_in_child(0, close_range, args),
+                (CompletionRoute::Served, -22)
+            );
+        }
+        // Plain close and UNSHARE remain effect-free refusals pending their
+        // retained-effects and resource-publication owners.
+        for flags in [
+            0,
+            u64::from(carrick_abi::LINUX_CLOSE_RANGE_UNSHARE),
+            u64::from(
+                carrick_abi::LINUX_CLOSE_RANGE_UNSHARE | carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC,
+            ),
+        ] {
+            assert_eq!(
+                run_in_child(0, close_range, [0, 4, flags]).0,
+                CompletionRoute::Forward
+            );
+        }
+        assert_eq!(run_in_child(0, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 1);
+        assert_eq!(run_in_child(0, sys_fcntl, [1, LINUX_F_GETFD, 0]).1, 0);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+                .is_queued()
+        );
+        activate_target(source, &task, &child_bindings[1]);
+        assert_eq!(run_in_child(1, sys_fcntl, [3, LINUX_F_GETFD, 0]).1, 0);
+        assert_eq!(run_in_child(1, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 1);
+        assert_eq!(run_in_child(1, sys_fcntl, [5, LINUX_F_GETFD, 0]).1, 0);
+        return;
     }
 
     // 1. dup(4) allocates lowest free slot 0 and clears FD_CLOEXEC.

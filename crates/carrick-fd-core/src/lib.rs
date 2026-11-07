@@ -207,6 +207,38 @@ pub struct OfdPin {
     authority: u64,
     key: OfdKey,
 }
+
+/// Cleanup custody for a removed descriptor. The original numeric identity
+/// is diagnostic only: settlement uses the retained description, even after
+/// that number has been reused. The crossing owner must additionally bind
+/// this custody to its caller and operation before publishing a removal.
+#[must_use = "a removed descriptor retains cleanup custody until its pin is released"]
+#[derive(Debug, Eq, PartialEq)]
+pub struct CloseReceipt {
+    table: TableId,
+    fd: Fd,
+    pin: OfdPin,
+}
+
+impl CloseReceipt {
+    pub fn table(&self) -> TableId {
+        self.table
+    }
+
+    pub fn fd(&self) -> Fd {
+        self.fd
+    }
+
+    pub fn pin(&self) -> &OfdPin {
+        &self.pin
+    }
+
+    /// Transfer the final cleanup hold to the existing filtered-release owner.
+    /// Call only after settling effects on the retained description.
+    pub fn into_pin(self) -> OfdPin {
+        self.pin
+    }
+}
 /// Plain-data form of an [`OfdPin`] held in an owned continuation.
 /// Converting either way transfers the one ownership; a copy of the raw
 /// value is not a second pin.
@@ -1953,6 +1985,32 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         self.close_locked_filtered(&t, fd, release_here)
     }
 
+    /// Remove one descriptor while retaining its exact description for cleanup.
+    /// The caller reserves crossing custody before admission and settles effects
+    /// through the receipt's pin outside the table lock. Reusing the numeric fd
+    /// cannot redirect settlement. Pin exhaustion leaves the descriptor intact.
+    pub fn close_retained(&self, table: TableId, fd: Fd) -> Result<CloseReceipt, Error> {
+        let authority = self.identity()?;
+        let (_guard, t) = self.lock(table)?;
+        let entry = t.entry(fd)?;
+        let generation = self.ofd(entry.ofd)?.generation.load(Ordering::Acquire);
+        self.retain(entry.ofd, PIN)?;
+        let receipt = CloseReceipt {
+            table,
+            fd,
+            pin: OfdPin {
+                authority,
+                key: OfdKey {
+                    index: entry.ofd,
+                    generation,
+                },
+            },
+        };
+        // The cleanup pin prevents finalization during numeric removal.
+        self.close_locked(&t, fd)?;
+        Ok(receipt)
+    }
+
     /// Pop and free one finalized OFD whose physical backing release was
     /// deferred to the host (`close_filtered` / `dup2_filtered` / `dup3_filtered`).
     pub fn take_retired_ofd(&self) -> Result<Option<Description>, Error> {
@@ -2001,6 +2059,69 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             }
         }
         Ok(())
+    }
+
+    /// Remove an inclusive range while retaining every selected description.
+    /// Caller-provided receipt slots must all be empty and cover the complete
+    /// selected population. Capacity refusal and pin exhaustion leave every
+    /// descriptor untouched. Work is bounded by allocated descriptor storage,
+    /// independent of `last`; no cleanup callback runs under the table lock.
+    ///
+    /// The caller must reserve crossing custody before invoking this operation,
+    /// and retain the returned receipts through cleanup or cancellation. Host
+    /// cleanup must use each receipt's pin, never replay its numeric fd/range.
+    pub fn close_range_retained(
+        &self,
+        table: TableId,
+        first: u32,
+        last: u32,
+        receipts: &mut [Option<CloseReceipt>],
+    ) -> Result<usize, Error> {
+        if first > last || receipts.iter().any(Option::is_some) {
+            return Err(Error::InvalidArgument);
+        }
+        let authority = self.identity()?;
+        let (_guard, t) = self.lock(table)?;
+        let end = (u64::from(last) + 1).min(t.storage.capacity() as u64) as usize;
+        let selected = (first as usize..end)
+            .filter(|&fd| t.storage.get(fd).is_some())
+            .count();
+        if selected > receipts.len() {
+            return Err(Error::NoMemory);
+        }
+        let mut count = 0;
+        for fd in first as usize..end {
+            let Some(entry) = t.storage.get(fd) else {
+                continue;
+            };
+            let generation = self.ofd(entry.ofd)?.generation.load(Ordering::Acquire);
+            if let Err(error) = self.retain(entry.ofd, PIN) {
+                // All descriptor holds still exist: these releases cannot
+                // finalize a description or invoke a backing owner.
+                for receipt in receipts[..count].iter_mut().filter_map(Option::take) {
+                    self.drop_hold(receipt.pin.key.index, PIN)?;
+                }
+                return Err(error);
+            }
+            receipts[count] = Some(CloseReceipt {
+                table,
+                fd: Fd(fd as i32),
+                pin: OfdPin {
+                    authority,
+                    key: OfdKey {
+                        index: entry.ofd,
+                        generation,
+                    },
+                },
+            });
+            count += 1;
+        }
+        // Every selected OFD now has a cleanup hold. Removing a slot cannot
+        // finalize its backing, even when it was the last numeric alias.
+        for receipt in receipts[..count].iter().flatten() {
+            self.close_locked(&t, receipt.fd)?;
+        }
+        Ok(count)
     }
     /// CLOSE_RANGE_UNSHARE: prepare a private successor without changing the
     /// old CLONE_FILES table. The venue must atomically publish the returned ID
@@ -2327,6 +2448,17 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     pub fn pinned(&self, pin: &OfdPin) -> Result<Description, Error> {
         self.check_pin(pin)?;
         self.snapshot(pin.key.index)
+    }
+
+    /// Read sticky cleanup effects from an exact retained incarnation. A
+    /// pre-removal numeric snapshot cannot authorize skipping later effects.
+    pub fn pinned_close_effects(&self, pin: &OfdPin) -> Result<CloseEffects, Error> {
+        self.check_pin(pin)?;
+        Ok(CloseEffects::from_bits(
+            self.ofd(pin.key.index)?
+                .close_effects
+                .load(Ordering::Acquire),
+        ))
     }
 
     /// Admit a description before installing a numeric descriptor. The pin
