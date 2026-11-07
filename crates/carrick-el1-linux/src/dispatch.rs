@@ -992,17 +992,26 @@ enum NativeServiceStage {
 struct HostFileCopy<'a, V: file::MemoryValidator>(file::ValidatedCopy<'a, V>);
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+impl<V: file::MemoryValidator> carrick_core::user_copy::UserCopy for HostFileCopy<'_, V> {
+    fn copy_in(
+        &mut self,
+        dst: &mut [u8],
+        src: carrick_guest_arch::UserVa,
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::UserCopy::copy_in(&mut self.0, dst, src)
+    }
+    fn copy_out(
+        &mut self,
+        dst: carrick_guest_arch::UserVa,
+        src: &[u8],
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::UserCopy::copy_out(&mut self.0, dst, src)
+    }
+}
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::HostFileUser
     for HostFileCopy<'_, V>
 {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> carrick_core::user_copy::CopyOutcome {
-        carrick_core::user_copy::UserCopy::copy_in(
-            &mut self.0,
-            dst,
-            carrick_guest_arch::UserVa::new(src),
-        )
-    }
-
     fn writable(&mut self, dst: u64, len: usize) -> usize {
         self.0.validator.writable_bytes(dst, len)
     }

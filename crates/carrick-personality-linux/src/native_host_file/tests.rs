@@ -7,8 +7,9 @@ struct Memory {
     bytes: Vec<u8>,
     writable: bool,
 }
-impl HostFileUser for Memory {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> CopyOutcome {
+impl carrick_core::user_copy::UserCopy for Memory {
+    fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> CopyOutcome {
+        let src = src.raw();
         let Some(start) = src.checked_sub(self.base) else {
             return CopyOutcome::Fault;
         };
@@ -21,6 +22,15 @@ impl HostFileUser for Memory {
             None => CopyOutcome::Fault,
         }
     }
+    fn copy_out(
+        &mut self,
+        _: carrick_guest_arch::UserVa,
+        _: &[u8],
+    ) -> carrick_core::user_copy::CopyOutcome {
+        panic!("staging does not copy output bytes")
+    }
+}
+impl HostFileUser for Memory {
     fn writable(&mut self, dst: u64, len: usize) -> usize {
         if !self.writable {
             return 0;
@@ -965,8 +975,9 @@ fn file_staging_not_yet_input_builds_no_request_before_supply() {
         pending: Option<u64>,
         refused: usize,
     }
-    impl HostFileUser for LazyInput {
-        fn copy_in(&mut self, dst: &mut [u8], src: u64) -> CopyOutcome {
+    impl carrick_core::user_copy::UserCopy for LazyInput {
+        fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> CopyOutcome {
+            let src = src.raw();
             if self.pending == Some(src) {
                 self.pending = None;
                 self.refused += 1;
@@ -976,8 +987,18 @@ fn file_staging_not_yet_input_builds_no_request_before_supply() {
                     access: Access::Read,
                 });
             }
-            self.memory.copy_in(dst, src)
+            self.memory
+                .copy_in(dst, carrick_guest_arch::UserVa::new(src))
         }
+        fn copy_out(
+            &mut self,
+            _: carrick_guest_arch::UserVa,
+            _: &[u8],
+        ) -> carrick_core::user_copy::CopyOutcome {
+            panic!("staging does not copy output bytes")
+        }
+    }
+    impl HostFileUser for LazyInput {
         fn writable(&mut self, _: u64, _: usize) -> usize {
             panic!("write input may be read-only");
         }
@@ -1045,15 +1066,26 @@ fn ppoll_input_preserves_fault_and_exact_owner_request() {
         address: u64,
         outcome: Option<CopyOutcome>,
     }
-    impl HostFileUser for RefusedInput {
-        fn copy_in(&mut self, dst: &mut [u8], src: u64) -> CopyOutcome {
+    impl carrick_core::user_copy::UserCopy for RefusedInput {
+        fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> CopyOutcome {
+            let src = src.raw();
             if src == self.address
                 && let Some(outcome) = self.outcome.take()
             {
                 return outcome;
             }
-            self.memory.copy_in(dst, src)
+            self.memory
+                .copy_in(dst, carrick_guest_arch::UserVa::new(src))
         }
+        fn copy_out(
+            &mut self,
+            _: carrick_guest_arch::UserVa,
+            _: &[u8],
+        ) -> carrick_core::user_copy::CopyOutcome {
+            panic!("staging does not copy output bytes")
+        }
+    }
+    impl HostFileUser for RefusedInput {
         fn writable(&mut self, dst: u64, len: usize) -> usize {
             self.memory.writable(dst, len)
         }
