@@ -87,11 +87,6 @@ pub fn resolve_shebang(
 /// readable match in the dispatcher's rootfs. A name with `/` is left as-is. This
 /// applies ONLY to the initial entrypoint; the guest's own `execve(2)` keeps
 /// full-path semantics. Shared by the macOS (HVF) and KVM run paths.
-//
-// The OCI/entrypoint run path is live on macOS (HVF) and aarch64-KVM (`run_oci`)
-// but not yet wired on x86_64-KVM, where `run_oci` is a stub until OCI-x86 lands
-// — so this is legitimately unused ONLY on the x86_64 platform-linux build.
-#[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
 pub fn resolve_entrypoint_path(
     path: &str,
     env: &[String],
@@ -123,7 +118,6 @@ pub fn resolve_entrypoint_path(
 /// command, then resolve any `#!` shebang to its interpreter, so a script
 /// entrypoint runs like Docker/`execve(2)`. Returns the final (program path,
 /// argv as opaque Linux-ABI bytes). Shared by both backends.
-#[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
 pub fn resolve_entrypoint_program(
     path: &str,
     env: &[String],
