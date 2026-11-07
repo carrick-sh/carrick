@@ -6019,129 +6019,13 @@ fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
 }
 
 #[test]
-fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
-    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let (control, record) = imported_thread_with_identity(fixture, |_| {});
-    let mut service = fixture.process_service();
-    fixture
-        .enter(
-            fixture.control,
-            fixture_ttbr0(fixture),
-            &mut service,
-            |_| (),
-        )
-        .unwrap();
-    run_as(fixture, 42, 12, 102, control);
-    assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
-        record.id
-    );
-    // Every glibc/musl thread registers a robust list at start.
-    // This preservation control needs a readable head: a terminal head
-    // fault now completes cleanup instead of requesting host custody.
-    let robust_head = carrick_test_support::GuestUserBuffer::from_values(&[0_u64; 3]);
-    let robust_address = robust_head.arg();
-    let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.x[0] = robust_address;
-    frame.x[1] = 24;
-    frame.x[8] = 99; // set_robust_list
-    let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
-    assert_eq!(
-        route,
-        carrick_personality_linux::dispatch::CompletionRoute::WithWork
-    );
-    assert_eq!(frame.x[0], 0);
-    assert_eq!(control.robust_list().0, robust_address);
-    // The in-ring exit declines (no robust-list walker here) with a live
-    // sibling: the host walks the list and retires the thread.
-    frame.x = [0; 31];
-    frame.x[8] = 93;
-    let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
-    assert_eq!(
-        route,
-        carrick_personality_linux::dispatch::CompletionRoute::HostCustody
-    );
-    assert_eq!(
-        arm_route_action(fixture, route, &mut frame),
-        carrick_el1_abi::Action::HostCustody
-    );
-    assert_eq!(frame.x[0], 0, "never rewritten to -ENOSYS");
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-    assert!(registry().for_record(fixture.zone, record).is_some());
-    assert!(control.host_exit_requested());
-    fixture.zone.clear_current(fixture.slot);
-    assert!(leader_sees_thread(fixture, &mut service, 42));
-    let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
-        carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-        carrick_core_abi::entry::BirthSerial::of_task(
-            carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
-        ),
-        carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
-    )
-    .unwrap();
-    carrick_el1_abi::Lifecycle::reserve_nonfinal_exit(fixture.page)
-        .unwrap()
-        .publish();
-    fixture
-        .page
-        .publish_exact_host_retirement(control, receipt.retirement());
-    run_as_leader(fixture);
-    registry()
-        .for_entry(
-            BornInZoneSource {
-                zone: fixture.zone,
-                slot: fixture.slot,
-            },
-            &fixture.task,
-            fixture.address,
-        )
-        .unwrap();
-    fixture.zone.free_record(record.id);
-    assert!(!leader_sees_thread(fixture, &mut service, 42));
-    assert!(leader_sees_thread(fixture, &mut service, 41));
+fn arm_two_live_threads_empty_robust_exit_finishes_in_zone() {
+    raw_exit_empty_robust_head(false);
 }
 
 #[test]
-fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
-    use carrick_el1_abi::Lifecycle;
-    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let (control, record) = imported_thread_with_identity(fixture, |_| {});
-    let mut service = fixture.process_service();
-    fixture
-        .enter(
-            fixture.control,
-            fixture_ttbr0(fixture),
-            &mut service,
-            |_| (),
-        )
-        .unwrap();
-    run_as(fixture, 42, 12, 102, control);
-    assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
-        record.id
-    );
-    // A failed clear_child_tid copy is checked only after the nonfinal
-    // membership reservation. The host must still see both page memberships.
-    let mut child_tid = 42_u32;
-    control.set_clear_child_tid((&raw mut child_tid).addr() as u64);
-    let live = fixture.page.live();
-    let entry = control.entry().unwrap();
-    let state = fixture.page.state(entry.index());
-    let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.x[8] = 93;
-    super::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-    let route = arm_call(fixture, control, &mut service, &mut frame);
-    super::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
-    let route = route.unwrap();
-    assert_eq!(
-        route,
-        carrick_personality_linux::dispatch::CompletionRoute::HostCustody
-    );
-    assert_eq!(fixture.page.live(), live);
-    assert_eq!(child_tid, 42);
-    fixture.zone.clear_current(fixture.slot);
-    assert_eq!(fixture.page.state(entry.index()), state);
-    assert!(leader_sees_thread(fixture, &mut service, 42));
+fn arm_raw_exit_terminal_clear_fault_consumes_membership() {
+    raw_exit_clear_tid(1 << 47, false, false);
 }
 
 #[cfg(test)]
@@ -6348,6 +6232,23 @@ fn arm_raw_exit_empty_robust_head_retires_adopted_thread() {
 #[test]
 fn arm_raw_exit_empty_robust_head_retires_unadopted_thread() {
     raw_exit_empty_robust_head(true);
+}
+
+#[test]
+fn arm_raw_exit_robust_pending_entry_is_processed_once() {
+    for unadopted in [false, true] {
+        let mut head = carrick_test_support::GuestUserBuffer::from_values(&[0_u64; 3]);
+        let mut first = carrick_test_support::GuestUserBuffer::from_values(&[0_u64, 0x8000_002a]);
+        let mut pending = carrick_test_support::GuestUserBuffer::from_values(&[0_u64, 0x8000_002a]);
+        head.set(0, first.arg());
+        head.set(1, 8_u64);
+        head.set(2, pending.arg());
+        first.set(0, pending.arg());
+        pending.set(0, head.arg());
+        raw_exit_robust_head(unadopted, head.arg(), false);
+        assert_eq!(first.get::<u32>(2), 0xc000_0000);
+        assert_eq!(pending.get::<u32>(2), 0xc000_0000);
+    }
 }
 
 #[test]

@@ -380,6 +380,30 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         }
         Ok(())
     }
+    fn terminal_access(
+        &mut self,
+        _mm: &Self::Mm,
+        mut access: carrick_core::terminal::TerminalAccess<'_>,
+    ) -> Result<(), NativeProcessError> {
+        let address = access.address();
+        if let Some(error) = self.child_copy_error
+            && self
+                .child_copy_error_at
+                .is_none_or(|at| at == address.raw())
+        {
+            return Err(error);
+        }
+        let task = CurrentTask::new();
+        let mut copy = crate::file::ValidatedCopy {
+            task: &task,
+            validator: &crate::file::HardwareValidator,
+        };
+        if access.perform(&mut copy, address, access.len().raw()) {
+            Ok(())
+        } else {
+            Err(NativeProcessError::Fault)
+        }
+    }
     fn copy_owned_bytes(
         &mut self,
         mm: &Self::Mm,
@@ -6427,3 +6451,6 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
     ));
     assert!(take_signal_copies().is_empty());
 }
+
+#[path = "tests/thread_cleanup.rs"]
+mod thread_cleanup_tests;

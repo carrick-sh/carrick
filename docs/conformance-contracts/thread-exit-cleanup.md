@@ -1,99 +1,48 @@
-# Thread exit cleanup (#1724): terminal copy faults
+# Thread exit cleanup (#1724)
 
 Contract: `kernel.el1.thread-lifecycle`.
 
-Linux's `set_tid_address(2)` contract describes clearing the registered word
-and waking one futex waiter at thread exit. The clear is best effort: a
-terminal write fault cannot return an errno from raw `exit` or cancel thread
-retirement. The wake remains owed even when the write faults.
+Linux's `set_tid_address(2)` and `get_robust_list(2)` describe best-effort
+terminal memory accesses. A bad robust head ends the walk; a bad robust word
+is skipped after retaining its successor. A bad clear-TID store must never
+return an errno from exit. This contract also requires one TID wake after
+settling that store.
 
-Authority: https://man7.org/linux/man-pages/man2/set_tid_address.2.html
+The neutral `ThreadCleanup<P>` retains the exact execution binding, entry
+incarnation, original status and personality cursor. The native pending table
+keys it by `RecordRef`, including its incarnation. Both ordinary native entry
+and service re-entry consume it before user execution. Linux owns the robust
+list's 24-byte header, successor, pending entry, 2048-entry cycle bound and
+owner-death CAS policy. The successor is read before touching each futex.
+Pending entries present in the list are processed once at the end. PI entries
+remain outside the non-PI CAS protocol; this change does not implement PI
+futex ownership.
 
-This first slice distinguishes terminal `CopyOutcome::Fault` from
-`CopyOutcome::NotYet` in the existing shared nonfinal exit path. A terminal
-fault completes the store obligation, then the existing wake and exact-address
-progress publication run before scheduler retirement. The ARM/common dispatch
-adapter rejects a range outside `carrick_guest_arch::lower_half_range` as
-terminal Fault, since no backing producer can make that range a user address.
-The shared personality exit policy also serves CPL0. No ABI layout changes.
+`MmPortal::access_user_target` uses the same selection, supply and exact-MM
+fence as byte writes. ARM and x86 perform aligned atomic accesses while that
+fence remains alive. Preparation alone never authorizes an unfenced CAS.
+The service cell owns backing supply or the existing MM producer wait. A
+terminal payload is exempt from cancellation by the very process exit it is
+finishing. A refusal consumes the current cursor phase as Fault; Supplied
+resumes that phase. Neither result becomes a user errno or syscall replay.
+No editor, transfer fence or scheduler bucket survives a park.
 
-The production ARM witness runs with both adopted and native-owned records (the latter has no host adopter and
-sets the production exit adapter's `unadopted` flag). The
-shared-policy witness starts a real futex joiner, refuses the clear-store,
-requires unchanged user bytes, one additional scheduler wake, one remaining
-live thread, and selection of the joiner with return value zero. Both witnesses
-were red on admitted main. The structural bound is one four-byte store attempt
-and one wake, with no copy retry on a terminal fault. The existing NotYet
-handback witness remains in the suite as a preservation control.
+After cleanup, the existing neutral membership and scheduler retirement
+transactions settle the member. A member which becomes last during cleanup
+enters process exit with its original status. Terminal group workers use the
+same cleanup before publishing their member receipt. A completed TID wake is
+not repeated when a later terminal step resumes.
 
-## Still required for #1724
+The original seven production ARM witnesses were red before this round and
+green in its first native run. Additional production bindings cover resident
+robust entries and a pending operation, real TID waiters, adopted and
+native-owned threads, owner Gate waits, and refused service replies. The
+structural bound is one header, one successor read per examined entry, one
+successful owner-death update and wake per owned word, and one clear-TID wake.
+A faulting word cannot pin the cursor. Each successful physical supply must
+advance its existing bounded MM transfer.
 
-This slice does **not** implement parking. NotYet still takes main's handback,
-and a readable registered robust list still declines before any in-ring mutation.
-Consequently this slice does not satisfy the issue's full acceptance criteria.
-
-The next slice consumes a terminal fault reading the robust-list head and
-continues to clear-TID and retirement. Both adopted and native-owned production
-ARM records must retire on a noncanonical head. A shared ARM/x86 policy witness
-also refuses scheduler release after the clear-TID wake, then re-enters exit:
-the terminal head fault must not prevent retirement or replay that wake. The
-head read is bounded to the 24-byte Linux ABI header; no robust futex update is
-attempted when that header faults. ARM/common copy-in now classifies non-user
-ranges as terminal faults, matching copy-out. Canonical unavailable memory
-continues to need the retained owner described below.
-
-A parked exit needs an exact-thread owned terminal continuation, not generic
-`wait_guest_copy`/syscall redispatch. That owner must retain the original exit
-status and cleanup phase through changes to signal state, the lifecycle gate,
-and the last-thread decision. A refused fault supply must become a consumed
-fault of the exact cleanup attempt and advance its cursor; it must neither
-install `-14` in user registers nor endlessly reissue the same fault.
-
-Robust owner-death handling additionally needs an atomic guest-word operation
-under the existing exact-MM transfer fence. Main has no robust walker and no
-user-word compare-exchange operation. `prepare_user_write` followed by a raw
-CAS is insufficient: preparation has already dropped that fence. The existing
-`MmPortal::write_user_target`/`UserWriteVenue::copy` fence is the appropriate
-venue for that operation, with shared policy and true ISA access mechanics.
-A cursor must retain the next list link before an entry's owner-death update,
-handle pending entries once, bound malformed cycles, skip terminal faults and
-never replay a completed wake when a later copy parks.
-
-VM-free evidence for the terminal-fault slice does not establish actual
-backing supply, signed execution, robust-list semantics or runtime ratios.
-HVF/Docker acceptance and owned-parking/robust witnesses remain outstanding.
-
-## Finishing-round production witnesses
-
-The unavailable-head and empty-head raw-exit bindings use the same real
-`arm_call` dispatch as the terminal-fault controls, with both adopted and
-native-owned records and a second live thread. The empty head is registered
-user storage whose first link points back to itself; the unavailable head is
-registered storage with a guarded-copy refusal injected at the production
-copy boundary. The empty-head rows require in-zone retirement and a consumed live membership.
-Unavailable-copy rows require terminal custody at admission and no host-exit
-request; they do not require retirement before a backing reply is consumed.
-These are acceptance assertions, not preservation assertions for the existing
-handback.
-
-The unavailable-clear-TID raw-exit bindings similarly require terminal custody
-at admission. They do not yet drive backing supply or its refusal. The exit-group worker binding starts the
-leader's actual `exit_group(7)` while the worker lives, then drive that worker
-through production service admission and terminal retirement. Before the close
-owner completes, the worker must have settled its resident
-clear-TID obligation, including the actual user word rather than only the
-slot's bookkeeping. Existing no-clear and retained-IPC rows remain controls.
-
-These witnesses alone do not implement the exact-thread terminal owner,
-exercise a robust entry's atomic owner-death update, prove exactly-once wakeups
-for parked copies, or confer signed acceptance. They must become green through
-the retained owner rather than by accepting HostCustody, returning errno 14,
-or treating NotYet as Fault.
-
-The production clear-TID terminal-fault control must register an address the
-slot actually retains. `u64::MAX` is normalized to `ClearChildTidState::None`
-and therefore never reaches copyout. The control now uses `1 << 47`, below the
-slot codec's `1 << 48` bound but outside the guest lower-half copy domain, and
-asserts that the slot retained the exact address before dispatch. The shared
-policy's injected-Fault/joiner witness remains the separate exactly-once wake
-check.
+Acceptance still requires the final focused suites and independent review.
+VM-free observations do not establish signed HVF execution, live KVM backing
+supply, a Docker comparison or a runtime ratio. Those gates must be recorded
+separately; no signed acceptance is claimed by this note.

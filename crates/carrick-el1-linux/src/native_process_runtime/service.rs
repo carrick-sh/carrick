@@ -150,6 +150,7 @@ pub(super) struct AdapterPreparation {
 enum ServicePayload<'a> {
     None,
     Copyin,
+    Terminal,
     Copyout(OwnedCopyout),
     Adapter,
     Exec(Box<[u8]>),
@@ -165,6 +166,7 @@ pub(super) struct PendingService<'a> {
     host_file: Option<PendingHostFile<'a>>,
     copyout: Option<Box<OwnedCopyout>>,
     copyin: bool,
+    terminal: bool,
     adapter: bool,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     retry_syscall_after_supply: bool,
@@ -181,6 +183,7 @@ impl PendingService<'_> {
     fn signal_interruptible(&self) -> bool {
         self.copyout.is_none()
             && !self.copyin
+            && !self.terminal
             && !self.adapter
             && !matches!(self.request.operation, ServiceOperation::CarrierWork { .. })
     }
@@ -348,7 +351,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .lock()
             .service_wait(&record)
             .filter(|pending| {
-                pending.signal_interruptible() || pending.claim.cancellation().is_some()
+                !pending.terminal
+                    && (pending.signal_interruptible() || pending.claim.cancellation().is_some())
             })
             .map(|pending| (pending.request, pending.control.clone(), pending.adapter));
         let Some((request, control, adapter)) = pending else {
@@ -786,6 +790,45 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceCompletion::RetrySyscall,
         )
     }
+    /// The terminal owner, rather than a syscall retry, consumes this reply.
+    pub(super) fn begin_terminal_copy(
+        &mut self,
+        request: carrick_core::user_copy::GuestCopyRequest,
+        error: NativeProcessError,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let (operation, sequence, wait) = match error {
+            NativeProcessError::OwnerWait(wait) => (
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None,
+                Some(wait),
+            ),
+            NativeProcessError::Busy => (
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None,
+                None,
+            ),
+            NativeProcessError::Unsupported => {
+                let (mut fault, sequence) = self
+                    .service
+                    .copyout_fault(request.address)
+                    .ok_or(NativeProcessError::Unsupported)?;
+                fault.access = request.access;
+                (ServiceOperation::Fault(fault), Some(sequence), None)
+            }
+            error => return Err(error),
+        };
+        self.begin_service_inner(
+            operation,
+            sequence,
+            wait,
+            ServicePayload::Terminal,
+            ServiceCompletion::OwnerCheckpoint,
+        )
+    }
     /// Supply readable memory for a guest-copy input, then
     /// retry the exact SVC before any setup effect. A refused supply becomes
     /// `EFAULT` from the copy rather than a user data-abort signal.
@@ -1145,8 +1188,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<PreparedService, NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
         let copyin = matches!(&payload, ServicePayload::Copyin);
+        let terminal = matches!(&payload, ServicePayload::Terminal);
+        if terminal && !self.runtime.graph.lock().pending.has_cleanup(self.record) {
+            return Err(NativeProcessError::Quarantined);
+        }
         let (payload, copyout, adapter) = match payload {
-            ServicePayload::Copyin => (ServicePayload::None, None, false),
+            ServicePayload::Copyin | ServicePayload::Terminal => {
+                (ServicePayload::None, None, false)
+            }
             ServicePayload::Copyout(output) => {
                 (ServicePayload::None, Some(Box::new(output)), false)
             }
@@ -1163,7 +1212,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Stale);
             }
             (_, ServicePayload::None) => (None, None),
-            (_, ServicePayload::Copyout(_) | ServicePayload::Copyin | ServicePayload::Adapter) => {
+            (
+                _,
+                ServicePayload::Copyout(_)
+                | ServicePayload::Copyin
+                | ServicePayload::Terminal
+                | ServicePayload::Adapter,
+            ) => {
                 return Err(NativeProcessError::Stale);
             }
         };
@@ -1293,7 +1348,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut closing = false;
         let published = {
             let graph = self.runtime.graph.lock();
-            if !claim.admitted() {
+            if !claim.admitted() && !terminal {
                 // Close publishes its gate and pending operation under this
                 // lock. A terminal gate without that owner is broken custody.
                 closing = graph.pending.has_exit(&self.key);
@@ -1372,6 +1427,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 host_file,
                 copyout,
                 copyin,
+                terminal,
                 adapter,
                 exec_successor,
                 retry_syscall_after_supply,
@@ -1551,9 +1607,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .lock()
                     .service_wait(&self.record)
                     .is_some_and(PendingService::signal_interruptible);
-                if ((interruptible && self.signal_interrupts_current())
-                    || self.runtime.graph.lock().pending.has_exit(&self.key))
-                    && let Err(error) = self.control.service.cancel(request.identity)
+                if ((interruptible && self.signal_interrupts_current()) || {
+                    let graph = self.runtime.graph.lock();
+                    graph.pending.has_exit(&self.key)
+                        && !graph
+                            .service_wait(&self.record)
+                            .is_some_and(|pending| pending.terminal)
+                }) && let Err(error) = self.control.service.cancel(request.identity)
                 {
                     failure = Some(service_protocol_error(error));
                     return Err(ObjectWaitError::Stale);
@@ -1806,10 +1866,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             )
                         },
                     );
-                if output_cancelled
-                    || (interruptible && self.signal_interrupts_current())
-                    || self.runtime.graph.lock().pending.has_exit(&self.key)
-                {
+                if output_cancelled || (interruptible && self.signal_interrupts_current()) || {
+                    let graph = self.runtime.graph.lock();
+                    graph.pending.has_exit(&self.key)
+                        && !graph
+                            .service_wait(&self.record)
+                            .is_some_and(|pending| pending.terminal)
+                } {
                     self.control
                         .service
                         .cancel(request.identity)
@@ -2503,9 +2566,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(NativeProcessError::Quarantined);
         }
         let retry_syscall_after_supply = pending.retry_syscall_after_supply;
-        let exiting = self.runtime.graph.lock().pending.has_exit(&self.key)
-            || ((pending.copyout.is_some() || pending.copyin)
-                && pending.claim.cancellation().is_some());
+        let exiting = !pending.terminal
+            && (self.runtime.graph.lock().pending.has_exit(&self.key)
+                || ((pending.copyout.is_some() || pending.copyin)
+                    && pending.claim.cancellation().is_some()));
         if (exiting || result == ServiceResult::Cancelled)
             && let Some(PendingServiceReply::Fault(reply)) = &pending.reply
         {
@@ -2649,6 +2713,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .zone
                 .record(self.record.id)
                 .consume_owner_continuation();
+        }
+        if pending.terminal {
+            if result != ServiceResult::Supplied {
+                let mut graph = self.runtime.graph.lock();
+                let mut owner = graph
+                    .pending
+                    .take_cleanup(self.record)
+                    .ok_or(NativeProcessError::Quarantined)?;
+                owner
+                    .resume(self.binding)
+                    .ok_or(NativeProcessError::Stale)?
+                    .refuse_copy();
+                graph.pending.put_cleanup(self.record, owner);
+            }
+            self.release_service_claim(pending.claim)?;
+            return Ok(NativeResume::NoPending);
         }
         let output = pending.copyout.take();
         if pending.adapter {

@@ -32,6 +32,21 @@ pub(super) fn install_raw_exit_before_commit_hook(
     hooks.push((page_address, hook));
 }
 
+#[cfg(test)]
+pub(super) fn run_raw_exit_before_commit_hook(page: &ThreadLifecyclePage) {
+    let page_address = page as *const _ as usize;
+    let hook = {
+        let mut hooks = RAW_EXIT_BEFORE_COMMIT_HOOK.lock();
+        hooks
+            .iter()
+            .position(|(page, _)| *page == page_address)
+            .map(|index| hooks.swap_remove(index).1)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 impl<
     'a,
     F: Fn(u32) -> *mut u8,
@@ -319,6 +334,17 @@ impl<
     }
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.exit_group(status))
+    }
+    fn process_exit_thread(
+        &mut self,
+        status: carrick_sched_core::process::TerminationStatus,
+    ) -> Option<LifecycleOutcome> {
+        let unadopted = self.exit_record().is_some_and(|record| record.unadopted);
+        let mut outcome = self.process_venue()?.exit_thread(status)?;
+        if unadopted {
+            self.run_ready_after_native_transfer(&mut outcome);
+        }
+        Some(outcome)
     }
     fn process_exit_binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
         let binding = LifecycleNative::binding(self)?;
@@ -681,20 +707,14 @@ impl<
             .ok();
         #[cfg(test)]
         if self.handoff.is_some() {
-            let page_address =
-                task.metadata
+            let page = unsafe {
+                &*(task
+                    .metadata
                     .lifecycle_page
-                    .load(core::sync::atomic::Ordering::Acquire) as usize;
-            let hook = {
-                let mut hooks = RAW_EXIT_BEFORE_COMMIT_HOOK.lock();
-                hooks
-                    .iter()
-                    .position(|(page, _)| *page == page_address)
-                    .map(|index| hooks.swap_remove(index).1)
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    as *const ThreadLifecyclePage)
             };
-            if let Some(hook) = hook {
-                hook();
-            }
+            run_raw_exit_before_commit_hook(page);
         }
         self.handoff.is_some()
     }

@@ -660,6 +660,11 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             // process venue before retaining its signal publisher's snapshot.
             frame.x[8] = 178;
             loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters);
+            assert_eq!(
+                fixture.zone.slot(fixture.slot).current(),
+                Some(record.id),
+                "gettid admission must retain the selected record"
+            );
             if case == ChildStockCase::Pinned
                 || (case == ChildStockCase::Exiting && page.live() > 2)
             {
@@ -772,13 +777,25 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             }
             frame.x[8] = 93;
             frame.x[0] = 0;
+            let exit_route = loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters);
             assert_ne!(
-                loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters),
+                exit_route,
                 carrick_personality_linux::dispatch::CompletionRoute::Forward
             );
             assert!(
                 fixture.zone.live(record).is_none(),
-                "raw exit must release the actual scheduler record"
+                "raw exit must release the actual scheduler record: route={exit_route:?}, entry={:?}, host_exit={}, page_live={}",
+                unsafe {
+                    &*(fixture.zone.record(record.id).identity().control_slot
+                        as *const ThreadControlSlot)
+                }
+                .entry(),
+                unsafe {
+                    &*(fixture.zone.record(record.id).identity().control_slot
+                        as *const ThreadControlSlot)
+                }
+                .host_exit_requested(),
+                page.live(),
             );
         }
         assert_eq!(page.live(), 1);

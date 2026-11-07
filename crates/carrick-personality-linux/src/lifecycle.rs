@@ -254,6 +254,10 @@ pub enum ThreadBirthAdmission {
 
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
     /// The admitted process graph owns root identity; namespace PID 1 does not.
+    /// Exact native owner for nonfinal exit cleanup, including memory parks.
+    fn exit_thread(&mut self, _status: TerminationStatus) -> Option<LifecycleOutcome> {
+        None
+    }
     fn is_root_process(&self) -> bool;
     /// Resume this exact thread's retained operation before a new syscall is
     /// dispatched. Readiness alone cannot authorize a user return.
@@ -585,6 +589,9 @@ pub trait LifecycleNative<'a>: UserCopy {
         None
     }
     /// Exact retained process owner for an adopted thread's terminal handoff.
+    fn process_exit_thread(&mut self, _status: TerminationStatus) -> Option<LifecycleOutcome> {
+        None
+    }
     fn process_exit_binding(&self) -> Option<ExecutionBinding> {
         None
     }
@@ -867,6 +874,11 @@ pub fn invoke<'a>(
             if !native.has_scheduler() {
                 native.record_decline(LifecycleDecline::ExitScheduler);
                 return None;
+            }
+            if let Some(outcome) =
+                native.process_exit_thread(TerminationStatus::exited(args[0] as u32))
+            {
+                return Some(outcome);
             }
             if let Some((progress, result)) = serve_exit(thread, native) {
                 Some(LifecycleOutcome::Transferred {
