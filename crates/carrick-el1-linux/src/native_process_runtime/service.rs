@@ -1187,7 +1187,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             (ServiceOperation::HostFile { .. }, ServicePayload::HostFile(pending)) => {
                 (None, Some(pending))
             }
-            (ServiceOperation::Exec { .. } | ServiceOperation::HostFile { .. }, _)
+            (
+                ServiceOperation::Exec { .. }
+                | ServiceOperation::HostFile { .. }
+                | ServiceOperation::Entropy { .. },
+                _,
+            )
             | (_, ServicePayload::Exec(_) | ServicePayload::HostFile(_)) => {
                 return Err(NativeProcessError::Stale);
             }
@@ -1554,7 +1559,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => OwnerEntry::Exception,
             ServiceOperation::Crossing { .. }
             | ServiceOperation::Exec { .. }
-            | ServiceOperation::HostFile { .. } => OwnerEntry::Syscall,
+            | ServiceOperation::HostFile { .. }
+            | ServiceOperation::Entropy { .. } => OwnerEntry::Syscall,
             ServiceOperation::CarrierWork { entry } => entry,
         };
         let mut completion = None;
@@ -2564,7 +2570,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             }
                             ServiceOperation::Crossing { .. }
                             | ServiceOperation::Exec { .. }
-                            | ServiceOperation::HostFile { .. } => OwnerEntry::Syscall,
+                            | ServiceOperation::HostFile { .. }
+                            | ServiceOperation::Entropy { .. } => OwnerEntry::Syscall,
                             ServiceOperation::CarrierWork { entry } => entry,
                         }
                     });
@@ -2737,7 +2744,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
                     Err(NativeProcessError::Quarantined)
                 }
-                (ServiceOperation::Crossing { .. }, ServiceResult::Refused) => {
+                (ServiceOperation::Entropy { .. }, ServiceResult::Supplied) => {
+                    // No retained entropy payload has been admitted here yet.
+                    Err(NativeProcessError::Quarantined)
+                }
+                (ServiceOperation::Entropy { .. }, ServiceResult::Cancelled) => {
+                    Ok(NativeResume::Returned(SyscallResult::from_errno(
+                        carrick_syscall_abi::LINUX_EINTR,
+                    )))
+                }
+                (ServiceOperation::Entropy { .. }, ServiceResult::Refused)
+                | (ServiceOperation::Crossing { .. }, ServiceResult::Refused) => {
                     Ok(NativeResume::Returned(SyscallResult::new(
                         carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
                     )))
