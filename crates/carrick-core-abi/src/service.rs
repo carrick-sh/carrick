@@ -1,5 +1,6 @@
 //! Exact native service operations. The ring retains semantic custody until
 //! an exact completion or cancellation acknowledgment is consumed.
+pub mod entropy;
 use crate::{El1MmHandle, EntryThreadGeneration, ReservationMm, SnapshotGeneration};
 use carrick_guest_arch::{Access, FaultInfo, GuestLen, GuestVa, NativeOrdinal};
 use carrick_sched_core::{RecordRef, object_wait::OwnerEntry, process::TaskKey};
@@ -124,6 +125,11 @@ pub struct NativeException {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceOperation {
+    /// Bounded ring-owned entropy request/reply. The authenticated member is
+    /// the authority; no file or loader capability is involved.
+    Entropy {
+        payload: entropy::EntropyPayloadDescriptor,
+    },
     Fault(FaultInfo),
     Exception(NativeException),
     Crossing {
@@ -1239,6 +1245,9 @@ impl ServiceCell {
             return Err(ServiceError::Exhausted);
         };
         let (kind, first, second) = match operation {
+            ServiceOperation::Entropy { payload } => {
+                (7, payload.address().raw(), payload.length().raw())
+            }
             ServiceOperation::Fault(fault) => (1, fault_bits(fault), fault.address.raw()),
             ServiceOperation::Crossing { ordinal } => (2, ordinal.raw(), 0),
             ServiceOperation::CarrierWork { entry } => {
@@ -1423,6 +1432,17 @@ impl ServiceCell {
                     )
                     .ok_or(ServiceError::Stale)?,
                 },
+                7 if cell.result.load(Ordering::Relaxed) == 0
+                    && cell.wait_revision.load(Ordering::Relaxed) == 0 =>
+                {
+                    ServiceOperation::Entropy {
+                        payload: entropy::EntropyPayloadDescriptor::checked(
+                            GuestVa::new(first),
+                            GuestLen::new(cell.words[11].load(Ordering::Relaxed)),
+                        )
+                        .ok_or(ServiceError::Stale)?,
+                    }
+                }
                 _ => return Err(ServiceError::Stale),
             };
             let fault_sequence = if matches!(operation, ServiceOperation::Fault(_)) {
@@ -1482,6 +1502,12 @@ impl ServiceCell {
         }
         cell.lock_exact(state, request.identity)?;
         let operation_matches = match request.operation {
+            ServiceOperation::Entropy { payload } => {
+                cell.words[9].load(Ordering::Relaxed) == 7
+                    && cell.words[10].load(Ordering::Relaxed) == payload.address().raw()
+                    && cell.words[11].load(Ordering::Relaxed) == payload.length().raw()
+                    && cell.wait_revision.load(Ordering::Relaxed) == 0
+            }
             ServiceOperation::Fault(fault) => {
                 cell.words[9].load(Ordering::Relaxed) == 1
                     && cell.words[10].load(Ordering::Relaxed) == fault_bits(fault)
@@ -1957,6 +1983,114 @@ mod tests {
             access: Access::Write,
             present: true,
         })
+    }
+
+    #[test]
+    fn entropy_service_roundtrips_exact_ticket_and_settles_cancellation() {
+        for cancel in [false, true] {
+            let cell = ServiceCell::new();
+            let owner = birth(1, 7);
+            cell.bind(owner).unwrap();
+            let operation = ServiceOperation::Entropy {
+                payload: entropy::EntropyPayloadDescriptor::checked(
+                    GuestVa::new(0x4000_0000),
+                    GuestLen::new(40),
+                )
+                .unwrap(),
+            };
+            let request = cell
+                .publish(owner, SnapshotGeneration::INITIAL, operation, None)
+                .unwrap();
+            let mut stale = request;
+            stale.identity.birth.mm = birth(1, 8).mm;
+            assert!(matches!(cell.claim(stale), Err(ServiceError::Stale)));
+            let mut foreign = request;
+            foreign.operation = ServiceOperation::Entropy {
+                payload: entropy::EntropyPayloadDescriptor::checked(
+                    GuestVa::new(0x4000_1000),
+                    GuestLen::new(40),
+                )
+                .unwrap(),
+            };
+            assert!(matches!(cell.claim(foreign), Err(ServiceError::Stale)));
+            let ticket = cell.claim(request).unwrap();
+            assert_eq!(ticket.request().operation, operation);
+            if cancel {
+                assert_eq!(cell.cancel(request.identity), Ok(false));
+                assert_eq!(cell.consume(request.identity), Err(ServiceError::Busy));
+            }
+            assert!(ticket.complete(true).is_ok());
+            assert_eq!(
+                cell.consume(request.identity),
+                Ok(if cancel {
+                    ServiceResult::Cancelled
+                } else {
+                    ServiceResult::Supplied
+                })
+            );
+            assert!(cell.claim(request).is_err());
+        }
+    }
+
+    #[test]
+    fn entropy_notice_checks_bounded_descriptor_and_reserved_service_words() {
+        // None is the valid wire; every mutation must fail intake before
+        // exposing a payload address to the carrier.
+        for mutation in [
+            None,
+            Some((10, u64::MAX - 16)),
+            Some((11, 31)),
+            Some((11, 4129)),
+            Some((11, 1u64 << 32)),
+            Some((12, 1)),
+            Some((13, 1)),
+        ] {
+            let cell = ServiceCell::new();
+            let owner = birth(1, 1);
+            cell.bind(owner).unwrap();
+            let operation = ServiceOperation::Entropy {
+                payload: entropy::EntropyPayloadDescriptor::checked(
+                    GuestVa::new(0x4000_0000),
+                    GuestLen::new(40),
+                )
+                .unwrap(),
+            };
+            let request = cell
+                .publish(owner, SnapshotGeneration::INITIAL, operation, None)
+                .unwrap();
+            if let Some((index, value)) = mutation {
+                match index {
+                    12 => cell.result.store(value, Ordering::Relaxed),
+                    13 => cell.wait_revision.store(value, Ordering::Relaxed),
+                    _ => cell.words[index].store(value, Ordering::Relaxed),
+                }
+            }
+            let member = carrick_sched_core::ThreadIdentity {
+                tid: 1,
+                serial: owner.thread.raw(),
+                mm: owner.mm.mm().raw(),
+                generation: SnapshotGeneration::INITIAL.raw(),
+                ..Default::default()
+            };
+            // SAFETY: this local wire fixture retains its cell, exact member
+            // and immutable synthetic MM throughout intake and acknowledgment.
+            let ticket = unsafe {
+                ServiceCell::claim_notice(
+                    &cell,
+                    request.identity.into(),
+                    owner.mm.carrier(),
+                    member,
+                )
+            };
+            if mutation.is_some() {
+                assert!(matches!(ticket, Err(ServiceError::Stale)), "{mutation:?}");
+            } else {
+                let ticket = ticket.unwrap();
+                assert_eq!(ticket.request().operation, operation);
+                assert!(ticket.complete(true).is_ok());
+                assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Supplied));
+            }
+        }
     }
 
     fn exec_payload(address: u64, bytes: u64) -> ExecPayloadDescriptor {

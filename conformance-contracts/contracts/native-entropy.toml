@@ -16,11 +16,17 @@ vm_free = [
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_flags_use_linux_unsigned_int_width",
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_source_failure_preserves_uncommitted_destination",
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_later_source_failure_returns_only_committed_prefix",
+  "carrick-core-abi::service::entropy::tests::entropy_record_roundtrips_bounded_requests_and_replies",
+  "carrick-core-abi::service::entropy::tests::entropy_record_rejects_malformed_lengths_states_reserved_and_counts",
+  "carrick-core-abi::service::entropy::tests::entropy_descriptor_rejects_wrapped_null_and_unbounded_staging",
+  "carrick-core-abi::service::tests::entropy_service_roundtrips_exact_ticket_and_settles_cancellation",
+  "carrick-core-abi::service::tests::entropy_notice_checks_bounded_descriptor_and_reserved_service_words",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_requires_retained_ring_payload_before_notice",
 ]
 
 [bindings.unresolved]
-semantics = "The two VM-free witnesses are red and ignored pending implementation; errno 38 is a defect, not an accepted result. No native entropy service is implemented by this slice."
-structural = "Bounded staging and exact crossing counts require a typed entropy service and measured witnesses; the refusal tests do not prove them."
+semantics = "The two VM-free witnesses are red and ignored pending implementation; errno 38 is a defect, not an accepted result. The checked entropy protocol exists, but native payload admission and child completion remain unimplemented."
+structural = "The codec bounds each record to the existing copyout chunk limit, but retained staging and exact crossing counts still require the service owner and measured completion witnesses; the refusal tests do not prove them."
 x86 = "The ignored KVM cpl0_initial_mm tests serial_host_native_child_getrandom_default_returns_eight_bytes and serial_host_native_child_getrandom_nonblock_returns_eight_bytes exercise fork, child getrandom and parent wait through the production pool. Native Linux exits 8 for both flags, KVM exits 218 (-38 modulo 256). The x86 carrier still needs typed entropy transport; these are defect witnesses, not acceptance."
 embed_structural = "UNRUN (director): signed fork-child getrandom, node -e and openssl rand on the implementation head."
 docker = "UNRUN: native Linux differential for flags, EFAULT and accessible-prefix short reads."

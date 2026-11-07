@@ -86,9 +86,10 @@ control proves execution and result propagation, not entropy support.
 The routing request spans a new ABI and retained completion, rather than a
 new ordinal match. The existing production paths make the missing work concrete:
 
-- `carrick-core-abi::service::ServiceOperation` needs a typed entropy payload
-  and checked encoding/decoding. Its `Crossing` variant carries no arguments
-  or output, and `Supplied` is explicitly quarantined by native completion.
+- `carrick-core-abi::service::ServiceOperation::Entropy` now carries a checked
+  bounded staging descriptor. Its request/reply codec lives in
+  `service::entropy`. Native payload admission and completion remain open;
+  a `Supplied` entropy reply without that owner is quarantined.
 - `NativeProcess::begin_service_inner` in
   `carrick-el1-linux/src/native_process_runtime/service.rs` already owns
   service birth, exact member/MM authentication, terminal claims, cancellation
@@ -110,9 +111,9 @@ new ordinal match. The existing production paths make the missing work concrete:
   examples, currently file-specific and restricted to private file mappings.
   Both the CPL0 entry and carrier adapter need entropy transport.
 
-No entropy protocol, staging owner or carrier adapter is implemented here.
-The earlier root-handler fixes and these additional witnesses do not satisfy
-the issue's child-service acceptance criterion.
+The checked entropy protocol is implemented, but its staging owner and carrier
+adapters remain open. The protocol, earlier root-handler fixes and red
+witnesses do not satisfy the issue's child-service acceptance criterion.
 
 ## Transport design review constraints
 
@@ -159,3 +160,36 @@ bits and conflicting sources. The witness checks 54 combinations, requiring
 no preparation for zero lengths or invalid flags, one preparation for an
 eight-byte valid request, and an unchanged buffer suffix. This handler
 correction does not serve a native child's request.
+
+## Checked protocol checkpoint
+
+The neutral service cell assigns entropy operation kind 7. Its two payload
+words carry the ring staging address and exact record length; no file or exec
+capability is required. Intake rejects nonzero capability/sequence or separate
+reply-address words for this operation. The descriptor rejects null or wrapped
+addresses and records outside the 32-byte header through 4096-byte output bound.
+The address still needs exact-MM translation and retained backing at carrier
+intake; a valid descriptor alone grants no memory access.
+
+The little-endian record contains magic `CENT`, version 1, opaque 32-bit flags,
+output capacity, signed 64-bit result, state and a zero reserved word, followed
+by capacity bytes. The request has zero result and state; the reply has state
+one and a result in the Linux errno interval or zero through capacity. The
+codec refuses other states, nonzero reserved fields, mismatched lengths and
+impossible returned counts. It does not interpret Linux entropy flags or draw
+randomness. The carrier must fill output before publishing the reply and
+acknowledging the same ticket.
+
+VM-free controls cover record roundtrips, malformed records, invalid staging
+lengths, wrapped addresses, notice decoding, exact-MM mismatch, changed staging
+addresses and cancellation while a ticket is claimed. These are protocol
+controls, not child completion, retained-copyout or physical transport proof.
+Both ARM and x86 child witnesses remain ignored and the Node startup blocker
+remains unresolved. Socket and mmap sibling crossings are unchanged.
+
+Native admission explicitly rejects an entropy descriptor without retained
+ring payload ownership, before publishing any notice. The production-entry
+control `entropy_service_requires_retained_ring_payload_before_notice` covers
+that boundary. This guard must be replaced by authenticated retained payload
+admission when implementing the transport; accepting a descriptor alone would
+let its allocation disappear before the carrier acknowledges it.

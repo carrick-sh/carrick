@@ -4362,6 +4362,40 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
     );
 }
 
+#[test]
+#[cfg(test)]
+fn entropy_service_requires_retained_ring_payload_before_notice() {
+    use carrick_core_abi::service::{ServiceOperation, entropy::EntropyPayloadDescriptor};
+    let fixture = native_exec_fixture();
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let operation = ServiceOperation::Entropy {
+        payload: EntropyPayloadDescriptor::checked(
+            carrick_guest_arch::GuestVa::new(0x4000_0000),
+            carrick_guest_arch::GuestLen::new(40),
+        )
+        .unwrap(),
+    };
+    assert!(matches!(
+        entry.begin_service(operation, None),
+        Err(NativeProcessError::Stale)
+    ));
+    assert_eq!(fixture.task.service_notice.take(), Ok(None));
+}
+
 #[cfg(test)]
 fn completed_output_busy_yields(in_preparation: bool) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
