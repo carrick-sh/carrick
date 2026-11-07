@@ -5265,3 +5265,264 @@ fn unmanaged_thread_birth_reusing_freed_record_does_not_observe_stale_mm() {
         "reused record must carry caller MM, never a freed predecessor's MM"
     );
 }
+
+/// Native owner admission plus the full Linux entry pipeline, with only the
+/// physical descriptor venue substituted. Host instruction execution below is
+/// a VM-free backing check, not evidence of guest TLB or VMM execution.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_owner_noreserve_code_range_writes_and_executes() {
+    use carrick_el1::memory::{AnonymousCall, AnonymousCallView, DelegatedAnonymous};
+    use carrick_el1_abi::{Counters, InotifyNameCache, ReservationRange, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
+        execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, LeafAccess, SubstrateGpa, terminal_descriptor_permits_el0,
+    };
+    use carrick_personality_linux::abi::entry::{LinuxTaskState, SyscallResult};
+    use carrick_personality_linux::dispatch::{CompletionRoute, FamilyCompletion};
+    use carrick_personality_linux::pending_anonymous::{
+        DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
+    };
+
+    // The injected venue is physical test scaffolding. Decoding, admission,
+    // proposal, descriptor edits, completion and accounting remain production.
+    struct Venue<'a> {
+        call: AnonymousCall,
+        fixture: &'static Fixture,
+        counters: &'a Counters,
+        editor: FixtureMapping<'a>,
+    }
+    impl PendingAnonymousVenue for Venue<'_> {
+        fn original_argument0(&self) -> u64 {
+            self.call.arguments()[0]
+        }
+        fn task_state(&self) -> Option<&LinuxTaskState> {
+            Some(&self.fixture.task.linux)
+        }
+        fn delegated(&mut self) -> DelegatedStep {
+            match carrick_el1::memory::serve_delegated_mapping(
+                &mut self.call,
+                self.counters,
+                &self.fixture.task,
+                crate::sched::object_wait::space_access(self.fixture.zone, self.fixture.slot),
+                self.fixture.region.table(),
+                &mut self.editor,
+                None,
+            ) {
+                DelegatedAnonymous::Served => {
+                    DelegatedStep::Served(SyscallResult::new(self.call.result().0 as i64))
+                }
+                other => panic!("owner-admitted native mapping left its owner: {other:?}"),
+            }
+        }
+        fn park_prepared(&mut self) -> Option<FamilyCompletion> {
+            None // No retained prepared edit in this uncontended fixture.
+        }
+        fn permission(&mut self) -> PermissionStep {
+            panic!("legacy protection path")
+        }
+        fn retirement(&mut self) -> RetirementStep {
+            panic!("legacy retirement path")
+        }
+        fn install_result(&mut self, _: SyscallResult) {
+            panic!("delegated result")
+        }
+    }
+
+    const LENGTH: u64 = 256 * 1024 * 1024;
+    const START: u64 = VA + 8192;
+    const CODE: u64 = START + 4096;
+    let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let fixture = Box::leak(Box::new(Fixture::with_identity_and_arena(
+        0x10000,
+        asid(1),
+        page,
+        control,
+        ThreadIdentity {
+            tid: 41,
+            serial: 101,
+            mm: 1,
+            file_table: 5,
+            generation: 11,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: page as *const _ as u64,
+            control_slot: control as *const _ as u64,
+        },
+        LENGTH + 8192,
+    )));
+    let words = fixture.tables.live(&fixture.maintenance);
+    let residency = carrick_el1::cow::test_support::residency_table();
+    let counters = Box::new(Counters::new());
+    let names = Box::new(InotifyNameCache::new());
+    let mut service = fixture.process_service();
+    let mut invoke = |nr: u64, args: [u64; 6]| {
+        let mut frame = TrapFrame::default();
+        frame.x[8] = nr;
+        frame.x[..6].copy_from_slice(&args);
+        let mut venue = Venue {
+            call: AnonymousCall::new(
+                carrick_core::CallOrdinal::from_raw(nr),
+                args,
+                0,
+                fixture.slot,
+                UserVa::new(0x40004),
+            ),
+            fixture,
+            counters: &counters,
+            editor: FixtureMapping {
+                words: &words,
+                residency: &residency,
+            },
+        };
+        let before = counters.served[nr as usize].load(Ordering::Relaxed);
+        let route = fixture
+            .enter(control, fixture_ttbr0(fixture), &mut service, |process| {
+                assert!(process.is_root_process(), "real native owner is admitted");
+                crate::dispatch::dispatch_syscall_with_native::<
+                    _,
+                    crate::sched::FakeCpu,
+                    crate::sched::HardwareUserWord,
+                    _,
+                    Aarch64ParkedContext,
+                >(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &names,
+                    None,
+                    None,
+                    None,
+                    Some(process),
+                    Some(BornInZoneSource {
+                        zone: fixture.zone,
+                        slot: fixture.slot,
+                    }),
+                    Some(&mut venue),
+                    |_| core::ptr::null_mut(),
+                )
+            })
+            .unwrap();
+        assert!(
+            matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+            "{route:?}"
+        );
+        assert_eq!(
+            counters.served[nr as usize].load(Ordering::Relaxed),
+            before + 1
+        );
+        assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
+        frame.x[0]
+    };
+    assert_eq!(invoke(222, [START, LENGTH, 0, 0x4022, u64::MAX, 0]), START);
+    assert_eq!(invoke(226, [CODE, LENGTH - 8192, 7, 0, 0, 0]), 0);
+    let mm = ReservationMm::new(1).unwrap();
+    let portal = super::super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    let mut rows = Vec::new();
+    portal
+        .root(mm, 0)
+        .unwrap()
+        .observe_range(
+            ReservationRange::new(START, START + LENGTH).unwrap(),
+            &mut |row| rows.push(row),
+        )
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.protection.bits())
+            .collect::<Vec<_>>(),
+        [0, 7, 0]
+    );
+    assert_eq!(
+        leaf(&words, fixture_ttbr0(fixture), CODE),
+        0,
+        "reservation and protection allocate no backing"
+    );
+
+    // A real host executable allocation stands for one supplied physical frame.
+    // Its address is used only as the fixture's IPA, never as the guest VA.
+    struct CodePage(*mut libc::c_void);
+    impl Drop for CodePage {
+        fn drop(&mut self) {
+            // SAFETY: this owns exactly one live mmap page.
+            assert_eq!(unsafe { libc::munmap(self.0, 4096) }, 0);
+        }
+    }
+    // SAFETY: fresh private host storage; Linux on this test lane permits RWX.
+    let backing = CodePage(unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    });
+    assert_ne!(backing.0, libc::MAP_FAILED);
+    let ipa = backing.0 as u64;
+    let nz = |v| NonZeroU64::new(v).unwrap();
+    assert!(matches!(
+        execute_descriptor_op(
+            &words,
+            SubstrateGpa(fixture.address.root.address().raw()),
+            DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: CODE,
+                    ipa,
+                    len: 4096,
+                    writable: true,
+                    executable: true
+                },
+                resident: PageSpan::new(CODE, 4096),
+                backing: BackingIdentity {
+                    frame_id: nz(1),
+                    mapping_id: nz(2),
+                    owner_generation: nz(3),
+                    inventory_revision: nz(4)
+                },
+            },
+            &TableGrants::NONE,
+            &mut InlineJournal::new(),
+        ),
+        DescriptorOutcome::Applied(_)
+    ));
+    // Exercise the resident editor as well as the untouched-range transaction.
+    assert_eq!(invoke(226, [CODE, 4096, 3, 0, 0, 0]), 0);
+    assert!(!terminal_descriptor_permits_el0(
+        leaf(&words, fixture_ttbr0(fixture), CODE),
+        LeafAccess::Execute
+    ));
+    assert_eq!(invoke(226, [CODE, 4096, 7, 0, 0, 0]), 0);
+    let descriptor = leaf(&words, fixture_ttbr0(fixture), CODE);
+    assert_eq!(descriptor & AARCH64_ROOT_ADDRESS_MASK, ipa);
+    assert!(terminal_descriptor_permits_el0(
+        descriptor,
+        LeafAccess::Write
+    ));
+    assert!(terminal_descriptor_permits_el0(
+        descriptor,
+        LeafAccess::Execute
+    ));
+    // ENDBR64; mov eax,42; ret. No arguments, stack writes or external calls.
+    let code = [0xf3_u8, 0x0f, 0x1e, 0xfa, 0xb8, 42, 0, 0, 0, 0xc3];
+    // SAFETY: the validated translated frame is our live RWX allocation;
+    // x86 instruction and data caches are coherent, and the code returns u32.
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), backing.0.cast::<u8>(), code.len());
+        let run: unsafe extern "C" fn() -> u32 = core::mem::transmute(backing.0);
+        assert_eq!(run(), 42);
+    }
+}
