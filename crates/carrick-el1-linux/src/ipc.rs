@@ -5847,6 +5847,8 @@ mod tests {
 
 #[cfg(test)]
 mod bound_venue_tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[cfg(target_os = "linux")]
