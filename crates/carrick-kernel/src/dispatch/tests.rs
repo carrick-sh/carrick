@@ -1795,6 +1795,53 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn synthetic_and_executable_read_refusals_preserve_offsets() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use crate::dispatch::executable_authority::{ExecSource, ExecutableAuthorityRegistry};
+        for nr in [63, 67] {
+            for kind in 0..3 {
+                for refuse_input in [false, true] {
+                    if refuse_input && kind != 2 { continue; }
+                    let mut h = Harness::new();
+                    let initial_offset = if kind == 2 { 0x1801 } else { 1 };
+                    let open = if kind == 1 {
+                        let source = ExecSource::shared(Arc::from(&b"abcdef"[..]),
+                            carrick_vfs::fs_backend::fresh_file_object_id(), "/exe".into(), 0o755,
+                            carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT);
+                        OpenDescription::ProcExecutable {
+                            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                            executable: source.into_current(&ExecutableAuthorityRegistry::default()),
+                            offset: initial_offset,
+                        }
+                    } else {
+                        OpenDescription::SyntheticFile {
+                            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                            path: if kind == 2 { "/proc/self/mem" } else { "/synthetic" }.into(),
+                            contents: b"abcdef".to_vec(), offset: initial_offset,
+                        }
+                    };
+                    let fd = h.dispatcher.install_fd_at_or_above(3, OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(open)), crate::linux_abi::LINUX_O_RDONLY, 0)).unwrap();
+                    let kernel = h.dispatcher.capture_one_task_context().unwrap();
+                    let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0);
+                    memory.seed(0x1800, b"abcdef");
+                    let wait = if refuse_input { memory.refuse_next_read() } else { memory.refuse_next() };
+                    let request = SyscallRequest::new(nr, SyscallArgs([fd as u64, 0x1100, 3, initial_offset as u64, 0, 0]));
+                    assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+                        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }, "nr={nr} kind={kind} input={refuse_input}");
+                    assert_eq!(returned(h.call(62, [fd as u64, 0, 1, 0, 0, 0])), initial_offset as i64);
+                    assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), [0; 3]);
+                    assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+                        DispatchOutcome::Returned { value: 3 });
+                    assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), b"bcd");
+                    assert_eq!(returned(h.call(62, [fd as u64, 0, 1, 0, 0, 0])),
+                        (initial_offset + if nr == 63 { 3 } else { 0 }) as i64);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn blocked_sendfile_captures_input_and_output_before_input_reuse() {
         let mut h = Harness::new();
         let path = h.put_str("/sendfile-authority");

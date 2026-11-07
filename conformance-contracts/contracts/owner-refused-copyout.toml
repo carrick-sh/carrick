@@ -25,6 +25,7 @@ rationale = "An admitted EL1 owner may refuse a host copyout or length read tran
 
 [bindings]
 vm_free = [
+  "carrick-kernel::dispatch::overlay_dispatch_tests::synthetic_and_executable_read_refusals_preserve_offsets: read and pread on synthetic files, retained executable files and proc-self memory preserve owner refusal before output or offset progress, then deliver bcd once; proc-self source refusal stays an owner wait",
   "carrick-kernel::dispatch::overlay_dispatch_tests::transfer_output_offsets_and_vmsplice_preserve_refused_bytes: production copy_file_range preserves both offset pointers and physical destination bytes on refusal, then advances each once; vmsplice retains all pipe bytes until destination admission and consumes them once",
   "carrick-kernel::dispatch::overlay_dispatch_tests::sendfile_offset_owner_refusal_precedes_transfer: production sendfile dispatch refuses offset input or output once before transfer, then writes bcd once, advances the explicit offset 1 to 4, and leaves the input description offset unchanged",
   "carrick-kernel::dispatch::fs::rw::iovec_owner_wait_tests::readv_iovec_intake_preserves_direct_owner_refusal",
