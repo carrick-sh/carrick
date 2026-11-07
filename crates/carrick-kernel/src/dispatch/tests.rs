@@ -1707,6 +1707,157 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn sendfile_offset_owner_refusal_precedes_transfer() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        for read_refusal in [true, false] {
+            let mut h = Harness::new();
+            let input_path = h.put_str("/sendfile-input");
+            let output_path = h.put_str("/sendfile-output");
+            let input = returned(h.call(56, [(-100i64) as u64, input_path, O_CREAT | 2, 0o600, 0, 0]));
+            let output = returned(h.call(56, [(-100i64) as u64, output_path, O_CREAT | 2, 0o600, 0, 0]));
+            let bytes = h.put_bytes(b"abcdef");
+            assert_eq!(returned(h.call(64, [input as u64, bytes, 6, 0, 0, 0])), 6);
+            let kernel = h.dispatcher.capture_one_task_context().unwrap();
+            let mut memory = OwnerRefusingMemory::new(0x1000, 0x1000, 0);
+            memory.seed(0x1000, &1u64.to_ne_bytes());
+            let wait = if read_refusal { memory.refuse_next_read() } else { memory.refuse_next() };
+            let request = SyscallRequest::new(71, SyscallArgs([output as u64, input as u64, 0x1000, 3, 0, 0]));
+            assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
+            assert_eq!(returned(h.call(62, [output as u64, 0, 1, 0, 0, 0])), 0);
+            assert_eq!(memory.read_bytes(0x1000, 8).unwrap(), 1u64.to_ne_bytes());
+            assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+                DispatchOutcome::Returned { value: 3 });
+            assert_eq!(memory.read_bytes(0x1000, 8).unwrap(), 4u64.to_ne_bytes());
+            assert_eq!(returned(h.call(62, [output as u64, 0, 1, 0, 0, 0])), 3);
+            assert_eq!(returned(h.call(62, [input as u64, 0, 1, 0, 0, 0])), 6);
+            assert_eq!(returned(h.call(62, [output as u64, 0, 0, 0, 0, 0])), 0);
+            let result = h.reserve(8);
+            assert_eq!(returned(h.call(63, [output as u64, result, 8, 0, 0, 0])), 3);
+            assert_eq!(h.memory.read_bytes(result, 3).unwrap(), b"bcd");
+        }
+    }
+
+    #[test]
+    fn transfer_output_offsets_and_vmsplice_preserve_refused_bytes() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use std::os::fd::IntoRawFd;
+        let mut h = Harness::new();
+        let path = h.put_str("/range-input");
+        let input = returned(h.call(56, [(-100i64) as u64, path, O_CREAT | 2, 0o600, 0, 0]));
+        let data = h.put_bytes(b"abcdef");
+        assert_eq!(returned(h.call(64, [input as u64, data, 6, 0, 0, 0])), 6);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let output = h.dispatcher.install_fd_at_or_above(3, OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                host_fd: HostFdRef::new(file.reopen().unwrap().into_raw_fd()),
+                metadata: RootFsMetadata { path: file.path().to_owned(), kind: RootFsEntryKind::File, mode: 0o600, size: 0 },
+                writable: true,
+            })), crate::linux_abi::LINUX_O_RDWR, 0)).unwrap();
+        let kernel = h.dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0);
+        memory.seed(0x1000, &1u64.to_ne_bytes());
+        memory.seed(0x1008, &2u64.to_ne_bytes());
+        let wait = memory.refuse_next();
+        let request = SyscallRequest::new(285, SyscallArgs([input as u64, 0x1000, output as u64, 0x1008, 3, 0]));
+        assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
+        assert_eq!(file.as_file().metadata().unwrap().len(), 0);
+        assert_eq!(memory.read_bytes(0x1000, 8).unwrap(), 1u64.to_ne_bytes());
+        assert_eq!(memory.read_bytes(0x1008, 8).unwrap(), 2u64.to_ne_bytes());
+        assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+            DispatchOutcome::Returned { value: 3 });
+        assert_eq!(memory.read_bytes(0x1000, 8).unwrap(), 4u64.to_ne_bytes());
+        assert_eq!(memory.read_bytes(0x1008, 8).unwrap(), 5u64.to_ne_bytes());
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"\0\0bcd");
+        assert_eq!(returned(h.call(62, [input as u64, 0, 1, 0, 0, 0])), 6);
+        assert_eq!(returned(h.call(62, [output as u64, 0, 1, 0, 0, 0])), 0);
+
+        let pair = h.reserve(8);
+        assert_eq!(returned(h.call(59, [pair, crate::linux_abi::LINUX_O_NONBLOCK as u64, 0, 0, 0, 0])), 0);
+        let pair = h.memory.read_bytes(pair, 8).unwrap();
+        let reader = i32::from_ne_bytes(pair[..4].try_into().unwrap()) as u64;
+        let writer = i32::from_ne_bytes(pair[4..].try_into().unwrap()) as u64;
+        assert_eq!(returned(h.call(64, [writer, data, 6, 0, 0, 0])), 6);
+        memory.seed(0x1000, &0x1100u64.to_ne_bytes());
+        memory.seed(0x1008, &6u64.to_ne_bytes());
+        let request = SyscallRequest::new(75, SyscallArgs([reader, 0x1000, 1, 0, 0, 0]));
+        let wait = memory.refuse_next();
+        assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
+        assert_eq!(memory.read_bytes(0x1100, 6).unwrap(), [0; 6]);
+        assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+            DispatchOutcome::Returned { value: 6 });
+        assert_eq!(memory.read_bytes(0x1100, 6).unwrap(), b"abcdef");
+        let drain = h.reserve(8);
+        assert_eq!(h.call(63, [reader, drain, 8, 0, 0, 0]), DispatchOutcome::errno(LINUX_EAGAIN));
+    }
+
+    #[test]
+    fn synthetic_and_executable_read_refusals_preserve_offsets() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use crate::dispatch::executable_authority::{ExecSource, ExecutableAuthorityRegistry};
+        for nr in [63, 65, 67, 69] {
+            for kind in 0..5 {
+                for refuse_input in [false, true] {
+                    if refuse_input && (kind != 2 || nr == 65 || nr == 69) { continue; }
+                    let mut h = Harness::new();
+                    let initial_offset = if kind == 2 { 0x1801 } else if kind >= 3 { 0 } else { 1 };
+                    let open = if kind == 1 {
+                        let source = ExecSource::shared(Arc::from(&b"abcdef"[..]),
+                            carrick_vfs::fs_backend::fresh_file_object_id(), "/exe".into(), 0o755,
+                            carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT);
+                        OpenDescription::ProcExecutable {
+                            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                            executable: source.into_current(&ExecutableAuthorityRegistry::default()),
+                            offset: initial_offset,
+                        }
+                    } else if kind >= 3 {
+                        OpenDescription::SyntheticDevice {
+                            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                            kind: if kind == 3 { carrick_vfs::SyntheticDeviceKind::Zero } else { carrick_vfs::SyntheticDeviceKind::Null },
+                        }
+                    } else {
+                        OpenDescription::SyntheticFile {
+                            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                            path: if kind == 2 { "/proc/self/mem" } else { "/synthetic" }.into(),
+                            contents: b"abcdef".to_vec(), offset: initial_offset,
+                        }
+                    };
+                    let fd = h.dispatcher.install_fd_at_or_above(3, OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(open)), crate::linux_abi::LINUX_O_RDONLY, 0)).unwrap();
+                    let kernel = h.dispatcher.capture_one_task_context().unwrap();
+                    let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0);
+                    memory.seed(0x1800, b"abcdef");
+                    memory.seed(0x1100, &[0xa5; 3]);
+                    let wait = if refuse_input { memory.refuse_next_read() } else { memory.refuse_next() };
+                    let vector = nr == 65 || nr == 69;
+                    memory.seed(0x1000, &0x1100u64.to_ne_bytes());
+                    memory.seed(0x1008, &3u64.to_ne_bytes());
+                    let request = SyscallRequest::new(nr, SyscallArgs([fd as u64,
+                        if vector { 0x1000 } else { 0x1100 }, if vector { 1 } else { 3 }, initial_offset as u64, 0, 0]));
+                    let first = h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap();
+                    if kind == 4 {
+                        assert_eq!(first, DispatchOutcome::Returned { value: 0 });
+                        assert_eq!(memory.prepares, 0, "null EOF must not prepare output");
+                        assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), [0xa5; 3]);
+                        continue;
+                    }
+                    assert_eq!(first, DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }, "nr={nr} kind={kind} input={refuse_input}");
+                    assert_eq!(returned(h.call(62, [fd as u64, 0, 1, 0, 0, 0])), initial_offset as i64);
+                    assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), [0xa5; 3]);
+                    assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+                        DispatchOutcome::Returned { value: 3 });
+                    assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), if kind == 3 { &[0; 3] } else { b"bcd" });
+                    assert_eq!(returned(h.call(62, [fd as u64, 0, 1, 0, 0, 0])),
+                        (initial_offset + if kind < 3 && (nr == 63 || nr == 65) { 3 } else { 0 }) as i64);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn blocked_sendfile_captures_input_and_output_before_input_reuse() {
         let mut h = Harness::new();
         let path = h.put_str("/sendfile-authority");

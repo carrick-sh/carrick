@@ -628,8 +628,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 ServiceCompletion::RetrySyscall,
                             );
                         }
+                        Err(NativeProcessError::Fault) => {
+                            return Ok(NativeResume::Returned(SyscallResult::from_errno(
+                                carrick_syscall_abi::LINUX_EFAULT,
+                            )));
+                        }
                         Err(error) => return Err(error),
                     }
+                }
+                Err(NativeProcessError::Fault) => {
+                    return Ok(NativeResume::Returned(SyscallResult::from_errno(
+                        carrick_syscall_abi::LINUX_EFAULT,
+                    )));
                 }
                 Err(error) => return Err(error),
             }
@@ -2650,7 +2660,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .record(self.record.id)
                 .consume_owner_continuation();
         }
-        let output = pending.copyout.take();
+        let mut output = pending.copyout.take();
         if pending.adapter {
             return self.finish_adapter_service(result, pending.claim);
         }
@@ -2829,17 +2839,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             .complete_chdir(&pending_file.record, pending_file.call)
                             .map(NativeResume::Returned);
                     }
-                    let mut copy_out = |address: u64, bytes: &[u8]| {
-                        self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)
-                            .is_ok()
+                    // Output must belong to the existing owner-memory continuation
+                    // before its first byte is copied. A carrier reply has already
+                    // consumed the source (notably a directory batch or file read).
+                    // Unwind the service claim before that continuation can park;
+                    // never replay the host-file request on an output refusal.
+                    use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
+                    let reply = carrick_core_abi::host_file::reply(&pending_file.record)
+                        .ok_or(NativeProcessError::Quarantined)?;
+                    let result = SyscallResult::new(reply.result);
+                    let mut retain_output = |address: u64, bytes: &[u8]| {
+                        let request = GuestCopyRequest {
+                            address: UserVa::new(address),
+                            len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                            access: carrick_guest_arch::Access::Write,
+                        };
+                        output = Some(Box::new(OwnedCopyout {
+                            address: request.address,
+                            bytes: bytes.to_vec(),
+                            offset: 0,
+                            result,
+                        }));
+                        CopyOutcome::NotYet(request)
                     };
-                    Ok(NativeResume::Returned(
-                        carrick_personality_linux::native_host_file::complete(
-                            &pending_file.record,
-                            pending_file.output,
-                            &mut copy_out,
-                        ),
-                    ))
+                    match carrick_personality_linux::native_host_file::complete(
+                        &pending_file.record,
+                        pending_file.output,
+                        &mut retain_output,
+                    ) {
+                        Ok(result) => Ok(NativeResume::Returned(result)),
+                        Err(CopyOutcome::NotYet(_)) => Ok(NativeResume::NoPending),
+                        Err(CopyOutcome::Fault) => Ok(NativeResume::Returned(
+                            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                        )),
+                        Err(CopyOutcome::Done) => Err(NativeProcessError::Quarantined),
+                    }
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied) => {
                     // Supplied without a reply is a transport violation.
