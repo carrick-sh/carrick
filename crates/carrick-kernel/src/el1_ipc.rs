@@ -845,9 +845,7 @@ impl HostIpc {
                         let Some(key) = bound[bound_count] else {
                             continue;
                         };
-                        if let Err(error) = zone.unbind_object_wait(key, &HostLockWait) {
-                            return Err(error);
-                        }
+                        zone.unbind_object_wait(key, &HostLockWait)?;
                     }
                     return Err(carrick_sched_core::object_wait::ObjectWaitError::Exhausted);
                 };
@@ -865,9 +863,7 @@ impl HostIpc {
                         let Some(key) = bound[bound_count] else {
                             continue;
                         };
-                        if let Err(rollback) = zone.unbind_object_wait(key, &HostLockWait) {
-                            return Err(rollback);
-                        }
+                        zone.unbind_object_wait(key, &HostLockWait)?;
                     }
                     return Err(error);
                 }
