@@ -2195,7 +2195,7 @@ fn add_signal_sibling_at(
             slot,
             ThreadIdentity {
                 tid: u64::from(tid),
-                serial: serial,
+                serial,
                 mm: 1,
                 file_table: 5,
                 generation: birth,
