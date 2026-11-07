@@ -1547,7 +1547,9 @@ where
         action: RetainedMemoryAction,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         if let RetainedMemoryAction::CoreCapture { context, terminal } = action {
-            return Ok(self.capture_terminal_core_or_continue(engine, terminal, context));
+            return Ok(
+                self.begin_persistent_process_terminal_with_claim(engine, terminal, context, None)
+            );
         }
         if let RetainedMemoryAction::ThreadExit { code } = action {
             return self.drive_thread_exit(engine, control, code);
@@ -1928,7 +1930,7 @@ where
                     "claim persistent process terminal owner failed: {failure}"
                 );
             });
-        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, receipt)
+        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, Some(receipt))
     }
 
     fn begin_persistent_process_terminal_from_exec(
@@ -1958,7 +1960,7 @@ where
         if receipt.claim == ProcessExitClaim::Owner {
             self.kernel.begin_process_exit();
         }
-        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, receipt)
+        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, Some(receipt))
     }
 
     fn begin_persistent_process_terminal_with_claim(
@@ -1966,78 +1968,74 @@ where
         engine: &mut E,
         terminal: PersistentTerminal,
         context: carrick_kernel::kernel::KernelContext,
-        receipt: ProcessExitClaimReceipt,
+        new_claim: Option<ProcessExitClaimReceipt>,
     ) -> executor::ExecutorExit {
-        match receipt.claim {
-            ProcessExitClaim::LostToExec | ProcessExitClaim::AlreadyOwned => {
-                self.state.trace_hvpatch_thread_terminal(
+        // A retained CoreCapture action already owns the terminal claim. It
+        // resumes here without claiming or arming terminal settlement again.
+        if let Some(receipt) = new_claim {
+            match receipt.claim {
+                ProcessExitClaim::LostToExec | ProcessExitClaim::AlreadyOwned => {
+                    self.state.trace_hvpatch_thread_terminal(
                     carrick_observability::probes::HvpatchThreadTerminalReason::ProcessTerminalLoser,
                     2,
                 );
-                if self.terminal_runtime == PersistentTerminalRuntimeState::Resident {
-                    if let Err(error) = self.state.capture_child_tid_clear() {
-                        return self.finish(Err(error));
+                    if self.terminal_runtime == PersistentTerminalRuntimeState::Resident {
+                        if let Err(error) = self.state.capture_child_tid_clear() {
+                            return self.finish(Err(error));
+                        }
+                        if !self.state.thread_exit_withdrawn {
+                            let _ = self
+                                .state
+                                .withdraw_persistent_terminal_owner_runtime(&self.kernel);
+                            self.state.thread_exit_withdrawn = true;
+                        }
+                        self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
                     }
-                    if !self.state.thread_exit_withdrawn {
-                        let _ = self
-                            .state
-                            .withdraw_persistent_terminal_owner_runtime(&self.kernel);
-                        self.state.thread_exit_withdrawn = true;
-                    }
-                    self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
+                    self.state.handoff_child_tid_clear();
+                    return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
                 }
-                self.state.handoff_child_tid_clear();
-                return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
-            }
-            ProcessExitClaim::Pending => {
-                tracing::info!(tid = ?self.state.this_tid, "process-terminal claim PENDING parks");
-                let scheduler = self
+                ProcessExitClaim::Pending => {
+                    tracing::info!(tid = ?self.state.this_tid, "process-terminal claim PENDING parks");
+                    let scheduler = self
                     .kernel
                     .hvpatch_runtime
                     .as_ref()
                     .unwrap_or_else(|| carrick_fatal!("kernel::runtime_binding", "A pending terminal claim cannot subscribe its exact thread without the Kernel HVPatch runtime"))
                     .continuation_services(context.kernel())
                     .0;
-                let thread = context.thread().key();
-                let subscription = self.kernel.clone_admission.subscribe_change(
-                    receipt.change_epoch,
-                    Arc::new(move || {
-                        let _ = scheduler.wake(thread);
-                    }),
-                );
-                self.phase = HvpatchProductionPhase::TerminalClaimRetry {
-                    terminal,
-                    context,
-                    _subscription: subscription,
-                };
-                return self.suspend(
-                    HvpatchLoopSuspension::TerminalSiblingDrain,
-                    executor::ExecutorExit::Blocked(
-                        carrick_kernel::kernel::objects::BlockedReason::ChildState,
-                    ),
-                );
-            }
-            ProcessExitClaim::Owner => {
-                self.terminal_settlement
-                    .arm_process_owner()
-                    .unwrap_or_else(|failure| {
-                        tracing::error!(%failure, "arm persistent terminal result owner");
-                        carrick_fatal!(
-                            "kernel::terminal_settlement",
-                            "arm persistent terminal result owner failed: {failure}"
-                        );
-                    });
+                    let thread = context.thread().key();
+                    let subscription = self.kernel.clone_admission.subscribe_change(
+                        receipt.change_epoch,
+                        Arc::new(move || {
+                            let _ = scheduler.wake(thread);
+                        }),
+                    );
+                    self.phase = HvpatchProductionPhase::TerminalClaimRetry {
+                        terminal,
+                        context,
+                        _subscription: subscription,
+                    };
+                    return self.suspend(
+                        HvpatchLoopSuspension::TerminalSiblingDrain,
+                        executor::ExecutorExit::Blocked(
+                            carrick_kernel::kernel::objects::BlockedReason::ChildState,
+                        ),
+                    );
+                }
+                ProcessExitClaim::Owner => {
+                    self.terminal_settlement
+                        .arm_process_owner()
+                        .unwrap_or_else(|failure| {
+                            tracing::error!(%failure, "arm persistent terminal result owner");
+                            carrick_fatal!(
+                                "kernel::terminal_settlement",
+                                "arm persistent terminal result owner failed: {failure}"
+                            );
+                        });
+                }
             }
         }
-        self.capture_terminal_core_or_continue(engine, terminal, context)
-    }
-
-    fn capture_terminal_core_or_continue(
-        &mut self,
-        engine: &mut E,
-        mut terminal: PersistentTerminal,
-        context: carrick_kernel::kernel::KernelContext,
-    ) -> executor::ExecutorExit {
+        let mut terminal = terminal;
         if let PersistentTerminal::Outcome {
             ref outcome,
             ref mut prepared_core,
@@ -2084,14 +2082,6 @@ where
                 }
             }
         }
-        self.continue_persistent_process_terminal(terminal, context)
-    }
-
-    fn continue_persistent_process_terminal(
-        &mut self,
-        terminal: PersistentTerminal,
-        context: carrick_kernel::kernel::KernelContext,
-    ) -> executor::ExecutorExit {
         if let Err(error) = self.state.capture_child_tid_clear() {
             return self.finish(Err(error));
         }
