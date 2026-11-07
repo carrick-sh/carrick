@@ -660,9 +660,12 @@ impl Snapshot {
                     {
                         return Err(ScalerError::Guard("board pagination did not advance"));
                     }
-                    let mut rows = array(&node[connection]["nodes"])?.clone();
-                    rows.extend(array(&next["nodes"])?.clone());
-                    node[*connection] = json!({"nodes":rows,"pageInfo":next["pageInfo"]});
+                    let next_rows = array(&next["nodes"])?;
+                    node[*connection]["nodes"]
+                        .as_array_mut()
+                        .ok_or(ScalerError::Guard("missing accumulated board nodes"))?
+                        .extend(next_rows.iter().cloned());
+                    node[*connection]["pageInfo"] = next["pageInfo"].clone();
                 }
             }
         }
