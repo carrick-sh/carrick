@@ -3818,6 +3818,163 @@ fn arm_root_setup_enters_production_process_venue() {
     physical.shutdown_without_child();
 }
 
+// These are deliberately runnable red witnesses, not acceptance results.
+// Entropy needs a reviewed carrier service protocol before these can be enabled.
+#[test]
+#[ignore = "#1338: native-child entropy service is not implemented"]
+fn arm_native_fork_child_getrandom_default_returns_eight_bytes() {
+    native_fork_child_getrandom(0);
+}
+
+#[test]
+#[ignore = "#1338: native-child entropy service is not implemented"]
+fn arm_native_fork_child_getrandom_nonblock_returns_eight_bytes() {
+    native_fork_child_getrandom(1);
+}
+
+#[cfg(test)]
+fn native_fork_child_getrandom(flags: u64) {
+    use crate::native_process_runtime::NativeThreadGroupOwner;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use std::sync::Arc;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let crossing = Box::leak(Box::new(TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ])));
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let child_task: &CurrentTask = Box::leak(Box::new(CurrentTask::new()));
+    let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            parked,
+        )
+        .unwrap(),
+    );
+    registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &*crossing,
+    )
+    .with_words(&*words);
+    let LifecycleOutcome::Returned { result, .. } = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap()
+        .fork(ProcessForkChildTid::NONE)
+    else {
+        panic!("production fork must publish a child");
+    };
+    assert!(result.raw() > 0);
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child_key = runtime
+        .namespace_child_key(parent, result.raw() as u32)
+        .unwrap();
+    let child = runtime.task_binding(child_key).unwrap();
+    let parent_binding = runtime.task_binding(parent).unwrap();
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
+    activate(source, child_task, &child);
+    // SAFETY: the live child owner retains this published lifecycle page.
+    // VM-free stock is host storage, outside the hardware metadata VA window.
+    let page = unsafe {
+        &*(child_task.metadata.lifecycle_page.load(Ordering::Acquire) as *const ThreadLifecyclePage)
+    };
+    assert_eq!(
+        registry.thread_group_owner(fixture.zone, page, child_task.visible_pid().unwrap()),
+        NativeThreadGroupOwner::ForkChild,
+    );
+    assert!(
+        runtime.task_binding(parent).is_some(),
+        "parent remains live"
+    );
+    let counters = carrick_el1_abi::Counters::new();
+    let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let output = carrick_test_support::GuestUserBuffer::zeroed(8);
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        elr: 0x400004,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    frame.x[8] = carrick_personality_linux::crossing::nr::GETRANDOM.raw();
+    frame.x[..3].copy_from_slice(&[output.arg(), 8, flags]);
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        child_task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &*crossing,
+    )
+    .with_words(&*words);
+    let mut entry = runtime
+        .enter_registered(
+            registry,
+            source,
+            child_task,
+            child.address,
+            &child.words,
+            &mut child_service,
+        )
+        .unwrap();
+    let route = crate::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(child_task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+        None,
+        None,
+        Some(&mut *entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    if route == CompletionRoute::Forward {
+        // The same final entry boundary used after no ring stage serves a call.
+        let _ = crate::dispatch::native_unstaged_exit(
+            &mut frame,
+            &child_task.linux,
+            carrick_el1_abi::Action::Forward,
+            || registry.thread_group_owner(fixture.zone, page, child_task.visible_pid().unwrap()),
+            &counters,
+        );
+    }
+    assert_eq!(
+        frame.x[0] as i64, 8,
+        "native child getrandom(flags={flags})"
+    );
+    assert_eq!(counters.refused_child[278].load(Ordering::Acquire), 0);
+}
+
 #[test]
 fn arm_signal_setup_then_plain_fork_returns_one_child() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
