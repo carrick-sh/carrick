@@ -1,7 +1,10 @@
 # Owner-admitted code reservations (#1791)
 
-The corrected signed classification is an outside-arena mmap hint, rather
-than RWX or MAP_NORESERVE by itself. Unhinted reservations already work.
+The signed check on PR #1797 still fails on an **in-arena**, whole-range
+256 MiB RWX transition at `0x6020000000`. The earlier outside-arena hint
+correction does not establish the cause of that failure. Unhinted/subrange
+controls alone cannot close this issue.
+
 Linux mmap(2) treats the requested address as an advisory placement hint;
 Carrick honours free usable hints outside its allocation arena. A hinted reservation
 must retain its MM owner through later R, RW and RWX protection changes,
@@ -54,3 +57,30 @@ Volatile stores and reads at both ends of each writable range then exercise
 the actual returned address, rather than a byte-copy backend or a separately
 allocated frame. Host VA equals guest VA only by explicit fixture placement;
 this does not change production VA/IPA lookup or establish VMM supply.
+
+## Whole-range continuation
+
+`delegated_whole_code_range_keeps_owner_protection` calls production host
+mmap then mprotect at `0x6020000000`, with a 256 MiB PROT_NONE reservation,
+MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, and the entire range becoming
+RWX without a preceding fault. It requires one owner publication, zero legacy
+protection calls, and no backing allocation. It passes on the rebased #1797
+implementation **before any continuation fix**. This is a control, not red
+proof of the reported failure.
+
+`serial_host_delegated_whole_code_range_writes_and_executes` applies the same
+whole-range transition to actual Linux native pages through the production
+host dispatcher. It verifies stores at both ends and, on x86_64, writes and
+executes `mov eax, 42; ret` in the returned range. Host instruction execution
+checks the test venue, not an ARM or x86 guest or VMM transaction.
+
+V8 13.6.233's BSD-licensed `src/heap/code-range.cc` (InitReservation) changes
+the allocatable range to RWX before discarding its pages; its
+`src/base/platform/platform-posix.cc` uses MAP_NORESERVE for inaccessible
+anonymous reservations. Sources:
+https://github.com/v8/v8/blob/13.6.233/src/heap/code-range.cc
+https://github.com/v8/v8/blob/13.6.233/src/base/platform/platform-posix.cc
+The signed failure still needs its preceding syscall sequence and exact
+artifact provenance to distinguish owner admission, opaque mapping history,
+and the forwarding venue from this passing control. Do not remove the sparse
+publication refusal or select owner publication without authenticated ownership.
