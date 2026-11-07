@@ -70,13 +70,19 @@ artifacts move to the external USB volume (`/Volumes/carrick`, 233 GB total):
 ### Runtime scratch stays internal
 
 The conventional `/Volumes/carrick` mount is cold USB storage on cloudmac.
-Runtime scratch must instead use the admitted internal checkout. The shared
+Runtime scratch must instead use an internal case-sensitive volume. Set
+`CARRICK_HOME` in the runner environment to a directory on that volume; an
+internal checkout alone is insufficient when its volume is case-insensitive. The shared
 `prepare-cargo` action exports `CARRICK_HOME=$GITHUB_WORKSPACE/target/carrick-home`
 when no override is set; signed test scripts use `$PWD/target/carrick-home`
 under the same condition. Acceptance commands default their child processes'
 `CARRICK_HOME` to `<checkout>/target/carrick-home`, preserving inherited and
 per-command operator overrides. Any explicit CI override must
-also point to internal storage.
+also point to internal case-sensitive storage. Acceptance and standalone signed
+tests validate the selected home once before starting tests, using the shared
+VFS probe. An unusable or case-insensitive default fails the gate immediately
+with a message naming `CARRICK_HOME`, rather than failing every guest test.
+This preflight never falls back to the conventional USB mount.
 
 The shared VFS resolver checks `$CARRICK_HOME/scratch` before touching the
 conventional mount. An unusable explicit root fails closed for the host

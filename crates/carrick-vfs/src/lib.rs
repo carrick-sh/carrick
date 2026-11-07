@@ -39,6 +39,7 @@ pub mod layer_cache;
 pub mod overlay;
 pub mod pathcodec;
 pub mod rootfs;
+pub mod scratch;
 pub mod vfs;
 
 // NOTE: this glob does NOT make `carrick_vfs::rootfs` mean `vfs::rootfs`.
