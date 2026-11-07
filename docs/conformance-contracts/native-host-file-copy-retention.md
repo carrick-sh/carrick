@@ -116,3 +116,34 @@ an actual host resource and do not establish descriptor retention.
 Descriptor admission before staging, retained vector input, carrier pin
 integration and production write/writev retention witnesses remain open.
 The completion checkpoint alone does not satisfy issue #1694.
+
+## Crossing layout review checkpoint
+
+The borrowed `OfdPinIdentity` lives in `carrick-core-abi` and is re-exported
+by `carrick-fd-core`. It is the same lookup-only type used by the existing
+carrier helper. Moving it removes the dependency cycle that would otherwise
+prevent the crossing header from using it: fd-core already depends on
+core-abi. This move changes neither ownership nor the current wire format.
+
+The independently reviewed integration design extends `HostFileHeader` with
+`Option<OfdPinIdentity>` and appends authority, index and generation at byte
+offsets 96, 104 and 112. The header becomes 120 bytes and its version becomes
+2. An absent identity is exactly three zero words. A present identity needs
+nonzero authority and generation, and an index fitting `u32` (zero is valid).
+Encoding, parsing and `request_parts` must enforce the same validation.
+Layout witnesses must check the offsets, first payload byte, maximum record
+length, old-version rejection, malformed identities and reply handling.
+
+That activation must be one coherent change with production retention:
+direct descriptor operations, including empty-path statx, require the
+borrowed identity and exclusively use `with_retained_host_resource`.
+Path operations retain their table authority; poll retains its separate
+per-entry admission contract. There is no numeric-fd fallback for direct
+operations. The ring owns the pin through terminal completion or cancellation
+acknowledgement and retires it exactly once via the host cleanup authority.
+
+Activating the layout without those producer and ownership changes would
+break existing calls. This checkpoint therefore leaves the header untouched.
+The required production write/writev and read/readv retention witnesses,
+retained vector input, carrier integration and delegation conversions are
+still open; the type move supplies no red/green behavioral evidence.
