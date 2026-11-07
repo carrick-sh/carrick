@@ -15,8 +15,8 @@ use carrick_abi::{
     LINUX_CLOCK_BOOTTIME, LINUX_CLOCK_BOOTTIME_ALARM, LINUX_CLOCK_MONOTONIC,
     LINUX_CLOCK_MONOTONIC_COARSE, LINUX_CLOCK_MONOTONIC_RAW, LINUX_CLOCK_PROCESS_CPUTIME_ID,
     LINUX_CLOCK_REALTIME, LINUX_CLOCK_REALTIME_ALARM, LINUX_CLOCK_REALTIME_COARSE, LINUX_CLOCK_TAI,
-    LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_EINVAL, LINUX_EOPNOTSUPP, LINUX_EPERM, LinuxTimex,
-    LinuxTimeval,
+    LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_EINVAL, LINUX_EOPNOTSUPP, LINUX_EPERM, LinuxTimeval,
+    LinuxTimex,
 };
 use carrick_core_abi::clock::{
     CLOCK_RECORD_BYTES, CLOCK_TIMEX_BYTES, ClockRecordError, ClockRequest, ClockSleepArmOutcome,
@@ -48,14 +48,6 @@ impl ClockSleepWaker for El1ZoneClockSleepWaker {
     fn wake_sleep(&self, channel: ClockSleepChannel) {
         crate::el1_zone::wake_native_sleep_channel(channel);
     }
-}
-
-/// No-op waker for isolated unit tests that do not park on sleep channels.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopClockSleepWaker;
-
-impl ClockSleepWaker for NoopClockSleepWaker {
-    fn wake_sleep(&self, _channel: ClockSleepChannel) {}
 }
 
 /// Generic zone sleep wakeup sequence reusable by x86 CPL0 and VM-free test
@@ -165,13 +157,18 @@ impl ClockResourceService {
     }
 
     /// Validate and answer one 256-byte staged clock-resource record in place.
-    pub fn serve_record(&self, bytes: &mut [u8; CLOCK_RECORD_BYTES]) -> Result<(), ClockRecordError> {
+    pub fn serve_record(
+        &self,
+        bytes: &mut [u8; CLOCK_RECORD_BYTES],
+    ) -> Result<(), ClockRecordError> {
         let request = parse_request(bytes)?;
         match request {
-            ClockRequest::Sample { clock_id } => match sample_container_clock(&self.clock, clock_id) {
-                Ok(now) => write_sample_reply(bytes, now.as_secs(), now.subsec_nanos()),
-                Err(errno) => write_errno_reply(bytes, errno),
-            },
+            ClockRequest::Sample { clock_id } => {
+                match sample_container_clock(&self.clock, clock_id) {
+                    Ok(now) => write_sample_reply(bytes, now.as_secs(), now.subsec_nanos()),
+                    Err(errno) => write_errno_reply(bytes, errno),
+                }
+            }
             ClockRequest::TimexPreflight { can_adjust, timex } => {
                 let timex = *timex;
                 self.serve_timex_preflight(bytes, can_adjust, &timex)
@@ -223,19 +220,21 @@ impl ClockResourceService {
         };
         let request = match TimexRequest::validate(&parsed, access) {
             Ok(req) => req,
-            Err(TimexValidationError::Errno(errno)) => return write_errno_reply(bytes, errno.raw()),
+            Err(TimexValidationError::Errno(errno)) => {
+                return write_errno_reply(bytes, errno.get());
+            }
             Err(TimexValidationError::InvalidModeOutput) => {
-                return write_errno_reply(bytes, LINUX_EINVAL.raw());
+                return write_errno_reply(bytes, LINUX_EINVAL.get());
             }
         };
         let step = match request.realtime_step(|| {
             carrick_abi::LinuxTimexStatus::from_bits_retain(self.clock.adjtimex_state().status)
         }) {
             Ok(step) => step,
-            Err(errno) => return write_errno_reply(bytes, errno.raw()),
+            Err(errno) => return write_errno_reply(bytes, errno.get()),
         };
         if step.is_some() && self.clock.is_controlled() {
-            return write_errno_reply(bytes, LINUX_EPERM.raw());
+            return write_errno_reply(bytes, LINUX_EPERM.get());
         }
         write_timex_preflight_ok(bytes)
     }
@@ -256,9 +255,11 @@ impl ClockResourceService {
         };
         let request = match TimexRequest::validate(&parsed, access) {
             Ok(req) => req,
-            Err(TimexValidationError::Errno(errno)) => return write_errno_reply(bytes, errno.raw()),
+            Err(TimexValidationError::Errno(errno)) => {
+                return write_errno_reply(bytes, errno.get());
+            }
             Err(TimexValidationError::InvalidModeOutput) => {
-                return write_errno_reply(bytes, LINUX_EINVAL.raw());
+                return write_errno_reply(bytes, LINUX_EINVAL.get());
             }
         };
         let mut output = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
@@ -270,7 +271,7 @@ impl ClockResourceService {
                     .map_err(|_| ClockRecordError::Invalid)?;
                 write_timex_apply_reply(bytes, value, out_bytes)
             }
-            Err(errno) => write_errno_reply(bytes, errno.raw()),
+            Err(errno) => write_errno_reply(bytes, errno.get()),
         }
     }
 
@@ -304,8 +305,8 @@ impl ClockResourceService {
                         return Ok(None);
                     }
                     let mono_now = self.clock.monotonic_now();
-                    let deadline =
-                        *pinned_relative_deadline.get_or_insert_with(|| mono_now.saturating_add(input));
+                    let deadline = *pinned_relative_deadline
+                        .get_or_insert_with(|| mono_now.saturating_add(input));
                     if deadline <= mono_now {
                         return Ok(None);
                     }
@@ -547,7 +548,7 @@ fn sample_container_clock(clock: &ClockDomain, clock_id: u64) -> Result<Duration
         LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW => Ok(clock.monotonic_now()),
         LINUX_CLOCK_MONOTONIC_COARSE => Ok(linux_coarse_duration(clock.monotonic_now())),
         LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Ok(clock.boottime_now()),
-        _ => Err(LINUX_EINVAL.raw()),
+        _ => Err(LINUX_EINVAL.get()),
     }
 }
 
@@ -557,7 +558,7 @@ fn sample_sleep_clock(clock: &ClockDomain, clock_id: u64) -> Result<Duration, i3
         LINUX_CLOCK_PROCESS_CPUTIME_ID | LINUX_CLOCK_THREAD_CPUTIME_ID
     ) || dynamic_cpu_clock(clock_id).is_some()
     {
-        return Err(LINUX_EOPNOTSUPP.raw());
+        return Err(LINUX_EOPNOTSUPP.get());
     }
     sample_container_clock(clock, clock_id)
 }
@@ -623,7 +624,14 @@ mod tests {
         clock.advance(Duration::from_millis(20)).unwrap();
         assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
 
-        encode_sleep_cancel_request(&mut buf, sleep_id, LINUX_CLOCK_MONOTONIC, true, 0, 50_000_000);
+        encode_sleep_cancel_request(
+            &mut buf,
+            sleep_id,
+            LINUX_CLOCK_MONOTONIC,
+            true,
+            0,
+            50_000_000,
+        );
         service.serve_record(&mut buf).unwrap();
         assert_eq!(
             parse_reply(&buf),
@@ -672,7 +680,10 @@ mod tests {
         let raw: [u8; CLOCK_TIMEX_BYTES] = tx.as_bytes().try_into().unwrap();
         encode_timex_request(&mut buf, false, true, &raw);
         service.serve_record(&mut buf).unwrap();
-        assert!(matches!(parse_reply(&buf), Ok(ClockReply::TimexApply(Ok(_)))));
+        assert!(matches!(
+            parse_reply(&buf),
+            Ok(ClockReply::TimexApply(Ok(_)))
+        ));
         assert!(wakes.0.load(Ordering::SeqCst) >= 1);
 
         encode_sleep_arm_request(
