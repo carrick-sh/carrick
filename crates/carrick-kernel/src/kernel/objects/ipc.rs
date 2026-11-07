@@ -2,7 +2,6 @@
 use super::*;
 use crate::el1_ipc::{AdmissionError, HostDescription, HostIpc, HostTable};
 use carrick_el1_abi::ipc::{IpcBacking, fd};
-use carrick_el1_abi::ipc_tables::IpcTableMap;
 
 /// The host slot map and stdio markers serialize publication. This binding
 /// owns only their shared projection; pipe/eventfd descriptions and flags
@@ -11,7 +10,7 @@ pub(super) struct Binding {
     reservations: HashMap<i32, (u64, crate::el1_ipc::HostSlotReservation)>,
     table: HostTable,
     owner: Arc<HostIpc>,
-    map: &'static IpcTableMap,
+    map: Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
     file_table: FileTableId,
     stdio: Vec<HostDescription>,
     explicit_stdio: [bool; 3],
@@ -45,7 +44,7 @@ pub struct ImplicitHostStdio {
 impl Binding {
     fn new(
         owner: Arc<HostIpc>,
-        map: &'static IpcTableMap,
+        map: Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
         file_table: FileTableId,
         slots: &FileSlotMap,
         reserved_slots: &HashMap<i32, u64>,
@@ -69,7 +68,7 @@ impl Binding {
             reservations: HashMap::new(),
             table,
             owner,
-            map,
+            map: Arc::clone(&map),
             file_table,
             stdio: Vec::with_capacity(3),
             explicit_stdio: [false; 3],
@@ -111,8 +110,14 @@ impl Binding {
         }
         // No guest can observe a partial namespace. Publish only after every
         // real descriptor and implicit host stream has been represented.
-        map.publish(file_table.raw(), binding.table.id().to_raw())
-            .map_err(|_| AdmissionError::NoMemory)?;
+        let mut publication = Err(AdmissionError::NoMemory);
+        map.with_table_map(&mut |map| {
+            publication = map
+                .publish(file_table.raw(), binding.table.id().to_raw())
+                .map_err(|_| AdmissionError::NoMemory);
+        })
+        .map_err(|_| AdmissionError::from(fd::Error::StaleTable))?;
+        publication?;
         Ok(binding)
     }
 
@@ -311,7 +316,9 @@ impl Drop for Binding {
     fn drop(&mut self) {
         // Withdraw before the owned table invalidates its generation. Already
         // admitted operations keep their own pins through teardown.
-        self.map.withdraw(self.file_table.raw());
+        let _ = self.map.with_table_map(&mut |map| {
+            map.withdraw(self.file_table.raw());
+        });
     }
 }
 
@@ -322,7 +329,7 @@ impl FileTable {
     pub fn publish_ipc(
         &self,
         owner: Arc<HostIpc>,
-        map: &'static IpcTableMap,
+        map: Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
     ) -> Result<(), AdmissionError> {
         if !self.functional_refs_active() {
             return Err(fd::Error::StaleTable.into());
@@ -333,7 +340,7 @@ impl FileTable {
                 return match binding {
                     Ok(binding)
                         if Arc::ptr_eq(&owner, &binding.owner)
-                            && core::ptr::eq(map, binding.map) =>
+                            && Arc::ptr_eq(&map, &binding.map) =>
                     {
                         Ok(())
                     }
@@ -355,7 +362,7 @@ impl FileTable {
         if let Some(binding) = &*ipc {
             return match binding {
                 Ok(binding)
-                    if Arc::ptr_eq(&owner, &binding.owner) && core::ptr::eq(map, binding.map) =>
+                    if Arc::ptr_eq(&owner, &binding.owner) && Arc::ptr_eq(&map, &binding.map) =>
                 {
                     Ok(())
                 }
@@ -563,13 +570,32 @@ mod tests {
     use crate::kernel::ids::ObjectIdRegistry;
     use carrick_el1_abi::ipc::{IpcBacking, fd};
 
-    fn map() -> &'static IpcTableMap {
-        // SAFETY: the map consists of zero-initialized atomics, lives for this
-        // test process, and is accessed only through its synchronized API.
-        unsafe {
-            &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<IpcTableMap>())
-                .cast::<IpcTableMap>()
-        }
+    fn map() -> Arc<carrick_test_support::TestIpcTableMap> {
+        Arc::new(carrick_test_support::TestIpcTableMap::new())
+    }
+
+    #[test]
+    fn publication_retains_map_until_namespace_withdrawal() {
+        let ids = ObjectIdRegistry::new();
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let map = map();
+        let retained = Arc::downgrade(&map);
+        let table = FileTable::new(ids.file_table_id().unwrap());
+        let id = table.id().raw();
+        table.publish_ipc(owner, map.clone()).unwrap();
+        drop(map);
+        let observed = retained.upgrade().expect("namespace must retain its map");
+        assert!(observed.lookup(id).is_some());
+        drop(table);
+        assert!(
+            observed.lookup(id).is_none(),
+            "withdraw before releasing custody"
+        );
+        drop(observed);
+        assert!(
+            retained.upgrade().is_none(),
+            "last namespace releases mapping custody"
+        );
     }
 
     // No host fd, fork, environment mutation or global counter: VM-free
@@ -583,9 +609,9 @@ mod tests {
         let description = Arc::new(FileDescription::regular(ids.file_description_id().unwrap()));
         description.retain_fd_ref();
         parent.install(FileSlotNumber::for_open_fd(3).unwrap(), description, false);
-        parent.publish_ipc(Arc::clone(&owner), map).unwrap();
+        parent.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
         let peer = FileTable::for_fork_copy(ids.file_table_id().unwrap(), &parent);
-        peer.publish_ipc(Arc::clone(&owner), map).unwrap();
+        peer.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
         let region = owner.region();
         let authority = region.fd(crate::el1_zone::HostLockWait);
         let shared = fd::TableId::from_raw(map.lookup(parent.id().raw()).unwrap());
@@ -608,9 +634,9 @@ mod tests {
         let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
         let map = map();
         let parent = Arc::new(FileTable::new(ids.file_table_id().unwrap()));
-        parent.publish_ipc(Arc::clone(&owner), map).unwrap();
+        parent.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
         let peer = FileTable::for_fork_copy(ids.file_table_id().unwrap(), &parent);
-        peer.publish_ipc(Arc::clone(&owner), map).unwrap();
+        peer.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
         let region = owner.region();
         let authority = region.fd(crate::el1_zone::HostLockWait);
         let shared = fd::TableId::from_raw(map.lookup(parent.id().raw()).unwrap());
@@ -641,7 +667,7 @@ mod tests {
             Arc::clone(&old),
             false,
         );
-        table.publish_ipc(Arc::clone(&owner), map).unwrap();
+        table.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
 
         let shared = fd::TableId::from_raw(map.lookup(table.id().raw()).unwrap());
         owner
@@ -709,7 +735,7 @@ mod tests {
             true,
         );
         parent.lock_stdio_cloexec()[1] = true;
-        parent.publish_ipc(Arc::clone(&owner), map).unwrap();
+        parent.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
         let child_context = kernel
             .fork_task(
                 &context,
@@ -721,7 +747,7 @@ mod tests {
             )
             .unwrap();
         let child = child_context.resources().files();
-        child.publish_ipc(Arc::clone(&owner), map).unwrap();
+        child.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
         let region = owner.region();
         let authority = region.fd(crate::el1_zone::HostLockWait);
         let parent_id = fd::TableId::from_raw(map.lookup(parent.id().raw()).unwrap());
@@ -733,7 +759,7 @@ mod tests {
         let prepared = kernel.prepare_exec(&child_context, None).unwrap();
         let committed = kernel.commit_exec(prepared, None).unwrap();
         let exec = committed.resources().files();
-        exec.publish_ipc(Arc::clone(&owner), map).unwrap();
+        exec.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
         let exec_id = fd::TableId::from_raw(map.lookup(exec.id().raw()).unwrap());
         assert_eq!(authority.get(exec_id, fd::Fd(3)), Err(fd::Error::BadFd));
         assert_eq!(authority.get(exec_id, fd::Fd(1)), Err(fd::Error::BadFd));
@@ -754,7 +780,7 @@ mod tests {
         );
         assert_eq!(parent.slot_count(), 2);
         assert!(authority.pinned(&operation).is_ok());
-        assert!(parent.publish_ipc(Arc::clone(&owner), map).is_err());
+        assert!(parent.publish_ipc(Arc::clone(&owner), map.clone()).is_err());
         assert!(map.lookup(child.id().raw()).is_none());
         assert!(authority.unpin(operation).unwrap().is_none());
         let child_key = child.id();
@@ -780,7 +806,7 @@ mod tests {
             false,
         );
         table
-            .publish_ipc(Arc::clone(&owner), map)
+            .publish_ipc(Arc::clone(&owner), map.clone())
             .expect("publish complete live FileTable");
         let shared = fd::TableId::from_raw(map.lookup(table.id().raw()).expect("live namespace"));
         let region = owner.region();
@@ -834,7 +860,7 @@ mod tests {
         }
         assert!(map.lookup(table.id().raw()).is_none());
         assert_eq!(authority.get(shared, fd::Fd(3)), Err(fd::Error::StaleTable));
-        assert!(table.publish_ipc(Arc::clone(&owner), map).is_err());
+        assert!(table.publish_ipc(Arc::clone(&owner), map.clone()).is_err());
         let retired = authority.unpin(operation).unwrap().unwrap();
         owner.release(retired.backing).unwrap();
     }

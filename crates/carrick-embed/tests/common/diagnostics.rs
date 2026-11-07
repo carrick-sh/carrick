@@ -84,7 +84,7 @@ pub fn persist_watchdog(run_id: &str, dir: &Path) -> std::io::Result<PathBuf> {
     if let Some(zone) = carrick_el1_abi::zone_tables() {
         let mut census = String::new();
         let _ = zone.write_census(&mut census);
-        let _ = carrick_runtime::with_carrier_ipc_region(|region| {
+        let _ = carrick_runtime::with_carrier_ipc_region(|region, _map_backing| {
             let _ = carrick_el1_abi::ipc::write_ipc_wait_census(zone, region, &mut census);
             let _ = region.write_host_wake_census(&mut census);
         });
