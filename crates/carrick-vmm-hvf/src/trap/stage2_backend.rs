@@ -608,7 +608,7 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
             size as u64,
         ),
     };
-    publish_el1_region_host_ptr(mapping, host);
+    publish_el1_region_host_ptr(custody, mapping, &region);
     Ok(region)
 }
 
@@ -881,7 +881,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         region.owner_generation = epoch.raw();
         region.structural_owner = Some(owner);
     }
-    publish_el1_region_host_ptr(mapping, host);
+    publish_el1_region_host_ptr(custody, mapping, &region);
     Ok(region)
 }
 
@@ -933,12 +933,24 @@ fn register_file_region_backing(
     .map_err(|error| TrapError::Hypervisor(format!("ARM file-region geometry: {error:?}")))?;
     // SAFETY: boot exclusively owns this freshly prepared mapping. The Arc
     // retains registration and mapping together until all consumers retire.
-    let backing = unsafe { crate::metadata_grant::BirthZoneBacking::initialize(owner, binding) }?;
-    Ok(RegionHostOwner::BirthZone(std::sync::Arc::new(backing)))
+    let backing = std::sync::Arc::new(unsafe {
+        crate::metadata_grant::BirthZoneBacking::initialize(owner, binding)
+    }?);
+    Ok(RegionHostOwner::BirthZone(backing))
 }
 
-fn publish_el1_region_host_ptr(mapping: &GuestMapping, host: *mut u8) {
+fn publish_el1_region_host_ptr(
+    custody: &CarrierVmCustody,
+    mapping: &GuestMapping,
+    region: &HvfMappedRegion,
+) {
+    let host = region.host_addr;
     if mapping.guest_start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE {
+        if let Some(RegionHostOwner::BirthZone(backing)) = &region.host_mapping {
+            // Publish only after every fallible mapping step has committed.
+            // Dropping an unpublished replacement leaves the old owner intact.
+            *custody.file_region_backing.lock() = std::sync::Arc::downgrade(backing);
+        }
         // The mapping is still exclusively owned by boot. Initialize in
         // place before publishing the host aperture or admitting guest CPUs.
         let ingress = unsafe {
@@ -1291,6 +1303,13 @@ mod tests {
         let b = CarrierVmCustody::new_live_fixture();
         let first = prepare_exec_region_raw_in(&a, &mapping).expect("first carrier region");
         let second = prepare_exec_region_raw_in(&b, &mapping).expect("second carrier region");
+        // An aborted candidate follows the same drop path as a stage-2 map
+        // failure. It must not replace the first carrier's published owner.
+        let (_, _, candidate) = map_exclusive_region(&mapping, mapping.mapped_size as usize)
+            .expect("candidate backing");
+        drop(
+            register_file_region_backing(&a, &mapping, candidate).expect("candidate registration"),
+        );
         let mailbox = |region: &HvfMappedRegion| {
             // SAFETY: both owned mappings stay live through the complete test;
             // this fixed ABI record uses atomics for shared access.

@@ -236,6 +236,11 @@ impl FileRegionRegistration {
         // SAFETY: caller grants exclusive initialized extent custody; every
         // allocation and its alignment is checked by the shared layout.
         unsafe {
+            mapped
+                .as_ptr()
+                .add(crate::EL1_METADATA_MAILBOX_OFFSET as usize)
+                .cast::<crate::MetadataGrantMailbox>()
+                .write(crate::MetadataGrantMailbox::new());
             for index in 0..MAX_DELEGATED_FILES {
                 mapped
                     .as_ptr()
@@ -297,6 +302,21 @@ impl FileRegionRegistration {
 
     pub const fn binding(&self) -> FileRegionBinding {
         self.binding
+    }
+
+    /// Borrow the initialized mailbox from this exact carrier registration.
+    /// Retirement refuses new borrows; no process-global aperture is read.
+    pub fn metadata_mailbox(&self) -> Result<&crate::MetadataGrantMailbox, FileRegionError> {
+        self.tables(self.binding)?;
+        // SAFETY: initialization writes this atomic record before publication;
+        // the registration borrow retains its complete aligned extent.
+        Ok(unsafe {
+            &*self
+                .mapped
+                .as_ptr()
+                .add(crate::EL1_METADATA_MAILBOX_OFFSET as usize)
+                .cast::<crate::MetadataGrantMailbox>()
+        })
     }
 
     pub fn tables(&self, expected: FileRegionBinding) -> Result<FileTables<'_>, FileRegionError> {

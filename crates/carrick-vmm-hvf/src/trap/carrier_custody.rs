@@ -417,6 +417,11 @@ type RetainedNativeExecPreparation = (
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub struct CarrierVmCustody {
     pub(crate) transfer_carrier: core::num::NonZeroU64,
+    /// The boot mapping owns the registration. Lookup upgrades this weak
+    /// handle before borrowing records, so replacement cannot free an
+    /// in-flight service's mapping and custody does not extend retirement.
+    pub(crate) file_region_backing:
+        parking_lot::Mutex<std::sync::Weak<crate::metadata_grant::BirthZoneBacking>>,
     pub(crate) el1_frame_grants: std::sync::Arc<El1FrameGrantLedger>,
     /// Host COW accounting for every MM admitted to this carrier.
     pub(crate) host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger,
@@ -768,6 +773,7 @@ impl CarrierVmCustody {
         let asids = carrick_hal::asid::AsidAllocator::new();
         Self {
             transfer_carrier,
+            file_region_backing: Default::default(),
             el1_frame_grants: std::sync::Arc::new(El1FrameGrantLedger::default()),
             host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger::default(),
             metadata_completion: parking_lot::Mutex::new(None),
