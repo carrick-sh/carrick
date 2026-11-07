@@ -12,6 +12,7 @@ rationale = "A fork child and its parent remain live while the child asks for ei
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_default_returns_eight_bytes",
   "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_nonblock_returns_eight_bytes",
+  "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_rejects_conflicting_sources_before_output_preparation",
 ]
 
 [bindings.unresolved]
