@@ -14031,6 +14031,7 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2]) {
         serial: TaskSerial::from_raw_u64(11).unwrap(),
     };
     let child = runtime.namespace_child_key(parent, child_pid).unwrap();
+    assert!(runtime.identity_number_reserved(child.id));
     let child_binding = runtime.task_binding(child).unwrap();
     let child_task = &*Box::leak(Box::new(CurrentTask::new()));
     activate(source, child_task, &child_binding);
@@ -14088,6 +14089,10 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2]) {
         LifecycleOutcome::Transferred { .. }
     ));
     drop(entry);
+    assert!(
+        runtime.identity_number_reserved(child.id),
+        "an unreaped zombie must retain its internal number"
+    );
     let parent_binding = runtime.task_binding(parent).unwrap();
     activate(source, &fixture.task, &parent_binding);
     let status = carrick_test_support::GuestUserBuffer::from_value(0i32);
@@ -14104,4 +14109,24 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2]) {
         matches!(waited, LifecycleOutcome::Returned { result, .. } if result.raw() == i64::from(child_pid))
     );
     assert_eq!(status.get::<i32>(0), 23 << 8, "real child exit status");
+    drop(entry);
+    assert!(runtime.namespace_child_key(parent, child_pid).is_none());
+    assert!(
+        !runtime.identity_number_reserved(child.id),
+        "wait4 must release the reaped child's internal number"
+    );
+    runtime.set_next_identity_for_test(child.id);
+    let mut entry = runtime
+        .enter(source, &fixture.task, parent_binding.words, &mut service)
+        .unwrap();
+    let reused = entry.fork(ProcessForkChildTid::NONE);
+    let LifecycleOutcome::Returned { result, .. } = reused else {
+        panic!("fork after reap must return");
+    };
+    assert!(result.raw() > 0, "fork after reap failed: {}", result.raw());
+    let next_pid = u32::try_from(result.raw()).unwrap();
+    assert!(!live_tids.contains(&next_pid));
+    let next_child = runtime.namespace_child_key(parent, next_pid).unwrap();
+    assert_eq!(next_child.id, child.id, "fully released number is reusable");
+    assert_ne!(next_child.serial, child.serial, "reuse starts a new task");
 }
