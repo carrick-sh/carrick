@@ -12,7 +12,7 @@
 schema_version = 1
 id = "kernel.el1.ipc-fd-authority"
 title = "One shared descriptor incarnation retains exact OFD pins"
-guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:sendmsg", "syscall:mmap"]
+guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:close_range", "syscall:sendmsg", "syscall:mmap"]
 semantic_authority = ["man 2 execve", "man 2 fork", "man 2 clone", "man 2 dup", "man 2 fcntl", "man 2 close", "man 2 close_range", "man 7 inotify", "man 7 epoll", "man 7 unix", "man 2 mmap"]
 fixture = "fd-core:two-live-table owners and incarnation pins"
 scale_points = [65, 4096, 65536]
@@ -26,6 +26,7 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_child_committed_close_never_replays_reused_fd (red acceptance witness: committed cleanup must not resolve a reused numeric fd)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_child_plain_close_range_is_served (red refusal witness: effect-free in-zone range must complete through production native dispatch; no shared-table UNSHARE or host cleanup claim)",
   "carrick-el1-linux::aarch64_process_tests::native_fd_shell_tests::{serial_host_native_child_redirect_restore_stdout_1410,serial_host_native_subshell_reads_parent_duplicated_heredoc_1399} (in-zone pipe compositions; no host-backed stdout or signed shell claim)",
   "carrick-el1-linux::file_table::tests::range_cloexec_projects_live_incarnation_one_only_after_authority_success",
   "carrick-el1-linux::file_table::tests::setfd_authority_and_projection_share_range_mutation_guard",
