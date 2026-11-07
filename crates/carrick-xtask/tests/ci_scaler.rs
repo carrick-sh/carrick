@@ -1263,87 +1263,6 @@ fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
 }
 
 #[test]
-fn dispatch_demand_and_hook_are_bound_to_owner_main_workflow_run() {
-    let mut run = standing_run("issues", "main");
-    run["path"] = DISPATCH_WORKFLOW.into();
-    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    assert!(Admission::Agent.identifies_run(&run));
-    assert!(!Admission::Standing.identifies_run(&run));
-    // #1214: run identity is shape only (human actors with valid logins);
-    // whether those actors are write collaborators is the live check in
-    // controller admission and the token mint, covered by the lib tests.
-    for field in ["actor", "triggering_actor"] {
-        let mut collaborator = run.clone();
-        collaborator[field]["login"] = "collaborator".into();
-        assert!(Admission::Agent.identifies_run(&collaborator));
-        for (key, value) in [("type", "Bot"), ("login", "../outsider"), ("login", "")] {
-            let mut bad = run.clone();
-            bad[field][key] = value.into();
-            assert!(
-                !Admission::Agent.identifies_run(&bad),
-                "{field}.{key}={value}"
-            );
-        }
-    }
-    let mut context = standing_context("issues", "refs/heads/main");
-    context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main");
-    let policy = JobPolicy::Agent(RunBinding {
-        run: RunId(context.run_id),
-        attempt: context.run_attempt,
-        sha: context.sha.clone(),
-    });
-    assert_eq!(JobPolicy::parse(&policy.render()).unwrap(), policy);
-    assert!(policy.authorize(&context).is_ok());
-    context.run_id += 1;
-    assert!(policy.authorize(&context).is_err());
-    context.workflow_ref = format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/main");
-    assert!(policy.authorize(&context).is_err());
-    let workflow = include_str!("../../../.github/workflows/dispatch-worker.yml");
-    assert_eq!(runs_on(workflow, "worker"), AGENT_LABELS);
-}
-
-#[test]
-fn dispatch_demand_refuses_worker_app_actor_and_triggering_actor() {
-    let mut run = standing_run("issues", "main");
-    run["path"] = DISPATCH_WORKFLOW.into();
-    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    for field in ["actor", "triggering_actor"] {
-        let mut app_run = run.clone();
-        app_run[field]["login"] = "carrick-workers[bot]".into();
-        assert!(
-            !Admission::Agent.identifies_run(&app_run),
-            "worker App in {field} admitted a credentialed agent clone"
-        );
-    }
-}
-
-#[test]
-fn dispatch_demand_refuses_nonuser_or_missing_actor_types() {
-    let mut run = standing_run("issues", "main");
-    run["path"] = DISPATCH_WORKFLOW.into();
-    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    assert!(Admission::Agent.identifies_run(&run));
-    for field in ["actor", "triggering_actor"] {
-        for account_type in [Some("Bot"), Some("Organization"), None] {
-            let mut spoofed = run.clone();
-            match account_type {
-                Some(value) => spoofed[field]["type"] = value.into(),
-                None => {
-                    spoofed[field].as_object_mut().unwrap().remove("type");
-                }
-            }
-            assert!(
-                !Admission::Agent.identifies_run(&spoofed),
-                "{field} with type {account_type:?} admitted an owner-spoofed run"
-            );
-        }
-    }
-}
-
-#[test]
 fn agent_resource_admission_uses_eight_cores_and_twenty_gib_plus_host_reserve() {
     assert!(admit_resources(0.63, 48, 26 << 30, 8, 20480));
     assert!(!admit_resources(0.64, 48, 26 << 30, 8, 20480));
@@ -1403,13 +1322,12 @@ fn agent_template_hash_locks_semgrep_at_the_ci_version() {
 }
 
 /// #1474: the Copilot fallback worker runs from a prebuilt, hash-locked SDK
-/// and a runtime extracted at template build; no job installs either, and
-/// the version marker matches the launcher's pinned `COPILOT_SDK_VERSION`.
+/// and a runtime extracted at template build; no job installs either.
 #[test]
 fn agent_template_prebuilds_the_hash_locked_copilot_sdk_and_runtime() {
     let builder = include_str!("../../../scripts/ci/build-template-debian.sh");
-    let venv = carrick_xtask::dispatch_worker::COPILOT_SDK_VENV;
-    let runtime = carrick_xtask::dispatch_worker::COPILOT_RUNTIME_DIR;
+    let venv = "/opt/carrick-agent/copilot-sdk";
+    let runtime = "/opt/carrick-agent/copilot-runtime";
     assert!(builder.contains(&format!("python3 -m venv {venv}\n")));
     assert!(builder.contains(
         "--no-deps --only-binary=:all: --require-hashes -r copilot-sdk-requirements.txt"
@@ -1447,9 +1365,6 @@ fn agent_template_prebuilds_the_hash_locked_copilot_sdk_and_runtime() {
             "{line}"
         );
     }
-    let driver = include_str!("../src/dispatch_worker.rs");
-    assert!(driver.contains(".env(\"AGY_DIRECTOR_COPILOT_VENV\", COPILOT_SDK_VENV)"));
-    assert!(driver.contains(".env(\"COPILOT_SKIP_CLI_DOWNLOAD\", \"1\")"));
 }
 
 #[test]
@@ -1457,7 +1372,7 @@ fn agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses() {
     // The codex tier failed live because `python3 -m venv` was unavailable
     // and every job would download the SDK from PyPI (#773).
     let builder = include_str!("../../../scripts/ci/build-template-debian.sh");
-    let venv = carrick_xtask::dispatch_worker::CODEX_SDK_VENV;
+    let venv = "/opt/carrick-agent/codex-sdk";
     assert!(builder.contains(&format!("python3 -m venv {venv}\n")));
     assert!(builder.contains(&format!("{venv}/bin/pip install ")));
     assert!(
@@ -1485,23 +1400,12 @@ fn agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses() {
             "{line}"
         );
     }
-    let driver = include_str!("../src/dispatch_worker.rs");
-    assert!(driver.contains(".env(\"AGY_DIRECTOR_CODEX_VENV\", CODEX_SDK_VENV)"));
-    // #1240: every launch can fall back to the pinned roster seed.
-    assert!(driver.contains("\"AGY_MODELS_SEED\""));
-    let coordinator = include_str!("../src/dispatch_loop.rs");
-    assert_eq!(coordinator.matches("\"AGY_MODELS_SEED\"").count(), 2);
-    // Codex runs only from the SDK's bundled package; a separately fetched
-    // codex binary lacks codex-code-mode-host (#787, run 39818689543).
-    assert!(!driver.contains("AGY_DIRECTOR_CODEX_SDK_BIN"));
     let tools = include_str!("../../../scripts/ci/inputs/agent-tools.json");
     assert!(!tools.contains("\"codex\""));
 }
 
 #[test]
-fn template_installs_every_program_the_dispatch_driver_spawns() {
-    // The runner-only witnesses use Git/GitHub stand-ins, so a program missing
-    // from the template only failed live (#769: no `gh`, bootstrap refused).
+fn template_installs_the_pinned_official_gh() {
     let source = include_str!("../../../scripts/ci/build-template-debian.sh");
     let packages: Vec<&str> = source
         .lines()
@@ -1509,45 +1413,8 @@ fn template_installs_every_program_the_dispatch_driver_spawns() {
         .unwrap()
         .split(", ")
         .collect();
-    // python3 ships in the cloud image (cloud-init); provision.sh installs rustup and official gh.
-    let provided_otherwise = ["python3", "rustup", "gh"];
-    let mut spawned = Vec::new();
-    for driver in [
-        include_str!("../src/agent_runner.rs"),
-        include_str!("../src/dispatch_worker.rs"),
-    ] {
-        for marker in ["Command::new(\"", "invoke("] {
-            for (start, _) in driver.match_indices(marker) {
-                let rest = &driver[start + marker.len()..];
-                let rest = if marker == "invoke(" {
-                    let Some(quote) = rest.find('"') else {
-                        continue;
-                    };
-                    if rest[..quote].contains(')') {
-                        continue;
-                    }
-                    &rest[quote + 1..]
-                } else {
-                    rest
-                };
-                let program = &rest[..rest.find('"').unwrap()];
-                if !program.starts_with('/') && !program.is_empty() {
-                    spawned.push(program.to_string());
-                }
-            }
-        }
-    }
-    for required in ["gh", "git", "curl"] {
-        assert!(
-            spawned.iter().any(|p| p == required),
-            "scan lost {required}"
-        );
-    }
-    for program in spawned {
-        assert!(
-            packages.contains(&program.as_str()) || provided_otherwise.contains(&program.as_str()),
-            "agent template does not install {program}"
-        );
+    for required in ["git", "curl"] {
+        assert!(packages.contains(&required), "template lacks {required}");
     }
     assert!(
         !packages.contains(&"gh"),
@@ -1639,37 +1506,6 @@ fn template_separates_loop_worker_and_runner_accounts() {
         assert!(source.contains(&format!("runner ALL=({user}) NOPASSWD: ALL")));
         assert!(source.contains(&format!("/etc/sudoers.d/{user}")));
     }
-}
-
-#[test]
-fn review_dispatch_demand_and_hook_are_admitted() {
-    let mut run = standing_run("pull_request_review", "work/dispatch-799-42");
-    run["path"] = DISPATCH_WORKFLOW.into();
-    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    run["triggering_actor"] = run["actor"].clone();
-    assert!(Admission::Agent.identifies_run(&run));
-    run["head_branch"] = "work/arbitrary".into();
-    assert!(!Admission::Agent.identifies_run(&run));
-    let mut context = standing_context("pull_request_review", "refs/pull/42/merge");
-    context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/pull/42/merge");
-    assert!(Admission::Agent.authorize(&context).is_ok());
-}
-
-#[test]
-fn owner_comment_dispatch_run_is_admitted() {
-    let mut run = standing_run("issue_comment", "main");
-    run["path"] = DISPATCH_WORKFLOW.into();
-    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    run["triggering_actor"] = run["actor"].clone();
-    assert!(
-        Admission::Agent.identifies_run(&run),
-        "owner comment run refused"
-    );
-    let mut context = standing_context("issue_comment", "refs/heads/main");
-    context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main");
-    assert!(Admission::Agent.authorize(&context).is_ok());
-    context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/pull/42/merge");
-    assert!(Admission::Agent.authorize(&context).is_err());
 }
 
 #[test]

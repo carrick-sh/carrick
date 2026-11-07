@@ -1,13 +1,13 @@
 //! Scoped capture privilege on agent clones (#1621; owner decision on #231,
-//! 2026-11-04, narrowed by the carrick-87 review). The dispatch worker gets
+//! 2026-11-04, narrowed by the carrick-87 review). The worker account gets
 //! passwordless sudo for exactly three commands and nothing else:
 //!
 //! - `/usr/local/sbin/carrick-capture <name> [--seconds N]`, which runs one
 //!   of the reviewed bpftrace scripts in the `carrick-capture` crate. There
 //!   is no free-form program: root bpftrace with `-e PROG` can read any
 //!   process's memory and files, including the loop and runner tokens and
-//!   `redaction-secrets.json`, which would erase the loop/worker uid
-//!   separation in `docs/ci/dispatch-worker.md`;
+//!   `redaction-secrets.json`, which would erase the separation between
+//!   the worker account and the accounts that hold credentials;
 //! - `dmesg` with no arguments and `journalctl -k`, both under sudo's
 //!   `NOEXEC` (read-only kernel log; no pager or helper can exec).
 //!

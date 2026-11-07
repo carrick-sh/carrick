@@ -17,7 +17,6 @@ enum Status {
 fn desired(
     node: &Value,
     current: Option<Status>,
-    running: &BTreeSet<u64>,
     open: &BTreeSet<u64>,
     cutoff: u64,
 ) -> Option<(Status, String)> {
@@ -54,12 +53,6 @@ fn desired(
             "published Verdict: APPROVE on current head",
         );
     }
-    if node["number"]
-        .as_u64()
-        .is_some_and(|number| running.contains(&number))
-    {
-        return decide(Status::InProgress, "dispatch workflow round is running");
-    }
     if pr
         && node["isDraft"] == true
         && node["updatedAt"]
@@ -83,25 +76,6 @@ fn desired(
             ));
         }
         return None;
-    }
-    let outcome = node["comments"]["nodes"].as_array().and_then(|comments| {
-        comments
-            .iter()
-            .filter(|comment| {
-                matches!(
-                    comment["author"]["login"].as_str(),
-                    Some("github-actions[bot]" | "carrick-workers[bot]")
-                )
-            })
-            .filter_map(|comment| {
-                let status =
-                    crate::dispatch_worker::published_outcome_status(comment["body"].as_str()?)?;
-                Some((comment["createdAt"].as_str()?, status))
-            })
-            .max_by_key(|(created, _)| *created)
-    });
-    if outcome.is_some_and(|(_, status)| status == "Blocked") {
-        return decide(Status::Blocked, "latest dispatch outcome is Blocked");
     }
     None
 }
@@ -196,7 +170,6 @@ struct Snapshot {
     options: BTreeMap<String, String>,
     items: BTreeMap<String, (String, Option<Status>)>,
     nodes: BTreeMap<u64, Value>,
-    running: BTreeSet<u64>,
 }
 
 const CONTENT: &str = r#"content { ... on Issue { id number repository { nameWithOwner } } ... on PullRequest { id number repository { nameWithOwner } } }"#;
@@ -219,7 +192,6 @@ impl Snapshot {
             options: BTreeMap::new(),
             items: BTreeMap::new(),
             nodes: BTreeMap::new(),
-            running: BTreeSet::new(),
         };
         let mut ids = BTreeSet::new();
         let mut cursor = Value::Null;
@@ -334,44 +306,8 @@ impl Snapshot {
             }
         }
         snapshot.complete_connections(api)?;
-        snapshot.running = running_issues(api)?;
         Ok(snapshot)
     }
-}
-
-fn running_issues(api: &mut impl Api) -> Result<BTreeSet<u64>, ScalerError> {
-    let pages = api.request("GET", &format!("repos/{REPOSITORY}/actions/workflows/dispatch-worker.yml/runs?status=in_progress&per_page=100"), None, true)?;
-    let mut issues = BTreeSet::new();
-    for page in array(&pages)? {
-        for run in array(&page["workflow_runs"])? {
-            let id = run["id"]
-                .as_u64()
-                .ok_or(ScalerError::Guard("missing dispatch run id"))?;
-            let jobs = api.request(
-                "GET",
-                &format!("repos/{REPOSITORY}/actions/runs/{id}/jobs?per_page=100"),
-                None,
-                true,
-            )?;
-            for page in array(&jobs)? {
-                for job in array(&page["jobs"])? {
-                    // This is the existing workflow guard's structured identity
-                    // record, also consumed by the dispatch GitHub client.
-                    for step in array(&job["steps"])? {
-                        if step["conclusion"] == "success"
-                            && let Some(number) = step["name"]
-                                .as_str()
-                                .and_then(|s| s.strip_prefix("Dispatch issue "))
-                                .and_then(|s| s.parse::<u64>().ok())
-                        {
-                            issues.insert(number);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(issues)
 }
 
 impl Status {
@@ -448,7 +384,7 @@ impl Snapshot {
                 .items
                 .get(node["id"].as_str().unwrap_or_default())
                 .and_then(|i| i.1);
-            if let Some(decision) = desired(node, current, &self.running, open, cutoff) {
+            if let Some(decision) = desired(node, current, open, cutoff) {
                 decisions.insert(*number, decision);
             }
         }
@@ -458,7 +394,7 @@ impl Snapshot {
             if node["__typename"] != "PullRequest" {
                 continue;
             }
-            let Some((status, _)) = desired(node, None, &self.running, open, cutoff) else {
+            let Some((status, _)) = desired(node, None, open, cutoff) else {
                 continue;
             };
             if !matches!(status, Status::InReview | Status::InProgress) {
@@ -681,29 +617,6 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     #[test]
-    fn running_round_887_overrides_blocked() {
-        let fixture: Value =
-            serde_json::from_str(include_str!("fixtures/board/running-887.json")).unwrap();
-        assert_eq!(
-            desired(
-                &fixture,
-                Some(Status::Blocked),
-                &BTreeSet::from([887]),
-                &BTreeSet::from([887]),
-                timestamp("2026-11-06T00:00:00Z").unwrap()
-            )
-            .unwrap()
-            .0,
-            Status::InProgress
-        );
-        let mut snapshot = snapshot();
-        snapshot.nodes.remove(&100);
-        let plan = snapshot.plan(0, &BTreeSet::from([887]));
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].number, 887);
-        assert_eq!(plan[0].to, Some(Status::InProgress));
-    }
-    #[test]
     fn recorded_rule_fixtures() {
         let fixtures: Vec<Value> =
             serde_json::from_str(include_str!("fixtures/board/rules.json")).unwrap();
@@ -711,12 +624,10 @@ mod tests {
             let current: Option<Status> = serde_json::from_value(case["current"].clone()).unwrap();
             let expected: Option<Status> =
                 serde_json::from_value(case["expected"].clone()).unwrap();
-            let running: BTreeSet<u64> = serde_json::from_value(case["running"].clone()).unwrap();
             let open: BTreeSet<u64> = serde_json::from_value(case["open"].clone()).unwrap();
             let actual = desired(
                 &case["node"],
                 current,
-                &running,
                 &open,
                 timestamp("2026-11-06T00:00:00Z").unwrap(),
             )
@@ -727,7 +638,7 @@ mod tests {
 
     fn snapshot() -> Snapshot {
         let issue: Value =
-            serde_json::from_str(include_str!("fixtures/board/running-887.json")).unwrap();
+            serde_json::from_str(include_str!("fixtures/board/issue-887.json")).unwrap();
         let cases: Vec<Value> =
             serde_json::from_str(include_str!("fixtures/board/rules.json")).unwrap();
         let pr = cases
@@ -750,7 +661,6 @@ mod tests {
             .collect(),
             items: BTreeMap::from([("I_887".into(), ("item-887".into(), Some(Status::Blocked)))]),
             nodes: BTreeMap::from([(887, issue), (100, pr)]),
-            running: BTreeSet::from([887]),
         }
     }
 
@@ -845,7 +755,6 @@ mod tests {
                 .iter()
                 .all(|c| c.to == Some(Status::InProgress))
         );
-        snapshot.running.clear();
         snapshot.nodes.remove(&100);
         snapshot.nodes.get_mut(&887).unwrap()["comments"] = json!({"nodes":[]});
         assert!(snapshot.plan(0, &BTreeSet::from([887])).is_empty());
@@ -904,7 +813,6 @@ mod tests {
         let mut api = Replay { steps };
         let snapshot = Snapshot::load(&mut api).unwrap();
         assert!(api.steps.is_empty());
-        assert_eq!(snapshot.running, BTreeSet::from([887]));
         assert!(
             !snapshot.nodes.contains_key(&777),
             "Done items need no history queries"
@@ -947,7 +855,6 @@ mod tests {
     fn closed_blocker_is_looked_up_even_when_not_on_board() {
         let mut snapshot = snapshot();
         snapshot.nodes.remove(&100);
-        snapshot.running.clear();
         snapshot.nodes.get_mut(&887).unwrap()["comments"]["nodes"].as_array_mut().unwrap().push(json!({"author":{"login":DISPATCH_OWNER},"createdAt":"2026-11-07T00:00:00Z","body":"waits on #200"}));
         let mut api = Replay {
             steps: std::collections::VecDeque::from([

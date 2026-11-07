@@ -552,7 +552,7 @@ test-xtask *ARGS:
 
 [private]
 _test-xtask *ARGS:
-    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test loom_run --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test signed_gate_fixtures --test smoke_signed --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder --test dispatch_workflow {{ARGS}}
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test loom_run --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test signed_gate_fixtures --test smoke_signed --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
 
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:
@@ -803,8 +803,7 @@ _test-unit-hvf *ARGS:
 # tests and carrick-x86-cpl0-host's lib tests. Linux x86_64 with a usable /dev/kvm only: the recipe refuses anywhere
 # else, and exports CARRICK_REQUIRE_KVM=1 so a test that would skip on a
 # missing device or fixture fails instead. Run by `just accept --profile
-# kvm` and the KVM job in kernel-runtime.yml (merge queue). Dispatch workers
-# may run it inside their dedicated clone under the job's inherited gate lease.
+# kvm` and the KVM job in kernel-runtime.yml (merge queue).
 test-kvm *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail

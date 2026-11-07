@@ -16,10 +16,8 @@ mod capture;
 mod claim;
 mod github;
 pub(crate) use github::Github;
-pub(crate) use github::dispatch_workflow_unchanged;
 mod live;
 mod mac;
-pub(crate) mod mint;
 mod qualify_clone;
 mod site;
 mod template_retirement;
@@ -36,15 +34,14 @@ pub use mac::{
 };
 
 pub const POOL: &str = "carrick-ci";
-/// Guest state shared by the job-start hook, the dispatch tool server and the
-/// controller (the hook's flock, drain marker, assignment rendezvous and token
-/// requests); created by the template.
+/// Guest state shared by the job-start hook and the controller (the hook's
+/// flock, drain marker and assignment rendezvous); created by the template.
 pub(crate) const GUEST_STATE: &str = "/run/carrick-ci";
 pub const REPOSITORY: &str = "carrick-sh/carrick";
 pub const DISPATCH_OWNER: &str = "tjfontaine";
-/// Credentialed agent clones, served by the same Contabo controller.
+/// The retired Actions dispatch lane's runner label. No job carrying it is
+/// admitted any more; the lane only reconciles and reaps its leftover rows.
 pub const AGENT_LABELS: [&str; 1] = ["carrick-agent"];
-pub const DISPATCH_WORKFLOW: &str = ".github/workflows/dispatch-worker.yml";
 /// The KVM runner label set, shared by Willow and Contabo.
 pub const LABELS: [&str; 4] = ["self-hosted", "Linux", "X64", "willow-kvm"];
 /// The one HVF runner label set for cloudmac main-push JIT runners.
@@ -79,15 +76,6 @@ pub enum ScalerError {
     Guard(&'static str),
     #[error("{0}")]
     Usage(String),
-    /// The run's own commits change workflow files, which dispatch's
-    /// publishing credentials can't push (#1241); the second field is any
-    /// note publication adds (where the commits were kept).
-    #[error(
-        "Refused workflow changes: the run's own commits change {}; dispatch publishing credentials cannot publish .github/workflows/*, so the owner must publish or drop them{}",
-        .0.join(", "),
-        .1
-    )]
-    WorkflowRefused(Vec<String>, String),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON: {0}")]
@@ -180,10 +168,12 @@ impl CloneLane {
             Self::Agent => &AGENT_LABELS,
         }
     }
-    pub fn admission(self) -> Admission {
+    /// The runs a lane's clones may serve. The agent lane admits none since
+    /// Actions dispatch was retired; its rows are only reconciled and reaped.
+    pub fn admission(self) -> Option<Admission> {
         match self {
-            Self::Kvm => Admission::Standing,
-            Self::Agent => Admission::Agent,
+            Self::Kvm => Some(Admission::Standing),
+            Self::Agent => None,
         }
     }
 }
@@ -214,9 +204,6 @@ pub struct Record {
     pub assigned_key: Option<JobKey>,
     #[serde(default)]
     pub approved: bool,
-    /// Answered on-demand dispatch token requests (#1012); never token bytes.
-    #[serde(default)]
-    pub mints: Vec<mint::MintEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,7 +313,6 @@ impl Ledger {
             clone_absent_since: None,
             assigned_key: None,
             approved: false,
-            mints: Vec::new(),
         };
         self.rows.push(row.clone());
         Ok(row)
@@ -377,14 +363,9 @@ impl Ledger {
         ) else {
             return;
         };
-        let assigned = (
-            row.assigned,
-            row.assigned_key,
-            row.approved,
-            std::mem::take(&mut row.mints),
-        );
+        let assigned = (row.assigned, row.assigned_key, row.approved);
         *row = written.clone();
-        (row.assigned, row.assigned_key, row.approved, row.mints) = assigned;
+        (row.assigned, row.assigned_key, row.approved) = assigned;
         self.publication = None;
     }
     /// Nominal resources of clones admitted but not yet running (#1251),
@@ -420,11 +401,6 @@ impl Ledger {
                         other.approved || (row.assigned_key == other.assigned_key && row.approved);
                     row.assigned = other.assigned;
                     row.assigned_key = other.assigned_key;
-                }
-                // Only the assignment worker writes the mint log, and it only
-                // grows (a failed mint rewrites its own last entry in place).
-                if other.mints.len() >= row.mints.len() {
-                    row.mints = other.mints.clone();
                 }
             },
         );
@@ -551,9 +527,10 @@ fn save_json(value: &impl Serialize, path: &Path) -> Result<(), ScalerError> {
     Ok(())
 }
 
-/// Concurrent dispatch-agent clones on the standing controller (#1251): 4
-/// by default, 1 to 8. Agent clones idle mostly on model calls; the CPU and
-/// memory admission checks still gate each one.
+/// The agent lane's clone budget on the standing controller (#1251): 4 by
+/// default, 1 to 8. Since Actions dispatch was retired the lane admits no
+/// job, so the budget only bounds rows left from before the retirement;
+/// the flag stays until the deployed units stop passing it.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct AgentClones(u8);
 impl AgentClones {
@@ -588,8 +565,8 @@ pub enum Intake {
     /// Read demand and admit clones within the budget.
     Open,
     /// Admit nothing and read no demand (so a superseded run is never
-    /// cancelled here), but keep reconciling, serving assignments, token
-    /// mints and reaping for the ledger's live rows. Ends when none remain,
+    /// cancelled here), but keep reconciling, serving assignments and
+    /// reaping for the ledger's live rows. Ends when none remain,
     /// so another host's controller can take over without stranding a clone.
     Drain,
 }
@@ -607,7 +584,9 @@ impl Intake {
 /// (`CARRICK_KVM_CLONES`, `CARRICK_AGENT_CLONES`), so two hosts can split the
 /// lanes between them (#1590): KVM and agent jobs carry different runner
 /// labels, so hosts serving disjoint lanes never claim the same job. Agents
-/// additionally need a standing controller on an agent site.
+/// additionally need a standing controller on an agent site. The agent lane
+/// admits no job since Actions dispatch was retired; it only reconciles and
+/// reaps its earlier rows.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Lanes {
     pub kvm: bool,
@@ -648,7 +627,7 @@ impl Lanes {
     }
 }
 
-/// Per-lane clone budgets: KVM clones and dispatch-agent clones.
+/// Per-lane clone budgets: KVM clones and (inert) agent-lane clones.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct CloneBudget {
     pub kvm: Concurrency,
@@ -711,8 +690,6 @@ pub enum Admission {
     /// `kernel-runtime.yml` on this repository for a push to main
     /// or an owner workflow_dispatch on main. Never pull_request.
     Standing,
-    /// Owner issue labels on main, served only by credentialed Contabo clones.
-    Agent,
 }
 pub(crate) fn full_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit())
@@ -731,7 +708,6 @@ impl Admission {
         let path = match self {
             Self::Pilot { .. } => PILOT_WORKFLOW,
             Self::Standing => KERNEL_RUNTIME_WORKFLOW,
-            Self::Agent => DISPATCH_WORKFLOW,
         };
         path.rsplit('/').next().unwrap_or(path)
     }
@@ -750,7 +726,6 @@ impl Admission {
                     && branch == PILOT_BRANCH
                     && run["path"] == PILOT_WORKFLOW
             }
-            Self::Agent => crate::dispatch_worker::dispatch_run_identity(run, None),
             Self::Standing => {
                 run["head_repository"]["full_name"] == REPOSITORY
                     && run["path"] == KERNEL_RUNTIME_WORKFLOW
@@ -775,29 +750,6 @@ impl Admission {
                         && branch == PILOT_BRANCH
                         && context.workflow_ref
                             == format!("{REPOSITORY}/{PILOT_WORKFLOW}@refs/heads/{PILOT_BRANCH}")
-                }
-                Self::Agent => {
-                    ((matches!(context.event.as_str(), "issues" | "issue_comment")
-                        && branch == "main")
-                        // A chained round (#1241 part 3); its outcome was
-                        // verified before this runner existed.
-                        || crate::dispatch_worker::chain_context(
-                            &context.event,
-                            &context.git_ref,
-                            &context.workflow_ref,
-                            &context.actor,
-                            &context.triggering_actor,
-                        )
-                        || (context.event == "pull_request_review"
-                            && context
-                                .git_ref
-                                .strip_prefix("refs/pull/")
-                                .and_then(|s| s.strip_suffix("/merge"))
-                                .is_some_and(|n| {
-                                    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
-                                })))
-                        && context.workflow_ref
-                            == format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@{}", context.git_ref)
                 }
                 Self::Standing => {
                     standing_event_ref(&context.event, branch)
@@ -996,15 +948,12 @@ pub struct RunBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobPolicy {
     /// The historical pilot: [`Admission::Pilot`] for one approved SHA.
-    Pilot {
-        sha: String,
-    },
+    Pilot { sha: String },
     /// [`Admission::Standing`] for a persistent self-hosted runner.
     Standing,
     /// [`Admission::Standing`] restricted to the one run the controller
     /// vetted (repository, workflow, event, ref and dispatch actors).
     Bound(RunBinding),
-    Agent(RunBinding),
 }
 impl JobPolicy {
     pub fn parse(text: &str) -> Result<Self, ScalerError> {
@@ -1016,7 +965,7 @@ impl JobPolicy {
                 _ => Err(ScalerError::Guard("pilot policy")),
             },
             ["standing"] => Ok(Self::Standing),
-            [kind @ ("standing" | "agent"), run, attempt, sha] => {
+            ["standing", run, attempt, sha] => {
                 let run = field(run, "run=")
                     .and_then(|v| v.parse::<u64>().ok())
                     .ok_or(ScalerError::Guard("policy run id"))?;
@@ -1028,16 +977,11 @@ impl JobPolicy {
                     .filter(|s| full_sha(s))
                     .ok_or(ScalerError::Guard("policy sha"))?
                     .to_ascii_lowercase();
-                let binding = RunBinding {
+                Ok(Self::Bound(RunBinding {
                     run: RunId(run),
                     attempt,
                     sha,
-                };
-                Ok(if *kind == "agent" {
-                    Self::Agent(binding)
-                } else {
-                    Self::Bound(binding)
-                })
+                }))
             }
             _ => Err(ScalerError::Guard("unrecognized runner job policy")),
         }
@@ -1046,7 +990,6 @@ impl JobPolicy {
         match self {
             Self::Pilot { sha } => format!("pilot {sha}"),
             Self::Standing => "standing".to_owned(),
-            Self::Agent(b) => format!("agent run={} attempt={} sha={}", b.run.0, b.attempt, b.sha),
             Self::Bound(b) => format!(
                 "standing run={} attempt={} sha={}",
                 b.run.0, b.attempt, b.sha
@@ -1058,13 +1001,8 @@ impl JobPolicy {
         match self {
             Self::Pilot { sha } => Admission::Pilot { sha: sha.clone() }.authorize(context),
             Self::Standing => Admission::Standing.authorize(context),
-            Self::Bound(binding) | Self::Agent(binding) => {
-                if matches!(self, Self::Agent(_)) {
-                    Admission::Agent
-                } else {
-                    Admission::Standing
-                }
-                .authorize(context)?;
+            Self::Bound(binding) => {
+                Admission::Standing.authorize(context)?;
                 if context.run_id == binding.run.0
                     && context.run_attempt == binding.attempt
                     && context.sha == binding.sha
@@ -1183,11 +1121,12 @@ pub enum ScalerAction {
         /// Concurrent clones, 1 (default) or 2.
         #[arg(long, default_value = "1")]
         max_concurrency: Concurrency,
-        /// Concurrent dispatch-agent clones (agent sites only), 1 to 8.
+        /// Agent-lane clone budget (agent sites only), 1 to 8. The lane admits
+        /// no job since Actions dispatch was retired.
         #[arg(long, default_value = "4")]
         max_agent_clones: AgentClones,
-        /// Take no new work: keep serving this ledger's live clones (mints,
-        /// assignments, reaping) and exit 0 once none remain (#1599).
+        /// Take no new work: keep serving this ledger's live clones
+        /// (assignments, reaping) and exit 0 once none remain (#1599).
         #[arg(long)]
         drain: bool,
         /// First pick of shared demand (#1597): the leader admits a queued
@@ -1286,7 +1225,7 @@ pub enum ScalerAction {
     VerifyKvm,
     /// Print the agent template's scoped capture sudoers drop-in (#1621).
     CaptureSudoers,
-    /// As the dispatch worker: fail unless sudo admits exactly the scoped
+    /// As the agent-template worker account: fail unless sudo admits exactly the scoped
     /// capture commands (carrick-capture's reviewed scripts, dmesg,
     /// journalctl -k) and nothing else.
     VerifyCapture,
@@ -1347,7 +1286,7 @@ pub fn admit_job_context(
                 mark_job_started(state_dir)?;
             }
             JobPolicy::Standing => Admission::Standing.authorize(context)?,
-            JobPolicy::Bound(_) | JobPolicy::Agent(_) => {
+            JobPolicy::Bound(_) => {
                 return Err(ScalerError::Guard(
                     "standing assignments require controller rendezvous",
                 ));
@@ -1684,7 +1623,7 @@ where
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("command");
-    let program = crate::dispatch_redaction::redact(program.as_bytes());
+    let program = crate::redaction::redact(program.as_bytes());
     // External host tools (curl, gh, ssh, lvs, bash) must resolve shared
     // libraries via the system dynamic linker cache rather than scanning
     // Cargo's target/debug/deps directory when xtask or its test binary runs
@@ -1838,7 +1777,7 @@ where
                     })
                     .flatten()
                     .unwrap_or_default();
-                format!("{http}{}", crate::dispatch_redaction::redact(bytes))
+                format!("{http}{}", crate::redaction::redact(bytes))
             })
             .unwrap_or_default();
         let text = stderr

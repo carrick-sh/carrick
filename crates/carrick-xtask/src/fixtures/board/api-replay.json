@@ -371,40 +371,5 @@
       "id1": "I_887",
       "cursor1": "comments-1"
     }
-  },
-  {
-    "method": "GET",
-    "endpoint": "repos/carrick-sh/carrick/actions/workflows/dispatch-worker.yml/runs?status=in_progress&per_page=100",
-    "response": [
-      {
-        "workflow_runs": [
-          {
-            "id": 42
-          }
-        ]
-      }
-    ]
-  },
-  {
-    "method": "GET",
-    "endpoint": "repos/carrick-sh/carrick/actions/runs/42/jobs?per_page=100",
-    "response": [
-      {
-        "jobs": [
-          {
-            "steps": [
-              {
-                "name": "Dispatch issue 887",
-                "conclusion": "success"
-              },
-              {
-                "name": "Dispatch issue 123",
-                "conclusion": "failure"
-              }
-            ]
-          }
-        ]
-      }
-    ]
   }
 ]

@@ -1,0 +1,9 @@
+{
+  "__typename": "Issue",
+  "id": "I_887",
+  "number": 887,
+  "comments": {
+    "nodes": []
+  },
+  "closed": false
+}

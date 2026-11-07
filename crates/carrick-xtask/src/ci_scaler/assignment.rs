@@ -314,7 +314,7 @@ pub fn admit_assigned(
     loop {
         if state.join("approved-policy").exists() {
             let policy = read_policy(&state.join("approved-policy"), Some(owner))?;
-            if !matches!(policy, JobPolicy::Bound(_) | JobPolicy::Agent(_)) {
+            if !matches!(policy, JobPolicy::Bound(_)) {
                 return Err(ScalerError::Guard(
                     "controller rendezvous requires a run-bound policy",
                 ));
@@ -356,7 +356,7 @@ pub fn pending_assignment(state: &Path) -> Result<Option<JobContext>, ScalerErro
 }
 
 pub fn publish_assignment(state: &Path, policy: &JobPolicy) -> Result<(), ScalerError> {
-    if !matches!(policy, JobPolicy::Bound(_) | JobPolicy::Agent(_)) {
+    if !matches!(policy, JobPolicy::Bound(_)) {
         return Err(ScalerError::Guard(
             "controller rendezvous requires a run-bound policy",
         ));
@@ -777,14 +777,7 @@ pub(super) fn serve_assignment<L: Refusals>(
 }
 
 fn authorize_context(context: &JobContext) -> Result<(), ScalerError> {
-    if context
-        .workflow_ref
-        .starts_with(&format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@"))
-    {
-        Admission::Agent.authorize(context)
-    } else {
-        Admission::Standing.authorize(context)
-    }
+    Admission::Standing.authorize(context)
 }
 
 #[cfg(test)]
@@ -1637,29 +1630,5 @@ mod tests {
             }};
         }
         verify!(Ledger::default(), "kvm");
-    }
-    #[test]
-    fn review_hook_context_routes_through_agent_admission() {
-        let mut review = context(
-            42,
-            "pull_request_review",
-            "refs/pull/800/merge",
-            &"a".repeat(40),
-        );
-        review.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@{}", review.git_ref);
-        assert!(authorize_context(&review).is_ok());
-        let binding = JobPolicy::Agent(RunBinding {
-            run: RunId(42),
-            attempt: 1,
-            sha: "a".repeat(40),
-        });
-        assert!(binding.authorize(&review).is_ok());
-        review.sha = "b".repeat(40);
-        assert!(
-            binding.authorize(&review).is_err(),
-            "review must keep the exact run-head binding"
-        );
-        review.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/work/arbitrary");
-        assert!(authorize_context(&review).is_err());
     }
 }
