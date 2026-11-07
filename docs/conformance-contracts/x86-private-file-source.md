@@ -206,9 +206,16 @@ of a guest fork failure or a reason to change this source-limit witness.
 
 ### Resumed worker verification
 
-The resumed dispatch checkout already contains both requested review fixes
-and their witnesses; rebasing onto the admitted main preserves those commits
-without conflicts. Fresh execution of the four `published_private` kernel
-tests passes, including admission-time and late-publication fault-time recall.
-The CPL0 release image also rebuilds successfully. These are scoped results,
-not proof of CLI loader startup or the outstanding suspension contract.
+The finishing checkout already contains both requested review fixes and their
+red-first witnesses. Rebasing onto the admitted main preserves all 21 commits;
+range comparison finds only changed contract-registry context, with no dropped
+fix or code move. Fresh execution passes the four `published_private` kernel
+tests, including admission-time and late-publication fault-time recall, and all
+seven real-KVM private-file witnesses. The source-bound case reaches all 1,024
+admissions and verifies errno 12, release/readmission, first-touch bytes and
+exactly 1,026 host-file crossings. The CPL0 release image rebuilds successfully.
+
+These results close the two scoped review findings; they do not prove CLI
+loader startup or the outstanding suspension contract. The owner's separate
+stacked consumer remains necessary for guest faults and host copyouts (#1728).
+No independent approval is implied by the worker's own verification.
