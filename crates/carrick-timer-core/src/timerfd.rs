@@ -337,3 +337,109 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod clock_projection_tests {
+    use super::clock::{Clock, ClockView, HostClock};
+    use core::time::Duration;
+
+    fn host(which: HostClock) -> Duration {
+        Duration::from_secs(match which {
+            HostClock::Realtime => 1000,
+            HostClock::Monotonic => 100,
+            HostClock::Boottime => 200,
+            HostClock::Elapsed => 10,
+        })
+    }
+
+    #[test]
+    fn creator_projection_keeps_live_clock_sources_distinct() {
+        let live = ClockView::Live {
+            realtime_offset_ns: -1_000_000_000,
+        };
+        assert_eq!(live.now(Clock::Realtime, host), Duration::from_secs(999));
+        assert_eq!(live.now(Clock::Monotonic, host), Duration::from_secs(100));
+        assert_eq!(live.now(Clock::Boottime, host), Duration::from_secs(200));
+        assert_eq!(
+            ClockView::Live {
+                realtime_offset_ns: i64::MIN
+            }
+            .now(Clock::Realtime, host),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn frozen_realtime_keeps_live_monotonic_and_boottime_deadlines() {
+        let frozen = ClockView::Frozen {
+            realtime: Duration::from_secs(500),
+        };
+        assert_eq!(
+            frozen.now(Clock::Realtime, |_| panic!("frozen realtime sampled host")),
+            Duration::from_secs(500)
+        );
+        assert_eq!(frozen.now(Clock::Monotonic, host), Duration::from_secs(100));
+        assert_eq!(frozen.now(Clock::Boottime, host), Duration::from_secs(200));
+        for (clock, timeout) in [
+            (Clock::Realtime, None),
+            (Clock::Monotonic, Some(Duration::from_secs(500))),
+            (Clock::Boottime, Some(Duration::from_secs(400))),
+        ] {
+            let plan = frozen.deadline(clock, Some(Duration::from_secs(600)), false, host);
+            assert_eq!(plan.host_timeout, timeout);
+            assert_eq!(plan.virtual_due, None);
+        }
+    }
+
+    #[test]
+    fn scaled_clock_reads_and_deadlines_use_inverse_transforms() {
+        let scaled = ClockView::Scaled {
+            realtime: Duration::from_secs(500),
+            numerator: 3,
+            denominator: 2,
+        };
+        assert_eq!(scaled.now(Clock::Realtime, host), Duration::from_secs(515));
+        for clock in [Clock::Monotonic, Clock::Boottime] {
+            assert_eq!(scaled.now(clock, host), Duration::from_secs(15));
+            assert_eq!(
+                scaled
+                    .deadline(clock, Some(Duration::from_secs(24)), false, host)
+                    .host_timeout,
+                Some(Duration::from_secs(6))
+            );
+        }
+        assert_eq!(
+            scaled.scale_timeout(Duration::MAX),
+            Duration::from_nanos(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn deterministic_deadlines_never_sample_host_or_lose_epoch() {
+        let deterministic = ClockView::Deterministic {
+            realtime_epoch: Duration::from_secs(500),
+            monotonic: Duration::from_secs(10),
+        };
+        for (clock, deadline) in [
+            (Clock::Realtime, 520),
+            (Clock::Monotonic, 20),
+            (Clock::Boottime, 20),
+        ] {
+            let plan =
+                deterministic.deadline(clock, Some(Duration::from_secs(deadline)), false, |_| {
+                    panic!("virtual deadline sampled host")
+                });
+            assert_eq!(plan.host_timeout, None);
+            assert_eq!(plan.virtual_due, Some(Duration::from_secs(20)));
+        }
+        assert_eq!(
+            deterministic.now(Clock::Realtime, |_| panic!("virtual clock sampled host")),
+            Duration::from_secs(510)
+        );
+        let ready = deterministic.deadline(Clock::Realtime, None, true, |_| {
+            panic!("ready timer sampled host")
+        });
+        assert_eq!(ready.host_timeout, Some(Duration::ZERO));
+        assert_eq!(ready.virtual_due, None);
+    }
+}
