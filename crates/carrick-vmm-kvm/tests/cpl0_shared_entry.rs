@@ -51,6 +51,52 @@ fn production_file_region_stdio_dup_parity() {
 }
 
 #[test]
+fn production_getfd_uses_shared_descriptor_flags() {
+    // Native Linux oracle: fcntl(1, F_GETFD) == 0; after
+    // dup3(1, 19, O_CLOEXEC), fcntl(19, F_GETFD) == FD_CLOEXEC (1).
+    // A descriptor outside this venue remains counted ENOSYS (38).
+    let mut code = Vec::new();
+    let mut branches = Vec::new();
+    for (fd, command, expected) in [(1u32, 1u32, 0i8), (19, 1, 1), (999, 1, -38)] {
+        if fd == 19 {
+            code.extend_from_slice(&[
+                0xbf, 1, 0, 0, 0, 0xbe, 19, 0, 0, 0, 0xba, 0, 0, 8, 0, // O_CLOEXEC
+                0xb8, 36, 1, 0, 0, 0x0f, 0x05, // dup3 (292)
+            ]);
+        }
+        code.push(0xbf);
+        code.extend_from_slice(&fd.to_le_bytes());
+        code.push(0xbe);
+        code.extend_from_slice(&command.to_le_bytes());
+        code.extend_from_slice(&[0xb8, 72, 0, 0, 0, 0x0f, 0x05]);
+        code.extend_from_slice(&[0x48, 0x83, 0xf8, expected as u8]);
+        branches.push(code.len());
+        code.extend_from_slice(&[0x75, 0]);
+    }
+    code.extend_from_slice(&[
+        0xbf, 42, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
+    ]);
+    let failure = code.len();
+    code.extend_from_slice(&[0xbf, 1, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in branches {
+        code[branch + 1] = u8::try_from(failure - branch - 2).expect("bounded branch");
+    }
+    let outcome = run_pool_fixture(&tiny_elf(&code), 8);
+    assert_eq!(outcome.run.exit_code, 42);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(72))
+            .unwrap(),
+        1
+    );
+    let witness = outcome.run.report.execution_witness.expect("CPL0 witness");
+    assert_eq!(witness.physical_crossing_families.len(), 1);
+    assert_eq!(witness.physical_crossing_families[0].family, "root_exit");
+    assert_eq!(witness.physical_crossing_families[0].count, 1);
+}
+
+#[test]
 fn production_sigprocmask_uses_shared_lifecycle_family() {
     let code = [
         // NULL set and oldset need no guest memory or host resource. The old
