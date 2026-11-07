@@ -1,0 +1,4 @@
+carrick: image localhost:5050/ltp:arm64 (linux/amd64) — pulling…
+carrick: failed to resolve image: OCI registry operation failed: error sending request for url (http://localhost:5050/v2/ltp/manifests/arm64)
+
+

@@ -1,0 +1,6 @@
+71c57e106688ba954a5a9947c9868f8a92160660
+Linux carrick-ci-42322853362-1-128252545936-1794014302 6.12.111+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.111-1 (2026-09-28) x86_64 GNU/Linux
+uid=999(carrick-dispatch-agent) gid=989(carrick-dispatch-agent) groups=989(carrick-dispatch-agent),992(kvm)
+crw-rw---- 1 root kvm 10, 232 Nov  7 01:18 /dev/kvm
+run_id=issue1795-quick-33042
+Docker unavailable

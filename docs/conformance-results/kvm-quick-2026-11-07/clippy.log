@@ -1,0 +1,1217 @@
+    Blocking waiting for file lock on build directory
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.27s
+     Running `target/debug/carrick-xtask worktree-run -- cargo --locked --config 'build.rustc-wrapper=""' clippy -p carrick-cli --no-default-features --features syscall-shim,platform-linux --all-targets --keep-going -- -D warnings`
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+ Downloading crates ...
+  Downloaded defmt-parser v1.1.0
+  Downloaded bs58 v0.5.1
+  Downloaded defmt v1.2.0
+  Downloaded predicates-tree v1.0.13
+  Downloaded time-core v0.1.8
+  Downloaded ref-cast-impl v1.0.25
+  Downloaded ref-cast v1.0.25
+  Downloaded wait-timeout v0.2.1
+  Downloaded hyperlocal v0.9.1
+  Downloaded time-macros v0.2.27
+  Downloaded predicates v3.1.4
+  Downloaded bollard-stubs v1.47.1-rc.27.3.1
+  Downloaded deranged v0.5.8
+  Downloaded schemars v0.9.0
+  Downloaded indexmap v1.9.3
+  Downloaded schemars v1.2.1
+  Downloaded hashbrown v0.12.3
+  Downloaded jiff-core v0.1.1
+  Downloaded bollard v0.18.1
+  Downloaded termtree v0.5.1
+  Downloaded serde_repr v0.1.20
+  Downloaded serde_with v3.22.0
+  Downloaded time v0.3.47
+  Downloaded bstr v1.12.1
+  Downloaded predicates-core v1.0.10
+  Downloaded powerfmt v0.2.0
+  Downloaded num-conv v0.2.2
+  Downloaded dyn-clone v1.0.20
+  Downloaded difflib v0.4.0
+  Downloaded normalize-line-endings v0.3.0
+  Downloaded hex v0.4.3
+  Downloaded assert_cmd v2.2.2
+  Downloaded float-cmp v0.10.0
+  Downloaded defmt-macros v1.2.0
+  Downloaded jiff v0.2.38
+    Blocking waiting for file lock on build directory
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.228
+    Checking cfg-if v1.0.4
+    Checking memchr v2.8.0
+    Checking libc v0.2.186
+    Checking bitflags v2.11.1
+    Checking itoa v1.0.18
+    Checking smallvec v1.15.1
+   Compiling proc-macro2 v1.0.106
+   Compiling portable-atomic v1.13.1
+   Compiling serde v1.0.228
+    Checking critical-section v1.2.0
+    Checking foldhash v0.1.5
+    Checking log v0.4.29
+    Checking hashbrown v0.15.5
+    Checking zmij v1.0.21
+   Compiling quote v1.0.45
+    Checking carrick-signal-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-signal-core)
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+    Checking once_cell v1.21.4
+    Checking subtle v2.6.1
+    Checking pin-project-lite v0.2.17
+    Checking typenum v1.20.0
+    Checking stable_deref_trait v1.2.1
+    Checking carrick-inotify-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-inotify-core)
+    Checking carrick-pipe-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-pipe-core)
+   Compiling ucd-trie v0.1.7
+    Checking carrick-el1-control-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-control-abi)
+    Checking serde_json v1.0.149
+   Compiling pest v2.8.6
+    Checking generic-array v0.14.7
+    Checking crypto-common v0.1.7
+    Checking block-buffer v0.10.4
+    Checking errno v0.3.14
+    Checking carrick-fatal v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-fatal)
+warning: `libc::proc_listallpids` does not refer to a reachable function
+  --> /var/tmp/carrick-dispatch-lFmtou/agent/work/clippy.toml:19:5
+   |
+19 |     { path = "libc::proc_listallpids", reason = "HA-CATALOG-PROCESS-LIST-ALL-PIDS: host process enumeration requires reviewed authority" },
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: add `allow-invalid = true` to the entry to suppress this warning
+
+warning: `carrick-fatal` (lib) generated 1 warning
+    Checking bytes v1.11.1
+   Compiling parking_lot_core v0.9.12
+    Checking signal-hook-registry v1.4.8
+    Checking digest v0.10.7
+    Checking scopeguard v1.2.0
+    Checking futures-core v0.3.32
+    Checking rand_core v0.10.1
+   Compiling getrandom v0.4.2
+    Checking lock_api v0.4.14
+    Checking cpufeatures v0.2.17
+   Compiling pest_meta v2.8.6
+    Checking sha2 v0.10.9
+    Checking parking_lot v0.12.5
+    Checking tracing-core v0.1.36
+    Checking mio v1.2.0
+    Checking socket2 v0.6.3
+    Checking litemap v0.8.2
+    Checking writeable v0.6.3
+    Checking linux-raw-sys v0.12.1
+   Compiling usdt-impl v0.6.0
+   Compiling icu_normalizer_data v2.2.0
+    Checking rustix v1.1.4
+    Checking percent-encoding v2.3.2
+    Checking plain v0.2.3
+    Checking utf8_iter v1.0.4
+   Compiling icu_properties_data v2.2.0
+   Compiling thread-id v5.1.0
+    Checking http v1.4.0
+    Checking aho-corasick v1.1.4
+    Checking regex-syntax v0.8.10
+    Checking fastrand v2.4.1
+   Compiling byteorder v1.5.0
+    Checking tempfile v3.27.0
+    Checking http-body v1.0.1
+   Compiling synstructure v0.13.2
+   Compiling pest_generator v2.8.6
+   Compiling httparse v1.10.1
+    Checking regex-automata v0.4.14
+    Checking pretty-hex v0.4.2
+    Checking slab v0.4.12
+    Checking futures-task v0.3.32
+    Checking getrandom v0.2.17
+    Checking untrusted v0.9.0
+    Checking tower-service v0.3.3
+   Compiling fnv v1.0.7
+   Compiling ident_case v1.0.1
+    Checking zeroize v1.8.2
+   Compiling strsim v0.11.1
+   Compiling autocfg v1.5.0
+    Checking try-lock v0.2.5
+    Checking want v0.3.1
+    Checking rustls-pki-types v1.14.1
+    Checking ring v0.17.14
+   Compiling darling_core v0.20.11
+   Compiling num-traits v0.2.19
+    Checking form_urlencoded v1.2.2
+    Checking futures-channel v0.3.32
+    Checking memmap2 v0.9.10
+    Checking base64 v0.22.1
+    Checking atomic-waker v1.1.2
+    Checking httpdate v1.0.3
+    Checking ipnet v2.12.0
+   Compiling carrick-observability v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-observability)
+    Checking carrick-kernel-arena v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-kernel-arena)
+warning: `carrick-observability` (build script) generated 1 warning (1 duplicate)
+   Compiling rustls v0.23.46
+    Checking anstyle v1.0.14
+    Checking rustls-webpki v0.103.16
+    Checking regex v1.12.3
+warning: `carrick-kernel-arena` (lib) generated 1 warning (1 duplicate)
+    Checking utf8parse v0.2.2
+    Checking tinyvec_macros v0.1.1
+    Checking tinyvec v1.11.0
+    Checking anstyle-parse v1.0.0
+    Checking http-body-util v0.1.3
+   Compiling proc-macro-error-attr2 v2.0.0
+    Checking sync_wrapper v1.0.2
+    Checking carrick-timer-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-timer-core)
+   Compiling unicode-xid v0.2.6
+    Checking futures-sink v0.3.32
+    Checking tower-layer v0.3.3
+    Checking anstyle-query v1.1.5
+    Checking ryu v1.0.23
+    Checking is_terminal_polyfill v1.70.2
+    Checking colorchoice v1.0.5
+    Checking konst_macro_rules v0.2.19
+   Compiling const_format_proc_macros v0.2.34
+   Compiling proc-macro-error2 v2.0.1
+    Checking anstream v1.0.0
+    Checking konst v0.2.20
+    Checking webpki-roots v1.0.7
+    Checking clap_lex v1.1.0
+    Checking lazy_static v1.5.0
+    Checking unicode-normalization v0.1.25
+    Checking hmac v0.12.1
+    Checking clap_builder v4.6.0
+    Checking strum v0.27.2
+    Checking base64 v0.13.1
+   Compiling camino v1.2.2
+    Checking foldhash v0.2.0
+    Checking iana-time-zone v0.1.65
+    Checking hashbrown v0.17.1
+    Checking filetime v0.2.29
+    Checking http-auth v0.1.10
+    Checking adler2 v2.0.1
+    Checking unicase v2.9.0
+    Checking simd-adler32 v0.3.9
+    Checking const_format v0.2.36
+   Compiling equivalent v1.0.2
+    Checking miniz_oxide v0.8.9
+   Compiling indexmap v2.14.0
+    Checking tar v0.4.46
+    Checking crc32fast v1.5.0
+   Compiling winnow v0.7.15
+   Compiling carrick-el1-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-linux)
+   Compiling toml_write v0.1.2
+warning: `carrick-el1-linux` (build script) generated 1 warning (1 duplicate)
+    Checking flate2 v1.1.9
+   Compiling rustversion v1.0.22
+    Checking cpufeatures v0.3.0
+   Compiling anyhow v1.0.102
+   Compiling getrandom v0.3.4
+    Checking bitflags v1.3.2
+    Checking vmm-sys-util v0.14.0
+    Checking chacha20 v0.10.1
+    Checking carrick-portable v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-portable)
+   Compiling kvm-ioctls v0.22.1
+warning: `carrick-portable` (lib) generated 1 warning (1 duplicate)
+    Checking rand v0.10.1
+    Checking kvm-bindings v0.12.1
+    Checking fd-lock v4.0.4
+   Compiling carrick-kernel v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-kernel)
+    Checking data-encoding v2.11.0
+    Checking static_assertions v1.1.0
+    Checking signal-hook v0.4.4
+warning: `carrick-kernel` (build script) generated 1 warning (1 duplicate)
+    Checking sharded-slab v0.1.7
+    Checking matchers v0.2.0
+    Checking tracing-log v0.2.0
+    Checking thread_local v1.1.9
+    Checking arc-swap v1.9.2
+    Checking nu-ansi-term v0.50.3
+    Checking predicates-core v1.0.10
+    Checking hashlink v0.12.2
+    Checking float-cmp v0.10.0
+    Checking serde_with v3.22.0
+    Checking arraydeque v0.5.1
+    Checking difflib v0.4.0
+    Checking hex v0.4.3
+    Checking termtree v0.5.1
+   Compiling carrick-cli v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-cli)
+    Checking normalize-line-endings v0.3.0
+   Compiling assert_cmd v2.2.2
+    Checking yaml-rust2 v0.13.0
+    Checking predicates-tree v1.0.13
+    Checking predicates v3.1.4
+    Checking bstr v1.12.1
+warning: `carrick-cli` (build script) generated 1 warning (1 duplicate)
+    Checking wait-timeout v0.2.1
+    Checking rustc-demangle v0.1.28
+    Checking carrick-capture v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-capture)
+warning: `carrick-capture` (lib) generated 1 warning (1 duplicate)
+   Compiling thiserror-impl v2.0.20
+    Checking thiserror v2.0.20
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling pest_derive v2.8.6
+   Compiling scroll_derive v0.13.1
+   Compiling tokio-macros v2.7.0
+   Compiling tracing-attributes v0.1.31
+    Checking scroll v0.13.0
+   Compiling dtrace-parser v0.3.0
+    Checking goblin v0.10.5
+   Compiling futures-macro v0.3.32
+    Checking tokio v1.52.3
+    Checking zerofrom v0.1.8
+    Checking yoke v0.8.2
+    Checking zerovec v0.11.6
+    Checking zerocopy v0.8.48
+    Checking tinystr v0.8.3
+    Checking potential_utf v0.1.5
+    Checking icu_locale_core v2.2.0
+    Checking zerotrie v0.2.4
+    Checking tracing v0.1.44
+    Checking icu_collections v2.2.0
+    Checking futures-util v0.3.32
+   Compiling darling_macro v0.20.11
+    Checking icu_provider v2.2.0
+   Compiling darling v0.20.11
+    Checking icu_normalizer v2.2.0
+    Checking icu_properties v2.2.0
+   Compiling derive_builder_core v0.20.2
+   Compiling getset v0.1.6
+    Checking hyper v1.9.0
+    Checking serde_urlencoded v0.7.1
+   Compiling serde_tokenstream v0.2.3
+    Checking tokio-util v0.7.18
+    Checking carrick-guest-arch v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-guest-arch)
+    Checking carrick-syscall-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-syscall-abi)
+    Checking dof v0.4.0
+    Checking hyper-util v0.1.20
+    Checking idna_adapter v1.2.2
+warning: `carrick-guest-arch` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-mmu-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-mmu-core)
+    Checking carrick-sched-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-sched-core)
+    Checking idna v1.1.0
+    Checking url v2.5.8
+   Compiling derive_builder_macro v0.20.2
+    Checking tower v0.5.3
+    Checking tokio-rustls v0.26.4
+    Checking hyper-rustls v0.27.9
+    Checking tower-http v0.6.10
+warning: `carrick-mmu-core` (lib) generated 1 warning (1 duplicate)
+    Checking derive_builder v0.20.2
+   Compiling strum_macros v0.27.2
+   Compiling clap_derive v4.6.1
+warning: `carrick-syscall-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-abi)
+warning: `carrick-sched-core` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-core-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-core-abi)
+   Compiling usdt-attr-macro v0.6.0
+   Compiling usdt-macro v0.6.0
+    Checking clap v4.6.1
+warning: `carrick-syscall-abi` (lib) generated 1 warning (1 duplicate)
+    Checking reqwest v0.12.28
+    Checking chrono v0.4.44
+    Checking oci-spec v0.8.4
+    Checking usdt v0.6.0
+warning: `carrick-sched-core` (lib) generated 1 warning (1 duplicate)
+    Checking olpc-cjson v0.1.4
+    Checking jwt v0.16.0
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+    Checking hickory-proto v0.26.1
+    Checking tracing-subscriber v0.3.23
+    Checking toml_edit v0.22.27
+warning: `carrick-core-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-core)
+    Checking carrick-fd-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-fd-core)
+warning: `carrick-core-abi` (lib) generated 1 warning (1 duplicate)
+    Checking oci-client v0.15.0
+warning: `carrick-fd-core` (lib) generated 1 warning (1 duplicate)
+   Compiling serde_repr v0.1.20
+    Checking toml v0.8.23
+warning: `carrick-core` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-personality-api v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-personality-api)
+    Checking bollard-stubs v1.47.1-rc.27.3.1
+warning: `carrick-fd-core` (lib) generated 1 warning (1 duplicate)
+    Checking hyperlocal v0.9.1
+warning: `carrick-personality-api` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-personality-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-personality-linux)
+    Checking carrick-coordinator v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-coordinator)
+warning: `carrick-coordinator` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-xtask v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-xtask)
+warning: `carrick-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-signal-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-signal-linux)
+   Compiling carrick-vmm-kvm v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-vmm-kvm)
+warning: `carrick-signal-linux` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-el1-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-abi)
+warning: `carrick-personality-api` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-core` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-el1-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-guest-mem v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-guest-mem)
+    Checking carrick-el1 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1)
+    Checking carrick-test-support v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-test-support)
+warning: `carrick-test-support` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-guest-mem` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-host v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-host)
+    Checking carrick-spec v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-spec)
+warning: `carrick-host` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-el1` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-spec` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-image v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-image)
+    Checking carrick-conformance v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-conformance)
+warning: `carrick-personality-linux` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-image` (lib) generated 1 warning (1 duplicate)
+    Checking bollard v0.18.1
+warning: `carrick-conformance` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-el1-abi` (lib) generated 1 warning (1 duplicate)
+   Compiling carrick-el1-image v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-image)
+warning: `carrick-observability` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-conformance-contract v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-conformance-contract)
+warning: `carrick-el1-linux` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-el1-image` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (lib) generated 1 warning (1 duplicate)
+warning: carrick-el1-image@0.1.0: EL1 stack unregistered native retirement: 5135 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring vector input: 4624 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native admission: 7584 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork publication: 9086 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork descriptors: 9806 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd inheritance: 4831 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd retirement: 7104 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork context: 4047 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork settlement: 3502 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service admission: 4575 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack host-owned return work: 7198 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service continuation: 5822 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service refusal: 6256 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native backing reply: 9902 / 11311 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring completed copyout: 10335 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring poll readiness: 3840 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe copyout: 8448 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe backing preparation: 4703 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native wait copy: 10383 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack declined fault signal: 10976 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal delivery copy: 10480 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service signal delivery: 10880 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack resumed signal delivery copy: 11487 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal terminal exit: 10191 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal return: 6128 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack anonymous munmap: 6896 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack metadata grant: 6912 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack backing retirement: 9088 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack descriptor drain: 6400 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 image budget: 1370176 bytes loaded / 1572864 bytes; 202688 bytes headroom
+warning: `carrick-el1-image` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-mem v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-mem)
+warning: `carrick-mem` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-hal v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-hal)
+warning: `carrick-hal` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-host-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-host-linux)
+    Checking carrick-thread v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-thread)
+    Checking carrick-x86 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-x86)
+    Checking carrick-aarch64 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-aarch64)
+warning: `carrick-host-linux` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-vfs v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-vfs)
+warning: `carrick-thread` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-x86` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-x86-cpl0-host v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-x86-cpl0-host)
+warning: `carrick-aarch64` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-vfs` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0-host` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-kernel` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-runtime v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-runtime)
+warning: `carrick-runtime` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-engine v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-engine)
+warning: `carrick-engine` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-embed v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-embed)
+warning: `carrick-embed` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "fs_backend_flag") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "build") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "conformance_cli_contract") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "namespace_work_profile") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "trace_profile") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "cli") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "x86_kvm_run") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "conformance") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "perf_runner") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (bin "carrick") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (bin "carrick" test) generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 32s
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running `target/debug/carrick-xtask worktree-run -- cargo --locked --config 'build.rustc-wrapper=""' clippy -p carrick-xtask --lib --bins --keep-going -- -D warnings`
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling syn v2.0.117
+    Checking memchr v2.8.0
+    Checking serde_core v1.0.228
+    Checking digest v0.10.7
+    Checking getrandom v0.4.2
+    Checking once_cell v1.21.4
+warning: `libc::proc_listallpids` does not refer to a reachable function
+  --> /var/tmp/carrick-dispatch-lFmtou/agent/work/clippy.toml:19:5
+   |
+19 |     { path = "libc::proc_listallpids", reason = "HA-CATALOG-PROCESS-LIST-ALL-PIDS: host process enumeration requires reviewed authority" },
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: add `allow-invalid = true` to the entry to suppress this warning
+
+warning: `carrick-portable` (lib) generated 1 warning
+warning: `carrick-fatal` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-capture` (lib) generated 1 warning (1 duplicate)
+    Checking tempfile v3.27.0
+    Checking sha2 v0.10.9
+    Checking aho-corasick v1.1.4
+    Checking regex-automata v0.4.14
+    Checking serde_json v1.0.149
+    Checking regex v1.12.3
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling clap_derive v4.6.1
+    Checking zerocopy v0.8.48
+    Checking clap v4.6.1
+    Checking serde v1.0.228
+    Checking toml_datetime v0.6.11
+    Checking serde_spanned v0.6.9
+    Checking toml_edit v0.22.27
+    Checking carrick-guest-arch v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-guest-arch)
+    Checking toml v0.8.23
+    Checking carrick-xtask v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-xtask)
+warning: `carrick-xtask` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (bin "carrick-xtask") generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.29s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running `target/debug/carrick-xtask worktree-run -- cargo --locked --config 'build.rustc-wrapper=""' tree -p carrick-cli --no-default-features --features syscall-shim,platform-linux --prefix none`
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running `target/debug/carrick-xtask worktree-run -- cargo --locked --config 'build.rustc-wrapper=""' clippy -p carrick-aarch64 -p carrick-abi -p carrick-capture -p carrick-cli -p carrick-conformance -p carrick-conformance-contract -p carrick-coordinator -p carrick-core -p carrick-core-abi -p carrick-el1 -p carrick-el1-abi -p carrick-el1-control-abi -p carrick-el1-image -p carrick-el1-linux -p carrick-engine -p carrick-fatal -p carrick-fd-core -p carrick-guest-arch -p carrick-guest-mem -p carrick-hal -p carrick-host -p carrick-host-linux -p carrick-image -p carrick-inotify-core -p carrick-kernel -p carrick-kernel-arena -p carrick-mem -p carrick-mmu-core -p carrick-observability -p carrick-personality-api -p carrick-personality-linux -p carrick-pipe-core -p carrick-portable -p carrick-runtime -p carrick-sched-core -p carrick-signal-core -p carrick-signal-linux -p carrick-spec -p carrick-syscall-abi -p carrick-test-support -p carrick-thread -p carrick-timer-core -p carrick-vfs -p carrick-vmm-kvm -p carrick-x86 -p carrick-x86-cpl0-host -p carrick-xtask -p carrick-x86-cpl0 -p carrick-x86-carrier -p carrick-conformance-next -p carrick-xtask --no-default-features --features syscall-shim,platform-linux --features carrick-xtask/impact --all-targets --keep-going -- -D warnings`
+ Downloading crates ...
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded generator v0.8.10
+  Downloaded quick-error v1.2.3
+  Downloaded unarray v0.1.4
+  Downloaded bit-vec v0.8.0
+  Downloaded bit-set v0.8.0
+  Downloaded scoped-tls v1.0.1
+  Downloaded rusty-fork v0.3.1
+  Downloaded rand_core v0.9.5
+  Downloaded loom v0.7.2
+  Downloaded rand_xorshift v0.4.0
+  Downloaded rand v0.9.4
+  Downloaded rand_chacha v0.9.0
+  Downloaded proptest v1.11.0
+   Compiling zerocopy v0.8.48
+   Compiling proc-macro2 v1.0.106
+warning: `libc::proc_listallpids` does not refer to a reachable function
+  --> /var/tmp/carrick-dispatch-lFmtou/agent/work/clippy.toml:19:5
+   |
+19 |     { path = "libc::proc_listallpids", reason = "HA-CATALOG-PROCESS-LIST-ALL-PIDS: host process enumeration requires reviewed authority" },
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: add `allow-invalid = true` to the entry to suppress this warning
+
+warning: `carrick-fatal` (lib) generated 1 warning
+   Compiling serde_core v1.0.228
+warning: `carrick-kernel-arena` (lib) generated 1 warning (1 duplicate)
+   Compiling num-traits v0.2.19
+   Compiling log v0.4.29
+   Compiling plain v0.2.3
+   Compiling pretty-hex v0.4.2
+   Compiling bitflags v2.11.1
+warning: `carrick-observability` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-portable` (lib) generated 1 warning (1 duplicate)
+   Compiling carrick-el1-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-linux)
+warning: `carrick-capture` (lib) generated 1 warning (1 duplicate)
+   Compiling getrandom v0.3.4
+   Compiling carrick-kernel v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-kernel)
+   Compiling foldhash v0.2.0
+   Compiling cfg-if v1.0.4
+warning: `carrick-el1-linux` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-kernel` (build script) generated 1 warning (1 duplicate)
+   Compiling hashbrown v0.17.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling smallvec v1.15.1
+   Compiling pin-project-lite v0.2.17
+   Compiling quote v1.0.45
+   Compiling bytes v1.11.1
+   Compiling futures-core v0.3.32
+   Compiling socket2 v0.6.3
+   Compiling mio v1.2.0
+   Compiling syn v2.0.117
+   Compiling syn v3.0.3
+   Compiling portable-atomic v1.13.1
+   Compiling indexmap v2.14.0
+   Compiling litemap v0.8.2
+   Compiling critical-section v1.2.0
+   Compiling writeable v0.6.3
+   Compiling subtle v2.6.1
+   Compiling once_cell v1.21.4
+   Compiling utf8_iter v1.0.4
+   Compiling http v1.4.0
+   Compiling percent-encoding v2.3.2
+   Compiling zeroize v1.8.2
+   Compiling serde_json v1.0.149
+   Compiling typenum v1.20.0
+   Compiling getrandom v0.2.17
+   Compiling rustls-pki-types v1.14.1
+   Compiling icu_normalizer_data v2.2.0
+   Compiling icu_properties_data v2.2.0
+   Compiling futures-task v0.3.32
+   Compiling slab v0.4.12
+   Compiling untrusted v0.9.0
+   Compiling http-body v1.0.1
+   Compiling generic-array v0.14.7
+   Compiling ring v0.17.14
+   Compiling try-lock v0.2.5
+   Compiling tower-service v0.3.3
+   Compiling want v0.3.1
+   Compiling form_urlencoded v1.2.2
+   Compiling tracing-core v0.1.36
+   Compiling futures-channel v0.3.32
+   Compiling httparse v1.10.1
+   Compiling atomic-waker v1.1.2
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling sync_wrapper v1.0.2
+   Compiling aho-corasick v1.1.4
+   Compiling digest v0.10.7
+   Compiling regex-syntax v0.8.10
+   Compiling base64 v0.22.1
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling const_format_proc_macros v0.2.34
+   Compiling ipnet v2.12.0
+   Compiling rustls-webpki v0.103.16
+   Compiling konst_macro_rules v0.2.19
+   Compiling tower-layer v0.3.3
+    Checking const_format v0.2.36
+   Compiling tinyvec_macros v0.1.1
+   Compiling rustls v0.23.46
+   Compiling tinyvec v1.11.0
+   Compiling synstructure v0.13.2
+   Compiling darling_core v0.20.11
+   Compiling proc-macro-error2 v2.0.1
+   Compiling pest_generator v2.8.6
+   Compiling regex-automata v0.4.14
+   Compiling konst v0.2.20
+   Compiling webpki-roots v1.0.7
+   Compiling cpufeatures v0.2.17
+   Compiling futures-sink v0.3.32
+   Compiling scopeguard v1.2.0
+   Compiling ryu v1.0.23
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling lock_api v0.4.14
+   Compiling sha2 v0.10.9
+   Compiling unicode-normalization v0.1.25
+   Compiling hmac v0.12.1
+   Compiling http-body-util v0.1.3
+   Compiling parking_lot_core v0.9.12
+   Compiling anstyle v1.0.14
+   Compiling strum v0.27.2
+   Compiling base64 v0.13.1
+   Compiling colorchoice v1.0.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling iana-time-zone v0.1.65
+   Compiling anstyle-query v1.1.5
+   Compiling parking_lot v0.12.5
+   Compiling anstream v1.0.0
+   Compiling http-auth v0.1.10
+   Compiling carrick-fatal v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-fatal)
+   Compiling regex v1.12.3
+   Compiling clap_lex v1.1.0
+   Compiling unicase v2.9.0
+warning: `carrick-fatal` (lib) generated 1 warning (1 duplicate)
+   Compiling rand_core v0.10.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling lazy_static v1.5.0
+   Compiling getrandom v0.4.2
+   Compiling clap_builder v4.6.0
+   Compiling camino v1.2.2
+   Compiling errno v0.3.14
+   Compiling rustix v1.1.4
+   Compiling simd-adler32 v0.3.9
+   Compiling fastrand v2.4.1
+   Compiling adler2 v2.0.1
+   Compiling miniz_oxide v0.8.9
+   Compiling signal-hook-registry v1.4.8
+   Compiling hashlink v0.12.2
+   Compiling filetime v0.2.29
+   Compiling crc32fast v1.5.0
+   Compiling carrick-kernel-arena v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-kernel-arena)
+   Compiling anyhow v1.0.102
+   Compiling tempfile v3.27.0
+   Compiling arraydeque v0.5.1
+   Compiling yaml-rust2 v0.13.0
+   Compiling flate2 v1.1.9
+   Compiling tar v0.4.46
+warning: `carrick-kernel-arena` (lib) generated 1 warning (1 duplicate)
+   Compiling signal-hook v0.4.4
+   Compiling carrick-portable v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-portable)
+warning: `carrick-portable` (lib) generated 1 warning (1 duplicate)
+   Compiling carrick-capture v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-capture)
+   Compiling generator v0.8.10
+    Checking scoped-tls v1.0.1
+    Checking rand_core v0.9.5
+    Checking fnv v1.0.7
+warning: `carrick-capture` (lib) generated 1 warning (1 duplicate)
+    Checking bit-vec v0.8.0
+    Checking quick-error v1.2.3
+    Checking rand v0.9.4
+    Checking rand_xorshift v0.4.0
+    Checking rusty-fork v0.3.1
+    Checking bit-set v0.8.0
+    Checking unarray v0.1.4
+    Checking float-cmp v0.10.0
+warning: `carrick-cli` (build script) generated 1 warning (1 duplicate)
+   Compiling carrick-x86-cpl0 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-x86-cpl0)
+    Checking predicates v3.1.4
+warning: `carrick-capture` (bin "carrick-capture") generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-capture` (bin "carrick-capture" test) generated 1 warning (1 duplicate)
+warning: `carrick-capture` (test "capture") generated 1 warning (1 duplicate)
+warning: `carrick-kernel-arena` (test "robust_lock_kill9") generated 1 warning (1 duplicate)
+warning: `carrick-capture` (lib test) generated 1 warning (1 duplicate)
+    Checking assert_cmd v2.2.2
+warning: `carrick-kernel-arena` (test "prefork_registration") generated 1 warning (1 duplicate)
+    Checking carrick-signal-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-signal-core)
+warning: `carrick-portable` (lib test) generated 1 warning (1 duplicate)
+    Checking carrick-pipe-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-pipe-core)
+warning: `carrick-fatal` (lib test) generated 1 warning (1 duplicate)
+    Checking carrick-inotify-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-inotify-core)
+    Checking carrick-el1-control-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-control-abi)
+warning: `carrick-el1-control-abi` (lib test) generated 1 warning (1 duplicate)
+    Checking carrick-timer-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-timer-core)
+warning: `carrick-inotify-core` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-kernel-arena` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-signal-core` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-timer-core` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-pipe-core` (lib test) generated 1 warning (1 duplicate)
+   Compiling thiserror-impl v2.0.20
+    Checking thiserror v2.0.20
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling tracing-attributes v0.1.31
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling scroll_derive v0.13.1
+   Compiling darling_macro v0.20.11
+    Checking tokio v1.52.3
+    Checking zerofrom v0.1.8
+    Checking yoke v0.8.2
+    Checking tracing v0.1.44
+   Compiling darling v0.20.11
+    Checking zerovec v0.11.6
+   Compiling derive_builder_core v0.20.2
+    Checking zerotrie v0.2.4
+   Compiling strum_macros v0.27.2
+   Compiling getset v0.1.6
+    Checking tinystr v0.8.3
+    Checking icu_locale_core v2.2.0
+    Checking potential_utf v0.1.5
+    Checking icu_provider v2.2.0
+   Compiling derive_builder_macro v0.20.2
+    Checking icu_collections v2.2.0
+    Checking scroll v0.13.0
+    Checking icu_properties v2.2.0
+    Checking icu_normalizer v2.2.0
+    Checking futures-util v0.3.32
+    Checking goblin v0.10.5
+    Checking serde v1.0.228
+    Checking idna_adapter v1.2.2
+   Compiling clap_derive v4.6.1
+    Checking idna v1.1.0
+    Checking url v2.5.8
+   Compiling pest_derive v2.8.6
+    Checking toml_datetime v0.6.11
+    Checking serde_spanned v0.6.9
+    Checking serde_urlencoded v0.7.1
+    Checking toml_edit v0.22.27
+    Checking hyper v1.9.0
+    Checking tower v0.5.3
+    Checking carrick-guest-arch v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-guest-arch)
+    Checking carrick-syscall-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-syscall-abi)
+    Checking hyper-util v0.1.20
+    Checking tokio-rustls v0.26.4
+warning: `carrick-guest-arch` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-sched-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-sched-core)
+    Checking carrick-mmu-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-mmu-core)
+    Checking tokio-util v0.7.18
+    Checking toml v0.8.23
+    Checking tower-http v0.6.10
+   Compiling dtrace-parser v0.3.0
+    Checking derive_builder v0.20.2
+    Checking hyper-rustls v0.27.9
+    Checking oci-spec v0.8.4
+   Compiling serde_tokenstream v0.2.3
+    Checking reqwest v0.12.28
+    Checking chrono v0.4.44
+    Checking jwt v0.16.0
+warning: `carrick-syscall-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-abi)
+    Checking olpc-cjson v0.1.4
+    Checking clap v4.6.1
+    Checking dof v0.4.0
+warning: `carrick-mmu-core` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-coordinator v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-coordinator)
+    Checking usdt-impl v0.6.0
+warning: `carrick-guest-arch` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-coordinator` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-sched-core` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-core-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-core-abi)
+warning: `carrick-syscall-abi` (lib) generated 1 warning (1 duplicate)
+    Checking oci-client v0.15.0
+warning: `carrick-core-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-core)
+    Checking carrick-fd-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-fd-core)
+    Checking hickory-proto v0.26.1
+warning: `carrick-mmu-core` (lib) generated 1 warning (1 duplicate)
+   Compiling usdt-attr-macro v0.6.0
+warning: `carrick-fd-core` (lib) generated 1 warning (1 duplicate)
+   Compiling usdt-macro v0.6.0
+warning: `carrick-sched-core` (lib) generated 1 warning (1 duplicate)
+    Checking tracing-subscriber v0.3.23
+    Checking usdt v0.6.0
+warning: `carrick-core` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-personality-api v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-personality-api)
+warning: `carrick-core-abi` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-personality-api` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-personality-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-personality-linux)
+warning: `carrick-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-signal-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-signal-linux)
+warning: `carrick-fd-core` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-signal-linux` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-el1-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-abi)
+   Compiling carrick-vmm-kvm v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-vmm-kvm)
+warning: `carrick-vmm-kvm` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-personality-api` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-core` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-el1-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-guest-mem v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-guest-mem)
+    Checking carrick-el1 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1)
+warning: `carrick-guest-mem` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-spec v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-spec)
+    Checking carrick-observability v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-observability)
+warning: `carrick-spec` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-host v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-host)
+warning: `carrick-el1` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-host` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-conformance v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-conformance)
+warning: `carrick-personality-linux` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-image v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-image)
+warning: `carrick-image` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-conformance` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-xtask v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-xtask)
+warning: `carrick-observability` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-conformance-contract v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-conformance-contract)
+warning: `carrick-el1-abi` (lib) generated 1 warning (1 duplicate)
+   Compiling carrick-el1-image v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-image)
+warning: `carrick-el1-image` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-el1-linux` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-test-support v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-test-support)
+warning: `carrick-test-support` (lib) generated 1 warning (1 duplicate)
+    Checking loom v0.7.2
+warning: `carrick-coordinator` (lib) generated 1 warning (1 duplicate)
+    Checking ppv-lite86 v0.2.21
+warning: `carrick-abi` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-guest-mem` (lib) generated 1 warning (1 duplicate)
+   Compiling serde_repr v0.1.20
+    Checking rand_chacha v0.9.0
+    Checking proptest v1.11.0
+    Checking bollard-stubs v1.47.1-rc.27.3.1
+    Checking hyperlocal v0.9.1
+    Checking carrick-x86-carrier v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-x86-carrier)
+warning: `carrick-x86-carrier` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0` (bin "carrick-x86-cpl0") generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0` (bin "carrick-x86-cpl0-fixture") generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0` (test "file_region") generated 1 warning (1 duplicate)
+warning: `carrick-x86-carrier` (test "switch_work") generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-sched-core` (test "n2_task_identity") generated 1 warning (1 duplicate)
+warning: `carrick-core` (test "aarch64_fork_geometry") generated 1 warning (1 duplicate)
+warning: `carrick-spec` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-fd-core` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-core` (test "x86_wave2") generated 1 warning (1 duplicate)
+warning: `carrick-core` (test "entry_completion") generated 1 warning (1 duplicate)
+warning: `carrick-el1-abi` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-core` (test "x86_acceleration") generated 1 warning (1 duplicate)
+warning: `carrick-el1-linux` (bin "carrick-el1") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (bin "generate-inventory" test) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (bin "check-contracts" test) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (test "evaluate") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (test "write_seek_bindings") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (bin "check-contracts") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (test "check_contracts") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (test "x86_mm_bindings") generated 1 warning (1 duplicate)
+warning: `carrick-sched-core` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (bin "check-personality-boundary" test) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (test "inventory") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (test "registry") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (test "claims") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (bin "generate-inventory") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (bin "check-personality-boundary") generated 1 warning (1 duplicate)
+    Checking bollard v0.18.1
+warning: `carrick-observability` (test "work_meter") generated 1 warning (1 duplicate)
+warning: `carrick-core` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-conformance` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-conformance` (bin "carrick-conformance" test) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-x86-carrier` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-conformance` (bin "carrick-conformance") generated 1 warning (1 duplicate)
+warning: `carrick-conformance` (test "native_stage1") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-image` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "loom_run") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (bin "carrick-xtask") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "asm_diff") generated 1 warning (1 duplicate)
+warning: `carrick-spec` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "ci_changes") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "ci_cache") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "authority_debt") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "test_shards") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "claims") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (bin "carrick-xtask" test) generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "ci_scaler_hook") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "signed_gate_fixtures") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "workorder") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "signed_receipt") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "test_batch") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "ledger_merge") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "provision") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "self_hosted_toolchain") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "ci_scaler") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "fixture_fetch") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "smoke_signed") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "fixtures") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "ci_receipt") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "probe_coverage") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "cli") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "target_prune") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "host_lease") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "build_cache") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "fixture_cli") generated 1 warning (1 duplicate)
+warning: `carrick-conformance` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "commit_trailers") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "el1_image_sysroot") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "ci_scaler_mac") generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (test "dispatch_workflow") generated 1 warning (1 duplicate)
+warning: `carrick-test-support` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-host` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-personality-api` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-guest-mem` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-coordinator` (test "exclusion") generated 1 warning (1 duplicate)
+warning: `carrick-coordinator` (test "crash_recovery") generated 1 warning (1 duplicate)
+warning: `carrick-signal-linux` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-syscall-abi` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-guest-arch` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-observability` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-coordinator` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-core-abi` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-abi` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (lib test) generated 1 warning (1 duplicate)
+warning: carrick-el1-image@0.1.0: EL1 stack unregistered native retirement: 5135 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring vector input: 4624 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native admission: 7584 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork publication: 9086 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork descriptors: 9806 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd inheritance: 4831 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd retirement: 7104 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork context: 4047 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork settlement: 3502 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service admission: 4575 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack host-owned return work: 7198 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service continuation: 5822 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service refusal: 6256 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native backing reply: 9902 / 11311 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring completed copyout: 10335 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring poll readiness: 3840 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe copyout: 8448 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe backing preparation: 4703 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native wait copy: 10383 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack declined fault signal: 10976 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal delivery copy: 10480 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service signal delivery: 10880 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack resumed signal delivery copy: 11487 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal terminal exit: 10191 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal return: 6128 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack anonymous munmap: 6896 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack metadata grant: 6912 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack backing retirement: 9088 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack descriptor drain: 6400 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 image budget: 1370176 bytes loaded / 1572864 bytes; 202688 bytes headroom
+warning: `carrick-el1-image` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-mem v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-mem)
+warning: `carrick-mem` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-hal v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-hal)
+warning: `carrick-hal` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-host-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-host-linux)
+warning: `carrick-host-linux` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-vfs v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-vfs)
+    Checking carrick-thread v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-thread)
+    Checking carrick-x86 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-x86)
+warning: `carrick-thread` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-aarch64 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-aarch64)
+warning: `carrick-x86` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (test "sched_policy") generated 1 warning (1 duplicate)
+warning: `carrick-aarch64` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-vfs` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (test "signal_policy_contract") generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (test "x86_process_route") generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (test "signal_return_contract") generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (test "x86_wave2") generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (test "sigaction_contract") generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (test "futex_policy") generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-thread` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-x86` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-host-linux` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-vfs` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-mem` (test "x86_initial_image") generated 1 warning (1 duplicate)
+warning: `carrick-mem` (test "n2_readiness_exec") generated 1 warning (1 duplicate)
+warning: `carrick-el1` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-aarch64` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-el1-image` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-mmu-core` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-hal` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-mem` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-kernel` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-x86-cpl0-host v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-x86-cpl0-host)
+warning: `carrick-kernel` (test "io_blocking_guard") generated 1 warning (1 duplicate)
+warning: `carrick-el1-linux` (test "n2_creation_baseline") generated 1 warning (1 duplicate)
+warning: `carrick-el1-linux` (bin "carrick-el1" test) generated 1 warning (1 duplicate)
+warning: `carrick-el1-linux` (test "x86_production_forward") generated 1 warning (1 duplicate)
+warning: `carrick-el1-linux` (test "n2_creation_owner") generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0-host` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0-host` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-kernel` (test "integration") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-runtime v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-runtime)
+warning: `carrick-vmm-kvm` (bin "carrick-vmm-kvm") generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-engine v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-engine)
+warning: `carrick-vmm-kvm` (test "sentinel_decode") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "carrier_cpu") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "cpl0_shared_entry") generated 1 warning (1 duplicate)
+warning: `carrick-engine` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-embed v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-embed)
+warning: `carrick-vmm-kvm` (test "cpuid_v3_kvm") generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (test "syscall_process") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "carrier_memory") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "cpl0_entry") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "cpl0_image_inputs") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "live_vcpu_x86") generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (test "live_nvmm_x86") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "detached_composition_root") generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (test "interactive_tty") generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (test "minherit_probe") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (bin "carrick-vmm-kvm" test) generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (test "trap_hvf") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "cpl0_progress") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "cpl0_initial_mm") generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (test "runtime_loop") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (example "syscall_round_trip") generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (test "thread_stress_harness") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "cpl0_lifecycle") generated 1 warning (1 duplicate)
+warning: `carrick-embed` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-cli v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-cli)
+warning: `carrick-engine` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "build") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (test "cpl0_fork_e2e") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "fs_backend_flag") generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "trace_profile") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "cli") generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (test "integration") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "conformance_cli_contract") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "namespace_work_profile") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "conformance") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "x86_kvm_run") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (test "perf_runner") generated 1 warning (1 duplicate)
+warning: `carrick-el1-linux` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-cli` (bin "carrick") generated 1 warning (1 duplicate)
+warning: `carrick-cli` (bin "carrick" test) generated 1 warning (1 duplicate)
+warning: `carrick-runtime` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-xtask` (lib) generated 1 warning (1 duplicate)
+   Compiling carrick-conformance-next v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-conformance-next)
+warning: `carrick-conformance-next` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (lib test) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "write_seek_lease") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "dedicated_container_topologies") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "directory_copyout") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "scheduler_affinity") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "immutable_private_file") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "dedicated_bridge_single") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "probes_shard_0") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "dedicated_service_groups") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "probes_shard_1") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "sigmask_alias") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "futex_contract") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "libpython_map") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "ptrace_poketext_signed") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "deferred_anonymous") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "workload_cases") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "core_mount") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "task_cwd") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "signal_lease_gap") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "sched_affinity_threads") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "elf_exec_errno") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "conformance_cases") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "ipc_timed_wait") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "entitlement_negative") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "forkexecstorm_witness") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "private_file_cow_lanes") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "ecosystem_reducers") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "inotify_lifecycle") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "syscall_write_destinations") generated 1 warning (1 duplicate)
+warning: `carrick-conformance-next` (test "probes_shard_2") generated 1 warning (1 duplicate)
+warning: `carrick-kernel` (lib test) generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 26s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running `target/debug/carrick-xtask worktree-run -- cargo --locked --config 'build.rustc-wrapper=""' clippy -p carrick-embed --no-default-features --features syscall-shim,platform-linux --lib --bins --examples --keep-going -- -D warnings`
+warning: `libc::proc_listallpids` does not refer to a reachable function
+  --> /var/tmp/carrick-dispatch-lFmtou/agent/work/clippy.toml:19:5
+   |
+19 |     { path = "libc::proc_listallpids", reason = "HA-CATALOG-PROCESS-LIST-ALL-PIDS: host process enumeration requires reviewed authority" },
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: add `allow-invalid = true` to the entry to suppress this warning
+
+warning: `carrick-guest-arch` (lib) generated 1 warning
+warning: `carrick-syscall-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-sched-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-sched-core)
+warning: `carrick-mmu-core` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-sched-core` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-core-abi` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-fatal` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-core` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-abi` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-personality-api` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-syscall-abi` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-personality-linux` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-fd-core` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-el1-abi` (lib) generated 1 warning (1 duplicate)
+   Compiling carrick-el1-image v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-image)
+warning: `carrick-observability` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-kernel-arena` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-signal-linux` (lib) generated 1 warning (1 duplicate)
+    Checking hyper v1.9.0
+    Checking tokio-util v0.7.18
+warning: `carrick-el1-linux` (build script) generated 1 warning (1 duplicate)
+    Checking rand v0.10.1
+warning: `carrick-vmm-kvm` (build script) generated 1 warning (1 duplicate)
+warning: `carrick-portable` (lib) generated 1 warning (1 duplicate)
+    Checking hashbrown v0.17.1
+   Compiling carrick-kernel v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-kernel)
+warning: `carrick-kernel` (build script) generated 1 warning (1 duplicate)
+    Checking indexmap v2.14.0
+warning: `carrick-el1-image` (build script) generated 1 warning (1 duplicate)
+    Checking hickory-proto v0.26.1
+    Checking hyper-util v0.1.20
+    Checking toml_edit v0.22.27
+    Checking hyper-rustls v0.27.9
+    Checking reqwest v0.12.28
+warning: `carrick-sched-core` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-core-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-core-abi)
+    Checking toml v0.8.23
+    Checking oci-client v0.15.0
+warning: `carrick-core-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-core)
+    Checking carrick-fd-core v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-fd-core)
+warning: `carrick-fd-core` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-core` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-personality-api v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-personality-api)
+warning: `carrick-personality-api` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-personality-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-personality-linux)
+warning: `carrick-personality-linux` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-el1-abi v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-abi)
+warning: `carrick-el1-abi` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-guest-mem v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-guest-mem)
+    Checking carrick-el1 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1)
+warning: `carrick-guest-mem` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-observability v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-observability)
+    Checking carrick-host v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-host)
+    Checking carrick-spec v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-spec)
+warning: `carrick-el1` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-el1-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-el1-linux)
+warning: `carrick-host` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-spec` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-image v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-image)
+warning: `carrick-image` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-observability` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-conformance-contract v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-conformance-contract)
+warning: `carrick-el1-linux` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-conformance-contract` (lib) generated 1 warning (1 duplicate)
+warning: carrick-el1-image@0.1.0: EL1 stack unregistered native retirement: 5135 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring vector input: 4624 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native admission: 7584 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork publication: 9086 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork descriptors: 9806 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd inheritance: 4831 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd retirement: 7104 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork context: 4047 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork settlement: 3502 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service admission: 4575 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack host-owned return work: 7198 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service continuation: 5822 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service refusal: 6256 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native backing reply: 9902 / 11311 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring completed copyout: 10335 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring poll readiness: 3840 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe copyout: 8448 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe backing preparation: 4703 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native wait copy: 10383 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack declined fault signal: 10976 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal delivery copy: 10480 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service signal delivery: 10880 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack resumed signal delivery copy: 11487 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal terminal exit: 10191 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal return: 6128 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack anonymous munmap: 6896 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack metadata grant: 6912 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack backing retirement: 9088 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack descriptor drain: 6400 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 image budget: 1374272 bytes loaded / 1572864 bytes; 198592 bytes headroom
+warning: `carrick-el1-image` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-mem v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-mem)
+warning: `carrick-mem` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-hal v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-hal)
+warning: `carrick-hal` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-host-linux v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-host-linux)
+    Checking carrick-x86 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-x86)
+    Checking carrick-thread v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-thread)
+    Checking carrick-aarch64 v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-aarch64)
+warning: `carrick-host-linux` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-vfs v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-vfs)
+warning: `carrick-thread` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-x86` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-x86-cpl0-host v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-x86-cpl0-host)
+warning: `carrick-aarch64` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-x86-cpl0-host` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-vmm-kvm v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-vmm-kvm)
+warning: `carrick-vfs` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-vmm-kvm` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-kernel` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-runtime v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-runtime)
+warning: `carrick-runtime` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-engine v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-engine)
+warning: `carrick-engine` (lib) generated 1 warning (1 duplicate)
+    Checking carrick-embed v0.1.0 (/var/tmp/carrick-dispatch-lFmtou/agent/work/crates/carrick-embed)
+warning: `carrick-embed` (lib) generated 1 warning (1 duplicate)
+warning: `carrick-embed` (example "intercept_getuid") generated 1 warning (1 duplicate)
+warning: `carrick-embed` (example "advanced_embed") generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 42.68s

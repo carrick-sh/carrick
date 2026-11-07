@@ -1,0 +1,69 @@
+# ltp-clock_gettime01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/clock_gettime01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/clock_gettime01
+# ltp-epoll_create01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/epoll_create01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/epoll_create01
+# ltp-eventfd01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/eventfd01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/eventfd01
+# ltp-getcpu01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/getcpu01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/getcpu01
+# ltp-gettid01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/gettid01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/gettid01
+# ltp-gettimeofday01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/gettimeofday01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/gettimeofday01
+# ltp-pipe01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/pipe01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/pipe01
+# ltp-rt_sigaction01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/rt_sigaction01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/rt_sigaction01
+# ltp-sched_getaffinity01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/sched_getaffinity01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/sched_getaffinity01
+# ltp-sched_yield01 [ltp, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/sched_yield01
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/ltp:arm64 /bin/sh -c /opt/ltp/testcases/bin/sched_yield01
+# go-build [go, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host -w /tmp --platform linux/amd64 localhost:5005/carrick-go-conformance:1.24 /bin/sh -c cd /tmp && printf 'package main\nfunc main(){println("ok")}\n' > h.go && GOCACHE=/tmp/gc /usr/local/go/bin/go build -o /tmp/h ./h.go && /tmp/h && echo BUILD_OK
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 -w /tmp localhost:5005/carrick-go-conformance:1.24 /bin/sh -c cd /tmp && printf 'package main\nfunc main(){println("ok")}\n' > h.go && GOCACHE=/tmp/gc /usr/local/go/bin/go build -o /tmp/h ./h.go && /tmp/h && echo BUILD_OK
+# go-context [go, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host -w /usr/local/go/src/context --platform linux/amd64 localhost:5005/carrick-go-conformance:1.24 /conformance/context.test -test.v -test.run Test -test.short
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 -w /usr/local/go/src/context localhost:5005/carrick-go-conformance:1.24 /conformance/context.test -test.v -test.run Test -test.short
+# go-runtime [go, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host -w /usr/local/go/src/runtime --platform linux/amd64 localhost:5005/carrick-go-conformance:1.24 /conformance/runtime.test -test.v -test.run ^(Test(FinalizerRegisterABI|UserArena.*|BitCursor|Callers.*|FPUnwindAfterRecovery|Chan|NonblockRecvRace|NonblockSelectRace2?|SelfSelect|SelectStress|SelectFairness|MultiConsumer|ShrinkStackDuringBlockedSend|NoShrinkStackWhileParking|SelectDuplicateChannel|SelectStackAdjust))$ -test.short
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 -w /usr/local/go/src/runtime localhost:5005/carrick-go-conformance:1.24 /conformance/runtime.test -test.v -test.run ^(Test(FinalizerRegisterABI|UserArena.*|BitCursor|Callers.*|FPUnwindAfterRecovery|Chan|NonblockRecvRace|NonblockSelectRace2?|SelfSelect|SelectStress|SelectFairness|MultiConsumer|ShrinkStackDuringBlockedSend|NoShrinkStackWhileParking|SelectDuplicateChannel|SelectStackAdjust))$ -test.short
+# go-sync [go, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host -w /usr/local/go/src/sync --platform linux/amd64 localhost:5005/carrick-go-conformance:1.24 /conformance/sync.test -test.v -test.run Test -test.short
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 -w /usr/local/go/src/sync localhost:5005/carrick-go-conformance:1.24 /conformance/sync.test -test.v -test.run Test -test.short
+# go-time [go, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host -w /usr/local/go/src/time --platform linux/amd64 localhost:5005/carrick-go-conformance:1.24 /conformance/time.test -test.v -test.run Test -test.short
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 -w /usr/local/go/src/time localhost:5005/carrick-go-conformance:1.24 /conformance/time.test -test.v -test.run Test -test.short
+# node-app-smoke [node, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --entrypoint /usr/local/bin/nodejs-conformance -e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick --platform linux/amd64 localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 --runner docker --suite app-smoke --line 24 --timeout 120
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 --entrypoint /usr/local/bin/nodejs-conformance -e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=docker localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 --runner docker --suite app-smoke --line 24 --timeout 120
+# node-v8-smoke [node, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --entrypoint /usr/local/bin/nodejs-conformance -e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick --platform linux/amd64 localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 --runner docker --suite v8-smoke --line 24 --timeout 120
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 --entrypoint /usr/local/bin/nodejs-conformance -e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=docker localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 --runner docker --suite v8-smoke --line 24 --timeout 120
+# cpython-fcntl [cpython, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_fcntl
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_fcntl
+# cpython-glob [cpython, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_glob
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_glob
+# cpython-json [cpython, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_json
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_json
+# cpython-math [cpython, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_math
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_math
+# cpython-subprocess [cpython, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_subprocess
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_subprocess
+# cpython-threading [cpython, Smoke]
+  carrick: target/release/carrick run --name conf-39951-cN --max-traps 18446744073709551615 --fs host --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_threading
+  oracle (Docker): docker run --name conf-39951-dN --platform linux/amd64 localhost:5050/cpython-test:3.12.13 /usr/local/bin/python3 -m test -v --randseed 0 test_threading

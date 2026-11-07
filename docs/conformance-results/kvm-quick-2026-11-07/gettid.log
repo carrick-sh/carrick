@@ -1,0 +1,17 @@
+    Blocking waiting for file lock on build directory
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.29s
+     Running `target/debug/carrick-xtask worktree-run -- cargo --locked --config 'build.rustc-wrapper=""' run --locked -p carrick-xtask -- host-lease --mode gate -- env CARRICK_REQUIRE_KVM=1 CARRICK_RUN_ID=issue1795-cached-gettid target/release/carrick-conformance --lane kvm-local --tier smoke --suite ltp-gettid01 --require-cached-oracle --no-image-refresh --force --flake-retries 0 --jsonl /var/tmp/carrick-dispatch-lFmtou/agent/evidence/gettid.jsonl`
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running `target/debug/carrick-xtask host-lease --mode gate -- env CARRICK_REQUIRE_KVM=1 CARRICK_RUN_ID=issue1795-cached-gettid target/release/carrick-conformance --lane kvm-local --tier smoke --suite ltp-gettid01 --require-cached-oracle --no-image-refresh --force --flake-retries 0 --jsonl /var/tmp/carrick-dispatch-lFmtou/agent/evidence/gettid.jsonl`
+oracle: all 1 selected suite(s) cached; running carrick-only
+phase 1/4: 1 carrick runs (workers=6, cpython-workers=4, fast-timeout=5s; cached slow rows get 2x oracle + 2s; hard-cap=None)
+  [carrick] ltp-gettid01
+phase 2/4: 0 Docker run(s), 1 cached oracle(s) (workers=6, cpython-workers=4)
+phase 3/4: classify
+syscall shapes: 0 observed, 1 missing (coverage debt; non-allowlisted refusals require an observed shape)
+
+=== summary ===
+  FAIL INCOMPLETE     ltp-gettid01                             carrick[Empty] oracle[2/2]  [infra: carrick: failed to resolve image: OCI registry operation failed: error sending request for url (http…]
+
+FAIL: 1 gating verdict(s) (REGRESSION / unexcused CRASH or TIMEOUT)
+error: Recipe `lease` failed with exit code 1

@@ -1,0 +1,8 @@
+{
+  "machine": "x86_64",
+  "kernel": "6.12.111+deb13-amd64",
+  "docker_executable": null,
+  "docker_socket_exists": false,
+  "inherited_vm_lease_socket_exists": true,
+  "kvm_api_version": 12
+}

@@ -1,0 +1,16 @@
+{
+  "status": "blocked",
+  "measured_source_commit": "71c57e106688ba954a5a9947c9868f8a92160660",
+  "selected_quick_suites": 23,
+  "current_amd64_cached_oracles": 15,
+  "missing_amd64_oracles": 8,
+  "all_suite_admission_exit": 2,
+  "guest_assertion_suites_executed": 0,
+  "match": null,
+  "diff": null,
+  "carrick_only_failures": null,
+  "oracle_only_failures": null,
+  "targeted_infrastructure_failures": 1,
+  "targeted_suite": "ltp-gettid01",
+  "baseline_updated": false
+}

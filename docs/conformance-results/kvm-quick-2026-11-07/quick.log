@@ -1,0 +1,9 @@
+--require-cached-oracle: 8 of 23 selected suite(s) have no cached oracle for platform LinuxAmd64; this lane cannot run docker. Re-bless the cache on a box with the images (`--refresh-oracle`) and commit it.
+  uncached: node-app-smoke
+  uncached: node-v8-smoke
+  uncached: cpython-fcntl
+  uncached: cpython-glob
+  uncached: cpython-json
+  uncached: cpython-math
+  uncached: cpython-subprocess
+  uncached: cpython-threading

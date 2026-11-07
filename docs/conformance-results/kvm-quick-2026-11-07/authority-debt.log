@@ -1,0 +1,13 @@
+    Blocking waiting for file lock on build directory
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 41s
+     Running `target/debug/carrick-xtask worktree-run -- cargo --locked --config 'build.rustc-wrapper=""' run --locked -p carrick-xtask -- authority-debt --source-only`
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s
+     Running `target/debug/carrick-xtask authority-debt --source-only`
+ISA wiring gaps: 12
+RootOnly: 283 retained handlers, 21 ambient-state obligations
+authority debt delta: no change range (no base provided); delta ratchet not applicable
+authority debt ceilings passed; source counters: 1266
