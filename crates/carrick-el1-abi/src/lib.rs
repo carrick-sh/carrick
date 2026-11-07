@@ -380,7 +380,8 @@ pub const EL1_METADATA_MAILBOX_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x10_000
 pub const EL1_METADATA_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_METADATA_MAILBOX_OFFSET;
 
 /// Dedicated metadata readiness queue, outside guest IPC queue admission.
-pub const METADATA_WAIT_QUEUE_INDEX: u32 = carrick_sched_core::ZONE_RECORDS as u32;
+pub const METADATA_WAIT_QUEUE_INDEX: u32 =
+    carrick_sched_core::object_wait::ADDRESS_SPACE_WAIT_BASE as u32;
 
 pub const METADATA_MAILBOX_IDLE: u32 = 0;
 pub const METADATA_MAILBOX_GUEST_WRITING: u32 = 1;
