@@ -115,7 +115,7 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
         return None;
     }
     let mut saved = crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    crate::sched::HardwareCpu.save(frame, &mut saved);
+    crate::sched::HardwareCpu.save(frame, &mut saved, crate::sched::CpuExitCause::Svc);
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     fp.vregs = saved.native.v;
     fp.fpsr = saved.native.fpsr as u32;
@@ -321,7 +321,7 @@ pub(crate) fn restore_live_arm_signal_frame(
     // The audited switch leaf is the sole reader/writer of EL0 FP/SIMD.
     // Retain the context off the 16 KiB EL1 stack until validation commits.
     let mut saved = crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    crate::sched::HardwareCpu.save(frame, &mut saved);
+    crate::sched::HardwareCpu.save(frame, &mut saved, crate::sched::CpuExitCause::Svc);
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     fp.vregs = saved.native.v;
     fp.fpsr = saved.native.fpsr as u32;
