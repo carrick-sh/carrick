@@ -28,12 +28,41 @@ pub const FUTEX_WAIT_BITSET_PRIVATE_REALTIME: u64 = 128 | 256 | 9;
 pub const EAGAIN: i64 = -11;
 pub const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
 
+/// MM-scoped futex identity, distinct from the aligned address used for
+/// guest memory access. Shared mappings require a different object authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmFutexKey(u64);
+impl MmFutexKey {
+    pub fn private(address: UserVa) -> Option<Self> {
+        (address.raw() & 3 == 0).then_some(Self(address.raw()))
+    }
+    /// Linux distinguishes shared operations on private anonymous memory from
+    /// PRIVATE operations (gVisor's KindSharedPrivate). This alignment bit is
+    /// never passed back to a user-copy operation.
+    pub fn shared_private(address: UserVa) -> Option<Self> {
+        Self::private(address).map(|key| Self(key.0 | 1))
+    }
+    pub fn scheduler_address(self) -> u64 {
+        self.0
+    }
+}
+
 /// Linux register arguments after the native adapter has captured them.
 #[derive(Clone, Copy)]
 pub struct FutexCall {
     pub args: [u64; 6],
 }
 impl FutexCall {
+    /// A shared operation can use an MM key only after the memory owner
+    /// authenticates private anonymous storage. Keep this candidate separate
+    /// from admission: shared mappings require their own object authority.
+    pub fn shared_private_candidate(mut self) -> Option<Self> {
+        if !matches!(self.args[1], 0 | 1) {
+            return None;
+        }
+        self.args[1] |= 128;
+        self.admitted().then_some(self)
+    }
     pub fn admitted(self) -> bool {
         if self.args[0] & 3 != 0 {
             return false;

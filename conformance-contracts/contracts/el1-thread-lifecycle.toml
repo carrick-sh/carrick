@@ -68,15 +68,13 @@ rationale = "EL1 thread lifecycle stage L0 (docs/superpowers/plans/2026-09-30-el
 # Core pool cancellation refuses an open gate before physical record release;
 # entry_completion::pool_cancellation_refuses_record_release_before_terminal_gate
 # binds the shared owner verdict for ARM and x86 compact-context callers.
-# The x86 native_execution.rs change removes only an unused import. The
-# continuation-work test in personality-linux::dispatch::ring_first_tests::
-# x86_owned_wait4_survives_pending_host_work and the 30x live KVM wait4 run
-# cover the changed completion path; no thread birth or exit path changed.
+# #1892: native scheduler selection enters each exact registered member;
+# the production CPL0 thread binding below covers birth, raw exit and join.
 embed = [
   "carrick-embed::el1_files::{terminal_save_vacates_both_roots_before_publication,terminal_save_second_root_write_failure_retains_ownership} (signed production HvpatchPersistentExecutor::save; seed both hardware roots with the owned process root, inspect before detached backend publication; partial second-write failure retains binding and worker ownership; execution pending on Mac)",
   "carrick-embed::el1_sched::{el1_thread_lifecycle_spawn_slope,el1_thread_lifecycle_tgkill_right_after_clone,el1_thread_lifecycle_mask_storm_exactly_once,el1_thread_lifecycle_cleartid_tid_reuse,el1_thread_lifecycle_rlimit_nproc_exact,el1_thread_lifecycle_fork_during_clone_storm,el1_thread_lifecycle_exit_group_and_exec_during_clone_storm,el1_thread_lifecycle_ptrace_traceclone,el1_thread_lifecycle_seccomp_clone_filter,el1_thread_lifecycle_parked_threads_beyond_executor_pool}",
   "carrick-vmm-kvm::cpl0_lifecycle::x5_shared_clone_exit (real KVM; two live MMs, clone/exit/clear-tid wake, 16/64/256 births per MM; host and guest use the same sidecar)",
-  "carrick-vmm-kvm::cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent (production image and executor pool; guest clone, parent/child handshake, child raw exit and surviving parent; red on ENOSYS(38), no production thread-birth acceptance yet)",
+  "carrick-vmm-kvm::cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent (production image and executor pool; guest clone, parent/child handshake, child raw exit and surviving parent; red on ENOSYS(38), green through the production pool after native lifecycle and root-stock admission)",
   "carrick-vmm-kvm::cpl0_fork_e2e (real KVM; fork/COW/wait4/rusage and issued child PID; lifecycle sidecar placement red/green)",
 ]
 
@@ -91,6 +89,8 @@ vm_free = [
   "carrick-kernel::kernel::tests::production_namespaced_roots_grow_local_identity_storage (nine simultaneous production roots cross local metadata growth; each namespace retains PID 1)",
   "carrick-el1-linux::native_process_runtime::host_test_support::{production_unmapped_root_early_bind_admits_and_forks,production_unmapped_root_late_bind_admits_and_forks} (production bootstrap without PID remapping, native admission and fork; shared internal/visible PID and TID)",
   "carrick-kernel::kernel::tests::{production_root_domains_retire_after_bootstrap,production_root_domains_retire_after_cancel} (production root binding and four cancelled preparations; namespace retirement returns cursor population and claims to baseline)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::native_root_stock_claim_rollback_and_nproc_limit",
+  "carrick-el1-linux::native_process_runtime::host_test_support::native_root_stock_busy_claim_parks_then_release_retries_same_clone",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_pid_excludes_live_host_thread_tids",
   "carrick-kernel::kernel::ids::tests::carrier_births_cover_reserved_unpublished_replenished_and_two_roots",
