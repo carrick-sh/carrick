@@ -1887,9 +1887,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
             }
             match claim {
                 Claim::Transferring { seq, cancelled, .. }
-                    if seq == self.seq && (cancelled || rec.is_cancelled()) =>
+                    if seq == self.seq
+                        && (cancelled
+                            || (rec.is_cancelled()
+                                && rec.object_wait_census().is_some_and(|census| {
+                                    census.has_anonymous_edit_operation()
+                                }))) =>
                 {
                     rec.retire_cancelled_metadata_operation();
+                    rec.retire_cancelled_anonymous_operation();
                     if rec.has_object_operation() {
                         // Cancellation must reach the adapter while its exact
                         // endpoint token is still retained by this incarnation.
