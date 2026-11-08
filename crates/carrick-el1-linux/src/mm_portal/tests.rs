@@ -3119,6 +3119,62 @@ mod anonymous_editor {
 }
 use anonymous_editor::ForkAnonymousEditor;
 
+// #1846 slice C: a native child's anonymous syscall must retain its own
+// execution lane while another participant holds the reservation root.
+// The production delegate currently counts this as a forward.
+#[test]
+fn anonymous_munmap_root_busy_requests_wait_without_counted_forward() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1_abi::{AnonymousLeave, Counters, CurrentTask, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_sched_core::spaces::notification::SpaceAccess;
+
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let held = portal.root(mm, 1).unwrap();
+    let tables = Tables::new(ROOT, IPA, 0);
+    let arenas = [&tables];
+    let task = CurrentTask::new();
+    task.execution.task.store(101, Ordering::Relaxed);
+    task.mm.thread_generation.store(1, Ordering::Relaxed);
+    task.mm.key.store(mm.raw(), Ordering::Relaxed);
+    let mut frame = TrapFrame {
+        slot: 0,
+        elr: 0x40004,
+        ..TrapFrame::default()
+    };
+    frame.x[0] = VA;
+    frame.x[1] = 4096;
+    frame.x[8] = 215;
+    let counters = Counters::default();
+    let mut editor = ForkAnonymousEditor {
+        arenas: &arenas,
+        pool: TableWindow {
+            words: tables.words.as_ptr().cast_mut(),
+            physical_base: tables.base,
+            byte_len: tables.words.len() * 8,
+        },
+    };
+    let route = serve_delegated_anonymous(
+        &mut frame,
+        &counters,
+        &task,
+        SpaceAccess::source_free(&spaces),
+        region.table(),
+        &mut editor,
+        None,
+    );
+    assert_ne!(route, DelegatedAnonymous::Forward, "Busy must ask to park");
+    assert_eq!(
+        counters.anonymous_leaves[AnonymousLeave::RootBusy as usize].load(Ordering::Relaxed),
+        0
+    );
+    drop(held);
+}
+
 #[test]
 fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_writes() {
     use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
