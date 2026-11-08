@@ -1351,6 +1351,7 @@ mod tests {
     /// usrmerge rootfs (`/lib -> usr/lib`) must resolve its PT_INTERP through
     /// the layered rootfs, exactly as the host-owned exec does.
     #[test]
+    /// Loader control only; the local custody checks are not live MM observations.
     fn native_child_exec_prepares_a_dynamic_binary_through_a_usrmerge_rootfs() {
         use std::os::unix::fs::PermissionsExt as _;
 
