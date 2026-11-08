@@ -6289,15 +6289,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // owner consumes its exact token before the generic IPC retry
             // below could leave it attached to the resumed clone caller.
             None => match self.resume_thread_stock_wait()? {
-                // A refused adapter admission published no service wait. The
-                // scheduler still owns the exact IPC token and pin: retry its
-                // preparation through that owner before returning to userspace.
+                // Adapter preparation and anonymous edits both retain a saved
+                // syscall across a queue wake. Anonymous replay owns no IPC
+                // adapter pin, so classify its operation independently.
                 NativeResume::NoPending
-                    if self
-                        .source
-                        .zone
-                        .record(self.record.id)
-                        .has_adapter_operation() =>
+                    if matches!(
+                        self.source
+                            .zone
+                            .record(self.record.id)
+                            .object_operation_kind(),
+                        Some(
+                            carrick_sched_core::object_wait::OperationKind::Adapter
+                                | carrick_sched_core::object_wait::OperationKind::AnonymousEdit
+                        )
+                    ) =>
                 {
                     Ok(syscall_retry)
                 }
