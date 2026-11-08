@@ -2,7 +2,9 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use carrick_core::entry::{CompletionError, admit, complete, handoff};
 use carrick_core::wait::{EditWaitOutcome, coordinate_anonymous_edit_wait};
-use carrick_core::wait::{notify_object, park_object_record, take_object_operation};
+use carrick_core::wait::{
+    notify_object, park_object_record, park_object_record_rechecked, take_object_operation,
+};
 use carrick_core_abi::{
     EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, ObjectParkRequest,
     SnapshotGeneration,
@@ -166,6 +168,85 @@ fn exercise_anonymous_wait_event(event: AnonymousWaitEvent) {
         assert!(cancellation.cancellation().is_some());
     }
     zone.free_record(record);
+}
+
+#[test]
+fn anonymous_release_after_enrollment_reprobes_before_park() {
+    let zone = zone();
+    let slot = SlotId::new(0);
+    let mm = 77;
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, mm, None, 0);
+    let here = ExecutionSlot::zone(slot);
+    zone.occupancy.vacate_any(here);
+    assert!(zone.occupancy.replace(here, 0, mm));
+    zone.enter_guest(slot);
+    let space = zone.spaces.publish_closed(mm, 0x7000, 0x7000).unwrap();
+    zone.spaces.open(space);
+    let entry = zone
+        .space_entry(std::num::NonZeroU64::new(mm).unwrap())
+        .unwrap();
+    entry
+        .admit_notifications(
+            std::num::NonZeroU64::MIN,
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.deliver_handbacks(&mut |_| {});
+            },
+        )
+        .unwrap();
+    let source = entry.live_notifications().unwrap();
+    let identity = ThreadIdentity {
+        tid: 41,
+        serial: 101,
+        mm,
+        file_table: 5,
+        generation: 1,
+        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+        affinity: 0,
+        lifecycle_page: 0,
+        control_slot: 0,
+    };
+    let record = zone.current_or_new(slot, identity).unwrap();
+    let mut probes = 0;
+    let mut enrollments = 0;
+    let outcome: EditWaitOutcome<()> = coordinate_anonymous_edit_wait(
+        &source,
+        None,
+        || {
+            probes += 1;
+            (probes == 1).then_some(Some(SpaceWaitCause::Reservations))
+        },
+        |key, snapshot, operation| {
+            enrollments += 1;
+            let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, operation, None);
+            let complete =
+                |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+                    let _ = effects.deliver_handbacks(&mut |_| {});
+                };
+            match park_object_record_rechecked(
+                &zone,
+                slot,
+                request,
+                &complete,
+                || Ok((record, false)),
+                || {
+                    assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+                    source
+                        .reserve(SpaceWaitCause::Reservations)
+                        .publish(carrick_sched_core::Waker::Host, &complete);
+                    source.observe(SpaceWaitCause::Reservations) == snapshot.observed()
+                },
+            ) {
+                Ok(_) => panic!("a release after enrollment cannot leave the caller parked"),
+                Err(error) => Err(error),
+            }
+        },
+    );
+    assert_eq!(outcome, EditWaitOutcome::NoConflict);
+    assert_eq!((probes, enrollments), (2, 1));
+    assert!(zone.slot(slot).current().is_some());
+    assert!(!zone.record(record).has_object_operation());
 }
 
 #[test]
