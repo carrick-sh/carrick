@@ -1,0 +1,53 @@
+schema = "carrick.conformance-exemption.v1"
+base = "9aa0cb59128418e7a4583a26f77030642baaabbc"
+head = "1b4aa2e256e74d3e4c103392f7c41c01012f214a"
+contracts = [
+  "core.entry.completion",
+  "core.personality.files",
+  "diagnostics.syscall-refusal",
+  "kernel.copyout.owner-refusal",
+  "kernel.el1.deferred-handback-identity",
+  "kernel.el1.ipc-fd-authority",
+  "kernel.el1.ipc-lifecycle",
+  "kernel.el1.ipc-two-process",
+  "kernel.el1.signal-delivery-owner",
+  "kernel.el1.thread-lifecycle",
+  "kernel.futex.contention",
+  "kernel.memory.owner-wait",
+  "kernel.mm.private-file-fixed-replacement",
+  "kernel.native.entropy",
+  "kernel.native.host-file-venue",
+  "kernel.native.namespace-mutation",
+  "kernel.scheduler.runnable-progress",
+  "kernel.vcpu.shutdown-entry",
+  "kernel.wait.child-rusage",
+  "kernel.wait.process-group",
+  "process.exec.custody",
+  "process.native.arm-admission",
+  "process.native.short-lock",
+  "process.native.terminal-child",
+]
+paths = [
+  "crates/carrick-el1-image/frame_budget.rs",
+  "crates/carrick-el1-linux/src/dispatch.rs",
+  "crates/carrick-el1-linux/src/ipc.rs",
+  "crates/carrick-el1-linux/src/native_process_runtime.rs",
+  "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs",
+  "crates/carrick-el1-linux/src/native_process_runtime/service.rs",
+  "crates/carrick-personality-linux/src/lifecycle.rs",
+]
+rationale = """
+The guest-visible change in these shared files is owned by the new
+`kernel.el1.poll-revents` contract: the poll body publishes one two-byte
+`revents` field per entry instead of the frozen whole-record array, and the
+retained native-venue output carries the same shape. Nothing else in these
+files moves: the other poll branches keep their result, their host crossing,
+their refusal arms and their fallbacks; `copy_poll_revents` reads only the
+resolved entry's `revents` and keeps the same Forward on a refused copy. The
+receipt names the remaining contracts bound to these files because the gate
+requires evidence for every contract on a modified surface, not because their
+behaviour changed. Their red-first production witnesses are unchanged and
+still pass, and the structural budget narrows: 2n guest bytes for n entries
+instead of 8n, with the same n entries visited and no added allocation,
+retry, poll or lock.
+"""
