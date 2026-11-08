@@ -128,6 +128,7 @@ enum CarrierContinuation {
 /// address is published in the request) and the user output it fills.
 struct PendingHostFile<'a> {
     call: NativeServiceCall<'a>,
+    operation: carrick_core_abi::host_file::HostFileOp,
     record: Box<[u8]>,
     output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
     map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
@@ -631,7 +632,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let Some(output) = self.copyout_ready.take() else {
                 break;
             };
-            result = self.finish_copyout(*output);
+            result = match self.finish_copyout(*output) {
+                Err(NativeProcessError::Fault) => Ok(NativeResume::Returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                )),
+                result => result,
+            };
         }
         result
     }
@@ -1184,6 +1190,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         chdir: bool,
         call: NativeServiceCall<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
+        let operation = carrick_core_abi::host_file::request_parts(&record)
+            .ok_or(NativeProcessError::Invalid)?
+            .0
+            .op;
         self.service_phase = NativeServicePhase::Capability;
         let capability = self
             .runtime
@@ -1204,6 +1214,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             ServicePayload::HostFile(PendingHostFile {
                 call,
+                operation,
                 record,
                 output,
                 map,
@@ -3079,6 +3090,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             );
         }
         let mut output = pending.copyout.take();
+        if matches!(request.operation, ServiceOperation::HostFile { .. })
+            && matches!(result, ServiceResult::Supplied | ServiceResult::Cancelled)
+            && let Some(file) = pending.host_file.as_ref()
+            && file.operation == carrick_core_abi::host_file::HostFileOp::Readlinkat
+            && let Some(destination) = file.output
+            && let Some(reply) = carrick_core_abi::host_file::reply(&file.record)
+            && reply.result >= 0
+            && reply.output.len() <= destination.len
+        {
+            output = Some(Box::new(OwnedCopyout {
+                address: UserVa::new(destination.address),
+                bytes: reply.output.to_vec(),
+                offset: 0,
+                result: SyscallResult::new(reply.result),
+                prefix_on_fault: false,
+                effect: None,
+            }));
+        }
         if matches!(request.operation, ServiceOperation::Entropy { .. })
             && matches!(result, ServiceResult::Supplied | ServiceResult::Cancelled)
             && let Some((record, address, empty_fault)) = pending.entropy.as_ref()
