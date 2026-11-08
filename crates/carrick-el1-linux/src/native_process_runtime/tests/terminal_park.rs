@@ -35,6 +35,7 @@ pub fn run() -> Result<LinuxWaitStatus, NativeTerminalFailure> {
             None,
             carrick_sched_core::Handback::Control,
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
         ),
         carrick_sched_core::HostClaim::El1Held { .. }
     ));
@@ -313,7 +314,8 @@ fn losing_entryless_exit_group_publishes_terminal_before_record_release() {
             fixture.record,
             None,
             carrick_sched_core::Handback::Control,
-            &carrick_sched_core::ShortLockSpin
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
         ),
         carrick_sched_core::HostClaim::El1Held { .. }
     ));

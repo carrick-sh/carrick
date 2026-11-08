@@ -46,6 +46,35 @@ fn record_test_wake(slot: SlotId, target: u64) {
     });
 }
 
+/// Guest task doorbell at the native ISA's mapped current-task authority.
+#[cfg(target_os = "none")]
+fn mark_guest_host_work(slot: SlotId) {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw())) {
+        task.linux.mark_pending_host_work();
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = slot;
+        if let Some(task) = crate::isa::x86::user_access::live_current_task() {
+            task.linux.mark_pending_host_work();
+        }
+    }
+}
+#[cfg(target_os = "none")]
+fn mark_guest_host_work_all() {
+    #[cfg(target_arch = "aarch64")]
+    for index in 0..carrick_sched_core::ZONE_SLOTS {
+        if let Some(slot) = SlotId::from_index(index) {
+            mark_guest_host_work(slot);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(task) = crate::isa::x86::user_access::live_current_task() {
+        task.linux.mark_pending_host_work();
+    }
+}
+
 /// Required completion venue for EL1-held queues. Detached handbacks use
 /// the carrier boundary; SGIs and pending work are delivered after unlock.
 pub fn deliver_completion<C: carrick_el1_abi::EntryContext>(
@@ -64,19 +93,11 @@ pub fn deliver_completion<C: carrick_el1_abi::EntryContext>(
             effects,
             deferred,
             |slot, target| cpu.send_resched(slot, target),
-            (
-                |slot| {
-                    if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
-                    {
-                        task.linux.mark_pending_host_work();
-                    }
-                },
-                carrick_el1_abi::mark_pending_host_work_all,
-            ),
+            (mark_guest_host_work, mark_guest_host_work_all),
         );
     }
     #[cfg(not(target_os = "none"))]
-    let _ = (waker, effects, deferred, venue, zone);
+    deliver_host_effects(zone, Some(venue), waker, effects, deferred);
 }
 
 /// A host release has no owning EL1 slot. Its deferred handbacks must be
@@ -96,19 +117,42 @@ pub fn deliver_host_completion<C: carrick_el1_abi::EntryContext>(
             effects,
             deferred,
             |slot, target| cpu.send_resched(slot, target),
-            (
-                |slot| {
-                    if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
-                    {
-                        task.linux.mark_pending_host_work();
-                    }
-                },
-                carrick_el1_abi::mark_pending_host_work_all,
-            ),
+            (mark_guest_host_work, mark_guest_host_work_all),
         );
     }
     #[cfg(not(target_os = "none"))]
-    let _ = (zone, waker, effects, deferred);
+    deliver_host_effects(zone, None, waker, effects, deferred);
+}
+
+// Host-test/native adapters retain the scheduler's existing reschedule latch
+// and mapped host-work doorbells. Physical host kicks remain the carrier's
+// completion venue (HostLockWait), rather than an independent callback table.
+#[cfg(not(target_os = "none"))]
+fn deliver_host_effects<C: carrick_el1_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    venue: Option<SlotId>,
+    waker: carrick_sched_core::Waker,
+    effects: WakeEffects,
+    deferred: bool,
+) {
+    deliver_effects_with(
+        zone,
+        venue,
+        waker,
+        effects,
+        deferred,
+        |slot, target| {
+            zone.owe_resched(slot);
+            #[cfg(any(test, feature = "host-test"))]
+            record_test_wake(slot, target);
+            #[cfg(not(any(test, feature = "host-test")))]
+            let _ = target;
+        },
+        (
+            |slot| carrick_el1_abi::mark_pending_host_work(usize::from(slot.raw())),
+            carrick_el1_abi::mark_pending_host_work_all,
+        ),
+    );
 }
 
 /// Deliver a native owner's plain wake through the same SGI and host-work
@@ -128,15 +172,7 @@ pub fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
             effects,
             false,
             |slot, target| cpu.send_resched(slot, target),
-            (
-                |slot| {
-                    if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
-                    {
-                        task.linux.mark_pending_host_work();
-                    }
-                },
-                carrick_el1_abi::mark_pending_host_work_all,
-            ),
+            (mark_guest_host_work, mark_guest_host_work_all),
         );
     }
     #[cfg(any(test, feature = "host-test"))]
@@ -153,7 +189,6 @@ pub fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
     let _ = (zone, venue, effects);
 }
 
-#[cfg(any(test, feature = "host-test", target_os = "none"))]
 pub fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     venue: Option<SlotId>,
@@ -336,7 +371,9 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         &self,
         key: ObjectWaitKey,
     ) -> Result<(ObjectWakeReport, WakeEffects), ObjectWaitError> {
-        carrick_core::wait::notify_object(self.zone, self.slot, key)
+        carrick_core::wait::notify_object(self.zone, self.slot, key, &|owned| {
+            deliver_completion(owned.zone(), self.slot, owned)
+        })
     }
 
     /// Send the same targeted SGIs and program the same queue timer as futex

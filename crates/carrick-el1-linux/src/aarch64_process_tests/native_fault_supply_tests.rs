@@ -2433,7 +2433,9 @@ fn composed_native_supply_with_prepared(
     let mut ticket = {
         let queue = fixture
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         let member = queue.native_service_member(selector.record).unwrap();
         unsafe { ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, member) }
@@ -2538,7 +2540,9 @@ fn composed_native_supply_with_prepared(
     {
         let queue = fixture
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         assert!(ticket.complete(true).is_ok());
         queue
@@ -2775,7 +2779,9 @@ fn composed_native_supply_with_prepared(
     let mut ticket = {
         let queue = fixture
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         let member = queue.native_service_member(notice.record).unwrap();
         unsafe { ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, member) }
@@ -3065,7 +3071,9 @@ fn composed_native_supply_with_prepared(
     {
         let queue = fixture
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         assert!(ticket.complete(true).is_ok());
         if end == SupplyEnd::Cancel {
@@ -4069,7 +4077,9 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                     let key = ObjectWaitKey::native_service(selector.record).unwrap();
                     let queue = fixture
                         .zone
-                        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                        .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                        })
                         .unwrap();
                     let member = fixture.zone.record(selector.record.id).identity();
                     let ticket = unsafe {
@@ -4195,6 +4205,10 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                             None,
                             carrick_el1_abi::Handback::Cancelled,
                             &carrick_sched_core::ShortLockSpin,
+                            &|owned| crate::sched::object_wait::deliver_host_completion(
+                                owned.zone(),
+                                owned
+                            )
                         ),
                         carrick_sched_core::HostClaim::Claimed
                     );
@@ -4251,6 +4265,10 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                             None,
                             carrick_el1_abi::Handback::Cancelled,
                             &carrick_sched_core::ShortLockSpin,
+                            &|owned| crate::sched::object_wait::deliver_host_completion(
+                                owned.zone(),
+                                owned
+                            )
                         ),
                         carrick_sched_core::HostClaim::Claimed
                     );

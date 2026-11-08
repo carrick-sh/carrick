@@ -5742,6 +5742,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     self.binding,
                     self.source,
                     self.record.id,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
                 );
                 if self.handoff.is_none() {
                     return Err(NativeProcessError::Quarantined);
@@ -5923,6 +5926,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.binding,
                 self.source,
                 self.record.id,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             );
             if self.take_handoff_receipt().is_none() {
                 return Err(NativeProcessError::Quarantined.run_failure_reason());
@@ -6035,6 +6039,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     self.binding,
                     self.source,
                     self.record.id,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
                 );
                 if self.take_handoff_receipt().is_none() {
                     return Err(NativeProcessError::Quarantined.run_failure_reason());
@@ -6833,6 +6840,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             lifetime: core::marker::PhantomData,
                             #[cfg(test)]
                             probe: self.publication_wait_probe,
+                        },
+                        &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
                         },
                     );
                 }
@@ -12037,8 +12047,18 @@ mod tests {
             zone.live(timer.record).unwrap().claim(),
             carrick_sched_core::Claim::Parked { .. }
         ));
-        assert_eq!(zone.expire_timer(slot, 1999, (-11i64) as u64), Ok(false));
-        assert_eq!(zone.expire_timer(slot, 2000, (-11i64) as u64), Ok(true));
+        assert_eq!(
+            zone.expire_timer(slot, 1999, (-11i64) as u64, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            }),
+            Ok(false)
+        );
+        assert_eq!(
+            zone.expire_timer(slot, 2000, (-11i64) as u64, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            }),
+            Ok(true)
+        );
         let selected = zone.switch_in_full(slot).unwrap();
         assert_eq!(zone.record_ref(selected.record), timer.record);
         let mut entry = runtime
@@ -13845,7 +13865,13 @@ mod tests {
         zone.publish_slot(peer_slot, 1, Some(1), 1);
         zone.enter_guest(peer_slot);
         assert_eq!(
-            zone.claim_for_host(child_record, None, Handback::Resumed, &BoundedSpin(0)),
+            zone.claim_for_host(
+                child_record,
+                None,
+                Handback::Resumed,
+                &BoundedSpin(0),
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            ),
             carrick_sched_core::HostClaim::Claimed
         );
         assert!(zone.requeue_on(peer_slot, child_record.id).is_some());
@@ -14696,7 +14722,11 @@ mod tests {
                         direct_record,
                         None,
                         Handback::Cancelled,
-                        &BoundedSpin(LOCK_SPINS)
+                        &BoundedSpin(LOCK_SPINS),
+                        &|owned| crate::sched::object_wait::deliver_host_completion(
+                            owned.zone(),
+                            owned
+                        )
                     ),
                     carrick_sched_core::HostClaim::Claimed
                 ));
@@ -16406,7 +16436,12 @@ mod tests {
         assert!(zone.slot(slot).current().is_none());
         if operation == 4 {
             assert_eq!(zone.timer_deadline(slot), Some(1001));
-            assert_eq!(zone.expire_timer(slot, 1001, (-11_i64) as u64), Ok(true));
+            assert_eq!(
+                zone.expire_timer(slot, 1001, (-11_i64) as u64, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                }),
+                Ok(true)
+            );
             let selected = zone.switch_in_full(slot).expect("timer must wake semop");
             assert_eq!(zone.record_ref(selected.record), entry.record);
             assert!(

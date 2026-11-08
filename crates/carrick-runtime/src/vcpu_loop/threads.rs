@@ -2516,10 +2516,22 @@ mod child_tid_owner_tests {
         custody.commit_registration();
         custody.commit_native_signal_owner();
         let wait_key = ObjectWaitKey::native_service(record).unwrap();
-        zone.bind_object_wait(wait_key, &carrick_sched_core::ShortLockSpin)
-            .unwrap();
+        zone.bind_object_wait(wait_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+            carrick_sched_core::LockWait::complete_object_wake(
+                &carrick_kernel::el1_zone::HostLockWait,
+                owned.zone(),
+                owned,
+            )
+        })
+        .unwrap();
         let queue = zone
-            .object_wait(wait_key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(wait_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            })
             .unwrap();
         let snapshot = queue.snapshot();
         queue
@@ -2621,10 +2633,22 @@ mod child_tid_owner_tests {
         custody.commit_registration();
         custody.commit_native_signal_owner();
         let wait_key = ObjectWaitKey::native_service(record).unwrap();
-        zone.bind_object_wait(wait_key, &carrick_sched_core::ShortLockSpin)
-            .unwrap();
+        zone.bind_object_wait(wait_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+            carrick_sched_core::LockWait::complete_object_wake(
+                &carrick_kernel::el1_zone::HostLockWait,
+                owned.zone(),
+                owned,
+            )
+        })
+        .unwrap();
         let queue = zone
-            .object_wait(wait_key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(wait_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            })
             .unwrap();
         let snapshot = queue.snapshot();
         queue
@@ -2653,7 +2677,12 @@ mod child_tid_owner_tests {
                     record,
                     None,
                     carrick_el1_abi::Handback::Woken,
-                    &carrick_kernel::el1_zone::HostLockWait
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    &|owned| carrick_sched_core::LockWait::complete_object_wake(
+                        &carrick_kernel::el1_zone::HostLockWait,
+                        owned.zone(),
+                        owned
+                    )
                 ),
                 carrick_el1_abi::HostClaim::Claimed
             );
@@ -2675,7 +2704,12 @@ mod child_tid_owner_tests {
                     record,
                     None,
                     carrick_el1_abi::Handback::Woken,
-                    &carrick_kernel::el1_zone::HostLockWait
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    &|owned| carrick_sched_core::LockWait::complete_object_wake(
+                        &carrick_kernel::el1_zone::HostLockWait,
+                        owned.zone(),
+                        owned
+                    )
                 ),
                 carrick_el1_abi::HostClaim::Claimed
             );

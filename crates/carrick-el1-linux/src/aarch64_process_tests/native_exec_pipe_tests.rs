@@ -263,6 +263,7 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
                 .unwrap(),
             &ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     let mut effects = WakeEffects::default();

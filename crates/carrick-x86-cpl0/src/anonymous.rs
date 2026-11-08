@@ -322,11 +322,7 @@ pub(super) fn initial_release(
         carrick_sched_core::ParkedContextWords,
     >,
 ) {
-    let mut handed = false;
-    let (_, effects) = owned.deliver_handbacks(&mut |_| handed = true);
-    if handed || effects != carrick_sched_core::WakeEffects::default() {
-        fatal_reservation();
-    }
+    carrick_el1::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned);
 }
 
 fn fatal_reservation() -> ! {

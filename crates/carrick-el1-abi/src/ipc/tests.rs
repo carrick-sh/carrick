@@ -1053,7 +1053,10 @@ fn el1_ipc_wait_census_names_each_waiter_object_and_its_readiness() {
     let zone: Box<ZoneTables> = unsafe { Box::new_zeroed().assume_init() };
     let park = |object, tid| {
         let key = object_wait_key(object, pipe::WaitFor::Readable).unwrap();
-        zone.bind_object_wait(key, &Spin).unwrap();
+        zone.bind_object_wait(key, &Spin, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
         let record = zone
             .alloc_record(ThreadIdentity {
                 tid,
@@ -1067,7 +1070,11 @@ fn el1_ipc_wait_census_names_each_waiter_object_and_its_readiness() {
                 control_slot: 0,
             })
             .unwrap();
-        let guard = zone.object_wait(key, &Spin).unwrap();
+        let guard = zone
+            .object_wait(key, &Spin, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         guard
             .park(
                 guard.snapshot(),

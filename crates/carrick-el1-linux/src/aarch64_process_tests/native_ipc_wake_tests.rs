@@ -281,7 +281,8 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                 parent_binding.record,
                 None,
                 carrick_sched_core::Handback::Resumed,
-                &ShortLockSpin
+                &ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
             ),
             carrick_sched_core::HostClaim::Claimed
         );

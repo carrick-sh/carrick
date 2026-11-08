@@ -712,14 +712,18 @@ impl HostIpc {
                         "admitted object has no readiness wait key: {object:?}"
                     );
                 };
-                let result = zone.bind_object_wait(key, &HostLockWait);
+                let result = zone.bind_object_wait(key, &HostLockWait, &|owned| {
+                    crate::el1_zone::complete_object_wake(owned.zone(), owned)
+                });
                 if let Err(error) = result {
                     while bound_count > 0 {
                         bound_count -= 1;
                         let Some(key) = bound[bound_count] else {
                             continue;
                         };
-                        zone.unbind_object_wait(key, &HostLockWait)?;
+                        zone.unbind_object_wait(key, &HostLockWait, &|owned| {
+                            crate::el1_zone::complete_object_wake(owned.zone(), owned)
+                        })?;
                     }
                     return Err(error);
                 }

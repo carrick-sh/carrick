@@ -792,7 +792,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 return Served::Idle;
             }
             let now = self.cpu.now();
-            let _ = zone.expire_timer(slot, now, timeout_result);
+            let _ = zone.expire_timer(slot, now, timeout_result, &|owned| {
+                crate::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            });
             if let Some(switched) = zone.switch_in_full(slot).or_else(|| zone.steal(slot)) {
                 zone.leave_idle(slot);
                 match self.load(frame, switched) {
@@ -953,7 +955,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         let (zone, slot) = (self.zone, self.slot);
         let now = self.cpu.now();
-        let _ = zone.expire_timer(slot, now, timeout_result);
+        let _ = zone.expire_timer(slot, now, timeout_result, &|owned| {
+            crate::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        });
         if zone.slot(slot).queued() != 0 {
             let mut since = zone.slot(slot).queued_since();
             if since == 0 {

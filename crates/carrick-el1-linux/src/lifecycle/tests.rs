@@ -3394,6 +3394,9 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
                 .bind_object_wait(
                     carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
                     &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
                 )
                 .unwrap();
             control.bind_zone_record(record);
@@ -3459,7 +3462,9 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
             .unwrap();
     assert!(matches!(
         w.zone
-            .object_wait(old_key, &carrick_sched_core::ShortLockSpin),
+            .object_wait(old_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            }),
         Err(carrick_sched_core::object_wait::ObjectWaitError::Stale)
     ));
     assert_eq!(w.zone.slot(SLOT).queued(), 0);

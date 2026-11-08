@@ -540,7 +540,9 @@ impl ForkStockCrossing for TestStockCrossing {
         for transfer in transfers {
             assert!(
                 transfer
-                    .finish(&carrick_sched_core::ShortLockSpin)
+                    .finish(&carrick_sched_core::ShortLockSpin, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
                     .is_some()
             );
         }
@@ -919,7 +921,11 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                         reference,
                         None,
                         carrick_el1_abi::Handback::Cancelled,
-                        &carrick_sched_core::ShortLockSpin
+                        &carrick_sched_core::ShortLockSpin,
+                        &|owned| crate::sched::object_wait::deliver_host_completion(
+                            owned.zone(),
+                            owned
+                        )
                     ),
                     carrick_sched_core::HostClaim::El1Held { slot: fixture.slot }
                 ),
@@ -1071,11 +1077,15 @@ fn arm_unregistered_cancel_requeues_adapter_operation_without_retirement() {
         let key = ObjectWaitKey::new(3, 1).unwrap();
         fixture
             .zone
-            .bind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         let queue = fixture
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         queue
             .park(
@@ -1099,7 +1109,8 @@ fn arm_unregistered_cancel_requeues_adapter_operation_without_retirement() {
                 reference,
                 None,
                 carrick_el1_abi::Handback::Cancelled,
-                &carrick_sched_core::ShortLockSpin
+                &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
             ),
             carrick_sched_core::HostClaim::El1Held { slot: fixture.slot }
         );
@@ -1185,7 +1196,8 @@ fn arm_unregistered_cancel_without_lifecycle_retains_record_for_host() {
             reference,
             None,
             carrick_el1_abi::Handback::Cancelled,
-            &carrick_sched_core::ShortLockSpin
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
         ),
         carrick_sched_core::HostClaim::El1Held { slot: fixture.slot }
     );
@@ -1207,7 +1219,8 @@ fn arm_unregistered_cancel_without_lifecycle_retains_record_for_host() {
             reference,
             None,
             carrick_el1_abi::Handback::Cancelled,
-            &carrick_sched_core::ShortLockSpin
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
         ),
         carrick_sched_core::HostClaim::Claimed
     );
@@ -3453,7 +3466,9 @@ pub fn with_native_terminal_host_handback(
     let record = transfers
         .pop()
         .unwrap()
-        .finish(&carrick_sched_core::ShortLockSpin)
+        .finish(&carrick_sched_core::ShortLockSpin, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
         .unwrap();
     assert!(transfers.is_empty());
     assert!(matches!(
@@ -3740,7 +3755,9 @@ impl super::thread_setup::LifecycleVenue for Fixture {
         for transfer in transfers {
             assert!(
                 transfer
-                    .finish(&carrick_sched_core::ShortLockSpin)
+                    .finish(&carrick_sched_core::ShortLockSpin, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
                     .is_some()
             );
         }
@@ -3976,6 +3993,7 @@ fn native_fork_child_getrandom(flags: u64) {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(child.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // SAFETY: this fixture owns the parked member and its service queue.
@@ -6512,6 +6530,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
                 None,
                 carrick_el1_abi::Handback::Cancelled,
                 &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             );
             assert!(fixture.zone.record(record.id).is_cancelled());
         }
@@ -7276,6 +7295,7 @@ fn arm_graph_pool_host_retirement(unbound: bool) {
         None,
         carrick_el1_abi::Handback::Cancelled,
         &carrick_sched_core::ShortLockSpin,
+        &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
     );
     assert!(fixture.zone.record(record.id).is_cancelled());
     let mut frame = carrick_el1_abi::TrapFrame::default();
@@ -8408,6 +8428,7 @@ fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
             None,
             carrick_el1_abi::Handback::Cancelled,
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         );
         assert!(fixture.zone.record(sibling_record.id).is_cancelled());
         drop(admission);

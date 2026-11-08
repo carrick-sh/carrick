@@ -5120,7 +5120,8 @@ mod serial_host {
                 record,
                 None,
                 carrick_el1_abi::Handback::Woken,
-                &crate::el1_zone::HostLockWait
+                &crate::el1_zone::HostLockWait,
+                &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned)
             ),
             carrick_el1_abi::HostClaim::Claimed
         );

@@ -1745,7 +1745,13 @@ where
             .ok_or_else(|| ipc_error("wait key", park.object))?;
         let parked = {
             let guard = zone
-                .object_wait(key, &HostLockWait)
+                .object_wait(key, &HostLockWait, &|owned| {
+                    carrick_sched_core::LockWait::complete_object_wake(
+                        &carrick_kernel::el1_zone::HostLockWait,
+                        owned.zone(),
+                        owned,
+                    )
+                })
                 .map_err(|error| ipc_error("wait queue", error))?;
             let record = zone
                 .alloc_record(identity)
@@ -2288,7 +2294,15 @@ mod ipc_tests {
         // the park is refused as Changed and the operation runs again.
         let key = host_ipc::wait_key(object, WaitFor::Writable).unwrap();
         {
-            let guard = zone.object_wait(key, &HostLockWait).unwrap();
+            let guard = zone
+                .object_wait(key, &HostLockWait, &|owned| {
+                    carrick_sched_core::LockWait::complete_object_wake(
+                        &carrick_kernel::el1_zone::HostLockWait,
+                        owned.zone(),
+                        owned,
+                    )
+                })
+                .unwrap();
             guard.notify_object_host(&mut |_| {}, &mut |_| {}).unwrap();
         }
         let record = zone
@@ -2304,7 +2318,15 @@ mod ipc_tests {
                 control_slot: 0,
             })
             .unwrap();
-        let guard = zone.object_wait(key, &HostLockWait).unwrap();
+        let guard = zone
+            .object_wait(key, &HostLockWait, &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            })
+            .unwrap();
         let token = host_ipc::to_sched_token(park.token).unwrap();
         let refused = guard.park(park.snapshot, record, token);
         assert!(matches!(

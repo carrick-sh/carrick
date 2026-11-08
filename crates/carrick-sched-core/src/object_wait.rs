@@ -76,7 +76,7 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 15;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 16;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
@@ -88,6 +88,7 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         ADMISSION_CUSTODY as u64,
         ADMISSION_POSTED as u64,
         ADMISSION_RELEASED as u64,
+        ADMISSION_LOCK_RELEASE as u64,
         core::mem::offset_of!(crate::ZoneTables, object_admission_handbacks) as u64,
         core::mem::offset_of!(crate::ZoneTables, delegated_host_pending) as u64,
         DELEGATED_FILE_WAIT_QUEUES.div_ceil(64) as u64,
@@ -455,7 +456,7 @@ pub struct OwnedObjectWakeEffects<
     effects: WakeEffects,
     handed: u32,
 }
-impl<C: Copy + Send + Sync + zerocopy::FromZeros> OwnedObjectWakeEffects<'_, C> {
+impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> OwnedObjectWakeEffects<'a, C> {
     pub(crate) fn missing_venue(self) {
         assert_eq!(
             self.zone
@@ -465,6 +466,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> OwnedObjectWakeEffects<'_, C> 
             0,
             "completion-enabled queue requires an effect delivery venue"
         );
+    }
+
+    /// The authenticated zone that owns these effects and detached claims.
+    pub fn zone(&self) -> &'a ZoneTables<C> {
+        self.zone
     }
 
     pub fn into_parts(mut self) -> (Waker, WakeEffects) {
@@ -753,77 +759,15 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectNotificationTicket<'
         before_link: impl FnOnce(),
         after_link: impl FnOnce(),
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
-        let zone = self.zone;
-        let key = self.key;
-        let rec = zone.record(record);
-        let claim = rec.claim();
-        if rec.has_object_operation()
-            || rec.object.queue.load(Ordering::Acquire) != 0
-            || rec.entry_count() != 0
-            || !matches!(claim, Claim::Free | Claim::OnCpu { .. })
-        {
-            return Err((ObjectWaitError::Occupied, operation));
-        }
-        let Some(transfer) = zone.begin_host_transfer(zone.record_ref(record), claim) else {
-            return Err((ObjectWaitError::Occupied, operation));
-        };
-        rec.object
-            .operation_generation
-            .store(operation.generation, Ordering::Relaxed);
-        rec.object
-            .operation
-            .store(operation.index, Ordering::Release);
-        rec.object
-            .generation
-            .store(key.generation, Ordering::Relaxed);
-        rec.object
-            .expired
-            .store(OBJECT_HOST_CONTINUATION, Ordering::Relaxed);
-        rec.object.next.store(0, Ordering::Relaxed);
-        rec.object.prev.store(ADMISSION_CUSTODY, Ordering::Release);
-        zone.mark_woken(rec, 0);
-        // The chain and the in-flight publisher retain separate counts. A
-        // different publisher can drain this linked record before we post our
-        // pending bit; its handback must not let the queue rebind underneath us.
-        let previous = zone
-            .object_queue(key.index as usize)
-            .publishers
-            .fetch_add(1, Ordering::AcqRel);
-        assert!(
-            previous != 0 && previous != u64::MAX,
-            "admission publisher exhaustion"
-        );
-        let _ = transfer; // Exact transfer custody moves into this intrusive chain.
-        zone.object_admission_handbacks[key.index as usize].push(
-            record.raw(),
-            record.raw(),
-            |previous, next| {
-                before_link();
-                zone.record(RecordId(previous))
-                    .object
-                    .next
-                    .store(next, Ordering::Release);
-            },
-        );
-        after_link();
-        zone.object_queue(key.index as usize)
-            .lock
-            .fetch_or(ADMISSION_PENDING, Ordering::SeqCst);
-        let previous = rec.object.prev.fetch_or(ADMISSION_POSTED, Ordering::AcqRel);
-        if previous & ADMISSION_RELEASED != 0 {
-            // The earlier consumer already unlocked and transferred this
-            // exact claim to us. No record reuse precedes this pending post.
-            rec.object.next.store(0, Ordering::Relaxed);
-            completion(OwnedObjectWakeEffects {
-                zone,
-                key,
-                waker: Waker::Host,
-                effects: WakeEffects::default(),
-                handed: record.raw(),
-            });
-        }
-        zone.try_drain_object_pending(key, completion);
-        Ok(())
+        self.zone.defer_object_admission(
+            self.key,
+            record,
+            operation,
+            completion,
+            AdmissionKind::Notification,
+            before_link,
+            after_link,
+        )
     }
     /// Never waits or retries. A current holder or this publisher owns delivery.
     pub fn publish(self, waker: Waker, completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>)) {
@@ -974,6 +918,13 @@ pub enum ResumeDisposition {
 const ADMISSION_CUSTODY: u32 = 1 << 31;
 const ADMISSION_POSTED: u32 = 1 << 30;
 const ADMISSION_RELEASED: u32 = 1 << 29;
+const ADMISSION_LOCK_RELEASE: u32 = 1 << 28;
+
+#[derive(Clone, Copy)]
+enum AdmissionKind {
+    Notification,
+    LockRelease,
+}
 /// Where an owned operation may execute after its producer completes.
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum OperationDestination {
@@ -1026,7 +977,7 @@ type ObjectWakeCompletion<'a, C> = &'a dyn Fn(OwnedObjectWakeEffects<'_, C>);
 pub struct ObjectWaitGuard<'a, C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx> {
     zone: &'a ZoneTables<C>,
     key: ObjectWaitKey,
-    completion: Option<ObjectWakeCompletion<'a, C>>,
+    completion: ObjectWakeCompletion<'a, C>,
 }
 
 // A host predicate may unwind before the record is parked. Keep the newly
@@ -1089,10 +1040,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
 
     fn release_with(&self, mut before_unlock: impl FnMut()) {
         let queue = self.queue();
-        let Some(completion) = self.completion else {
-            queue.lock.store(0, Ordering::Release);
-            return;
-        };
+        let completion = self.completion;
         let mut effects = WakeEffects::default();
         let mut handed = 0;
         let mut notified = false;
@@ -1159,13 +1107,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
         } {
             let rec = self.zone.record(RecordId(raw));
             assert!(matches!(rec.claim(), Claim::Transferring { .. }));
-            assert_eq!(
-                rec.object.generation.load(Ordering::Acquire),
-                self.key.generation
-            );
-            // SAFETY: this admission chain owns the one ticket detached with
-            // this exact record; retirement/rebind cannot pass its count.
-            drop(unsafe { self.zone.retained_object_notification(self.key) });
+            if rec.object.prev.load(Ordering::Acquire) & ADMISSION_LOCK_RELEASE == 0 {
+                assert_eq!(
+                    rec.object.generation.load(Ordering::Acquire),
+                    self.key.generation
+                );
+                // SAFETY: notification admission owns a detached exact-source pin.
+                drop(unsafe { self.zone.retained_object_notification(self.key) });
+            }
             rec.object.next.store(*handed, Ordering::Relaxed);
             *handed = raw;
         }
@@ -1386,7 +1335,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
         operation: OperationToken,
         still_blocked: impl FnOnce() -> bool,
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
-        if self.completion.is_none() {
+        if self.queue().completion_mode.load(Ordering::Acquire) == 0 {
             return Err((ObjectWaitError::Occupied, operation));
         }
         self.park_until_rechecked(
@@ -1408,7 +1357,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
         destination: OperationDestination,
         still_blocked: impl FnOnce() -> bool,
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
-        if deadline != 0 && self.completion.is_some() {
+        if deadline != 0 && self.queue().completion_mode.load(Ordering::Acquire) != 0 {
             return Err((ObjectWaitError::Occupied, operation));
         }
         if snapshot.key != self.key {
@@ -1820,6 +1769,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
+    fn initialize_object_handbacks(
+        &self,
+        key: ObjectWaitKey,
+        wait: &impl LockWait<C>,
+    ) -> Result<(), ObjectWaitError> {
+        for chain in [
+            &self.completion_handbacks,
+            &self.object_admission_handbacks[key.index as usize],
+        ] {
+            if !chain.initialize_with_wait(|attempt| wait.wait(attempt)) {
+                return Err(ObjectWaitError::Busy);
+            }
+        }
+        Ok(())
+    }
+
     /// Bind before publishing the IPC region. The caller owns publication;
     /// no operation can probe or retire until this returns successfully.
     pub fn bind_ipc_operation_slots(
@@ -1832,9 +1797,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if self.notification_generation(key) == key.generation {
             return Ok(());
         }
-        if !self.completion_handbacks.initialize() {
-            return Err(ObjectWaitError::Busy);
-        }
+        self.initialize_object_handbacks(key, wait)?;
         let guard = self.lock_completion_index(key, wait, completion)?;
         let queue = guard.queue();
         let actual = queue.generation.load(Ordering::Acquire);
@@ -1843,9 +1806,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         if actual != 0 {
             return Err(ObjectWaitError::Stale);
-        }
-        if !self.object_admission_handbacks[key.index as usize].initialize() {
-            return Err(ObjectWaitError::Busy);
         }
         queue.completion_mode.store(1, Ordering::Release);
         queue.epoch.store(1, Ordering::SeqCst);
@@ -1896,6 +1856,134 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         .reserve()
         .publish(waker, completion);
+    }
+
+    /// Retain an owned host operation on the real queue unlock, including
+    /// before first bind or while an older incarnation still owns the lock.
+    /// No notification publisher pin or readiness generation is consumed.
+    /// Every holder of this queue must supply a completion delivery venue.
+    pub fn defer_object_lock_release(
+        &self,
+        key: ObjectWaitKey,
+        record: RecordId,
+        operation: OperationToken,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        self.defer_object_admission(
+            key,
+            record,
+            operation,
+            completion,
+            AdmissionKind::LockRelease,
+            || {},
+            || {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn defer_object_admission(
+        &self,
+        key: ObjectWaitKey,
+        record: RecordId,
+        operation: OperationToken,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+        kind: AdmissionKind,
+        before_link: impl FnOnce(),
+        after_link: impl FnOnce(),
+    ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        let zone = self;
+        // Initialization precedes claiming the record; even a never-bound
+        // legacy queue can inherit custody from its first contending creator.
+        for queue in [
+            &zone.completion_handbacks,
+            &zone.object_admission_handbacks[key.index as usize],
+        ] {
+            if !queue.initialize_with_wait(|_| {
+                core::hint::spin_loop();
+                true
+            }) {
+                unreachable!("short initialization cannot refuse");
+            }
+        }
+        let rec = zone.record(record);
+        let claim = rec.claim();
+        if rec.has_object_operation()
+            || rec.object.queue.load(Ordering::Acquire) != 0
+            || rec.entry_count() != 0
+            || !matches!(claim, Claim::Free | Claim::OnCpu { .. })
+        {
+            return Err((ObjectWaitError::Occupied, operation));
+        }
+        let Some(transfer) = zone.begin_host_transfer(zone.record_ref(record), claim) else {
+            return Err((ObjectWaitError::Occupied, operation));
+        };
+        rec.object
+            .operation_generation
+            .store(operation.generation, Ordering::Relaxed);
+        rec.object
+            .operation
+            .store(operation.index, Ordering::Release);
+        rec.object
+            .generation
+            .store(key.generation, Ordering::Relaxed);
+        rec.object
+            .expired
+            .store(OBJECT_HOST_CONTINUATION, Ordering::Relaxed);
+        rec.object.next.store(0, Ordering::Relaxed);
+        rec.object.prev.store(
+            ADMISSION_CUSTODY
+                | if matches!(kind, AdmissionKind::LockRelease) {
+                    ADMISSION_LOCK_RELEASE
+                } else {
+                    0
+                },
+            Ordering::Release,
+        );
+        zone.mark_woken(rec, 0);
+        // The chain and the in-flight publisher retain separate counts. A
+        // different publisher can drain this linked record before we post our
+        // pending bit; its handback must not let the queue rebind underneath us.
+        if matches!(kind, AdmissionKind::Notification) {
+            let previous = zone
+                .object_queue(key.index as usize)
+                .publishers
+                .fetch_add(1, Ordering::AcqRel);
+            assert!(
+                previous != 0 && previous != u64::MAX,
+                "admission publisher exhaustion"
+            );
+        }
+        let _ = transfer; // Exact transfer custody moves into this intrusive chain.
+        zone.object_admission_handbacks[key.index as usize].push(
+            record.raw(),
+            record.raw(),
+            |previous, next| {
+                before_link();
+                zone.record(RecordId(previous))
+                    .object
+                    .next
+                    .store(next, Ordering::Release);
+            },
+        );
+        after_link();
+        zone.object_queue(key.index as usize)
+            .lock
+            .fetch_or(ADMISSION_PENDING, Ordering::SeqCst);
+        let previous = rec.object.prev.fetch_or(ADMISSION_POSTED, Ordering::AcqRel);
+        if previous & ADMISSION_RELEASED != 0 {
+            // The earlier consumer already unlocked and transferred this
+            // exact claim to us. No record reuse precedes this pending post.
+            rec.object.next.store(0, Ordering::Relaxed);
+            completion(OwnedObjectWakeEffects {
+                zone,
+                key,
+                waker: Waker::Host,
+                effects: WakeEffects::default(),
+                handed: record.raw(),
+            });
+        }
+        zone.try_drain_object_pending(key, completion);
+        Ok(())
     }
 
     fn completion_transfer(&self, id: RecordId) -> HostTransfer<'_, C> {
@@ -1973,37 +2061,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         {
             drop(ObjectWaitGuard {
                 zone: self,
-                key,
-                completion: Some(completion),
+                key: ObjectWaitKey {
+                    index: key.index,
+                    generation: queue.generation.load(Ordering::Acquire),
+                },
+                completion,
             });
         }
     }
-    fn lock_object_index(
-        &self,
-        key: ObjectWaitKey,
-        wait: &impl LockWait<C>,
-    ) -> Option<ObjectWaitGuard<'_, C>> {
-        let queue = self.object_queue(key.index as usize);
-        let mut attempt = 0;
-        loop {
-            if queue
-                .lock
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Some(ObjectWaitGuard {
-                    zone: self,
-                    key,
-                    completion: None,
-                });
-            }
-            if !wait.wait(attempt) {
-                return None;
-            }
-            attempt = attempt.saturating_add(1);
-        }
-    }
-
     /// Admission only: bind a previously unused index or advance a quiescent
     /// index to a strictly newer object generation. T1 must retain the old
     /// object while any operation pin exists, even if this queue is empty.
@@ -2011,6 +2076,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         &self,
         key: ObjectWaitKey,
         wait: &impl LockWait<C>,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<(), ObjectWaitError> {
         if self
             .object_queue(key.index as usize)
@@ -2020,10 +2086,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         {
             return Err(ObjectWaitError::Occupied);
         }
-        let guard = self
-            .lock_object_index(key, wait)
-            .ok_or(ObjectWaitError::Busy)?;
+        let guard = self.lock_completion_index(key, wait, completion)?;
         let queue = guard.queue();
+        if queue.completion_mode.load(Ordering::Acquire) != 0
+            || queue.publishers.load(Ordering::Acquire) != 0
+        {
+            return Err(ObjectWaitError::Occupied);
+        }
         if queue.generation.load(Ordering::Relaxed) >= key.generation {
             return Err(ObjectWaitError::Stale);
         }
@@ -2041,8 +2110,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         &self,
         key: ObjectWaitKey,
         wait: &impl LockWait<C>,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<(), ObjectWaitError> {
-        let guard = self.object_wait(key, wait)?;
+        let guard = self.object_wait(key, wait, completion)?;
         let queue = guard.queue();
         if queue.head.load(Ordering::Relaxed) != NIL
             || queue.publishers.load(Ordering::Acquire) != 0
@@ -2091,18 +2161,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         wait: &impl LockWait<C>,
         completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<ObjectNotificationSource<'a, C>, ObjectWaitError> {
-        if !self
-            .completion_handbacks
-            .initialize_with_wait(|attempt| wait.wait(attempt))
-        {
-            return Err(ObjectWaitError::Busy);
-        }
+        self.initialize_object_handbacks(key, wait)?;
         let guard = self.lock_completion_index(key, wait, completion)?;
         self.bind_completion_queue(&guard, key)?;
-        assert!(
-            self.object_admission_handbacks[key.index as usize].initialize(),
-            "admission chain initializes under its exclusive object guard"
-        );
         guard.queue().publishers.store(1, Ordering::Release);
         Ok(ObjectNotificationTicket {
             zone: self,
@@ -2140,7 +2201,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                         index: key.index,
                         generation: actual,
                     },
-                    completion: Some(completion),
+                    completion,
                 };
                 return Ok(guard);
             }
@@ -2178,14 +2239,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         wait: &impl LockWait<C>,
         completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<ObjectNotificationTicket<'a, C>, ObjectWaitError> {
-        if !self.completion_handbacks.initialize() {
-            return Err(ObjectWaitError::Busy);
-        }
+        self.initialize_object_handbacks(key, wait)?;
         let guard = self.object_wait_with_completion(key, wait, completion)?;
-        assert!(
-            self.object_admission_handbacks[key.index as usize].initialize(),
-            "admission chain initializes under its exclusive object guard"
-        );
         guard
             .queue()
             .publishers
@@ -2250,17 +2305,26 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         })
     }
 
-    pub fn object_wait(
-        &self,
+    /// Acquisition must name a delivery venue even on a legacy readiness
+    /// queue: a concurrent lock admission may transfer completion custody.
+    ///
+    /// ```compile_fail,E0061
+    /// use carrick_sched_core::{BoundedSpin, ZoneTables};
+    /// use carrick_sched_core::object_wait::ObjectWaitKey;
+    /// fn missing_venue(zone: &ZoneTables, key: ObjectWaitKey) {
+    ///     let _ = zone.object_wait(key, &BoundedSpin(0));
+    /// }
+    /// ```
+    pub fn object_wait<'a>(
+        &'a self,
         key: ObjectWaitKey,
         wait: &impl LockWait<C>,
-    ) -> Result<ObjectWaitGuard<'_, C>, ObjectWaitError> {
+        completion: &'a dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<ObjectWaitGuard<'a, C>, ObjectWaitError> {
         if self.completion_enabled(key) {
             return Err(ObjectWaitError::Occupied);
         }
-        let guard = self
-            .lock_object_index(key, wait)
-            .ok_or(ObjectWaitError::Busy)?;
+        let guard = self.lock_completion_index(key, wait, completion)?;
         if guard.queue().completion_mode.load(Ordering::Acquire) != 0 {
             return Err(ObjectWaitError::Occupied);
         }
@@ -2283,6 +2347,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         slot: SlotId,
         exact: RecordRef,
         seq: u32,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<bool, ()> {
         let record = exact.id;
         let Some(rec) = self.live(exact) else {
@@ -2295,7 +2360,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         ) else {
             return Ok(false);
         };
-        let guard = match self.object_wait(key, &BoundedSpin(EL1_SLOT_LOCK_SPINS)) {
+        let guard = match self.object_wait(key, &BoundedSpin(EL1_SLOT_LOCK_SPINS), completion) {
             Ok(guard) => guard,
             Err(ObjectWaitError::Busy) => return Err(()),
             Err(_) => return Ok(false),
@@ -2320,7 +2385,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 
     /// The claim owner removes at most one object registration, by direct
     /// index and intrusive links, before consuming the operation token.
-    pub(super) fn unlink_object(&self, record: RecordId, wait: &impl LockWait<C>) {
+    pub(super) fn unlink_object(
+        &self,
+        record: RecordId,
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) {
         let rec = self.record(record);
         loop {
             let index = rec.object.queue.load(Ordering::Acquire);
@@ -2333,12 +2403,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             ) else {
                 return;
             };
-            let completion =
-                |effects: OwnedObjectWakeEffects<'_, C>| wait.complete_object_wake(self, effects);
             let result = if self.completion_enabled(key) {
-                self.object_wait_with_completion(key, wait, &completion)
+                self.object_wait_with_completion(key, wait, completion)
             } else {
-                self.object_wait(key, wait)
+                self.object_wait(key, wait, completion)
             };
             let Ok(guard) = result else {
                 continue;
@@ -2373,9 +2441,262 @@ mod host_tests {
             assert!(zone.occupancy.replace(ExecutionSlot::zone(SLOT), 0, MM));
             zone.enter_guest(SLOT);
         }
-        zone.bind_object_wait(key(1), &SpinForever).unwrap();
-        zone.bind_object_wait(key(2), &SpinForever).unwrap();
+        zone.bind_object_wait(key(1), &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
+        zone.bind_object_wait(key(2), &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
         zone
+    }
+
+    #[test]
+    fn legacy_lock_release_returns_two_owned_operations_after_unlock() {
+        use std::cell::RefCell;
+        let zone = fixture(true);
+        let old = key(1);
+        let delivered = RefCell::new(Vec::new());
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            assert!(!zone.object_queue_census(old.index()).unwrap().locked);
+            let _ = owned.deliver_handbacks(&mut |record| delivered.borrow_mut().push(record));
+        };
+        let held = zone.object_wait(old, &BoundedSpin(0), &completion).unwrap();
+        let mut waiters = Vec::new();
+        for tid in [501, 502] {
+            let record = allocate(&zone, tid);
+            let newer = ObjectWaitKey::new(old.index(), tid).unwrap();
+            assert_eq!(
+                zone.bind_object_wait(newer, &BoundedSpin(0), &completion),
+                Err(ObjectWaitError::Busy)
+            );
+            zone.defer_object_lock_release(
+                newer,
+                record,
+                OperationToken::new(tid, 19).unwrap(),
+                &completion,
+            )
+            .unwrap();
+            assert!(matches!(
+                zone.record(record).claim(),
+                Claim::Transferring { .. }
+            ));
+            waiters.push((record, newer, tid));
+        }
+        assert!(delivered.borrow().is_empty());
+        assert_eq!(held.queue().publishers.load(Ordering::Acquire), 0);
+        drop(held);
+        assert_eq!(delivered.borrow().len(), 2);
+        for (record, newer, tid) in waiters {
+            assert!(delivered.borrow().contains(&zone.record_ref(record)));
+            assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
+            assert_eq!(
+                unsafe { zone.record(record).take_object_operation() }
+                    .unwrap()
+                    .identity(),
+                OperationToken::new(tid, 19).unwrap().identity()
+            );
+            zone.bind_object_wait(newer, &BoundedSpin(0), &completion)
+                .unwrap();
+        }
+        assert_eq!(
+            zone.object_queue(old.index() as usize)
+                .publishers
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_first_bind_and_release_before_enrollment_return_custody() {
+        use std::cell::RefCell;
+        for first_bind in [false, true] {
+            let zone = fixture(true);
+            let key = ObjectWaitKey::new(3, 27).unwrap();
+            let delivered = RefCell::new(Vec::new());
+            let completion = |owned: OwnedObjectWakeEffects<'_>| {
+                assert!(!zone.object_queue_census(key.index()).unwrap().locked);
+                let _ = owned.deliver_handbacks(&mut |record| delivered.borrow_mut().push(record));
+            };
+            // A fresh queue has never initialized either handback chain. A
+            // lock-release enrollment cannot assume a notification generation.
+            let held = zone
+                .lock_completion_index(key, &BoundedSpin(0), &completion)
+                .unwrap();
+            assert_eq!(held.key.generation(), 0);
+            let record = allocate(&zone, 503);
+            if first_bind {
+                assert_eq!(
+                    zone.bind_object_wait(key, &BoundedSpin(0), &completion),
+                    Err(ObjectWaitError::Busy)
+                );
+                zone.defer_object_lock_release(
+                    key,
+                    record,
+                    OperationToken::new(503, 1).unwrap(),
+                    &completion,
+                )
+                .unwrap();
+                assert!(delivered.borrow().is_empty());
+                drop(held);
+            } else {
+                drop(held);
+                zone.defer_object_lock_release(
+                    key,
+                    record,
+                    OperationToken::new(503, 1).unwrap(),
+                    &completion,
+                )
+                .unwrap();
+            }
+            assert_eq!(*delivered.borrow(), [zone.record_ref(record)]);
+            assert_eq!(
+                unsafe { zone.record(record).take_object_operation() }
+                    .unwrap()
+                    .identity(),
+                OperationToken::new(503, 1).unwrap().identity()
+            );
+            zone.bind_object_wait(key, &BoundedSpin(0), &completion)
+                .unwrap();
+            zone.object_wait(key, &BoundedSpin(0), &completion).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_release_during_admission_post_survives_rebinding() {
+        use std::cell::{Cell, RefCell};
+        let zone = fixture(true);
+        let old = key(1);
+        let newer = ObjectWaitKey::new(old.index(), 2).unwrap();
+        let delivered = RefCell::new(Vec::new());
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.deliver_handbacks(&mut |record| delivered.borrow_mut().push(record));
+        };
+        let held = Cell::new(Some(
+            zone.object_wait(old, &BoundedSpin(0), &completion).unwrap(),
+        ));
+        let record = allocate(&zone, 504);
+        zone.defer_object_admission(
+            newer,
+            record,
+            OperationToken::new(504, 1).unwrap(),
+            &completion,
+            AdmissionKind::LockRelease,
+            || {},
+            || {
+                drop(held.take());
+                // The original producer has linked but not posted. A
+                // different creator may bind; no publisher pin is assumed.
+                assert!(delivered.borrow().is_empty());
+                zone.bind_object_wait(newer, &BoundedSpin(0), &completion)
+                    .unwrap();
+            },
+        )
+        .unwrap();
+        assert_eq!(*delivered.borrow(), [zone.record_ref(record)]);
+        assert_eq!(
+            unsafe { zone.record(record).take_object_operation() }
+                .unwrap()
+                .identity(),
+            OperationToken::new(504, 1).unwrap().identity()
+        );
+        assert_eq!(
+            zone.object_queue(old.index() as usize)
+                .publishers
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn cancelled_legacy_lock_admission_returns_owned_endpoint_once() {
+        let zone = fixture(true);
+        let key = key(1);
+        let delivered = std::cell::RefCell::new(Vec::new());
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.deliver_handbacks(&mut |record| delivered.borrow_mut().push(record));
+        };
+        let held = zone.object_wait(key, &BoundedSpin(0), &completion).unwrap();
+        let record = allocate(&zone, 505);
+        let exact = zone.record_ref(record);
+        zone.defer_object_lock_release(
+            key,
+            record,
+            OperationToken::new(505, 1).unwrap(),
+            &completion,
+        )
+        .unwrap();
+        assert_eq!(
+            zone.claim_for_host(
+                exact,
+                None,
+                Handback::Cancelled,
+                &BoundedSpin(0),
+                &completion
+            ),
+            HostClaim::Deferred
+        );
+        drop(held);
+        assert_eq!(*delivered.borrow(), [exact]);
+        assert_eq!(zone.record(record).handback(), Some(Handback::Cancelled));
+        assert_eq!(
+            unsafe { zone.record(record).take_object_operation() }
+                .unwrap()
+                .identity(),
+            OperationToken::new(505, 1).unwrap().identity()
+        );
+        assert_eq!(
+            zone.object_queue(key.index() as usize)
+                .publishers
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_bind_rechecks_live_source_after_waiting_for_the_lock() {
+        use std::cell::{Cell, RefCell};
+        let zone = fixture(true);
+        let old = key(1);
+        let source_key = ObjectWaitKey::new(old.index(), 2).unwrap();
+        let requested = ObjectWaitKey::new(old.index(), 3).unwrap();
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.deliver_handbacks(&mut |_| {});
+        };
+        let held = Cell::new(Some(
+            zone.object_wait(old, &BoundedSpin(0), &completion).unwrap(),
+        ));
+        let source = RefCell::new(None);
+        struct Interleave<F>(F);
+        impl<F: Fn()> LockWait for Interleave<F> {
+            fn wait(&self, _: u32) -> bool {
+                (self.0)();
+                true
+            }
+        }
+        let wait = Interleave(|| {
+            drop(held.take());
+            *source.borrow_mut() = Some(
+                zone.bind_object_notification_source(source_key, &BoundedSpin(0), &completion)
+                    .unwrap(),
+            );
+        });
+        assert_eq!(
+            zone.bind_object_wait(requested, &wait, &completion),
+            Err(ObjectWaitError::Occupied),
+            "legacy bind overwrote a live notification source"
+        );
+        assert_eq!(
+            zone.notification_generation(source_key),
+            source_key.generation()
+        );
+        source
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .reserve()
+            .publish(Waker::Host, &completion);
     }
 
     /// Both APIs protect the same object queue; completion admission must not
@@ -2384,7 +2705,11 @@ mod host_tests {
     fn legacy_object_holder_excludes_completion_admission() {
         let zone = fixture(true);
         let key = key(1);
-        let held = zone.object_wait(key, &BoundedSpin(0)).unwrap();
+        let held = zone
+            .object_wait(key, &BoundedSpin(0), &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         let completion = |owned: OwnedObjectWakeEffects<'_>| {
             let _ = owned.deliver_handbacks(&mut |_| {});
         };
@@ -2400,8 +2725,14 @@ mod host_tests {
             }
         };
         drop(held);
-        assert!(excluded, "completion admission acquired a live IPC queue lock");
-        zone.object_wait(key, &BoundedSpin(0)).unwrap();
+        assert!(
+            excluded,
+            "completion admission acquired a live IPC queue lock"
+        );
+        zone.object_wait(key, &BoundedSpin(0), &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -2410,10 +2741,17 @@ mod host_tests {
         let record = allocate(&zone, 101);
         let record_ref = zone.record_ref(record);
         let key = ObjectWaitKey::native_service(record_ref).unwrap();
-        zone.bind_object_wait(key, &SpinForever).unwrap();
+        zone.bind_object_wait(key, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
         let operation = OperationToken::new(u64::from(record.raw()), 19).unwrap();
         {
-            let queue = zone.object_wait(key, &SpinForever).unwrap();
+            let queue = zone
+                .object_wait(key, &SpinForever, &|owned| {
+                    let _ = owned.into_parts();
+                })
+                .unwrap();
             queue
                 .park_owner_until(
                     queue.snapshot(),
@@ -2428,7 +2766,11 @@ mod host_tests {
             zone.record(record).resume_disposition(),
             ResumeDisposition::OwnerContinuation(OwnerEntry::Exception)
         );
-        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         let mut effects = crate::WakeEffects::default();
         let report = queue.notify_object(SLOT, &mut effects).unwrap();
         assert_eq!(report.visited, 1);
@@ -2458,12 +2800,27 @@ mod host_tests {
         assert!(zone.requeue_preempted(SLOT, record).is_queued());
         assert_eq!(zone.switch_in(SLOT), Some(record));
         let key = ObjectWaitKey::native_service(record_ref).unwrap();
-        zone.bind_object_wait(key, &SpinForever).unwrap();
+        zone.bind_object_wait(key, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
         let operation = OperationToken::new(u64::from(record.raw()), 23).unwrap();
-        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         let refused = queue.park_rechecked(queue.snapshot(), record, operation, || {
             assert_eq!(
-                zone.claim_for_host(record_ref, None, Handback::Control, &SpinForever),
+                zone.claim_for_host(
+                    record_ref,
+                    None,
+                    Handback::Control,
+                    &SpinForever,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    }
+                ),
                 HostClaim::El1Held { slot: SLOT }
             );
             true
@@ -2480,7 +2837,11 @@ mod host_tests {
         ));
         assert!(zone.record(record).host_wanted());
         assert!(!zone.record(record).has_object_operation());
-        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         let report = queue
             .notify_object(SLOT, &mut crate::WakeEffects::default())
             .unwrap();
@@ -2490,12 +2851,24 @@ mod host_tests {
         // later park from a fresh OnCpu custody enrolls normally.
         assert!(zone.unswitch(SLOT, record));
         assert_eq!(
-            zone.claim_for_host(record_ref, None, Handback::Control, &SpinForever),
+            zone.claim_for_host(
+                record_ref,
+                None,
+                Handback::Control,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                }
+            ),
             HostClaim::Claimed
         );
         assert!(zone.requeue_on(SLOT, record).is_some());
         assert_eq!(zone.switch_in(SLOT), Some(record));
-        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         queue
             .park_owner_until(queue.snapshot(), record, returned, 0, OwnerEntry::Syscall)
             .unwrap();
@@ -2507,10 +2880,17 @@ mod host_tests {
     fn metadata_completion_follows_parked_record_after_slot_switch() {
         let zone = fixture(true);
         let key = ObjectWaitKey::metadata_request(17).unwrap();
-        zone.bind_object_wait(key, &SpinForever).unwrap();
+        zone.bind_object_wait(key, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
         let original = allocate(&zone, 101);
         let original_ref = zone.record_ref(original);
-        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         queue
             .park(
                 queue.snapshot(),
@@ -2536,7 +2916,11 @@ mod host_tests {
             CurrentHandback::HandedBack
         );
         let occupant_claim = zone.record(occupant).claim();
-        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         let mut handed = Vec::new();
         let report = queue
             .notify_object_host(&mut |record| handed.push(record), &mut |_| {})
@@ -2553,17 +2937,32 @@ mod host_tests {
         drop(queue);
         // A later incarnation cannot alias an outstanding earlier wait.
         let next = ObjectWaitKey::metadata_request(18).unwrap();
-        zone.bind_object_wait(next, &SpinForever).unwrap();
-        assert!(zone.object_wait(key, &SpinForever).is_err());
+        zone.bind_object_wait(next, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
+        assert!(
+            zone.object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn metadata_wait_cancellation_unlinks_its_reserved_queue() {
         let zone = fixture(false);
         let key = ObjectWaitKey::metadata_request(1).unwrap();
-        zone.bind_object_wait(key, &SpinForever).unwrap();
+        zone.bind_object_wait(key, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
         let record = allocate(&zone, 1);
-        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         queue
             .park(
                 queue.snapshot(),
@@ -2577,11 +2976,18 @@ mod host_tests {
                 zone.record_ref(record),
                 None,
                 Handback::Control,
-                &SpinForever
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                }
             ),
             HostClaim::Claimed
         );
-        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         assert_eq!(
             queue
                 .notify_object_host(
@@ -2615,7 +3021,11 @@ mod host_tests {
 
     fn park(zone: &ZoneTables, index: u32, tid: u64) -> RecordId {
         let record = allocate(zone, tid);
-        let guard = zone.object_wait(key(index), &SpinForever).unwrap();
+        let guard = zone
+            .object_wait(key(index), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         guard
             .park(
                 guard.snapshot(),
@@ -2628,7 +3038,11 @@ mod host_tests {
 
     fn notify(zone: &ZoneTables, index: u32) -> (HostObjectWakeReport, Vec<RecordId>) {
         let mut handed = Vec::with_capacity(64);
-        let guard = zone.object_wait(key(index), &SpinForever).unwrap();
+        let guard = zone
+            .object_wait(key(index), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         let report = guard
             .notify_object_host(&mut |r| handed.push(r.id), &mut |_| {})
             .unwrap();
@@ -2769,7 +3183,9 @@ mod host_tests {
         zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &completion)
             .unwrap();
         assert!(matches!(
-            zone.object_wait(key, &BoundedSpin(0)),
+            zone.object_wait(key, &BoundedSpin(0), &|owned| {
+                let _ = owned.into_parts();
+            }),
             Err(ObjectWaitError::Occupied)
         ));
         let ticket = zone
@@ -3160,7 +3576,10 @@ mod host_tests {
                     zone.record_ref(first),
                     None,
                     Handback::Cancelled,
-                    &BoundedSpin(0)
+                    &BoundedSpin(0),
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    }
                 ),
                 HostClaim::Deferred
             );
@@ -3420,7 +3839,10 @@ mod host_tests {
                 zone.record_ref(cancelled),
                 None,
                 Handback::Cancelled,
-                &Venue(&completion)
+                &Venue(&completion),
+                &|owned| {
+                    let _ = owned.into_parts();
+                }
             ),
             HostClaim::Deferred
         );
@@ -3431,7 +3853,7 @@ mod host_tests {
         zone.object_queue(key.index as usize)
             .lock
             .store(NOTIFY_PENDING, Ordering::Release);
-        let ready = transfer.finish(&Venue(&completion)).unwrap();
+        let ready = transfer.finish(&Venue(&completion), &completion).unwrap();
         assert_eq!(ready, zone.record_ref(cancelled));
         assert_eq!(zone.record(cancelled).handback(), Some(Handback::Cancelled));
         assert!(delivered.get());
@@ -3497,7 +3919,11 @@ mod host_tests {
                 control_slot: 0,
             })
             .unwrap();
-        let guard = zone.object_wait(key(1), &SpinForever).unwrap();
+        let guard = zone
+            .object_wait(key(1), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         guard
             .park(
                 guard.snapshot(),
@@ -3558,7 +3984,12 @@ mod host_tests {
     #[test]
     fn el1_ipc_wait_host_wake_closes_concurrent_enroll_gap() {
         let zone = fixture(true);
-        let snapshot = zone.object_wait(key(1), &SpinForever).unwrap().snapshot();
+        let snapshot = zone
+            .object_wait(key(1), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap()
+            .snapshot();
         let barrier = Barrier::new(2);
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -3567,7 +3998,11 @@ mod host_tests {
             });
             barrier.wait();
             let record = allocate(&zone, 1);
-            let guard = zone.object_wait(key(1), &SpinForever).unwrap();
+            let guard = zone
+                .object_wait(key(1), &SpinForever, &|owned| {
+                    let _ = owned.into_parts();
+                })
+                .unwrap();
             let (error, operation) = guard
                 .park(snapshot, record, OperationToken::new(1, 1).unwrap())
                 .unwrap_err();
@@ -3596,7 +4031,15 @@ mod host_tests {
                 barrier.wait();
                 for record in records {
                     assert_eq!(
-                        zone.claim_for_host(zone.record_ref(record), None, kind, &SpinForever),
+                        zone.claim_for_host(
+                            zone.record_ref(record),
+                            None,
+                            kind,
+                            &SpinForever,
+                            &|owned| {
+                                let _ = owned.into_parts();
+                            }
+                        ),
                         HostClaim::Claimed
                     );
                     let rec = zone.record(record);
@@ -3638,7 +4081,11 @@ mod host_tests {
             .unwrap();
         let seq = zone.next_seq(record);
         zone.arm_timer(SLOT, record, seq).unwrap();
-        let guard = zone.object_wait(key(index), &SpinForever).unwrap();
+        let guard = zone
+            .object_wait(key(index), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         guard
             .park_until(
                 guard.snapshot(),
@@ -3660,8 +4107,19 @@ mod host_tests {
         let zone = fixture(true);
         let record = park_home_until(&zone, 1, 1_000);
         assert_eq!(zone.timer_deadline(SLOT), Some(1_000));
-        assert_eq!(zone.expire_timer(SLOT, 999, 0), Ok(false), "not yet");
-        assert_eq!(zone.expire_timer(SLOT, 1_000, 0), Ok(true));
+        assert_eq!(
+            zone.expire_timer(SLOT, 999, 0, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            Ok(false),
+            "not yet"
+        );
+        assert_eq!(
+            zone.expire_timer(SLOT, 1_000, 0, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            Ok(true)
+        );
         let rec = zone.record(record);
         assert!(matches!(rec.claim(), Claim::Queued { slot, .. } if slot == SLOT));
         assert!(rec.object_wait_expired());
@@ -3686,7 +4144,12 @@ mod host_tests {
         let zone = fixture(true);
         let record = park_home_until(&zone, 1, 1_000);
         assert_eq!(notify(&zone, 1).0.queued, 1);
-        assert_eq!(zone.expire_timer(SLOT, 5_000, 0), Ok(false));
+        assert_eq!(
+            zone.expire_timer(SLOT, 5_000, 0, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            Ok(false)
+        );
         assert_eq!(
             zone.timer_deadline(SLOT),
             None,
@@ -3713,7 +4176,9 @@ mod host_tests {
                 });
                 barrier.wait();
                 let expired = loop {
-                    match zone.expire_timer(SLOT, 1_000, 0) {
+                    match zone.expire_timer(SLOT, 1_000, 0, &|owned| {
+                        let _ = owned.into_parts();
+                    }) {
                         Ok(expired) => break expired,
                         Err(()) => core::hint::spin_loop(),
                     }
@@ -3735,7 +4200,11 @@ mod host_tests {
         let record = allocate(zone, tid);
         let seq = zone.next_seq(record);
         zone.arm_timer(SLOT, record, seq).unwrap();
-        let guard = zone.object_wait(key(index), &SpinForever).unwrap();
+        let guard = zone
+            .object_wait(key(index), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         guard
             .park_until(
                 guard.snapshot(),
@@ -3753,11 +4222,21 @@ mod host_tests {
         let later = park_foreign_until(&zone, 1, 310, 2_000);
         let earlier = park_foreign_until(&zone, 2, 311, 1_000);
         assert_eq!(zone.timer_deadline(SLOT), Some(1_000));
-        assert_eq!(zone.expire_timer(SLOT, 1_000, 0), Ok(true));
+        assert_eq!(
+            zone.expire_timer(SLOT, 1_000, 0, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            Ok(true)
+        );
         assert!(matches!(zone.record(earlier).claim(), Claim::Queued { .. }));
         assert!(matches!(zone.record(later).claim(), Claim::Parked { .. }));
         assert_eq!(zone.timer_deadline(SLOT), Some(2_000));
-        assert_eq!(zone.expire_timer(SLOT, 2_000, 0), Ok(true));
+        assert_eq!(
+            zone.expire_timer(SLOT, 2_000, 0, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            Ok(true)
+        );
         assert!(matches!(zone.record(later).claim(), Claim::Queued { .. }));
         assert_eq!(zone.timer_deadline(SLOT), None);
     }
@@ -3785,7 +4264,10 @@ mod host_tests {
                 taken.record,
                 Some(taken.seq),
                 Handback::Control,
-                &SpinForever
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                }
             ),
             HostClaim::Claimed
         );
@@ -3821,7 +4303,11 @@ mod host_tests {
                 },
             )
             .unwrap();
-        let guard = zone.object_wait(key(2), &SpinForever).unwrap();
+        let guard = zone
+            .object_wait(key(2), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         guard
             .park(guard.snapshot(), home, OperationToken::new(77, 1).unwrap())
             .unwrap();
@@ -3866,11 +4352,15 @@ mod host_tests {
             assert_eq!(zone.switch_in(SLOT), Some(record));
             let exact = zone.record_ref(record);
             assert_eq!(
-                zone.claim_for_host(exact, None, Handback::GroupStop, &SpinForever),
+                zone.claim_for_host(exact, None, Handback::GroupStop, &SpinForever, &|owned| {
+                    let _ = owned.into_parts();
+                }),
                 HostClaim::El1Held { slot: SLOT }
             );
             // A later ordinary control nudge cannot erase the stop cause.
-            zone.claim_for_host(exact, None, Handback::Control, &SpinForever);
+            zone.claim_for_host(exact, None, Handback::Control, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            });
             if completed {
                 // SAFETY: this slot owns the operation as its EL1 adapter.
                 unsafe {
@@ -4075,7 +4565,11 @@ mod host_tests {
         }
         let zone = fixture(true);
         let record = park(&zone, 1, 492);
-        let guard = zone.object_wait(key(1), &BoundedSpin(0)).unwrap();
+        let guard = zone
+            .object_wait(key(1), &BoundedSpin(0), &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         let from = zone.record(record).claim();
         let held_slot = zone.slot_lock(SLOT, &BoundedSpin(0)).unwrap();
         let attempts = NoWait(Cell::new(0));

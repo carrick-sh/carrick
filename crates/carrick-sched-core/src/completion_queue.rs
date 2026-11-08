@@ -96,6 +96,50 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
     #[test]
+    fn source_admission_waits_for_an_inflight_handback_initializer() {
+        use crate::object_wait::{ObjectWaitKey, OwnedObjectWakeEffects};
+        use crate::{BoundedSpin, LockWait, ZoneTables};
+        // SAFETY: the shared zone's bootstrap ABI is all-zero.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>());
+            assert!(!ptr.is_null());
+            std::boxed::Box::from_raw(ptr.cast::<ZoneTables>())
+        };
+        let key = ObjectWaitKey::new(1, 1).unwrap();
+        let queue = &zone.object_admission_handbacks[key.index() as usize];
+        // Pause the real first initializer after admission, before publishing
+        // its stub. A concurrent source admission must retain work and wait
+        // for this short publication instead of asserting exclusive init.
+        assert_eq!(
+            queue
+                .initialized
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire),
+            Ok(0)
+        );
+        struct FinishInitialization<'a>(&'a CompletionQueue);
+        impl LockWait for FinishInitialization<'_> {
+            fn wait(&self, _: u32) -> bool {
+                self.0.head.store(STUB, Ordering::Relaxed);
+                self.0.tail.store(STUB, Ordering::Relaxed);
+                self.0.stub_next.store(0, Ordering::Relaxed);
+                self.0.initialized.store(2, Ordering::Release);
+                true
+            }
+        }
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.into_parts();
+        };
+        let source = zone
+            .bind_object_notification_source(key, &FinishInitialization(queue), &completion)
+            .unwrap();
+        source.reserve().publish(crate::Waker::Host, &completion);
+        assert!(
+            zone.object_wait_with_completion(key, &BoundedSpin(0), &completion)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn paused_producer_link_retains_custody_and_consumer_never_waits() {
         // SAFETY: shared queue bootstrap is the all-zero ABI state.
         let queue: CompletionQueue = unsafe { core::mem::zeroed() };

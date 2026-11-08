@@ -545,7 +545,13 @@ mod tests {
         drop(guard);
         assert_eq!(transfers.len(), 1);
         assert_eq!(
-            transfers.pop().unwrap().finish(&BoundedSpin(0)),
+            transfers.pop().unwrap().finish(&BoundedSpin(0), &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            }),
             Some(reference)
         );
         let restored = materialize_zone_in(&zone, &saved, reference, ZoneResumeOrigin::GuestRecord)

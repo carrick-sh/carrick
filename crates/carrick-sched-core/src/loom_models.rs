@@ -159,7 +159,15 @@ fn current_handback_preserves_birth_incarnation_for_mint() {
                 let seq = zone.record(id).claim().seq();
                 if requested {
                     assert_eq!(
-                        zone.claim_for_host(record, None, Handback::Signal, &SpinForever),
+                        zone.claim_for_host(
+                            record,
+                            None,
+                            Handback::Signal,
+                            &SpinForever,
+                            &|owned| {
+                                let _ = owned.into_parts();
+                            }
+                        ),
                         HostClaim::El1Held { slot: SLOT }
                     );
                     assert_eq!(
@@ -214,7 +222,9 @@ fn release_races_closing_without_losing_custody() {
         });
         let closing_zone = zone.clone();
         let closing = thread::spawn(move || {
-            closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever)
+            closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
         });
         let released = producer.join().unwrap();
         closing.join().unwrap();
@@ -239,7 +249,9 @@ fn requested_fallback_on_wfi_owes_a_kick() {
         // The sleeping/away last driver is ineligible for normal placement.
         assert!(zone.enter_idle(SLOT, true));
         assert_eq!(
-            zone.claim_for_host(record, None, Handback::Control, &SpinForever),
+            zone.claim_for_host(record, None, Handback::Control, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            }),
             HostClaim::Deferred
         );
         let placement = zone.place_first_entry(custody).ok().unwrap();
@@ -357,7 +369,15 @@ fn producer_closing_executor_and_second_birth_complete_once() {
             });
             let closing_zone = zone.clone();
             let closing = thread::spawn(move || {
-                closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever)
+                closing_zone.claim_for_host(
+                    record,
+                    None,
+                    Handback::Control,
+                    &SpinForever,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    },
+                )
             });
             if let Some(custody) = zone.claim_current_first_entry_activation(record) {
                 finish(&zone, custody, &deliveries);
@@ -471,7 +491,9 @@ fn closing_producer_executor_sleep_and_reuse_preserve_delivery() {
         });
         let closing_zone = zone.clone();
         let closing = thread::spawn(move || {
-            closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever)
+            closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
         });
         zone.enter_idle(SLOT, true);
         if let Some(ServiceHead::FirstEntry(custody)) = zone.take_service_head_for_executor(SLOT) {
@@ -531,7 +553,15 @@ fn stale_placement_releases_replacement_despite_its_closing_request() {
             let replacement = birth(&zone);
             let closing_zone = zone.clone();
             let closing = thread::spawn(move || {
-                closing_zone.claim_for_host(replacement, None, Handback::Control, &SpinForever)
+                closing_zone.claim_for_host(
+                    replacement,
+                    None,
+                    Handback::Control,
+                    &SpinForever,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    },
+                )
             });
             closing.join().unwrap();
         }
@@ -563,7 +593,15 @@ fn closing_republishes_while_producer_and_executor_contend() {
         });
         let closing_zone = zone.clone();
         let closing = thread::spawn(move || {
-            let claim = closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever);
+            let claim = closing_zone.claim_for_host(
+                record,
+                None,
+                Handback::Control,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+            );
             // The real handback adapter routes Claimed/AlreadyHost records
             // through first-entry admission; Deferred belongs to its owner.
             if matches!(claim, HostClaim::Claimed | HostClaim::AlreadyHost)
@@ -641,7 +679,9 @@ fn delayed_closing_cannot_overwrite_replacement_handback() {
         let custody = zone.claim_first_entry_placement(old).unwrap();
         let closing_zone = zone.clone();
         let closing = thread::spawn(move || {
-            closing_zone.claim_for_host(old, None, Handback::Control, &SpinForever)
+            closing_zone.claim_for_host(old, None, Handback::Control, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
         });
         let custody = zone.place_first_entry(custody).unwrap_err();
         assert!(zone.release_first_entry_placement(custody));
@@ -719,7 +759,9 @@ fn concurrent_group_exit_keeps_direct_load_terminal_intent_before_release() {
                 Some(CurrentRelease::Released)
             );
         });
-        let _ = zone.claim_for_host(record, None, Handback::Control, &SpinForever);
+        let _ = zone.claim_for_host(record, None, Handback::Control, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        });
         if zone.live(record).is_none() {
             assert_eq!(
                 intent.load(Ordering::Acquire),

@@ -336,6 +336,12 @@ fn resident_signal_work_return(
                             )
                             .unwrap(),
                             &carrick_sched_core::ShortLockSpin,
+                            &|owned| {
+                                crate::sched::object_wait::deliver_host_completion(
+                                    owned.zone(),
+                                    owned,
+                                )
+                            },
                         )
                         .unwrap();
                     // SAFETY: production intake's exact-member queue authenticates

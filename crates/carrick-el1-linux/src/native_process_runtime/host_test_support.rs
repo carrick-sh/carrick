@@ -1624,6 +1624,7 @@ impl NativeServiceCapacityFixture {
             .object_wait(
                 carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
                 &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             )
             .unwrap();
         assert_eq!(queue.native_service_member(record), Some(identity));
@@ -1652,6 +1653,9 @@ impl NativeServiceCapacityFixture {
                 .object_wait(
                     carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
                     &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
                 )
                 .unwrap();
             assert!(ticket.complete(true).is_ok());
@@ -1884,6 +1888,7 @@ fn carrier_work_wake_preserves_the_completed_syscall_result() {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // SAFETY: the fixture retains the exact process control and record named
@@ -1987,7 +1992,9 @@ fn publish_test_exec_reply_for(
     let key = ObjectWaitKey::native_service(selector.record).unwrap();
     let queue = fixture
         .zone
-        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+        .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
         .unwrap();
     let record = fixture.zone.record(selector.record.id);
     let member = record.identity();
@@ -2506,6 +2513,7 @@ fn add_signal_sibling(
             .object_wait(
                 carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
                 &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             )
             .unwrap();
         let ticket = unsafe {
@@ -4311,6 +4319,7 @@ fn carrier_work_redrives_parked_wait4(cancel: bool) {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(parent_record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // SAFETY: the service queue authenticates the retained parent's notice.
@@ -4776,6 +4785,7 @@ fn completed_output_busy_yields(in_preparation: bool) {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // SAFETY: the fixture owns the exact member and its service queue.
@@ -5611,6 +5621,7 @@ fn retained_ipc_supply(
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // SAFETY: the fixture retains this exact member and authenticates the notice under its service queue.
@@ -5968,7 +5979,9 @@ fn host_contended_service_park(
     assert_eq!(
         fixture
             .zone
-            .claim_for_host(record, None, Handback::Control, &ShortLockSpin),
+            .claim_for_host(record, None, Handback::Control, &ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            }),
         HostClaim::El1Held { slot: fixture.slot }
     );
     let mut service = fixture.service();
@@ -6148,6 +6161,7 @@ fn host_contended_service_park(
         .object_wait(
             ObjectWaitKey::native_service(record).unwrap(),
             &ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     assert_eq!(queue.native_service_member(record), Some(identity));
@@ -6164,6 +6178,7 @@ fn host_contended_service_park(
         .object_wait(
             ObjectWaitKey::native_service(record).unwrap(),
             &ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap()
         .notify_object(fixture.slot, &mut Default::default())
@@ -6243,9 +6258,13 @@ fn host_request_during_owner_wait_park_yields_then_reparks() {
         Some(fixture.record.id)
     );
     assert_eq!(
-        fixture
-            .zone
-            .claim_for_host(fixture.record, None, Handback::Control, &ShortLockSpin),
+        fixture.zone.claim_for_host(
+            fixture.record,
+            None,
+            Handback::Control,
+            &ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        ),
         HostClaim::El1Held { slot: fixture.slot }
     );
     let saved = words(fixture.address);
@@ -6673,6 +6692,7 @@ fn rehomed_signal_copy_service(input: bool) {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(reference).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     assert_eq!(
@@ -6704,6 +6724,7 @@ fn rehomed_signal_copy_service(input: bool) {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(reference).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap()
         .notify_object(fixture.slot, &mut Default::default())
@@ -6985,6 +7006,7 @@ fn entropy_service_retained_cursor(owner_wait: bool) {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // SAFETY: the fixture owns the exact member and holds its service queue.
@@ -7095,6 +7117,7 @@ fn entropy_service_retained_cursor(owner_wait: bool) {
                 carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record)
                     .unwrap(),
                 &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             )
             .unwrap();
         // SAFETY: exact member service queue is held, as above.
@@ -7251,6 +7274,7 @@ fn entropy_service_result(case: EntropyReplyCase) {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // A stale MM incarnation cannot claim or consume this retained allocation.
@@ -7305,6 +7329,7 @@ fn entropy_service_result(case: EntropyReplyCase) {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     assert!(
@@ -7396,6 +7421,7 @@ fn entropy_service_preparation_busy_retries_before_generation() {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // SAFETY: fixture retains the exact member and service queue.
@@ -7423,6 +7449,7 @@ fn entropy_service_preparation_busy_retries_before_generation() {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     assert!(ticket.complete(true).is_ok());
@@ -7472,6 +7499,7 @@ fn entropy_service_preparation_busy_retries_before_generation() {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // SAFETY: the same member now owns a fresh, authenticated entropy ticket.
@@ -7539,7 +7567,9 @@ fn entropy_physical_checkpoint(busy: bool) {
             let key =
                 carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap();
             let queue = zone
-                .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
                 .unwrap();
             let member = queue.native_service_member(record).unwrap();
             // SAFETY: fixture retains this exact initialized member under its queue.
@@ -7563,7 +7593,9 @@ fn entropy_physical_checkpoint(busy: bool) {
                 _ => panic!("entropy or its retained preparation"),
             }
             let _queue = zone
-                .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
                 .unwrap();
             assert!(ticket.complete(true).is_ok());
         }))
@@ -7737,7 +7769,9 @@ fn entropy_fault_completion(cancel_wait: bool) {
         carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap();
     let queue = fixture
         .zone
-        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+        .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
         .unwrap();
     // SAFETY: the real pending owner and this queue retain the exact control.
     let ticket = unsafe {
@@ -7786,7 +7820,9 @@ fn entropy_fault_completion(cancel_wait: bool) {
         FAULT_REPLY_WAIT_ONCE.with(|once| once.set(Some(wait)));
         let queue = fixture
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         fixture
             .control
@@ -7800,7 +7836,9 @@ fn entropy_fault_completion(cancel_wait: bool) {
     };
     let queue = fixture
         .zone
-        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+        .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
         .unwrap();
     assert!(ticket.complete(false).is_ok());
     queue
@@ -7838,7 +7876,9 @@ fn entropy_fault_completion(cancel_wait: bool) {
         let notice = fixture.task.service_notice.take().unwrap().unwrap();
         let queue = fixture
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         let ticket = unsafe {
             ServiceCell::claim_notice(
@@ -7969,6 +8009,7 @@ fn host_root_open_publishes_unstamped_record_through_service_notice() {
         .object_wait(
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap();
     // SAFETY: fixture retains the control and exact member under its queue.

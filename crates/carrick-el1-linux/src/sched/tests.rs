@@ -267,7 +267,9 @@ fn host_request_during_repark(kind: Handback) {
         fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
             assert_eq!(
                 self.zone
-                    .claim_for_host(self.record, None, self.kind, &HostWait),
+                    .claim_for_host(self.record, None, self.kind, &HostWait, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    }),
                 carrick_el1_abi::HostClaim::El1Held { slot: SLOT }
             );
             // Model delivery of the claimant's kick after dispatch admission.
@@ -458,6 +460,7 @@ fn host_service_posted_at_idle_boundary_does_not_sleep_in_wfi() {
             Some(seq),
             Handback::Service,
             &HostWait,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
         ),
         carrick_el1_abi::HostClaim::Claimed
     );
@@ -1136,7 +1139,13 @@ fn host_runnable(zone: &ZoneTables, slot: SlotId, tid: u64) -> RecordId {
     let seq = zone.next_seq(record);
     zone.publish_park(record, seq);
     assert_eq!(
-        zone.claim_for_host(zone.record_ref(record), None, Handback::Service, &HostWait),
+        zone.claim_for_host(
+            zone.record_ref(record),
+            None,
+            Handback::Service,
+            &HostWait,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        ),
         carrick_el1_abi::HostClaim::Claimed
     );
     assert_eq!(zone.place_from_host(record).map(|p| p.slot), Some(slot));
@@ -2044,8 +2053,14 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     zone.enter_guest(SLOT);
     let key_a = ObjectWaitKey::new(1, 3).unwrap();
     let key_b = ObjectWaitKey::new(2, 3).unwrap();
-    zone.bind_object_wait(key_a, &HostWait).unwrap();
-    zone.bind_object_wait(key_b, &HostWait).unwrap();
+    zone.bind_object_wait(key_a, &HostWait, &|owned| {
+        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+    })
+    .unwrap();
+    zone.bind_object_wait(key_b, &HostWait, &|owned| {
+        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+    })
+    .unwrap();
     let b = zone
         .alloc_record(ThreadIdentity {
             mm: OTHER_MM,
@@ -2063,7 +2078,11 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
         *zone.record(b).ctx_mut() =
             Aarch64ParkedContext::from_register(b_ctx, TTBR_OTHER, OTHER_MM, 1)
     };
-    let guard = zone.object_wait(key_b, &HostWait).unwrap();
+    let guard = zone
+        .object_wait(key_b, &HostWait, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
+        .unwrap();
     guard
         .park(guard.snapshot(), b, OperationToken::new(202, 4).unwrap())
         .unwrap();
@@ -2177,9 +2196,16 @@ fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
     let target = super::sgi_target_of(0x8000_0004);
     zone.slot(other).set_sgi_target(target);
     let key = ObjectWaitKey::new(1, 1).unwrap();
-    zone.bind_object_wait(key, &HostWait).unwrap();
+    zone.bind_object_wait(key, &HostWait, &|owned| {
+        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+    })
+    .unwrap();
     let record = zone.current_or_new(other, identity(202)).unwrap();
-    let guard = zone.object_wait(key, &HostWait).unwrap();
+    let guard = zone
+        .object_wait(key, &HostWait, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
+        .unwrap();
     guard
         .park(
             guard.snapshot(),
@@ -2205,8 +2231,10 @@ fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
     assert!(sched.cpu.sgis.is_empty());
     // Lock reacquisition proves the notification returned with no lock held.
     drop(
-        zone.object_wait(key, &carrick_sched_core::BoundedSpin(0))
-            .unwrap(),
+        zone.object_wait(key, &carrick_sched_core::BoundedSpin(0), &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
+        .unwrap(),
     );
     sched.finish_object_wake(effects);
     assert_eq!(
@@ -2355,7 +2383,10 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
     assert!(sched.may_time_park());
 
     let key = ObjectWaitKey::new(1, 1).unwrap();
-    zone.bind_object_wait(key, &HostWait).unwrap();
+    zone.bind_object_wait(key, &HostWait, &|owned| {
+        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+    })
+    .unwrap();
     // SAFETY: this fixture exclusively owns the blocked object's state.
     let snapshot = unsafe {
         carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
@@ -2411,7 +2442,12 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
         .unwrap();
     assert!(parked.matches(&zone, SLOT));
     assert_eq!(zone.timer_deadline(SLOT), Some(5000));
-    assert_eq!(zone.expire_timer(SLOT, 5000, 0), Ok(true));
+    assert_eq!(
+        zone.expire_timer(SLOT, 5000, 0, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        }),
+        Ok(true)
+    );
     assert_eq!(zone.timer_deadline(SLOT), Some(10000));
 }
 

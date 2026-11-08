@@ -5263,7 +5263,10 @@ fn serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations() {
     };
     crate::el1_zone::with_test_zone(zone, || {
         let metadata = carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(1).unwrap();
-        zone.bind_object_wait(metadata, &HostLockWait).unwrap();
+        zone.bind_object_wait(metadata, &HostLockWait, &|owned| {
+            crate::el1_zone::complete_object_wake(owned.zone(), owned)
+        })
+        .unwrap();
         let mut h = SpliceTestRig::new(4096);
         const LIMIT: usize = 8193;
         let limit = (LIMIT as u64).to_ne_bytes().repeat(2);
@@ -5305,7 +5308,10 @@ fn serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations() {
             }
             assert_eq!(h.dispatcher.captured_file_table().slot_count(), initial);
             assert!(
-                zone.object_wait(metadata, &HostLockWait).is_ok(),
+                zone.object_wait(metadata, &HostLockWait, &|owned| {
+                    crate::el1_zone::complete_object_wake(owned.zone(), owned)
+                })
+                .is_ok(),
                 "IPC must not overwrite metadata's queue generation"
             );
         }

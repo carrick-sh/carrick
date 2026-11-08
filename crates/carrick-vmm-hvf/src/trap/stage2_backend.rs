@@ -1574,7 +1574,11 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
             region.operation_slot_generation(),
             &carrick_sched_core::BoundedSpin(0),
             &|owned| {
-                let _ = owned.into_parts();
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                );
             },
         )
         .map_err(|error| {
