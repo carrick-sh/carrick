@@ -11,3 +11,9 @@ test = "carrick_el1_linux::native_process_runtime::host_test_support::portal_wai
 reason = "#1691: carrier-work cancellation and terminal cancellation now resume a parked native service waiter differently (nonterminal interruption leaves CarrierWork parked), so the witness was split and renamed to name the terminal case it proves (d0ddf25d2e)."
 replaced_by = "carrick_el1_linux::native_process_runtime::host_test_support::portal_wait_terminal_cancellation_resumes_exact_native_service_waiter"
 pr = 1701
+
+[[retired]]
+test = "carrick_el1_linux::ipc::tests::el1_ipc_io_first_write_to_an_unbacked_pipe_forwards_before_effects"
+reason = "#1506: native-child pipe2 is now served in ring with owned descriptor publication, so the first write to an unbacked pipe supplies shared storage (or returns ENOMEM) instead of forwarding; the witness was renamed for what it proves (ae515b5b91)."
+replaced_by = "carrick_el1_linux::ipc::tests::el1_ipc_io_first_write_supplies_shared_storage_or_returns_enomem"
+pr = 1740
