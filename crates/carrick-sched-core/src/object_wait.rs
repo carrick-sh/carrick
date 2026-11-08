@@ -76,6 +76,69 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
+
+/// The queue indices `coordinate_anonymous_edit_wait` parks its five replay
+/// causes on: the exact-MM prepared-overlap lane and the four extra cause
+/// lanes below the per-MM metadata lane. An operation token whose index lies
+/// here replays this record's own anonymous edit; it names no arena entry.
+const fn is_anonymous_replay_index(index: u64) -> bool {
+    let primary =
+        index > ADDRESS_SPACE_WAIT_BASE as u64 && index < RESERVATION_POOL_WAIT_INDEX as u64;
+    let extra = index >= ORIGINAL_OBJECT_WAIT_QUEUES as u64
+        && index < cause_queue_index(0, spaces::notification::SpaceWaitCause::Metadata) as u64;
+    primary || extra
+}
+
+/// The authority that owns the operation a record retains. One numeric rule
+/// decides it, so no consumer has to authenticate a token by sniffing another
+/// authority's reserved values. Only [`OperationAuthority::AdapterIpc`] names
+/// an external pin: it stays attached until the adapter consumes, completes or
+/// cancels it. Every other authority is a scheduler-owned replay receipt with
+/// no external pin: it retires with the record's wait, and its producer replays
+/// the original syscall and re-probes its own predicate.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum OperationAuthority {
+    /// A pinned operation in the carrier's IPC adapter arena.
+    AdapterIpc,
+    /// A metadata-provisioning request, named by the reserved `u64::MAX` index.
+    MetadataRequest,
+    /// An anonymous edit replay naming its exact space-cause notification key.
+    AnonymousReplay,
+    /// A prepared portal edit replay, tagged so it cannot alias the anonymous
+    /// waits that share its queue.
+    PreparedEdit,
+}
+
+impl OperationAuthority {
+    /// Attribute a retained operation word. `None` only for index 0, which is
+    /// no operation at all. An untagged index outside every scheduler-owned
+    /// replay domain belongs to the adapter, whose arena cannot reach it.
+    pub const fn classify(index: u64) -> Option<Self> {
+        if index == 0 {
+            None
+        } else if index == u64::MAX {
+            Some(Self::MetadataRequest)
+        } else if index & PREPARED_EDIT_OPERATION_TAG != 0 {
+            Some(Self::PreparedEdit)
+        } else if is_anonymous_replay_index(index) {
+            Some(Self::AnonymousReplay)
+        } else {
+            Some(Self::AdapterIpc)
+        }
+    }
+
+    /// Whether this authority owns a replay receipt rather than an adapter pin.
+    pub const fn is_replay_receipt(self) -> bool {
+        !matches!(self, Self::AdapterIpc)
+    }
+}
+
 pub const OBJECT_WAIT_PROTOCOL: u64 = 15;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
@@ -1668,14 +1731,9 @@ pub struct ObjectWaitCensus {
 impl ObjectWaitCensus {
     pub(crate) const fn has_anonymous_edit_operation(&self) -> bool {
         // Only the five causes accepted by coordinate_anonymous_edit_wait
-        // issue replay tokens. Metadata, spare queues, services and tagged
-        // prepared edits retain their own host cancellation custody.
-        let primary = self.operation > ADDRESS_SPACE_WAIT_BASE as u64
-            && self.operation < RESERVATION_POOL_WAIT_INDEX as u64;
-        let extra = self.operation >= ORIGINAL_OBJECT_WAIT_QUEUES as u64
-            && self.operation
-                < cause_queue_index(0, spaces::notification::SpaceWaitCause::Metadata) as u64;
-        (primary || extra)
+        // issue untagged replay tokens. Metadata, spare queues, services and
+        // tagged prepared edits retain their own host cancellation custody.
+        is_anonymous_replay_index(self.operation)
             && self.operation_generation != 0
             && self.operation_generation == self.generation
     }
@@ -1761,15 +1819,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     }
 
     pub fn has_object_operation(&self) -> bool {
-        self.object.operation.load(Ordering::Acquire) != 0
+        self.operation_authority().is_some()
     }
 
-    /// Whether this record holds an adapter-owned IPC operation token
-    /// with an external endpoint pin. Metadata and anonymous-edit replay
-    /// tokens are scheduler-owned and have no adapter arena entry.
+    /// Whose operation this record retains, or `None` when it retains none.
+    /// Anything that acts on a retained token routes on this, never on
+    /// `has_object_operation`: a nonzero token is not necessarily the adapter's.
+    pub fn operation_authority(&self) -> Option<OperationAuthority> {
+        OperationAuthority::classify(self.object.operation.load(Ordering::Acquire))
+    }
+
+    /// Whether this record holds an adapter-owned IPC operation token with an
+    /// external endpoint pin. Metadata, anonymous edit replay and prepared edit
+    /// replay tokens are scheduler-owned and have no adapter arena entry, so an
+    /// adapter handback must never be manufactured for one.
     pub fn has_adapter_operation(&self) -> bool {
-        let operation = self.object.operation.load(Ordering::Acquire);
-        !matches!(operation, 0 | u64::MAX) && operation & PREPARED_EDIT_OPERATION_TAG == 0
+        self.operation_authority() == Some(OperationAuthority::AdapterIpc)
     }
 
     /// Whether this record's last object park ended at its deadline rather
@@ -1782,12 +1847,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.object.expired.load(Ordering::Acquire) & OBJECT_HOST_CONTINUATION != 0
     }
 
-    /// Retire a cancelled metadata receipt under the cancellation or slot
-    /// owner's exclusive custody (`Host`, `Transferring`, `OnCpu`, or
-    /// `OnCpuRequested`). Unlike an IPC operation, this token has no external
-    /// pin or adapter cleanup: its only resource is this record. Do not
-    /// manufacture an orphan adapter handback for it.
-    pub(crate) fn retire_cancelled_metadata_operation(&self) {
+    /// Retire a cancelled scheduler-owned replay receipt under the cancellation
+    /// or slot owner's exclusive custody (`Host`, `Transferring`, `OnCpu`, or
+    /// `OnCpuRequested`). Unlike an IPC operation these tokens own no external
+    /// pin and need no adapter cleanup: their only resource is this record, so a
+    /// record released with one still attached could never be recycled. Do not
+    /// manufacture an orphan adapter handback for them, and never consume an
+    /// adapter token here.
+    pub(crate) fn retire_cancelled_replay_operation(&self) {
         if !self.is_cancelled()
             || !matches!(
                 self.claim(),
@@ -1796,41 +1863,45 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
                     | Claim::OnCpu { .. }
                     | Claim::OnCpuRequested { .. }
             )
-            || self.object.queue.load(Ordering::Acquire) != 0
         {
             return;
         }
-        // The reserved metadata index cannot name an external operation.
-        // The CAS consumes that receipt once; all adapter-owned tokens stay
-        // attached until the adapter releases their endpoint pins.
+        let Some(authority) = self.operation_authority() else {
+            return;
+        };
+        if !authority.is_replay_receipt() || !self.replay_receipt_is_owed(authority) {
+            return;
+        }
+        // The CAS consumes this receipt exactly once. A token another authority
+        // already took, or a newer registration, keeps its own value.
+        let operation = self.object.operation.load(Ordering::Acquire);
         let _ = self.object.operation.compare_exchange(
-            u64::MAX,
+            operation,
             0,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
     }
 
-    /// Retire an anonymous-edit replay token after its queue link is removed.
-    /// The retained operation index and generation preserve the typed identity
-    /// until the transfer owner settles cancellation. Unlike adapter operations
-    /// it owns no external pin and needs no host handback.
-    pub(super) fn retire_cancelled_anonymous_operation(&self) {
-        if !self.is_cancelled() {
-            return;
+    /// Whether the cancelled record's replay receipt may be retired with the
+    /// wait. A metadata receipt is spendable once its queue link is gone; an
+    /// anonymous edit receipt authenticates against the exact object
+    /// registration it parked for. A prepared edit receipt stays attached for
+    /// its own handback: the portal authenticates the replay by that token, and
+    /// the release that re-delivers the saved SVC consumes it.
+    fn replay_receipt_is_owed(&self, authority: OperationAuthority) -> bool {
+        match authority {
+            OperationAuthority::MetadataRequest => self.object.queue.load(Ordering::Acquire) == 0,
+            OperationAuthority::AnonymousReplay => {
+                let operation = self.object.operation.load(Ordering::Acquire);
+                self.object_wait_census().is_some_and(|census| {
+                    census.operation == operation
+                        && census.operation_generation != 0
+                        && census.operation_generation == census.generation
+                })
+            }
+            OperationAuthority::PreparedEdit | OperationAuthority::AdapterIpc => false,
         }
-        let Some(census) = self.object_wait_census() else {
-            return;
-        };
-        if !census.has_anonymous_edit_operation() {
-            return;
-        }
-        let _ = self.object.operation.compare_exchange(
-            census.operation,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
     }
 
     /// Consume a resumed metadata operation receipt under the execution
@@ -2610,6 +2681,127 @@ mod host_tests {
         let next = ObjectWaitKey::metadata_request(18).unwrap();
         zone.bind_object_wait(next, &SpinForever).unwrap();
         assert!(zone.object_wait(key, &SpinForever).is_err());
+    }
+
+    /// One rule attributes every token a record can retain, because every
+    /// consumer that acts on a retained token reads this answer: the HVF EL1
+    /// zone resume, the cancellation arms in `HostTransfer::publish`, and the
+    /// native service cancellation. A replay receipt that classifies as an
+    /// adapter pin makes those consumers manufacture an adapter handback for
+    /// an operation the IPC arena never pinned.
+    #[test]
+    fn operation_authority_attributes_every_retained_token_domain() {
+        use spaces::notification::SpaceWaitCause;
+
+        assert_eq!(OperationAuthority::classify(0), None);
+        assert_eq!(
+            OperationAuthority::classify(u64::MAX),
+            Some(OperationAuthority::MetadataRequest)
+        );
+        // Adapter tokens are arena slots stored as `index + 1`, so the adapter
+        // domain ends where the address-space lanes begin. The reserved
+        // metadata lane and the spare pools are not anonymous edit lanes.
+        for index in [
+            1u64,
+            91,
+            701,
+            ADDRESS_SPACE_WAIT_BASE as u64 - 1,
+            METADATA_WAIT_INDEX as u64,
+            RESERVATION_POOL_WAIT_INDEX as u64,
+            ORIGINAL_OBJECT_WAIT_QUEUES as u64 - 1,
+        ] {
+            assert_eq!(
+                OperationAuthority::classify(index),
+                Some(OperationAuthority::AdapterIpc),
+                "index {index}"
+            );
+        }
+        // Every cause `coordinate_anonymous_edit_wait` may park on, in both of
+        // its lane groups, and at the first and last address space.
+        for cause in SpaceWaitCause::ALL {
+            for space in [0usize, 1, spaces::ADDRESS_SPACES - 1] {
+                let key = ObjectWaitKey::address_space_cause(space, 17, cause).unwrap();
+                let anonymous = cause != SpaceWaitCause::Metadata;
+                assert_eq!(
+                    OperationAuthority::classify(u64::from(key.index())),
+                    Some(if anonymous {
+                        OperationAuthority::AnonymousReplay
+                    } else {
+                        OperationAuthority::AdapterIpc
+                    }),
+                    "cause {cause:?} space {space}"
+                );
+                let prepared = OperationToken::prepared_edit(key).unwrap();
+                assert_eq!(
+                    OperationAuthority::classify(prepared.index()),
+                    Some(OperationAuthority::PreparedEdit),
+                    "cause {cause:?} space {space} prepared"
+                );
+                assert!(
+                    OperationAuthority::classify(prepared.index())
+                        .unwrap()
+                        .is_replay_receipt(),
+                    "a prepared edit replay is a scheduler receipt"
+                );
+            }
+        }
+
+        // And through a production park, what the record itself answers.
+        let space_key =
+            ObjectWaitKey::address_space_cause(3, 17, SpaceWaitCause::PendingEdit).unwrap();
+        let prepared_key =
+            ObjectWaitKey::address_space_cause(3, 17, SpaceWaitCause::PreparedOverlap).unwrap();
+        // The fixture pre-binds queues 1 and 2, so each case claims its own
+        // queue. An adapter token need not name the queue it is parked on: the
+        // arena slot is the token, and the queue is only where the record waits.
+        let cases = [
+            (
+                "adapter",
+                key(50),
+                OperationToken::new(91, 17).unwrap(),
+                OperationAuthority::AdapterIpc,
+            ),
+            (
+                "metadata",
+                ObjectWaitKey::metadata_request(17).unwrap(),
+                OperationToken::metadata_request(17).unwrap(),
+                OperationAuthority::MetadataRequest,
+            ),
+            (
+                "anonymous",
+                space_key,
+                OperationToken::new(u64::from(space_key.index()), 17).unwrap(),
+                OperationAuthority::AnonymousReplay,
+            ),
+            (
+                "prepared",
+                prepared_key,
+                OperationToken::prepared_edit(prepared_key).unwrap(),
+                OperationAuthority::PreparedEdit,
+            ),
+        ];
+        for (name, wait, operation, authority) in cases {
+            let zone = fixture(false);
+            zone.bind_object_wait(wait, &SpinForever).unwrap();
+            let id = allocate(&zone, 1);
+            let retained = operation.index();
+            let guard = zone.object_wait(wait, &SpinForever).unwrap();
+            guard.park(guard.snapshot(), id, operation).unwrap();
+            drop(guard);
+            let record = zone.record(id);
+            assert_eq!(record.operation_authority(), Some(authority), "{name}");
+            assert_eq!(
+                record.has_adapter_operation(),
+                authority == OperationAuthority::AdapterIpc,
+                "{name}: only the adapter domain may be handed to the IPC authority"
+            );
+            assert!(record.has_object_operation(), "{name}");
+            assert_eq!(
+                record.object_wait_census().unwrap().operation,
+                retained,
+                "{name}"
+            );
+        }
     }
 
     #[test]

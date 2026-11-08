@@ -1885,8 +1885,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
                                     census.has_anonymous_edit_operation()
                                 }))) =>
                 {
-                    rec.retire_cancelled_metadata_operation();
-                    rec.retire_cancelled_anonymous_operation();
+                    rec.retire_cancelled_replay_operation();
                     if rec.has_object_operation() {
                         // Cancellation must reach the adapter while its exact
                         // endpoint token is still retained by this incarnation.
@@ -2766,7 +2765,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     self.begin_host_transfer(self.record_ref(record), Claim::Queued { slot, seq })
             {
                 self.remove_locked(&guard, record);
-                rec.retire_cancelled_metadata_operation();
+                rec.retire_cancelled_replay_operation();
                 rec.handback
                     .store(Handback::Cancelled as u32, Ordering::Release);
                 transfer.retire();
@@ -2780,7 +2779,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// party that allocated it and never published a park).
     pub fn free_record(&self, id: RecordId) {
         let record = self.record(id);
-        record.retire_cancelled_metadata_operation();
+        record.retire_cancelled_replay_operation();
         // A pending operation owns an external endpoint pin. Keep this
         // record reachable until its adapter consumes/cancels that token;
         // recycling it would lose the only completion authority.
@@ -2797,7 +2796,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     fn finish_retiring_record(&self, identity: RecordRef) {
         let id = identity.id;
         let record = self.record(id);
-        record.retire_cancelled_metadata_operation();
+        record.retire_cancelled_replay_operation();
         if record.has_object_operation() {
             return;
         }
@@ -4342,7 +4341,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 continue;
             };
             if rec.is_cancelled() {
-                rec.retire_cancelled_metadata_operation();
+                rec.retire_cancelled_replay_operation();
                 rec.handback
                     .store(Handback::Cancelled as u32, Ordering::Release);
                 let discard = !rec.has_object_operation();
@@ -4402,7 +4401,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return CurrentHandback::Lost;
         };
         if rec.is_cancelled() {
-            rec.retire_cancelled_metadata_operation();
+            rec.retire_cancelled_replay_operation();
             rec.handback
                 .store(Handback::Cancelled as u32, Ordering::Release);
             if !rec.has_object_operation() {
@@ -4463,7 +4462,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let rec = self.record(record);
         let owned = matches!(rec.claim(), Claim::OnCpu { slot: owner, .. } | Claim::OnCpuRequested { slot: owner, .. } if owner == slot);
         if owned {
-            rec.retire_cancelled_metadata_operation();
+            rec.retire_cancelled_replay_operation();
         }
         if owned
             && rec.has_object_operation()
@@ -4957,7 +4956,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 };
                 let discard = rec.is_cancelled();
                 if discard {
-                    rec.retire_cancelled_metadata_operation();
+                    rec.retire_cancelled_replay_operation();
                     rec.handback
                         .store(Handback::Cancelled as u32, Ordering::Release);
                 } else if rec.handback() != Some(Handback::Resumed) {
