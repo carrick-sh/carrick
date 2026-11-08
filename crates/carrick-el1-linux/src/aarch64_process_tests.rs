@@ -268,11 +268,11 @@ fn metadata_lifecycle_allocation() -> (core::ptr::NonNull<u8>, usize, usize) {
     )
 }
 
-struct TestStockCrossing {
+struct TestStockCrossing<'a> {
     #[cfg(test)]
     ipc: Option<(
         std::sync::Arc<carrick_kernel::el1_ipc::HostIpc>,
-        &'static carrick_el1_abi::ipc_tables::IpcTableMap,
+        &'a carrick_el1_abi::ipc_tables::IpcTableMap,
     )>,
     #[cfg(test)]
     physical: Option<std::sync::Mutex<native_retirement_tests::PhysicalStock>>,
@@ -290,7 +290,7 @@ struct TestStockCrossing {
     commit_fault: std::sync::Mutex<CommitFault>,
     pending_loan: std::sync::Mutex<Option<ForkStockLoan>>,
     retirements: AtomicUsize,
-    zone: std::sync::Mutex<Option<&'static ZoneTables<Aarch64ParkedContext>>>,
+    zone: std::sync::Mutex<Option<&'a ZoneTables<Aarch64ParkedContext>>>,
     child: std::sync::Mutex<Option<(carrick_el1_abi::ExecutionBinding, AddressContext<RootGpa>)>>,
     handbacks: AtomicUsize,
     root_exits: AtomicUsize,
@@ -309,7 +309,7 @@ struct TestStockCrossing {
     refuse_root_seed: core::sync::atomic::AtomicBool,
 }
 
-impl TestStockCrossing {
+impl TestStockCrossing<'_> {
     fn has_physical(&self) -> bool {
         #[cfg(test)]
         {
@@ -367,7 +367,7 @@ impl TestStockCrossing {
     }
 }
 
-impl ForkStockCrossing for TestStockCrossing {
+impl ForkStockCrossing for TestStockCrossing<'_> {
     fn cross_root_fork_seed(&self, record_va: u64, _cpu: u64) -> Result<(), NativeProcessError> {
         // SAFETY: the synchronous crossing retains the ring's boxed record.
         let record = unsafe { &mut *(record_va as *mut carrick_core_abi::service::RootForkSeed) };
@@ -808,16 +808,16 @@ impl ForkStockCrossing for TestStockCrossing {
     }
 }
 
-struct Fixture {
-    zone: &'static ZoneTables<Aarch64ParkedContext>,
+struct Fixture<'a> {
+    zone: &'a ZoneTables<Aarch64ParkedContext>,
     task: CurrentTask,
     slot: SlotId,
     address: AddressContext<RootGpa>,
-    region: &'static crate::mm_portal::test_support::Region,
+    region: &'a crate::mm_portal::test_support::Region,
     tables: crate::mm_portal::test_support::Tables,
     maintenance: CallerInvalidatesAsid,
-    page: &'static ThreadLifecyclePage,
-    control: &'static ThreadControlSlot,
+    page: &'a ThreadLifecyclePage,
+    control: &'a ThreadControlSlot,
     #[cfg(test)]
     leader: ThreadIdentity,
 }
@@ -1323,7 +1323,7 @@ fn arm_unregistered_pool_cancel_reaps_entry_before_host_cleanup() {
     }
 }
 
-impl Fixture {
+impl Fixture<'static> {
     #[cfg(test)]
     fn new(root_gpa: u64, asid: carrick_guest_arch::Asid) -> Self {
         Self::with_file_table(root_gpa, asid, 5)
@@ -1343,7 +1343,57 @@ impl Fixture {
         page: &'static ThreadLifecyclePage,
     ) -> Self {
         let control = Box::leak(Box::new(ThreadControlSlot::new()));
-        Self::with_identity(
+        Self::with_region(
+            root_gpa,
+            asid,
+            file_table,
+            Box::leak(Box::new(crate::mm_portal::test_support::Region::new())),
+            page,
+            control,
+        )
+    }
+    #[cfg(test)]
+    fn with_identity(
+        root_gpa: u64,
+        asid: carrick_guest_arch::Asid,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        leader: ThreadIdentity,
+    ) -> Self {
+        Self::with_identity_and_arena(root_gpa, asid, page, control, leader, 0x1000_0000)
+    }
+    #[cfg(test)]
+    fn with_identity_and_arena(
+        root_gpa: u64,
+        asid: carrick_guest_arch::Asid,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        leader: ThreadIdentity,
+        arena_len: u64,
+    ) -> Self {
+        Self::with_region_identity(
+            Box::leak(Box::new(crate::mm_portal::test_support::Region::new())),
+            root_gpa,
+            asid,
+            page,
+            control,
+            leader,
+            arena_len,
+        )
+    }
+}
+
+impl<'a> Fixture<'a> {
+    fn with_region(
+        root_gpa: u64,
+        asid: carrick_guest_arch::Asid,
+        file_table: u64,
+        region: &'a crate::mm_portal::test_support::Region,
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+    ) -> Self {
+        Self::with_region_identity(
+            region,
             root_gpa,
             asid,
             page,
@@ -1359,22 +1409,16 @@ impl Fixture {
                 lifecycle_page: page as *const _ as u64,
                 control_slot: control as *const _ as u64,
             },
+            0x1000_0000,
         )
     }
-    fn with_identity(
+
+    fn with_region_identity(
+        region: &'a crate::mm_portal::test_support::Region,
         root_gpa: u64,
         asid: carrick_guest_arch::Asid,
-        page: &'static ThreadLifecyclePage,
-        control: &'static ThreadControlSlot,
-        leader: ThreadIdentity,
-    ) -> Self {
-        Self::with_identity_and_arena(root_gpa, asid, page, control, leader, 0x1000_0000)
-    }
-    fn with_identity_and_arena(
-        root_gpa: u64,
-        asid: carrick_guest_arch::Asid,
-        page: &'static ThreadLifecyclePage,
-        control: &'static ThreadControlSlot,
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
         leader: ThreadIdentity,
         arena_len: u64,
     ) -> Self {
@@ -1409,9 +1453,7 @@ impl Fixture {
             ));
         }
 
-        let region_box = Box::new(crate::mm_portal::test_support::Region::new());
-        let region = Box::leak(region_box);
-        let zone: &'static ZoneTables<Aarch64ParkedContext> = unsafe {
+        let zone: &'a ZoneTables<Aarch64ParkedContext> = unsafe {
             &*region
                 .ptr
                 .as_ptr()
@@ -1512,6 +1554,9 @@ impl Fixture {
             leader,
         }
     }
+}
+
+impl Fixture<'static> {
     #[cfg(test)]
     fn enter<R>(
         &'static self,
@@ -1537,7 +1582,9 @@ impl Fixture {
         )
     }
     #[cfg(test)]
-    fn process_service(&'static self) -> Aarch64NativeProcessService<'static, TestStockCrossing> {
+    fn process_service(
+        &'static self,
+    ) -> Aarch64NativeProcessService<'static, TestStockCrossing<'static>> {
         Aarch64NativeProcessService::with_crossing(
             &self.task,
             self.slot,
@@ -1549,7 +1596,7 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
+impl Drop for Fixture<'_> {
     fn drop(&mut self) {
         let leftover =
             super::aarch64_process::drain_and_clear_retired_scope(self.zone, self.region.table());
@@ -3549,7 +3596,7 @@ pub fn with_native_file_fork(
     witness: impl FnOnce(&CurrentTask),
 ) {
     struct Crossing<'a> {
-        stock: TestStockCrossing,
+        stock: TestStockCrossing<'a>,
         fds: &'a [carrick_el1_abi::FdMapSlot],
         opens: &'a [carrick_el1_abi::DelegatedOpenFile],
     }
@@ -3677,7 +3724,7 @@ pub fn with_native_file_fork(
     assert_eq!(crossing.stock.retirements.load(Ordering::Acquire), 1);
 }
 
-impl super::thread_setup::LifecycleVenue for Fixture {
+impl super::thread_setup::LifecycleVenue for Fixture<'_> {
     fn thread<'a>(
         &'a self,
         task: &'a CurrentTask,
@@ -10628,7 +10675,10 @@ fn native_descriptor_metadata_witness(
     use carrick_personality_linux::dispatch::CompletionRoute;
     use std::sync::Arc;
 
-    let fixture = Fixture::new(0x10000, asid(1));
+    let fixture_region = crate::mm_portal::test_support::Region::new();
+    let page = Box::new(ThreadLifecyclePage::new());
+    let control = Box::new(ThreadControlSlot::new());
+    let fixture = Fixture::with_region(0x10000, asid(1), 5, &fixture_region, &page, &control);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -10711,7 +10761,7 @@ fn native_descriptor_metadata_witness(
         description
     });
 
-    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let region = carrick_test_support::TestEl1Region::zeroed();
     let map = unsafe {
         &*region
             .as_ptr()

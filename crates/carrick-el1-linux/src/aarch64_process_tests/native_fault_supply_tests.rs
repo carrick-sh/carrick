@@ -5355,7 +5355,7 @@ fn native_owner_code_range(whole: bool) {
     // proposal, descriptor edits, completion and accounting remain production.
     struct Venue<'a> {
         call: AnonymousCall,
-        fixture: &'static Fixture,
+        fixture: &'static Fixture<'static>,
         counters: &'a Counters,
         editor: FixtureMapping<'a>,
     }

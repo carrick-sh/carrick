@@ -579,8 +579,8 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
 
 struct HostResumeCpu<'a> {
     inner: crate::sched::FakeCpu,
-    fixture: &'static Fixture,
-    service: &'a mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    fixture: &'static Fixture<'static>,
+    service: &'a mut Aarch64NativeProcessService<'static, TestStockCrossing<'static>>,
     owner: RecordId,
     owner_resumes: usize,
     expect_initial_deferred: bool,

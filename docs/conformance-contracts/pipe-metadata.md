@@ -99,3 +99,24 @@ ARM and decoded-x86 empty-cwd witnesses return EBADF(9) instead of forwarding
 to the path owner. Restoring it passes all eight pathname/control witnesses.
 The automatically merged surface registry also needs its existing allocation
 binding placed after the x86 integration bindings to retain sorted admission.
+
+## VM-free fixture lifetime (round 7)
+
+The root/child and exec-successor metadata witnesses own their carrier regions,
+lifecycle pages and controls for one test. `Fixture` and `TestStockCrossing`
+borrow that storage instead of requiring static references. The existing
+`Region::drop` drains retired scope and deallocates the carrier; the separate
+IPC-map region in the root/child witness is also an owned box.
+
+Exec root registration stores a registry reference in the runtime that the
+registry retains. A test-local `RegistryOwner` keeps this self-borrow's
+allocation stable and releases it after all entries and services, before the
+fixture storage. It also runs on assertion unwind. The existing host-region
+pointer restoration guard remains active, and the name cache is now owned.
+No carrier size, test concurrency, assertion or expected value changes.
+
+RSS evidence uses the same serial test-binary filters before and after the
+change. The director approved Python `resource.getrusage(RUSAGE_CHILDREN)`
+(maximum resident set size in KiB on Linux) because this worker lacks GNU time.
+The unfixed full serial population was SIGKILLed; the fixed population must
+finish, rather than passing by splitting the process or omitting tests.

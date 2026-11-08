@@ -50,7 +50,18 @@ fn fork_exec_successor_with_metadata(
     bitset: u64,
     metadata: Option<super::pipe_metadata_tests::Case>,
 ) {
-    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let fixture_region = crate::mm_portal::test_support::Region::new();
+    let page = Box::new(ThreadLifecyclePage::new());
+    let control = Box::new(ThreadControlSlot::new());
+    let fixture = Box::new(Fixture::with_region(
+        0x10000,
+        asid(1),
+        5,
+        &fixture_region,
+        &page,
+        &control,
+    ));
+    let fixture = fixture.as_ref();
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
         fn drop(&mut self) {
@@ -96,7 +107,15 @@ fn fork_exec_successor_with_metadata(
     }
     // Fork, exec and dispatch use the same published table map, just as the
     // carrier does. The fixture registered this retained EL1 region above.
-    let map = carrick_el1_abi::ipc_table_map_host().unwrap();
+    // SAFETY: the scoped fixture owns the aligned carrier region for all users.
+    let map = unsafe {
+        &*fixture
+            .region
+            .ptr
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
     map.publish(5, table.id().to_raw()).unwrap();
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);
@@ -104,6 +123,22 @@ fn fork_exec_successor_with_metadata(
     crossing.ipc = Some((owner.clone(), map));
     let words = fixture.tables.live(&fixture.maintenance);
     let tables = crate::ipc::MapTables(map);
+    // Root registration stores a registry reference in the runtime it retains.
+    // Keep that self-borrow stable, then destroy the registry after all entries
+    // and services but before the fixture region, including on assertion panic.
+    struct RegistryOwner<'a>(
+        *mut NativeProcessRegistry<'a, AddressContext<RootGpa>, Aarch64ParkedContext>,
+    );
+    impl Drop for RegistryOwner<'_> {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns the original Box; all callers have ended.
+            unsafe { drop(Box::from_raw(self.0)) };
+        }
+    }
+    let registry = Box::into_raw(Box::new(NativeProcessRegistry::new()));
+    let _registry_owner = RegistryOwner(registry);
+    // SAFETY: the guard keeps this allocation stable until all users drop.
+    let registry = unsafe { &*registry };
     let runtime = Arc::new(
         NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
             source,
@@ -117,7 +152,6 @@ fn fork_exec_successor_with_metadata(
         .unwrap(),
     );
     runtime.give_fixture_root_a_cwd();
-    let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
     registry
         .register_root(runtime.clone(), source, &fixture.task, fixture.address)
         .unwrap();
@@ -339,11 +373,8 @@ fn fork_exec_successor_with_metadata(
     }
     let mut cpu = crate::sched::FakeCpu::default();
     assert_eq!(fixture.slot.raw(), 0);
-    // SAFETY: zero is the valid empty name-cache state; retained by fixture.
-    let names = unsafe {
-        &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::InotifyNameCache>())
-            .cast::<carrick_el1_abi::InotifyNameCache>()
-    };
+    // SAFETY: zero is the valid empty name-cache state; storage stays scoped.
+    let names = unsafe { Box::<carrick_el1_abi::InotifyNameCache>::new_zeroed().assume_init() };
     let mut call_full = |nr, fd, address, count, extra| {
         let mut frame = carrick_el1_abi::TrapFrame {
             elr: 0x400004,
@@ -404,7 +435,7 @@ fn fork_exec_successor_with_metadata(
                 &[]
             },
             &[],
-            names,
+            &names,
             Some(crate::dispatch::Zone {
                 tables: fixture.zone,
                 cpu: &mut cpu,
