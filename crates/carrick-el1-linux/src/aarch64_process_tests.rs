@@ -2160,6 +2160,99 @@ fn renewed_root_resume_refreshes_pid_before_admission() {
 }
 
 #[test]
+fn registered_child_return_rejects_supplied_root_lifecycle_page() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ]);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        crossing,
+    )
+    .with_words(words);
+    let child_pid = fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |entry| {
+                let LifecycleOutcome::Returned { result, .. } =
+                    entry.fork(ProcessForkChildTid::NONE)
+                else {
+                    panic!("production fork must return a child");
+                };
+                result.raw() as u32
+            },
+        )
+        .unwrap();
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let root = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child = runtime.namespace_child_key(root, child_pid).unwrap();
+    let child = runtime.task_binding(child).unwrap();
+    let child_identity = fixture.zone.record(child.record.id).identity();
+    assert_ne!(child_identity.lifecycle_page, fixture.leader.lifecycle_page);
+    assert_eq!(fixture.page.live(), 1);
+
+    fixture.zone.clear_current(fixture.slot);
+    activate(source, &fixture.task, &child);
+    fixture
+        .task
+        .publish_root_generation(child.address.generation);
+    // SAFETY: the live child record retains this exact control slot.
+    let child_control =
+        unsafe { &*(child_identity.control_slot as *const carrick_el1_abi::ThreadControlSlot) };
+    // SAFETY: the live child record retains this exact lifecycle page.
+    let child_page =
+        unsafe { &*(child_identity.lifecycle_page as *const carrick_el1_abi::ThreadLifecyclePage) };
+    // Confirm this binding already reaches the registered-member fast path.
+    assert!(matches!(
+        registry().admit_existing_group(
+            source,
+            &fixture.task,
+            child.address,
+            child_page,
+            child_control,
+        ),
+        Ok(crate::native_process_runtime::NativeGroupAdmission::Existing(_))
+    ));
+    let outcome = registry()
+        .admit_existing_group(
+            source,
+            &fixture.task,
+            child.address,
+            fixture.page,
+            child_control,
+        )
+        .map(|_| ());
+    assert!(
+        matches!(
+            outcome,
+            Err(crate::native_process_runtime::NativeAdmissionError {
+                error: NativeProcessError::Stale,
+                ..
+            })
+        ),
+        "registered child return must reject the supplied root lifecycle page: {outcome:?}"
+    );
+}
+
+#[test]
 fn test_fork_child_gets_distinct_root_and_x0_zero() {
     let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
