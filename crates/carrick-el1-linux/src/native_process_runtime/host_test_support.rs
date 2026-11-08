@@ -2288,7 +2288,10 @@ fn register_thread_busy_keeps_birth_authenticable() {
             fixture.page,
             sibling.control
         ),
-        Err(NativeProcessError::Busy)
+        Err(NativeAdmissionError::Contended(ref contention))
+            if contention.origin == NativeAdmissionOrigin::ThreadPendingCustody
+                && contention.binding == binding
+                && contention.conflicting_owner == Some(binding)
     ));
     assert!(
         IssuedHostThread::authenticate(
