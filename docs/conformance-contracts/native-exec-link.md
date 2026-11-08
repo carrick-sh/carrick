@@ -19,7 +19,8 @@ The root fork seed additionally captures the root dispatcher's current
 executable beside the filesystem seed. Its short-lived CPU slot is qualified
 by the stopped execution identity and consumed at fork reservation. This is
 part of the existing `RootOnlyState::RootForkSeed` retirement obligation;
-remove it when the host-served root is removed.
+remove it when the host-served root exits or its predecessor MM retires on
+image replacement, including a seed left by a refused fork reservation.
 
 Canonical syscall 78 stages a path record with the caller's access context.
 The carrier receives the executable from the authenticated caller MM, and
