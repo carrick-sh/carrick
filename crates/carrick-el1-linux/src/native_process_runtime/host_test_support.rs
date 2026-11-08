@@ -2532,6 +2532,255 @@ fn add_signal_sibling(
     }
 }
 
+#[cfg(test)]
+fn park_anonymous_sibling(
+    fixture: &NativeSignalFixture,
+    sibling: &ExecSibling,
+) -> carrick_sched_core::object_wait::ObjectWaitKey {
+    use carrick_core::wait::{
+        EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait, park_object_record,
+    };
+    use carrick_sched_core::object_wait::ObjectWaitError;
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+
+    let space = fixture.zone.space_entry(NonZeroU64::MIN).unwrap();
+    space
+        .admit_notifications(
+            NonZeroU64::MIN,
+            &carrick_sched_core::ShortLockSpin,
+            &|effects| {
+                crate::sched::object_wait::deliver_completion(fixture.zone, sibling.slot, effects)
+            },
+        )
+        .unwrap();
+    let notifications = space.notifications(NonZeroU64::MIN).unwrap();
+    let key = notifications.key(SpaceWaitCause::Editor);
+    let outcome = coordinate_anonymous_edit_wait(
+        &notifications,
+        None,
+        || Some(Some(SpaceWaitCause::Editor)),
+        |key, snapshot, operation| {
+            let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, operation, None);
+            let parked = park_object_record(
+                fixture.zone,
+                sibling.slot,
+                request,
+                &|effects| {
+                    crate::sched::object_wait::deliver_completion(
+                        fixture.zone,
+                        sibling.slot,
+                        effects,
+                    )
+                },
+                || {
+                    let record = fixture
+                        .zone
+                        .slot(sibling.slot)
+                        .current()
+                        .or_else(|| fixture.zone.slot(sibling.slot).host_record())
+                        .ok_or(ObjectWaitError::Stale)?;
+                    // SAFETY: this fixture owns the selected sibling record until park publishes.
+                    *unsafe { fixture.zone.record(record).ctx_mut() } = words(fixture.address);
+                    Ok((record, false))
+                },
+            );
+            if let Err((error, _)) = &parked {
+                panic!("anonymous sibling park failed: {error:?}");
+            }
+            parked
+        },
+    );
+    let EditWaitOutcome::Parked(_) = outcome else {
+        panic!("anonymous sibling must enter the production object wait");
+    };
+    assert_eq!(
+        fixture
+            .zone
+            .object_queue_census(key.index())
+            .unwrap()
+            .waiters,
+        1
+    );
+    key
+}
+
+#[test]
+fn caught_signal_entry_interrupts_parked_anonymous_edit_without_eintr() {
+    let fixture = native_exec_fixture();
+    let sibling = add_signal_sibling(&fixture, None, false);
+    let key = park_anonymous_sibling(&fixture, &sibling);
+    let binding = crate::common_entry::execution_binding(sibling.task);
+    let event = carrick_el1_abi::ExternalSignalRecord::new(
+        carrick_core_abi::EntryEventIdentity::from_binding(binding),
+        binding,
+        sibling.record,
+        carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::MIN),
+        carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+        carrick_el1_abi::ExternalSignalSource::InZoneIpc,
+    );
+    let mut service = fixture.service();
+    assert!(
+        fixture
+            .registry
+            .admit_external_event(fixture.zone, event, fixture.slot, &mut service)
+            .unwrap()
+    );
+    assert_eq!(
+        fixture
+            .zone
+            .object_queue_census(key.index())
+            .unwrap()
+            .waiters,
+        0,
+        "the real signal entry must detach the anonymous edit waiter"
+    );
+    assert_eq!(
+        fixture.zone.record(sibling.record.id).handback(),
+        Some(carrick_sched_core::Handback::Signal),
+        "caught signal retains the operation for syscall-instruction replay"
+    );
+    assert!(
+        fixture
+            .zone
+            .record(sibling.record.id)
+            .has_object_operation(),
+        "signal interruption cannot synthesize EINTR or discard the anonymous call"
+    );
+}
+
+#[test]
+fn exit_group_entry_cancels_parked_anonymous_edit_without_effects() {
+    let fixture = native_exec_fixture();
+    let sibling = add_signal_sibling(&fixture, None, false);
+    let key = park_anonymous_sibling(&fixture, &sibling);
+    let reservation_revision = fixture
+        .zone
+        .space_entry(NonZeroU64::MIN)
+        .unwrap()
+        .notifications(NonZeroU64::MIN)
+        .unwrap()
+        .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.exit_group(23),
+        LifecycleOutcome::Transferred { .. }
+    ));
+    assert!(entry.take_run_failure().is_none());
+    assert_eq!(
+        fixture
+            .zone
+            .object_queue_census(key.index())
+            .unwrap()
+            .waiters,
+        0,
+        "the real exit entry must unlink the anonymous waiter"
+    );
+    assert_eq!(
+        fixture.zone.record(sibling.record.id).handback(),
+        Some(carrick_sched_core::Handback::Cancelled)
+    );
+    assert_eq!(
+        fixture
+            .zone
+            .space_entry(NonZeroU64::MIN)
+            .unwrap()
+            .notifications(NonZeroU64::MIN)
+            .unwrap()
+            .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations),
+        reservation_revision,
+        "terminal cancellation cannot publish an anonymous edit"
+    );
+}
+
+#[test]
+fn exec_entry_cancels_parked_anonymous_edit_without_effects() {
+    let fixture = native_exec_fixture();
+    let sibling = add_signal_sibling(&fixture, None, false);
+    let key = park_anonymous_sibling(&fixture, &sibling);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(
+                test_exec_payload(b"/bin/static"),
+                None,
+                NativeServiceCall::new(
+                    carrick_guest_arch::NativeOrdinal::new(221),
+                    &carrick_el1_abi::Counters::new()
+                )
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let _successor =
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 0x1846, 0xa0_0000);
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    // SAFETY: the production service completion selected this exact root record.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::Left(None))
+    ));
+    assert!(entry.take_run_failure().is_none());
+    assert_eq!(
+        fixture
+            .zone
+            .object_queue_census(key.index())
+            .unwrap()
+            .waiters,
+        0,
+        "the real exec entry must unlink the anonymous waiter"
+    );
+    assert_eq!(
+        fixture.zone.record(sibling.record.id).handback(),
+        Some(carrick_sched_core::Handback::Cancelled)
+    );
+}
+
 #[path = "tests/terminal_park.rs"]
 pub mod terminal_park_tests;
 
