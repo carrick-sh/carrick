@@ -43,3 +43,22 @@ The director must rerun `el1_files_exit_group_stress` on the exact signed head
 against the paired base population (ten runs per artifact), and the changed
 runtime crate's Mac tests. No signed or runtime-ratio acceptance is claimed by
 the VM-free bindings.
+
+The native resume checkpoint must also recognize the anonymous kind when
+choosing saved-syscall replay. `anonymous_release_resumes_through_syscall_replay`
+enrolls through the production coordinator, releases the queue, selects the
+record and enters that checkpoint. It was red when the checkpoint tested only
+adapter ownership: an anonymous wake returned `NoPending`. The x86 guest then
+resumed after `SYSCALL` with its original ordinal in RAX (`munmap` returned 11,
+`mprotect` returned 10), taking the witnesses' exit-9 failure branch instead of
+completing with zero and exiting 7. Recognizing `AnonymousEdit` for replay
+preserves its exclusion from adapter custody; metadata and prepared-edit policy
+are unchanged. This adds no queue, lock, retry loop or service operation.
+
+Isolated KVM builds distinguish this from the earlier rebase: the pre-rebase
+head passes all seven anonymous witnesses, and the rebased head passes the
+three affected witnesses. The latter run separately failed the
+contention-then-metadata witness with an unexpected idle-peer physical doorbell;
+it is not evidence of a clean full suite at that revision. The range-diff's
+changed contexts in patches 5 and 14 do not explain the lost replay. The
+regression follows the later introduction of typed anonymous tokens.
