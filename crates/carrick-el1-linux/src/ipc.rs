@@ -5492,14 +5492,19 @@ mod tests {
         // Busy: the unrelated writer is mid-update.
         seq.fetch_add(1, Ordering::Release);
         assert_eq!(
-            tables.table_of(&task),
+            tables.table_for_file_table(child),
             None,
-            "precondition: the fail-forward lookup reads the update as no table"
+            "precondition: the arbitrary-key lookup reads the update as no table"
         );
         assert_eq!(
             native_exec_table(&tables, &task),
             expected,
             "an unrelated update must not make fexecve ENOSYS"
+        );
+        assert_eq!(
+            tables.table_of(&task),
+            Some(raw(2)),
+            "current-task custody survives the same update"
         );
         // Then success: the writer publishes.
         seq.fetch_add(1, Ordering::Release);
