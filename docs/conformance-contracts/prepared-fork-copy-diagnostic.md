@@ -60,6 +60,7 @@ cause; no identity fix is justified by these VM-free projections.
 The director must run signed HVF selectors
 `el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes` and
 `el1_prepared_fork_poll_arguments_touched_after_fork` via `just test-embed`.
-Their failed output assertions include the carrier counter rows directly,
-with original reason and both bindings, without LLDB. Signed AT/LDTRB
+Their failed output assertions and unwound harness failures include the
+carrier counter rows directly, with original reason and both bindings,
+without LLDB. Signed AT/LDTRB
 attribution remains required before claiming a cause fix.
