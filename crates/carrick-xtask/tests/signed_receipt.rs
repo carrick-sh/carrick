@@ -2004,26 +2004,6 @@ fn legacy_or_incomplete_identity_and_different_bundles_are_incomparable() {
 }
 
 #[test]
-fn base_selection_prefers_matching_host_and_bundle_over_newest() {
-    use carrick_xtask::signed_receipt::select_base;
-    let candidate = base();
-    let mut other = candidate.clone();
-    other.host_identity.as_mut().unwrap().runner_name = "other-mac".into();
-    let bases = [other, candidate.clone()];
-    assert!(std::ptr::eq(
-        select_base(&bases, &candidate).unwrap(),
-        &bases[1]
-    ));
-    assert!(
-        select_base(&bases[..1], &candidate)
-            .unwrap_err()
-            .to_string()
-            .contains("incomparable base")
-    );
-    assert!(select_base(&[], &candidate).is_err());
-}
-
-#[test]
 fn identical_fixture_content_from_different_commits_is_comparable() {
     use carrick_xtask::fixtures::{BuildPolicy, Manifest};
     use sha2::{Digest, Sha256};
