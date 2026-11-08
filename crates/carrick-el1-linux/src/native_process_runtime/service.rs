@@ -415,7 +415,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                             .is_some()
                 })
             };
-            let _ = self.zone.claim_for_host(
+            let claimed = self.zone.claim_for_host(
                 record,
                 None,
                 if terminal {
@@ -425,6 +425,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 },
                 &carrick_sched_core::ShortLockSpin,
             );
+            if matches!(claimed, carrick_sched_core::HostClaim::Claimed)
+                && member.is_native_owned()
+                && let Some(placement) = self.zone.place_native_handback(record)
+                && placement.resched
+            {
+                let mut effects = WakeEffects::default();
+                effects.request_reschedule(placement.slot);
+                service.wake_effects(effects);
+            }
             return Ok(());
         }
         let pending = self

@@ -777,6 +777,25 @@ fn production_anonymous_caught_signal_returns_and_reexecutes() {
     let stack_pointer = code.len();
     code.extend_from_slice(&0_u64.to_le_bytes());
 
+    // Prove every page later used by the signal frame is resident and writable
+    // before signal delivery, so a delivery failure cannot be mistaken for a
+    // fixture mapping hole.
+    for offset in (0x4000_u64..=0xe000).step_by(0x1000) {
+        append_mov(&mut code, &[0x48, 0xb8], IMAGE_BASE + offset);
+        code.extend_from_slice(&[0xc6, 0x00, 0x5a]); // mov byte ptr [rax],0x5a
+    }
+
+    // Install a fixture-private alternate stack in the writable ELF segment.
+    // Reading the action back below proves the real rt_sigaction entry retained
+    // the exact handler before the injected signal reaches production ingress.
+    code.extend_from_slice(&[0x48, 0xbf]); // movabs rdi,stack_t
+    let altstack_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xf6]); // xor esi,esi
+    append_mov(&mut code, &[0x48, 0xb8], 131); // sigaltstack
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+
     append_mov(&mut code, &[0x48, 0xbf], 10); // SIGUSR1
     code.extend_from_slice(&[0x48, 0xbe]); // movabs rsi,action
     let action_pointer = code.len();
@@ -786,6 +805,32 @@ fn production_anonymous_caught_signal_returns_and_reexecutes() {
     append_mov(&mut code, &[0x48, 0xb8], 13); // rt_sigaction
     code.extend_from_slice(&[0x0f, 0x05]);
     append_result_check(&mut code, &mut failures, 0);
+
+    append_mov(&mut code, &[0x48, 0xbf], 10); // SIGUSR1
+    code.extend_from_slice(&[0x31, 0xf6]); // xor esi,esi
+    code.extend_from_slice(&[0x48, 0xba]); // movabs rdx,queried action
+    let queried_action_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    append_mov(&mut code, &[0x49, 0xba], 8);
+    append_mov(&mut code, &[0x48, 0xb8], 13); // rt_sigaction
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x48, 0xb8]); // movabs rax,handler
+    let expected_handler = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x39, 0x02, 0x0f, 0x85]); // cmp [rdx],rax; jne failure
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    append_mov(&mut code, &[0x48, 0xb8], 0x0c00_0000);
+    code.extend_from_slice(&[0x48, 0x39, 0x42, 8, 0x0f, 0x85]); // cmp [rdx+8],rax
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xb8]); // movabs rax,restorer
+    let expected_restorer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x39, 0x42, 16, 0x0f, 0x85]); // cmp [rdx+16],rax
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
 
     append_mov(&mut code, &[0x48, 0xb8], INJECT_CAUGHT_SIGNAL_ON_PARK);
     code.extend_from_slice(&[0x0f, 0x05]);
@@ -819,10 +864,23 @@ fn production_anonymous_caught_signal_returns_and_reexecutes() {
     }
     let action = IMAGE_BASE + code.len() as u64;
     code.extend_from_slice(&handler.to_le_bytes());
-    code.extend_from_slice(&0x0400_0000_u64.to_le_bytes()); // SA_RESTORER
+    code.extend_from_slice(&0x0c00_0000_u64.to_le_bytes()); // SA_RESTORER | SA_ONSTACK
     code.extend_from_slice(&restorer.to_le_bytes());
     code.extend_from_slice(&0_u64.to_le_bytes());
+    let queried_action = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&[0; 32]);
+    let altstack_record = IMAGE_BASE + code.len() as u64;
+    let altstack_base = IMAGE_BASE + 0x4000;
+    let altstack_size = 0xb000_u64;
+    code.extend_from_slice(&altstack_base.to_le_bytes());
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&altstack_size.to_le_bytes());
     code[action_pointer..action_pointer + 8].copy_from_slice(&action.to_le_bytes());
+    code[queried_action_pointer..queried_action_pointer + 8]
+        .copy_from_slice(&queried_action.to_le_bytes());
+    code[expected_handler..expected_handler + 8].copy_from_slice(&handler.to_le_bytes());
+    code[expected_restorer..expected_restorer + 8].copy_from_slice(&restorer.to_le_bytes());
+    code[altstack_pointer..altstack_pointer + 8].copy_from_slice(&altstack_record.to_le_bytes());
     code.resize(0x1_0000, 0);
     let stack = IMAGE_BASE + 0xfff0;
     code[stack_pointer..stack_pointer + 8].copy_from_slice(&stack.to_le_bytes());
