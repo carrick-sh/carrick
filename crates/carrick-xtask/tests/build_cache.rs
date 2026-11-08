@@ -465,6 +465,9 @@ fn signed_gate_recipes_remove_ambient_target_overrides() {
                 .command("--no-deps")
                 .arg(recipe)
                 .env("CARRICK_TEST_TARGET", "accidentally_exported")
+                .env("CARRICK_XTASK_BIN", env!("CARGO_BIN_EXE_carrick-xtask"))
+                .env("CARRICK_HOST_LEASE_PATH", build.root.path().join("host-lease"))
+                .env_remove("CARRICK_HOST_LEASE_SOCKET")
                 .output()
                 .unwrap(),
         );
