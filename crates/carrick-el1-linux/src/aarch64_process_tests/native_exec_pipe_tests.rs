@@ -95,14 +95,9 @@ fn fork_exec_successor_with_metadata(
             description.install(table.id(), fd::Fd(6), true).unwrap();
         }
     }
-    let storage = Box::leak(carrick_test_support::TestEl1Region::zeroed());
-    // SAFETY: aligned storage is retained for both inherited table bindings.
-    let map = unsafe {
-        &*storage
-            .as_ptr()
-            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
-            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
-    };
+    // Fork, exec and dispatch use the same published table map, just as the
+    // carrier does. The fixture registered this retained EL1 region above.
+    let map = carrick_el1_abi::ipc_table_map_host().unwrap();
     map.publish(5, table.id().to_raw()).unwrap();
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);

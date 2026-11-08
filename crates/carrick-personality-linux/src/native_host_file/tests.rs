@@ -48,7 +48,9 @@ fn memory(bytes: &[u8]) -> Memory {
 /// Descriptors: 0 pipe, 1 host stdout, 3 host file (read-only), 4 eventfd.
 fn caller(fd: i32) -> Option<NativeDescriptor> {
     Some(match fd {
-        0 => NativeDescriptor::InZone(InZoneKind::Pipe),
+        0 => NativeDescriptor::InZone(InZoneKind::Pipe(
+            carrick_syscall_abi::LinuxPipeIdentity::new(1, 1),
+        )),
         1 => NativeDescriptor::HostBacked {
             access: DescriptionAccess::ReadWrite,
         },
@@ -200,7 +202,7 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
         pipe,
         Some(HostFileStage::InRingReply {
             output,
-            bytes: stat(&carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE),
+            bytes: stat(&carrick_syscall_abi::LinuxPipeIdentity::new(1, 1).stat_fields()),
         })
     );
     let Some(HostFileStage::InRingReply { bytes, .. }) = pipe else {
@@ -245,7 +247,7 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
                 len: LINUX_STATX_BYTES,
             },
             bytes: zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStatx::from_fields(
-                &carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE
+                &carrick_syscall_abi::LinuxPipeIdentity::new(1, 1).stat_fields()
             ))
             .into(),
         })
@@ -704,7 +706,7 @@ fn chdir_stages_one_lookup_and_reads_the_directory_from_its_reply() {
     assert_eq!(view.output_capacity(), CHDIR_REPLY_BYTES);
 
     let mut stat = carrick_syscall_abi::LinuxStat::from_fields(
-        &carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE,
+        &carrick_syscall_abi::LinuxPipeIdentity::new(1, 1).stat_fields(),
     );
     stat.st_mode = carrick_syscall_abi::LINUX_S_IFDIR | 0o755;
     let mut reply = zerocopy::IntoBytes::as_bytes(&stat).to_vec();

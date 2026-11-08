@@ -409,6 +409,15 @@ fn abort_child(
 }
 
 impl NativeProcessService<'static, ParkedContextWords> for Service {
+    fn exec_ipc_binding(
+        &self,
+    ) -> Option<(
+        carrick_el1_abi::ipc::IpcRegion<'_>,
+        &carrick_el1_abi::ipc_tables::IpcTableMap,
+    )> {
+        let venue = carrick_el1_linux::ipc::guest_venue(self.slot.raw() as u32)?;
+        Some((venue.region, carrick_el1_abi::ipc_table_map_guest()))
+    }
     type Mm = Mm;
     type PreparedMm = Prepared;
     type Born = Box<Born>;

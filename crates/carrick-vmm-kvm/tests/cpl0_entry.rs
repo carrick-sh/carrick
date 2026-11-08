@@ -2281,3 +2281,156 @@ fn file_region_guest_refuses_unpublished_binding() {
         "{error}"
     );
 }
+
+/// Execute real Linux metadata syscalls in CPL0; any mismatch exits with the
+/// numbered assertion. No read/write transfer is needed (#1756).
+#[test]
+fn production_pipe_metadata_stays_in_the_ring_namespace() {
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    fn mov(code: &mut Vec<u8>, register: u8, value: u64) {
+        code.extend_from_slice(&[0x48, 0xb8 + register]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    fn check(code: &mut Vec<u8>, failures: &mut Vec<usize>, expected: i32) {
+        code.extend_from_slice(&[0x48, 0x3d]); // cmp rax, imm32
+        code.extend_from_slice(&expected.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x85]); // jne fail
+        failures.push(code.len());
+        code.extend_from_slice(&[0; 4]);
+    }
+    fn call(code: &mut Vec<u8>, number: u64, args: [u64; 3]) {
+        for (reg, arg) in [(7, args[0]), (6, args[1]), (2, args[2])] {
+            mov(code, reg, arg);
+        }
+        mov(code, 0, number);
+        code.extend_from_slice(&[0x0f, 0x05]);
+    }
+    // #1807: standard fd F_GETFD must have an x86 crossing on a decline.
+    call(&mut code, 72, [1, 1, 0]);
+    check(&mut code, &mut failures, 0);
+    // Reserve writable user stack for pipe fds, stat, ioctl and empty path.
+    code.extend_from_slice(&[0x48, 0x81, 0xec, 0x00, 0x04, 0x00, 0x00]);
+    // pipe2(rsp, O_NONBLOCK), then read the allocated read fd into r12d.
+    code.extend_from_slice(&[0x48, 0x89, 0xe7]);
+    mov(&mut code, 6, carrick_abi::LINUX_O_NONBLOCK);
+    mov(&mut code, 0, 293);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x44, 0x8b, 0x24, 0x24]);
+    // Every operation below resolves this exact ring-owned fd.
+    for (nr, command, value, expected) in [
+        (72, 3, 0, 2048), // F_GETFL
+        (72, 4, 0, 0),    // F_SETFL
+        (72, 3, 0, 0),
+        (72, 2, 1, 0), // F_SETFD
+        (72, 1, 0, 1),
+        (72, 1032, 0, 65536),
+        (72, 1031, 4096, 4096),
+        (72, 1032, 0, 4096),
+        (16, 0x5450, 0, 0), // FIONCLEX
+        (72, 1, 0, 0),
+        (16, 0x5451, 0, 0), // FIOCLEX
+        (72, 1, 0, 1),
+        (16, 0x5401, 0, -25),
+        (8, 0, 0, -29),
+    ] {
+        code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // rdi=r12
+        mov(&mut code, 6, command);
+        mov(&mut code, 2, value);
+        mov(&mut code, 0, nr);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        check(&mut code, &mut failures, expected);
+    }
+    // fstat into rsp+16, verify the x86 mode offset (24).
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7, 0x48, 0x8d, 0x74, 0x24, 0x10]);
+    mov(&mut code, 0, 5);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x8b, 0x44, 0x24, 0x28]);
+    check(
+        &mut code,
+        &mut failures,
+        (carrick_abi::LINUX_S_IFIFO | 0o600) as i32,
+    );
+    // FIONREAD on the empty pipe writes zero.
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    mov(&mut code, 6, carrick_abi::LINUX_FIONREAD);
+    code.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 0x10]);
+    mov(&mut code, 0, 16);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x8b, 0x44, 0x24, 0x10]);
+    check(&mut code, &mut failures, 0);
+    // FIONBIO imports a scalar through shared user-copy, changing this OFD.
+    code.extend_from_slice(&[0xc7, 0x44, 0x24, 0x10, 1, 0, 0, 0]);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    mov(&mut code, 6, carrick_abi::LINUX_FIONBIO);
+    code.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 0x10]);
+    mov(&mut code, 0, 16);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    // Empty-path newfstatat uses the same x86 stat encoder.
+    code.extend_from_slice(&[0xc6, 0x84, 0x24, 0x00, 0x02, 0, 0, 0]);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7, 0x48, 0x8d, 0xb4, 0x24, 0x00, 0x02, 0, 0]);
+    code.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 0x10]);
+    code.extend_from_slice(&[0x49, 0xba]);
+    code.extend_from_slice(&carrick_abi::LINUX_AT_EMPTY_PATH.to_le_bytes());
+    mov(&mut code, 0, 262);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x8b, 0x44, 0x24, 0x28]);
+    check(
+        &mut code,
+        &mut failures,
+        (carrick_abi::LINUX_S_IFIFO | 0o600) as i32,
+    );
+    // Save inode, stat the other end and require exact identity equality.
+    code.extend_from_slice(&[0x4c, 0x8b, 0x74, 0x24, 0x18]); // r14=ino
+    code.extend_from_slice(&[0x8b, 0x7c, 0x24, 0x04, 0x48, 0x8d, 0x74, 0x24, 0x10]);
+    mov(&mut code, 0, 5);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x31, 0xc0, 0x4c, 0x39, 0x74, 0x24, 0x18, 0x0f, 0x94, 0xc0]);
+    check(&mut code, &mut failures, 1);
+    // A second live pipe must have a different inode.
+    code.extend_from_slice(&[0x48, 0x8d, 0xbc, 0x24, 0xc8, 0, 0, 0]);
+    mov(&mut code, 6, 0);
+    mov(&mut code, 0, 293);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[
+        0x8b, 0xbc, 0x24, 0xc8, 0, 0, 0, 0x48, 0x8d, 0x74, 0x24, 0x10,
+    ]);
+    mov(&mut code, 0, 5);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x31, 0xc0, 0x4c, 0x39, 0x74, 0x24, 0x18, 0x0f, 0x95, 0xc0]);
+    check(&mut code, &mut failures, 1);
+    for (nr, command, value, expected) in [
+        (72, 3, 0, 2048),
+        (72, 0, 31, 31),        // F_DUPFD
+        (33, 31, 0, 31),        // dup2
+        (292, 31, 0x80000, 31), // dup3
+        (3, 0, 0, 0),           // close
+        (3, 0, 0, -9),
+    ] {
+        code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+        mov(&mut code, 6, command);
+        mov(&mut code, 2, value);
+        mov(&mut code, 0, nr);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        check(&mut code, &mut failures, expected);
+    }
+    call(&mut code, 231, [0, 0, 0]);
+    for (index, offset) in failures.into_iter().enumerate() {
+        let relative = (code.len() as i64 - offset as i64 - 4) as i32;
+        code[offset..offset + 4].copy_from_slice(&relative.to_le_bytes());
+        call(&mut code, 231, [index as u64 + 1, 0, 0]);
+    }
+    code.extend_from_slice(&[0x0f, 0x0b]);
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 128);
+    assert_eq!(outcome.run.exit_code, 0, "numbered metadata assertion");
+    assert!(outcome.run.stdout.is_empty());
+    assert!(outcome.run.stderr.is_empty());
+}
