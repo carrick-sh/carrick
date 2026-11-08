@@ -185,7 +185,17 @@ fn write_paired_base(results: &std::path::Path, base: &AcceptReceipt) -> std::pa
     .unwrap();
     // Completed itemized failures: acceptance exits nonzero (#1889 review).
     std::fs::write(paired.join("accept-exit.json"), r#"{"success":false}"#).unwrap();
+    seal_paired_base(results, &base.head);
     paired
+}
+
+/// Write the sealed record `execute` leaves after the candidate run.
+fn seal_paired_base(results: &std::path::Path, base: &str) {
+    std::fs::write(
+        results.join("base-seal.json"),
+        json!({"base": base, "files": inventory(&results.join("base"))}).to_string(),
+    )
+    .unwrap();
 }
 
 fn admitted(head: &str) -> AcceptReceipt {
@@ -841,6 +851,7 @@ else:
     // Without its paired base, or with unadmitted base evidence, a request
     // cannot pass; publication never falls back to a stored receipt.
     std::fs::write(paired.join("cleanup.json"), "[]").unwrap();
+    seal_paired_base(&results, &a);
     assert!(!publish("success").status.success());
     let body = std::fs::read_to_string(results.join("comment.md")).unwrap();
     assert!(body.contains("Base evidence admission failed"), "{body}");
@@ -2180,7 +2191,14 @@ else:
         .unwrap();
     }
 
+    /// Base evidence plus the executor's seal over it.
     fn write_base(&self, receipt: &AcceptReceipt, accepted: bool) {
+        self.write_base_unsealed(receipt, accepted);
+        seal_paired_base(&self.results(), &self.base);
+    }
+
+    /// Rewrite base evidence after the seal, as candidate code could.
+    fn write_base_unsealed(&self, receipt: &AcceptReceipt, accepted: bool) {
         self.write_side(&self.results().join("base"), "base.json", receipt, accepted);
     }
 
@@ -2439,7 +2457,7 @@ fn publish_refuses_base_evidence_that_differs_from_its_seal() {
     forged.steps[2]
         .failed_tests
         .push("candidate_regression".into());
-    bench.write_base(&forged, false);
+    bench.write_base_unsealed(&forged, false);
     let (passed, body) = bench.publish();
     assert!(!passed, "forged base passed: {body}");
     assert!(body.contains("base evidence seal"), "{body}");
