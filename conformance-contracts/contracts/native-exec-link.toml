@@ -19,6 +19,7 @@ vm_free = [
   "carrick-kernel::dispatch::native_files::tests::native_readlink_serves_ordinary_links_and_refuses_foreign_magic",
   "carrick-runtime::runtime::exec::tests::native_child_exec_prepares_a_dynamic_binary_through_a_usrmerge_rootfs",
   "carrick-hal::fork_stock::tests::committed_child_retains_physical_custody_through_quarantine",
+  "carrick-vmm-hvf::fork_stock::tests::root_seed_retirement_releases_only_matching_mm",
 ]
 
 [bindings.unresolved]
