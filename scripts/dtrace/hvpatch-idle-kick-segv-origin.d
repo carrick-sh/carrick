@@ -56,6 +56,7 @@
  *   hvpatch-native-crossing-refused (u64, u64, u32, u64, u64)
  *   el1-grant-refusal (u32, u64, u64, u64, u64)
  *   el1-native-diagnostic (u32, u64, u64, char *)
+ *   embed-fixture-loaded (char *host path, char *SHA-256, u64 bytes, u32 guest CPUs)
  *   el1-zone-capture-missing (u64, u64)
  *   el1-task-record-stale (u64, u64, u64, u64, u64)
  * Scope: the signed embed test executable (`execname` starts `el1_sched`)
@@ -204,6 +205,18 @@ carrick*:::el1-grant-refusal
 	last = timestamp;
 	printf("REFUSE|grant|ns=%d|reason=%u|a=0x%x|b=0x%x|c=0x%x|d=0x%x\n",
 	    timestamp, (uint32_t)arg0, arg1, arg2, arg3, arg4);
+}
+
+/* Fixture-load provider added for #1857; live qualification remains owed.
+ * A loaded record is a positive control, not proof that later fault probes fire.
+ * Hashing costs one fixture-sized SHA-256 pass only with this probe enabled.
+ */
+carrick*:::embed-fixture-loaded
+/strstr(execname, "el1_sched") != NULL/
+{
+    last = timestamp;
+    printf("FIXTURE|ns=%d|host_pid=%d|path=%s|sha256=%s|bytes=%d|guest_cpus=%d\n",
+        timestamp, pid, copyinstr(arg0), copyinstr(arg1), arg2, arg3);
 }
 
 carrick*:::el1-native-diagnostic
