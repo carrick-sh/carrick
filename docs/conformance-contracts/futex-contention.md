@@ -346,3 +346,13 @@ were red after the notification fix; word-copy cases already passed and
 remain controls. Timer and queue custody are the existing scheduler owners;
 there is no new deadline ledger or polling. Signed execution and same-image
 Docker timing remain higher-layer evidence not supplied by these fixtures.
+## Native exec child timed admission (#1862)
+
+`serial_host_native_fork_exec_child_timed_futex` extends the real native
+fork/exec fixture with a relative timeout. The production syscall path must
+retain it across one owner-copy refusal, compare atomically on resumption,
+then park a matching wait and count exactly one sibling wake. Neither wait
+nor wake may forward. The scheduler already leases timers to exact records
+and park sequences; the former host-record-only admission check was stale.
+The switched-in scheduler witness also requires numeric timeout `-110` and
+consumption of its expired timer lease. Signed Go execution remains open.
