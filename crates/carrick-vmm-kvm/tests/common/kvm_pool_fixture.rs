@@ -12,6 +12,22 @@ pub fn run_pool_fixture(
     run_pool_fixture_with(elf, max_exits, |_| {})
 }
 
+pub fn run_instrumented_pool_fixture(
+    elf: &[u8],
+    max_exits: usize,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
+    try_run_program_with_dispatcher_image(
+        &program,
+        max_exits,
+        ROOT_AFFINITY_ANY,
+        |_| {},
+        carrick_kernel::dispatch::SyscallDispatcher::default(),
+        Some(include_bytes!(env!("CARRICK_X86_CPL0_TEST_IMAGE"))),
+    )
+    .expect("instrumented shared pool fixture")
+}
+
 pub fn run_pool_fixture_with(
     elf: &[u8],
     max_exits: usize,
@@ -87,14 +103,29 @@ pub fn try_run_program_with_dispatcher(
     carrick_runtime::prepare::PreparedKvmPoolOutcome,
     carrick_runtime::prepare::PreparedKvmPoolFailure,
 > {
+    try_run_program_with_dispatcher_image(program, max_exits, affinity, configure, dispatcher, None)
+}
+
+fn try_run_program_with_dispatcher_image(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    max_exits: usize,
+    affinity: u64,
+    configure: impl FnOnce(&mut Cpl0Carrier),
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    production_image: Option<&[u8]>,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_runtime::prepare::PreparedKvmPoolFailure,
+> {
     let image = prepare_x86_elf(program).expect("x86 ELF program");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
-    let mut carrier = Cpl0Carrier::boot_production(
-        physical_inventory(),
-        extent,
-        carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher),
-    )
+    let inventory = physical_inventory();
+    let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher);
+    let mut carrier = match production_image {
+        Some(image) => Cpl0Carrier::boot_production_image(inventory, image, extent, ipc),
+        None => Cpl0Carrier::boot_production(inventory, extent, ipc),
+    }
     .expect("production KVM image");
     let root = dispatcher.capture_one_task_context().expect("issued root");
     {
