@@ -765,6 +765,19 @@ const BASE_RECEIPT: &str = "base.json";
 /// The paired base's evidence lives beside the candidate's, in this subdirectory.
 const BASE_DIR: &str = "base";
 
+/// One side of a paired execution, as the pairing hands it to the runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedRun {
+    /// Exact commit checked out, built and accepted.
+    pub commit: String,
+    /// Commit whose published fixture bundle this run must restore.
+    pub fixture_publisher: String,
+    /// Evidence directory for this run's receipt, identity and logs.
+    pub output: PathBuf,
+    /// Receipt file name inside `output`.
+    pub receipt_name: &'static str,
+}
+
 /// Run the merge base (unless this is a main baseline) and then the candidate
 /// on this Mac, under one exclusive host lease and with the candidate's
 /// fixture bundle. Publication compares the candidate only with this paired
@@ -785,32 +798,57 @@ fn execute(
     fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
     let output = fs::canonicalize(output).map_err(|e| fail(e.to_string()))?;
     let bundle = fs::canonicalize(bundle).map_err(|e| fail(e.to_string()))?;
-    let result = (|| {
+    let lease = (|| {
         crate::host_load::check().map_err(|e| fail(e.to_string()))?;
-        let lease = HostLease::acquire(HostLeaseMode::Gate).map_err(|e| fail(e.to_string()))?;
-        if request.kind != RequestKind::Main {
-            let base_dir = output.join(BASE_DIR);
-            fs::create_dir_all(&base_dir).map_err(|e| fail(e.to_string()))?;
-            execute_one(
-                root,
-                &lease,
-                &request.base,
-                &request.sha,
-                &bundle,
-                &base_dir,
-                BASE_RECEIPT,
-            )
-            .map_err(|error| fail(format!("paired base {}: {error}", request.base)))?;
+        HostLease::acquire(HostLeaseMode::Gate).map_err(|e| fail(e.to_string()))
+    })();
+    let lease = match lease {
+        Ok(lease) => lease,
+        Err(error) => {
+            write(&output.join("execution-error.txt"), error.to_string())?;
+            return Err(error);
         }
+    };
+    execute_pair(&request, &output, |run| {
         execute_one(
             root,
             &lease,
-            &request.sha,
-            &request.sha,
+            &run.commit,
+            &run.fixture_publisher,
             &bundle,
-            &output,
-            CANDIDATE_RECEIPT,
+            &run.output,
+            run.receipt_name,
         )
+    })
+}
+
+/// The pairing itself: the base (unless this is a main baseline) and then the
+/// candidate, each handed to `run`, which builds, accepts and inspects one
+/// commit. `execute` supplies the real runner under one exclusive lease.
+/// Any error is recorded in `execution-error.txt` for publication.
+pub fn execute_pair(
+    request: &Request,
+    output: &Path,
+    mut run: impl FnMut(&PairedRun) -> Result<(), ReceiptError>,
+) -> Result<(), ReceiptError> {
+    let result = (|| {
+        if request.kind != RequestKind::Main {
+            let base_dir = output.join(BASE_DIR);
+            fs::create_dir_all(&base_dir).map_err(|e| fail(e.to_string()))?;
+            run(&PairedRun {
+                commit: request.base.clone(),
+                fixture_publisher: request.sha.clone(),
+                output: base_dir,
+                receipt_name: BASE_RECEIPT,
+            })
+            .map_err(|error| fail(format!("paired base {}: {error}", request.base)))?;
+        }
+        run(&PairedRun {
+            commit: request.sha.clone(),
+            fixture_publisher: request.sha.clone(),
+            output: output.to_path_buf(),
+            receipt_name: CANDIDATE_RECEIPT,
+        })
     })();
     if let Err(error) = &result {
         write(&output.join("execution-error.txt"), error.to_string())?;
