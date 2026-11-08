@@ -37,7 +37,7 @@ path; those belong to the x86-run milestone and director acceptance.
 
 [bindings]
 vm_free = [
-  "carrick-x86-cpl0-host::cpl0_boot::birth_source_tests::corrupted_guest_reply_cannot_change_host_grant_or_stack_geometry",
+  "carrick-x86-cpl0-host::cpl0_boot::initial_reply_tests::corrupted_guest_reply_cannot_change_host_grant_or_stack_geometry",
   "carrick-el1::isa::x86_initial_mm::tests::fresh_owner_allocates_sparse_tables_on_demand",
   "carrick-el1::isa::x86_initial_mm::tests::fresh_owner_maps_static_text_data_and_stack_with_publications",
   "carrick-el1::isa::x86_initial_mm::tests::guest_stack_has_sysv_order_and_exact_auxv_addresses",
