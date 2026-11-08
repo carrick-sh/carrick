@@ -77,6 +77,22 @@ pub trait GuestDispatchFrame: SyscallFrame {
     ) -> bool {
         false
     }
+    /// ISA mechanics for an unpublished native thread context. The shared
+    /// lifecycle owner supplies Linux's stack, TLS and return policy.
+    fn can_capture_thread_child(
+        &self,
+        _stack: carrick_guest_arch::UserVa,
+        _tls: Option<carrick_guest_arch::UserVa>,
+    ) -> bool {
+        false
+    }
+    fn capture_x86_thread_child(
+        &self,
+        _child: &mut carrick_sched_core::ParkedContextWords,
+        _context: &lifecycle::ChildContext,
+    ) -> bool {
+        false
+    }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
     fn arm_frame_ref(&self) -> Option<&TrapFrame>;
     fn arm_scheduler(&self) -> bool;
@@ -2103,6 +2119,13 @@ type LegacyDispatchContext = carrick_el1_abi::Aarch64ParkedContext;
 /// Exact context capability for the shared dispatcher. Only the ARM context
 /// can obtain an ARM scheduler source or consume an ARM scheduler receipt.
 pub trait DispatchContext: carrick_el1_abi::EntryContext {
+    fn capture_thread_child(
+        _frame: &impl GuestDispatchFrame,
+        _child: &mut Self,
+        _context: &lifecycle::ChildContext,
+    ) -> bool {
+        false
+    }
     fn arm_source(
         zone: &ZoneTables,
         slot: SlotId,
@@ -2126,6 +2149,13 @@ impl DispatchContext for carrick_sched_core::ThreadCtx {
     }
 }
 impl DispatchContext for carrick_sched_core::ParkedContextWords {
+    fn capture_thread_child(
+        frame: &impl GuestDispatchFrame,
+        child: &mut Self,
+        context: &lifecycle::ChildContext,
+    ) -> bool {
+        frame.capture_x86_thread_child(child, context)
+    }
     fn arm_source(
         _: &ZoneTables,
         _: SlotId,
@@ -3034,6 +3064,29 @@ impl<
         Some(self)
     }
     fn futex(&mut self) -> FamilyCompletion {
+        if !self.frame.arm_scheduler() {
+            let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+                return FamilyCompletion::Forward;
+            };
+            let Some(process) = self.process.as_deref_mut() else {
+                return FamilyCompletion::Forward;
+            };
+            if process.binding() != super::common_entry::execution_binding(task) {
+                return FamilyCompletion::Forward;
+            }
+            let call = carrick_personality_linux::sched::FutexCall {
+                args: core::array::from_fn(|index| self.frame.argument(index).unwrap_or(0)),
+            };
+            let mut copy = file::ValidatedCopy {
+                task,
+                validator: &file::HardwareValidator,
+            };
+            return process
+                .native_futex(call, &mut copy)
+                .map_or(FamilyCompletion::Forward, |outcome| {
+                    lifecycle::lifecycle_effect(&outcome)
+                });
+        }
         let mut operation = self
             .process
             .as_deref_mut()
