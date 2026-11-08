@@ -2,12 +2,13 @@
 //!
 //! Exercises the real `NativeProcessRuntime` (`admit_fresh_root::<X86Mmu>`,
 //! `fork`, `exit_group`, `wait4`), `MmPortal<..., X86Mmu, ParkedContextWords>`,
-//! `dispatch_x86_fault_with_prepared` (`OwnerFaultSupply`, `PreparedFaultPath`,
-//! `CowResolver` over `resolve_guest_cow`), `CowGrantPool` settlement, and
+//! shared `dispatch_x86_fault_with_prepared` with production `OwnerFaultSupply`
+//! but test-owned prepared/COW resolvers and backing, `CowGrantPool` settlement, and
 //! `RetiredSpaces::drain_portal`. The red result is the parent's first write
 //! to an inherited `PREPARED|COW` sibling page after the child writes, exits,
-//! and is reaped by `wait4`. Subsequent checks cover COW replenishment across
-//! 72 16-KiB compounds once that fault is fixed.
+//! and is reaped by `wait4`. This is a fixture diagnostic until a CPL0
+//! production fault reaches the same page. Subsequent checks cover COW
+//! replenishment across 72 16-KiB compounds once that fault is fixed.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use carrick_core::mm::cow::{
