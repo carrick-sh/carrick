@@ -8391,3 +8391,49 @@ fn production_unmapped_root_admits_and_forks(late_bind: bool) {
         );
     }
 }
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[test]
+fn invalid_copy_ranges_are_efault_before_owner_preparation() {
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    // No invalid user range may reach an owner operation. If it does, this
+    // deliberately refusing physical service exposes the missing admission.
+    service.prepare_copy_error = Some(NativeProcessError::Invalid);
+    service.child_copy_error = Some(NativeProcessError::Invalid);
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    for raw in [
+        u64::MAX - 3,
+        carrick_guest_arch::USER_CEILING - 3,
+        carrick_guest_arch::USER_CEILING,
+    ] {
+        let address = UserVa::new(raw);
+        let input = entry.wait_guest_copy(carrick_core::user_copy::GuestCopyRequest {
+            address,
+            len: carrick_guest_arch::GuestLen::new(8),
+            access: carrick_guest_arch::Access::Read,
+        });
+        assert!(matches!(input, LifecycleOutcome::Returned { result, .. } if result.raw() == -14));
+        let output = entry.complete_copyout(address, vec![0; 8], SyscallResult::new(0));
+        assert!(matches!(output, LifecycleOutcome::Returned { result, .. } if result.raw() == -14));
+    }
+    assert!(entry.take_handoff_receipt().is_none());
+    assert!(
+        service.copies.is_empty(),
+        "bad addresses cannot publish bytes"
+    );
+}
