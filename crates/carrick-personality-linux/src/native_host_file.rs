@@ -109,6 +109,11 @@ pub enum HostFileCall {
         flags: u64,
         mode: u64,
     },
+    Mkdirat {
+        dirfd: i32,
+        path: u64,
+        mode: u64,
+    },
     Faccessat {
         dirfd: i32,
         path: u64,
@@ -232,6 +237,11 @@ impl HostFileCall {
                 path: args[1],
                 flags: args[2],
                 mode: args[3],
+            },
+            c if c == nr::MKDIRAT => Self::Mkdirat {
+                dirfd: fd,
+                path: args[1],
+                mode: args[2],
             },
             c if c == nr::FACCESSAT => Self::Faccessat {
                 dirfd: fd,
@@ -506,6 +516,25 @@ impl Staging<'_, '_> {
         }))
     }
 
+    fn path_input(
+        &mut self,
+        user: &mut dyn HostFileUser,
+        dirfd: i32,
+        address: u64,
+    ) -> Option<Result<Vec<u8>, HostFileStage>> {
+        let path = match copy_path(user, address) {
+            Path::Bytes(path) => path,
+            Path::Stage(stage) => return Some(Err(stage)),
+        };
+        if path.is_empty() {
+            return Some(Err(errno(carrick_syscall_abi::LINUX_ENOENT)));
+        }
+        if let Some(answer) = self.path_base(dirfd, &path)? {
+            return Some(Err(answer));
+        }
+        Some(Ok(path))
+    }
+
     /// Stage `fstat`/`statx` of a descriptor (`AT_EMPTY_PATH` or `fstat`).
     fn descriptor_stat(
         &mut self,
@@ -656,6 +685,20 @@ fn stage_call(
                 len: LINUX_STAT_BYTES,
             },
         )?,
+        HostFileCall::Mkdirat { dirfd, path, mode } => {
+            let path = match staging.path_input(user, dirfd, path)? {
+                Ok(path) => path,
+                Err(stage) => return Some(stage),
+            };
+            staging.request(
+                HostFileOp::Mkdirat,
+                LINUX_AT_FDCWD,
+                0,
+                [mode, 0, 0, 0],
+                &path,
+                None,
+            )
+        }
         HostFileCall::Openat {
             dirfd,
             path,
