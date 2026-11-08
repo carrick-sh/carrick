@@ -4,6 +4,12 @@
 # #1153: InotifyNameCache seqlock rebuild and EL1_ABI_LAYOUT_HASH update in
 # shared crates/carrick-el1-abi/src/lib.rs (bound under kernel.el1.inotify and
 # kernel.x86.file-region). Open-lifetime reference custody is unchanged.
+# IpcPhysicalHold admits the existing functional I/O lease under its existing
+# physical lifetime transition, without retaining its own publication owner.
+# native_files::tests::native_child_write_serves_parent_redirected_stdout_after_host_close
+# checks host-close survival and child-close EBADF on both writable uppers.
+# serial_host_ipc_mapping_projection_shares_live_delegation_identity and the
+# other 204 serial-host kernel tests pass; mapping admission is unchanged.
 schema_version = 1
 id = "kernel.el1.open-lifetime"
 title = "One terminal authority for host and ring file references"
