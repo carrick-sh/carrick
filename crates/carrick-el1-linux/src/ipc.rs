@@ -542,6 +542,15 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
     )
 }
 
+/// A readiness decision is final before output preparation. The native
+/// copyout owner retains these bytes and this result through exact-MM waits;
+/// it never re-probes a source whose level may have changed meanwhile.
+pub(crate) struct PollOutput {
+    pub address: IpcUserVa,
+    pub pollfd: crate::file_table::PollFd,
+    pub result: i64,
+}
+
 /// Serve the blocking, one-description zone subset of AArch64 `ppoll`.
 ///
 /// The shared dispatcher handles immediate, host and mixed sets. This owner
@@ -553,6 +562,7 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
     frame: &mut TrapFrame,
     venue: &IpcVenue<'_>,
     user: &mut M,
+    output: &mut Option<PollOutput>,
 ) -> IpcServed {
     use crate::file_table::{LINUX_POLLERR, LINUX_POLLHUP, PollFd};
     use carrick_el1_abi::ipc::epoll::EpollMember;
@@ -681,12 +691,11 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 Ok((pin, description)) => (None, Some(pin), description),
                 Err(FdError::BadFd) => {
                     pollfd.revents = crate::file_table::LINUX_POLLNVAL;
-                    let bytes = unsafe {
-                        core::slice::from_raw_parts((&raw const pollfd).cast::<u8>(), POLLFD_BYTES)
-                    };
-                    if !user.copy_out(frame.x[0], bytes) {
-                        return IpcServed::Forward;
-                    }
+                    *output = Some(PollOutput {
+                        address: IpcUserVa(frame.x[0]),
+                        pollfd,
+                        result: 1,
+                    });
                     frame.x[0] = 1;
                     return IpcServed::Returned { switched: false };
                 }
@@ -760,20 +769,11 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
         pollfd.revents = level as i16 & (pollfd.events | LINUX_POLLERR | LINUX_POLLHUP);
         if pollfd.revents != 0 || deadline.get().is_some_and(|end| sched.cpu.now() >= end) {
             drop(guard);
-            let bytes = unsafe {
-                core::slice::from_raw_parts((&raw const pollfd).cast::<u8>(), POLLFD_BYTES)
-            };
-            if !user.copy_out(frame.x[0], bytes) {
-                if let Some((token, _)) = active.take() {
-                    finish(sched, token, region);
-                    frame.x[0] = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
-                    return IpcServed::Returned { switched: false };
-                }
-                if let Some(pin) = fresh_pin {
-                    release_pin(sched, pin, region);
-                }
-                return IpcServed::Forward;
-            }
+            *output = Some(PollOutput {
+                address: IpcUserVa(frame.x[0]),
+                pollfd,
+                result: i64::from(pollfd.revents != 0),
+            });
             if let Some((token, _)) = active.take() {
                 finish(sched, token, region);
             } else if let Some(pin) = fresh_pin {

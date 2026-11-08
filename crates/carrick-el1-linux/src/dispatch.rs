@@ -4339,7 +4339,24 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 owner: self.process.as_deref_mut(),
                 wait: None,
             };
-            let disposition = ipc::serve_single_zone_ppoll(&mut sched, frame, venue, &mut user);
+            let mut output = None;
+            let disposition =
+                ipc::serve_single_zone_ppoll(&mut sched, frame, venue, &mut user, &mut output);
+            if let Some(output) = output {
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        (&raw const output.pollfd).cast::<u8>(),
+                        core::mem::size_of_val(&output.pollfd),
+                    )
+                };
+                return complete_poll_copyout(
+                    self.process.as_deref_mut(),
+                    task,
+                    carrick_guest_arch::UserVa::new(output.address.0),
+                    bytes,
+                    SyscallResult::new(output.result),
+                );
+            }
             return carrick_personality_linux::dispatch::transfer_effect(
                 &task.linux,
                 orig_x0,
