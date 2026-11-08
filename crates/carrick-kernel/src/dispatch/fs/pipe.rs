@@ -524,7 +524,8 @@ impl PipeInner {
     }
     pub(crate) fn set_capacity(&self, capacity: usize) -> Result<usize, LinuxErrno> {
         let _resize = self.resize.lock();
-        self.owner
+        let resized = self
+            .owner
             .resize_pipe(self.object, capacity, MAX_PIPE_CAPACITY)
             .map_err(|error| match error {
                 crate::el1_ipc::AdmissionError::Shared(carrick_el1_abi::ipc::IpcError::Object(
@@ -533,7 +534,7 @@ impl PipeInner {
                 _ => LINUX_ENOMEM,
             })?;
         self.owner.service_host_wake(self.object);
-        Ok(self.get_capacity())
+        Ok(resized)
     }
     #[cfg(test)]
     pub(crate) fn readiness_pipes_initialized(&self) -> (bool, bool) {
