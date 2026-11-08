@@ -6844,7 +6844,7 @@ fn rehomed_signal_copy_service(input: bool) {
         );
         assert_eq!(
             observed,
-            vec![carrick_personality_linux::lifecycle::InputPreparationRefusal::Busy]
+            vec![carrick_personality_linux::lifecycle::InputPreparationRefusal::OwnerBusy]
         );
         outcome
     } else {
