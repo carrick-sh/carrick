@@ -106,7 +106,8 @@ pub use carrick_pipe_core::{
 /// Descriptor tables (distinct `CLONE_FILES` groups) in the shared authority.
 /// Exhaustion is not guest-visible: the host keeps serving a table it could
 /// not publish.
-pub const IPC_FD_TABLES: usize = 256;
+pub const IPC_FD_TABLES: usize =
+    carrick_sched_core::object_wait::ipc_release::IPC_DESCRIPTOR_TABLE_CAPACITY;
 /// Zone-wide ceiling on open file descriptions: the elastic OFD store's
 /// reservation, and the zone's file-table limit (ENFILE, `fs.file-max`).
 pub const IPC_MAX_OFDS: usize = 1 << 20;
@@ -931,6 +932,7 @@ pub struct IpcRegion<'a> {
     pool_len: u64,
     /// Who this view's object locks name as their holder.
     holder: IpcLockHolder,
+    lock_release: Option<&'a dyn carrick_sched_core::object_wait::ipc_release::IpcLockRelease>,
     /// The descriptor ceiling this venue raises before any number goes live
     /// ([`crate::DescriptorCeiling`]). Unbound, every install is refused.
     ceiling: Option<&'a dyn crate::DescriptorCeiling>,
@@ -1029,6 +1031,7 @@ impl<'a> IpcRegion<'a> {
             pool_len: pool_len as u64,
             holder: IpcLockHolder::Host,
             ceiling: None,
+            lock_release: None,
             _pool: PhantomData,
         };
         region
@@ -1092,6 +1095,7 @@ impl<'a> IpcRegion<'a> {
             pool_len: pool_len as u64,
             holder: IpcLockHolder::Host,
             ceiling: None,
+            lock_release: None,
             _pool: PhantomData,
         })
     }
@@ -1111,6 +1115,18 @@ impl<'a> IpcRegion<'a> {
     pub fn for_el1_slot(self, slot: u32) -> Self {
         Self {
             holder: IpcLockHolder::El1 { slot },
+            ..self
+        }
+    }
+
+    /// Attach the carrier's already admitted release venue to this local view.
+    /// The owner must admit every lock this view can acquire before publication.
+    pub fn with_lock_release(
+        self,
+        release: &'a dyn carrick_sched_core::object_wait::ipc_release::IpcLockRelease,
+    ) -> Self {
+        Self {
+            lock_release: Some(release),
             ..self
         }
     }
@@ -2017,6 +2033,11 @@ impl<'a> IpcRegion<'a> {
 }
 
 impl SlotBacking for IpcRegion<'_> {
+    fn table_lock_release(
+        &self,
+    ) -> Option<&dyn carrick_sched_core::object_wait::ipc_release::IpcLockRelease> {
+        self.lock_release
+    }
     fn cover_descriptor(&self, fd: usize) -> bool {
         match (self.ceiling, u32::try_from(fd)) {
             (Some(ceiling), Ok(fd)) => ceiling.cover(fd),
@@ -2130,6 +2151,7 @@ pub struct IpcObjectGuard<'a> {
 impl Drop for IpcObjectGuard<'_> {
     fn drop(&mut self) {
         self.record.lock.store(LOCK_FREE, Ordering::Release);
+
     }
 }
 

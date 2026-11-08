@@ -1090,7 +1090,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
         let view = self.storage(*storage).map_err(map_core_error)?;
         let index = self.pop_table().map_err(map_core_error)?;
-        let guard = match self.acquire(&self.core.tables[index]) {
+        let guard = match self.acquire(index) {
             Ok(guard) => guard,
             Err(err) => {
                 self.push_table(index);
@@ -1722,7 +1722,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
         let child = self.storage(*storage).map_err(map_core_error)?;
         let child_index = self.pop_table().map_err(map_core_error)?;
-        let child_guard = match self.acquire(&self.core.tables[child_index]) {
+        let child_guard = match self.acquire(child_index) {
             Ok(guard) => guard,
             Err(err) => {
                 self.push_table(child_index);
