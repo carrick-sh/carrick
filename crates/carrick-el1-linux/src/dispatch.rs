@@ -2626,6 +2626,10 @@ impl<
         self.ipc_transfer()
     }
     fn poll(&mut self) -> FamilyCompletion {
+        let zone_wait = self.ipc_poll_transfer();
+        if zone_wait != FamilyCompletion::Forward {
+            return zone_wait;
+        }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Forward;
         };
@@ -4325,6 +4329,42 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             );
         }
 
+        FamilyCompletion::Forward
+    }
+
+    fn ipc_poll_transfer(&mut self) -> FamilyCompletion {
+        let Some(venue) = self.ipc else {
+            return FamilyCompletion::Forward;
+        };
+        let Some(frame) = self.frame.arm_frame() else {
+            return FamilyCompletion::Forward;
+        };
+        let counters = self.counters;
+        let zone = &mut self.zone;
+        let current_tasks = self.current_tasks;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        if let (Some(zone), Some(task), Some(zslot)) =
+            (zone.as_mut(), cur_task, SlotId::from_index(slot))
+        {
+            let orig_x0 = frame.x[0];
+            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
+            let mut user = file::OwnerCopy {
+                inner: file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                },
+                owner: self.process.as_deref_mut(),
+                wait: None,
+            };
+            let disposition = ipc::serve_single_zone_ppoll(&mut sched, frame, venue, &mut user);
+            return carrick_personality_linux::dispatch::transfer_effect(
+                &task.linux,
+                orig_x0,
+                frame.x[0] as i64,
+                disposition,
+            );
+        }
         FamilyCompletion::Forward
     }
     fn task(&self) -> Option<&CurrentTask> {
