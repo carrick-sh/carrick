@@ -1987,6 +1987,12 @@ fn live_fork_child_cannot_supply_renewed_roots_entry_pid() {
         crate::sched::ResumeAction::NoPending
     );
 
+    assert_eq!(
+        fixture.task.visible_pid(),
+        Some(41),
+        "before returning to userspace"
+    );
+
     // Enter the same production admission boundary used by user return. The
     // retained writer makes accidental fresh-root admission fail, not create
     // a second owner. Both processes still have live lifecycle custody.

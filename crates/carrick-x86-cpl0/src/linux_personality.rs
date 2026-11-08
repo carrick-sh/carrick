@@ -978,7 +978,8 @@ impl Personality for LinuxPersonality {
             .unwrap_or_else(|| fatal_boot());
         let source = carrick_x86_carrier::native_execution::source(slot);
         let words = capture(frame, early_xstate);
-        native_process::admit_root(words, source, task).unwrap_or_else(|_| fatal_boot());
+        native_process::admit_root(words, source, task)
+            .unwrap_or_else(|error| native_process::fatal_admission(error));
         admit_stdio_cached(binding, task, &files);
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
         let mut service = native_process::Service::new(task, slot);

@@ -20,16 +20,40 @@ pub fn yield_host_effect() {
 /// Non-returning native fatal transport after an entry loses its exact binding.
 #[cold]
 #[inline(never)]
+#[track_caller]
 pub fn fatal_entry_binding() -> ! {
-    // SAFETY: CPL0 signals fatal boundary to the host via FATAL_PORT with
-    // PANIC_SENTINEL in rax, and enters an infinite halt loop.
+    fatal_entry_binding_with_identity(
+        carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
+        [0; 8],
+        [0; 8],
+    )
+}
+
+/// Same terminal port with the shared admission payload retained on the
+/// stopped CPU's private supervisor stack. RDI is the existing entry tag,
+/// RSI/RCX encode reason/caller, and R8 names the two eight-word arrays.
+/// The host validates that entire range against this CPU's private stack
+/// before reading it; no guest user pointer is accepted.
+#[cold]
+#[inline(never)]
+#[track_caller]
+pub fn fatal_entry_binding_with_identity(
+    reason: carrick_el1_abi::EntryBindingFatalReason,
+    identity: [u64; 8],
+    lookup: [u64; 8],
+) -> ! {
+    let [reason, location] = carrick_el1_abi::EntryBindingFatalDetail::at_caller(reason).encode();
+    let payload = [identity, lookup];
+    // SAFETY: CPL0 retains the initialized payload until the host consumes
+    // FATAL_PORT. No instruction returns to guest userspace after this OUT.
     unsafe {
         core::arch::asm!(
-            "out dx, al",
-            "2: hlt",
-            "jmp 2b",
+            "out dx, al", "2: hlt", "jmp 2b",
             in("dx") FATAL_PORT,
             in("rax") carrick_el1_abi::PANIC_SENTINEL,
+            in("rdi") carrick_el1_abi::ENTRY_BINDING_FATAL_TAG,
+            in("rsi") reason, in("rcx") location,
+            in("r8") &payload as *const _ as u64,
             options(noreturn)
         );
     }
@@ -66,6 +90,11 @@ pub fn witness(op: u64) -> u64 {
                 detail: carrick_guest_arch::FatalCode::new(1),
             });
         }
+        2 => fatal_entry_binding_with_identity(
+            carrick_el1_abi::EntryBindingFatalReason::AdmissionFreshRootPendingCustody,
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [9, 10, 11, 12, 13, 14, 15, 16],
+        ),
         _ => u64::MAX,
     }
 }

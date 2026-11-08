@@ -313,6 +313,16 @@ fn resume_production_with(
     ) -> crate::sched::ResumeAction,
 ) -> crate::sched::ResumeAction {
     let Some(runtime) = registry().for_record(zone, zone.record_ref(record)) else {
+        // Scheduler publication replaced execution/MM/lifecycle identity,
+        // but the PID cache can still belong to the previously running child.
+        // A renewed record is not indexed until admission rehomes it. Resolve
+        // identity through the exact execution key before any EL0 return.
+        // SAFETY: the scheduler owns this selected record exclusively.
+        if let Some(address) = unsafe { zone.record(record).ctx_mut() }.address_context() {
+            registry()
+                .refresh_entry_identity(zone, task, address)
+                .unwrap_or_else(|_| fatal());
+        }
         return resume_unregistered(zone, task, slot, record);
     };
     let source = BornInZoneSource { zone, slot };
@@ -594,19 +604,7 @@ fn admit_entry_runtime(
     // SAFETY: the EL1 caller owns the running slot and its record until the
     // process route returns to the vector.
     let observed = unsafe { observed_entry_address(source, task, ttbr0, record)? };
-    let address = if control.entry().is_some() {
-        REGISTRY
-            .group_address(
-                source.zone,
-                observed,
-                page,
-                task.visible_pid().ok_or(NativeProcessError::Stale)?,
-            )
-            .filter(|address| *address == observed)
-            .ok_or(NativeProcessError::Stale)?
-    } else {
-        observed
-    };
+    let address = observed;
     let lookup = match REGISTRY.admit_existing_group(source, task, address, page, control)? {
         super::native_process_runtime::NativeGroupAdmission::Existing(runtime) => {
             return Ok((runtime, address));
