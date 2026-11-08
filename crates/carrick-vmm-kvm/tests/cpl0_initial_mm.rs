@@ -1920,6 +1920,15 @@ fn private_file_source_limit_returns_enomem() {
 
 #[test]
 fn serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace() {
+    loader_reopen_with_publication(false);
+}
+
+#[test]
+fn serial_host_loader_open_survives_colliding_publication() {
+    loader_reopen_with_publication(true);
+}
+
+fn loader_reopen_with_publication(contended: bool) {
     let dir = tempfile::tempdir().expect("loader file directory");
     let path = dir.path().join("library");
     std::fs::write(&path, b"loader library").expect("loader source file");
@@ -1942,14 +1951,74 @@ fn serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace() {
             .expect("host filesystem"),
     ));
     let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
-    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
-        &program,
-        128,
-        ROOT_AFFINITY_LOADED,
-        |_| {},
-        dispatcher,
-    )
-    .expect("production loader runtime");
+    let key = dispatcher
+        .capture_one_task_context()
+        .expect("root")
+        .resources()
+        .files()
+        .id()
+        .raw();
+    let (release, released) = std::sync::mpsc::channel();
+    let outcome = std::thread::scope(|scope| {
+        let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+            &program,
+            128,
+            ROOT_AFFINITY_LOADED,
+            |carrier| {
+                if !contended {
+                    return;
+                }
+                let backing = carrier.ipc_table_map().expect("retained map");
+                let map = backing.table_map();
+                let home = |key: u64| {
+                    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize
+                        % carrick_el1_abi::ipc_tables::IPC_TABLE_MAP_ENTRIES
+                };
+                let blocker = (1..u64::MAX)
+                    .find(|other| *other != key && home(*other) == home(key))
+                    .expect("collision");
+                let raw = map.withdraw_table(key).expect("root binding");
+                map.publish(blocker, raw).expect("blocker");
+                map.publish(key, raw).expect("displaced root binding");
+                let (ready, entered) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    use carrick_el1_abi::ipc_tables::{
+                        IPC_TABLE_MAP_ENTRIES, IpcTableMap, IpcTableMapEntry,
+                    };
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    let map = backing.table_map();
+                    // Test-only fault injection into repr(C) shared storage. The
+                    // entries follow the aligned header; seq is each entry's
+                    // first word. No guest runs until the odd sequence is visible.
+                    let offset = std::mem::size_of::<IpcTableMap>()
+                        - IPC_TABLE_MAP_ENTRIES * std::mem::size_of::<IpcTableMapEntry>()
+                        + home(blocker) * std::mem::size_of::<IpcTableMapEntry>();
+                    // SAFETY: retained backing keeps this aligned atomic live;
+                    // the blocker has no other publisher during this schedule.
+                    let seq = unsafe {
+                        &*((map as *const IpcTableMap)
+                            .cast::<u8>()
+                            .add(offset)
+                            .cast::<AtomicU64>())
+                    };
+                    seq.fetch_add(1, Ordering::Release);
+                    ready.send(()).expect("reader alive");
+                    let result = released.recv_timeout(std::time::Duration::from_secs(5));
+                    seq.fetch_add(1, Ordering::Release);
+                    map.withdraw_table(blocker).expect("remove blocker");
+                    result.expect("guest completed while publisher held");
+                });
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("publisher entered");
+            },
+            dispatcher,
+        );
+        if contended {
+            release.send(()).expect("publisher alive");
+        }
+        outcome.expect("production loader runtime")
+    });
     assert_eq!(
         outcome.run.exit_code, 0,
         "open returns its errno as the exit code; 42=close failure, 43=fd reuse failure: {:?}",
