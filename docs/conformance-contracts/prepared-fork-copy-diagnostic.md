@@ -155,7 +155,11 @@ can authorize a millisecond write. The runtime checks that convention's
 ordinal before writing both the vCPU argument and any host request.
 PollWait produces no syscall replay or timeout-argument writes. Real
 handler interruptions still return EINTR, independent of SA_RESTART;
-control interruptions retain the original operation.
+control interruptions retain the original operation. A directly claimed
+ring park's `handback=None` is normalized to `Continue` before host
+completion can suspend on copyout. Its production interruption/copyout
+witness was red at the subsequent `complete_handback` (Corrupt); the fixed
+resume retains the decided answer despite readiness and counter changes.
 
 The frame store also samples `host-ipc-replay` at
 `restart_with_remaining`, after any authorized argument writes. It records
