@@ -1848,6 +1848,171 @@ fn host_home_process_call_seeds_an_unpublished_root_context() {
 
 /// Red-first Test 1: child gets distinct root and x0 = 0.
 #[test]
+fn live_fork_child_cannot_supply_renewed_roots_entry_pid() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ]);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        crossing,
+    )
+    .with_words(words);
+    let child_pid = fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |entry| {
+                let LifecycleOutcome::Returned { result, .. } =
+                    entry.fork(ProcessForkChildTid::NONE)
+                else {
+                    panic!("production fork must return a child");
+                };
+                result.raw() as u32
+            },
+        )
+        .unwrap();
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let root = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let parent = runtime.task_binding(root).unwrap();
+    let child = runtime.namespace_child_key(root, child_pid).unwrap();
+    let child = runtime.task_binding(child).unwrap();
+    let child_identity = fixture.zone.record(child.record.id).identity();
+    assert_ne!(child_identity.lifecycle_page, fixture.leader.lifecycle_page);
+    assert_eq!(fixture.page.live(), 1);
+
+    // The host releases an old execution record before publishing its next
+    // snapshot. Keep the native process and its child alive throughout.
+    fixture.zone.clear_current(fixture.slot);
+    fixture.zone.free_record(parent.record.id);
+    let renewed = fixture.zone.alloc_record(fixture.leader).unwrap();
+    // SAFETY: this newly allocated, unpublished record is exclusively ours.
+    unsafe {
+        *fixture.zone.record(renewed).ctx_mut() = parent.words;
+    }
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, renewed)
+            .is_queued()
+    );
+    assert!(
+        registry()
+            .for_record(fixture.zone, fixture.zone.record_ref(renewed))
+            .is_none()
+    );
+
+    // The real scheduler loads the child and the production resume publishes
+    // its namespace PID into this CPU's CurrentTask slot.
+    let counters = carrick_el1_abi::Counters::new();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    {
+        let mut cpu = ResumeCpu {
+            inner: crate::sched::FakeCpu::default(),
+            runtime: &runtime,
+            registry: registry(),
+            source,
+            task: &fixture.task,
+            service: &mut service,
+        };
+        assert_eq!(
+            (crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot: fixture.slot,
+                task: &fixture.task,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            })
+            .run_next(&mut frame, 0),
+            crate::sched::Served::Returned { switched: true }
+        );
+    }
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).current(),
+        Some(child.record.id)
+    );
+    assert_eq!(fixture.task.visible_pid(), Some(child_pid));
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child.record.id)
+            .is_queued()
+    );
+
+    // Loading a renewed root has no record-indexed native resume yet. The
+    // scheduler publishes its exact identity; production unregistered resume
+    // returns NoPending. No test code writes a PID on this handoff.
+    let mut cpu = crate::sched::FakeCpu::default();
+    assert_eq!(
+        (crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .run_next(&mut frame, 0),
+        crate::sched::Served::Returned { switched: true }
+    );
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(renewed));
+    assert_eq!(
+        super::aarch64_process::resume_production_with_service(
+            fixture.zone,
+            &fixture.task,
+            fixture.slot,
+            renewed,
+            &mut service,
+        ),
+        crate::sched::ResumeAction::NoPending
+    );
+
+    // Enter the same production admission boundary used by user return. The
+    // retained writer makes accidental fresh-root admission fail, not create
+    // a second owner. Both processes still have live lifecycle custody.
+    let outcome = fixture.enter(
+        fixture.control,
+        fixture_ttbr0(fixture),
+        &mut service,
+        |_| {
+            assert_eq!(fixture.task.visible_pid(), Some(41));
+        },
+    );
+    assert!(
+        outcome.is_ok(),
+        "root must reuse its exact owner after child admission: {outcome:?}"
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &runtime,
+        &registry()
+            .for_entry(source, &fixture.task, fixture.address)
+            .unwrap()
+    ));
+    assert!(runtime.task_binding(child.key).is_some());
+    assert_eq!(fixture.page.live(), 1);
+}
+
+#[test]
 fn test_fork_child_gets_distinct_root_and_x0_zero() {
     let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
