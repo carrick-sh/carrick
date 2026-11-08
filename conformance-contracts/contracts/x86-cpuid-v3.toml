@@ -42,6 +42,8 @@ vm_free = [
   "carrick-x86::cpuid::tests::qualify_supported_refuses_hosts_missing_any_required_v3_or_cpl0_capability",
   "carrick-x86::cpuid::tests::per_vcpu_apic_id_and_high_frequency_tsc_calibration_round_trip",
   "carrick-x86::cpuid::tests::optional_features_are_host_qualified",
+  "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
+  "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
 ]
 
 [bindings.unresolved]
