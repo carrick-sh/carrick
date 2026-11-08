@@ -15,7 +15,7 @@ AT S1E0R validates each page and LDTRB copies under exception fixup. The vector
 in `carrick-mem/src/memory.rs` redirects an armed copy fault to failure; it
 does not resolve the page there. A failed copy with no matching process
 venue returns Fault/EFAULT. Otherwise `wait_guest_copy` reaches
-`NativeProcessAdapter::prepare_guest_input` and exact-MM preparation, which
+`NativeProcessEntry::prepare_guest_input` and exact-MM preparation, which
 may independently return EFAULT. A COW-readable page should pass S1E0R.
 The host projection instead checks the lower half and TEST_USER_ACCESS, then
 copies host memory. Its green result cannot prove the ARM translation path.
