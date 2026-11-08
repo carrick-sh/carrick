@@ -3,15 +3,9 @@ use super::*;
 use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest, UserCopy};
 use carrick_guest_arch::{Access, CounterTick, GuestLen};
 use carrick_personality_linux::sched::{
-    FutexCall, FutexFrequency, FutexVenue, FutexWait, RelativeFutexWait,
+    FutexCall, FutexFrequency, FutexVenue, FutexWait, MmFutexKey, RelativeFutexWait,
 };
 use core::cell::{Cell, RefCell};
-
-/// Aligned futex words leave this tag bit unused. Linux distinguishes PRIVATE
-/// and shared-on-private keys even in one MM (gVisor's KindSharedPrivate).
-pub(super) fn shared_private_key(address: UserVa) -> u64 {
-    address.raw() | 1
-}
 
 pub fn private_anonymous_futex_mapping<P, Policy, Geometry, Venue, B, C>(
     portal: &carrick_core::mm::transaction::MmPortal<'_, P, Policy, Geometry, Venue, B, C>,
@@ -100,20 +94,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
         limit: u32,
     ) -> Option<LifecycleOutcome> {
         let key = if self.shared {
-            shared_private_key(address)
+            MmFutexKey::shared_private(address)?
         } else {
-            address.raw()
+            MmFutexKey::private(address)?
         };
         let zone = self.entry.source.zone;
         let guard = zone.short_lock(
-            ZoneTables::<C>::bucket_of_with_context(mm.raw(), key),
+            ZoneTables::<C>::bucket_of_with_context(mm.raw(), key.scheduler_address()),
             &carrick_sched_core::ShortLockSpin,
         );
         let mut effects = WakeEffects::default();
         let result = zone.wake_placed(
             &guard,
             mm.raw(),
-            key,
+            key.scheduler_address(),
             bitset,
             limit,
             Waker::El1 {
@@ -137,15 +131,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
             self.retained = Some(RelativeFutexWait { deadline });
         }
         let key = if self.shared {
-            shared_private_key(wait.address)
+            MmFutexKey::shared_private(wait.address)?
         } else {
-            wait.address.raw()
+            MmFutexKey::private(wait.address)?
         };
         let zone = self.entry.source.zone;
         let slot = self.entry.source.slot;
         let record = self.entry.record.id;
         let guard = zone.short_lock(
-            ZoneTables::<C>::bucket_of_with_context(wait.mm.raw(), key),
+            ZoneTables::<C>::bucket_of_with_context(wait.mm.raw(), key.scheduler_address()),
             &carrick_sched_core::ShortLockSpin,
         );
         let mut word = 0;
@@ -176,7 +170,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
             return Some(returned(-11));
         }
         if zone
-            .enqueue(&guard, record, sequence, wait.mm.raw(), key, wait.bitset, 0)
+            .enqueue(
+                &guard,
+                record,
+                sequence,
+                wait.mm.raw(),
+                key.scheduler_address(),
+                wait.bitset,
+                0,
+            )
             .is_err()
         {
             zone.cancel_timer_admission(self.entry.record);
@@ -225,8 +227,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         mut call: FutexCall,
         copy: &mut dyn UserCopy,
     ) -> Option<LifecycleOutcome> {
-        let shared = matches!(call.args[1], 0 | 1);
-        if shared {
+        let shared = call.shared_private_candidate();
+        if let Some(candidate) = shared {
             let mm = self
                 .runtime
                 .graph
@@ -242,7 +244,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .service
                 .futex_shared_private(&mm, UserVa::new(call.args[0]))
             {
-                Ok(true) => call.args[1] |= 128,
+                Ok(true) => call = candidate,
                 Ok(false) => return None,
                 Err(NativeProcessError::OwnerWait(_) | NativeProcessError::Busy) => {
                     return Some(self.wait_guest_copy(GuestCopyRequest {
@@ -272,7 +274,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             entry: self,
             copy: RefCell::new(copy),
             refusal: Cell::new(None),
-            shared,
+            shared: shared.is_some(),
             now,
             frequency,
             retained,

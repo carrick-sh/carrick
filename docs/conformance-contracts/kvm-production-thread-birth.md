@@ -1,72 +1,87 @@
-# Production CPL0 thread birth remains unwired
+# Production CPL0 thread birth (#1892)
 
-Issue #1892 belongs to `kernel.el1.thread-lifecycle`. Its production-entry
-binding is
-`cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent`.
-The binding is intentionally red until production thread creation is wired;
-it must not be ignored or converted into an assertion that ENOSYS is correct.
+The unchanged `kernel.el1.thread-lifecycle` production-entry binding
+`cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent`
+now runs a real guest thread through the production image and executor pool.
+It was red on the round-one head: clone returned counted ENOSYS (38), rather
+than reaching the parent's status 7. The fixture, guest bytecode and existing
+assertions are unchanged.
 
-The fixture already calls `Cpl0Carrier::boot_production`, loads the initial
-guest MM and runs `try_run_prepared_kvm_pool`. It supplies a real issued root,
-two guest CPUs and the production runtime executor pool. There is no absent
-fixture pool to switch on. The initial lifecycle page has thread service
-enabled and its gate open.
+## Ownership and publication
 
-Production `LinuxPersonality` supplies the shared dispatcher with a
-`BornInZoneSource<ParkedContextWords>`, `GuestLifecycleVenue` and registered
-native process. It deliberately supplies no ARM `Zone`. However, the
-`El1PendingFamilies` implementation of `LifecycleNative::has_scheduler`
-requires an ARM scheduler, an ARM zone and a CPU slot. The common Linux
-`serve_clone` therefore declines immediately, before checking flags, acquiring
-stock, allocating a record or preparing a child. Strict x86 crossing policy
-then returns counted ENOSYS (38); clone is not a host crossing. Allowlisting
-it would substitute a different owner for the missing in-ring operation.
+The common Linux lifecycle owner still decides clone flags, credentials,
+NPROC limits, TID outputs, birth rollback, raw nonfinal exit and clear-tid.
+`El1PendingFamilies` can now use its typed native scheduler source without an
+ARM `Zone`. The x86 frame adapter captures the actual SYSCALL/XSAVE state and
+changes only the child's return register, user stack and FS TLS base.
 
-Changing that first predicate alone cannot repair the path. The same adapter's
-`can_prepare_child`, `allocate_record`, `prepare_child`, `enqueue_born`,
-`exit_record`, `wake_child_tid`, `release_current` and `run_next` still depend
-on the ARM zone and saved frame. The production x86 scheduler instead owns
-typed parked contexts and continuation receipts. Moreover, fresh native root
-admission leaves `NativeResources::thread_stock` absent: root births depend
-on externally supplied stock, whereas native fork children already have the
-shared `NativeThreadStock` owner. Production root admission needs retained
-control storage and issued, reclaimable identities, not a fixture's fabricated
-entry. Stock is a subsequent blocker, not the cause of the first refusal.
+Fresh CPL0 root admission receives bounded empty control storage retained by
+the carrier until all guest CPUs and graph/control references have gone.
+There are no issued sibling identities or preloaded sibling contexts in that
+storage. `NativeThreadStock` issues identities on demand, checks resource
+limits, returns rollback claims, and waits on its existing release notification
+when an in-flight birth or final retired-control pin prevents reuse. The same
+stock owner already serves native fork children. Host-served ARM roots retain
+their existing external stock owner.
 
-`carrick-x86::cpl0_lifecycle::NativeLane` and
-`cpl0_lifecycle::x5_shared_clone_exit` implement a different, explicitly bounded
-hardware fixture. Its two-context sidecar cannot establish production-pool
-thread creation. Moving that sidecar into the production image or preloading
-a test sibling would recreate the rejected second path.
+A native Born member must enter the exact-record registry before runnable
+publication: a different CPU may select it immediately. Registration reuses
+the common member-admission transaction and its retained pending/signal
+custody. A Born member already admitted before terminal close may finish
+registration while the process topology is reserved. The x86 resume loop uses
+the common registered-member entry, including each sibling's exact control,
+rather than the leader-only entry. Retirement gives the production pool its
+typed handoff receipt; no host thread implements guest clone or raw exit.
 
-## Witness and remaining implementation
+## Join and futex custody
 
-The new guest uses glibc thread flags plus CHILD_SETTID, with the parent and
-child TID outputs sharing one word. Linux guarantees the parent TID write
-before the parent returns from clone; CHILD_SETTID alone would race the
-parent's first join. Parent and child exchange a futex handshake, the child
-records its own gettid and invokes raw exit, and the parent requires clear-tid
-completion and its unchanged gettid before exit_group(7). Clone errors are
-reported as positive errno exit codes; other assertion failures use status 9.
-Each wait is bounded to five seconds and timeout fails; there is no retry or
-polling loop. The clear-tid join uses the shared futex key required by native
-Linux's exit wake.
+The witness uses glibc thread flags plus CHILD_SETTID. Parent and child TID
+outputs share one word; PARENT_SETTID orders its publication before the parent
+returns. A bounded futex handshake prevents the child from exiting before the
+parent runs. The child records gettid and invokes raw exit. The parent requires
+clear-tid completion, the child's expected gettid, and its own unchanged gettid
+before exit_group(7). Both waits retain the existing five-second deadlines;
+no retries, polling, timeout increase or host clone/futex fallback was added.
 
-The identical generated ELF exits 7 on native x86 Linux and 38 in the
-production KVM pool. This establishes a valid Linux lifecycle witness and
-the initial production refusal, not production birth or retirement correctness.
-The structural requirement is one guest-owned birth and nonfinal retirement,
-zero host clone/exit implementations and zero counted clone refusals. Existing
-thread-lifecycle scaling budgets remain unchanged and unqualified by this
-single-birth case.
+The native futex adapter lives in the common Linux owner and uses the shared
+Linux `serve_futex` policy. It compares an acquire atomic word under the
+existing scheduler bucket, saves the exact native context, enrolls once,
+probes signal interruption, and releases execution with a typed receipt.
+Owner-refused input preserves its relative deadline through the existing
+native service continuation. Shared operations are admitted here only when
+the MM owner authenticates private anonymous storage. Shared file and shared
+anonymous mappings still need their separate object-key authority and remain
+unrouted by this adapter.
 
-Remaining work is to extend the common lifecycle adapter to typed native
-record/context custody, provision root stock through production admission,
-and make this unchanged test green. Identity allocation, resource limits,
-publication rollback, Busy-once enrollment and terminal draining stay in the
-shared owners. ISA code should provide only register/TLS capture and restore.
-Then add production two-live-thread exit-group and exec cancellation of a
-parked anonymous operation, using the anonymous-operation changes in #1863,
-and audit other two-thread x86 production bindings. No terminal witness is
-claimed before that dependency and real guest thread birth exist. Signed HVF
-acceptance and full lifecycle scaling evidence remain separate gates.
+Linux distinguishes PRIVATE keys from shared operations on private anonymous
+storage even within one MM; see the clean-room
+[gVisor futex key contract](https://pkg.go.dev/gvisor.dev/gvisor/pkg/sentry/kernel/futex#KeyKind)
+and [futex(2)](https://man7.org/linux/man-pages/man2/futex.2.html).
+The native queue key tags an otherwise unused alignment bit for the latter;
+clear-tid wakes that same shared key. Private wake does not match it. The
+original aligned address alone is used for guest memory access.
+
+`production_native_futex_timeout_returns_etimedout` additionally parks a sole
+native thread, then requires errno 110 and zero futex refusals. It was red
+with the previous x86 timer's signal-wait EAGAIN result (guest status 9), while
+the identical ELF exited 7 on native x86 Linux. Bucket futex expiry now uses
+the common Linux ETIMEDOUT result; object/signal waits retain their own
+continuation completions. This asserts a result, not elapsed-time performance.
+
+The VM-free fresh-root stock bindings cover claim rollback without new
+identities, NPROC refusal, exhausted in-flight stock parking, notification on
+claim release, retry of the exact returned identity, and terminal withdrawal
+of reserved stock. Existing ARM native stock tests cover retired-control
+pins and repeated reuse. One production birth/retirement requires zero host
+clone/exit implementations and zero counted clone refusals. Existing lifecycle
+scaling budgets are unchanged; a single birth supplies no scaling or runtime
+ratio acceptance.
+
+## Remaining work
+
+The x86 exit_group and exec witnesses cancelling a parked anonymous operation
+still depend on #1863's ARM witness and implementation, absent on this main
+base. This PR remains **Part of #1892**. No such terminal-cancellation witness,
+full two-thread production-binding audit, signed HVF result, or lifecycle
+runtime-ratio acceptance is claimed. Signed evidence remains with the director
+and merge-group lane. Worker gate evidence is recorded on draft PR #1902.
