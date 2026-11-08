@@ -2863,7 +2863,8 @@ mod tests {
         }
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.set_fs_backend(Box::new(backend));
-        let mut fixture = fixture_with(dispatcher, None);
+        let mut fixture =
+            fixture_with_owner(dispatcher, None, |context| context.kernel().ipc().unwrap());
         let context = fixture.dispatcher.capture_one_task_context().unwrap();
         let acquire = |path| {
             fixture.dispatcher.retain_native_executable(
@@ -2892,7 +2893,7 @@ mod tests {
                 authority_of(&fixture.dispatcher).stamp(&mut bytes);
                 fixture
                     .dispatcher
-                    .serve_native_host_file_in(&fixture.owner, &mut bytes, custody.executable())
+                    .serve_native_host_file(&mut bytes, custody.executable())
                     .unwrap();
                 let reply = host_file::reply(&bytes).unwrap();
                 (reply.result, reply.output.to_vec())
@@ -2991,22 +2992,32 @@ mod tests {
 
     #[test]
     fn native_readlink_serves_ordinary_links_and_refuses_foreign_magic() {
-        let fixture = rootfs_fixture();
-        let authority = authority_of(&fixture.dispatcher);
-        assert_eq!(
-            fixture.result(
-                Some(&authority),
-                record(
-                    fixture.table,
-                    HostFileOp::Readlinkat,
-                    FDCWD,
-                    [0; 4],
-                    b"/lib",
-                    128
-                )
-            ),
-            (7, b"usr/lib".to_vec())
+        let lower = rootfs();
+        let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let fixture = fixture_with_owner(
+            SyscallDispatcher::with_rootfs(rootfs),
+            Some(lower),
+            |context| context.kernel().ipc().unwrap(),
         );
+        let authority = authority_of(&fixture.dispatcher);
+        let serve = |authority: &CallerAccess, bytes: &mut Vec<u8>| {
+            authority.stamp(bytes);
+            fixture
+                .dispatcher
+                .serve_native_host_file(bytes, None)
+                .map(|_| ())
+        };
+        let mut ordinary = record(
+            fixture.table,
+            HostFileOp::Readlinkat,
+            FDCWD,
+            [0; 4],
+            b"/lib",
+            128,
+        );
+        serve(&authority, &mut ordinary).unwrap();
+        let reply = host_file::reply(&ordinary).unwrap();
+        assert_eq!((reply.result, reply.output), (7, b"usr/lib".as_slice()));
         for path in [
             b"/proc/7/exe".as_slice(),
             b"/proc/self/cwd",
@@ -3021,10 +3032,7 @@ mod tests {
                 path,
                 128,
             );
-            assert_eq!(
-                fixture.serve(Some(&authority), &mut bytes),
-                Err(NativeHostFileRefusal)
-            );
+            assert_eq!(serve(&authority, &mut bytes), Err(NativeHostFileRefusal));
         }
         let mut confined = authority.clone();
         confined.root = Some("/usr".into());
@@ -3036,10 +3044,7 @@ mod tests {
             b"/lib",
             128,
         );
-        assert_eq!(
-            fixture.serve(Some(&confined), &mut bytes),
-            Err(NativeHostFileRefusal)
-        );
+        assert_eq!(serve(&confined, &mut bytes), Err(NativeHostFileRefusal));
     }
 
     fn dirent_names(records: &[u8]) -> Vec<String> {
