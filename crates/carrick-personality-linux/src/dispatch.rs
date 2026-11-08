@@ -33,6 +33,20 @@ pub enum AnonymousCall {
     Mprotect,
 }
 
+impl AnonymousCall {
+    /// Canonical anonymous-memory ordinals shared by the native ISA venues.
+    pub const fn from_canonical(ordinal: CanonicalNr) -> Option<Self> {
+        match ordinal.raw() {
+            214 => Some(Self::Brk),
+            215 => Some(Self::Munmap),
+            216 => Some(Self::Mremap),
+            222 => Some(Self::Mmap),
+            226 => Some(Self::Mprotect),
+            _ => None,
+        }
+    }
+}
+
 pub use crate::sched::SchedCall;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -648,13 +662,11 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
 }
 
 const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
+    if let Some(call) = AnonymousCall::from_canonical(CanonicalNr::new(ordinal)) {
+        return Family::Anonymous(call);
+    }
     match ordinal {
         nr if nr == crate::crossing::nr::GETRANDOM.raw() => Family::NativeService,
-        214 => Family::Anonymous(AnonymousCall::Brk),
-        215 => Family::Anonymous(AnonymousCall::Munmap),
-        216 => Family::Anonymous(AnonymousCall::Mremap),
-        222 => Family::Anonymous(AnonymousCall::Mmap),
-        226 => Family::Anonymous(AnonymousCall::Mprotect),
         63 => Family::Read,
         64 | 66 => Family::Write,
         20 | 21 => Family::Descriptor,
