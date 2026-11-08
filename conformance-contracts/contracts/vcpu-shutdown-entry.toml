@@ -73,6 +73,8 @@ vm_free = [
   "carrick-sched-core::loom_models::concurrent_group_exit_keeps_direct_load_terminal_intent_before_release",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-el1-linux::native_process_runtime::host_test_support::{host_request_during_service_park_yields_then_reparks,host_request_during_owner_wait_park_yields_then_reparks} (#1467: a host claimant interleaving with a running native service park is contention: the record leaves through its owner checkpoint with its exact operation, and the honoured request is handed back, never a carrier fatal; VM-free only)",
+  "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
+  "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
 ]
 embed = [
   "carrick-vmm-hvf::trap_engine_hvf::shutdown_kick::trap_engine_hvf_shutdown_kick_before_entry",

@@ -33,6 +33,8 @@ vm_free = [
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused (shared ABI identity and EL1_NAME_CACHE_SIZE/alignment asserts include seqlock-backed InotifyNameCache; carrick-x86-cpl0::file_region::file_region_layout_alignment_capacity_and_extent re-verified; no new file-region custody or KVM claim)",
   "carrick-x86-cpl0-host::cpl0_boot::birth_source_tests::bootstrap_metadata_records_are_disjoint_before_root_binding (bootstrap control-layout precondition for the existing KVM file-region fixtures; file-region storage and descriptor semantics unchanged)",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
+  "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
+  "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
 ]
 
 [bindings.unresolved]
