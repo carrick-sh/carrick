@@ -495,13 +495,15 @@ test-mm-owner *ARGS:
     {{_admit}} {{_cargo}} test --locked -p carrick-core --doc
     {{_admit}} {{_cargo}} test --locked -p carrick-core --test x86_acceleration {{ARGS}}
 
+# Changed crates and reverse dependencies; preserve just test compilation units.
+# JOBS limits Cargo compilation parallelism (default 3); test processes run serially.
+test-touched BASE:
+    {{_admit}} {{_xtask}} test-touched {{quote(BASE)}}
+
 # Host unit/harness tests without HVF guests or Docker. This ordered list is
 # the unsharded authority; check-test-shards compares the exact Cargo command
 # multiset and per-binary feature sets (including filters, serial threads and
 # stack budgets).
-test-touched BASE:
-    {{_admit}} {{_xtask}} test-touched {{quote(BASE)}}
-
 test *ARGS: _test-stdio
     #!/usr/bin/env bash
     set -euo pipefail
