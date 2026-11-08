@@ -246,6 +246,39 @@ checkout configs are rejected before Cargo runs. Toolchain and linker version
 identities remain in the manifest; this is a controlled build-input policy,
 not a sandbox for untrusted build scripts or a claim of bit reproducibility.
 
+## Comparing clean builds
+
+Two independent builds can be checked without restoring either one:
+
+```sh
+just xtask fixtures build --sha "$(git rev-parse HEAD)" --output target/fixtures/repro-1
+just xtask fixtures build --sha "$(git rev-parse HEAD)" --output target/fixtures/repro-2
+just xtask fixtures compare --first /absolute/path/to/first/manifest.json --second /absolute/path/to/second/manifest.json
+```
+
+Each build takes a fresh source snapshot and builds into its own target
+directories. The comparison checks the bundles' content addresses, rehashes
+all objects, checks both inventories against the current checkout, requires
+identical input identities and toolchain records, and reports every differing
+or missing executable. It compares bundle contents, not their admission by the
+current checkout; use `fixtures verify` for admission.
+Use the manifest paths printed by the build commands. The publisher rejects
+ambient compiler wrappers and Cargo build overrides; remove those from the
+publisher's environment if necessary.
+
+**Reproducibility remains unresolved.** Two clean x86_64 Linux builds of the
+same inputs reproduced 19 differing executables out of 1,195: `connrefused`,
+`eventwaitmatrix`, `fifonode`, `inzonetcp`, `mock_network_socket`, `pollevent`,
+`procconfigloop`, `pselecteintr`, and `selecttimeout` for each libc, plus
+`el1-sched-aarch64`. The GNU probes' `.rodata` contains the isolated Cargo
+home's random directory in a `libc` source path; its GNU build ID also changes.
+The musl probes contain the same path and have changed section layouts. For
+the scheduler fixture, separate source directories cause Cargo to pass different
+`-C metadata` values for its local `carrick-el1-control-abi` dependency and
+the scheduler executable; symbol names and executable sections differ.
+Neither disabling build IDs nor comparing only selected sections would resolve
+these byte differences. Keep using one authenticated bundle for paired gates.
+
 ## Scoped tests and red-first work
 
 A bundle stays valid across commits and dirty edits that do not touch fixture

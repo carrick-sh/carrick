@@ -62,6 +62,13 @@ pub enum FixturesAction {
         #[arg(long, help = "Bundle store (default: target/fixtures/bundles)")]
         output: Option<PathBuf>,
     },
+    /// Compare all executable objects from two independently built bundles.
+    Compare {
+        #[arg(long)]
+        first: PathBuf,
+        #[arg(long)]
+        second: PathBuf,
+    },
     /// Validate the entire bundle before installing any executable.
     Restore {
         #[arg(long, required_unless_present = "bundle", conflicts_with = "bundle")]
@@ -694,6 +701,72 @@ fn inspect_bundle(path: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
+fn compare_bundles(root: &Path, first: &Path, second: &Path) -> Result<usize> {
+    let first = inspect_bundle(first)?;
+    let second = inspect_bundle(second)?;
+    if first.input_identity()? != second.input_identity()? {
+        return Err(fail("fixture input identities differ"));
+    }
+    if first.toolchain.rustc != second.toolchain.rustc
+        || first.toolchain.cargo != second.toolchain.cargo
+        || first.toolchain.gnu_linker != second.toolchain.gnu_linker
+    {
+        return Err(fail("fixture toolchains differ"));
+    }
+    fn inventory(manifest: &Manifest) -> Result<BTreeMap<&str, &Executable>> {
+        let mut entries = BTreeMap::new();
+        for executable in &manifest.executables {
+            if entries
+                .insert(executable.path.as_str(), executable)
+                .is_some()
+            {
+                return Err(fail(format!(
+                    "duplicate fixture executable: {}",
+                    executable.path
+                )));
+            }
+        }
+        if entries.is_empty() {
+            return Err(fail("empty fixture executable inventory"));
+        }
+        Ok(entries)
+    }
+    let first_entries = inventory(&first)?;
+    let second_entries = inventory(&second)?;
+    let expected = executable_inventory(root)?;
+    let paths: std::collections::BTreeSet<_> = first_entries
+        .keys()
+        .chain(second_entries.keys())
+        .copied()
+        .chain(expected.keys().map(String::as_str))
+        .collect();
+    let mut differences = Vec::new();
+    for path in paths {
+        match (
+            first_entries.get(path),
+            second_entries.get(path),
+            expected.get(path),
+        ) {
+            (Some(a), Some(b), Some(target))
+                if a.target == *target && b.target == *target && a.sha256 == b.sha256 => {}
+            (Some(a), Some(b), Some(target)) => differences.push(format!(
+                "{path}: {:?} {} vs {:?} {} (expected target {target:?})",
+                a.target, a.sha256, b.target, b.sha256,
+            )),
+            (_, _, None) => differences.push(format!("{path}: unexpected fixture executable")),
+            _ => differences.push(format!("{path}: missing from one bundle")),
+        }
+    }
+    if !differences.is_empty() {
+        return Err(fail(format!(
+            "{} fixture executable(s) differ:\n{}",
+            differences.len(),
+            differences.join("\n")
+        )));
+    }
+    Ok(first_entries.len())
+}
+
 /// `sha`, when given, asserts the checkout's HEAD; the bundle itself is
 /// admitted by input identity whichever commit published it.
 pub fn verify_bundle(root: &Path, path: &Path, sha: Option<&str>) -> Result<Manifest> {
@@ -1137,6 +1210,10 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
         FixturesAction::Build { sha, output } => {
             let path = build(root, &sha, output.as_deref())?;
             writeln!(writer, "fixtures: bundle manifest {}", path.display())?;
+        }
+        FixturesAction::Compare { first, second } => {
+            let count = compare_bundles(root, &first, &second)?;
+            writeln!(writer, "fixtures: {count} executable hashes match")?;
         }
         FixturesAction::Restore {
             manifest,
