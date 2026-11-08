@@ -10891,7 +10891,13 @@ fn native_descriptor_metadata_witness(
 
     if let Some(case) = metadata {
         pipe_metadata_tests::exercise(case, |nr, args| {
+            let served = counters.served[nr as usize].load(Ordering::Relaxed);
             let (route, result) = run_in_child_full(0, nr, args);
+            assert_eq!(
+                counters.served[nr as usize].load(Ordering::Relaxed),
+                served + 1,
+                "metadata syscall {nr} must record a completed ring call, route {route:?}"
+            );
             assert!(
                 matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
                 "pipe metadata syscall {nr} must complete in ring: {route:?}, result {result}"

@@ -14,6 +14,8 @@ pub(super) enum Case {
     PipeSize,
     Readable,
     Nonblocking,
+    IoctlCloexec,
+    ExecCloexec,
     Terminal,
     Seek,
     Dup,
@@ -119,6 +121,47 @@ witness!(
     serial_host_pipe_metadata_root_close,
     serial_host_pipe_metadata_child_close,
     Close
+);
+
+macro_rules! exec_witness {
+    ($name:ident, $case:ident) => {
+        #[test]
+        fn $name() {
+            super::native_exec_pipe_tests::metadata_successor(Case::$case);
+        }
+    };
+}
+
+witness!(
+    serial_host_pipe_metadata_root_ioctl_cloexec,
+    serial_host_pipe_metadata_child_ioctl_cloexec,
+    IoctlCloexec
+);
+exec_witness!(serial_host_pipe_metadata_exec_stat, Stat);
+exec_witness!(serial_host_pipe_metadata_exec_empty_path, EmptyPath);
+exec_witness!(serial_host_pipe_metadata_exec_flags, Flags);
+exec_witness!(
+    serial_host_pipe_metadata_exec_descriptor_flags,
+    DescriptorFlags
+);
+exec_witness!(serial_host_pipe_metadata_exec_duplicate, Duplicate);
+exec_witness!(
+    serial_host_pipe_metadata_exec_duplicate_cloexec,
+    DuplicateCloexec
+);
+exec_witness!(serial_host_pipe_metadata_exec_pipe_size, PipeSize);
+exec_witness!(serial_host_pipe_metadata_exec_readable, Readable);
+exec_witness!(serial_host_pipe_metadata_exec_nonblocking, Nonblocking);
+exec_witness!(serial_host_pipe_metadata_exec_ioctl_cloexec, IoctlCloexec);
+exec_witness!(serial_host_pipe_metadata_exec_terminal, Terminal);
+exec_witness!(serial_host_pipe_metadata_exec_seek, Seek);
+exec_witness!(serial_host_pipe_metadata_exec_dup, Dup);
+exec_witness!(serial_host_pipe_metadata_exec_dup3, Dup3);
+exec_witness!(serial_host_pipe_metadata_exec_close, Close);
+
+exec_witness!(
+    serial_host_pipe_metadata_exec_inherited_cloexec,
+    ExecCloexec
 );
 
 pub(super) fn exercise(case: Case, mut call: impl FnMut(u64, [u64; 4]) -> i64) {
@@ -256,6 +299,21 @@ pub(super) fn exercise(case: Case, mut call: impl FnMut(u64, [u64; 4]) -> i64) {
                 0
             );
             assert_eq!(call(nr::FCNTL.raw(), [read, LINUX_F_GETFL, 0, 0]), 0);
+        }
+        Case::ExecCloexec => {
+            assert_eq!(
+                call(nr::FCNTL.raw(), [6, LINUX_F_GETFD, 0, 0]),
+                -9,
+                "exec must remove the inherited CLOEXEC alias"
+            );
+        }
+        Case::IoctlCloexec => {
+            // Linux asm-generic ioctl numbers, shared by ARM64 and x86_64.
+            assert_eq!(call(nr::IOCTL.raw(), [read, 0x5451, 0, 0]), 0); // FIOCLEX
+            assert_eq!(call(nr::FCNTL.raw(), [read, LINUX_F_GETFD, 0, 0]), 1);
+            assert_eq!(call(nr::FCNTL.raw(), [write, LINUX_F_GETFD, 0, 0]), 0);
+            assert_eq!(call(nr::IOCTL.raw(), [read, 0x5450, 0, 0]), 0); // FIONCLEX
+            assert_eq!(call(nr::FCNTL.raw(), [read, LINUX_F_GETFD, 0, 0]), 0);
         }
         Case::Terminal => assert_eq!(call(nr::IOCTL.raw(), [read, LINUX_TCGETS, 0, 0]), -25),
         Case::Seek => assert_eq!(call(nr::LSEEK.raw(), [read, 0, 0, 0]), -29),

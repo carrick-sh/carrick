@@ -38,6 +38,18 @@ fn fork_exec_successor(futex: Option<u64>) {
 }
 
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
+    fork_exec_successor_with_metadata(futex, bitset, None);
+}
+
+pub(super) fn metadata_successor(case: super::pipe_metadata_tests::Case) {
+    fork_exec_successor_with_metadata(None, u32::MAX as u64, Some(case));
+}
+
+fn fork_exec_successor_with_metadata(
+    futex: Option<u64>,
+    bitset: u64,
+    metadata: Option<super::pipe_metadata_tests::Case>,
+) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
@@ -68,15 +80,19 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
         (3, End::Reader, fd::AccessMode::ReadOnly),
         (4, End::Writer, fd::AccessMode::WriteOnly),
     ] {
-        owner
+        let description = owner
             .admit_description(fd::Description::new(
                 IpcBacking::Pipe { object, end }.encode(),
                 access,
                 fd::StatusFlags::default(),
             ))
-            .unwrap()
+            .unwrap();
+        description
             .install(table.id(), fd::Fd(number), false)
             .unwrap();
+        if metadata.is_some() && number == 3 {
+            description.install(table.id(), fd::Fd(6), true).unwrap();
+        }
     }
     let storage = Box::leak(carrick_test_support::TestEl1Region::zeroed());
     // SAFETY: aligned storage is retained for both inherited table bindings.
@@ -347,6 +363,25 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
         let selected = fixture.zone.slot(fixture.slot).current().unwrap();
         // SAFETY: fixture retains this selected live record.
         let binding = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+        // Physical records owner copies rather than writing host memory. Bind
+        // this call's live GuestUserBuffer output and apply only the bytes the
+        // production owner actually delivered, never a synthesized result.
+        let output = metadata.and_then(|_| match nr {
+            59 => Some((fd, 8usize)),
+            80 => Some((address, core::mem::size_of::<carrick_abi::LinuxStat>())),
+            79 => Some((count, core::mem::size_of::<carrick_abi::LinuxStat>())),
+            29 if address == carrick_abi::LINUX_FIONREAD => Some((count, 4)),
+            63 => Some((address, count as usize)),
+            _ => None,
+        });
+        if metadata.is_some() {
+            let _ = crate::native_process_runtime::host_test_support::take_signal_copies();
+        }
+        if let Some((address, 4)) = output {
+            service
+                .tid_words
+                .insert((binding.address.mm.raw().get(), address), 0);
+        }
         let mut entry = runtime
             .enter_registered(
                 registry,
@@ -357,13 +392,22 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
                 &mut service,
             )
             .unwrap_or_else(|error| panic!("native entry nr={nr}, fd={fd}: {error:?}"));
+        let served_before = counters.served[nr as usize].load(Ordering::Relaxed);
         let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
             core::slice::from_ref(&fixture.task),
+            if metadata.is_some() {
+                crossing.fd_map()
+            } else {
+                &[]
+            },
             &[],
-            &[],
-            &[],
+            if metadata.is_some() {
+                crossing.open_table()
+            } else {
+                &[]
+            },
             &[],
             names,
             Some(crate::dispatch::Zone {
@@ -378,6 +422,34 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
             None,
             |_| core::ptr::null_mut(),
         );
+        drop(entry);
+        if metadata.is_some() {
+            assert_eq!(
+                counters.served[nr as usize].load(Ordering::Relaxed),
+                served_before + 1,
+                "metadata syscall {nr} must record a completed ring call, route {route:?}"
+            );
+        }
+        if let Some((destination, length)) = output {
+            let mut copies = crate::native_process_runtime::host_test_support::take_signal_copies();
+            if length == 4 {
+                let word = service.tid_words[&(binding.address.mm.raw().get(), destination)];
+                copies.push((UserVa::new(destination), word.to_ne_bytes().to_vec()));
+            }
+            for (at, bytes) in copies {
+                assert!(at.raw() >= destination);
+                assert!(at.raw() + bytes.len() as u64 <= destination + length as u64);
+                // SAFETY: exercise owns this exact live GuestUserBuffer until
+                // the call returns, and the assertions bound every copied byte.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        at.raw() as *mut u8,
+                        bytes.len(),
+                    );
+                }
+            }
+        }
         // Completed in-ring I/O can still owe native return-event work.
         // This fixture checks committed results and pipe bytes below, without
         // modelling the carrier's return transport. Neither route replays I/O.
@@ -391,6 +463,32 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
         );
         frame.x[0]
     };
+    if let Some(case) = metadata {
+        use carrick_personality_linux::crossing::nr as sys;
+        for fd in [3, 4] {
+            assert_eq!(
+                call_full(sys::FCNTL.raw(), fd, carrick_abi::LINUX_F_GETFD, 0, 0),
+                0,
+                "non-CLOEXEC pipe ends must survive fork and exec"
+            );
+        }
+        assert!(
+            runtime.task_binding(parent).is_some(),
+            "parent remains live"
+        );
+        super::pipe_metadata_tests::exercise(case, |nr, args| {
+            call_full(nr, args[0], args[1], args[2], args[3]) as i64
+        });
+        assert!(
+            owner
+                .region()
+                .fd(carrick_sched_core::ShortLockSpin)
+                .getfd(table.id(), fd::Fd(6))
+                .unwrap()
+        );
+        registry.unregister_root_for_test(&runtime);
+        return;
+    }
     // Constructors must use the successor's native table after exec, just
     // as they do before exec. Check a usable counter and empty epoll wait.
     use carrick_personality_linux::crossing::nr as sys;
