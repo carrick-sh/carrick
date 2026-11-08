@@ -289,6 +289,29 @@ pub(crate) fn native_entry_owned(
     }
 }
 
+/// Admission contention is evidence, not an invariant error. There is deliberately
+/// no From implementation into an invariant or errno type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeAdmissionOrigin {
+    OldRecordRetained,
+    ExecutionKeyCollision,
+    RecordKeyCollision,
+    ThreadRegistrationCollision,
+    ThreadPendingCustody,
+    FreshRootPendingCustody,
+    RootRegistrationCollision,
+}
+
+/// Exact identities captured while the refusing registry/owner is still locked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeAdmissionContention {
+    pub origin: NativeAdmissionOrigin,
+    pub binding: ExecutionBinding,
+    pub old_record: Option<RecordRef>,
+    pub new_record: RecordRef,
+    pub conflicting_owner: Option<ExecutionBinding>,
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -306,6 +329,7 @@ pub enum NativeProcessError {
     Unsupported,
     GroupExitCustody,
     Busy,
+    AdmissionContended(NativeAdmissionContention),
     Quarantined,
     NoChild,
 }
@@ -319,7 +343,7 @@ impl NativeProcessError {
             Self::Fault => R::NativeFault,
             Self::ForkRefused(refusal) => refusal.error().run_failure_reason(),
             Self::Unsupported => R::NativeUnsupported,
-            Self::Busy => R::NativeBusy,
+            Self::Busy | Self::AdmissionContended(_) => R::NativeBusy,
             Self::OwnerWait(_) => R::NativeFault,
             Self::Quarantined => R::NativeQuarantined,
             Self::NoChild => R::NativeNoChild,
@@ -329,7 +353,7 @@ impl NativeProcessError {
     pub fn errno(self) -> i64 {
         match self {
             Self::Invalid | Self::Stale => -22,
-            Self::Exhausted | Self::Busy => -11,
+            Self::Exhausted | Self::Busy | Self::AdmissionContended(_) => -11,
             Self::Fault | Self::OwnerWait(_) => -14,
             Self::ForkRefused(refusal) => refusal.error().errno(),
             Self::Unsupported | Self::GroupExitCustody => -38,
@@ -1887,7 +1911,28 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             || state.records.contains_key(&record_key)
             || state.groups.contains_key(&group_key)
         {
-            return Err(NativeProcessError::Busy);
+            let owner = state
+                .records
+                .get(&record_key)
+                .copied()
+                .or_else(|| {
+                    state.groups.get(&group_key).and_then(|(_, process)| {
+                        state
+                            .by_process
+                            .get(&(key.carrier, *process))
+                            .and_then(|(_, keys)| keys.first().copied())
+                    })
+                })
+                .unwrap_or(key);
+            return Err(NativeProcessError::AdmissionContended(
+                NativeAdmissionContention {
+                    origin: NativeAdmissionOrigin::RootRegistrationCollision,
+                    binding,
+                    old_record: state.members.get(&owner).map(|member| member.record),
+                    new_record: owned.record,
+                    conflicting_owner: Some(owner.binding()),
+                },
+            ));
         }
         let retained = retain_member_control(control)?;
         // Root registration, like child publication, transfers the still-Free
@@ -1995,13 +2040,40 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             return Err(NativeProcessError::Stale);
         }
         if old_record != reference && signal_record_exists(source.zone, old_record) {
-            return Err(NativeProcessError::Busy);
+            return Err(NativeProcessError::AdmissionContended(
+                NativeAdmissionContention {
+                    origin: NativeAdmissionOrigin::OldRecordRetained,
+                    binding,
+                    old_record: Some(old_record),
+                    new_record: reference,
+                    conflicting_owner: Some(old_key.binding()),
+                },
+            ));
         }
         let record_key = Self::record_key(source.zone, reference);
-        if (old_key != key && state.members.contains_key(&key))
-            || (old_record != reference && state.records.contains_key(&record_key))
+        if old_key != key && state.members.contains_key(&key) {
+            return Err(NativeProcessError::AdmissionContended(
+                NativeAdmissionContention {
+                    origin: NativeAdmissionOrigin::ExecutionKeyCollision,
+                    binding,
+                    old_record: Some(old_record),
+                    new_record: reference,
+                    conflicting_owner: Some(key.binding()),
+                },
+            ));
+        }
+        if old_record != reference
+            && let Some(owner) = state.records.get(&record_key)
         {
-            return Err(NativeProcessError::Busy);
+            return Err(NativeProcessError::AdmissionContended(
+                NativeAdmissionContention {
+                    origin: NativeAdmissionOrigin::RecordKeyCollision,
+                    binding,
+                    old_record: Some(old_record),
+                    new_record: reference,
+                    conflicting_owner: Some(owner.binding()),
+                },
+            ));
         }
         let mut member = state
             .members
@@ -2642,7 +2714,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         let record_key = Self::record_key(source.zone, source.zone.record_ref(record));
         if state.members.contains_key(&key) || state.records.contains_key(&record_key) {
-            return Err(NativeProcessError::Busy);
+            let owner = state.records.get(&record_key).copied().unwrap_or(key);
+            return Err(NativeProcessError::AdmissionContended(
+                NativeAdmissionContention {
+                    origin: NativeAdmissionOrigin::ThreadRegistrationCollision,
+                    binding,
+                    old_record: state.members.get(&owner).map(|member| member.record),
+                    new_record: source.zone.record_ref(record),
+                    conflicting_owner: Some(owner.binding()),
+                },
+            ));
         }
         if !state.by_process.contains_key(&(key.carrier, process)) {
             return Err(NativeProcessError::Stale);
@@ -2710,7 +2791,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             } else {
                 let retained = retain_member_control(control)?;
                 let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
-                    .map_err(|_| NativeProcessError::Busy)?;
+                    .map_err(|_| {
+                        NativeProcessError::AdmissionContended(NativeAdmissionContention {
+                            origin: NativeAdmissionOrigin::ThreadPendingCustody,
+                            binding,
+                            old_record: None,
+                            new_record: source.zone.record_ref(record),
+                            conflicting_owner: Some(binding),
+                        })
+                    })?;
                 retained.commit_registration();
                 let projection = row
                     .native()
@@ -3537,7 +3626,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let signals = NativeProcessSignals::fresh_root(key, page);
         for member in &mut members {
             let pending = carrick_el1_abi::NativePendingCustody::try_admit(member.control.clone())
-                .map_err(|_| NativeProcessError::Busy)?;
+                .map_err(|_| {
+                    NativeProcessError::AdmissionContended(NativeAdmissionContention {
+                        origin: NativeAdmissionOrigin::FreshRootPendingCustody,
+                        binding,
+                        old_record: Some(member.record),
+                        new_record: source.zone.record_ref(record),
+                        conflicting_owner: Some(binding),
+                    })
+                })?;
             member.signal_projection = Some(signals.project_member(member.record, pending));
         }
         let resources = NativeResources {
