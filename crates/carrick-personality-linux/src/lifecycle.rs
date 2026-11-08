@@ -258,6 +258,28 @@ pub trait CopyoutEffect: Send {
 }
 
 pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
+    /// Native scheduler publication belongs to the admitted process execution
+    /// owner, which also delivers architecture-specific wake effects.
+    fn native_futex(
+        &mut self,
+        _call: crate::sched::FutexCall,
+        _copy: &mut dyn carrick_core::user_copy::UserCopy,
+    ) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn enqueue_thread(&mut self, _record: RecordRef) -> BornEnqueue {
+        BornEnqueue::Refused
+    }
+    fn wake_thread_join(&mut self, _mm: carrick_core_abi::EntryMmKey, _address: UserVa) -> bool {
+        false
+    }
+    fn retire_thread_current(
+        &mut self,
+        _record: RecordRef,
+        _retirement: carrick_core::terminal::ZoneRetirement<'_, '_>,
+    ) -> bool {
+        false
+    }
     /// The admitted process graph owns root identity; namespace PID 1 does not.
     fn is_root_process(&self) -> bool;
     /// A native execution record owns its complete published descriptor

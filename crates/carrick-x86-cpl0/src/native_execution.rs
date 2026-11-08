@@ -72,7 +72,14 @@ pub fn schedule(slot: SlotId) -> ! {
             {
                 let _copy_gate = user_fault_gate::install();
                 let mut entry = runtime
-                    .enter(source, current, words, &mut service)
+                    .enter_registered(
+                        native_process::registry(),
+                        source,
+                        current,
+                        state.address,
+                        &words,
+                        &mut service,
+                    )
                     .unwrap_or_else(|_| fatal_boot());
                 match entry
                     .resume_checkpoint(|entry| {

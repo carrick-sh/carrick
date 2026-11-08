@@ -126,6 +126,18 @@ pub(super) fn admit_root(
     let owner = NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
         source, task, page, control, address, address, words,
     )?;
+    // SAFETY: the production bootstrap initialized this aligned empty extent
+    // before vCPU entry. Carrier custody retains it until every guest CPU and
+    // process/control pin is gone; it is disjoint from the leader's control.
+    let controls = unsafe {
+        core::slice::from_raw_parts(
+            (carrick_el1::isa::x86_kernel_layout().dynamic_metadata.raw()
+                + carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET)
+                as *const ThreadControlSlot,
+            carrick_el1_abi::THREAD_POOL_ENTRIES + 1,
+        )
+    };
+    owner.admit_thread_stock(NativeLifecycleResources { page, controls })?;
     REGISTRY.register_root(Arc::new(owner), source, task, address)?;
     let binding =
         carrick_el1::isa::x86::context::current_cpu_binding().ok_or(NativeProcessError::Stale)?;
@@ -860,6 +872,20 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             core::slice::from_raw_parts(info as *const _ as *const u8, core::mem::size_of_val(info))
         };
         self.copy_signal_bytes(mm, address, bytes)
+    }
+    fn futex_shared_private(
+        &mut self,
+        mm: &Mm,
+        address: UserVa,
+    ) -> Result<bool, NativeProcessError> {
+        // The neutral MM owner authenticates the mapping; ISA code supplies
+        // only its portal and current worker, as for every other MM service.
+        carrick_el1_linux::native_process_runtime::private_anonymous_futex_mapping(
+            &portal()?,
+            mm.mm,
+            self.worker(),
+            address,
+        )
     }
     fn wake_effects(&mut self, mut effects: WakeEffects) {
         if effects.queued_own {
