@@ -1,4 +1,6 @@
 //! Counter publication is independent of task, memory and scheduler state.
+extern crate std;
+
 use super::Counters;
 use core::sync::atomic::Ordering;
 
