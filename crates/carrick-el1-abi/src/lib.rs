@@ -2959,7 +2959,7 @@ pub enum CopyRefusalReason {
     OwnerAbsent,
     OwnerMismatch,
     OwnerBusy,
-    OwnerWait,
+    OwnerDependency,
 }
 
 impl CopyRefusalReason {
@@ -2972,7 +2972,7 @@ impl CopyRefusalReason {
             Self::OwnerAbsent => 5,
             Self::OwnerMismatch => 6,
             Self::OwnerBusy => 7,
-            Self::OwnerWait => 8,
+            Self::OwnerDependency => 8,
             Self::ArmTranslation(fst) => 0x100 | fst as u64,
         }
     }

@@ -234,9 +234,11 @@ impl<
                     InputPreparationRefusal::Fault => {
                         carrick_el1_abi::CopyRefusalReason::OwnerFault
                     }
-                    InputPreparationRefusal::Busy => carrick_el1_abi::CopyRefusalReason::OwnerBusy,
-                    InputPreparationRefusal::OwnerWait => {
-                        carrick_el1_abi::CopyRefusalReason::OwnerWait
+                    InputPreparationRefusal::OwnerBusy => {
+                        carrick_el1_abi::CopyRefusalReason::OwnerBusy
+                    }
+                    InputPreparationRefusal::OwnerDependency => {
+                        carrick_el1_abi::CopyRefusalReason::OwnerDependency
                     }
                 },
             );
