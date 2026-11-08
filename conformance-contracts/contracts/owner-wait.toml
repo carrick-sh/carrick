@@ -135,6 +135,7 @@ vm_free = [
 
 embed = [
   "carrick-embed::el1_host_copyout::root_signal_copy::root_sigprocmask_reads_untouched_readonly_file_mapping (#1677: root in-ring signal set first-reads an untouched readonly file mapping; old/new/restored mask and no forwarding)",
+  "carrick-embed::el1_sched::el1_prepared_fork_poll_arguments_touched_after_fork (#1877 diagnostic control; signed verification pending)",
 ]
 
 [bindings.unresolved]

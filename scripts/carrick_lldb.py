@@ -1076,6 +1076,26 @@ def _c_global_load_addr(target, name: str) -> Optional[int]:
 
 # ----- the top-level `carrick` multiplex command --------------------------
 
+def _copy_refusal_lines(raw):
+    """Decode committed, immutable diagnostic rows; never infer COW from PAR."""
+    import struct
+
+    if len(raw) != 16 * 64:
+        raise ValueError("invalid copy refusal extent")
+    lines = []
+    for offset in range(0, len(raw), 64):
+        committed, nr, va, length, role, direction, reason, owner = struct.unpack_from("<8Q", raw, offset)
+        if committed != 1:
+            continue
+        label = {1: "forbidden-range", 2: "validator-other", 3: "guarded-fault", 4: "owner-efault"}.get(reason, "other")
+        if reason & 0x100:
+            fsc = reason & 0x3f
+            label = "unmapped" if 4 <= fsc <= 7 else "forbidden" if 12 <= fsc <= 15 else "translation-other"
+            label += f"(PAR.FST={fsc:#x})"
+        lines.append(f"copy-refusal nr={nr} va={va:#x} len={length} argument={role} direction={'out' if direction else 'in'} reason={label} owner={owner}")
+    return lines
+
+
 def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
     """Read the mapped ARM counters, using this artifact's DWARF layout."""
     import struct
@@ -1125,6 +1145,20 @@ def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
         row = {name: counts[nr] if nr < len(counts) else 0 for name, counts in values.items()}
         if any(row.values()):
             lines.append(f"nr={nr} " + " ".join(f"{name}={count}" for name, count in row.items()))
+    for index in range(layout.GetNumberOfFields()):
+        field = layout.GetFieldAtIndex(index)
+        if field.GetName() != "copy_refusals":
+            continue
+        size = field.GetType().GetByteSize()
+        if size != 16 * 8 * 8:
+            result.SetError("invalid copy refusal extent in DWARF")
+            return
+        raw = process.ReadMemory(pointer + field.GetOffsetInBytes(), size, error)
+        if error.Fail() or len(raw) != size:
+            result.SetError("copy refusals unreadable: " + str(error))
+            return
+        lines.extend(_copy_refusal_lines(raw))
+        lines.append("# copy-refusal retains first 16 records; owner=0 means absent or binding mismatch; COW/Busy are not inferred from permission faults")
     result.AppendMessage("\n".join(lines))
 
 
