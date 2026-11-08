@@ -716,6 +716,9 @@ enum AtEmptyPathCase {
     CwdDot,
     AbsoluteBadFd,
     Pipe,
+    BadFlagsBadFd,
+    RelativeBadFd,
+    RelativePipe,
 }
 
 fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
@@ -725,7 +728,7 @@ fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
     use carrick_kernel::el1_ipc::{HostIpc, HostTable};
     use carrick_personality_linux::dispatch::CompletionRoute;
     use carrick_personality_linux::native_host_file::{
-        HostFileCall, HostFileStage, NativeNamespace,
+        HostFileCall, HostFileStage, InZoneKind, NativeDescriptor, NativeNamespace,
     };
     use carrick_test_support::GuestUserBuffer;
     use std::sync::Arc;
@@ -772,21 +775,23 @@ fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
         AtEmptyPathCase::CwdDot => (LINUX_AT_FDCWD as i32, b".\0"),
         AtEmptyPathCase::AbsoluteBadFd => (63, b"/\0"),
         AtEmptyPathCase::Pipe => (3, b"\0"),
+        AtEmptyPathCase::BadFlagsBadFd => (63, b"\0"),
+        AtEmptyPathCase::RelativeBadFd => (63, b".\0"),
+        AtEmptyPathCase::RelativePipe => (3, b".\0"),
     };
+    let flags = LINUX_AT_EMPTY_PATH
+        | if matches!(case, AtEmptyPathCase::BadFlagsBadFd) {
+            0x8000_0000
+        } else {
+            0
+        };
     let path = GuestUserBuffer::from_bytes(path);
     let output = GuestUserBuffer::zeroed(if x86 {
         core::mem::size_of::<LinuxX8664Stat>()
     } else {
         core::mem::size_of::<LinuxStat>()
     });
-    let args = [
-        dirfd as u64,
-        path.arg(),
-        output.arg(),
-        LINUX_AT_EMPTY_PATH,
-        0,
-        0,
-    ];
+    let args = [dirfd as u64, path.arg(), output.arg(), flags, 0, 0];
     let mut arm = TrapFrame {
         esr: 0x15 << 26,
         elr: 0x4004,
@@ -854,7 +859,11 @@ fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
         );
         (route, arm.x[0] as i64)
     };
-    if matches!(case, AtEmptyPathCase::Pipe) {
+    if matches!(case, AtEmptyPathCase::BadFlagsBadFd) {
+        assert_eq!(route, CompletionRoute::Served);
+        assert_eq!(result, -22, "invalid flags must precede EBADF(9)");
+        assert!(output.as_bytes().iter().all(|byte| *byte == 0));
+    } else if matches!(case, AtEmptyPathCase::Pipe) {
         assert_eq!(route, CompletionRoute::Served, "pipe query stays in ring");
         assert_eq!(result, 0);
         let mode = if x86 {
@@ -875,6 +884,68 @@ fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
         );
         assert_eq!(result, if x86 { 0xfeed } else { dirfd as i64 });
         assert!(output.as_bytes().iter().all(|byte| *byte == 0));
+        if matches!(
+            case,
+            AtEmptyPathCase::RelativeBadFd | AtEmptyPathCase::RelativePipe
+        ) {
+            let mut resolved = Vec::new();
+            let stage = dispatch::stage_native_host_file(
+                HostFileCall::Newfstatat {
+                    dirfd,
+                    path: path.arg(),
+                    statbuf: output.arg(),
+                    flags,
+                },
+                &task,
+                &carrick_el1_linux::file::HardwareValidator,
+                &mut NativeNamespace {
+                    table: [1, 2, 3],
+                    resolve: &mut |fd| {
+                        resolved.push(fd);
+                        let descriptor = match owner
+                            .region()
+                            .fd(fd::BoundedSpin(1024))
+                            .get(table.id(), fd::Fd(fd))
+                        {
+                            Ok(description) => {
+                                let Some(IpcBacking::Pipe { object, .. }) =
+                                    IpcBacking::decode(description.backing)
+                                else {
+                                    panic!("fixture descriptor must name a pipe");
+                                };
+                                NativeDescriptor::InZone(InZoneKind::Pipe(
+                                    carrick_abi::LinuxPipeIdentity::new(
+                                        object.index(),
+                                        object.generation(),
+                                    ),
+                                ))
+                            }
+                            Err(fd::Error::BadFd) => NativeDescriptor::Absent,
+                            Err(error) => panic!("unexpected descriptor error: {error:?}"),
+                        };
+                        Some(descriptor)
+                    },
+                    releases: &mut |_| 0,
+                },
+            );
+            let Some(HostFileStage::Returned(result)) = stage else {
+                panic!("relative path must complete with a descriptor error");
+            };
+            assert_eq!(
+                result,
+                carrick_personality_linux::abi::entry::SyscallResult::new(
+                    if matches!(case, AtEmptyPathCase::RelativeBadFd) {
+                        -9
+                    } else {
+                        -20
+                    }
+                ),
+                "relative path requires EBADF(9) or ENOTDIR(20)"
+            );
+            assert_eq!(resolved, [dirfd]);
+            assert!(output.as_bytes().iter().all(|byte| *byte == 0));
+            return;
+        }
         // Continue the handoff through the existing shared Newfstatat path
         // owner: cwd and absolute paths must stage a path request without
         // consulting the descriptor namespace at all.
@@ -951,4 +1022,29 @@ fn at_empty_path_x86_absolute_bad_fd() {
 #[test]
 fn at_empty_path_x86_pipe_control() {
     at_empty_path_dispatch(true, AtEmptyPathCase::Pipe);
+}
+
+#[test]
+fn at_empty_path_arm_bad_flags_bad_fd() {
+    at_empty_path_dispatch(false, AtEmptyPathCase::BadFlagsBadFd);
+}
+#[test]
+fn at_empty_path_x86_bad_flags_bad_fd() {
+    at_empty_path_dispatch(true, AtEmptyPathCase::BadFlagsBadFd);
+}
+#[test]
+fn at_empty_path_arm_relative_bad_fd() {
+    at_empty_path_dispatch(false, AtEmptyPathCase::RelativeBadFd);
+}
+#[test]
+fn at_empty_path_x86_relative_bad_fd() {
+    at_empty_path_dispatch(true, AtEmptyPathCase::RelativeBadFd);
+}
+#[test]
+fn at_empty_path_arm_relative_pipe() {
+    at_empty_path_dispatch(false, AtEmptyPathCase::RelativePipe);
+}
+#[test]
+fn at_empty_path_x86_relative_pipe() {
+    at_empty_path_dispatch(true, AtEmptyPathCase::RelativePipe);
 }
