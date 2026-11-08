@@ -3779,6 +3779,9 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         let arg = self.frame.argument(1).unwrap_or(0);
         let value = self.frame.argument(2).unwrap_or(0);
         let at = ordinal == nr::NEWFSTATAT || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT;
+        let flags = self.frame.argument(3).unwrap_or(0);
+        // Linux 6.11+ accepts NULL as empty only with AT_EMPTY_PATH.
+        let empty_null_path = at && arg == 0 && flags & LINUX_AT_EMPTY_PATH != 0;
         // AT_EMPTY_PATH permits an empty pathname; it does not require one.
         // Cwd queries belong to the path owner even when the path is empty.
         if at && fd.0 == LINUX_AT_FDCWD as i32 {
@@ -3789,7 +3792,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         // no description, object guard or output has been retained yet.
         let input = if ordinal == nr::IOCTL && arg == LINUX_FIONBIO {
             Some((value, 4))
-        } else if at {
+        } else if at && !empty_null_path {
             Some((arg, 1))
         } else {
             None
@@ -3833,6 +3836,12 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         // it, and all nonempty paths must go through the existing path owner.
         if at && imported[0] != 0 {
             return FamilyCompletion::Forward;
+        }
+        if at
+            && flags & !(LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT)
+                != 0
+        {
+            return FamilyCompletion::Complete(LINUX_EINVAL.guest_retval());
         }
         let (pin, description) = match authority.pin(table, fd) {
             Ok(value) => value,
@@ -3888,17 +3897,8 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 || ordinal == nr::NEWFSTATAT
                 || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT
             {
-                if at {
-                    let flags = self.frame.argument(3).unwrap_or(0);
-                    if flags
-                        & !(LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT)
-                        != 0
-                    {
-                        return FamilyCompletion::Complete(LINUX_EINVAL.guest_retval());
-                    }
-                    if flags & LINUX_AT_EMPTY_PATH == 0 {
-                        return FamilyCompletion::Forward;
-                    }
+                if at && flags & LINUX_AT_EMPTY_PATH == 0 {
+                    return FamilyCompletion::Forward;
                 }
                 // Authenticate the live object under the same lock as pipe I/O.
                 let guard = match venue.region.lock(object, &NativeFdWait) {
