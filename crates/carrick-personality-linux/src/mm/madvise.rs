@@ -9,7 +9,13 @@
 
 use alloc::vec::Vec;
 use carrick_guest_arch::{GuestLen, GuestVa};
-use carrick_syscall_abi::*;
+use carrick_syscall_abi::{
+    LINUX_EINVAL, LINUX_ENOMEM, LINUX_MADV_COLLAPSE, LINUX_MADV_DODUMP, LINUX_MADV_DOFORK,
+    LINUX_MADV_DONTDUMP, LINUX_MADV_DONTFORK, LINUX_MADV_DONTNEED, LINUX_MADV_FREE,
+    LINUX_MADV_HUGEPAGE, LINUX_MADV_KEEPONFORK, LINUX_MADV_NOHUGEPAGE, LINUX_MADV_NORMAL,
+    LINUX_MADV_RANDOM, LINUX_MADV_SEQUENTIAL, LINUX_MADV_WILLNEED, LINUX_MADV_WIPEONFORK,
+    LinuxErrno,
+};
 
 /// Advice classification, independent of the execution venue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
