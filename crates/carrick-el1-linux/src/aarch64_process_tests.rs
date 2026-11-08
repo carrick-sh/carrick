@@ -9279,6 +9279,333 @@ impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
     }
 }
 
+// #1846 slice C: a caught signal must borrow a parked anonymous syscall only
+// until its handler returns. The syscall then re-enters its saved SVC, never
+// reports EINTR, and owns no stale wait token after its real completion.
+#[test]
+fn arm_caught_signal_returns_then_reexecutes_parked_anonymous_edit() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1::substrate::sched::{Sched, Served};
+    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_personality_linux::signal::ProcessSignals;
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    fixture.tables.words[1536].store(0, Ordering::Relaxed);
+    fixture.tables.words[1537].store(0, Ordering::Relaxed);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let user_sp = stack.va_at(stack.len());
+    let mut native = ThreadCtx::ZERO;
+    native.x[0] = VA;
+    native.x[1] = 4096;
+    native.x[8] = 215;
+    native.pc = 0x500004;
+    native.sp_el0 = user_sp.raw();
+    let initial = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            initial,
+        )
+        .unwrap(),
+    );
+    let owner_registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+    owner_registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    )
+    .with_words(words);
+    let signal = Signal::from_number(10).unwrap();
+    {
+        let mut entry = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                &initial,
+                &mut service,
+            )
+            .unwrap();
+        entry
+            .rt_sigaction(
+                signal,
+                Some(Action {
+                    disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+    }
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let binding = runtime.task_binding(parent).unwrap();
+    fixture
+        .zone
+        .discard_unpublished(fixture.slot, binding.record.id);
+    let record = fixture
+        .zone
+        .current_or_new(
+            fixture.slot,
+            crate::sched::identity_of(&fixture.task, fixture.zone.slot(fixture.slot).affinity()),
+        )
+        .unwrap();
+    // SAFETY: the fixture owns this unpublished AArch64 home exclusively.
+    unsafe {
+        *fixture.zone.record(record).ctx_mut() = initial;
+    }
+    fixture
+        .control
+        .bind_zone_record(fixture.zone.record_ref(record));
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, record)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record
+    );
+    assert!(fixture.zone.mark_native_owned(record));
+    assert_ne!(fixture.zone.record_ref(record), binding.record);
+    owner_registry
+        .rehome_entry(
+            source,
+            &fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .unwrap()
+        .unwrap();
+    let binding = runtime.task_binding(parent).unwrap();
+    assert_eq!(binding.record.id, record);
+    let index = fixture
+        .zone
+        .spaces
+        .find(fixture.address.mm.raw().get())
+        .unwrap();
+    let held = fixture
+        .region
+        .table()
+        .lock_in(
+            crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+            index.index(),
+            ReservationMm::new(fixture.address.mm.raw().get()).unwrap(),
+            91,
+        )
+        .unwrap();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        elr: native.pc,
+        ..Default::default()
+    };
+    frame.x = native.x;
+    let counters = carrick_el1_abi::Counters::new();
+    let mut cpu = crate::sched::FakeCpu::default();
+    fixture.task.linux.mark_pending_host_work();
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).current(),
+        Some(binding.record.id),
+        "the production park must save the registered native record"
+    );
+    assert_eq!(
+        crate::mm_portal::park_anonymous_edit(
+            &mut Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot: fixture.slot,
+                task: &fixture.task,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            },
+            &mut frame,
+            fixture.region.table(),
+            SpaceWaitCause::Reservations,
+        ),
+        Some(Served::Idle)
+    );
+    fixture
+        .task
+        .linux
+        .take_host_work_doorbell()
+        .unwrap()
+        .settled();
+    let parked_record = binding.record.id;
+    assert!(fixture.zone.record(parked_record).has_object_operation());
+
+    let event_binding = crate::common_entry::execution_binding(&fixture.task);
+    assert!(
+        owner_registry
+            .admit_external_event(
+                fixture.zone,
+                carrick_el1_abi::ExternalSignalRecord::new(
+                    carrick_core_abi::EntryEventIdentity::from_binding(event_binding),
+                    event_binding,
+                    binding.record,
+                    carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::MIN),
+                    signal,
+                    carrick_el1_abi::ExternalSignalSource::InZoneIpc,
+                ),
+                fixture.slot,
+                &mut service,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        fixture.zone.record(binding.record.id).handback(),
+        Some(carrick_sched_core::Handback::Signal)
+    );
+    assert!(fixture.zone.place_native_handback(binding.record).is_some());
+    drop(held);
+
+    let mut cpu = ResumeCpu {
+        inner: crate::sched::FakeCpu::default(),
+        runtime: &runtime,
+        registry: owner_registry,
+        source,
+        task: &fixture.task,
+        service: &mut service,
+    };
+    assert_eq!(
+        (Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .run_next(&mut frame, 0),
+        Served::Returned { switched: true }
+    );
+
+    let mut resumed = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    crate::sched::ThreadCpu::save(
+        &mut cpu.inner,
+        &frame,
+        &mut resumed,
+        crate::sched::CpuExitCause::Svc,
+    );
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    {
+        let mut entry = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                &resumed,
+                &mut service,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::signal_delivery::deliver_signal_on_syscall_return(
+                &fixture.task,
+                fixture.control,
+                &mut entry,
+                &mut frame,
+                fp.as_bytes(),
+                &mut ArmWaitSignalMachine {
+                    user_sp,
+                    backend: ArmWaitSignalBackend,
+                },
+            ),
+            None
+        );
+    }
+    assert_eq!(frame.elr, 0x700000, "the real handler must run");
+
+    let signal_sp = UserVa::new(frame.x[1]);
+    let offset = usize::try_from(signal_sp.raw() - stack.va().raw()).unwrap();
+    let signal_frame = carrick_personality_linux::signal::arm::RtSigframe::ref_from_bytes(
+        &stack.as_bytes()
+            [offset..offset + carrick_personality_linux::signal::arm::PUBLIC_FRAME_LEN],
+    )
+    .unwrap();
+    let mut restored_fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let (mask, restored_sp, altstack) = crate::arm_signal::restore(
+        &mut frame,
+        signal_frame,
+        restored_fp.as_mut_bytes(),
+        signal_sp,
+    )
+    .unwrap();
+    fixture
+        .control
+        .init_blocked(carrick_el1_abi::BlockedMask(mask));
+    fixture.control.write_altstack(altstack);
+    assert_eq!(restored_sp, user_sp.raw());
+    assert_eq!(frame.elr, 0x500000, "sigreturn must resume the saved SVC");
+
+    let arenas = [&fixture.tables];
+    let mut editor = crate::mm_portal::tests::anonymous_editor::ForkAnonymousEditor {
+        arenas: &arenas,
+        pool: TableWindow {
+            words: fixture.tables.words.as_ptr().cast_mut(),
+            physical_base: fixture.tables.base,
+            byte_len: fixture.tables.words.len() * 8,
+        },
+    };
+    assert_eq!(
+        serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &fixture.task,
+            crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+            fixture.region.table(),
+            &mut editor,
+            None,
+        ),
+        DelegatedAnonymous::Served,
+        "nr={}, arg0={:#x}, arg1={}, leaves={:?}",
+        frame.x[8],
+        frame.x[0],
+        frame.x[1],
+        counters
+            .anonymous_leaves
+            .each_ref()
+            .map(|counter| counter.load(Ordering::Relaxed)),
+    );
+    assert_eq!(frame.x[0] as i64, 0, "the replayed munmap must complete");
+    assert_ne!(
+        frame.x[0] as i64,
+        carrick_syscall_abi::LINUX_EINTR.guest_retval(),
+        "anonymous edit interruption never returns EINTR"
+    );
+    assert!(
+        !fixture
+            .zone
+            .record(binding.record.id)
+            .has_object_operation(),
+        "completed replay must release the anonymous operation token"
+    );
+}
+
 // VM-free binding for kernel.el1.signal-delivery-owner: the scheduler must
 // preserve the original wait4 context across a fresh signal-delivery entry.
 // No guest instructions or hardware user-memory translation execute here;
