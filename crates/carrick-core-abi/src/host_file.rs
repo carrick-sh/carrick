@@ -79,6 +79,9 @@ pub enum HostFileOp {
     Truncate = 19,
     /// `ftruncate` with the same length and limit words.
     Ftruncate = 20,
+    /// `renameat`/`renameat2`: source path, NUL, target path;
+    /// `flags` carries the Linux rename flags.
+    Renameat = 21,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -204,6 +207,7 @@ impl HostFileOp {
             18 => Self::SetFdTimes,
             19 => Self::Truncate,
             20 => Self::Ftruncate,
+            21 => Self::Renameat,
             _ => return None,
         })
     }
@@ -224,6 +228,7 @@ impl HostFileOp {
                 | Self::Linkat
                 | Self::Utimensat
                 | Self::Truncate
+                | Self::Renameat
         )
     }
 }
