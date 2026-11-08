@@ -5480,7 +5480,7 @@ mod tests {
         let mut w = world();
         let table = w.table(w.a_tid);
         let (read, write, _) = w.pipe(table, BLOCK);
-        let fds = GuestUserBuffer::from_value(PollFd {
+        let mut fds = GuestUserBuffer::from_value(PollFd {
             fd: read,
             events: 0,
             revents: 0x7777,
@@ -5502,6 +5502,8 @@ mod tests {
         ));
         assert!(w.zone.record(record).has_object_operation());
         assert_eq!(revents(&fds, 0), 0x7777);
+        fds.write(0, 12345i32);
+        fds.write(4, 0x1234i16);
         w.host_close(table, write);
         w.zone.clear_current(SLOT);
         assert!(w.zone.switch_in_full(SLOT).is_some());
@@ -5514,6 +5516,16 @@ mod tests {
             CompletionRoute::Served
         );
         assert_eq!(frame.x[0], 1);
+        assert_eq!(
+            fds.get::<PollFd>(0).fd,
+            12345,
+            "poll completion overwrote fd input"
+        );
+        assert_eq!(
+            fds.get::<PollFd>(0).events,
+            0x1234,
+            "poll completion overwrote events input"
+        );
         assert_ne!(
             revents(&fds, 0) & super::super::file_table::LINUX_POLLHUP,
             0
