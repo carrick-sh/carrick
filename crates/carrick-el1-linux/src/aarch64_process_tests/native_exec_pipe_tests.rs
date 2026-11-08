@@ -312,7 +312,6 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
         registry.unregister_root_for_test(&runtime);
         return;
     }
-    let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
         tables: &tables,
