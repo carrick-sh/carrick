@@ -2476,3 +2476,174 @@ fn publish_refuses_base_evidence_that_differs_from_its_seal() {
     let (passed, body) = bench.publish();
     assert!(!passed && body.contains("base evidence seal"), "{body}");
 }
+
+/// Review P1 on #1889: the candidate must not supply the base's fixture
+/// authority. Both sides restore the bundle a trusted main push published
+/// for the merge base; the candidate is admitted against it by equal inputs.
+#[test]
+fn both_paired_runs_restore_the_trusted_base_fixture_bundle() {
+    use carrick_xtask::signed_gate::{Request, RequestKind, execute_pair};
+    for kind in [RequestKind::PullRequest, RequestKind::MergeGroup] {
+        let request = Request {
+            kind,
+            prs: vec![123],
+            sha: "b".repeat(40),
+            base: "a".repeat(40),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen = Vec::new();
+        execute_pair(&request, dir.path(), |run| {
+            seen.push((run.commit.clone(), run.fixture_publisher.clone()));
+            let head = run.commit.clone();
+            write_run_evidence(&run.output, run.receipt_name, &admitted(&head));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (request.base.clone(), request.base.clone()),
+                (request.sha.clone(), request.base.clone()),
+            ],
+            "{kind:?}: the candidate's bundle served as fixture authority"
+        );
+    }
+}
+
+/// `signed-gate base-fixtures` fetches the merge base's bundle only from an
+/// authenticated main-push run of the trusted fixture publisher, keyed by
+/// `request.base`, and blocks when none is available.
+#[cfg(unix)]
+#[test]
+fn base_fixtures_come_only_from_an_authenticated_main_run_of_the_base() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(
+        bin.join("gh"),
+        r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+base = os.environ['TEST_BASE_SHA']
+name = 'signed-fixtures-' + base
+trusted = {'id': 500, 'path': '.github/workflows/kernel-runtime.yml', 'head_branch': 'main', 'head_sha': base, 'event': 'push', 'status': 'completed', 'repository': {'full_name': 'carrick-sh/carrick'}, 'head_repository': {'full_name': 'carrick-sh/carrick'}, 'actor': {'login': 'github-merge-queue[bot]'}, 'triggering_actor': {'login': 'github-merge-queue[bot]'}}
+def variant(run_id, **changes):
+    run = json.loads(json.dumps(trusted))
+    run['id'] = run_id
+    for key, value in changes.items():
+        if key in ('repository', 'head_repository'):
+            run[key] = {'full_name': value}
+        elif key in ('actor', 'triggering_actor'):
+            run[key] = {'login': value}
+        else:
+            run[key] = value
+    return run
+# Newer untrusted runs, each carrying a planted bundle, must never be used.
+untrusted = [
+    variant(601, path='.github/workflows/signed-gate.yml'),
+    variant(602, head_branch='feature'),
+    variant(603, event='pull_request'),
+    variant(604, repository='someone/fork'),
+    variant(605, head_repository='someone/fork'),
+    variant(606, head_sha='c' * 40),
+    variant(607, event='workflow_dispatch', actor='carrick-workers[bot]', triggering_actor='carrick-workers[bot]'),
+]
+mode = os.environ.get('TEST_MODE', 'trusted')
+if args[:2] == ['run', 'download']:
+    run_id = args[2]
+    assert args[args.index('--repo')+1] == 'carrick-sh/carrick', args
+    assert args[args.index('--name')+1] == name, args
+    out = pathlib.Path(args[args.index('--dir')+1])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / ('bundle-from-run-' + run_id + '.tar.gz')).write_text(run_id)
+elif args[0] == 'api':
+    endpoint = args[-1]
+    if '/actions/workflows/kernel-runtime.yml/runs?' in endpoint:
+        assert 'branch=main' in endpoint and 'head_sha=' + base in endpoint, endpoint
+        runs = untrusted + ([] if mode == 'none' else [trusted])
+        print(json.dumps([{'workflow_runs': runs}]))
+    elif endpoint.endswith('/artifacts?per_page=100'):
+        run_id = int(endpoint.split('/runs/')[1].split('/')[0])
+        rows = [{'name': name, 'expired': False}]
+        if run_id == 500 and mode == 'missing':
+            rows = [{'name': 'signed-fixtures-' + 'c' * 40, 'expired': False}]
+        if run_id == 500 and mode == 'expired':
+            rows = [{'name': name, 'expired': True}]
+        print(json.dumps([{'artifacts': rows}]))
+    else:
+        raise SystemExit('unexpected API endpoint: ' + endpoint)
+else:
+    raise SystemExit('unexpected gh invocation: ' + repr(args))
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let base = "a".repeat(40);
+    let request = dir.path().join("request.json");
+    std::fs::write(
+        &request,
+        json!({"kind":"MergeGroup","prs":[123],"sha":"b".repeat(40),"base":base}).to_string(),
+    )
+    .unwrap();
+    let fetch = |mode: &str| {
+        let output = dir.path().join(format!("fixtures-{mode}"));
+        let result = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("TEST_BASE_SHA", &base)
+            .env("TEST_MODE", mode)
+            .args(["signed-gate", "base-fixtures", "--request"])
+            .arg(&request)
+            .arg("--output")
+            .arg(&output)
+            .args(["--wait-minutes", "0"])
+            .output()
+            .unwrap();
+        (result, output)
+    };
+    let (fetched, output) = fetch("trusted");
+    assert!(
+        fetched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fetched.stderr)
+    );
+    let bundles: Vec<_> = std::fs::read_dir(&output)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".tar.gz"))
+        .collect();
+    assert_eq!(bundles, ["bundle-from-run-500.tar.gz"]);
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("provenance.json")).unwrap()).unwrap();
+    assert_eq!(provenance["run_id"], 500);
+    assert_eq!(provenance["head_sha"], base);
+    assert_eq!(
+        provenance["workflow"],
+        ".github/workflows/kernel-runtime.yml"
+    );
+    assert_eq!(provenance["artifact"], format!("signed-fixtures-{base}"));
+    for mode in ["none", "missing", "expired"] {
+        let (refused, output) = fetch(mode);
+        assert!(
+            !refused.status.success(),
+            "{mode}: untrusted bundle admitted"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains("trusted base fixture"), "{mode}: {stderr}");
+        let planted = std::fs::read_dir(&output).map_or(0, |entries| {
+            entries
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".tar.gz")
+                })
+                .count()
+        });
+        assert_eq!(planted, 0, "{mode}: downloaded an untrusted bundle");
+    }
+}
