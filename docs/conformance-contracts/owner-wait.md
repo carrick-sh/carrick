@@ -263,3 +263,13 @@ The diagnostic pipe carries an eight-byte readiness word before twelve child
 fields. Decoding drains any unread readiness bytes even after ppoll EFAULT;
 the native control covers zero, partial and complete readiness consumption and
 requires the last child byte observation (68) in the final field.
+
+Malformed user ranges are rejected before owner preparation. The native input
+and completed-output entry control covers arithmetic overflow and the user
+ceiling, with an owner service that refuses unexpected access. It requires
+errno 14, no bytes, no handoff and no run failure. An owner's own Invalid/Core
+refusal remains an invariant failure after user-range admission succeeds.
+
+Non-prefix completed records validate their entire range before copying a
+page-sized piece. Prefix I/O retains its existing progress/fault policy. The
+owner-invariant output control requires a run failure, never errno 22 or 5.
