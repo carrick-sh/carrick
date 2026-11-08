@@ -2957,6 +2957,10 @@ pub enum CopyRefusalReason {
     GuardedFault,
     OwnerFault,
     ArmTranslation(u8),
+    OwnerAbsent,
+    OwnerMismatch,
+    OwnerBusy,
+    OwnerWait,
 }
 
 impl CopyRefusalReason {
@@ -2966,6 +2970,10 @@ impl CopyRefusalReason {
             Self::Validator => 2,
             Self::GuardedFault => 3,
             Self::OwnerFault => 4,
+            Self::OwnerAbsent => 5,
+            Self::OwnerMismatch => 6,
+            Self::OwnerBusy => 7,
+            Self::OwnerWait => 8,
             Self::ArmTranslation(fst) => 0x100 | fst as u64,
         }
     }
@@ -2980,6 +2988,8 @@ pub struct CopyRefusal {
     pub access: carrick_guest_arch::Access,
     pub reason: CopyRefusalReason,
     pub owner_present: bool,
+    pub presented: Option<ExecutionBinding>,
+    pub expected: Option<ExecutionBinding>,
 }
 
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
@@ -3014,8 +3024,10 @@ pub struct Counters {
     pub venue_refused_child: [AtomicU64; 513],
     /// First 16 argument-copy refusals. Each immutable row is published by
     /// word 0 (1 = committed): ordinal, VA, length, argument (6 = derived),
-    /// direction (0 = in, 1 = out), reason, matching-owner-present.
-    pub copy_refusals: [[AtomicU64; 8]; 16],
+    /// direction (0 = in, 1 = out), reason, owner-present, then the presented
+    /// and expected binding (MM, execution generation, task, thread generation).
+    /// Zero binding words denote an absent identity, never a matching owner.
+    pub copy_refusals: [[AtomicU64; 16]; 16],
     pub copy_refusal_slots: AtomicU64,
 }
 
@@ -3047,7 +3059,7 @@ impl Counters {
             refused_child: [const { AtomicU64::new(0) }; 513],
             venue_refused: [const { AtomicU64::new(0) }; 513],
             venue_refused_child: [const { AtomicU64::new(0) }; 513],
-            copy_refusals: [const { [const { AtomicU64::new(0) }; 8] }; 16],
+            copy_refusals: [const { [const { AtomicU64::new(0) }; 16] }; 16],
             copy_refusal_slots: AtomicU64::new(0),
         }
     }
@@ -3126,10 +3138,18 @@ impl Counters {
             u64::from(refusal.access == carrick_guest_arch::Access::Write),
             refusal.reason.code(),
             u64::from(refusal.owner_present),
+            refusal.presented.map_or(0, |b| b.mm.raw()),
+            refusal.presented.map_or(0, |b| b.generation.raw()),
+            refusal.presented.map_or(0, |b| b.task.raw()),
+            refusal.presented.map_or(0, |b| b.thread_generation.raw()),
+            refusal.expected.map_or(0, |b| b.mm.raw()),
+            refusal.expected.map_or(0, |b| b.generation.raw()),
+            refusal.expected.map_or(0, |b| b.task.raw()),
+            refusal.expected.map_or(0, |b| b.thread_generation.raw()),
         ]);
     }
 
-    fn publish_copy_refusal(&self, words: [u64; 7]) {
+    fn publish_copy_refusal(&self, words: [u64; 15]) {
         let Ok(slot) =
             self.copy_refusal_slots
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -3143,6 +3163,60 @@ impl Counters {
             target.store(value, Ordering::Relaxed);
         }
         row[0].store(1, Ordering::Release);
+    }
+
+    /// Stream committed diagnostic rows without allocating or copying the store.
+    pub fn write_copy_refusals(&self, output: &mut impl core::fmt::Write) -> core::fmt::Result {
+        let mut found = false;
+        for row in &self.copy_refusals {
+            if row[0].load(Ordering::Acquire) != 1 {
+                continue;
+            }
+            found = true;
+            let word = |i: usize| row[i].load(Ordering::Relaxed);
+            let reason = word(6);
+            let label = match reason {
+                1 => "forbidden-range",
+                2 => "validator-other",
+                3 => "guarded-fault",
+                4 => "owner-efault",
+                5 => "owner-absent",
+                6 => "owner-mismatch",
+                7 => "owner-busy",
+                8 => "owner-wait",
+                _ if reason & 0x100 != 0 => "arm-translation",
+                _ => "unknown",
+            };
+            write!(
+                output,
+                "copy-refusal nr={} va={:#x} len={} argument={} direction={} reason={label}",
+                word(1),
+                word(2),
+                word(3),
+                word(4),
+                if word(5) == 0 { "in" } else { "out" }
+            )?;
+            if reason & 0x100 != 0 {
+                write!(output, "(PAR.FST={:#x})", reason & 0x3f)?;
+            }
+            writeln!(
+                output,
+                " owner={} presented[mm={},generation={},task={},thread={}] expected[mm={},generation={},task={},thread={}]",
+                word(7),
+                word(8),
+                word(9),
+                word(10),
+                word(11),
+                word(12),
+                word(13),
+                word(14),
+                word(15)
+            )?;
+        }
+        if !found {
+            writeln!(output, "copy-refusal: no committed rows")?;
+        }
+        Ok(())
     }
 
     pub fn record_refusal(
@@ -4842,14 +4916,30 @@ mod tests {
     fn copy_refusals_keep_first_records_and_snapshot_committed_rows() {
         let counters = Counters::new();
         for n in 0..20 {
-            counters.publish_copy_refusal([73, n, 16, 2, 0, 3, 0]);
+            counters.publish_copy_refusal([73, n, 16, 2, 0, 3, 0, 11, 12, 13, 14, 21, 22, 23, 24]);
         }
         assert_eq!(counters.copy_refusal_slots.load(Ordering::Relaxed), 16);
         let snapshot = counters.copy_snapshot();
         for (n, row) in snapshot.copy_refusals.iter().enumerate() {
             assert_eq!(row[0].load(Ordering::Acquire), 1);
             assert_eq!(row[2].load(Ordering::Relaxed), n as u64);
+            assert_eq!(row[8].load(Ordering::Relaxed), 11);
+            assert_eq!(row[15].load(Ordering::Relaxed), 24);
         }
+    }
+
+    #[test]
+    fn copy_refusal_format_includes_both_owner_identities() {
+        let counters = Counters::new();
+        counters.publish_copy_refusal([73, 0x4000, 16, 2, 0, 6, 1, 11, 12, 13, 14, 21, 22, 23, 24]);
+        // An unpublished row must not be printed.
+        counters.copy_refusals[1][1].store(99, Ordering::Relaxed);
+        let mut output = std::string::String::new();
+        counters.write_copy_refusals(&mut output).unwrap();
+        assert_eq!(
+            output,
+            "copy-refusal nr=73 va=0x4000 len=16 argument=2 direction=in reason=owner-mismatch owner=1 presented[mm=11,generation=12,task=13,thread=14] expected[mm=21,generation=22,task=23,thread=24]\n"
+        );
     }
 
     #[test]
@@ -4864,7 +4954,7 @@ mod tests {
                 + LifecycleDecline::COUNT
                 + AnonymousLeave::COUNT
                 + 4 * 513
-                + 16 * 8
+                + 16 * 16
                 + 1)
                 * 8
         );
