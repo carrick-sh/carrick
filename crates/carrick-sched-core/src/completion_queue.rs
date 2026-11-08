@@ -96,6 +96,7 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn source_admission_waits_for_an_inflight_handback_initializer() {
         use crate::object_wait::{ObjectWaitKey, OwnedObjectWakeEffects};
         use crate::{BoundedSpin, LockWait, ZoneTables};

@@ -92,9 +92,20 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
             // ordinary path; the record owns the sole remaining operation.
             handoff(entry, parked.take_receipt().unwrap()).unwrap();
             assert!(zone.slot(slot).current().is_none());
-            let (wake, _) = notify_object(&zone, slot, key).unwrap();
+            let (wake, _) = notify_object(&zone, slot, key, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
             assert_eq!(wake.queued, 1);
-            assert_eq!(notify_object(&zone, slot, key).unwrap().0.queued, 0);
+            assert_eq!(
+                notify_object(&zone, slot, key, &|owned| {
+                    let _ = owned.into_parts();
+                })
+                .unwrap()
+                .0
+                .queued,
+                0
+            );
             assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
             for _ in 0..2 {
                 if let Some(taken) = take_object_operation(&zone, slot, identity).unwrap() {
@@ -266,7 +277,15 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     )
     .unwrap();
     assert!(parked.matches(&zone, slot));
-    assert_eq!(notify_object(&zone, slot, key).unwrap().0.queued, 1);
+    assert_eq!(
+        notify_object(&zone, slot, key, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap()
+        .0
+        .queued,
+        1
+    );
     assert_eq!(zone.switch_in(slot), Some(record));
     assert_eq!(
         complete_born_in_zone(stale, binding, source),

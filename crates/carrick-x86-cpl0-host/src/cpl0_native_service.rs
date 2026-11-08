@@ -29,6 +29,40 @@ pub(in crate::cpl0_boot) enum NativeNoticeStep {
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
+    /// Retain queue handbacks through the existing completion chain and ring
+    /// this stopped CPU's authenticated task doorbell. Native-service queues
+    /// are legacy queues; host contention parks must not be enabled until the
+    /// x86 boundary can drain its ParkedContextWords completion population.
+    pub(in crate::cpl0_boot) fn complete_object_wake(
+        &self,
+        stopped_cpu: carrick_guest_arch::CpuId,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >,
+    ) {
+        let zone = owned.zone();
+        let (waker, effects, deferred) = owned.defer_handbacks();
+        // A stopped production lease names one of the carrier's two CPUs.
+        let slot = SlotId::new(stopped_cpu.raw() as u8);
+        let task = self.task(stopped_cpu);
+        carrick_el1::substrate::sched::object_wait::deliver_effects_with(
+            zone,
+            Some(slot),
+            waker,
+            effects,
+            deferred,
+            |target, _| {
+                zone.owe_resched(target);
+                task.linux.mark_pending_host_work();
+            },
+            (
+                |_| task.linux.mark_pending_host_work(),
+                || task.linux.mark_pending_host_work(),
+            ),
+        );
+    }
+
     /// Authenticate a retained supervisor span against this exact live root.
     /// The carrier owns the backing through the crossing; the outstanding
     /// service claim prevents retirement of the member/MM and payload.
@@ -106,14 +140,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let zone = unsafe { &*zone_pointer.cast::<X86Cpl0Zone>() };
         let key = ObjectWaitKey::native_service(selector.record)
             .ok_or_else(|| fail("native service wait key"))?;
+        let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| self.complete_object_wake(lease.cpu, owned);
         let queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
-                    owned.zone(),
-                    owned,
-                )
-            })
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
             .map_err(|_| fail("native service queue"))?;
         let member = queue
             .native_service_member(selector.record)
@@ -140,13 +172,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // supervisor storage. Its atomic fields are revalidated under its queue.
         let control = unsafe { &*pointer.cast::<ThreadControlSlot>() };
         let queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
-                    owned.zone(),
-                    owned,
-                )
-            })
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
             .map_err(|_| fail("native service claim queue"))?;
         if queue.native_service_member(selector.record) != Some(member)
             || control.zone_record() != Some(selector.record)
@@ -280,14 +306,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             }
             _ => return Err(fail("unsupported CPL0 native service operation")),
         };
+        let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| self.complete_object_wake(lease.cpu, owned);
         let _queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
-                    owned.zone(),
-                    owned,
-                )
-            })
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
             .map_err(|_| fail("native service acknowledgment queue"))?;
         if let Some(wait) = owner_wait {
             ticket
@@ -365,14 +389,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .ok_or_else(|| fail("native service zone absent"))?;
         // SAFETY: fixed aligned zone is retained by custody and the ticket.
         let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
+        let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| self.complete_object_wake(lease.cpu, owned);
         let _queue = zone
-            .object_wait(pending.key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
-                    owned.zone(),
-                    owned,
-                )
-            })
+            .object_wait(pending.key, &carrick_sched_core::ShortLockSpin, &completion)
             .map_err(|_| fail("native host file acknowledgment queue"))?;
         pending
             .ticket
