@@ -8,7 +8,12 @@ use carrick_el1_abi::{
 use core::sync::atomic::Ordering;
 
 #[cfg(any(test, feature = "host-test"))]
+pub type TestUserAccess = std::boxed::Box<dyn Fn(u64, usize, bool) -> bool>;
+#[cfg(any(test, feature = "host-test"))]
 std::thread_local! {
+    /// Host fixture projection of live guest permissions (no host MMU at EL1).
+    pub static TEST_USER_ACCESS: std::cell::RefCell<Option<TestUserAccess>> =
+        const { std::cell::RefCell::new(None) };
     pub static SIMULATE_COPY_FAULT: core::sync::atomic::AtomicBool =
         const { core::sync::atomic::AtomicBool::new(false) };
     pub static SIMULATE_COPYOUT_FAULT: core::sync::atomic::AtomicBool =
@@ -72,7 +77,11 @@ pub unsafe fn copy_to_user_guarded(
     {
         let _ = cur_task;
         #[cfg(any(test, feature = "host-test"))]
-        if SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed))
+        if !TEST_USER_ACCESS.with(|hook| {
+            hook.borrow()
+                .as_ref()
+                .is_none_or(|check| check(dest as u64, len, true))
+        }) || SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed))
             || SIMULATE_COPYOUT_FAULT.with(|f| f.load(Ordering::Relaxed))
         {
             return false;
@@ -146,7 +155,12 @@ pub unsafe fn copy_from_user_guarded(
     {
         let _ = cur_task;
         #[cfg(any(test, feature = "host-test"))]
-        if SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed)) {
+        if !TEST_USER_ACCESS.with(|hook| {
+            hook.borrow()
+                .as_ref()
+                .is_none_or(|check| check(src as u64, len, false))
+        }) || SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed))
+        {
             return false;
         }
         unsafe {
