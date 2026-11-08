@@ -2645,10 +2645,30 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             let owner = self.owner(&item.ident.unraw().to_string(), item.span());
             for variant in &item.variants {
                 let name = variant.ident.unraw().to_string();
+                // The anonymous dispatch result carries the scheduler's typed
+                // space cause directly into its park binding. It does not
+                // create a new, owner-defined contention vocabulary.
+                let anonymous_space_wait = name == "Contended"
+                    && matches!(
+                        owner.as_str(),
+                        "carrick_el1::memory::DelegatedAnonymous"
+                            | "carrick_personality_linux::pending_anonymous::DelegatedStep"
+                    )
+                    && matches!(
+                        &variant.fields,
+                        syn::Fields::Unnamed(fields)
+                            if fields.unnamed.len() == 1
+                                && matches!(
+                                    &fields.unnamed[0].ty,
+                                    syn::Type::Path(path)
+                                        if path.path.segments.last().is_some_and(|segment| segment.ident == "SpaceWaitCause")
+                                )
+                    );
                 if matches!(
                     name.as_str(),
                     "Busy" | "Contended" | "OwnerWait" | "PinRaced" | "Occupied"
-                ) {
+                ) && !anonymous_space_wait
+                {
                     self.census.contention_variants.push(ApiSite {
                         file: self.file.clone(),
                         line: variant.span().start().line,
