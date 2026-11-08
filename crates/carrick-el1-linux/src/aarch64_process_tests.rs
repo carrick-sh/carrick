@@ -1534,6 +1534,125 @@ impl Fixture {
     }
 }
 
+#[test]
+fn signal_user_return_busy_once_preserves_completed_wait_and_delivers_once() {
+    use carrick_personality_linux::signal::{SignalInfo, SignalRequest, SignalThreadSelector};
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    use zerocopy::IntoBytes;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                let signals = process.signal_venue().unwrap();
+                signals
+                    .rt_sigaction(
+                        Signal::PIPE,
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+                signals
+                    .tgkill(
+                        SignalThreadSelector::from_abi(41),
+                        SignalThreadSelector::from_abi(41),
+                        SignalRequest::from_abi(13).unwrap(),
+                        SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let mut frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        esr: 0x5600_0000,
+        elr: 0x400004,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    frame.x[0] = (-10i64) as u64;
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let mut machine = ArmWaitSignalMachine {
+        user_sp: stack.va_at(stack.len()),
+        backend: ArmWaitSignalBackend,
+    };
+    super::aarch64_process::inject_signal_entry_busy_once();
+    let refused = with_process_entry(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| {
+            super::arm_signal::deliver_on_user_return_with(
+                &fixture.task,
+                fixture.control,
+                process,
+                &mut frame,
+                fp.as_bytes(),
+                &mut machine,
+            )
+        },
+    );
+    assert_eq!(
+        super::dispatch::signal_user_return_admission(refused),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        frame.x[0] as i64, -10,
+        "completed wait4 result must survive Busy"
+    );
+    let delivered = with_process_entry(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| {
+            super::arm_signal::deliver_on_user_return_with(
+                &fixture.task,
+                fixture.control,
+                process,
+                &mut frame,
+                fp.as_bytes(),
+                &mut machine,
+            )
+        },
+    );
+    assert_eq!(
+        super::dispatch::signal_user_return_admission(delivered),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(frame.elr, 0x700000);
+    let once = with_process_entry(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| process.signal_checkpoint_needed(),
+    )
+    .unwrap();
+    assert!(!once, "signal must be consumed exactly once");
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let leftover =

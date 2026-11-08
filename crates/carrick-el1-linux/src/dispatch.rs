@@ -1920,8 +1920,19 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         control,
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
-    )
-    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
+    );
+    signal_user_return_admission(delivered)
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn signal_user_return_admission(
+    delivered: Result<
+        Option<carrick_personality_linux::dispatch::CompletionRoute>,
+        super::native_process_runtime::NativeProcessError,
+    >,
+) -> Action {
+    let delivered =
+        delivered.unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     match delivered {
         None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
