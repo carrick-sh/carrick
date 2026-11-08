@@ -35,17 +35,24 @@ const MAX_WORKERS: usize = 7;
 const PAGE: usize = 4096;
 const READ_SENTINEL: u64 = 0x5E17_14E1_5E17_14E1;
 
+#[unsafe(export_name = "CARRICK_TLB_PROBE_PAGE")]
 static PROBE_PAGE: AtomicUsize = AtomicUsize::new(0);
+#[unsafe(export_name = "CARRICK_TLB_CMD")]
 static CMD: AtomicU32 = AtomicU32::new(0);
+#[unsafe(export_name = "CARRICK_TLB_ACKS")]
 static ACKS: AtomicU32 = AtomicU32::new(0);
+#[unsafe(export_name = "CARRICK_TLB_FAULTS")]
 static FAULTS: [AtomicU64; MAX_WORKERS] = [const { AtomicU64::new(0) }; MAX_WORKERS];
 static STALE: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 // Deterministic witness: omit exactly one worker's acknowledgement of the
 // first read-only write probe. Its work still finishes; only the ack is lost.
 static OMIT_ACK: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[unsafe(export_name = "CARRICK_TLB_WORKER_TIDS")]
 static WORKER_TIDS: [AtomicU32; MAX_WORKERS] = [const { AtomicU32::new(0) }; MAX_WORKERS];
+#[unsafe(export_name = "CARRICK_TLB_WORKER_COMMANDS")]
 static WORKER_COMMANDS: [AtomicU32; MAX_WORKERS] = [const { AtomicU32::new(0) }; MAX_WORKERS];
+#[unsafe(export_name = "CARRICK_TLB_WORKER_ACKS")]
 static WORKER_ACKS: [AtomicU32; MAX_WORKERS] = [const { AtomicU32::new(0) }; MAX_WORKERS];
 
 thread_local! {

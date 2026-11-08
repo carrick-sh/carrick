@@ -500,10 +500,28 @@ pub(crate) fn setup_arm_signal_frame(
     fpstate: &[u8],
     copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
 ) -> Result<UserVa, ArchError> {
-    let (sp, sigframe) = build(frame, params, siginfo, fpstate)?;
+    let (sp, sigframe) = build(frame, params, siginfo, fpstate).inspect_err(|error| {
+        super::native_diagnostic::emit(format_args!(
+            "signal-frame-build esr={:#x} pc={:#x} far={:#x} sp={:#x} signal={} error={error:?}",
+            frame.esr,
+            frame.elr,
+            frame.far,
+            params.sp.raw(),
+            params.signal.number(),
+        ));
+    })?;
     let new_sp = sp.raw();
 
     if !copy_out(UserVa::new(new_sp), &sigframe) {
+        super::native_diagnostic::emit(format_args!(
+            "signal-frame-copy esr={:#x} pc={:#x} far={:#x} sp={:#x} frame={new_sp:#x}+{:#x} signal={}",
+            frame.esr,
+            frame.elr,
+            frame.far,
+            params.interrupted_sp.raw(),
+            sigframe.len(),
+            params.signal.number(),
+        ));
         return Err(ArchError::InvalidFrame);
     }
 

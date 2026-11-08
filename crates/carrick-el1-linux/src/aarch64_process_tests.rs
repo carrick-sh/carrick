@@ -12833,6 +12833,15 @@ fn arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path() {
                 && line.contains("error=InvalidFrame")),
         "missing the production signal-frame refusal: {diagnostics:?}"
     );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("signal-terminal entry-esr=0xfffc")
+                && line.contains("pc=0x400200")
+                && line.contains("far=0x12345000")
+                && line.contains("signal=11 code=2")),
+        "{diagnostics:?}"
+    );
 }
 
 #[test]

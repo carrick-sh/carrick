@@ -4899,9 +4899,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .clone();
         self.service
             .copy_signal_bytes(&mm, address, bytes)
-            .map_err(|error| match error {
-                NativeProcessError::OwnerWait(_) => NativeProcessError::Fault,
-                other => other,
+            .map_err(|error| {
+                super::native_diagnostic::emit(format_args!(
+                    "signal-copy-refused record={:?} address={:#x}+{:#x} error={error:?}",
+                    self.record,
+                    address.raw(),
+                    bytes.len(),
+                ));
+                match error {
+                    NativeProcessError::OwnerWait(_) => NativeProcessError::Fault,
+                    other => other,
+                }
             })
     }
     #[inline(never)]

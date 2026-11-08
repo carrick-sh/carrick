@@ -262,6 +262,8 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/mm_portal/tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-el1-linux/src/mm_portal/tests.rs", contract = "kernel.fork.stage1-image" },
   { path = "crates/carrick-el1-linux/src/mm_portal/tests.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-el1-linux/src/native_diagnostic.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/src/native_diagnostic.rs", contract = "process.native.arm-admission" },
   { path = "crates/carrick-el1-linux/src/native_fork_refusal.rs", contract = "process.native.arm-admission" },
   { path = "crates/carrick-el1-linux/src/native_ownership_tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-el1-linux/src/native_process_custody.rs", contract = "kernel.el1.thread-lifecycle" },

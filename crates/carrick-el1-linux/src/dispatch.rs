@@ -1661,6 +1661,12 @@ where
         // instruction, so the entry syndrome must survive for that rerun.
         (frame.esr, frame.far) = entry_syndrome;
     }
+    if control
+        .synchronous_fault()
+        .is_some_and(|(_, _, _, default)| default)
+    {
+        super::native_diagnostic::signal_terminal(frame, control, entry_syndrome);
+    }
     Ok(action)
 }
 

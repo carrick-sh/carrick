@@ -2376,8 +2376,8 @@ pub(crate) fn handle_metadata_grant_trap(
             .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
             .map_err(|e| TrapError::Hypervisor(format!("read COW supply root: {e}")))?;
         service_native_cow_supply(custody, region, cpu, ttbr0, arg1, arg2)?
-    } else if op == carrick_el1_abi::GRANT_OP_FORK_REFUSAL {
-        service_fork_refusal(
+    } else if op == carrick_el1_abi::GRANT_OP_DIAGNOSTIC {
+        service_native_diagnostic(
             custody,
             generation,
             cpu,
@@ -2411,7 +2411,7 @@ pub(crate) fn handle_metadata_grant_trap(
 
 /// Observe an authenticated stopped execution without granting or editing it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn service_fork_refusal(
+fn service_native_diagnostic(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
@@ -2421,11 +2421,11 @@ fn service_fork_refusal(
     let Some(region) = retained_abi_region(custody) else {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     };
-    service_fork_refusal_using_region(custody, generation, cpu, address, ttbr0, region)
+    service_native_diagnostic_using_region(custody, generation, cpu, address, ttbr0, region)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn service_fork_refusal_using_region(
+fn service_native_diagnostic_using_region(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
@@ -2443,15 +2443,14 @@ fn service_fork_refusal_using_region(
     let Some((binding, root)) = diagnostic_identity(cpu, task, zone, ttbr0) else {
         return refused;
     };
-    let Some(record) =
-        abi_stack_record::<carrick_el1_abi::NativeForkDiagnostic>(region, cpu, address)
+    let Some(record) = abi_stack_record::<carrick_el1_abi::NativeDiagnostic>(region, cpu, address)
     else {
         return refused;
     };
     let Some(message) = record.message() else {
         return refused;
     };
-    carrick_observability::probes::el1_native_fork_refusal(
+    carrick_observability::probes::el1_native_diagnostic(
         cpu.raw(),
         binding.mm.raw(),
         root.address().raw(),
@@ -3013,12 +3012,12 @@ mod tests {
         task.mm.thread_generation.store(101, Ordering::Release);
         assert!(task.root_generation().is_none());
         let address = carrick_el1_abi::stack_slot_usable_base(3);
-        let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
+        let mut diagnostic = carrick_el1_abi::NativeDiagnostic::new();
         write!(&mut diagnostic, "Census: Core").unwrap();
         // SAFETY: aligned complete stack record in this exclusively owned ABI region.
         unsafe {
             ptr.add((address - carrick_el1_abi::EL1_REGION_BASE) as usize)
-                .cast::<carrick_el1_abi::NativeForkDiagnostic>()
+                .cast::<carrick_el1_abi::NativeDiagnostic>()
                 .write(diagnostic);
         }
         let bytes = unsafe {
@@ -3031,13 +3030,13 @@ mod tests {
             custody
                 .stage2_record_covering(
                     address,
-                    core::mem::size_of::<carrick_el1_abi::NativeForkDiagnostic>()
+                    core::mem::size_of::<carrick_el1_abi::NativeDiagnostic>()
                 )
                 .is_none(),
             "ABI stacks are not physical fork-stock rows"
         );
         assert_eq!(
-            service_fork_refusal_using_region(
+            service_native_diagnostic_using_region(
                 &custody,
                 Some(generation),
                 cpu,
@@ -3053,7 +3052,7 @@ mod tests {
             (cpu, address, ttbr + 4096),
         ] {
             assert_eq!(
-                service_fork_refusal_using_region(
+                service_native_diagnostic_using_region(
                     &custody,
                     Some(generation),
                     wrong_cpu,

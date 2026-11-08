@@ -2,7 +2,7 @@
 #pragma D option bufsize=4m
 /*
  * Which native fork owner operation refused, and with what typed cause?
- * ABI: el1-native-fork-refusal(cpu, mm, root GPA, debug reason string).
+ * ABI: el1-native-diagnostic(cpu, mm, root GPA, debug reason string).
  * The stock companion carries refusal reason plus requested/cached bindings
  * and requested/cached address contexts as five bounded Debug strings.
  * Root-prepublish is the positive control when a corrected fork succeeds.
@@ -35,7 +35,7 @@
  * carrick trace also rejects libdtrace consumer drops, including hosts without
  * a dtrace:::DROP provider. The capture status is not the workload verdict.
  */
-carrick*:::el1-native-fork-refusal
+carrick*:::el1-native-diagnostic
 /pid == $target || progenyof($target)/
 {
     refusals++;
