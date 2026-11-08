@@ -3082,7 +3082,7 @@ pub struct Counters {
     pub copy_refusals: [[AtomicU64; 23]; 16],
     pub copy_refusal_slots: AtomicU64,
     /// First 32 ppoll frame-source samples, not a complete execution census.
-    /// commit, source, ordinal, PC, slot, binding[4], arguments[6], syndrome.
+    /// commit, source, ordinal, PC, slot, `binding[4]`, `arguments[6]`, syndrome.
     pub syscall_frames: [[AtomicU64; 16]; 32],
     pub syscall_frame_slots: AtomicU64,
 }
