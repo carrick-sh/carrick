@@ -140,8 +140,9 @@ fn exercise_anonymous_wait_event(event: AnonymousWaitEvent) {
     );
     // SAFETY: the concrete event just transferred this exact record to the
     // host claimant and unlinked every queue entry before returning Claimed.
-    let operation = unsafe { zone.record(record).take_object_operation() }
-        .expect("the event owns the exact parked operation");
+    let Some(operation) = (unsafe { zone.record(record).take_object_operation() }) else {
+        panic!("the event must own the exact parked operation");
+    };
     // SAFETY: the same host claim remains exclusive until this test frees it.
     assert!(unsafe { zone.record(record).take_object_operation() }.is_none());
     if matches!(event, AnonymousWaitEvent::Signal) {
