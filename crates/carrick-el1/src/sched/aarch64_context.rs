@@ -124,3 +124,24 @@ pub(super) fn load(frame: &mut TrapFrame, ctx: &ThreadCtx) {
         carrick_el1_fpsimd_load(area);
     }
 }
+
+#[cfg(test)]
+#[test]
+fn saved_frame_round_trip_preserves_every_gpr_and_return_pc() {
+    let mut frame = TrapFrame {
+        elr: 0x4000,
+        spsr: 0x3c0,
+        slot: 3,
+        ..TrapFrame::default()
+    };
+    frame.x = core::array::from_fn(|i| 0xa000 + i as u64);
+    frame.x[3] = 4999;
+    let original = frame;
+    let mut context = ThreadCtx::ZERO;
+    save_frame(&frame, &mut context);
+    frame.x.fill(0xdeaddead);
+    frame.elr = 0;
+    frame.spsr = 0;
+    load_frame(&mut frame, &context);
+    assert_eq!(frame, original);
+}
