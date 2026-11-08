@@ -39,6 +39,7 @@ fn fork_exec_successor(futex: Option<u64>) {
 
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let metadata_scope = MetadataScope::new(&fixture);
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
         fn drop(&mut self) {
@@ -90,6 +91,7 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
+    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     crossing.ipc = Some((owner.clone(), map));
     let words = fixture.tables.live(&fixture.maintenance);
     let tables = crate::ipc::MapTables(map);
@@ -501,6 +503,7 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
 #[test]
 fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let metadata_scope = MetadataScope::new(&fixture);
     fixture
         .control
         .initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[1]));
@@ -563,6 +566,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
+    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     crossing.ipc = Some((owner.clone(), map));
     let words = fixture.tables.live(&fixture.maintenance);
     let runtime = Arc::new(

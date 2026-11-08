@@ -284,11 +284,13 @@ enum ChildStockCase {
 #[cfg(not(target_os = "macos"))]
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let metadata_scope = MetadataScope::new(&fixture);
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
     let pages: Vec<_> = (0..16).map(|index| 0x20000 + index * 4096).collect();
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
+    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     if case != ChildStockCase::FirstBirth {
         let mut physical = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
         physical.metadata_in_el1_window = true;

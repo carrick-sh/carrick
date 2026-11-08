@@ -268,6 +268,35 @@ fn metadata_lifecycle_allocation() -> (core::ptr::NonNull<u8>, usize, usize) {
     )
 }
 
+// Own the host mapping, even while the fixture lends static aliases to the runtime.
+struct MetadataLifecycleAllocation {
+    base: u64,
+    bytes: usize,
+}
+
+impl Drop for MetadataLifecycleAllocation {
+    fn drop(&mut self) {
+        // SAFETY: this owner retains exactly the mapping allocated by the fixture.
+        let result = unsafe { libc::munmap(self.base as *mut libc::c_void, self.bytes) };
+        assert_eq!(result, 0, "fixture metadata unmap failed");
+    }
+}
+
+#[test]
+fn serial_host_metadata_window_reuses_released_chunks() {
+    let page_bytes = core::mem::size_of::<ThreadLifecyclePage>().next_multiple_of(16384);
+    let chunk_bytes = (page_bytes + core::mem::size_of::<ControlsArray>()).next_multiple_of(16384);
+    let population = carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE as usize / chunk_bytes + 1;
+    for _ in 0..population {
+        let (base, _, bytes) = metadata_lifecycle_allocation();
+        let allocation = MetadataLifecycleAllocation {
+            base: base.as_ptr() as u64,
+            bytes,
+        };
+        drop(allocation);
+    }
+}
+
 struct TestStockCrossing {
     #[cfg(test)]
     ipc: Option<(
@@ -297,6 +326,7 @@ struct TestStockCrossing {
     root_exit_status: AtomicU64,
     publish_child_affinity_aliases: bool,
     metadata_in_el1_window: bool,
+    metadata_allocations: Arc<std::sync::Mutex<Vec<MetadataLifecycleAllocation>>>,
     exec_adopted: core::sync::atomic::AtomicBool,
     #[cfg(all(test, target_os = "linux"))]
     require_stack_commit: bool,
@@ -307,6 +337,29 @@ struct TestStockCrossing {
     /// Refuse the seed, as the carrier does once the root's capability
     /// retired with a host exec.
     refuse_root_seed: core::sync::atomic::AtomicBool,
+}
+
+struct MetadataScope {
+    zone: &'static ZoneTables<Aarch64ParkedContext>,
+    roots: &'static carrick_el1::memory::reservations::SharedReservations,
+    allocations: Arc<std::sync::Mutex<Vec<MetadataLifecycleAllocation>>>,
+}
+
+impl MetadataScope {
+    fn new(fixture: &Fixture) -> Self {
+        Self {
+            zone: fixture.zone,
+            roots: fixture.region.table(),
+            allocations: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl Drop for MetadataScope {
+    fn drop(&mut self) {
+        registry().unregister_zone_for_test(self.zone);
+        super::aarch64_process::drain_and_clear_retired_scope(self.zone, self.roots);
+    }
 }
 
 impl TestStockCrossing {
@@ -357,6 +410,7 @@ impl TestStockCrossing {
             root_exit_status: AtomicU64::new(u64::MAX),
             publish_child_affinity_aliases: true,
             metadata_in_el1_window: false,
+            metadata_allocations: Arc::new(std::sync::Mutex::new(Vec::new())),
             exec_adopted: core::sync::atomic::AtomicBool::new(false),
             #[cfg(all(test, target_os = "linux"))]
             require_stack_commit: false,
@@ -591,7 +645,13 @@ impl ForkStockCrossing for TestStockCrossing {
                 type ControlsArray = [ThreadControlSlot; carrick_el1_abi::THREAD_POOL_ENTRIES + 1];
                 let (page_ptr, controls): (*mut ThreadLifecyclePage, &'static mut ControlsArray) =
                     if self.metadata_in_el1_window {
-                        let (mapped, page_bytes, _) = metadata_lifecycle_allocation();
+                        let (mapped, page_bytes, bytes) = metadata_lifecycle_allocation();
+                        self.metadata_allocations.lock().unwrap().push(
+                            MetadataLifecycleAllocation {
+                                base: mapped.as_ptr() as u64,
+                                bytes,
+                            },
+                        );
                         let mapped = mapped.as_ptr();
                         unsafe {
                             let page_ptr = mapped.cast::<ThreadLifecyclePage>();
@@ -10327,6 +10387,7 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     authority.register(Arc::clone(&ceiling) as Arc<dyn carrick_hal::FdCeilingPublisher>);
 
     let fixture = Fixture::new(0x10000, asid(1));
+    let metadata_scope = MetadataScope::new(&fixture);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -10385,6 +10446,7 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
+    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     crossing.ipc = Some((Arc::clone(&owner), map));
     let tables = crate::ipc::MapTables(map);
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
@@ -10687,6 +10749,7 @@ fn native_descriptor_witness(
     use std::sync::Arc;
 
     let fixture = Fixture::new(0x10000, asid(1));
+    let metadata_scope = MetadataScope::new(&fixture);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -10780,6 +10843,7 @@ fn native_descriptor_witness(
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
+    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     crossing.ipc = Some((Arc::clone(&owner), map));
     let tables = crate::ipc::MapTables(map);
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
@@ -11923,6 +11987,7 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     use std::sync::Arc;
 
     let fixture = Fixture::new(0x10000, asid(1));
+    let metadata_scope = MetadataScope::new(&fixture);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -11982,6 +12047,7 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
+    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     crossing.ipc = Some((Arc::clone(&owner), map));
     let tables = crate::ipc::MapTables(map);
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
@@ -14054,6 +14120,7 @@ fn serial_host_namespace_exhaustion_is_eagain_and_recovers_after_reap() {
 #[cfg(test)]
 fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: NamespaceScenario) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let metadata_scope = MetadataScope::new(&fixture);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -14083,7 +14150,8 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
-    let crossing = &*Box::leak(Box::new(crossing));
+    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
+    let crossing = &crossing;
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
