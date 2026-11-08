@@ -3704,7 +3704,7 @@ test-signed: NOT-RUN /w/el1_sched-d12e72e26c1d1655 el1_tlb_cross_vcpu_mm_edits_l
 }
 
 #[test]
-fn deadline_preserves_prior_failure_and_skips_are_never_new_or_fixed() {
+fn deadline_preserves_prior_failure_and_skips_do_not_fix_baseline_failures() {
     for synthetic in ["test later ... FAILED\n", ""] {
         let log = format!(
             "test-signed: running /w/suite-abcdef\ntest real_failure ... FAILED\ntest timed_out ... FAILED\ntest-signed: DEADLINE /w/suite-abcdef timed_out (9s)\n{synthetic}test-signed: NOT-RUN /w/suite-abcdef later (binary budget of 600s spent)\ntest result: FAILED.\n"
@@ -3728,12 +3728,133 @@ fn deadline_preserves_prior_failure_and_skips_are_never_new_or_fixed() {
                 .any(|key| key.contains("later"))
         );
         let reverse = diff(&candidate, &base).unwrap();
+        assert!(reverse.new.contains(&"test:el1-embed:suite::later".into()));
+    }
+}
+
+#[test]
+fn not_run_cannot_fix_a_baseline_failure() {
+    for deadline in [false, true] {
+        let mut base_step = step("el1-embed", false, &["suite::x"]);
+        let mut candidate_step = step("el1-embed", false, &[]);
+        candidate_step.not_run_tests.push("suite::x".into());
+        if deadline {
+            for s in [&mut base_step, &mut candidate_step] {
+                s.failed_tests.push("deadline:suite::timeout".into());
+            }
+        }
+        let base = receipt(vec![base_step]);
+        let candidate = receipt(vec![candidate_step]);
+        let delta = diff(&base, &candidate).unwrap();
+        assert!(!delta.fixed.contains(&"test:el1-embed:suite::x".into()));
+        // The baseline failure is retained, rather than claimed fixed or new.
+        assert!(!delta.new.contains(&"test:el1-embed:suite::x".into()));
         assert!(
-            !reverse
+            diff(&candidate, &base)
+                .unwrap()
                 .new
-                .iter()
-                .chain(&reverse.fixed)
-                .any(|key| key.contains("later"))
+                .contains(&"test:el1-embed:suite::x".into())
         );
     }
+}
+
+#[test]
+fn deadline_requires_a_start_in_its_own_binary() {
+    for prefix in ["", "test-signed: running /w/other-abcdef\ntest x ... ok\n"] {
+        let log = format!(
+            "{prefix}test-signed: running /w/suite-abcdef\ntest-signed: DEADLINE /w/suite-abcdef x (9s)\n"
+        );
+        let parsed = parse_test_log(&log);
+        assert!(parsed.failed_tests.is_empty());
+        assert_eq!(parsed.unitemized_failures, ["parse-error:suite:DEADLINE:x"]);
+    }
+}
+
+#[test]
+fn prefix_collision_keeps_exact_failure_and_not_run_identities() {
+    let parsed = parse_test_log(
+        "test-signed: running /w/suite-abcdef\ntest X ... ok\ntest X_on_any_thread ... FAILED\ntest X_later ... FAILED\ntest-signed: NOT-RUN /w/suite-abcdef X_later (budget spent)\ntest result: FAILED.\n",
+    );
+    assert_eq!(parsed.failed_tests, ["suite::X_on_any_thread"]);
+    assert_eq!(parsed.started_tests, ["suite::X", "suite::X_on_any_thread"]);
+    assert_eq!(parsed.not_run_tests, ["suite::X_later"]);
+}
+
+#[test]
+fn failed_result_with_only_not_run_itemization_fails_closed() {
+    let parsed = parse_test_log(
+        "test-signed: running /w/suite-abcdef\ntest x ... FAILED\ntest-signed: NOT-RUN /w/suite-abcdef x (budget spent)\ntest result: FAILED.\n",
+    );
+    assert!(parsed.failed_tests.is_empty());
+    assert!(
+        parsed
+            .unitemized_failures
+            .contains(&"parse-error:suite".into())
+    );
+}
+
+#[test]
+fn real_budget_artifact_population() {
+    let log = include_str!("fixtures/el1-embed-budget-excerpt.log");
+    let parsed = parse_test_log(log);
+    let never_run: std::collections::BTreeSet<_> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("test-signed: NOT-RUN "))
+        .map(|rest| format!("el1_sched::{}", rest.split_whitespace().nth(1).unwrap()))
+        .collect();
+    assert_eq!(
+        never_run.len(),
+        7,
+        "artifact has seven NOT-RUN markers, not eight"
+    );
+    assert_eq!(
+        parsed
+            .not_run_tests
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        never_run
+    );
+    let deadline = "deadline:el1_sched::el1_thread_lifecycle_tgkill_right_after_clone";
+    assert_eq!(
+        parsed
+            .failed_tests
+            .iter()
+            .filter(|t| t.starts_with("deadline:"))
+            .collect::<Vec<_>>(),
+        [deadline]
+    );
+    let mut expected = std::collections::BTreeSet::new();
+    let mut binary = "";
+    for line in log.lines() {
+        if let Some(rest) = line.strip_prefix("test-signed: running ") {
+            binary = rest
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .rsplit_once('-')
+                .unwrap()
+                .0;
+        }
+        if let Some(rest) = line.strip_prefix("test ")
+            && let Some(name) = rest.strip_suffix(" ... FAILED")
+        {
+            let qualified = format!("{binary}::{name}");
+            if !never_run.contains(&qualified) && !deadline.ends_with(&qualified) {
+                expected.insert(qualified);
+            }
+        }
+    }
+    expected.insert(deadline.into());
+    assert_eq!(expected.len(), 38);
+    assert_eq!(
+        parsed
+            .failed_tests
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
 }
