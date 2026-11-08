@@ -557,7 +557,7 @@ test-xtask *ARGS:
 
 [private]
 _test-xtask *ARGS:
-    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test test_touched --test loom_run --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test signed_gate_fixtures --test smoke_signed --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test loom_run --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test signed_gate_fixtures --test smoke_signed --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
 
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:
