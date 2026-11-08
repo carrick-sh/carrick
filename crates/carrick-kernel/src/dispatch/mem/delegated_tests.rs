@@ -8037,6 +8037,118 @@ fn delegated_outside_hint_go_arena_fixed_subranges_keep_owner_authority() {
     }
 }
 
+/// Go `persistentalloc1` requests a fresh 256 KiB anonymous RW chunk with a
+/// nil hint after `sysReserveOS` has reserved an arena and `sysMapOS` has
+/// committed part of it. The signed go-build failure is an ENOMEM at this
+/// point, but its actual mmap arguments were not captured; this fixture tests
+/// the inferred request, not a claim that this isolated sequence reproduces it.
+#[test]
+fn delegated_go_persistentalloc_after_hinted_arena() {
+    fn step(name: &str, outcome: DispatchOutcome) -> i64 {
+        match outcome {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("Go {name} returned {other:?}"),
+        }
+    }
+    const HINT: u64 = 0x0140_0000_0000;
+    const ARENA: u64 = 64 * 1024 * 1024;
+    const CHUNK: u64 = 256 * 1024;
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = CountingMmapMemory::new(HINT + 16 * PAGE, (32 * PAGE) as usize);
+    memory.defer_anon = true;
+    memory.discard_anon = true;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
+    let rw = LINUX_PROT_READ | LINUX_PROT_WRITE;
+
+    assert_eq!(
+        step(
+            "reserve",
+            host_mmap(&mut dispatcher, &mut memory, HINT, ARENA, 0, flags, -1)
+        ) as u64,
+        HINT
+    );
+    assert_eq!(
+        step(
+            "fixed commit",
+            host_mmap(
+                &mut dispatcher,
+                &mut memory,
+                HINT + 16 * PAGE,
+                32 * PAGE,
+                rw,
+                flags | LINUX_MAP_FIXED,
+                -1,
+            )
+        ) as u64,
+        HINT + 16 * PAGE
+    );
+    assert_eq!(
+        step(
+            "madvise",
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MADVISE,
+                [
+                    HINT + 16 * PAGE,
+                    4 * PAGE,
+                    carrick_abi::LINUX_MADV_DONTNEED,
+                    0,
+                    0,
+                    0
+                ],
+            )
+        ),
+        0
+    );
+    assert_eq!(
+        step(
+            "mprotect",
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MPROTECT,
+                [HINT + 14 * PAGE, 36 * PAGE, rw, 0, 0, 0],
+            )
+        ),
+        0
+    );
+    let chunk = step(
+        "persistentalloc",
+        host_mmap(&mut dispatcher, &mut memory, 0, CHUNK, rw, flags, -1),
+    ) as u64;
+    assert_eq!(chunk, LINUX_MMAP_BASE);
+    assert!(
+        root.lock().mapping(chunk).is_some(),
+        "persistent chunk must remain owner-owned"
+    );
+    assert_eq!(
+        step(
+            "chunk munmap",
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MUNMAP,
+                [chunk, CHUNK, 0, 0, 0, 0]
+            )
+        ),
+        0
+    );
+    assert_eq!(
+        step(
+            "arena munmap",
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MUNMAP,
+                [HINT, ARENA, 0, 0, 0, 0]
+            )
+        ),
+        0
+    );
+}
+
 /// When a genuinely host-served edit (such as `mprotect(PROT_GROWSDOWN)` or
 /// `mmap(MAP_PRIVATE | MAP_ANONYMOUS | MAP_DROPPABLE | MAP_FIXED)`) splits an
 /// outside-layout root reservation, `MemState::demote_root_rows` converts the
