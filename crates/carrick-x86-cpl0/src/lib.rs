@@ -10,6 +10,8 @@ pub mod linux_personality;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod native_execution;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod native_host_file;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod native_process;
 
 use carrick_el1_abi::Action;
