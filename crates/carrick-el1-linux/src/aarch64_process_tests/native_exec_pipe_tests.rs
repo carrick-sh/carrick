@@ -482,13 +482,7 @@ fn fork_exec_probe_copy(
                 }
             }
             let raw = map.lookup(child_table).unwrap();
-            let Some(carrick_personality_linux::native_host_file::HostFileStage::Request {
-                record,
-                output,
-                resolves_path,
-                map,
-                chdir,
-            }) = crate::dispatch::native_host_file_stage(
+            let stage = crate::dispatch::native_host_file_stage(
                 &frame,
                 &fixture.task,
                 &Resident,
@@ -496,6 +490,19 @@ fn fork_exec_probe_copy(
                 |_| panic!("absolute readlink does not inspect a descriptor"),
                 &mut |_| 0,
             )
+            .expect("readlink is a native file operation");
+            if let carrick_personality_linux::native_host_file::HostFileStage::Returned(result) =
+                stage
+            {
+                return result.raw() as u64;
+            }
+            let carrick_personality_linux::native_host_file::HostFileStage::Request {
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+            } = stage
             else {
                 panic!("readlink must stage through the native venue");
             };
@@ -722,6 +729,24 @@ fn fork_exec_probe_copy(
             }
         );
         assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
+        if copy_error.is_none() {
+            for size in [0, u64::MAX] {
+                assert_eq!(
+                    call_full(78, (-100i64) as u64, memory.arg(), memory.arg() + 512, size) as i64,
+                    -22,
+                    "non-positive bufsiz returns errno 22"
+                );
+            }
+            assert_eq!(
+                call_full(78, (-100i64) as u64, memory.arg(), memory.arg() + 512, 3),
+                3
+            );
+            assert_eq!(
+                crate::native_process_runtime::host_test_support::take_signal_copies(),
+                vec![(UserVa::new(memory.arg() + 512), b"/bi".to_vec())]
+            );
+            assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
+        }
         registry.unregister_root_for_test(&runtime);
         return;
     }
