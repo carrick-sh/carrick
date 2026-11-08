@@ -150,10 +150,49 @@ pub struct CensusRow {
     pub el1_boundaries: u64,
 }
 
+/// Bounded mapped mmap failure evidence captured before terminal unmapping.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MmapFailureEvidence {
+    pub attempted: u64,
+    pub dropped: u64,
+    pub incomplete: u64,
+    /// Wire words follow `carrick_el1_abi::MmapFailureRecord::words`.
+    pub records: Vec<[u64; 15]>,
+}
+
+fn mmap_failure_evidence(counters: &carrick_el1_abi::Counters) -> MmapFailureEvidence {
+    let census = &counters.mmap_failures;
+    let attempted = census.attempted.load(Ordering::Acquire);
+    let mut evidence = MmapFailureEvidence {
+        attempted,
+        dropped: attempted.saturating_sub(census.records.len() as u64),
+        incomplete: 0,
+        records: Vec::new(),
+    };
+    for record in census
+        .records
+        .iter()
+        .take(attempted.min(census.records.len() as u64) as usize)
+    {
+        if record.ready.load(Ordering::Acquire) != 1 {
+            evidence.incomplete += 1;
+        } else {
+            evidence.records.push(
+                record
+                    .words
+                    .each_ref()
+                    .map(|word| word.load(Ordering::Relaxed)),
+            );
+        }
+    }
+    evidence
+}
+
 /// The census of one carrier.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Census {
     pub refusal_evidence: carrick_spec::syscall_census::RefusalEvidence,
+    pub mmap_failures: Option<MmapFailureEvidence>,
     pub schema: u32,
     pub run_id: Option<String>,
     pub pid: u32,
@@ -247,7 +286,8 @@ fn snapshot_counters(
     let (process_user_ns, process_sys_ns) = process_cpu_ns();
     Census {
         refusal_evidence: refusal_evidence(counters, isa),
-        schema: 2,
+        mmap_failures: counters.map(mmap_failure_evidence),
+        schema: 3,
         run_id: run_id.map(|id| id.as_str().to_owned()),
         pid: std::process::id(),
         el1_counters: counters.is_some(),
@@ -418,6 +458,7 @@ pub struct Aggregate {
     pub process_cpu_ns: u64,
     pub wall_ns: u64,
     pub rows: Vec<AggregateRow>,
+    pub mmap_failures: Vec<(u32, MmapFailureEvidence)>,
 }
 
 /// Sum censuses by syscall number and rank by host CPU. Fails closed on an
@@ -428,7 +469,7 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
     }
     let mut by_nr: std::collections::BTreeMap<u64, AggregateRow> = Default::default();
     for census in censuses {
-        if census.schema != 2 {
+        if census.schema != 3 {
             return Err(format!("unknown census schema {}", census.schema));
         }
         for row in &census.rows {
@@ -459,6 +500,15 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
         return Err("census inputs contain no syscalls".to_owned());
     }
     Ok(Aggregate {
+        mmap_failures: censuses
+            .iter()
+            .filter_map(|c| {
+                c.mmap_failures
+                    .as_ref()
+                    .filter(|e| e.attempted != 0)
+                    .map(|e| (c.pid, e.clone()))
+            })
+            .collect(),
         runs: censuses.len(),
         runs_with_el1_counters: censuses.iter().filter(|c| c.el1_counters).count(),
         host_total_ns: rows.iter().map(AggregateRow::host_total_ns).sum(),
@@ -509,6 +559,17 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
             row.refused,
             row.venue_refused
         ));
+    }
+    for (pid, evidence) in &aggregate.mmap_failures {
+        out.push_str(&format!(
+            "\nmmap ENOMEM pid={pid}: attempted={} dropped={} incomplete={}\n",
+            evidence.attempted, evidence.dropped, evidence.incomplete
+        ));
+        for words in &evidence.records {
+            out.push_str(&format!("mm={} tid={} hint={:#x} length={} prot={:#x} flags={:#x} reason={} arena={:#x}..{:#x} address_limit={} data_limit={} external_address={} external_data={} root_address={} root_data={}\n",
+                words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+                words[7], words[8], words[9], words[10], words[11], words[12], words[13], words[14]));
+        }
     }
     out
 }
@@ -580,11 +641,12 @@ mod tests {
 
     fn census(rows: Vec<CensusRow>) -> Census {
         Census {
+            mmap_failures: None,
             refusal_evidence: refusal_evidence(
                 None,
                 carrick_spec::syscall_census::CensusIsa::Aarch64,
             ),
-            schema: 2,
+            schema: 3,
             run_id: None,
             pid: 1,
             el1_counters: true,
@@ -796,11 +858,66 @@ mod tests {
     }
 
     #[test]
+    fn mmap_failure_survives_terminal_serialization_and_debug_aggregation() {
+        use carrick_el1_abi::{
+            CurrentTask, Layout, ReservationMm, ReservationPolicyPayload, ReservationRange,
+        };
+        let counters = carrick_el1_abi::Counters::new();
+        let task = CurrentTask::new();
+        task.execution.task.store(42, Ordering::Relaxed);
+        let layout = Layout {
+            heap: ReservationRange::new(4096, 8192).unwrap(),
+            arena: ReservationRange::new(0x6000000000, 0x6800000000).unwrap(),
+            policy: ReservationPolicyPayload::new([4096, u64::MAX, 0, 0, 0]),
+        };
+        for _ in 0..18 {
+            counters.mmap_failures.record_limit(
+                ReservationMm::new(1).unwrap(),
+                &task,
+                [0, 262144, 3, 0x22, u64::MAX, 0],
+                layout,
+                carrick_core_abi::Charges {
+                    bytes: 0,
+                    data: 0,
+                    locked: 0,
+                },
+            );
+        }
+        // A writer that did not publish is incomplete, never zero evidence.
+        counters.mmap_failures.records[0]
+            .ready
+            .store(0, Ordering::Relaxed);
+        counters.served[222].store(18, Ordering::Relaxed);
+        let census = snapshot_counters(
+            None,
+            Some(&counters),
+            carrick_spec::syscall_census::CensusIsa::Aarch64,
+        );
+        let json = serde_json::to_vec(&census).unwrap();
+        let restored: Census = serde_json::from_slice(&json).unwrap();
+        let evidence = restored.mmap_failures.as_ref().unwrap();
+        assert_eq!(
+            (evidence.attempted, evidence.dropped, evidence.incomplete),
+            (18, 2, 1)
+        );
+        assert_eq!(evidence.records.len(), 15);
+        assert_eq!(evidence.records[0][3], 262144);
+        let text = render_table(&aggregate(&[restored]).unwrap(), 10);
+        assert!(text.contains("attempted=18 dropped=2 incomplete=1"));
+        assert!(text.contains("length=262144 prot=0x3 flags=0x22 reason=1"));
+        assert!(
+            snapshot_counters(None, None, carrick_spec::syscall_census::CensusIsa::Aarch64)
+                .mmap_failures
+                .is_none()
+        );
+    }
+
+    #[test]
     fn aggregate_fails_closed_on_empty_or_unknown_input() {
         assert!(aggregate(&[]).is_err());
         assert!(aggregate(&[census(vec![])]).is_err());
         let mut odd = census(vec![row(1, 1, 1)]);
-        odd.schema = 3;
+        odd.schema = 4;
         assert!(aggregate(&[odd]).is_err());
     }
 }
