@@ -2443,11 +2443,17 @@ fn copy_poll_revents(
     };
     let mut entry = 0;
     while entry < resolved.len() {
+        // The stride and the field offset come from the same record type the
+        // resolver iterated, so a layout change cannot silently misaddress an
+        // entry.
         let Some(address) = pollfds
             .raw()
             .checked_add((entry * core::mem::size_of::<super::file_table::PollFd>()) as u64)
             .and_then(|base| {
-                base.checked_add(core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64)
+                base.checked_add(core::mem::offset_of!(
+                    super::file_table::PollFd,
+                    revents
+                ) as u64)
             })
         else {
             return false;
