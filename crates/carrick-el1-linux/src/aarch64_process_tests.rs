@@ -12687,6 +12687,17 @@ fn native_descriptor_argument_witness(
                 "ring ppoll must retain the original guarded-copy refusal before owner preparation"
             );
             let row = row.unwrap();
+            let arguments = [pollfds.arg(), 1, timeout.arg(), 0, 0, 0];
+            for (i, expected) in arguments.iter().enumerate() {
+                assert_eq!(
+                    row[17 + i].load(Ordering::Relaxed),
+                    *expected,
+                    "copy refusal must retain raw decoded argument {i}"
+                );
+            }
+            let mut frames = String::new();
+            counters.write_syscall_frames(&mut frames).unwrap();
+            assert!(frames.contains("source=decoded-dispatch nr=73"), "{frames}");
             assert_eq!(row[7].load(Ordering::Relaxed), 1, "owner present");
             for i in 0..4 {
                 assert_eq!(

@@ -53,6 +53,7 @@ impl<
             counters: self.counters,
             ordinal: self.frame.canonical_ordinal(),
             arguments: core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
+            pc: self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
             presented: self.process.as_deref().map(|venue| venue.binding()),
             expected: LifecycleNative::binding(self),
         };
@@ -218,6 +219,7 @@ impl<
             counters: self.counters,
             ordinal: self.frame.canonical_ordinal(),
             arguments: core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
+            pc: self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
             presented: self.process.as_deref().map(|venue| venue.binding()),
             expected: LifecycleNative::binding(self),
         };
@@ -245,6 +247,14 @@ impl<
         });
         if matches!(outcome, LifecycleOutcome::Redispatch) {
             self.frame.restart_syscall();
+            if let (Some(frame), Some(binding)) = (self.frame.arm_frame_ref(), diagnostic.presented)
+            {
+                self.counters.record_syscall_frame(
+                    carrick_el1_abi::SyscallFrameSource::OwnerInputRedispatch,
+                    frame,
+                    binding,
+                );
+            }
         }
         self.run_ready_after_native_transfer(&mut outcome);
         outcome
