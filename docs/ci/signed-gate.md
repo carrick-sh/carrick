@@ -1,9 +1,10 @@
 # Signed gate in the merge queue
 
 `Signed gate` runs signed acceptance on every `checks_requested` merge group
-for this repository's `main` queue. It builds and signs the exact group head,
-compares against the signed baseline for the event's **base_sha**, and posts
-`signed-gate` as a commit status. The **Signed queue gate** check requires successful authorization, fixtures,
+for this repository's `main` queue. On one assigned Mac, under one host
+lease, it builds, signs and accepts the event's **base_sha** and then the exact
+group head, compares the two receipts, and posts `signed-gate` as a commit
+status. The **Signed queue gate** check requires successful authorization, fixtures,
 execution and verdict publication; skipped, cancelled or failed dependencies
 fail it. Main's merge ruleset must require this GitHub Actions check. Its
 PR-only placeholder permits enqueueing without a separate PR signed run.
@@ -15,18 +16,28 @@ matching `GITHUB_REF`, and an exact `head_sha=GITHUB_SHA`. The event base must
 be an ancestor of main. Manual gates still require `tjfontaine` as actor and
 rerun actor; the agent-held `carrick-workers` App remains refused (#654).
 
-## Automatic main baselines
+## Paired base execution
 
-Every push to `main` runs the same signed phase and uploads an admitted
-`signed-baseline-<sha>-<attempt>` artifact with 90-day retention. This seeds
-each new main without director dispatches or per-PR baseline preparation.
-If the exact base push run is still active when a group arrives, authorization
-waits for that run and reloads its terminal provenance before downloading.
-Only completed main push runs of this workflow or owner-authorized dispatches
-can supply a baseline; the receipt must name the exact base SHA. Missing,
-expired or invalid evidence fails closed. There is no fallback to a nearby
-commit or failure-name allowlist. The queue comparison is never recomputed
-against a moving main tip or a PR merge base.
+A signed receipt depends on the Mac that ran it: a test can fail
+deterministically on one gate Mac and pass on another. A base receipt from a
+different host would report such a failure as NEW and eject every group
+(#1884). The gate job therefore runs the merge base itself, before the
+candidate, on the same Mac in the same job and under the same exclusive
+`gate` lease. Both runs restore the candidate's same-run fixture bundle; when
+the base checkout's fixture inputs differ from that bundle, execution is
+refused instead of substituting another bundle. The receipts record the
+execution host and fixture content identity, and publication compares the
+candidate only with this paired base. A pair whose host or fixture evidence
+still differs is reported as **INCOMPARABLE BASE — BLOCKED**, never as NEW.
+No stored receipt from another run or host is downloaded.
+
+A PR that changes fixture inputs cannot be paired this way and is blocked;
+land such a change only after its fixture inputs are on main, or by owner
+direction.
+
+Every push to `main` still runs the signed phase, admits its receipt against
+itself and uploads `signed-baseline-<sha>-<attempt>` (90-day retention) as
+main's own evidence. Queue and PR requests do not consume it.
 
 PRs in a batch receive the verdict comment, found through the comparison's
 commits and their associated PRs. The group status and Actions summary also
@@ -44,9 +55,9 @@ gh workflow run signed-gate.yml --ref main -f pr=123 -f sha=<40-character-sha>
 ```
 
 Label authorization also checks the latest transition's actor through the
-API. A stale label does not authorize a new head. A PR request uses its exact
-merge-base baseline; its evidence belongs only to the requested head.
-Recovery of an expired or missing baseline remains owner-only:
+API. A stale label does not authorize a new head. A PR request executes its exact
+merge base beside the head; its evidence belongs only to the requested head.
+A main receipt can be regenerated, owner-only, with:
 
 ```sh
 gh workflow run signed-gate.yml --ref main -f pr=main -f sha=<main-ancestor-sha>
@@ -65,7 +76,7 @@ before activating the required queue check: authorization checks out main. The
 director announces the shared CI change on #231 and adds **Signed queue gate**
 to main's required checks (GitHub Actions source),
 removing any mandatory per-PR `signed-gate` status requirement. The queue
-check-response budget must cover waiting for the base plus the signed run.
+check-response budget must cover the paired base and candidate runs.
 Repo settings are not changed by this patch.
 
 Validate on GitHub with an ARM-touching group that passes and lands, a group
@@ -95,9 +106,10 @@ input identity before restoration. No manually provisioned archive or Docker
 is needed on the Mac.
 
 GitHub assigns one job at a time to a runner. The Rust executor also holds
-the machine's exclusive `gate` lease across fixture restore, `just
+the machine's exclusive `gate` lease across both runs' fixture restore, `just
 build`, `cargo run -p carrick-xtask -- accept --profile no-docker --phase
-signed`, and independent artifact inspection. Nested acceptance reuses that
+signed`, and independent artifact inspection. A paired job takes about twice
+a single run (roughly 45-70 minutes; the job timeout is 240). Nested acceptance reuses that
 lease. Both runners must share their local lease path with all other gate
 participants on that host. A per-SHA Actions concurrency group with
 `cancel-in-progress: false` queues duplicate requests. GitHub does not expose
@@ -105,12 +117,12 @@ participants on that host. A per-SHA Actions concurrency group with
 the lease rather than an invalid runner-name expression (director ruling on
 #634).
 
-Authorization, baseline download, comparison and status/comment publication
+Authorization, comparison and status/comment publication
 run on Ubuntu using trusted `main` code. The execution job has read-only
 permissions, persists no checkout credential, and passes no GitHub token to
-candidate commands. It fetches the admitted commit into a fresh detached
-worktree and removes the worktree and its target directory after copying
-logs. Runner operators must still treat approved PR code as code executing
+candidate commands. It fetches each admitted commit (base, then candidate)
+into a fresh detached worktree and removes the worktree and its target
+directory after copying logs. Runner operators must still treat approved PR code as code executing
 on that machine.
 
 ## Evidence and verdict
@@ -144,8 +156,8 @@ population, and no disappeared completed binary. New probe diffs or cleanup
 failures also fail. The execution job must finish successfully and its receipt
 must pass admission. Existing main test failures do not alone reject a PR.
 
-Artifacts are `signed-request-<attempt>`, `signed-result-<attempt>` (receipt,
-identity and logs), and `signed-verdict-<attempt>` (comparison JSON and PR
+Artifacts are `signed-request-<attempt>`, `signed-result-<attempt>` (candidate
+receipt, identity and logs; the paired base's in `base/`), and `signed-verdict-<attempt>` (comparison JSON and PR
 comment Markdown). Evidence is retained 30 days; main baselines 90 days.
 The PR comments and Actions summary link the run and name NEW/FIXED tests.
 A failed execution with no receipt still gets a failure status and an explanatory comment when the publication job runs.

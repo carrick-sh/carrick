@@ -3278,7 +3278,8 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     let output = CanonicalTempDir::new();
     let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
     let artifact = fixtures::archive::pack(&f.path, output.path()).unwrap();
-    carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &sha).unwrap();
+    carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &sha, &sha)
+        .unwrap();
     fixtures::archive::restore(f.repo.path(), &artifact, Some(&sha), &private_gate().lease)
         .unwrap();
     fixtures::verify_installed(f.repo.path()).unwrap();
@@ -3289,7 +3290,7 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     f.republish();
     let wrong_sha = fixtures::archive::pack(&f.path, output.path()).unwrap();
     let error =
-        carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &wrong_sha, &sha)
+        carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &wrong_sha, &sha, &sha)
             .unwrap_err();
     assert!(error.to_string().contains("source SHA differs"), "{error}");
 
@@ -3297,8 +3298,37 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     *f.manifest.sources.values_mut().next().unwrap() = hash(b"different inputs");
     f.republish();
     let wrong_inputs = fixtures::archive::pack(&f.path, output.path()).unwrap();
+    let error = carrick_xtask::signed_gate::verify_fixture_artifact(
+        f.repo.path(),
+        &wrong_inputs,
+        &sha,
+        &sha,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("input identity"), "{error}");
+
+    // The paired merge-base run checks out another commit with unchanged
+    // fixture inputs and restores the candidate publisher's bundle (#1884).
+    git(
+        f.repo.path(),
+        &["commit", "--allow-empty", "-m", "paired base"],
+    );
+    let base = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(base, sha);
+    carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &base, &sha)
+        .unwrap();
+    // The bundle still has to come from the authorized candidate SHA...
     let error =
-        carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &wrong_inputs, &sha)
+        carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &base, &base)
             .unwrap_err();
+    assert!(error.to_string().contains("source SHA differs"), "{error}");
+    // ...and a base whose inputs differ is refused, never given another bundle.
+    let error = carrick_xtask::signed_gate::verify_fixture_artifact(
+        f.repo.path(),
+        &wrong_inputs,
+        &base,
+        &sha,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("input identity"), "{error}");
 }
