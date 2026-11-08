@@ -1,78 +1,84 @@
 #![allow(clippy::unwrap_used)]
 use std::{fs, path::Path};
 
-/// The Signed gate builds its fixtures for the exact authorized SHA in the
-/// same run and hands that archive to the Mac gate (#1581). The workflow half
-/// landed as #1602; this checks the live workflow.
+/// The Signed gate restores fixtures only from a trusted producer keyed by
+/// the merge base: main's own published `signed-fixtures-<base>` artifact,
+/// fetched by trusted main code that authenticates its producing run. No
+/// job builds fixtures from candidate code (#1889 review P1).
 #[test]
-fn signed_gate_wires_same_run_authorized_fixture_artifact() {
+fn signed_gate_restores_the_trusted_base_fixture_artifact() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let text = fs::read_to_string(root.join(".github/workflows/signed-gate.yml")).unwrap();
     let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
     let jobs = &docs[0]["jobs"];
-    let publisher = &jobs["signed-fixtures"];
-    assert_eq!(publisher["needs"].as_str(), Some("authorize"));
-    assert_eq!(publisher["runs-on"].as_str(), Some("ubuntu-24.04-arm"));
-    let steps = publisher["steps"].as_vec().unwrap();
-    assert_eq!(
-        steps[0]["with"]["ref"].as_str(),
-        Some("${{ needs.authorize.outputs.sha }}")
+    assert!(
+        jobs["signed-fixtures"].is_badvalue(),
+        "a candidate fixture publisher must not supply fixture authority"
     );
+    assert!(!text.contains("fixtures-publish"));
+    let fetcher = &jobs["base-fixtures"];
+    assert_eq!(fetcher["needs"].as_str(), Some("authorize"));
+    let steps = fetcher["steps"].as_vec().unwrap();
+    assert_eq!(steps[0]["with"]["ref"].as_str(), Some("main"));
+    assert_eq!(
+        fetcher["permissions"]["actions"].as_str(),
+        Some("read"),
+        "the fetcher reads the producing run through the API"
+    );
+    let fetch = steps
+        .iter()
+        .find(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.contains("signed-gate base-fixtures"))
+        })
+        .unwrap();
+    assert!(fetch["run"].as_str().unwrap().contains("request.json"));
     let upload = steps
         .iter()
         .find(|s| s["uses"].as_str() == Some("actions/upload-artifact@v4"))
         .unwrap();
-    assert!(
-        upload["with"]["path"]
-            .as_str()
-            .unwrap()
-            .contains("needs.authorize.outputs.sha")
-    );
-    assert!(
-        upload["with"]["name"]
-            .as_str()
-            .unwrap()
-            .contains("github.run_attempt")
-    );
+    let name = upload["with"]["name"].as_str().unwrap();
+    assert!(name.contains("github.run_attempt"), "{name}");
     let gate = &jobs["gate"];
     assert!(
         gate["needs"]
             .as_vec()
             .unwrap()
             .iter()
-            .any(|s| s.as_str() == Some("signed-fixtures"))
+            .any(|s| s.as_str() == Some("base-fixtures"))
     );
     let download = gate["steps"]
         .as_vec()
         .unwrap()
         .iter()
-        .find(|s| s["with"]["name"] == upload["with"]["name"])
+        .find(|s| s["with"]["name"].as_str() == Some(name))
         .unwrap();
     assert_eq!(
         download["uses"].as_str(),
         Some("actions/download-artifact@v4")
     );
+    // Candidate code is checked out only by the executor, never by a job.
+    for (job, body) in jobs.as_hash().unwrap() {
+        for step in body["steps"].as_vec().into_iter().flatten() {
+            assert_ne!(
+                step["with"]["ref"].as_str(),
+                Some("${{ needs.authorize.outputs.sha }}"),
+                "{job:?} checks out the candidate"
+            );
+        }
+    }
     assert!(!text.contains("vars.CARRICK_SIGNED_FIXTURE_BUNDLE"));
-    // The publisher runs the same commands as main's own fixture publisher,
-    // for the authorized SHA instead of the pushed one.
+    // The trusted producer is main's own fixture publisher.
     let kernel = fs::read_to_string(root.join(".github/workflows/kernel-runtime.yml")).unwrap();
     let kernel = yaml_rust2::YamlLoader::load_from_str(&kernel).unwrap();
-    for step in steps.iter().filter(|s| !s["run"].is_badvalue()) {
-        let name = step["name"].as_str().unwrap();
-        let original = kernel[0]["jobs"]["signed-fixtures"]["steps"]
-            .as_vec()
-            .unwrap()
-            .iter()
-            .find(|s| s["name"].as_str() == Some(name))
-            .unwrap();
-        assert_eq!(
-            step["run"].as_str().unwrap(),
-            original["run"]
-                .as_str()
-                .unwrap()
-                .replace("$GITHUB_SHA", "$FIXTURE_SHA")
-        );
-    }
+    let published = kernel[0]["jobs"]["signed-fixtures"]["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["with"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(published.contains(&"signed-fixtures-${{ github.sha }}"));
 }
 
 /// The required check must fail on any skipped or failed dependency, while
@@ -117,7 +123,7 @@ fn signed_queue_workflow_requires_published_group_pass_and_seeds_main() {
         Some("always() && github.event_name == 'merge_group'")
     );
     let required = check["needs"].as_vec().unwrap();
-    for job in ["authorize", "signed-fixtures", "gate", "publish"] {
+    for job in ["authorize", "base-fixtures", "gate", "publish"] {
         assert!(required.iter().any(|j| j.as_str() == Some(job)));
     }
     let command = check["steps"][0]["run"].as_str().unwrap();
@@ -125,7 +131,7 @@ fn signed_queue_workflow_requires_published_group_pass_and_seeds_main() {
     // each dependency's actual result (a constant success would fail open).
     for (variable, job) in [
         ("AUTHORIZE", "authorize"),
-        ("FIXTURES", "signed-fixtures"),
+        ("FIXTURES", "base-fixtures"),
         ("GATE", "gate"),
         ("PUBLISH", "publish"),
     ] {
