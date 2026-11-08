@@ -1832,10 +1832,12 @@ pub(crate) fn service_native_fork_stock(
                 );
                 if let Err(refusal) = &result {
                     report_stock_refusal(None, Some(execution), &format!("Reserve: {refusal:?}"));
-                } else {
+                }
+                let accepted = result.is_ok();
+                if accepted {
                     stock.root_executables.remove(&execution.cpu);
                 }
-                result.is_ok()
+                accepted
             } else {
                 let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                 match stock.owner.settle(
