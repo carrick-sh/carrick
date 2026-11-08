@@ -2982,7 +2982,13 @@ impl CopyRefusalReason {
 /// The code boundary that produced a frame sample. A fresh trap can itself
 /// be an SVC replay: correlate its PC/binding with the preceding replay row.
 /// These observations never change execution or claim to be a full census.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u64)]
 pub enum SyscallFrameSource {
     FreshTrap = 1,
