@@ -536,6 +536,53 @@ fn production_image_rejects_fixture_syscalls() {
 }
 
 #[test]
+fn production_image_has_no_anonymous_injection_statics() {
+    let bytes = std::fs::read(env!("CARRICK_X86_CPL0_IMAGE")).expect("production CPL0 image");
+    let image = goblin::elf::Elf::parse(&bytes).expect("production CPL0 symbols");
+    for forbidden in [
+        "INJECT_ROOT_BUSY",
+        "INJECT_EDITOR_BUSY",
+        "INJECT_PREPARED_CONFLICT",
+        "INJECT_METADATA_REQUIRED",
+    ] {
+        assert!(
+            image.syms.iter().all(|symbol| image
+                .strtab
+                .get_at(symbol.st_name)
+                .is_none_or(|name| !name.contains(forbidden))),
+            "production image contains test injection static {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn production_image_refuses_anonymous_injection_ordinals() {
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    for ordinal in 0xffff_ffff_ffff_fe10..=0xffff_ffff_ffff_fe14 {
+        append_mov(&mut code, &[0x48, 0xb8], ordinal);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        append_result_check(&mut code, &mut failures, -38);
+    }
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 16);
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 5);
+}
+
+#[test]
 fn production_interrupt_boot_serves_an_ordinary_syscall() {
     // Production entry requires an admitted initial MM and scheduler record.
     // Keep the ordinary syscall and refusal checks on that real launch path.
