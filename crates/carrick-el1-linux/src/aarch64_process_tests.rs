@@ -1587,7 +1587,7 @@ fn signal_user_return_busy_once_preserves_completed_wait_and_delivers_once() {
         user_sp: stack.va_at(stack.len()),
         backend: ArmWaitSignalBackend,
     };
-    super::aarch64_process::inject_signal_entry_busy_once();
+    super::aarch64_process::inject_signal_entry_busy_once(&fixture.task);
     let refused = with_process_entry(
         source,
         &fixture.task,
