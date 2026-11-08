@@ -168,7 +168,7 @@ impl OwnerVenue<ParkedContextWords> for Venue {
         carrick_personality_linux::mm::cancelled_copy_errno()
     }
 }
-fn release(
+pub(super) fn release(
     _: &X86Cpl0Zone,
     _: carrick_sched_core::Waker,
     effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, ParkedContextWords>,

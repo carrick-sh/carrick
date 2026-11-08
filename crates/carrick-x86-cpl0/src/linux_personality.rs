@@ -622,7 +622,7 @@ pub fn handle_user_page_fault_prepared(
     let zone =
         unsafe { &*(venues.zone.raw() as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
     let roots = carrick_el1::memory::reservations::shared_x86_cpl0_guest();
-    let spaces = carrick_core::wait::space_access(zone, slot, anonymous::initial_release);
+    let spaces = carrick_core::wait::space_access(zone, slot, native_process::release);
     let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
     let Some(prepared_mm) = core::num::NonZeroU64::new(mm_key) else {
         return 9;

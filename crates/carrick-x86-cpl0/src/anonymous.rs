@@ -73,7 +73,7 @@ impl X86AnonymousVenue<'_> {
             let limit = out.len().min(rows.len());
             let count = carrick_el1::memory::take_native_source_releases(
                 self.task,
-                carrick_core::wait::space_access(zone, slot, initial_release),
+                carrick_core::wait::space_access(zone, slot, crate::native_process::release),
                 shared_x86_cpl0_guest(),
                 slot.index() as u32,
                 &mut rows[..limit],
@@ -149,7 +149,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             &mut self.frame,
             counters,
             self.task,
-            carrick_core::wait::space_access(zone, slot, initial_release),
+            carrick_core::wait::space_access(zone, slot, crate::native_process::release),
             shared_x86_cpl0_guest(),
             &mut editor,
             file,
@@ -312,17 +312,6 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
         }
         Ok(())
     }
-}
-
-pub(super) fn initial_release(
-    _: &X86Cpl0Zone,
-    _: carrick_sched_core::Waker,
-    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-        '_,
-        carrick_sched_core::ParkedContextWords,
-    >,
-) {
-    carrick_el1::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned);
 }
 
 fn fatal_reservation() -> ! {
