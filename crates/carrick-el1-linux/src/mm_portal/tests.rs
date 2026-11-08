@@ -3176,6 +3176,63 @@ fn anonymous_munmap_root_busy_requests_wait_without_counted_forward() {
 }
 
 #[test]
+fn anonymous_munmap_editor_busy_requests_wait_without_counted_forward() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1_abi::{AnonymousLeave, Counters, CurrentTask, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_sched_core::spaces::notification::SpaceAccess;
+
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let held = spaces
+        .try_begin_edit(
+            spaces.find(mm.raw()).unwrap(),
+            mm.raw(),
+            NonZeroU64::new(2).unwrap(),
+        )
+        .unwrap();
+    let tables = Tables::new(ROOT, IPA, 0);
+    let arenas = [&tables];
+    let task = CurrentTask::new();
+    task.execution.task.store(101, Ordering::Relaxed);
+    task.mm.thread_generation.store(1, Ordering::Relaxed);
+    task.mm.key.store(mm.raw(), Ordering::Relaxed);
+    let mut frame = TrapFrame {
+        slot: 0,
+        elr: 0x40004,
+        ..TrapFrame::default()
+    };
+    frame.x[0] = VA;
+    frame.x[1] = 4096;
+    frame.x[8] = 215;
+    let counters = Counters::default();
+    let mut editor = ForkAnonymousEditor {
+        arenas: &arenas,
+        pool: TableWindow {
+            words: tables.words.as_ptr().cast_mut(),
+            physical_base: tables.base,
+            byte_len: tables.words.len() * 8,
+        },
+    };
+    let route = serve_delegated_anonymous(
+        &mut frame,
+        &counters,
+        &task,
+        SpaceAccess::source_free(&spaces),
+        region.table(),
+        &mut editor,
+        None,
+    );
+    assert_ne!(route, DelegatedAnonymous::Forward, "Busy must ask to park");
+    assert_eq!(
+        counters.anonymous_leaves[AnonymousLeave::EditorBusy as usize].load(Ordering::Relaxed),
+        0
+    );
+    drop(held);
+}
+
+#[test]
 fn anonymous_edit_wait_reruns_when_root_releases_between_probe_and_park() {
     use carrick_core::wait::{EditWaitOutcome, coordinate_anonymous_edit_wait};
     use carrick_sched_core::object_wait::ObjectWaitError;
