@@ -101,9 +101,135 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         queue.epoch.store(1, Ordering::SeqCst);
         queue.publishers.store(1, Ordering::Release);
         queue.generation.store(key.generation, Ordering::Release);
+        #[cfg(all(test, not(feature = "loom")))]
+        tests::after_publication();
         Ok(())
     }
+}
 
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+    use crate::object_wait::OperationToken;
+    use crate::{Aarch64ParkedContext, BoundedSpin, Claim, ParkedContextWords, ThreadIdentity};
+    use std::{
+        boxed::Box,
+        cell::RefCell,
+        sync::{Mutex, mpsc},
+        time::Duration,
+        vec::Vec,
+    };
+
+    struct PublicationHook {
+        published: mpsc::Sender<()>,
+        enrolled: mpsc::Receiver<()>,
+    }
+    std::thread_local! {
+        static PUBLICATION: RefCell<Option<PublicationHook>> = const { RefCell::new(None) };
+    }
+    pub(super) fn after_publication() {
+        PUBLICATION.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook.published.send(()).unwrap();
+                hook.enrolled.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        });
+    }
+
+    fn concurrent_admission<C: Copy + Send + Sync + zerocopy::FromZeros>() {
+        // SAFETY: the scheduler ABI starts at zero, with its native alignment.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables<C>>());
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr.cast::<ZoneTables<C>>())
+        };
+        for index in [
+            IpcLockIndex::object(0).unwrap(),
+            IpcLockIndex::table(0).unwrap(),
+        ] {
+            let carrier = NonZeroU64::new(777).unwrap();
+            let handed = Mutex::new(Vec::new());
+            let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
+                let _ = effects.deliver_handbacks(&mut |r| handed.lock().unwrap().push(r));
+            };
+            let records = [101, 102].map(|tid| {
+                zone.alloc_record(ThreadIdentity {
+                    tid,
+                    serial: tid,
+                    mm: 7,
+                    file_table: 99,
+                    generation: 1,
+                    affinity_source: crate::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap()
+            });
+            let (published_tx, published_rx) = mpsc::channel();
+            let (enrolled_tx, enrolled_rx) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let binder = scope.spawn(|| {
+                    PUBLICATION.with(|hook| {
+                        *hook.borrow_mut() = Some(PublicationHook {
+                            published: published_tx,
+                            enrolled: enrolled_rx,
+                        });
+                    });
+                    zone.bind_ipc_lock_release(index, carrier, &BoundedSpin(0), &completion)
+                        .unwrap();
+                });
+                published_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                zone.bind_ipc_lock_release(index, carrier, &BoundedSpin(0), &completion)
+                    .unwrap();
+                let source = zone.ipc_lock_release_source(index, carrier).unwrap();
+                for (i, record) in records.into_iter().enumerate() {
+                    source
+                        .reserve()
+                        .park_host_rechecked(
+                            source.observe(),
+                            record,
+                            OperationToken::new(i as u64 + 1, 11).unwrap(),
+                            &completion,
+                            || true,
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        zone.record(record).claim(),
+                        Claim::Transferring { .. }
+                    ));
+                }
+                enrolled_tx.send(()).unwrap();
+                binder.join().unwrap();
+            });
+            assert_eq!(handed.lock().unwrap().len(), records.len());
+            assert_eq!(
+                zone.object_queue(index.key(carrier).index() as usize)
+                    .publishers
+                    .load(Ordering::Acquire),
+                1,
+                "both counted admissions must return to the permanent base publisher"
+            );
+            for record in records {
+                assert!(unsafe { zone.record(record).take_object_operation() }.is_some());
+                zone.free_record(record);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_ipc_admission_aarch64_keeps_guard_generation() {
+        concurrent_admission::<Aarch64ParkedContext>();
+    }
+
+    #[test]
+    fn concurrent_ipc_admission_cpl0_keeps_guard_generation() {
+        concurrent_admission::<ParkedContextWords>();
+    }
+}
+
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Borrow only a source admitted by this carrier's IPC directory owner.
     pub fn ipc_lock_release_source(
         &self,
