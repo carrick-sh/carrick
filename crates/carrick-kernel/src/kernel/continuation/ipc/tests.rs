@@ -1622,6 +1622,15 @@ fn interrupt(
 
 #[test]
 fn ppoll_completed_answer_survives_owner_copyout_refusal_and_readiness_change() {
+    poll_completed_answer_survives_copyout_refusal(false);
+}
+
+#[test]
+fn ppoll_control_copyout_refusal_resumes_the_retained_answer() {
+    poll_completed_answer_survives_copyout_refusal(true);
+}
+
+fn poll_completed_answer_survives_copyout_refusal(control: bool) {
     use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
     let w = world();
     let (reader, _, object) = w.pipe();
@@ -1636,22 +1645,33 @@ fn ppoll_completed_answer_survives_owner_copyout_refusal_and_readiness_change() 
     op.orig_x0 = BUF;
     op.value = carrick_el1_abi::ipc::IpcEventValue(1 << 32 | reader.0 as u64);
     op.deadline = carrick_el1_abi::ipc::IpcCounterDeadline::at(5_000_000_000);
-    op.handback = IpcHandback::Continue;
+    op.handback = if control {
+        IpcHandback::None
+    } else {
+        IpcHandback::Continue
+    };
     w.region.update_operation(&token, op).unwrap();
     let mut memory = OwnerRefusingMemory::new(BUF, 4096, 0xff);
     memory.refuse_next();
-    let outcome = complete_handback(
-        &caller(),
-        w.region,
-        token,
-        MM,
-        &mut memory,
-        None,
-        &Clocked {
-            wakes: Wakes::default(),
-            now: 1,
-        },
-    )
+    let clock = Clocked {
+        wakes: Wakes::default(),
+        now: 1,
+    };
+    let outcome = if control {
+        // A directly claimed in-ring park still has handback=None. Drive
+        // the exact interrupt entry used by resume_ipc_operation.
+        super::interrupt(
+            &caller(),
+            w.region,
+            token,
+            MM,
+            &mut memory,
+            IpcCause::Control,
+            &clock,
+        )
+    } else {
+        complete_handback(&caller(), w.region, token, MM, &mut memory, None, &clock)
+    }
     .unwrap();
     let IpcHostOutcome::OwnerMemory { token, .. } = outcome else {
         panic!("{outcome:?}");
