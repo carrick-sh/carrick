@@ -8314,8 +8314,8 @@ fn admission_group_lookup_distinguishes_missing_indexes() {
     assert_eq!(lookup.0, [0, 0, 0, 0, 0, 0, 1 << 32, 0]);
 }
 
-// A known-answer diagnostic check, not attribution of the signed producer:
-// deliberately publish a different PID through the normal task metadata API.
+// Cached executor identity is not authority for an already admitted member.
+// Keep the diagnostic payload's known-answer encoding check separately below.
 #[cfg(test)]
 #[test]
 fn admission_group_lookup_captures_stored_and_observed_keys() {
@@ -8331,7 +8331,7 @@ fn admission_group_lookup_captures_stored_and_observed_keys() {
     let renewed = fixture.zone.current_or_new(fixture.slot, identity).unwrap();
     let renewed = fixture.zone.record_ref(renewed);
     fixture.task.publish_visible_pid(99);
-    let NativeGroupAdmission::FreshRoot(lookup) = fixture
+    let NativeGroupAdmission::Existing(runtime) = fixture
         .registry
         .admit_existing_group(
             source,
@@ -8342,14 +8342,34 @@ fn admission_group_lookup_captures_stored_and_observed_keys() {
         )
         .unwrap()
     else {
-        panic!("expected diagnostic miss")
+        panic!("an exact admitted member must repair its cached PID")
     };
-    assert_eq!(lookup.0[6] >> 32, 7, "by_process still agrees");
-    let (observed, stored, registered) = lookup.1.unwrap();
-    assert_eq!(&observed[..4], &stored[..4]);
-    assert_eq!(observed[4], 99);
-    assert_eq!(stored[4], 41);
-    assert_eq!(registered, fixture.record);
+    assert!(Arc::ptr_eq(&runtime, &fixture.runtime));
+    assert_eq!(fixture.task.visible_pid(), Some(41));
+    assert!(Arc::ptr_eq(
+        &runtime,
+        &fixture.registry.for_record(fixture.zone, renewed).unwrap()
+    ));
+
+    // Known-answer wire encoding only: a real production lookup now repairs
+    // this mismatch. Preserve the original observed/stored diagnostic words,
+    // without misrepresenting a synthetic PID write as a reachable refusal.
+    let stored_key =
+        NativeProcessRegistry::group_key(fixture.zone, fixture.address, fixture.page, 41);
+    let stored = [
+        stored_key.0 as u64,
+        stored_key.1,
+        stored_key.2,
+        stored_key.3 as u64,
+        u64::from(stored_key.4),
+    ];
+    let mut observed = stored;
+    observed[4] = 99;
+    let registered = fixture.record;
+    let lookup = NativeGroupLookup(
+        [7 << 32, 0, 0, 0, 0, 0, 7 << 32, 0],
+        Some((observed, stored, registered)),
+    );
     let error = NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
         source,
         fixture.task,
@@ -8361,7 +8381,7 @@ fn admission_group_lookup_captures_stored_and_observed_keys() {
     )
     .err()
     .unwrap()
-    .with_group_lookup(*lookup);
+    .with_group_lookup(lookup);
     let NativeAdmissionError::Contended(contention) = error else {
         panic!("expected custody refusal")
     };
