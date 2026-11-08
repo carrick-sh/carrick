@@ -1493,6 +1493,17 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         exit: &CarrierRunExit,
         on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
+        self.service_idle_peer_doorbell_with_host_file(exit, on_work, &mut |_, _| {
+            Err(carrick_hal::fork_stock::NativeHostFileRefused)
+        })
+    }
+
+    pub fn service_idle_peer_doorbell_with_host_file(
+        &mut self,
+        exit: &CarrierRunExit,
+        on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
+        host_file: &mut NativeHostFileService<'_>,
+    ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("idle peer service requires physical doorbell"));
         };
@@ -1507,6 +1518,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             .map_err(|_| fail("physical custody poisoned"))?;
         let native_entropy = self.native_entropy;
         let mut work_flags = None;
+        let mut pending_file = None;
         let (exit, register_child, unregister_child) = self.cpu.with_idle_peer_io(|io| {
             let lease = StoppedCpuLease {
                 cpu: carrick_guest_arch::CpuId::new(1),
@@ -1561,11 +1573,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     if let anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) =
                         custody.service_native_notice(&lease, file, native_entropy)?
                     {
-                        custody.finish_native_host_file(
-                            &lease,
-                            *pending,
-                            Err(carrick_hal::fork_stock::NativeHostFileRefused),
-                        )?;
+                        pending_file = Some(pending);
                     }
                     Ok((None, None, None))
                 }
@@ -1587,6 +1595,23 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
+        if let Some(mut pending) = pending_file {
+            let served = host_file(
+                pending.ticket.request().identity.birth.origin,
+                &mut pending.record,
+            );
+            let mut custody = self
+                ._custody
+                .lock()
+                .map_err(|_| fail("physical custody poisoned"))?;
+            self.cpu.with_idle_peer_io(|io| {
+                let lease = StoppedCpuLease {
+                    cpu: carrick_guest_arch::CpuId::new(1),
+                    io,
+                };
+                custody.finish_native_host_file(&lease, *pending, served)
+            })?;
+        }
         if let Some((served, doorbell)) = work_flags {
             on_work(served, doorbell);
         }
@@ -1734,6 +1759,18 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         exit: &CarrierRunExit,
         on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
+        self.service_physical_doorbell_with_host_file(task, exit, on_work, &mut |_, _| {
+            Err(carrick_hal::fork_stock::NativeHostFileRefused)
+        })
+    }
+
+    pub fn service_physical_doorbell_with_host_file(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+        exit: &CarrierRunExit,
+        on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
+        host_file: &mut NativeHostFileService<'_>,
+    ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("physical service requires a doorbell exit"));
         };
@@ -1754,6 +1791,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             .map_err(|_| fail("physical custody poisoned"))?;
         let native_entropy = self.native_entropy;
         let mut work_flags = None;
+        let mut pending_file = None;
         let (exit, register_child, unregister_child) = self.cpu.with_stopped_io(task, |io| {
             let lease = StoppedCpuLease { cpu: slot, io };
             match production_port(*port) {
@@ -1801,8 +1839,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 Some(ProductionPort::NativeService) => {
                     if let anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) =
                         custody.service_native_notice(&lease, file, native_entropy)? {
-                        custody.finish_native_host_file(&lease, *pending,
-                            Err(carrick_hal::fork_stock::NativeHostFileRefused))?;
+                        pending_file = Some(pending);
                     }
                     Ok((None, None, None))
                 }
@@ -1834,12 +1871,35 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
+        if let Some(mut pending) = pending_file {
+            let served = host_file(
+                pending.ticket.request().identity.birth.origin,
+                &mut pending.record,
+            );
+            let mut custody = self
+                ._custody
+                .lock()
+                .map_err(|_| fail("physical custody poisoned"))?;
+            self.cpu.with_stopped_io(task, |io| {
+                let lease = StoppedCpuLease { cpu: slot, io };
+                custody.finish_native_host_file(&lease, *pending, served)
+            })?;
+        }
         if let Some((served, doorbell)) = work_flags {
             on_work(served, doorbell);
         }
         Ok(exit)
     }
 }
+
+/// Host-file handler invoked with physical custody and CPU-I/O borrows released.
+pub type NativeHostFileService<'a> = dyn FnMut(
+        carrick_core_abi::service::ServiceOrigin,
+        &mut [u8],
+    ) -> Result<
+        Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+        carrick_hal::fork_stock::NativeHostFileRefused,
+    > + 'a;
 
 enum ProductionPort {
     OwnerGrant,
