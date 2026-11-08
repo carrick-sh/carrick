@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Build the conformance probe binaries for BOTH libc flavours, so the
 # conformance matrix exercises glibc-specific ABI paths (e.g. glibc tcgetattr/
 # isatty going through TCGETS2, which musl never issues) as well as musl:
@@ -31,7 +31,7 @@
 # is non-gating anyway). Likewise the aarch64 sets are built natively on an
 # aarch64 host's container; on the x86_64 fleet they are simply not produced
 # (and `lane_runnable_here` SKIPs the ARM64 lane there).
-set -e
+set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib/cargo-target-dir.sh
 
