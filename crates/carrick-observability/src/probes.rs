@@ -7291,7 +7291,12 @@ mod real {
     /// Construct fixture provenance only for an attached consumer.
     #[inline(never)]
     pub fn embed_fixture_loaded(make_args: impl FnOnce() -> (String, String, u64, u32)) {
-        carrick_usdt::embed__fixture__loaded!(|| make_args());
+        // USDT rejects a bare single-token factory; spell out the owned ABI
+        // fields without storing a collection operation inside the macro.
+        carrick_usdt::embed__fixture__loaded!(|| {
+            let (path, sha256, bytes, guest_cpus) = make_args();
+            (path, sha256, bytes, guest_cpus)
+        });
     }
 
     #[inline(never)]
