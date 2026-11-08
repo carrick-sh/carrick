@@ -2355,6 +2355,90 @@ fn register_thread_busy_keeps_birth_authenticable() {
     );
 }
 
+// Existing payload allocations must survive production admission unchanged.
+#[test]
+fn register_thread_preserves_existing_credential_storage() {
+    use carrick_personality_linux::identity::TaskGid;
+
+    let fixture = native_exec_fixture();
+    let sibling = prepare_signal_sibling(&fixture, true);
+    let before = {
+        let mut graph = fixture.runtime.graph.lock();
+        let root = graph.root_key;
+        let row = graph.owner.task_mut(root).unwrap();
+        for tid in 43..47 {
+            row.threads.spawn_thread(41, tid).unwrap();
+        }
+        row.threads.threads.reserve(1);
+        for (index, thread) in row.threads.threads.iter_mut().enumerate() {
+            thread.credentials.groups = (0..4096 + index * 257)
+                .map(|group| TaskGid::new((index * 10000 + group) as u32))
+                .collect();
+            thread.credentials.groups_installed = true;
+            thread.comm = [index as u8 + 1; 16];
+        }
+        (
+            row.threads.threads.as_ptr(),
+            row.threads.threads.capacity(),
+            row.threads
+                .threads
+                .iter()
+                .map(|thread| {
+                    (
+                        thread.credentials.groups.as_ptr(),
+                        thread.credentials.groups.capacity(),
+                    )
+                })
+                .collect::<alloc::vec::Vec<_>>(),
+        )
+    };
+    fixture
+        .registry
+        .register_thread(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            fixture.page,
+            sibling.control,
+        )
+        .unwrap();
+    let graph = fixture.runtime.graph.lock();
+    let row = graph.owner.task(graph.root_key).unwrap();
+    assert_eq!(
+        row.threads.threads.as_ptr(),
+        before.0,
+        "registration replaced unrelated thread credential storage"
+    );
+    assert_eq!(row.threads.threads.capacity(), before.1);
+    assert_eq!(row.threads.threads.len(), before.2.len() + 1);
+    for (index, (thread, storage)) in row.threads.threads.iter().zip(&before.2).enumerate() {
+        assert_eq!(
+            thread.credentials.groups.as_ptr(),
+            storage.0,
+            "registration copied an existing supplementary-group payload"
+        );
+        assert_eq!(thread.credentials.groups.capacity(), storage.1);
+        assert_eq!(thread.credentials.groups.len(), 4096 + index * 257);
+        assert!(
+            thread
+                .credentials
+                .groups
+                .iter()
+                .enumerate()
+                .all(|(group, gid)| *gid == TaskGid::new((index * 10000 + group) as u32))
+        );
+        assert_eq!(thread.comm, [index as u8 + 1; 16]);
+    }
+    let child = row.threads.threads.last().unwrap();
+    assert_eq!(child.tid, 42);
+    assert_eq!(child.credentials, row.threads.threads[0].credentials);
+    assert_ne!(child.credentials.groups.as_ptr(), before.2[0].0);
+    assert_eq!(child.comm, row.threads.threads[0].comm);
+}
+
 fn add_signal_sibling(
     fixture: &NativeSignalFixture,
     operation: Option<carrick_core_abi::service::ServiceOperation>,
