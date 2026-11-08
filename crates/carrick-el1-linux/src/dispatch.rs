@@ -2099,6 +2099,9 @@ pub trait DispatchContext: carrick_el1_abi::EntryContext {
     fn arm_receipt(
         receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>>;
+    fn x86_receipt(
+        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::ParkedContextWords>,
+    ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>>;
 }
 impl DispatchContext for carrick_sched_core::ThreadCtx {
     fn arm_source(
@@ -2111,6 +2114,11 @@ impl DispatchContext for carrick_sched_core::ThreadCtx {
         receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
         let _ = receipt;
+        None
+    }
+    fn x86_receipt(
+        _: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::ParkedContextWords>,
+    ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
         None
     }
 }
@@ -2126,6 +2134,11 @@ impl DispatchContext for carrick_sched_core::ParkedContextWords {
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
         None
     }
+    fn x86_receipt(
+        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::ParkedContextWords>,
+    ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
+        Some(receipt)
+    }
 }
 impl DispatchContext for carrick_sched_core::Aarch64ParkedContext {
     fn arm_source(
@@ -2138,6 +2151,11 @@ impl DispatchContext for carrick_sched_core::Aarch64ParkedContext {
         receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
         Some(receipt)
+    }
+    fn x86_receipt(
+        _: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::ParkedContextWords>,
+    ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
+        None
     }
 }
 
@@ -2550,11 +2568,17 @@ impl<
         })
     }
     fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt<Context>> {
-        self.process
+        if let Some(process) = self.process.as_deref_mut() {
+            process.drain_owned_preparation();
+        }
+        self.anonymous
             .as_deref_mut()
-            .and_then(|process| {
-                process.drain_owned_preparation();
-                process.take_handoff_receipt()
+            .and_then(|venue| venue.take_x86_handoff_receipt())
+            .and_then(Context::x86_receipt)
+            .or_else(|| {
+                self.process
+                    .as_deref_mut()
+                    .and_then(|process| process.take_handoff_receipt())
             })
             .or_else(|| self.handoff.take().and_then(Context::arm_receipt))
     }
@@ -3272,7 +3296,7 @@ impl<
             &mut memory::HardwareAnonymousEditor,
             file,
         ) {
-            memory::DelegatedAnonymous::PreparedConflict => DelegatedStep::PreparedConflict,
+            memory::DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
             memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
             memory::DelegatedAnonymous::Served => {
                 DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
@@ -3300,6 +3324,27 @@ impl<
             &mut sched,
             self.frame.arm_frame()?,
             memory::reservations::shared_guest(),
+        )?;
+        Some(
+            carrick_personality_linux::dispatch::accounted_scheduler_effect(
+                served,
+                self.frame.result().0 as i64,
+            ),
+        )
+    }
+    fn park_contended(
+        &mut self,
+        cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
+    ) -> Option<FamilyCompletion> {
+        let slot = self.frame.slot()?;
+        let task = self.current_tasks.get(self.frame.task_index())?;
+        let zone = self.zone.as_mut()?;
+        let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
+        let served = super::mm_portal::park_anonymous_edit(
+            &mut sched,
+            self.frame.arm_frame()?,
+            memory::reservations::shared_guest(),
+            cause,
         )?;
         Some(
             carrick_personality_linux::dispatch::accounted_scheduler_effect(

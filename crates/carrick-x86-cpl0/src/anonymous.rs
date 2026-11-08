@@ -3,6 +3,7 @@
 use carrick_el1::memory::reservations::{X86Cpl0Zone, shared_x86_cpl0_guest};
 use carrick_el1::memory::{AnonymousCall, AnonymousCallView};
 use carrick_el1::memory::{X86AnonymousDecode, classify_anonymous_range};
+use carrick_el1_abi::BornInZoneSource;
 use carrick_el1_abi::CurrentTask;
 use carrick_guest_arch::{FrameGpa, GuestLen, RootGpa, UserRange, UserVa};
 use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
@@ -11,15 +12,23 @@ use carrick_personality_linux::entry::{CanonicalCall, SyscallResult};
 use carrick_personality_linux::pending_anonymous::{
     DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
 };
+use carrick_sched_core::ParkedContextWords;
+use carrick_sched_core::object_wait::ObjectWaitError;
+use carrick_sched_core::spaces::notification::SpaceWaitCause;
 use carrick_x86_carrier::entry::InitialWords;
 pub use carrick_x86_carrier::table_span::{
     admit_context, admit_tables, live_context, live_words, retire_context, working_tables,
 };
+use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
 pub(super) struct X86AnonymousVenue<'a> {
     frame: AnonymousCall,
     task: &'a CurrentTask,
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    saved: ParkedContextWords,
+    handoff: Option<carrick_el1_abi::EntryHandoffReceipt<ParkedContextWords>>,
+    retry: bool,
 }
 impl<'a> X86AnonymousVenue<'a> {
     pub(super) fn new(
@@ -27,9 +36,24 @@ impl<'a> X86AnonymousVenue<'a> {
         task: &'a CurrentTask,
         slot: u32,
         return_pc: u64,
+        source: BornInZoneSource<'static, ParkedContextWords>,
+        saved: ParkedContextWords,
     ) -> Option<Self> {
         let frame = crate::anonymous_call(*call, slot, UserVa::new(return_pc))?;
-        Some(Self { frame, task })
+        Some(Self {
+            frame,
+            task,
+            source,
+            saved,
+            handoff: None,
+            retry: false,
+        })
+    }
+    pub(super) fn take_retry(&mut self) -> bool {
+        core::mem::take(&mut self.retry)
+    }
+    pub(super) fn original_syscall_number(&self) -> u64 {
+        self.saved.syscall_return()
     }
     fn editor(&self) -> Option<(&'static X86Cpl0Zone, X86AnonymousEditor)> {
         let mm = carrick_el1_abi::ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))?;
@@ -169,6 +193,9 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                 DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
             carrick_el1::memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
+            carrick_el1::memory::DelegatedAnonymous::Contended(cause) => {
+                DelegatedStep::Contended(cause)
+            }
             carrick_el1::memory::DelegatedAnonymous::Forward if file.is_some() => {
                 DelegatedStep::Served(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))
             }
@@ -177,6 +204,134 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> {
         None
+    }
+    fn park_contended(&mut self, _: SpaceWaitCause) -> Option<FamilyCompletion> {
+        use carrick_core::wait::{
+            EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait, park_object_record,
+            space_access, take_object_operation,
+        };
+        use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall};
+        use carrick_guest_arch::ProcessContext;
+        use carrick_sched_core::Waker;
+        let zone = self.source.zone;
+        let slot = self.source.slot;
+        let mm = carrick_el1_abi::ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))?;
+        let source = zone
+            .space_entry(NonZeroU64::new(mm.raw())?)?
+            .live_notifications()
+            .ok()?;
+        let table = shared_x86_cpl0_guest();
+        if !table.admitted(zone.spaces.find(mm.raw())?.index(), mm) {
+            return None;
+        }
+        let index = zone.spaces.find(mm.raw())?;
+        let access = space_access(zone, slot, crate::native_process::release);
+        let owner = NonZeroU64::new(slot.index() as u64 + 1)?;
+        let record = zone
+            .slot(slot)
+            .current()
+            .or_else(|| zone.slot(slot).host_record())?;
+        let resumed = take_object_operation(zone, slot, zone.record(record).identity())
+            .ok()
+            .flatten();
+        let saved = self.saved;
+        let task = self.task;
+        let frame = &self.frame;
+        let outcome = coordinate_anonymous_edit_wait(
+            &source,
+            resumed,
+            || {
+                let mut root = match table.lock_in(access, index.index(), mm, slot.index() as u32) {
+                    Ok(root) => root,
+                    Err(carrick_el1::memory::reservations::Refusal::Busy) => {
+                        return Some(Some(SpaceWaitCause::Reservations));
+                    }
+                    Err(_) => return None,
+                };
+                match decide_reservation_syscall(frame, task, &mut root, None) {
+                    ReservationDisposition::Unavailable(
+                        carrick_el1::memory::reservations::Refusal::PreparedConflict,
+                    ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
+                    ReservationDisposition::Unavailable(
+                        carrick_el1::memory::reservations::Refusal::Busy,
+                    ) => return Some(Some(SpaceWaitCause::PendingEdit)),
+                    ReservationDisposition::Unavailable(
+                        carrick_el1::memory::reservations::Refusal::MetadataRequired,
+                    ) => return None,
+                    ReservationDisposition::Unavailable(_) => return None,
+                    ReservationDisposition::Work(pending) => {
+                        if pending.cancel(&mut root).is_err() {
+                            return None;
+                        }
+                    }
+                    ReservationDisposition::Return(_) | ReservationDisposition::Forward => {}
+                }
+                drop(root);
+                match zone
+                    .spaces
+                    .try_begin_edit_cause(index, mm.raw(), owner, access.venue())
+                {
+                    Ok(editor) => {
+                        drop(editor);
+                        Some(None)
+                    }
+                    Err(carrick_sched_core::spaces::EditAdmissionRefusal::Editor) => {
+                        Some(Some(SpaceWaitCause::Editor))
+                    }
+                    Err(carrick_sched_core::spaces::EditAdmissionRefusal::Gate) => {
+                        Some(Some(SpaceWaitCause::Gate))
+                    }
+                    Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => None,
+                }
+            },
+            |key, snapshot, token| {
+                let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
+                let mut replaced = None;
+                let result = park_object_record(
+                    zone,
+                    slot,
+                    request,
+                    &|effects| crate::native_process::release(zone, Waker::El1 { slot }, effects),
+                    || {
+                        let record = zone
+                            .slot(slot)
+                            .current()
+                            .or_else(|| zone.slot(slot).host_record())
+                            .ok_or(ObjectWaitError::Stale)?;
+                        // SAFETY: the executing slot owns its current record until the park publishes.
+                        let context = unsafe { zone.record(record).ctx_mut() };
+                        replaced = Some((record, *context));
+                        let mut restart = saved;
+                        restart.restart_syscall();
+                        *context = restart;
+                        Ok((record, false))
+                    },
+                );
+                if result.is_err()
+                    && let Some((record, previous)) = replaced
+                {
+                    // SAFETY: a failed park leaves the same current slot owning this record.
+                    *unsafe { zone.record(record).ctx_mut() } = previous;
+                }
+                result
+            },
+        );
+        match outcome {
+            EditWaitOutcome::Parked(mut parked) => {
+                self.handoff = parked.take_receipt();
+                Some(FamilyCompletion::AccountedSuspended)
+            }
+            EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => {
+                self.retry = true;
+                Some(FamilyCompletion::AccountedComplete(0))
+            }
+            EditWaitOutcome::Refused => None,
+        }
+    }
+    fn take_x86_handoff_receipt(
+        &mut self,
+    ) -> Option<carrick_core_abi::EntryHandoffReceipt<ParkedContextWords>> {
+        self.handoff.take()
     }
     fn permission(&mut self) -> PermissionStep {
         crate::refuse_anonymous_permission(&crate::CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS)
