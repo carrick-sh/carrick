@@ -627,6 +627,16 @@ impl Drop for IrqGuard {
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[track_caller]
 pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
+    fatal_entry_binding_with_identity(reason, [0; 8])
+}
+
+/// Same terminal transport with retained admission identities in x4..x11.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[track_caller]
+pub fn fatal_entry_binding_with_identity(
+    reason: carrick_el1_abi::EntryBindingFatalReason,
+    identity: [u64; 8],
+) -> ! {
     let [reason, location] = carrick_el1_abi::EntryBindingFatalDetail::at_caller(reason).encode();
     // SAFETY: this runs at EL1. HVC #3 is the image's fatal boundary, with
     // the established panic sentinel and no guest return/result publication.
@@ -635,6 +645,10 @@ pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> 
             in("x0") carrick_el1_abi::PANIC_SENTINEL,
             in("x1") carrick_el1_abi::ENTRY_BINDING_FATAL_TAG,
             in("x2") reason, in("x3") location,
+            in("x4") identity[0], in("x5") identity[1],
+            in("x6") identity[2], in("x7") identity[3],
+            in("x8") identity[4], in("x9") identity[5],
+            in("x10") identity[6], in("x11") identity[7],
             options(nostack));
     }
     loop {

@@ -1910,7 +1910,23 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
-    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
+    .unwrap_or_else(|error| match error {
+        super::native_process_runtime::NativeProcessError::AdmissionContended(contention) => {
+            // Explicit diagnostic-only terminal policy for #887. This is not
+            // an invariant conversion or an errno; the owned retry is separate.
+            #[cfg(target_os = "none")]
+            carrick_el1::substrate::sched::hw::fatal_entry_binding_with_identity(
+                contention.fatal_reason(),
+                contention.diagnostic_words(),
+            );
+            #[cfg(not(target_os = "none"))]
+            carrick_fatal::carrick_fatal!(
+                "el1::entry_completion",
+                "admission contention: {contention:?}"
+            )
+        }
+        error => invalid_completion(native_service_invariant(error)),
+    });
     match delivered {
         None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
@@ -2373,6 +2389,7 @@ fn native_service_fatal_reason(
         Error::Unsupported => Fatal::NativeServiceUnsupported,
         Error::GroupExitCustody => Fatal::NativeServiceGroupExit,
         Error::Busy => Fatal::NativeServiceBusy,
+        Error::AdmissionContended(contention) => contention.fatal_reason(),
         Error::Quarantined => Fatal::NativeServiceQuarantined,
         Error::NoChild => Fatal::NativeServiceNoChild,
         Error::OwnerWait(_) => Fatal::NativeServiceOwnerWait,

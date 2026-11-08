@@ -74,6 +74,13 @@ pub enum EntryBindingFatalReason {
     /// claim was neither this slot's `OnCpu*` nor `Free` (#1100). Leaving it
     /// on no run queue would strand the thread.
     RequeueRefused = 61,
+    AdmissionOldRecordRetained = 62,
+    AdmissionExecutionKeyCollision = 63,
+    AdmissionRecordKeyCollision = 64,
+    AdmissionThreadRegistrationCollision = 65,
+    AdmissionThreadPendingCustody = 66,
+    AdmissionFreshRootPendingCustody = 67,
+    AdmissionRootRegistrationCollision = 68,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -128,6 +135,13 @@ impl EntryBindingFatalReason {
             48 => Some(Self::NativeServiceCompleteStale),
             60 => Some(Self::SwitchInStaleRoot),
             61 => Some(Self::RequeueRefused),
+            62 => Some(Self::AdmissionOldRecordRetained),
+            63 => Some(Self::AdmissionExecutionKeyCollision),
+            64 => Some(Self::AdmissionRecordKeyCollision),
+            65 => Some(Self::AdmissionThreadRegistrationCollision),
+            66 => Some(Self::AdmissionThreadPendingCustody),
+            67 => Some(Self::AdmissionFreshRootPendingCustody),
+            68 => Some(Self::AdmissionRootRegistrationCollision),
 
             _ => None,
         }
@@ -192,6 +206,8 @@ impl fmt::Display for FatalDetail {
 pub struct ArmEntryFatalRegisters {
     pub reason: Option<u64>,
     pub source_location: Option<u64>,
+    /// x4..x11, populated only for typed admission contention reasons.
+    pub admission_identity: [Option<u64>; 8],
     pub pc: Option<u64>,
     pub lr: Option<u64>,
     pub fp: Option<u64>,
@@ -385,6 +401,9 @@ impl fmt::Display for Register {
 impl fmt::Display for ArmEntryBindingFatal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let r = &self.registers;
+        if r.reason.is_some_and(|reason| (62..=68).contains(&reason)) {
+            write!(f, "admission_identity={:x?} ", r.admission_identity)?;
+        }
         write!(
             f,
             "entry_binding cpu={} pc={} lr={} fp={} sp_el1={} esr_el1={} far_el1={} elr_el1={} spsr_el1={} sp_el0={} ",
