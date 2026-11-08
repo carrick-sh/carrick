@@ -9,6 +9,11 @@
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
 # carrick-kernel::kernel::objects::ipc::tests::one_table_writer
+# Inherited redirected writes use the exact pinned ring description.
+# native_files::tests::native_child_write_serves_parent_redirected_stdout_after_host_close
+# drives production ring dup2/fork and host final close, then checks Write
+# progress and EBADF after child close. No table or descriptor routing changes.
+# test-el1-native passes (781 tests, 3 ignored); no signed result is claimed.
 schema_version = 1
 id = "kernel.el1.ipc-fd-authority"
 title = "One shared descriptor incarnation retains exact OFD pins"
