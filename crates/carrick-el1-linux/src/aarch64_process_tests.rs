@@ -12657,6 +12657,24 @@ fn native_descriptor_argument_witness(
             sys::PPOLL.raw(),
             [pollfds.arg(), 1, timeout.arg(), 0],
         );
+        if prepared_timeout.is_some() {
+            let argument = if prepared_timeout == Some(PreparedPollArgument::Timeout) {
+                2
+            } else {
+                0
+            };
+            let row = counters.copy_refusals.iter().find(|row| {
+                row[0].load(Ordering::Acquire) == 1
+                    && row[1].load(Ordering::Relaxed) == sys::PPOLL.raw()
+                    && row[4].load(Ordering::Relaxed) == argument
+                    && row[6].load(Ordering::Relaxed)
+                        == carrick_el1_abi::CopyRefusalReason::GuardedFault.code()
+            });
+            assert!(
+                row.is_some(),
+                "ring ppoll must retain the original guarded-copy refusal before owner preparation"
+            );
+        }
         let revents = pollfds.get::<PollFd>(0).revents;
         assert!(matches!(
             route,
