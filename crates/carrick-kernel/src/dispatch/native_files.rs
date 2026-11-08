@@ -1456,6 +1456,65 @@ mod tests {
     }
 
     #[test]
+    fn native_child_rename_dispatch_preserves_moves_noreplace_and_errno_matrix() {
+        let fixture = mutation_child(Upper::Host);
+        let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+        let source = fixture.venue_open(&authority, b"source", CREATE, 0o644);
+        let target = fixture.venue_open(&authority, b"target", CREATE, 0o644);
+        assert_eq!(fixture.venue_write(source, b"source\n"), 7);
+        assert_eq!(fixture.venue_write(target, b"target\n"), 7);
+        let rename = |ordinal, old: &[u8], new: &[u8], flags| {
+            fixture.child_call(
+                &authority,
+                ordinal,
+                [FDCWD as u64, 0, FDCWD as u64, 0, flags, 0],
+                &[(1, old), (3, new)],
+            )
+        };
+        assert_eq!(rename(38, b"source", b"moved", 0), 0);
+        assert_eq!(fixture.venue_open(&authority, b"source", 0, 0), -2);
+        assert_eq!(fixture.venue_contents(&authority, b"moved"), b"source\n");
+        assert_eq!(rename(276, b"moved", b"target", 1), -17);
+        assert_eq!(fixture.venue_contents(&authority, b"target"), b"target\n");
+        assert_eq!(rename(276, b"moved", b"noreplace", 1), 0);
+        assert_eq!(rename(38, b"noreplace", b"target", 0), 0);
+        assert_eq!(fixture.venue_contents(&authority, b"target"), b"source\n");
+        assert_eq!(rename(38, b"missing", b"new", 0), -2);
+        assert_eq!(rename(38, b"", b"new", 0), -2);
+        assert_eq!(rename(38, b"target", b"/tmp", 0), -21);
+        assert_eq!(rename(38, b"/etc", b"target", 0), -20);
+        assert_eq!(rename(38, b"target", b"/etc/ld.so.cache/x", 0), -20);
+        assert_eq!(rename(38, b"target", &[b'x'; 256], 0), -36);
+        assert_eq!(rename(276, b"target", b"x", 4), -22);
+        assert_eq!(rename(276, b"target", b"x", 3), -22);
+        assert_eq!(rename(276, b"target", b"x", 8), -22);
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                38,
+                [999, 0, FDCWD as u64, 0, 0, 0],
+                &[(1, b"x"), (3, b"new")],
+            ),
+            -9,
+        );
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                37,
+                [FDCWD as u64, 0, FDCWD as u64, 0, 0, 0],
+                &[(1, b"target"), (3, b"same-inode")],
+            ),
+            0,
+        );
+        assert_eq!(rename(38, b"target", b"same-inode", 0), 0);
+        assert_eq!(fixture.venue_contents(&authority, b"target"), b"source\n");
+        assert_eq!(
+            fixture.venue_contents(&authority, b"same-inode"),
+            b"source\n"
+        );
+    }
+
+    #[test]
     fn native_child_write_serves_parent_redirected_stdout_after_host_close() {
         for upper in [Upper::Memory, Upper::Host] {
             let mut fixture = writable_fixture(upper);
