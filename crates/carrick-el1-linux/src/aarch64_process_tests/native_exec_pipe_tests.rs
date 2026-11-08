@@ -134,6 +134,7 @@ fn fork_exec_probe_with_departure(
     departure: Option<TimerDeparture>,
     readlink: bool,
 ) {
+    let counters = carrick_el1_abi::Counters::new();
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let metadata_scope = MetadataScope::new(fixture);
     struct RestoreRegion(usize);
@@ -289,7 +290,6 @@ fn fork_exec_probe_with_departure(
         refuse_copy: false,
         on_signal_clock: None,
     };
-    let counters = carrick_el1_abi::Counters::new();
     let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
     payload.extend_from_slice(b"/bin/pipe-writer\0");
     carrick_core_abi::service::encode_exec_payload_header(
