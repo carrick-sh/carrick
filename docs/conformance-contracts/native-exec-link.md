@@ -40,7 +40,21 @@ existing service identity/receipt. A typed native file request would carry
 that capability plus the readlink output capacity; the ring would own
 copyout and its returned byte count, including truncation without a NUL.
 No large by-value pathname belongs on EL1/CPL0 stacks. This is a proposal,
-not an implemented or independently reviewed layout.
+not an implemented or independently reviewed layout. Concretely, the proposal
+would bump the manifest revision from 1 to 2 and insert handle/generation after
+receipt at byte offsets 160/168, moving digest to 176. With the current 64-byte
+alignment the record would remain 192 bytes. Compile-time layout checks and
+cross-ISA readers must agree; every seal/open/digest test must cover the two
+new words. Zero is invalid for an adopted executable capability. A separate
+ring-owned capability row, rather than a numeric TaskKey cache in the carrier,
+would retain the physical object service until its last task reference retires.
+
+The initial root must seed its existing executable capability, so a child
+that has forked but not execed inherits the right image too. This must be
+part of root admission/fork seeding, never a lookup of the carrier's current
+executable on a descendant request. A refused fork must release its proposed
+reference without changing the parent's ownership. The exact root-seed ABI
+change and release transport still need design review.
 
 Required witnesses before adopting that design: two live processes with
 different executable identities; failed exec retaining the previous identity;
