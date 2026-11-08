@@ -188,7 +188,14 @@ build_native() {
     fi
     rm -rf "$consumer_release"
     mkdir -p "$consumer_release"
-    find "$built" -maxdepth 1 -type f ! -name '*.*' -exec cp -f {} "$consumer_release/" \;
+    # Copy one file at a time so a failed cp stops the script: `find -exec cp
+    # \;` turns a cp failure into a false predicate and still exits 0, which
+    # silently shrank the published probe population (#1923 review).
+    for probe in "$built"/*; do
+      case "${probe##*/}" in *.*) continue ;; esac
+      [ -f "$probe" ] || continue
+      cp -f "$probe" "$consumer_release/" || { echo "build-probes: failed to publish $probe" >&2; exit 1; }
+    done
   else
     # Nothing built (every probe failed for this target): leave no stale
     # binaries behind at the consumer path.
