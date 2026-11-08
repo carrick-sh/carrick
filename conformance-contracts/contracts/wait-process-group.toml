@@ -1,3 +1,8 @@
+# #1881: shared thread registration prepares custody before publication.
+# This family's operations and budgets are unchanged. Atomicity is witnessed by
+# native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable
+# under process.native.arm-admission; the full VM-free native suite passes.
+# No additional signed, Docker or runtime-ratio evidence is claimed here.
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
