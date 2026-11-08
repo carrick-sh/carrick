@@ -1256,6 +1256,10 @@ impl FutexVenue for NativeLane<'_> {
     fn now(&self) -> carrick_guest_arch::CounterTick {
         carrick_guest_arch::CounterTick::new(0)
     }
+    fn invalid(&mut self, result: SyscallResult) -> Option<Self::Served> {
+        self.frame.rax = result.raw() as u64;
+        Some(carrick_core::Served::Returned { switched: false })
+    }
     fn wake(
         &mut self,
         mm: carrick_core_abi::ReservationMm,
