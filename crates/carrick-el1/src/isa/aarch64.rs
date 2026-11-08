@@ -57,11 +57,11 @@ pub fn yield_host_effect() {
 
 /// A failure-only diagnostic; its reply never changes the original verdict.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-pub fn cross_hvc_fork_refusal(record: &carrick_el1_abi::NativeForkDiagnostic) {
+pub fn cross_hvc_native_diagnostic(record: &carrick_el1_abi::NativeDiagnostic) {
     // SAFETY: the synchronous crossing retains this aligned, bounded record.
     unsafe {
         core::arch::asm!("hvc #6",
-            inlateout("x0") carrick_el1_abi::GRANT_OP_FORK_REFUSAL => _,
+            inlateout("x0") carrick_el1_abi::GRANT_OP_DIAGNOSTIC => _,
             inlateout("x1") record as *const _ as u64 => _,
             inlateout("x2") 0u64 => _, inlateout("x3") 0u64 => _,
             options(nostack));

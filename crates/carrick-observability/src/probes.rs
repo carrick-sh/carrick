@@ -5755,7 +5755,7 @@ mod real {
         fn hvpatch__el1__owner__grant__supply(_: u64, _: u64, _: u32, _: u64) {}
         fn el1__grant__refusal(_: u32, _: u64, _: u64, _: u64, _: u64) {}
         /// Failure-only native process refusal: CPU, MM, root GPA, typed debug reason.
-        fn el1__native__fork__refusal(_: u32, _: u64, _: u64, _: &str) {}
+        fn el1__native__diagnostic(_: u32, _: u64, _: u64, _: &str) {}
         /// Refusal reason, requested/cached binding, requested/cached root context.
         fn el1__native__fork__stock__refusal(_: &str, _: &str, _: &str, _: &str, _: &str) {}
         /// Physical retention refusal for an EL1 owner read: selected IPA and
@@ -7286,8 +7286,8 @@ mod real {
     }
 
     #[inline(never)]
-    pub fn el1_native_fork_refusal(cpu: u32, mm: u64, root: u64, reason: &str) {
-        carrick_usdt::el1__native__fork__refusal!(|| (cpu, mm, root, reason));
+    pub fn el1_native_diagnostic(cpu: u32, mm: u64, root: u64, reason: &str) {
+        carrick_usdt::el1__native__diagnostic!(|| (cpu, mm, root, reason));
     }
 
     #[inline(never)]
@@ -9834,7 +9834,7 @@ mod stub {
     stub!(hvpatch_el1_host_write_prepare(address: u64, length: u64, phase: u32, detail: u64));
     stub!(hvpatch_el1_owner_grant_supply(address: u64, length: u64, phase: u32, detail: u64));
     stub!(el1_grant_refusal(row: u32, a: u64, b: u64, c: u64, d: u64));
-    stub!(el1_native_fork_refusal(cpu: u32, mm: u64, root: u64, reason: &str));
+    stub!(el1_native_diagnostic(cpu: u32, mm: u64, root: u64, reason: &str));
     stub!(el1_native_fork_stock_refusal(reason: &str, requested: &str, cached: &str, requested_context: &str, cached_context: &str));
     stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
 

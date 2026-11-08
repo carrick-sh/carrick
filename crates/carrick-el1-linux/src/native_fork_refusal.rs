@@ -179,16 +179,7 @@ fn observe_process_venue_with<T>(
     venue
 }
 
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-fn emit(_arguments: core::fmt::Arguments<'_>) {}
-
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-fn emit(arguments: core::fmt::Arguments<'_>) {
-    let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
-    // Bounded, allocation-free and failure-only; no verdict depends on this reply.
-    let _ = core::fmt::write(&mut diagnostic, arguments);
-    carrick_el1::isa::aarch64::cross_hvc_fork_refusal(&diagnostic);
-}
+use super::native_diagnostic::emit;
 
 #[cfg(test)]
 mod tests {
@@ -210,7 +201,7 @@ mod tests {
             (E::Quarantined, -5, R::NativeQuarantined),
             (E::NoChild, -10, R::NativeNoChild),
         ] {
-            let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
+            let mut diagnostic = carrick_el1_abi::NativeDiagnostic::new();
             let observed = observe_process_error_with(error, |arguments| {
                 core::fmt::write(&mut diagnostic, arguments).unwrap();
             });
@@ -245,7 +236,7 @@ mod tests {
 
     #[test]
     fn missing_venue_observation_preserves_fallback_and_success_is_silent() {
-        let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
+        let mut diagnostic = carrick_el1_abi::NativeDiagnostic::new();
         assert_eq!(
             observe_process_venue_with(None::<u32>, |arguments| {
                 core::fmt::write(&mut diagnostic, arguments).unwrap();
@@ -306,7 +297,7 @@ mod tests {
             let NativeProcessError::ForkRefused(refusal) = error else {
                 unreachable!()
             };
-            let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
+            let mut diagnostic = carrick_el1_abi::NativeDiagnostic::new();
             core::fmt::write(&mut diagnostic, format_args!("{refusal:?}")).unwrap();
             let expected = std::format!(
                 "NativeForkRefusal {{ stage: ParentLifecycleGate {{ observed: {observed:?} }}, cause: Busy }}"

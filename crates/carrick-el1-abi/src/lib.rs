@@ -661,8 +661,8 @@ pub const GRANT_OP_COW_SUPPLY: u64 = 6;
 /// Runtime handback of a terminal child's unplaceable parent wait.
 pub const GRANT_OP_WAIT_CHANNEL_WAKE: u64 = 7;
 
-/// Failure-only native fork diagnostic. This crossing grants no authority.
-pub const GRANT_OP_FORK_REFUSAL: u64 = 8;
+/// Failure-only native operation diagnostic. This crossing grants no authority.
+pub const GRANT_OP_DIAGNOSTIC: u64 = 8;
 /// Kick an excluded, host-owned execution residency on an issued CPU slot.
 pub const GRANT_OP_RESIDENCY_KICK: u64 = 9;
 /// Drain physical child stock after switching off its retired root.
@@ -683,18 +683,18 @@ pub const GRANT_OP_ROOT_FORK_SEED: u64 = 14;
 
 /// Bounded debug rendering of a typed refusal, retained on the stopped EL1 stack.
 #[repr(C, align(64))]
-pub struct NativeForkDiagnostic {
+pub struct NativeDiagnostic {
     bytes: [u8; 256],
     len: u32,
 }
 
-impl Default for NativeForkDiagnostic {
+impl Default for NativeDiagnostic {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl NativeForkDiagnostic {
+impl NativeDiagnostic {
     pub const fn new() -> Self {
         Self {
             bytes: [0; 256],
@@ -707,7 +707,7 @@ impl NativeForkDiagnostic {
     }
 }
 
-impl core::fmt::Write for NativeForkDiagnostic {
+impl core::fmt::Write for NativeDiagnostic {
     fn write_str(&mut self, text: &str) -> core::fmt::Result {
         let start = self.len as usize;
         let end = start.checked_add(text.len()).ok_or(core::fmt::Error)?;
@@ -719,13 +719,13 @@ impl core::fmt::Write for NativeForkDiagnostic {
 }
 
 #[cfg(test)]
-mod native_fork_diagnostic_tests {
-    use super::NativeForkDiagnostic;
+mod native_diagnostic_tests {
+    use super::NativeDiagnostic;
     use core::fmt::Write;
 
     #[test]
     fn diagnostic_is_bounded_and_rejects_malformed_wire_text() {
-        let mut record = NativeForkDiagnostic::new();
+        let mut record = NativeDiagnostic::new();
         assert!(record.write_str(&"x".repeat(256)).is_ok());
         assert!(record.write_str("y").is_err());
         assert_eq!(record.message().map(str::len), Some(256));

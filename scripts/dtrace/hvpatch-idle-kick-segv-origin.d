@@ -25,7 +25,7 @@
  *           (Backing, Refused, OwnerWait, BackingFault, Unselected), with an
  *           END count per phase: the host's answer to a native owner fault
  *   REFUSE  `hvpatch-native-crossing-refused`, `el1-grant-refusal`,
- *           `el1-native-fork-refusal`, `el1-zone-capture-missing`,
+ *           `el1-native-diagnostic`, `el1-zone-capture-missing`,
  *           `el1-task-record-stale`
  * and an END census. Faults EL1 serves in the ring (native owners) do not
  * surface here; a SIGSEGV exit with no FAULT/DELIVER line was decided in the
@@ -54,7 +54,7 @@
  *     5 BackingFault, 6 Unselected
  *   hvpatch-native-crossing-refused (u64, u64, u32, u64, u64)
  *   el1-grant-refusal (u32, u64, u64, u64, u64)
- *   el1-native-fork-refusal (u32, u64, u64, char *)
+ *   el1-native-diagnostic (u32, u64, u64, char *)
  *   el1-zone-capture-missing (u64, u64)
  *   el1-task-record-stale (u64, u64, u64, u64, u64)
  * Scope: the signed embed test executable (`execname` starts `el1_sched`)
@@ -205,7 +205,7 @@ carrick*:::el1-grant-refusal
 	    timestamp, (uint32_t)arg0, arg1, arg2, arg3, arg4);
 }
 
-carrick*:::el1-native-fork-refusal
+carrick*:::el1-native-diagnostic
 /strstr(execname, "el1_sched") != NULL/
 {
 	last = timestamp;
