@@ -3531,6 +3531,31 @@ fn contention_variants_are_scoped_production_debt() {
 }
 
 #[test]
+fn anonymous_space_wait_is_typed_without_hiding_untyped_contention() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("crates/carrick-el1/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod memory { pub enum DelegatedAnonymous { Contended(SpaceWaitCause) } }",
+    )
+    .unwrap();
+    let census = load_census(temp.path()).unwrap();
+    assert!(census.contention_variants.is_empty());
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod memory { pub enum DelegatedAnonymous { Contended(u64) } }",
+    )
+    .unwrap();
+    let census = load_census(temp.path()).unwrap();
+    assert_eq!(census.contention_variants.len(), 1);
+    assert_eq!(
+        census.contention_variants[0].owner,
+        "carrick_el1::memory::DelegatedAnonymous"
+    );
+}
+
+#[test]
 fn raw_owner_wait_census_counts_producers_across_moves_and_excludes_fixtures() {
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("crates/carrick-demo/src");
