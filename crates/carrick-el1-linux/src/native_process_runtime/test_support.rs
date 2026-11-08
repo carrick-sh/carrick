@@ -61,3 +61,22 @@ pub(crate) fn seed_fixture_namespace<C: ProcessContext>(
             }
         });
 }
+
+#[cfg(test)]
+impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
+    /// Release all registrations before a fixture returns its metadata mappings.
+    pub(crate) fn unregister_zone_for_test(&self, zone: &ZoneTables<C>) {
+        let carrier = core::ptr::from_ref(zone).addr();
+        let groups: Vec<_> = self
+            .state
+            .lock()
+            .groups
+            .iter()
+            .filter(|(key, _)| key.0 == carrier)
+            .map(|(_, (runtime, process))| (runtime.clone(), *process))
+            .collect();
+        for (runtime, process) in groups {
+            self.unregister_process(&runtime, process);
+        }
+    }
+}

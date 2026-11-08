@@ -133,6 +133,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
     };
     use carrick_signal_core::policy::{Action, ActionFlags, Disposition, HandlerAddress, Signal};
     let fixture = Fixture::new(0x10000, asid(1));
+    let metadata_scope = MetadataScope::new(&fixture);
     let sender_task = CurrentTask::new();
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
@@ -222,6 +223,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
+    crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     crossing.ipc = Some((Arc::clone(&owner), map));
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
