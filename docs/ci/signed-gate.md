@@ -4,8 +4,8 @@
 for this repository's `main` queue. On one assigned Mac, under one host
 lease, it builds, signs and accepts the event's **base_sha** and then the exact
 group head, compares the two receipts, and posts `signed-gate` as a commit
-status. The **Signed queue gate** check requires successful authorization, fixtures,
-execution and verdict publication; skipped, cancelled or failed dependencies
+status. The **Signed queue gate** check requires successful authorization, the
+trusted base fixture fetch, execution and verdict publication; skipped, cancelled or failed dependencies
 fail it. Main's merge ruleset must require this GitHub Actions check. Its
 PR-only placeholder permits enqueueing without a separate PR signed run.
 There are no path filters that could leave a required group check missing.
@@ -23,17 +23,71 @@ deterministically on one gate Mac and pass on another. A base receipt from a
 different host would report such a failure as NEW and eject every group
 (#1884). The gate job therefore runs the merge base itself, before the
 candidate, on the same Mac in the same job and under the same exclusive
-`gate` lease. Both runs restore the candidate's same-run fixture bundle; when
-the base checkout's fixture inputs differ from that bundle, execution is
-refused instead of substituting another bundle. The receipts record the
-execution host and fixture content identity, and publication compares the
-candidate only with this paired base. A pair whose host or fixture evidence
-still differs is reported as **INCOMPARABLE BASE — BLOCKED**, never as NEW.
-No stored receipt from another run or host is downloaded.
+`gate` lease. The receipts record the execution host and fixture content
+identity, and publication compares the candidate only with this paired base.
+A pair whose host or fixture evidence still differs is reported as
+**INCOMPARABLE BASE — BLOCKED**, never as NEW. No stored receipt from another
+run or host is downloaded.
 
-A PR that changes fixture inputs cannot be paired this way and is blocked;
-land such a change only after its fixture inputs are on main, or by owner
-direction.
+**Fixture authority comes from main, never from the candidate** (#1889).
+The `base-fixtures` job runs trusted `main` code that finds the
+`kernel-runtime.yml` run which built exactly the merge base, and checks that
+run's workflow path, `main` branch, head SHA, repository and event (a push,
+or an owner dispatch). It downloads only that run's `signed-fixtures-<base>`
+artifact, waiting up to 75 minutes while main's publisher may still upload
+it, and fails when no such bundle exists. Both paired runs restore this one
+bundle: the base checkout must match it exactly, and the candidate checkout
+must have equal fixture inputs. Fixture builds are not bit-reproducible (two
+main bundles with identical inputs differed in 19 of 1195 executables), so a
+second, candidate-built bundle would never have equal `content_sha256`;
+publication still requires equal content and input identity.
+
+**An incomplete base blocks.** Completed tests with known failures stay
+comparable, because the gate is differential. A base step that did not run
+to completion (a killed or unfinished binary, a build failure, zero tests
+selected), tests skipped after the binary budget expired, or a failing
+acceptance exit that no completed failure explains is refused before any
+comparison, in the executor and again at publication. A missing base result
+can therefore never read as FIXED.
+
+**The base evidence is sealed before candidate code runs.** Immediately after
+the base run the executor records a SHA-256 inventory of every file under
+`base/` in its own memory. After the candidate run and its cleanup it
+re-inventories `base/` and refuses any changed, missing or added file; only
+then does it write `base-seal.json`, replacing anything planted at that path.
+Publication checks that record against the base evidence it loads. This
+protects the baseline against candidate-phase writes, including accidental
+ones; a candidate process that outlives its run and rewrites both the
+evidence and the record before upload would need process or storage
+isolation, which this lane does not provide.
+
+### Owner exception: PRs that change fixture inputs
+
+A PR that changes fixture inputs (probe sources, fixture lockfiles, the
+compiler pin or build policy) cannot pass this gate: main has no bundle for
+its inputs, and comparability is never relaxed for it. Do not retry, rebuild
+the bundle from candidate code inside the gate, or edit the comparison. Land
+such a change only through this owner-approved exception:
+
+1. Keep the fixture-input change in its own small PR, with no unrelated
+   runtime changes, so the unverified surface is only the fixtures.
+2. The owner records the exception on the PR and in the decision log (#231),
+   naming the exact head SHA.
+3. Independent fixture evidence: publish a bundle for that exact head on a
+   trusted Linux ARM host (`just fixtures-publish <sha>`), restore and verify
+   it on a gate Mac (`just fixtures-restore`, `just fixtures-verify`), and
+   attach the bundle's manifest and content SHA-256 to the PR.
+4. Exact-head signed validation on that Mac with that bundle:
+   `just accept --profile no-docker --phase signed` on a detached checkout of
+   the head, with every step finished (no `NotRun`, no unfinished binary)
+   and its itemized failures reviewed by the owner against main's latest
+   signed results from the same Mac. This is owner review, not a gate PASS.
+5. The owner lands the PR by explicit admin direction (the AGENTS.md
+   admin-merge rules apply). The landing push makes main publish its own
+   bundle for the new inputs.
+6. Post-landing queue validation: the next merge group's **Signed queue
+   gate** must pass on the new base with main's new bundle. If it does not,
+   fix forward on main before landing anything else.
 
 Every push to `main` still runs the signed phase, admits its receipt against
 itself and uploads `signed-baseline-<sha>-<attempt>` (90-day retention) as
@@ -100,10 +154,11 @@ and the same scoped sudo/cleanup configuration as the existing signed lane.
 Keep Apple ld64 and debuginfo. The workflow neither installs runner software
 nor changes host permissions. The runner pool serves whichever Mac is free.
 
-The Linux ARM fixture job publishes an exact-SHA archive in the same run.
-The Mac downloads that artifact and verifies both its producing SHA and fixture
-input identity before restoration. No manually provisioned archive or Docker
-is needed on the Mac.
+main's Linux ARM fixture job (`kernel-runtime.yml`) publishes an exact-SHA
+archive on every push to main. The `base-fixtures` job fetches the merge
+base's archive from that authenticated run; the Mac verifies its producing
+SHA and each checkout's fixture input identity before restoration. No
+manually provisioned archive or Docker is needed on the Mac.
 
 GitHub assigns one job at a time to a runner. The Rust executor also holds
 the machine's exclusive `gate` lease across both runs' fixture restore, `just
@@ -154,10 +209,13 @@ PASS requires no new itemized or unitemized failures, no newly unfinished
 binary, no missing step, no smaller started-test or finished-binary
 population, and no disappeared completed binary. New probe diffs or cleanup
 failures also fail. The execution job must finish successfully and its receipt
-must pass admission. Existing main test failures do not alone reject a PR.
+must pass admission, and the paired base must be complete and match its
+seal. Existing main test failures do not alone reject a PR.
 
-Artifacts are `signed-request-<attempt>`, `signed-result-<attempt>` (candidate
-receipt, identity and logs; the paired base's in `base/`), and `signed-verdict-<attempt>` (comparison JSON and PR
+Artifacts are `signed-request-<attempt>`, `signed-base-fixtures-<attempt>`
+(the trusted base bundle and its `provenance.json`), `signed-result-<attempt>`
+(candidate receipt, identity and logs; the paired base's in `base/`, sealed by
+`base-seal.json`), and `signed-verdict-<attempt>` (comparison JSON and PR
 comment Markdown). Evidence is retained 30 days; main baselines 90 days.
 The PR comments and Actions summary link the run and name NEW/FIXED tests.
 A failed execution with no receipt still gets a failure status and an explanatory comment when the publication job runs.
