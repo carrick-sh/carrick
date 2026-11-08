@@ -12,8 +12,8 @@
 schema_version = 1
 id = "kernel.el1.ipc-fd-authority"
 title = "One shared descriptor incarnation retains exact OFD pins"
-guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:sendmsg", "syscall:mmap", "syscall:pipe2", "syscall:eventfd2", "syscall:epoll_create1", "syscall:timerfd_create", "syscall:timerfd_settime", "syscall:timerfd_gettime"]
-semantic_authority = ["man 2 execve", "man 2 fork", "man 2 clone", "man 2 dup", "man 2 fcntl", "man 2 close", "man 2 close_range", "man 7 inotify", "man 7 epoll", "man 7 unix", "man 2 mmap", "man 2 pipe2", "man 2 eventfd", "man 2 epoll_create1", "man 2 timerfd_create"]
+guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:sendmsg", "syscall:mmap", "syscall:pipe2", "syscall:fstat", "syscall:newfstatat", "syscall:ioctl", "syscall:lseek", "syscall:eventfd2", "syscall:epoll_create1", "syscall:timerfd_create", "syscall:timerfd_settime", "syscall:timerfd_gettime"]
+semantic_authority = ["man 2 execve", "man 2 fork", "man 2 clone", "man 2 dup", "man 2 fcntl", "man 2 close", "man 2 close_range", "man 7 inotify", "man 7 epoll", "man 7 unix", "man 2 mmap", "man 2 pipe2", "man 2 fstat", "man 2 ioctl", "man 2 lseek", "man 2 eventfd", "man 2 epoll_create1", "man 2 timerfd_create"]
 fixture = "fd-core:two-live-table owners and incarnation pins"
 scale_points = [65, 4096, 65536]
 rationale = "Fork shares OFD offsets/status, not descriptor flags. CLONE_FILES shares table identity; exec unshares first. Pins retain the original incarnation through close/dup2/reuse and final release occurs once. A native in-ring close remains local when it has no host-owned effects; descriptions carrying process record locks, host-owned epoll interest, or inotify close observation replay through the one canonical host close authority. Allocation searches at most 2*bitmap_levels-1 words and backed steady-state operations allocate zero objects. Descriptor backing allocation uses a shared pointer-free buddy tree with logarithmic tree depth; live extents remain disjoint and retirement returns storage to the same pool. See the M1 witness ledger for exact test bindings and evidence limits."
@@ -67,6 +67,7 @@ vm_free = [
 ]
 
 [bindings.unresolved]
+kvm = "Executing metadata-only x86 binding: carrick-vmm-kvm::cpl0_entry::production_pipe_metadata_stays_in_the_ring_namespace. Real KVM required; the contract evaluator has no registered KVM observation layer. Byte-moving x86 IPC remains #1756; signed ARM and CPython remain director-owned."
 embed_structural = "EL0 pair-copyout and actual mapped-file pin integration require a carrick-conformance-next binding after Phase B/memory integration; core pins alone do not prove those consumers."
 docker = "No Docker executed in M1 preparation. Native arm64 same-source semantic differential remains director-owned."
 

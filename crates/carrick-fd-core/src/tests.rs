@@ -2893,3 +2893,20 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
     c.destroy_table(peer, |_| panic!("all descriptions already released"))
         .unwrap();
 }
+
+#[test]
+fn exec_defers_exactly_one_final_backing_and_preserves_survivors() {
+    let c = authority::<2, 8>();
+    let t = c.create_table(8, &mut storage(8)).unwrap();
+    c.open(t, Fd(3), description(71), true).unwrap();
+    c.open(t, Fd(4), description(72), false).unwrap();
+    c.exec_deferred(t).unwrap();
+    assert_eq!(c.get(t, Fd(3)), Err(Error::BadFd));
+    assert_eq!(c.get(t, Fd(4)), Ok(description(72)));
+    assert_eq!(c.take_retired_ofd(), Ok(Some(description(71))));
+    assert_eq!(c.take_retired_ofd(), Ok(None));
+    assert_eq!(c.open(t, Fd(3), description(73), false), Ok(Fd(3)));
+    c.exec_deferred(t).unwrap();
+    assert_eq!(c.take_retired_ofd(), Ok(None));
+    assert_eq!(c.get(t, Fd(3)), Ok(description(73)));
+}
