@@ -1640,6 +1640,8 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     #[cfg(test)]
     raw_exit_after_commit_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    retiring_release_hook: SpinLock<Option<Box<dyn FnOnce() + Send + 'a>>>,
+    #[cfg(test)]
     yield_receipt_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send + 'a>>>,
     registry: SpinLock<Option<&'a NativeProcessRegistry<'a, M, C>>>,
 }
@@ -2604,6 +2606,49 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime.task_binding(process).map(|binding| binding.address)
     }
 
+    /// Reuse an already-admitted group before a caller may construct a fresh
+    /// root. Exact entry custody wins immediately; a renewed execution record
+    /// is rehomed through the group's existing signal projection.
+    pub fn admit_existing_group(
+        &self,
+        source: BornInZoneSource<'a, C>,
+        current: &CurrentTask,
+        address: AddressContext<RootGpa>,
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+    ) -> Result<Option<Arc<NativeProcessRuntime<'a, M, C>>>, NativeAdmissionError> {
+        if let Ok(runtime) = self.for_entry(source, current, address)
+            && self
+                .for_record(
+                    source.zone,
+                    source
+                        .zone
+                        .slot(source.slot)
+                        .current()
+                        .or_else(|| source.zone.slot(source.slot).host_record())
+                        .map(|record| source.zone.record_ref(record))
+                        .ok_or(NativeProcessError::Stale)?,
+                )
+                .is_some_and(|retained| Arc::ptr_eq(&retained, &runtime))
+        {
+            return Ok(Some(runtime));
+        }
+        let visible_pid = current.visible_pid().ok_or(NativeProcessError::Stale)?;
+        if control.entry().is_none()
+            && self
+                .group_address(source.zone, address, page, visible_pid)
+                .is_none()
+        {
+            return Ok(None);
+        }
+        match self.rehome_entry(source, current, address, page, control)? {
+            Some(runtime) => Ok(Some(runtime)),
+            None => self
+                .register_thread(source, current, address, page, control)
+                .map(Some),
+        }
+    }
+
     /// Classify the admitted thread group at whatever address incarnation.
     /// Root and fork-child groups have distinct exec authority until native
     /// child exec is implemented.
@@ -2970,10 +3015,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "host-test"))]
     pub(crate) fn unregister_root_for_test(&self, runtime: &NativeProcessRuntime<'a, M, C>) {
         let key = runtime.graph.lock().root_key;
-        self.unregister_process(runtime, key);
+        self.remove_process_registration(runtime, key);
     }
 
     /// Exercise the production unregister path while the root is still live.
@@ -2987,10 +3032,35 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime: &NativeProcessRuntime<'a, M, C>,
     ) {
         let key = runtime.graph.lock().root_key;
-        self.unregister_process(runtime, key);
+        assert!(runtime.task_binding(key).is_some());
+        // Production registration removal consumes `GuestRetiring`, whose
+        // drop releases the group's signal projections first. A live root has
+        // no such proof and therefore cannot call that path.
     }
 
-    fn unregister_process(&self, runtime: &NativeProcessRuntime<'a, M, C>, process: TaskKey) {
+    fn unregister_retired_process(
+        &self,
+        runtime: &NativeProcessRuntime<'a, M, C>,
+        process: TaskKey,
+        retiring: super::process_owner::GuestRetiring<Custody<'a, M, C>>,
+    ) {
+        // `retiring` owns the process resources and their signal projections.
+        // Release every pending writer while the group index still classifies
+        // a concurrent return as existing. Only then can fresh-root admission
+        // become eligible for this address.
+        drop(retiring);
+        #[cfg(test)]
+        if let Some(hook) = runtime.retiring_release_hook.lock().take() {
+            hook();
+        }
+        self.remove_process_registration(runtime, process);
+    }
+
+    fn remove_process_registration(
+        &self,
+        runtime: &NativeProcessRuntime<'a, M, C>,
+        process: TaskKey,
+    ) {
         let mut state = self.state.lock();
         let carrier = core::ptr::from_ref(runtime.zone).addr();
         let Some((group, members)) = state.by_process.remove(&(carrier, process)) else {
@@ -3426,6 +3496,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     #[cfg(test)]
     pub(super) fn install_raw_exit_after_commit_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.raw_exit_after_commit_hook.lock() = Some(hook);
+    }
+    #[cfg(test)]
+    fn install_retiring_release_hook(&self, hook: Box<dyn FnOnce() + Send + 'a>) {
+        *self.retiring_release_hook.lock() = Some(hook);
     }
     pub fn zone(&self) -> &'a ZoneTables<C> {
         self.zone
@@ -3865,6 +3939,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             settle_race_hook: SpinLock::new(None),
             #[cfg(test)]
             raw_exit_after_commit_hook: SpinLock::new(None),
+            #[cfg(test)]
+            retiring_release_hook: SpinLock::new(None),
             #[cfg(test)]
             yield_receipt_race_hook: SpinLock::new(None),
             registry: SpinLock::new(None),
@@ -7022,19 +7098,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })
             .map_err(|_| NativeProcessError::Quarantined)?;
         // Graph removal (`publish_exit`) and member cancellation are complete.
-        // Unregister from `NativeProcessRegistry` and release all
-        // `MemberControlCustody` references (graph resources, registry member,
-        // and this entry) BEFORE `retire_mm` quarantines the child's fork stock
-        // and publishes slot absence (`leave_space`). Once slot absence is
-        // published, a concurrent `fork()` on another CPU can reclaim and zero
-        // or re-loan this child's `ThreadControlSlot` storage
+        // `GuestRetiring` still owns the process resources, including each
+        // signal projection's pending writer. Consume it into registry removal
+        // so those writers drop while the group still classifies concurrent
+        // returns as existing; removing the group first makes the same member
+        // attempt fresh-root admission against its own writer.
+        //
+        // Release all `MemberControlCustody` references (graph resources,
+        // registry member, and this entry) BEFORE `retire_mm` quarantines the
+        // child's fork stock and publishes slot absence (`leave_space`). Once
+        // slot absence is published, a concurrent `fork()` on another CPU can
+        // reclaim and zero or re-loan this child's `ThreadControlSlot` storage
         // (`window.clear(lifecycle)`), so a later `MemberControlCustody::drop`
-        // (`fetch_sub(GRAPH_REFERENCE)`) would dirty the zeroed stock window
-        // or underflow the next child's control word into `RESETTING`.
+        // (`fetch_sub(GRAPH_REFERENCE)`) would dirty the zeroed stock window or
+        // underflow the next child's control word into `RESETTING`.
         if let Some(registry) = *self.runtime.registry.lock() {
-            registry.unregister_process(self.runtime, self.key);
+            registry.unregister_retired_process(self.runtime, self.key, published.retiring);
+        } else {
+            drop(published.retiring);
         }
-        drop(published.retiring);
         drop(self._control_custody.take());
         // Only fork-born processes own stock to retire. The root is known by
         // graph position, not by the pid it shows in its namespace (a child
@@ -12487,6 +12569,37 @@ mod tests {
         };
         assert!(zone.slot(slot).current().is_none());
         let home = zone.slot(slot).host_record().unwrap();
+        let runtime = Arc::new(runtime);
+        let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+        let registry_ref = &*registry;
+        let task_ref = &task;
+        let page_ref = &*page;
+        let control_ref = &*control;
+        registry_ref
+            .register_root(runtime.clone(), source, task_ref, address)
+            .unwrap();
+        let retained = retain_member_control(control_ref).unwrap();
+        runtime.install_retiring_release_hook(Box::new(move || {
+            let group =
+                NativeProcessRegistry::<AddressContext<RootGpa>, ParkedContextWords>::group_key(
+                    source.zone,
+                    address,
+                    page_ref,
+                    41,
+                );
+            assert!(
+                registry_ref.state.lock().groups.contains_key(&group),
+                "projection release must precede group removal"
+            );
+            assert!(matches!(
+                registry_ref.admit_existing_group(source, task_ref, address, page_ref, control_ref),
+                Err(NativeAdmissionError::Failure(NativeProcessError::Stale))
+            ));
+            drop(
+                carrick_el1_abi::NativePendingCustody::try_admit(retained)
+                    .expect("retiring projection releases its pending writer before unregister"),
+            );
+        }));
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
@@ -12506,6 +12619,7 @@ mod tests {
         assert!(zone.slot(slot).host_record().is_none());
         assert!(zone.slot(slot).current().is_none());
         assert_eq!(zone.record(home).claim(), carrick_sched_core::Claim::Free);
+        assert!(registry_ref.is_empty());
     }
 
     #[test]
@@ -16470,8 +16584,7 @@ mod tests {
         }
         impl Drop for Registration<'_> {
             fn drop(&mut self) {
-                let process = self.runtime.graph.lock().root_key;
-                self.registry.unregister_process(&self.runtime, process);
+                self.registry.unregister_root_for_test(&self.runtime);
             }
         }
         let _registration = external.then(|| Registration {

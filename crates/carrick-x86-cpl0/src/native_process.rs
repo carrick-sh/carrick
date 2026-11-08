@@ -97,9 +97,6 @@ pub(super) fn admit_root(
         NonZeroU64::new(task.mm.key.load(Ordering::Acquire)).ok_or(NativeProcessError::Stale)?,
     );
     let address = anonymous::live_context(mm, root).ok_or(NativeProcessError::Stale)?;
-    if REGISTRY.for_entry(source, task, address).is_ok() {
-        return Ok(());
-    }
     // SAFETY: the authenticated admitted root's boot metadata is retained
     // throughout the native lane; the shared constructor rechecks both pointers.
     let (page, control) = unsafe {
@@ -108,8 +105,10 @@ pub(super) fn admit_root(
             &*(task.metadata.control_slot.load(Ordering::Acquire) as *const ThreadControlSlot),
         )
     };
-    if control.entry().is_some() {
-        REGISTRY.register_thread(source, task, address, page, control)?;
+    if REGISTRY
+        .admit_existing_group(source, task, address, page, control)?
+        .is_some()
+    {
         return Ok(());
     }
     // The stopped-host x86 bootstrap retains a temporary extra leader count.
