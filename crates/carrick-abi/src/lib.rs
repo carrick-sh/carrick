@@ -2931,7 +2931,7 @@ pub const LINUX_AT_HANDLE_MNT_ID_UNIQUE: u64 = 0x001;
 pub const LINUX_AT_HANDLE_CONNECTABLE: u64 = 0x002;
 pub const LINUX_AT_EACCESS: u64 = 0x200;
 pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
-pub const LINUX_AT_REMOVEDIR: u64 = 0x200;
+pub use carrick_syscall_abi::LINUX_AT_REMOVEDIR;
 pub const LINUX_AT_NO_AUTOMOUNT: u64 = 0x800;
 pub const LINUX_AT_STATX_FORCE_SYNC: u64 = 0x2000;
 pub const LINUX_AT_STATX_DONT_SYNC: u64 = 0x4000;
