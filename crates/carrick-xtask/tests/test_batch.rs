@@ -52,7 +52,7 @@ fn batch_fixture(isolated: bool) {
         #[test] #[ignore] fn intentionally_ignored() { panic!("ignore lost"); }
         "#.as_bytes()).unwrap();
     }
-    std::fs::write(dir.path().join("justfile"), "lanes:\n    env RUST_MIN_STACK=8388608 cargo --locked --offline test --lib --features left -- --skip serial_host --skip excluded\n    env RUST_TEST_THREADS=1 cargo --locked --offline test --lib --features right serial_host\ndocs:\n    cargo --locked --offline test documented\nred:\n    cargo --locked --offline test --lib excluded\nsingle:\n    env RUST_MIN_STACK=8388608 cargo --locked --offline test --lib --features left,right -- --skip excluded --skip serial_host --test-threads=1\n").unwrap();
+    std::fs::write(dir.path().join("justfile"), "lanes:\n    env RUST_MIN_STACK=8388608 cargo --locked --offline test --lib --features left -- --skip serial_host --skip excluded\n    env RUST_TEST_THREADS=1 cargo --locked --offline test --lib --features right serial_host\ndocs:\n    cargo --locked --offline test documented\nexplicit-docs:\n    cargo --locked --offline test --doc documented\nred:\n    cargo --locked --offline test --lib excluded\nsingle:\n    env RUST_MIN_STACK=8388608 cargo --locked --offline test --lib --features left,right -- --skip excluded --skip serial_host --test-threads=1\n").unwrap();
     std::fs::write(
         dir.path().join("Cargo.lock"),
         format!(
@@ -102,6 +102,16 @@ fn batch_fixture(isolated: bool) {
     assert!(
         String::from_utf8_lossy(&docs.stdout).contains("src/lib.rs"),
         "implicit doctests were lost"
+    );
+    let explicit_docs = run("explicit-docs");
+    assert!(
+        explicit_docs.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit_docs.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&explicit_docs.stderr).contains("test-batch: one compile"),
+        "doctest-only batches must not compile workspace defaults"
     );
     let red = run("red");
     assert!(
