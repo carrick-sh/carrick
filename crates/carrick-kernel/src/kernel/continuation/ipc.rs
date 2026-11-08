@@ -525,12 +525,7 @@ fn complete_poll<M: carrick_guest_mem::CurrentMmMemory>(
         drop(guard);
         let revents =
             level as i16 & (events | carrick_abi::LINUX_POLLERR | carrick_abi::LINUX_POLLHUP);
-        if revents == 0
-            && !op
-                .deadline
-                .get()
-                .is_some_and(|end| wake.counter().now >= end)
-        {
+        if revents == 0 && op.deadline.get().is_none_or(|end| wake.counter().now < end) {
             let lane = match member {
                 EpollMember::PipeWriter => WaitFor::Writable,
                 EpollMember::EventFd
