@@ -1515,6 +1515,115 @@ mod tests {
     }
 
     #[test]
+    fn native_child_utimens_dispatch_preserves_times_null_and_errno_matrix() {
+        use carrick_abi::{LINUX_AT_SYMLINK_NOFOLLOW, LINUX_UTIME_NOW, LINUX_UTIME_OMIT};
+        let fixture = mutation_child(Upper::Host);
+        let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+        let file = fixture.venue_open(&authority, b"time", CREATE, 0o644);
+        let time_bytes = |atime: (i64, i64), mtime: (i64, i64)| {
+            [atime.0, atime.1, mtime.0, mtime.1]
+                .into_iter()
+                .flat_map(i64::to_ne_bytes)
+                .collect::<Vec<_>>()
+        };
+        let times = time_bytes((100, 123), (200, 456));
+        let set = |path: &[u8], times: &[u8], flags| {
+            fixture.child_call(
+                &authority,
+                88,
+                [FDCWD as u64, 0, 0, flags, 0, 0],
+                &[(1, path), (2, times)],
+            )
+        };
+        assert_eq!(set(b"time", &times, 0), 0);
+        let stat = fixture
+            .dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .real_stat("/tmp/time", false)
+            .unwrap();
+        assert_eq!(stat.atime, (100, 123));
+        assert_eq!(stat.mtime, (200, 456));
+        let omit = time_bytes((0, LINUX_UTIME_OMIT), (0, LINUX_UTIME_OMIT));
+        assert_eq!(set(b"time", &omit, 0), 0);
+        assert_eq!(set(b"missing", &omit, 0), -2);
+        assert_eq!(
+            fixture.child_call(&authority, 88, [file as u64, 0, 0, 0, 0, 0], &[(2, &times)]),
+            0
+        );
+        assert_eq!(
+            fixture.child_call(&authority, 88, [999, 0, 0, 0, 0, 0], &[(2, &omit)]),
+            -9
+        );
+        assert_eq!(
+            fixture.child_call(&authority, 88, [FDCWD as u64, 0, 0, 0, 0, 0], &[]),
+            -14
+        );
+        assert_eq!(set(b"time", &time_bytes((0, -1), (0, 0)), 0), -22);
+        assert_eq!(
+            set(b"time", &time_bytes((0, 0), (0, 1_000_000_000)), 0),
+            -22
+        );
+        assert_eq!(set(b"time", &times, 0x1000), -22);
+        assert_eq!(set(b"", &times, 0), -2);
+        assert_eq!(set(b"/etc/ld.so.cache/x", &times, 0), -20);
+        assert_eq!(set(&[b'x'; 256], &times, 0), -36);
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                36,
+                [0, FDCWD as u64, 0, 0, 0, 0],
+                &[(0, b"time"), (2, b"time-link")],
+            ),
+            0
+        );
+        assert_eq!(set(b"time-link", &times, LINUX_AT_SYMLINK_NOFOLLOW), 0);
+        let link = fixture
+            .dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .real_stat("/tmp/time-link", true)
+            .unwrap();
+        assert_eq!(link.mtime, (200, 456));
+        assert_eq!(
+            set(
+                b"time-link",
+                &time_bytes((0, LINUX_UTIME_OMIT), (0, LINUX_UTIME_NOW)),
+                0
+            ),
+            0
+        );
+        let target = fixture
+            .dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .real_stat("/tmp/time", false)
+            .unwrap();
+        assert_eq!(target.atime, (100, 123));
+        assert!(target.mtime.0 > 200);
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                88,
+                [FDCWD as u64, 0, 0, 0, 0, 0],
+                &[(1, b"time")]
+            ),
+            0
+        );
+        let target = fixture
+            .dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .real_stat("/tmp/time", false)
+            .unwrap();
+        assert_eq!(target.atime, target.mtime);
+    }
+
+    #[test]
     fn native_child_write_serves_parent_redirected_stdout_after_host_close() {
         for upper in [Upper::Memory, Upper::Host] {
             let mut fixture = writable_fixture(upper);
