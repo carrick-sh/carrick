@@ -24,7 +24,7 @@ use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
     restore_native_context,
 };
-use kvm_pool_fixture::{physical_inventory, run_pool_fixture};
+use kvm_pool_fixture::{physical_inventory, run_instrumented_pool_fixture, run_pool_fixture};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
@@ -656,7 +656,7 @@ fn production_anonymous_root_busy_once_parks_and_completes() {
         code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
     }
 
-    let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+    let outcome = run_instrumented_pool_fixture(&production_probe_elf(&code), 32);
     assert_eq!(
         outcome.run.exit_code,
         7,
@@ -727,7 +727,7 @@ fn production_anonymous_editor_busy_once_parks_and_completes() {
         code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
     }
 
-    let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+    let outcome = run_instrumented_pool_fixture(&production_probe_elf(&code), 32);
     assert_eq!(outcome.run.exit_code, 7);
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(
@@ -788,7 +788,7 @@ fn production_anonymous_prepared_conflict_once_parks_and_completes() {
         code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
     }
 
-    let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+    let outcome = run_instrumented_pool_fixture(&production_probe_elf(&code), 32);
     assert_eq!(outcome.run.exit_code, 7);
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(
@@ -846,7 +846,7 @@ fn production_anonymous_metadata_required_provisions_without_park() {
         code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
     }
 
-    let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+    let outcome = run_instrumented_pool_fixture(&production_probe_elf(&code), 32);
     assert_eq!(outcome.run.exit_code, 7);
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(
