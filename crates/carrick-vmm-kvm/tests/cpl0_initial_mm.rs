@@ -264,15 +264,32 @@ fn native_exit_workers(
 ) -> (
     carrick_vmm_kvm::cpl0_boot::ProductionWorkerParts,
     carrick_el1_abi::El1TaskId,
+    carrick_kernel::dispatch::SyscallDispatcher,
 ) {
     let program = carrick_mem::elf::ElfProgram::load(elf, ELF_X86_64_MACHINE, &|_| None)
         .expect("ELF program");
     let image = prepare_x86_elf(&program).expect("static ELF");
     let extent = Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent, None).expect("real KVM");
+    // Match production preparation: native descriptor owners require the
+    // shared IPC window and this exact root table's publication.
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let mut carrier = Cpl0Carrier::boot_production(
+        physical_inventory(),
+        extent,
+        carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher),
+    )
+    .expect("real KVM");
     let issued = dispatcher.capture_one_task_context().expect("issued root");
+    issued
+        .resources()
+        .files()
+        .publish_ipc(
+            issued.kernel().ipc().expect("IPC owner"),
+            carrick_kernel::kernel::objects::IpcTableMapBinding::Retained(
+                carrier.ipc_table_map().expect("retained descriptor map"),
+            ),
+        )
+        .expect("publish exact root descriptor table");
     issued
         .kernel()
         .object_ids()
@@ -309,6 +326,9 @@ fn native_exit_workers(
     (
         carrier.into_worker_parts(128).expect("physical workers"),
         carrick_el1_abi::El1TaskId::from_linux_tid(issued.thread().key().tid.raw()),
+        // Keep the issuing host owner alive until the stopped-worker fixture
+        // finishes; dropping it withdraws the root's IPC table publication.
+        dispatcher,
     )
 }
 
@@ -318,19 +338,8 @@ fn run_to_marker(
     expected: u8,
     factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
 ) {
-    run_to_marker_with_work(cpu, task, expected, factory, 0);
-}
-
-fn run_to_marker_with_work(
-    cpu: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
-    task: carrick_guest_arch::TaskIdentity,
-    expected: u8,
-    factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
-    expected_work: usize,
-) {
     use carrick_guest_mem::GuestMemory;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
-    let mut completed_work = 0;
     for _ in 0..128 {
         let exit = cpu
             .fixture_run_loaded(task)
@@ -359,27 +368,14 @@ fn run_to_marker_with_work(
                     [expected],
                     "guest assertions must reach the next marker"
                 );
-                assert_eq!(
-                    completed_work, expected_work,
-                    "completed boundaries before marker {expected}"
-                );
                 cpu.complete_forward(task, token, 1)
                     .expect("write completion");
                 return;
             }
             CarrierRunExit::PhysicalDoorbell { .. } => {
                 let outcome = cpu
-                    .service_physical_doorbell(task, &exit, |served, pending| {
-                        assert!(served, "only completed work may precede a marker");
-                        let work = pending.expect("completed boundary owes ordinary host work");
-                        assert!(!work.native_signal_wake());
-                        assert!(work.native_terminal_slot().is_none());
-                        work.settled();
-                        completed_work += 1;
-                        assert!(
-                            completed_work <= expected_work,
-                            "unexpected completed host work before marker {expected}"
-                        );
+                    .service_physical_doorbell(task, &exit, |_, _| {
+                        panic!("unexpected completed host work before marker")
                     })
                     .expect("physical service");
                 assert!(
@@ -483,7 +479,7 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
     use carrick_sched_core::Claim;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture("native_exit_order.S");
-    let (parts, root_tid) = native_exit_workers(&elf);
+    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
     let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let newborn_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
@@ -602,7 +598,7 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
 fn work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes() {
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture("native_exit_order.S");
-    let (parts, root_tid) = native_exit_workers(&elf);
+    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
     let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let mut parent = factory.claim(0).expect("root executor");
@@ -706,7 +702,7 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
     use carrick_hal::VcpuKick;
     use carrick_sched_core::Claim;
     let elf = native_exit_fixture_with_flags("native_autoreap_exit.S", flags);
-    let (parts, root_tid) = native_exit_workers(&elf);
+    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
     let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let first_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let second_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
@@ -836,7 +832,7 @@ fn native_sigign_blocks_until_every_child_mm_retires() {
 fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture("native_peer_birth.S");
-    let (parts, root_tid) = native_exit_workers(&elf);
+    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
     let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let newborn_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
@@ -1405,7 +1401,7 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
     use carrick_hal::VcpuKick;
     use std::sync::atomic::Ordering;
     let elf = native_exit_fixture("native_file_fork.S");
-    let (parts, root_tid) = native_exit_workers(&elf);
+    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
     let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let task = root.binding().task();
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
@@ -1430,7 +1426,7 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
             (stdout, incarnation)
         })
         .expect("pre-fork open lifetime");
-    run_to_marker_with_work(&mut parent, task, 1, &factory, 1);
+    run_to_marker(&mut parent, task, 1, &factory);
     factory
         .fixture_pin_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
         .expect("child on independent physical lane");
