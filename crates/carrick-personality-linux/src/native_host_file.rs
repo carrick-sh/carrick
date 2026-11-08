@@ -10,6 +10,8 @@
 //! transports only carry the record.
 extern crate alloc;
 
+pub use carrick_syscall_abi::LinuxPipeIdentity;
+
 use crate::abi::entry::SyscallResult;
 use alloc::boxed::Box;
 use alloc::vec;
@@ -57,7 +59,7 @@ impl DescriptionAccess {
 /// The in-zone object kinds the ring owns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InZoneKind {
-    Pipe(carrick_syscall_abi::LinuxPipeIdentity),
+    Pipe(LinuxPipeIdentity),
     EventFd,
     Epoll,
 }
