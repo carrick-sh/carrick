@@ -244,17 +244,14 @@ impl BuildEnvironment {
 }
 
 #[cfg(test)]
-#[path = "../../tests/support/cargo_env.rs"]
-mod cargo_env;
-
-#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::test_cargo_env;
 
     #[test]
     fn build_environment_contains_only_declared_variables() {
-        if !cargo_env::in_clean_cargo_test() {
+        if !test_cargo_env::in_clean_cargo_test() {
             return;
         }
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

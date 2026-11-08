@@ -52,6 +52,10 @@ pub mod workorder;
 pub mod worktree_admission;
 pub mod worktree_gc;
 
+#[cfg(test)]
+#[path = "../tests/support/cargo_env.rs"]
+mod test_cargo_env;
+
 pub mod stress_capture;
 
 mod root_only_debt;

@@ -603,12 +603,9 @@ pub(crate) fn remote_script(remote_root: &str) -> Result<String, GcError> {
 }
 
 #[cfg(test)]
-#[path = "../tests/support/cargo_env.rs"]
-mod cargo_env;
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_cargo_env;
     use std::os::unix::fs::symlink;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::{Child, Stdio};
@@ -1399,7 +1396,7 @@ mod tests {
         let socket = temp.path().join("cargo.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let mut command = crate::command::offline_cargo();
-        cargo_env::clean_cargo_env(&mut command);
+        test_cargo_env::clean_cargo_env(&mut command);
         let mut cargo = command
             .arg("build")
             .current_dir(temp.path())
