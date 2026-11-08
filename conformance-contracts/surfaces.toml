@@ -1227,6 +1227,7 @@ surfaces = [
   { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs", contract = "kernel.mm.native-code-content" },
   { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs", contract = "kernel.mm.syscall-code-write" },
   { path = "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs", contract = "kernel.mm.backing-maintenance-lookup" },
+  { path = "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs", contract = "process.exec.native-exe-link" },
   { path = "crates/carrick-vmm-hvf/src/trap/frame_inventory/tests.rs", contract = "kernel.fork.stage1-image" },
   { path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs", contract = "kernel.mm.native-code-content" },
