@@ -1785,26 +1785,33 @@ fn namespace_baseline(
                 |_| core::ptr::null_mut(),
             )
             .unwrap();
-            assert_eq!(route, CompletionRoute::Forward);
-            // The vector calls this shipping final-capture policy after
-            // dispatch and descriptor drain. It is separate from syscall
-            // dispatch, and must see the admitted child's real ownership.
-            assert_eq!(
-                super::super::dispatch::native_unstaged_exit(
-                    &mut frame,
-                    &task.linux,
-                    carrick_el1_abi::Action::Forward,
-                    || super::super::dispatch::arm_thread_group_owner(fixture.zone, task, page),
-                    &counters,
-                ),
-                super::super::dispatch::NativeUnstagedExit::Refused(
-                    carrick_el1_abi::Action::Served
-                ),
-            );
-            assert_eq!(
-                frame.x[0] as i64, -38,
-                "baseline child {index} ordinal {nr}"
-            );
+            if nr == 78 {
+                // Readlink is now an exact native file service. Its full
+                // reply/continuation witness is native_exec_pipe_tests.
+                assert_eq!(route, CompletionRoute::NativeService);
+                assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
+            } else {
+                assert_eq!(route, CompletionRoute::Forward);
+                // The vector calls this shipping final-capture policy after
+                // dispatch and descriptor drain. It is separate from syscall
+                // dispatch, and must see the admitted child's real ownership.
+                assert_eq!(
+                    super::super::dispatch::native_unstaged_exit(
+                        &mut frame,
+                        &task.linux,
+                        carrick_el1_abi::Action::Forward,
+                        || super::super::dispatch::arm_thread_group_owner(fixture.zone, task, page),
+                        &counters,
+                    ),
+                    super::super::dispatch::NativeUnstagedExit::Refused(
+                        carrick_el1_abi::Action::Served
+                    ),
+                );
+                assert_eq!(
+                    frame.x[0] as i64, -38,
+                    "baseline child {index} ordinal {nr}"
+                );
+            }
             assert!(
                 task.service_notice.take().unwrap().is_none(),
                 "ring refusal creates no carrier request"
@@ -1816,10 +1823,14 @@ fn namespace_baseline(
                     .is_queued()
             );
         }
-        assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 2);
+        let refused = if nr == 78 { 0 } else { 2 };
+        assert_eq!(
+            counters.refused[nr as usize].load(Ordering::Relaxed),
+            refused
+        );
         assert_eq!(
             counters.refused_child[nr as usize].load(Ordering::Relaxed),
-            2
+            refused
         );
         assert_eq!(
             counters.venue_refused[nr as usize].load(Ordering::Relaxed),

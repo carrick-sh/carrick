@@ -4608,29 +4608,43 @@ fn parent_reaps_then_execs_child(namespace_census: bool) {
                 None,
                 |_| core::ptr::null_mut(),
             );
+            if nr == 78 {
+                // The exec successor uses the exact native file service;
+                // native_exec_pipe_tests drives its reply and copyout too.
+                assert_eq!(
+                    route,
+                    carrick_personality_linux::dispatch::CompletionRoute::NativeService
+                );
+                assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
+            } else {
+                assert_eq!(
+                    route,
+                    carrick_personality_linux::dispatch::CompletionRoute::Forward
+                );
+                assert_eq!(
+                    crate::dispatch::native_unstaged_exit(
+                        &mut frame,
+                        &fixture.task.linux,
+                        carrick_el1_abi::Action::Forward,
+                        || if child.is_root_process() {
+                            NativeThreadGroupOwner::Root
+                        } else {
+                            NativeThreadGroupOwner::ForkChild
+                        },
+                        &counters,
+                    ),
+                    crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
+                );
+                assert_eq!(frame.x[0] as i64, -38, "exec successor ordinal {nr}");
+            }
+            let refused = if nr == 78 { 0 } else { 1 };
             assert_eq!(
-                route,
-                carrick_personality_linux::dispatch::CompletionRoute::Forward
+                counters.refused[nr as usize].load(Ordering::Relaxed),
+                refused
             );
-            assert_eq!(
-                crate::dispatch::native_unstaged_exit(
-                    &mut frame,
-                    &fixture.task.linux,
-                    carrick_el1_abi::Action::Forward,
-                    || if child.is_root_process() {
-                        NativeThreadGroupOwner::Root
-                    } else {
-                        NativeThreadGroupOwner::ForkChild
-                    },
-                    &counters,
-                ),
-                crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
-            );
-            assert_eq!(frame.x[0] as i64, -38, "exec successor ordinal {nr}");
-            assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
             assert_eq!(
                 counters.refused_child[nr as usize].load(Ordering::Relaxed),
-                1
+                refused
             );
             assert_eq!(
                 counters.venue_refused[nr as usize].load(Ordering::Relaxed),
