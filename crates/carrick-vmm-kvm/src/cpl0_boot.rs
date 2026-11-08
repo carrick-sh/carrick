@@ -702,6 +702,17 @@ impl Cpl0Carrier {
         ipc: Option<Arc<dyn carrick_el1_abi::IpcWindowBacking>>,
     ) -> Result<Self, TrapError> {
         const IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/carrick-x86-cpl0"));
+        Self::boot_production_image(frame_inventory, IMAGE, initial_extent_bytes, ipc)
+    }
+
+    /// Boot a caller-selected build of the production entry. Integration
+    /// tests use this to keep instrumentation in a separate image artifact.
+    pub fn boot_production_image(
+        frame_inventory: Arc<dyn PhysicalFrameInventory>,
+        image: &[u8],
+        initial_extent_bytes: usize,
+        ipc: Option<Arc<dyn carrick_el1_abi::IpcWindowBacking>>,
+    ) -> Result<Self, TrapError> {
         if initial_extent_bytes == 0
             || initial_extent_bytes > X86_CPL0_INITIAL_EXTENT_MAX_SIZE as usize
             || !initial_extent_bytes.is_multiple_of(4096)
@@ -710,7 +721,7 @@ impl Cpl0Carrier {
         }
         Self::boot_bytes_inner(
             frame_inventory,
-            IMAGE,
+            image,
             [&[], &[]],
             false,
             Some(initial_extent_bytes),
