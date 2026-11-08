@@ -3434,6 +3434,30 @@ fn anonymous_edit_wait_reruns_when_root_releases_between_probe_and_park() {
 }
 
 #[test]
+fn anonymous_edit_wait_never_parks_for_metadata_required() {
+    use carrick_core::wait::{EditWaitOutcome, coordinate_anonymous_edit_wait};
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 2, 0);
+    let source = zone
+        .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+        .unwrap()
+        .live_notifications()
+        .unwrap();
+    // MetadataRequired is handled by the synchronous provision branch in
+    // serve_delegated_anonymous, never by this per-MM waiter.
+    let outcome: EditWaitOutcome<()> = coordinate_anonymous_edit_wait(
+        &source,
+        None,
+        || Some(Some(SpaceWaitCause::Metadata)),
+        |_, _, _| panic!("metadata has no per-MM release publisher"),
+    );
+    assert_eq!(outcome, EditWaitOutcome::Refused);
+}
+
+#[test]
 fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_writes() {
     use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
     use carrick_el1_abi::{Counters, CowDecline, CurrentTask, TrapFrame};
