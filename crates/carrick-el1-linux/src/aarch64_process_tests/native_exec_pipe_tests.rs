@@ -66,6 +66,7 @@ fn fork_exec_probe(futex: Option<u64>, bitset: u64, readlink: bool, timed: bool)
 enum TimerDeparture {
     CarrierExit,
     SlotReset,
+    Nanosleep,
 }
 
 #[test]
@@ -87,6 +88,17 @@ fn serial_host_native_child_timed_futex_slot_reset() {
         false,
         true,
         Some(TimerDeparture::SlotReset),
+    );
+}
+
+#[test]
+fn serial_host_native_child_nanosleep_is_routed() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        false,
+        true,
+        Some(TimerDeparture::Nanosleep),
     );
 }
 
@@ -1506,6 +1518,50 @@ fn child_futex<'a>(
     drop(entry);
     if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
         work.settled();
+    }
+    if matches!(departure, Some(TimerDeparture::Nanosleep)) {
+        let mut request = carrick_test_support::GuestUserBuffer::zeroed(32);
+        request.as_mut_bytes()[..8].copy_from_slice(&100_i64.to_ne_bytes());
+        request.as_mut_bytes()[16..].fill(0xa5);
+        frame.x[8] = 101;
+        frame.x[..2].copy_from_slice(&[request.arg(), request.arg() + 16]);
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                worker.address,
+                &worker.words,
+                service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &word,
+            }),
+            None,
+            Some(&venue),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_ne!(
+            route,
+            CompletionRoute::Forward,
+            "native child nanosleep cannot use a host continuation"
+        );
+        return;
     }
     if let Some(departure) = departure {
         let waiter = fixture.zone.record(binding.record.id);
