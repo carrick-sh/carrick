@@ -73,6 +73,7 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just run [ARGS]` 🔏 | `just build`, run `target/release/carrick ARGS`. |
 | `just check [ARGS]` | **Unsigned** `cargo build`, compile-check only. |
 | `just test` | Host lib/harness tests (no HVF/Docker). **Never bare `cargo test --workspace --lib`.** Parallel `--skip serial_host`, then `serial_host` under `RUST_TEST_THREADS=1`; `scripts/migrate/check-serial-host-tests.py` ratchets it (host fork/spawn, env/rlimit/umask mutation, exact fs counters stay serial — reaping is process-wide). Per-crate serial reasons: justfile. |
+| `just test-touched BASE` | Test changed workspace crates and reverse dependencies with `just test` features and serial rules; `JOBS` bounds Cargo jobs (default 3). |
 | `just test-kernel [ARGS]` | VM-free inner loop: kernel lib + kernel-semantics suites. Still run `just test` + signed gates before push. |
 | `just test-kernel-semantics [ARGS]` | `crates/carrick-kernel-example` suites; host-portable, CI runs them on Linux aarch64 (`kernel-linux-native`). |
 | `just test-integration` | Host integration (`carrick-runtime`/`engine`/`image`; no HVF). |
@@ -611,8 +612,9 @@ verification, the signed evidence and landing.
 - **Worktree lifecycle:** remove the worktree and `target/` on every host when
   a PR merges (`git worktree remove --force <path>` and prune).
 - **Workers prove their slice; CI and the director gate the rest** (owner,
-  2026-10-30, #231 items 4 and 5). Workers run `just test-touched <main-sha>` (changed crates and reverse
-  dependencies, using `just test` features and serial partitions),
+  2026-10-30, #231 items 4 and 5). Workers run
+  `just test-touched <main-sha>` (changed crates and reverse dependencies,
+  using `just test` features and serial partitions),
   `just check-contract-change <main-sha> HEAD`,
   `just xtask authority-debt --source-only` and the pre-push clippy hook,
   plus the checks their change calls for:
