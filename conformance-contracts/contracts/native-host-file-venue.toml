@@ -25,6 +25,7 @@ dispatcher's syscalls byte for byte and prove the in-zone routing.
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit}",
+  "carrick-el1-linux::native_process_runtime::host_test_support::host_root_open_publishes_unstamped_record_through_service_notice",
   "carrick-el1-linux::native_process_runtime::host_test_support::root_exec_access_refusal_is_counted_before_service_publication (production admitted and registered root has no filesystem authority: host-file open and exec refuse before service publication)",
   "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls",
   "carrick-el1-linux::dispatch::tests::native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout",
@@ -46,8 +47,11 @@ vm_free = [
   "carrick-runtime::runtime::exec::tests::native_child_fexecve_executes_the_open_file_not_its_path (#1530: the native exec service runs the opened image from the sealed ring table, never a re-resolution of its path; EBADF, missing table and fexecve'd scripts are exact)",
 ]
 
+embed = [
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace (three open/close pairs reuse one ring descriptor; exit 0, seven entries, zero refusals)",
+]
+
 [bindings.unresolved]
-kvm = "carrick-vmm-kvm::cpl0_initial_mm::serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace: production three-open/close sequence, exact descriptor reuse, bounded native Linux control; initial red returns EBUSY(16) on the second open."
 embed_structural = "The director owns the signed carrier binding and exact-artifact verification for this venue."
 observation = "No versioned WorkObservation counts venue crossings yet; the routing witnesses prove zero host requests for in-zone objects."
 embed = "The signed native pipeline witnesses (`sh -c 'ls / | head -2'`, `true | true`) bind the exec successor's image import and RELRO end to end (#894 ruling 1); acceptance waits on the director's recorded signed run. A static-pie successor witness is tracked as a follow-up."
