@@ -125,13 +125,54 @@ The architectural x2 therefore points at libc's timespec copy, not necessarily
 the fixture's original timeout. This local rebuild is not proof of the
 director's signed fixture identity; restore/verify the matching bundle there.
 
-No inspected assignment identifies the origin of 4999. It resembles a
-remaining millisecond timeout, but neither a millisecond-to-mask conversion
-nor a child/stale frame substitution is established. The table-index typo
-and the claim that normal musl intentionally supplies 4999 as sigmask are
-excluded by inspection. Live snapshot/restore corruption, a stale saved
-context, and a replay at the wrong instruction remain open. No frame-source
-fix is justified yet.
+Round 14 identifies the concrete conversion: host IPC completion grouped
+`PollWait` with `EpollWait`, retired its operation and called `epoll_rerun`.
+`restart_with_remaining` then wrote remaining milliseconds into x3, ppoll's
+signal-mask pointer. A five-second wait sampled one millisecond later
+therefore produced 4999 (`0x1387`) without an HVF register-table error.
+The three production `complete_handback` witnesses were red on round 13:
+readiness and control wakes returned `Some(4999)`; expiry returned
+`Some(0)` instead of completing the admitted poll.
+
+### Round 14: retained poll completion
+
+The host now continues PollWait in the existing IPC operation arena. It
+reuses the description pin, original pollfd bytes and absolute counter
+deadline; closing/reusing the numeric fd or editing user inputs cannot
+change that admission. The existing shared `member_level` primitive supplies
+readiness. An empty wake retains the token and deadline on the same object
+queue, including the host timer; expiry copies zero revents and returns 0
+without restarting a relative wait. A completed answer and its byte cursor
+remain in that operation through owner-copyout refusal, without another
+readiness query. The normal in-ring resumption already consumes the same
+retained token before fd lookup.
+
+Replay uses `IpcRestart::Original` or `IpcRestart::EpollPwait`, which alone
+can authorize a millisecond write. The runtime checks that convention's
+ordinal before writing both the vCPU argument and any host request.
+PollWait produces no syscall replay or timeout-argument writes. Real
+handler interruptions still return EINTR, independent of SA_RESTART;
+control interruptions retain the original operation.
+
+The frame store also samples `host-ipc-replay` at
+`restart_with_remaining`, after any authorized argument writes. It records
+canonical ordinal, PC, binding, all six argument registers and an
+`argument-write-mask` (bit N means argument N was written at this boundary).
+For this source the last existing row word holds that mask instead of ESR;
+there is no row-layout change. A ppoll sample must show mask 0 and x3 NULL;
+an epoll timeout rewrite shows mask 8. The Rust formatter and LLDB decoder
+both distinguish these meanings. The bounded prefix is still not a census.
+
+The x86 CPL0 dispatcher currently does not produce PollWait: its poll family
+is the shared non-parking snapshot/output path. ARM's blocking single-zone
+admission is in `serve_single_zone_ppoll`. Host continuation and typed replay
+are shared, so any future x86 PollWait producer receives the same retained
+completion without a separate register convention. This round does not add
+x86 blocking poll routing or edit the crossing allowlist.
+
+VM-free proof covers production host completion, retained pin/snapshot and
+counter deadlines, copyout refusal, and the runtime argument-write boundary.
+The two signed prepared-fork cases remain the exact-binary HVF proof.
 
 ### Signed interpretation
 
@@ -151,7 +192,9 @@ persists, the copy row identifies the raw words used for the refusal. If x3
 is already 4999 at `fresh-trap`, the source precedes shared dispatch; compare
 scheduler replay rows before attributing it to HVF or libc. If fresh x3 is
 zero but decoded x3 is 4999 on that binding/PC, the entry boundary is implicated.
-If a saved/replay row first shows 4999, inspect that saved-context producer.
+If a host-ipc-replay row writes x3 for nr=73, replay is still defective;
+compare that row with the next fresh trap before blaming the saved context.
 If both tests pass, that establishes only this artifact's signed outcomes;
-this diagnostic-only round does not establish a cause fix. If only touch
+the paired red/green run is required to establish that this replay fix
+removes the recorded signed failure. If only touch
 passes, operand residency/timing still matters and requires attribution.
