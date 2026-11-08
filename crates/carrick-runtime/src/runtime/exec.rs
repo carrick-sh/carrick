@@ -273,10 +273,7 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             .map_err(|_| carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)
     }
 
-    /// The host-served root's live cwd and root, read once for a child the
-    /// stopped root is forking (#1392). The root's chdir and chroot are
-    /// served by this run's dispatcher, so its filesystem context is the
-    /// one authority; the child's ring row owns the copy from here on.
+    /// Retain the root's current object for its new child's MM custody.
     fn root_executable_seed(
         &self,
     ) -> Option<std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>> {
@@ -287,6 +284,8 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             .root_executable_seed()
     }
 
+    /// The host-served root's live cwd and root, read once for a child the
+    /// stopped root is forking (#1392). The child's ring row owns the copy.
     fn root_fork_seed(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
         let Some(run) = self.run.get().and_then(std::sync::Weak::upgrade) else {
             return false;
