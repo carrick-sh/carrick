@@ -6,7 +6,9 @@ use carrick_sched_core::object_wait::{
     ObjectWaitError, ObjectWaitKey, ObjectWaitSnapshot, ObjectWakeReport, OperationToken,
     OwnedObjectWakeEffects,
 };
-use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
+use carrick_sched_core::spaces::notification::{
+    SpaceAccess, SpaceNotificationLease, SpaceReleaseVenue, SpaceWaitCause,
+};
 use carrick_sched_core::{
     RecordId, ShortLockSpin, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
 };
@@ -231,6 +233,64 @@ pub fn space_access<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
         waker: Waker::El1 { slot },
         deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(deliver),
     })
+}
+
+/// Coordinate a retryable anonymous edit against the exact live MM source.
+/// Observe before the failed predicate probe so a release in the gap is a
+/// Changed result, never a sleeping waiter. `probe` must drop root and editor
+/// custody before it returns; the parked operation has made no effects.
+pub fn coordinate_anonymous_edit_wait<P, F, T, Context: carrick_core_abi::EntryContext>(
+    source: &SpaceNotificationLease<'_, Context>,
+    resumed: Option<OperationToken>,
+    mut probe: P,
+    mut park: F,
+) -> EditWaitOutcome<T>
+where
+    P: FnMut() -> Option<Option<SpaceWaitCause>>,
+    F: FnMut(
+        ObjectWaitKey,
+        carrick_sched_core::object_wait::ObjectStateSnapshot,
+        OperationToken,
+    ) -> Result<T, (ObjectWaitError, OperationToken)>,
+{
+    loop {
+        if !source.is_live() {
+            return EditWaitOutcome::Refused;
+        }
+        let observed = SpaceWaitCause::ALL.map(|cause| source.observe(cause));
+        let Some(conflict) = probe() else {
+            return EditWaitOutcome::Refused;
+        };
+        let Some(cause) = conflict else {
+            return EditWaitOutcome::NoConflict;
+        };
+        let key = source.key(cause);
+        if resumed.as_ref().is_some_and(|token| {
+            token.index() != u64::from(key.index()) || token.generation() != key.generation()
+        }) {
+            return EditWaitOutcome::StaleToken;
+        }
+        let Some(snapshot) = SpaceWaitCause::ALL
+            .into_iter()
+            .zip(observed)
+            .find_map(|(candidate, snapshot)| (candidate == cause).then_some(snapshot))
+        else {
+            return EditWaitOutcome::Refused;
+        };
+        let Some(token) = OperationToken::new(u64::from(key.index()), key.generation()) else {
+            return EditWaitOutcome::Refused;
+        };
+        // SAFETY: the source observation precedes the failed predicate probe;
+        // park revalidates this exact revision before enrollment.
+        let snapshot = unsafe {
+            carrick_sched_core::object_wait::ObjectStateSnapshot::before_object_probe(snapshot)
+        };
+        match park(key, snapshot, token) {
+            Ok(parked) => return EditWaitOutcome::Parked(parked),
+            Err((ObjectWaitError::Changed, _)) => continue,
+            Err(_) => return EditWaitOutcome::Refused,
+        }
+    }
 }
 
 /// Coordinate a conflicting reservation edit wait: validates active wait key,
