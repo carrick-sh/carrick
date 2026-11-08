@@ -195,11 +195,19 @@ pub fn comparable(base: &AcceptReceipt, candidate: &AcceptReceipt) -> Result<(),
         .fixture_validation
         .as_ref()
         .ok_or_else(|| refuse("candidate receipt missing fixture bundle identity"))?;
-    // The manifest binds actual executable hashes and build inputs. Archive paths,
-    // checkout SHAs and compression bytes do not identify the executed fixtures.
-    if old.manifest_sha256 != next.manifest_sha256 || old.inputs_sha256 != next.inputs_sha256 {
+    // Full manifest hashes include publishing provenance; content binds inputs,
+    // executable hashes and toolchain without requiring equal publishing commits.
+    let old_content = old
+        .content_sha256
+        .as_ref()
+        .ok_or_else(|| refuse("base receipt missing fixture content identity"))?;
+    let next_content = next
+        .content_sha256
+        .as_ref()
+        .ok_or_else(|| refuse("candidate receipt missing fixture content identity"))?;
+    if old_content != next_content || old.inputs_sha256 != next.inputs_sha256 {
         return Err(refuse(
-            "fixture bundle identity differs (manifest or inputs SHA-256)",
+            "fixture bundle identity differs (content or inputs SHA-256)",
         ));
     }
     Ok(())

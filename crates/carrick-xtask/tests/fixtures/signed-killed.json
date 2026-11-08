@@ -47,6 +47,7 @@
     "checkout_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "bundle_source_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "checkout_dirty": false,
+    "content_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
     "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
     "inputs_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
   }
