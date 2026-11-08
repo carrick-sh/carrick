@@ -1616,16 +1616,23 @@ pub struct ObjectWaitCensus {
 
 impl ObjectWaitCensus {
     pub(crate) const fn has_anonymous_edit_operation(&self) -> bool {
-        self.operation as usize >= ADDRESS_SPACE_WAIT_BASE
+        // Only the five causes accepted by coordinate_anonymous_edit_wait
+        // issue replay tokens. Metadata, spare queues, services and tagged
+        // prepared edits retain their own host cancellation custody.
+        let primary = self.operation > ADDRESS_SPACE_WAIT_BASE as u64
+            && self.operation < RESERVATION_POOL_WAIT_INDEX as u64;
+        let extra = self.operation >= ORIGINAL_OBJECT_WAIT_QUEUES as u64
+            && self.operation
+                < cause_queue_index(0, spaces::notification::SpaceWaitCause::Metadata) as u64;
+        (primary || extra)
+            && self.operation_generation != 0
             && self.operation_generation == self.generation
     }
 
     /// Whether this census names an anonymous reservation edit on its exact
     /// address-space notification incarnation.
     pub const fn is_anonymous_edit(&self) -> bool {
-        self.queue as usize >= ADDRESS_SPACE_WAIT_BASE
-            && self.operation == self.queue as u64
-            && self.has_anonymous_edit_operation()
+        self.operation == self.queue as u64 && self.has_anonymous_edit_operation()
     }
 }
 
@@ -3028,27 +3035,47 @@ mod host_tests {
         use spaces::notification::SpaceWaitCause;
         // Each case goes through the production host cancellation entry.
         // Include the boundaries and every reserved queue producer.
-        let mut cases = std::vec![
-            ("metadata", ObjectWaitKey::metadata_request(17).unwrap(),
-                OperationToken::metadata_request(17).unwrap(), false),
-        ];
+        let mut cases = std::vec![(
+            "metadata",
+            ObjectWaitKey::metadata_request(17).unwrap(),
+            OperationToken::metadata_request(17).unwrap(),
+            false
+        ),];
         for cause in SpaceWaitCause::ALL {
             let key = ObjectWaitKey::address_space_cause(0, 17, cause).unwrap();
-            cases.push(("prepared", key, OperationToken::prepared_edit(key).unwrap(), false));
-            cases.push(("space", key,
+            cases.push((
+                "prepared",
+                key,
+                OperationToken::prepared_edit(key).unwrap(),
+                false,
+            ));
+            cases.push((
+                "space",
+                key,
                 OperationToken::new(key.index() as u64, 17).unwrap(),
-                cause != SpaceWaitCause::Metadata));
+                cause != SpaceWaitCause::Metadata,
+            ));
         }
         for index in [
-            1, ADDRESS_SPACE_WAIT_BASE, RESERVATION_POOL_WAIT_INDEX,
-            IPC_OPERATION_SLOT_WAIT_INDEX, ORIGINAL_OBJECT_WAIT_QUEUES - 1,
-            DELEGATED_FILE_WAIT_BASE, NATIVE_SERVICE_WAIT_BASE,
-            MEMBER_RELEASE_WAIT_BASE, OBJECT_WAIT_QUEUES,
+            1,
+            ADDRESS_SPACE_WAIT_BASE,
+            RESERVATION_POOL_WAIT_INDEX,
+            IPC_OPERATION_SLOT_WAIT_INDEX,
+            ORIGINAL_OBJECT_WAIT_QUEUES - 1,
+            DELEGATED_FILE_WAIT_BASE,
+            NATIVE_SERVICE_WAIT_BASE,
+            MEMBER_RELEASE_WAIT_BASE,
+            OBJECT_WAIT_QUEUES,
         ] {
             // Adapter token values must not acquire anonymous retirement just
             // because their numeric index lies above the MM queues.
             let key = ObjectWaitKey::metadata_request(17).unwrap();
-            cases.push(("other", key, OperationToken::new(index as u64, 17).unwrap(), false));
+            cases.push((
+                "other",
+                key,
+                OperationToken::new(index as u64, 17).unwrap(),
+                false,
+            ));
         }
         for (kind, key, operation, anonymous) in cases {
             let zone = fixture(false);
@@ -3061,7 +3088,11 @@ mod host_tests {
             drop(guard);
             assert_eq!(
                 zone.claim_for_host(reference, None, Handback::Cancelled, &SpinForever),
-                if anonymous { HostClaim::Stale } else { HostClaim::Claimed },
+                if anonymous {
+                    HostClaim::Stale
+                } else {
+                    HostClaim::Claimed
+                },
                 "{kind}: {identity:?}"
             );
             if anonymous {
@@ -3077,10 +3108,12 @@ mod host_tests {
         }
         let zone = fixture(false);
         let id = allocate(&zone, 1);
+        let reference = zone.record_ref(id);
         assert_eq!(
-            zone.claim_for_host(zone.record_ref(id), None, Handback::Cancelled, &SpinForever),
-            HostClaim::AlreadyHost
+            zone.claim_for_host(reference, None, Handback::Cancelled, &SpinForever),
+            HostClaim::Stale
         );
+        assert!(zone.live(reference).is_none());
         assert!(!zone.record(id).has_object_operation());
     }
 
