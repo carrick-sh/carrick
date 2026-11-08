@@ -449,8 +449,8 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
             .unwrap();
         std::os::unix::fs::symlink(binary, tools.join(name)).unwrap();
     }
-    let mut missing = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
-    missing
+    let mut missing_command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+    missing_command
         .args([
             "--root",
             root.to_str().unwrap(),
@@ -458,7 +458,7 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
             &config_base,
         ])
         .env_clear()
-        .env("PATH", tools)
+        .env("PATH", &tools)
         .env("CARGO_TARGET_DIR", root.join("target"));
     for name in [
         "HOME",
@@ -468,10 +468,10 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
         "TMPDIR",
     ] {
         if let Some(value) = std::env::var_os(name) {
-            missing.env(name, value);
+            missing_command.env(name, value);
         }
     }
-    let missing = missing.output().unwrap();
+    let missing = missing_command.output().unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&missing.stdout),
@@ -480,6 +480,23 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
     assert!(!missing.status.success(), "{text}");
     assert!(
         text.contains("host facility unavailable: lsof is required"),
+        "{text}"
+    );
+    assert!(!text.contains("must_not_run ... FAILED"), "{text}");
+    let lsof = std::env::split_paths(&paths)
+        .map(|dir| dir.join("lsof"))
+        .find(|path| path.is_file())
+        .unwrap();
+    std::os::unix::fs::symlink(lsof, tools.join("lsof")).unwrap();
+    let missing_rsync = missing_command.output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&missing_rsync.stdout),
+        String::from_utf8_lossy(&missing_rsync.stderr)
+    );
+    assert!(!missing_rsync.status.success(), "{text}");
+    assert!(
+        text.contains("host facility unavailable: rsync is required"),
         "{text}"
     );
     assert!(!text.contains("must_not_run ... FAILED"), "{text}");
