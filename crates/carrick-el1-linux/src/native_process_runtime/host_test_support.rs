@@ -8192,3 +8192,173 @@ fn production_unmapped_root_admits_and_forks(late_bind: bool) {
         );
     }
 }
+
+/// Fresh-root storage uses the same issuer, limits, rollback and release
+/// notification path as fork-child stock; no sibling context is supplied.
+#[test]
+fn native_root_stock_claim_rollback_and_nproc_limit() {
+    use carrick_personality_linux::identity::ProcessIdentityVenue;
+    use carrick_personality_linux::lifecycle::ThreadBirthAdmission;
+    use carrick_personality_linux::sysinfo::ProcessSysinfoVenue;
+    let fixture = native_exec_fixture();
+    let controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+        ThreadControlSlot::new()
+    })));
+    fixture
+        .runtime
+        .admit_thread_stock(NativeLifecycleResources {
+            page: fixture.page,
+            controls,
+        })
+        .unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.prepare_thread_birth(),
+        ThreadBirthAdmission::Ready
+    ));
+    let before = thread_stock::claim_counts(&fixture.runtime);
+    let claim = fixture.page.claim_any().unwrap();
+    let identity = fixture.page.identity(claim.entry()).unwrap();
+    assert_ne!(identity.tid, 41);
+    fixture.page.unclaim(claim).unwrap();
+    entry.lifecycle_admission_settled().unwrap();
+    assert!(matches!(
+        entry.prepare_thread_birth(),
+        ThreadBirthAdmission::Ready
+    ));
+    assert_eq!(
+        thread_stock::claim_counts(&fixture.runtime),
+        before,
+        "rollback must not issue replacement identities"
+    );
+    entry
+        .set_rlimit(
+            carrick_abi::LinuxResource::Nproc.index(),
+            carrick_sched_core::process::LinuxRlimit {
+                rlim_cur: 1,
+                rlim_max: 1,
+            },
+        )
+        .unwrap();
+    entry.set_uid(1000).unwrap();
+    assert!(
+        matches!(entry.prepare_thread_birth(),ThreadBirthAdmission::Owned(LifecycleOutcome::Returned {result,..}) if result.raw()==-11)
+    );
+    assert_eq!(fixture.page.live(), 1);
+}
+
+#[test]
+fn native_root_stock_busy_claim_parks_then_release_retries_same_clone() {
+    use carrick_personality_linux::lifecycle::ThreadBirthAdmission;
+    let fixture = native_exec_fixture();
+    let controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+        ThreadControlSlot::new()
+    })));
+    fixture
+        .runtime
+        .admit_thread_stock(NativeLifecycleResources {
+            page: fixture.page,
+            controls,
+        })
+        .unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let mut claims = Vec::new();
+    for _ in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+        assert!(matches!(
+            entry.prepare_thread_birth(),
+            ThreadBirthAdmission::Ready
+        ));
+        claims.push(fixture.page.claim_any().unwrap());
+    }
+    assert!(
+        matches!(
+            entry.prepare_thread_birth(),
+            ThreadBirthAdmission::Owned(LifecycleOutcome::Transferred { .. })
+        ),
+        "busy stock must park, never return EAGAIN or fail the run"
+    );
+    assert!(entry.take_run_failure().is_none());
+    assert!(entry.take_handoff_receipt().is_some());
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+    let claim = claims.pop().unwrap();
+    let released = claim.entry();
+    fixture.page.unclaim(claim).unwrap();
+    entry.lifecycle_admission_settled().unwrap();
+    drop(entry);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+        NativeResume::RetrySyscall
+    ));
+    assert!(matches!(
+        entry.prepare_thread_birth(),
+        ThreadBirthAdmission::Ready
+    ));
+    let retry = fixture.page.claim_any().unwrap();
+    assert_eq!(
+        retry.entry(),
+        released,
+        "retry must consume the returned standing identity"
+    );
+    fixture.page.unclaim(retry).unwrap();
+    for claim in claims {
+        fixture.page.unclaim(claim).unwrap();
+    }
+    entry.lifecycle_admission_settled().unwrap();
+    let outcome = entry.exit_group(7);
+    assert!(matches!(outcome, LifecycleOutcome::Transferred { .. }));
+    assert!(entry.take_run_failure().is_none());
+    assert!(entry.take_root_exit().is_some());
+    assert_eq!(fixture.page.live(), 0);
+    for index in 0..fixture.page.entry_count() {
+        assert!(matches!(
+            fixture.page.state(index),
+            Some((_, carrick_el1_abi::EntryState::Revoked))
+        ));
+    }
+}
