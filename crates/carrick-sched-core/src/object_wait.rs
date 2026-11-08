@@ -1615,12 +1615,17 @@ pub struct ObjectWaitCensus {
 }
 
 impl ObjectWaitCensus {
+    pub(crate) const fn has_anonymous_edit_operation(&self) -> bool {
+        self.operation as usize >= ADDRESS_SPACE_WAIT_BASE
+            && self.operation_generation == self.generation
+    }
+
     /// Whether this census names an anonymous reservation edit on its exact
     /// address-space notification incarnation.
     pub const fn is_anonymous_edit(&self) -> bool {
         self.queue as usize >= ADDRESS_SPACE_WAIT_BASE
             && self.operation == self.queue as u64
-            && self.operation_generation == self.generation
+            && self.has_anonymous_edit_operation()
     }
 }
 
@@ -1748,18 +1753,18 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         );
     }
 
-    /// Retire an anonymous-edit replay token while its exact queue identity is
-    /// still published.  Unlike adapter operations it owns no external pin;
-    /// terminal cancellation must not retain the record merely to hand that
-    /// scheduler-only token to a nonexistent adapter.
-    fn retire_cancelled_anonymous_operation(&self) {
+    /// Retire an anonymous-edit replay token after its queue link is removed.
+    /// The retained operation index and generation preserve the typed identity
+    /// until the transfer owner settles cancellation. Unlike adapter operations
+    /// it owns no external pin and needs no host handback.
+    pub(super) fn retire_cancelled_anonymous_operation(&self) {
         if !self.is_cancelled() {
             return;
         }
         let Some(census) = self.object_wait_census() else {
             return;
         };
-        if !census.is_anonymous_edit() {
+        if !census.has_anonymous_edit_operation() {
             return;
         }
         let _ = self.object.operation.compare_exchange(
@@ -2481,7 +2486,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 continue;
             };
             if rec.object.queue.load(Ordering::Acquire) == index {
-                rec.retire_cancelled_anonymous_operation();
                 guard.unlink(record);
             }
             return;
