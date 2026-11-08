@@ -247,6 +247,8 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             }
             carrick_el1::memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
             carrick_el1::memory::DelegatedAnonymous::Contended(cause) => {
+                #[cfg(feature = "test-support")]
+                crate::test_support::arm_metadata_for_reprobe();
                 DelegatedStep::Contended(cause)
             }
             carrick_el1::memory::DelegatedAnonymous::Forward if file.is_some() => {
@@ -369,7 +371,11 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                 self.retry = true;
                 Some(FamilyCompletion::AccountedComplete(0))
             }
-            EditWaitOutcome::Refused => None,
+            EditWaitOutcome::Refused => {
+                #[cfg(feature = "test-support")]
+                crate::test_support::record_anonymous_wait_handback();
+                None
+            }
         }
     }
     fn take_x86_handoff_receipt(
