@@ -14,5 +14,7 @@ vm_free = [
 ]
 
 [bindings.unresolved]
+embed_structural = "Director: exact signed artifact must demonstrate one retained readlink service and no host syscall replay."
+observation = "The VM-free dispatch witness asserts zero forwarded calls; no WorkObservation schema exists for executable custody."
 embed = "Director: signed real go-build row on this exact head; this worker has no HVF"
 docker = "Director: native arm64 go-build differential"

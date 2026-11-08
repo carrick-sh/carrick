@@ -37,7 +37,7 @@ fn fork_exec_successor(futex: Option<u64>) {
     fork_exec_successor_with_futex(futex, u32::MAX as u64);
 }
 
-/// RED: the exec successor has no retained executable-object capability yet.
+/// The exec successor resolves its live MM's executable through native service.
 #[test]
 fn serial_host_native_fork_exec_child_readlink_exe() {
     fork_exec_probe(None, u32::MAX as u64, None, true);
@@ -448,8 +448,9 @@ fn fork_exec_probe(
             None,
             |_| core::ptr::null_mut(),
         );
-        if readlink && route == carrick_personality_linux::dispatch::CompletionRoute::Forward {
-            // The carrier service follows the normal family's unclaimed result.
+        if readlink && route == carrick_personality_linux::dispatch::CompletionRoute::NativeService
+        {
+            // The carrier service follows the shared family's exact handoff.
             // Drive the production staging/continuation entry used by the SVC exit.
             struct Resident;
             impl crate::file::MemoryValidator for Resident {
