@@ -1210,15 +1210,22 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     TrapError::Hypervisor("KVM doorbell lost task binding".into())
                 })?;
                 let kernel = binding.kernel_binding.kernel();
-                let status = self.physical.service_physical_doorbell(
-                    task,
-                    &stopped.exit,
-                    |served, doorbell| {
-                        carrick_kernel::el1_delegation::settle_host_work_boundary(
-                            kernel, served, doorbell,
-                        );
-                    },
-                )?;
+                let status = {
+                    let mut host_file = native_host_file_server(
+                        &self.dispatcher,
+                        &self.root_binding.host_root_resources,
+                    );
+                    self.physical.service_physical_doorbell_with_host_file(
+                        task,
+                        &stopped.exit,
+                        |served, doorbell| {
+                            carrick_kernel::el1_delegation::settle_host_work_boundary(
+                                kernel, served, doorbell,
+                            );
+                        },
+                        &mut host_file,
+                    )?
+                };
                 self.scheduler.poke_executor_control();
                 if let Some(status) = status {
                     self.publish_exit(carrick_vmm_kvm::cpl0_boot::initial_process_exit(
@@ -1260,14 +1267,22 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         match self.physical.run_idle_peer()? {
             exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
                 let kernel = self.scheduler.kernel();
-                if let Some(status) =
-                    self.physical
-                        .service_idle_peer_doorbell(&exit, |served, doorbell| {
+                let status = {
+                    let mut host_file = native_host_file_server(
+                        &self.dispatcher,
+                        &self.root_binding.host_root_resources,
+                    );
+                    self.physical.service_idle_peer_doorbell_with_host_file(
+                        &exit,
+                        |served, doorbell| {
                             carrick_kernel::el1_delegation::settle_host_work_boundary(
                                 kernel, served, doorbell,
                             );
-                        })?
-                {
+                        },
+                        &mut host_file,
+                    )?
+                };
+                if let Some(status) = status {
                     let exits = self.total_exits.load(Ordering::Acquire);
                     self.publish_exit(carrick_vmm_kvm::cpl0_boot::initial_process_exit(
                         status, exits,
@@ -2068,5 +2083,34 @@ mod tests {
         );
         carrick_signal_linux::clear_proc_pending();
         carrick_signal_linux::clear_thread_pending();
+    }
+}
+
+/// Select resource authority independently from native execution custody.
+fn native_host_file_server<'a>(
+    dispatcher: &'a Mutex<SyscallDispatcher>,
+    resources: &'a carrick_kernel::dispatch::resources::HostRootResources,
+) -> impl FnMut(
+    carrick_core_abi::service::ServiceOrigin,
+    &mut [u8],
+) -> Result<
+    Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+    carrick_hal::fork_stock::NativeHostFileRefused,
+> + 'a {
+    move |origin, record| {
+        let dispatcher = dispatcher
+            .lock()
+            .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
+        let result = match origin {
+            carrick_core_abi::service::ServiceOrigin::Initial => {
+                dispatcher.serve_host_root_file(resources, record)
+            }
+            carrick_core_abi::service::ServiceOrigin::Descendant => {
+                dispatcher.serve_native_host_file(record)
+            }
+        };
+        result
+            .map(|served| served.retained_source)
+            .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)
     }
 }
