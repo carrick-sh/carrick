@@ -2921,7 +2921,7 @@ pub fn errno_name(e: LinuxErrno) -> Option<&'static str> {
 }
 pub use carrick_syscall_abi::LINUX_AT_FDCWD;
 pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-pub const LINUX_AT_SYMLINK_FOLLOW: u64 = 0x400;
+pub use carrick_syscall_abi::LINUX_AT_SYMLINK_FOLLOW;
 /// Request an identity-only file handle that need not be decodable by
 /// `open_by_handle_at(2)`.
 pub const LINUX_AT_HANDLE_FID: u64 = 0x200;

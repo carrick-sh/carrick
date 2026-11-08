@@ -619,6 +619,7 @@ impl SyscallDispatcher {
             | HostFileOp::Mkdirat
             | HostFileOp::Unlinkat
             | HostFileOp::Symlinkat
+            | HostFileOp::Linkat
             | HostFileOp::Poll => Served::Refused,
         }
     }
@@ -633,6 +634,23 @@ impl SyscallDispatcher {
     ) -> Served {
         let fs = self.fs_view();
         match header.op {
+            HostFileOp::Linkat => {
+                let Some((old, new)) = native_path_pair(path) else {
+                    return Served::Refused;
+                };
+                match fs.link_paths(
+                    None,
+                    LINUX_AT_FDCWD,
+                    old,
+                    LINUX_AT_FDCWD,
+                    new,
+                    u64::from(header.flags),
+                ) {
+                    Ok(outcome) => served_mutation(outcome),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::Symlinkat => {
                 let Some((target, path)) = native_path_pair(path) else {
                     return Served::Refused;
