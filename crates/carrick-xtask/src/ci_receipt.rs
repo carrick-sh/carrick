@@ -182,6 +182,9 @@ fn receipt_failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
             .iter()
             .filter(|diff| diff.step == step.name)
             .collect();
+        for test in &step.not_run_tests {
+            keys.insert(format!("not-run:{}:{test}", step.name));
+        }
         for test in &step.failed_tests {
             keys.insert(format!("test:{}:{test}", step.name));
         }
@@ -1020,6 +1023,23 @@ pub fn diff_with_retired(
         verified_retired.push((bin, test_path));
     }
 
+    // Explicit skips are observations, not comparable failure verdicts.
+    // Suppress both synthetic failures from old receipts and missing-population
+    // keys; the deadline remains an independent, fail-closed identity.
+    let skipped_keys: BTreeSet<String> = baseline
+        .steps
+        .iter()
+        .chain(&candidate.steps)
+        .flat_map(|step| {
+            step.not_run_tests.iter().flat_map(move |test| {
+                [
+                    format!("not-run:{}:{test}", step.name),
+                    format!("test:{}:{test}", step.name),
+                    format!("missing:{test}"),
+                ]
+            })
+        })
+        .collect();
     let base = failure_keys(baseline);
     let mut next = receipt_failure_keys(candidate);
     for base_step in &baseline.steps {
@@ -1107,8 +1127,12 @@ pub fn diff_with_retired(
         }
     }
     Ok(ReceiptDiff {
-        new: new.into_iter().collect(),
-        fixed: base.difference(&next).cloned().collect(),
+        new: new.difference(&skipped_keys).cloned().collect(),
+        fixed: base
+            .difference(&next)
+            .filter(|key| !skipped_keys.contains(*key))
+            .cloned()
+            .collect(),
         warnings,
     })
 }

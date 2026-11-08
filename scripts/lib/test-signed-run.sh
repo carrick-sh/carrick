@@ -155,7 +155,6 @@ test_signed_run_tests_isolated() {
         index=$((index + 1))
         local tid="$run_id-b$exe_index-t$index"
         if [ "$budget_end" -gt 0 ] && [ "$(date +%s)" -ge "$budget_end" ]; then
-            echo "test $name ... FAILED"
             echo "test-signed: NOT-RUN $exe $name (binary budget of ${binary_deadline_secs}s spent)" >&2
             test_signed_record_execution "$executable_id" "$name" not-run
             failed=1
