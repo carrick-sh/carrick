@@ -332,6 +332,7 @@ pub enum NativeAdmissionOrigin {
 /// Exact identities captured while the refusing registry/owner is still locked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeAdmissionContention {
+    pub group_lookup: Option<NativeGroupLookup>,
     pub origin: NativeAdmissionOrigin,
     pub binding: ExecutionBinding,
     pub old_record: Option<RecordRef>,
@@ -339,8 +340,32 @@ pub struct NativeAdmissionContention {
     pub conflicting_owner: Option<ExecutionBinding>,
 }
 
+/// Snapshot of the four registry lookups at classification, not at fatal time.
+/// Each pair is `(flags << 32 | task, incarnation)`. Members and records
+/// carry execution generations; groups carry neutral process serials.
+/// Bit 0: index present;
+/// bit 1: downstream lookup present; bit 2: Arc agrees with entry member.
+/// Pairs: members[execution], records[record], groups[group],
+/// groups[by_process[process].group]. Absent identities are zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeGroupLookup(pub [u64; 8]);
+
+pub enum NativeGroupAdmission<'a, M: Clone, C: ProcessContext> {
+    Existing(Arc<NativeProcessRuntime<'a, M, C>>),
+    FreshRoot(Box<NativeGroupLookup>),
+}
+
+impl NativeAdmissionError {
+    pub fn with_group_lookup(mut self, lookup: NativeGroupLookup) -> Self {
+        if let Self::Contended(contention) = &mut self {
+            contention.group_lookup = Some(lookup);
+        }
+        self
+    }
+}
+
 impl NativeAdmissionContention {
-    pub fn fatal_reason(self) -> carrick_el1_abi::EntryBindingFatalReason {
+    pub fn fatal_reason(&self) -> carrick_el1_abi::EntryBindingFatalReason {
         use carrick_el1_abi::EntryBindingFatalReason as R;
         match self.origin {
             NativeAdmissionOrigin::OldRecordRetained => R::AdmissionOldRecordRetained,
@@ -359,7 +384,7 @@ impl NativeAdmissionContention {
 
     /// Lossless compact identities: record ids, incarnations, task ids,
     /// snapshot generations and thread generations. Zero id means absent.
-    pub fn diagnostic_words(self) -> [u64; 8] {
+    pub fn diagnostic_words(&self) -> [u64; 8] {
         let owner = self.conflicting_owner;
         [
             u64::from(self.new_record.id.raw()) << 32
@@ -1990,6 +2015,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .unwrap_or(key);
             return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
+                    group_lookup: None,
                     origin: NativeAdmissionOrigin::RootRegistrationCollision,
                     binding,
                     old_record: state.members.get(&owner).map(|member| member.record),
@@ -2106,6 +2132,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if old_record != reference && signal_record_exists(source.zone, old_record) {
             return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
+                    group_lookup: None,
                     origin: NativeAdmissionOrigin::OldRecordRetained,
                     binding,
                     old_record: Some(old_record),
@@ -2118,6 +2145,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if old_key != key && state.members.contains_key(&key) {
             return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
+                    group_lookup: None,
                     origin: NativeAdmissionOrigin::ExecutionKeyCollision,
                     binding,
                     old_record: Some(old_record),
@@ -2131,6 +2159,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         {
             return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
+                    group_lookup: None,
                     origin: NativeAdmissionOrigin::RecordKeyCollision,
                     binding,
                     old_record: Some(old_record),
@@ -2616,36 +2645,93 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         address: AddressContext<RootGpa>,
         page: &'a ThreadLifecyclePage,
         control: &'a ThreadControlSlot,
-    ) -> Result<Option<Arc<NativeProcessRuntime<'a, M, C>>>, NativeAdmissionError> {
-        if let Ok(runtime) = self.for_entry(source, current, address)
-            && self
-                .for_record(
-                    source.zone,
-                    source
-                        .zone
-                        .slot(source.slot)
-                        .current()
-                        .or_else(|| source.zone.slot(source.slot).host_record())
-                        .map(|record| source.zone.record_ref(record))
-                        .ok_or(NativeProcessError::Stale)?,
-                )
-                .is_some_and(|retained| Arc::ptr_eq(&retained, &runtime))
-        {
-            return Ok(Some(runtime));
-        }
+    ) -> Result<NativeGroupAdmission<'a, M, C>, NativeAdmissionError> {
+        let binding = super::common_entry::execution_binding(current);
+        let key = NativeExecutionKey::new(source.zone, binding, address)?;
+        let record = source
+            .zone
+            .slot(source.slot)
+            .current()
+            .or_else(|| source.zone.slot(source.slot).host_record())
+            .map(|record| source.zone.record_ref(record))
+            .ok_or(NativeProcessError::Stale)?;
         let visible_pid = current.visible_pid().ok_or(NativeProcessError::Stale)?;
-        if control.entry().is_none()
-            && self
-                .group_address(source.zone, address, page, visible_pid)
-                .is_none()
+        let group_key = Self::group_key(source.zone, address, page, visible_pid);
+        // Preserve receipt folding before classification (for_entry's side effect).
+        if let Ok(runtime) = self.for_entry(source, current, address) {
+            drop(runtime);
+        }
         {
-            return Ok(None);
+            let state = self.state.lock();
+            let member = state.members.get(&key);
+            let record_key = state.records.get(&Self::record_key(source.zone, record));
+            let record_member = record_key.and_then(|key| state.members.get(key));
+            let same_runtime = member
+                .zip(record_member)
+                .is_some_and(|(a, b)| Arc::ptr_eq(&a.runtime, &b.runtime));
+            if same_runtime {
+                return Ok(NativeGroupAdmission::Existing(
+                    member.ok_or(NativeProcessError::Stale)?.runtime.clone(),
+                ));
+            }
+            let group = state.groups.get(&group_key);
+            let group_address = group.and_then(|(runtime, process)| runtime.task_binding(*process));
+            if control.entry().is_none() && group_address.is_none() {
+                let process = member
+                    .map(|m| m.process)
+                    .or_else(|| host_admitted_process(key.task.id(), control).ok());
+                let by_process =
+                    process.and_then(|process| state.by_process.get(&(key.carrier, process)));
+                let indexed_group = by_process.and_then(|(group, _)| state.groups.get(group));
+                let pair =
+                    |present: bool, downstream: bool, same: bool, task: u64, generation: u64| {
+                        let flags = u64::from(present)
+                            | (u64::from(downstream) << 1)
+                            | (u64::from(same) << 2);
+                        [flags << 32 | task, generation]
+                    };
+                let m = pair(
+                    member.is_some(),
+                    member.is_some(),
+                    member.is_some(),
+                    member.map_or(0, |_| key.binding().task.raw()),
+                    member.map_or(0, |_| key.binding().generation.raw()),
+                );
+                let r = pair(
+                    record_key.is_some(),
+                    record_member.is_some(),
+                    same_runtime,
+                    record_key.map_or(0, |k| k.binding().task.raw()),
+                    record_key.map_or(0, |k| k.binding().generation.raw()),
+                );
+                let g = pair(
+                    group.is_some(),
+                    group_address.is_some(),
+                    member
+                        .zip(group)
+                        .is_some_and(|(m, (r, _))| Arc::ptr_eq(&m.runtime, r)),
+                    group.map_or(0, |(_, p)| p.id.raw() as u64),
+                    group.map_or(0, |(_, p)| p.serial.raw()),
+                );
+                let b = pair(
+                    by_process.is_some(),
+                    indexed_group.is_some(),
+                    member
+                        .zip(indexed_group)
+                        .is_some_and(|(m, (r, _))| Arc::ptr_eq(&m.runtime, r)),
+                    indexed_group.map_or(0, |(_, p)| p.id.raw() as u64),
+                    indexed_group.map_or(0, |(_, p)| p.serial.raw()),
+                );
+                return Ok(NativeGroupAdmission::FreshRoot(Box::new(
+                    NativeGroupLookup([m[0], m[1], r[0], r[1], g[0], g[1], b[0], b[1]]),
+                )));
+            }
         }
         match self.rehome_entry(source, current, address, page, control)? {
-            Some(runtime) => Ok(Some(runtime)),
+            Some(runtime) => Ok(NativeGroupAdmission::Existing(runtime)),
             None => self
                 .register_thread(source, current, address, page, control)
-                .map(Some),
+                .map(NativeGroupAdmission::Existing),
         }
     }
 
@@ -2824,6 +2910,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             let owner = state.records.get(&record_key).copied().unwrap_or(key);
             return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
+                    group_lookup: None,
                     origin: NativeAdmissionOrigin::ThreadRegistrationCollision,
                     binding,
                     old_record: state.members.get(&owner).map(|member| member.record),
@@ -2900,6 +2987,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
                     .map_err(|_| {
                         NativeAdmissionError::Contended(Box::new(NativeAdmissionContention {
+                            group_lookup: None,
                             origin: NativeAdmissionOrigin::ThreadPendingCustody,
                             binding,
                             old_record: None,
@@ -3778,6 +3866,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             let pending = carrick_el1_abi::NativePendingCustody::try_admit(member.control.clone())
                 .map_err(|_| {
                     NativeAdmissionError::Contended(Box::new(NativeAdmissionContention {
+                        group_lookup: None,
                         origin: NativeAdmissionOrigin::FreshRootPendingCustody,
                         binding,
                         old_record: Some(member.record),

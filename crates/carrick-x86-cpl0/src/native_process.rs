@@ -105,12 +105,14 @@ pub(super) fn admit_root(
             &*(task.metadata.control_slot.load(Ordering::Acquire) as *const ThreadControlSlot),
         )
     };
-    if REGISTRY
-        .admit_existing_group(source, task, address, page, control)?
-        .is_some()
-    {
-        return Ok(());
-    }
+    let lookup = match REGISTRY.admit_existing_group(source, task, address, page, control)? {
+        carrick_el1_linux::native_process_runtime::NativeGroupAdmission::Existing(_) => {
+            return Ok(());
+        }
+        carrick_el1_linux::native_process_runtime::NativeGroupAdmission::FreshRoot(lookup) => {
+            lookup
+        }
+    };
     // The stopped-host x86 bootstrap retains a temporary extra leader count.
     // This fresh launch adapter owns that census; the shared owner never
     // normalizes arbitrary live membership supplied by another execution lane.
@@ -124,7 +126,8 @@ pub(super) fn admit_root(
     }
     let owner = NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
         source, task, page, control, address, address, words,
-    )?;
+    )
+    .map_err(|error| error.with_group_lookup(*lookup))?;
     REGISTRY.register_root(Arc::new(owner), source, task, address)?;
     let binding =
         carrick_el1::isa::x86::context::current_cpu_binding().ok_or(NativeProcessError::Stale)?;
