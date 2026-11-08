@@ -1033,6 +1033,11 @@ pub fn check_image_abi(image: &[u8]) -> Result<ImageHeader, ImageAbiError> {
 /// whose copy differs.
 pub const EL1_ABI_LAYOUT_HASH: u64 = {
     let facts: &[u64] = &[
+        carrick_core_abi::X86_INITIAL_BOOT_VERSION as u64,
+        core::mem::size_of::<carrick_core_abi::X86InitialBootHeader>() as u64,
+        core::mem::size_of::<carrick_core_abi::X86InitialBootRequest>() as u64,
+        core::mem::offset_of!(carrick_core_abi::X86InitialBootHeader, layout_hash) as u64,
+        core::mem::offset_of!(carrick_core_abi::X86InitialBootRequest, layout_hash) as u64,
         EL1_REGION_BASE,
         EL1_REGION_SIZE,
         EL1_IMAGE_SIZE.raw(),
@@ -1276,29 +1281,6 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(InotifyNameCacheEntry, seq) as u64,
         core::mem::offset_of!(InotifyNameCacheEntry, path_bytes) as u64,
     ];
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut i = 0;
-    let txn_end = facts.len() + DESCRIPTOR_TXN_LAYOUT_FACTS.len();
-    let cow_end = txn_end + COW_GRANT_LAYOUT_FACTS.len();
-    while i < cow_end + THREAD_LIFECYCLE_LAYOUT_FACTS.len() {
-        let mut word = if i < facts.len() {
-            facts[i]
-        } else if i < txn_end {
-            DESCRIPTOR_TXN_LAYOUT_FACTS[i - facts.len()]
-        } else if i < cow_end {
-            COW_GRANT_LAYOUT_FACTS[i - txn_end]
-        } else {
-            THREAD_LIFECYCLE_LAYOUT_FACTS[i - cow_end]
-        };
-        let mut b = 0;
-        while b < 8 {
-            hash ^= word & 0xff;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            word >>= 8;
-            b += 1;
-        }
-        i += 1;
-    }
     let boundary_facts = [
         EL1_APERTURE_CONTROL_OFFSET,
         core::mem::size_of::<ApertureControl>() as u64,
@@ -1309,20 +1291,36 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         SERVED_FORWARD_WORK as u64, // effect-free retry differs from an owed commit.
         PortalGrantSlot::PREPARED_SELECTION_STATE,
     ];
-    let mut a = 0;
-    while a < boundary_facts.len() {
-        let mut word = boundary_facts[a];
-        let mut b = 0;
-        while b < 8 {
-            hash ^= word & 0xff;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            word >>= 8;
-            b += 1;
+    hash_layout_facts(&[
+        facts,
+        &DESCRIPTOR_TXN_LAYOUT_FACTS,
+        &COW_GRANT_LAYOUT_FACTS,
+        &THREAD_LIFECYCLE_LAYOUT_FACTS,
+        &boundary_facts,
+    ])
+};
+
+/// Fingerprint ordered layout facts with one shared FNV-1a implementation.
+pub const fn hash_layout_facts(groups: &[&[u64]]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut g = 0;
+    while g < groups.len() {
+        let mut i = 0;
+        while i < groups[g].len() {
+            let mut word = groups[g][i];
+            let mut b = 0;
+            while b < 8 {
+                hash ^= word & 0xff;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                word >>= 8;
+                b += 1;
+            }
+            i += 1;
         }
-        a += 1;
+        g += 1;
     }
     hash
-};
+}
 
 /// Fixed header placed at the beginning of the `carrick-el1` binary image.
 #[repr(C)]
@@ -4563,7 +4561,7 @@ impl Default for InotifyNameCache {
 
 const _: () = {
     assert!(MAX_NAME_CACHE_PATH_LEN == NAME_CACHE_PATH_WORDS * core::mem::size_of::<u64>());
-    assert!(EL1_ABI_LAYOUT_HASH == 0x467db09da4cf61e1);
+
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -4579,6 +4577,20 @@ const _: () = {
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
+    #[test]
+    fn layout_hash_changes_when_any_fact_changes() {
+        let facts = [0, 1, u64::MAX, EL1_ABI_LAYOUT_HASH];
+        let original = hash_layout_facts(&[&facts]);
+        for i in 0..facts.len() {
+            for bit in 0..64 {
+                let mut changed = facts;
+                changed[i] ^= 1 << bit;
+                assert_ne!(original, hash_layout_facts(&[&changed]));
+            }
+        }
+        assert_eq!(original, hash_layout_facts(&[&facts[..2], &facts[2..]]));
+    }
+
     #[test]
     fn fd_map_waiter_does_no_rmw_while_lock_is_observed_held() {
         let word = super::AtomicU32::new(1);
