@@ -43,6 +43,16 @@ fn serial_host_native_fork_exec_child_readlink_exe() {
     fork_exec_probe(None, u32::MAX as u64, None, true);
 }
 
+#[test]
+fn serial_host_native_readlink_copyout_busy_once_then_success() {
+    fork_exec_probe_copy(None, u32::MAX as u64, None, true, Some(NativeProcessError::Busy));
+}
+
+#[test]
+fn serial_host_native_readlink_copyout_fault_returns_errno_14() {
+    fork_exec_probe_copy(None, u32::MAX as u64, None, true, Some(NativeProcessError::Fault));
+}
+
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
     fork_exec_successor_with_metadata(futex, bitset, None);
 }
@@ -64,6 +74,16 @@ fn fork_exec_probe(
     bitset: u64,
     metadata: Option<super::pipe_metadata_tests::Case>,
     readlink: bool,
+) {
+    fork_exec_probe_copy(futex, bitset, metadata, readlink, None);
+}
+
+fn fork_exec_probe_copy(
+    futex: Option<u64>,
+    bitset: u64,
+    metadata: Option<super::pipe_metadata_tests::Case>,
+    readlink: bool,
+    copy_error: Option<NativeProcessError>,
 ) {
     let counters = carrick_el1_abi::Counters::new();
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -551,6 +571,7 @@ fn fork_exec_probe(
             let selected = fixture.zone.slot(fixture.slot).current().unwrap();
             let binding =
                 unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+            service.child_copy_error = copy_error;
             let mut entry = runtime
                 .enter_registered(
                     registry,
@@ -561,6 +582,55 @@ fn fork_exec_probe(
                     &mut service,
                 )
                 .unwrap();
+            if copy_error == Some(NativeProcessError::Busy) {
+                assert!(matches!(
+                    entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+                    NativeResume::Left(None)
+                ));
+                // resume_checkpoint authenticates and consumes its handoff.
+                drop(entry);
+                assert!(
+                    crate::native_process_runtime::host_test_support::take_signal_copies()
+                        .is_empty()
+                );
+                service.child_copy_error = None;
+                let selector = fixture.task.service_notice.take().unwrap().unwrap();
+                let member = fixture.zone.record(selector.record.id).identity();
+                // SAFETY: the fixture retains this exact parked member.
+                let control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
+                let ticket = unsafe {
+                    ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, member)
+                }
+                .unwrap();
+                assert!(matches!(
+                    ticket.request().operation,
+                    carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+                ));
+                assert!(ticket.complete(true).is_ok());
+                fixture
+                    .zone
+                    .object_wait(
+                        carrick_sched_core::object_wait::ObjectWaitKey::native_service(
+                            selector.record,
+                        )
+                        .unwrap(),
+                        &ShortLockSpin,
+                    )
+                    .unwrap()
+                    .notify_object(fixture.slot, &mut Default::default())
+                    .unwrap();
+                activate_target(source, &fixture.task, &successor);
+                entry = runtime
+                    .enter_registered(
+                        registry,
+                        source,
+                        &fixture.task,
+                        successor.address,
+                        &successor.words,
+                        &mut service,
+                    )
+                    .unwrap();
+            }
             let NativeResume::Returned(result) = entry.resume_checkpoint(|_| Ok(None)).unwrap()
             else {
                 panic!("readlink reply");
@@ -633,15 +703,23 @@ fn fork_exec_probe(
     };
     if readlink {
         assert_eq!(
-            call_full(78, (-100i64) as u64, memory.arg(), memory.arg() + 512, 128),
-            16
+            call_full(78, (-100i64) as u64, memory.arg(), memory.arg() + 512, 128) as i64,
+            if copy_error == Some(NativeProcessError::Fault) {
+                -14
+            } else {
+                16
+            }
         );
         assert_eq!(
             crate::native_process_runtime::host_test_support::take_signal_copies(),
-            vec![(
-                UserVa::new(memory.arg() + 512),
-                b"/bin/pipe-writer".to_vec()
-            )]
+            if copy_error == Some(NativeProcessError::Fault) {
+                vec![]
+            } else {
+                vec![(
+                    UserVa::new(memory.arg() + 512),
+                    b"/bin/pipe-writer".to_vec(),
+                )]
+            }
         );
         assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
         registry.unregister_root_for_test(&runtime);

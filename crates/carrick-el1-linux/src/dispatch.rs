@@ -1230,7 +1230,10 @@ fn native_host_file_return(
             },
             carrick_el1_abi::RefusalVenue::Ring,
         );
-        if let Some(served) = counters.served.get(ordinal.raw() as usize) {
+        // The exact readlink family already counted the served handoff.
+        if ordinal.raw() != carrick_personality_linux::crossing::nr::READLINKAT.raw()
+            && let Some(served) = counters.served.get(ordinal.raw() as usize)
+        {
             served.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1266,9 +1269,8 @@ fn arm_native_service_exit(
     ) {
         return None;
     }
-    // Only a fork child's execve and execveat are staged for the native exec
-    // service; a root's exec keeps the host route and its live cwd,
-    // credentials, executable and descriptor table.
+    // A host-served root retains its exec and executable-link dispatcher.
+    // Descendants use their own MM custody through the native services.
     if (frame.esr >> 26) & 0x3f == 0x15
         && matches!(frame.x[8], 221 | 281)
         && !arm_process_call_claimed(frame.x[8], 0, || arm_thread_group_owner(zone, task, page))
@@ -1279,6 +1281,13 @@ fn arm_native_service_exit(
                 Some(refuse_unclaimed_native_syscall(frame, counters))
             }
         };
+    }
+    if (frame.esr >> 26) & 0x3f == 0x15
+        && frame.x[8] == carrick_personality_linux::crossing::nr::READLINKAT.raw()
+        && unclaimed_native_syscall(arm_thread_group_owner(zone, task, page))
+            == UnclaimedNativeSyscall::HostRoute
+    {
+        return None;
     }
     let child = || {
         arm_thread_group_owner(zone, task, page)
@@ -2605,11 +2614,9 @@ impl<
         )
     }
     fn native_host_file(&mut self) -> FamilyCompletion {
-        if self
-            .process
-            .as_deref()
-            .is_some_and(|process| process.owns_descriptor_namespace())
-        {
+        if self.process.as_deref().is_some_and(|process| {
+            !process.is_root_process() && process.owns_descriptor_namespace()
+        }) {
             FamilyCompletion::NativeHostFile
         } else {
             FamilyCompletion::Forward

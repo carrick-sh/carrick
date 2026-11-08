@@ -1371,6 +1371,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("usr/bin/true", root.join("launch")).unwrap();
         let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(root).unwrap();
         let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
@@ -1379,13 +1380,13 @@ mod tests {
         let files = dispatcher.capture_exec_files(&context).unwrap();
         let loader = ExecLoaderCapabilities::capture(&dispatcher);
         drop(context);
-        for spelling in ["/usr/bin/true", "/bin/true", "usr/bin/true"] {
+        for spelling in ["/usr/bin/true", "/bin/true", "usr/bin/true", "/launch"] {
             load_execve_image(&loader, &files, spelling, vec![], vec![], false)
                 .unwrap_or_else(|errno| panic!("host-owned exec of {spelling}: errno {errno:?}"));
         }
 
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
-        for spelling in ["/usr/bin/true", "/bin/true", "usr/bin/true"] {
+        for spelling in ["/usr/bin/true", "/bin/true", "usr/bin/true", "/launch"] {
             let payload = sealed(
                 native_exec_payload(carrick_core_abi::service::ExecCall::Execve, spelling),
                 0,
