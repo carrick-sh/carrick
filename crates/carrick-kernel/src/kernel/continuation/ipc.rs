@@ -585,12 +585,18 @@ fn complete_poll<M: carrick_guest_mem::CurrentMmMemory>(
                 });
             }
         };
-        if output.commit([&bytes[offset..offset + length]]).is_err() {
+        let (landed, effect) = output.commit_retaining([&bytes[offset..offset + length]]);
+        if landed.is_err() {
+            drop(effect);
             finish(region, token, wake)?;
             return Ok(complete(LINUX_EFAULT.guest_retval()));
         }
         op.progress.written += length as u64;
-        region.update_operation(&token, op)?;
+        // As for HostCopy::land below, terminal publication must not pass
+        // the guest write before its retained cursor is published.
+        let updated = region.update_operation(&token, op);
+        drop(effect);
+        updated?;
     }
     finish(region, token, wake)?;
     Ok(complete(op.result))
