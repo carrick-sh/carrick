@@ -5384,6 +5384,182 @@ mod tests {
         )
     }
 
+    /// Production entry, including the scheduler venue required to retain a
+    /// not-ready zone wait. Test buffers are real guarded user allocations.
+    fn dispatch_zone_poll(w: &mut World, frame: &mut TrapFrame) -> CompletionRoute {
+        let tables = delegated();
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        // The real trap frame indexes the carrier's whole per-slot array.
+        let tasks: [_; 4] = core::array::from_fn(|_| CurrentTask::new());
+        let task = &tasks[SLOT.index()];
+        task.set(
+            El1TaskId::from_linux_tid(101),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            w.task.linux.file_table.load(Ordering::Acquire),
+        );
+        task.mm.key.store(MM, Ordering::Relaxed);
+        task.mm.thread_generation.store(1101, Ordering::Relaxed);
+        crate::dispatch::dispatch_syscall_with_native::<
+            _,
+            FakeCpu,
+            HardwareUserWord,
+            _,
+            carrick_sched_core::Aarch64ParkedContext,
+        >(
+            frame,
+            w.counters,
+            &tasks,
+            &tables.fd_map,
+            &tables.objects,
+            &tables.opens,
+            &[],
+            &tables.names,
+            Some(crate::dispatch::Zone {
+                tables: &w.zone,
+                cpu: &mut w.cpu,
+                user: &HardwareUserWord,
+            }),
+            Some(&venue),
+            None,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        )
+    }
+
+    fn zone_ppoll(fds: &GuestUserBuffer, timeout: Option<&GuestUserBuffer>) -> TrapFrame {
+        let mut frame = syscall(73, 0, 0, 0, A_SVC);
+        frame.x[0] = fds.arg();
+        frame.x[1] = 1;
+        frame.x[2] = timeout.map_or(0, GuestUserBuffer::arg);
+        frame
+    }
+
+    #[test]
+    fn production_zone_ppoll_ignores_negative_fd() {
+        let mut w = world();
+        let _table = w.table(w.a_tid);
+        let fds = GuestUserBuffer::from_value(PollFd {
+            fd: -1,
+            events: LINUX_POLLIN,
+            revents: 0x7777,
+        });
+        let timeout = zero_timespec();
+        let mut frame = zone_ppoll(&fds, Some(&timeout));
+        assert_eq!(
+            dispatch_zone_poll(&mut w, &mut frame),
+            CompletionRoute::Served
+        );
+        assert_eq!(frame.x[0], 0);
+        assert_eq!(revents(&fds, 0), 0);
+    }
+
+    #[test]
+    fn production_zone_ppoll_events_zero_parks_until_writer_close() {
+        let mut w = world();
+        let table = w.table(w.a_tid);
+        let (read, write, _) = w.pipe(table, BLOCK);
+        let fds = GuestUserBuffer::from_value(PollFd {
+            fd: read,
+            events: 0,
+            revents: 0x7777,
+        });
+        let mut frame = zone_ppoll(&fds, None);
+        w.map.publish(w.a_tid, table.to_raw()).unwrap();
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        w.queue(w.a_tid, MM, &frame, A_SVC);
+        let record = w.zone.switch_in_full(SLOT).unwrap().record;
+        w.queue(
+            202,
+            MM,
+            &syscall(SYS_READ, read, 0x30000, 65536, B_SVC),
+            B_SVC,
+        );
+        assert!(matches!(
+            dispatch_zone_poll(&mut w, &mut frame),
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert!(w.zone.record(record).has_object_operation());
+        assert_eq!(revents(&fds, 0), 0x7777);
+        w.host_close(table, write);
+        w.zone.clear_current(SLOT);
+        assert!(w.zone.switch_in_full(SLOT).is_some());
+        w.task.execution.task.store(w.a_tid, Ordering::Relaxed);
+        w.task.mm.thread_generation.store(1101, Ordering::Relaxed);
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        frame = zone_ppoll(&fds, None);
+        assert_eq!(
+            dispatch_zone_poll(&mut w, &mut frame),
+            CompletionRoute::Served
+        );
+        assert_eq!(frame.x[0], 1);
+        assert_ne!(
+            revents(&fds, 0) & super::super::file_table::LINUX_POLLHUP,
+            0
+        );
+    }
+
+    #[test]
+    fn production_zone_ppoll_full_writer_with_both_interests_wakes_on_drain() {
+        let mut w = world();
+        let table = w.table(w.a_tid);
+        let (read, write, _) = w.pipe(table, BLOCK);
+        w.mem.write(MM, 0x10000, &std::vec![1; 65536]);
+        let mut write_frame = syscall(SYS_WRITE, write, 0x10000, 65536, A_SVC);
+        assert_eq!(
+            (w.call(&mut write_frame), write_frame.x[0]),
+            (RETURNED, 65536)
+        );
+        let fds = GuestUserBuffer::from_value(PollFd {
+            fd: write,
+            events: LINUX_POLLIN | LINUX_POLLOUT,
+            revents: 0x7777,
+        });
+        let mut frame = zone_ppoll(&fds, None);
+        w.map.publish(w.a_tid, table.to_raw()).unwrap();
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        w.queue(w.a_tid, MM, &frame, A_SVC);
+        let record = w.zone.switch_in_full(SLOT).unwrap().record;
+        w.queue(
+            202,
+            MM,
+            &syscall(SYS_READ, read, 0x30000, 65536, B_SVC),
+            B_SVC,
+        );
+        assert!(matches!(
+            dispatch_zone_poll(&mut w, &mut frame),
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert!(w.zone.record(record).has_object_operation());
+        w.map.publish(202, table.to_raw()).unwrap();
+        w.task.execution.task.store(202, Ordering::Relaxed);
+        w.task.mm.thread_generation.store(1202, Ordering::Relaxed);
+        w.task.linux.file_table.store(202, Ordering::Relaxed);
+        w.mem.map(MM, 0x30000, 65536);
+        let mut drain = syscall(SYS_READ, read, 0x30000, 65536, B_SVC);
+        assert_eq!((w.call(&mut drain), drain.x[0]), (RETURNED, 65536));
+        // Remove the peer's running claim before selecting the notified waiter.
+        w.zone.clear_current(SLOT);
+        assert!(
+            w.zone.switch_in_full(SLOT).is_some(),
+            "drain must wake the writer lane"
+        );
+        w.task.execution.task.store(w.a_tid, Ordering::Relaxed);
+        w.task.mm.thread_generation.store(1101, Ordering::Relaxed);
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        frame = zone_ppoll(&fds, None);
+        assert_eq!(
+            dispatch_zone_poll(&mut w, &mut frame),
+            CompletionRoute::Served
+        );
+        assert_eq!(frame.x[0], 1);
+        assert_ne!(revents(&fds, 0) & LINUX_POLLOUT, 0);
+    }
+
     /// A ppoll set: one ready eventfd first, then negative (ignored) entries.
     fn eventfd_set(event: i32, nfds: usize) -> GuestUserBuffer {
         let mut fds = std::vec![
