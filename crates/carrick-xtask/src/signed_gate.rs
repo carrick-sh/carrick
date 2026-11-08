@@ -811,6 +811,8 @@ const BASE_RECEIPT: &str = "base.json";
 const BASE_DIR: &str = "base";
 /// Acceptance exit status recorded by the trusted executor for each run.
 const ACCEPT_EXIT: &str = "accept-exit.json";
+/// Sealed record of the base evidence, written after the candidate run.
+const BASE_SEAL: &str = "base-seal.json";
 
 /// One side of a paired execution, as the pairing hands it to the runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -879,6 +881,7 @@ pub fn execute_pair(
     mut run: impl FnMut(&PairedRun) -> Result<(), ReceiptError>,
 ) -> Result<(), ReceiptError> {
     let result = (|| {
+        let mut sealed = None;
         if request.kind != RequestKind::Main {
             let base_dir = output.join(BASE_DIR);
             fs::create_dir_all(&base_dir).map_err(|e| fail(e.to_string()))?;
@@ -893,18 +896,152 @@ pub fn execute_pair(
             // spending a candidate run on a comparison that cannot pass.
             let receipt = load(&base_dir.join(BASE_RECEIPT))?;
             admit_paired_base(&receipt, accept_exit(&base_dir)?)?;
+            // Seal the base now, before any candidate code runs. The
+            // expected inventory lives only in this process's memory.
+            sealed = Some((base_dir.clone(), evidence_inventory(&base_dir)?));
         }
         run(&PairedRun {
             commit: request.sha.clone(),
             fixture_publisher: request.sha.clone(),
             output: output.to_path_buf(),
             receipt_name: CANDIDATE_RECEIPT,
-        })
+        })?;
+        if let Some((base_dir, files)) = sealed {
+            // The candidate run, including its worktree cleanup, is over:
+            // the base evidence must be byte-for-byte what was sealed.
+            verify_inventory(&base_dir, &files)?;
+            let record = BaseSeal {
+                base: request.base.clone(),
+                files,
+            };
+            write_fresh(
+                &output.join(BASE_SEAL),
+                serde_json::to_vec_pretty(&record).map_err(|e| fail(e.to_string()))?,
+            )?;
+        }
+        Ok::<_, ReceiptError>(())
     })();
     if let Err(error) = &result {
         write(&output.join("execution-error.txt"), error.to_string())?;
     }
     result
+}
+
+/// The paired base's evidence as sealed by the trusted executor between the
+/// base run and the candidate run. Publication compares it with what it loads.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaseSeal {
+    base: String,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+/// SHA-256 of every regular file under `dir`, keyed by `/`-separated relative
+/// path. Symlinks and other special files are refused, never followed.
+fn evidence_inventory(
+    dir: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, ReceiptError> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        files: &mut std::collections::BTreeMap<String, String>,
+    ) -> Result<(), ReceiptError> {
+        let seal = |message: String| fail(format!("base evidence seal: {message}"));
+        let entries = fs::read_dir(dir).map_err(|e| seal(format!("{}: {e}", dir.display())))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| seal(format!("{}: {e}", dir.display())))?
+                .path();
+            let kind = fs::symlink_metadata(&path)
+                .map_err(|e| seal(format!("{}: {e}", path.display())))?
+                .file_type();
+            if kind.is_dir() {
+                walk(root, &path, files)?;
+                continue;
+            }
+            if !kind.is_file() {
+                return Err(seal(format!("{} is not a regular file", path.display())));
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| seal(e.to_string()))?
+                .components()
+                .map(|c| {
+                    c.as_os_str()
+                        .to_str()
+                        .ok_or_else(|| seal(format!("non-UTF-8 path {}", path.display())))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join("/");
+            let digest = crate::provision::compute_sha256(&path)
+                .map_err(|e| seal(format!("{}: {e}", path.display())))?;
+            files.insert(relative, digest);
+        }
+        Ok(())
+    }
+    let mut files = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut files)?;
+    Ok(files)
+}
+
+/// Refuse changed, missing or added files relative to a sealed inventory.
+fn verify_inventory(
+    dir: &Path,
+    sealed: &std::collections::BTreeMap<String, String>,
+) -> Result<(), ReceiptError> {
+    let current = evidence_inventory(dir)?;
+    let mut problems = Vec::new();
+    for (path, digest) in sealed {
+        match current.get(path) {
+            None => problems.push(format!("missing {path}")),
+            Some(now) if now != digest => problems.push(format!("changed {path}")),
+            Some(_) => {}
+        }
+    }
+    problems.extend(
+        current
+            .keys()
+            .filter(|path| !sealed.contains_key(*path))
+            .map(|path| format!("added {path}")),
+    );
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(fail(format!(
+            "base evidence seal: base evidence differs from its seal: {}",
+            problems.join(", ")
+        )))
+    }
+}
+
+/// Check the published paired base against the executor's sealed record.
+fn verify_base_seal(results: &Path, base: &str) -> Result<(), ReceiptError> {
+    let record: BaseSeal = read_json(&results.join(BASE_SEAL))
+        .and_then(|value| serde_json::from_value(value).map_err(|e| fail(e.to_string())))
+        .map_err(|error| fail(format!("base evidence seal: {error}")))?;
+    if record.base != base {
+        return Err(fail(format!(
+            "base evidence seal: record names base {}, request names {base}",
+            record.base
+        )));
+    }
+    verify_inventory(&results.join(BASE_DIR), &record.files)
+}
+
+/// Replace whatever is at `path` (including a planted symlink) with a new file.
+fn write_fresh(path: &Path, data: impl AsRef<[u8]>) -> Result<(), ReceiptError> {
+    use std::io::Write;
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(fail(format!("{}: {error}", path.display()))),
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(data.as_ref()))
+        .map_err(|e| fail(format!("{}: {e}", path.display())))
 }
 
 /// Build, accept and independently inspect one commit in a fresh detached
@@ -1106,6 +1243,7 @@ fn publish(
             (candidate.clone(), Ok(()))
         } else {
             let dir = results.join(BASE_DIR);
+            verify_base_seal(results, &request.base)?;
             let base = load(&dir.join(BASE_RECEIPT))?;
             admit_paired_base(&base, accept_exit(&dir)?)?;
             let evidence = admit_evidence(&dir, &base).map(|_| ());
