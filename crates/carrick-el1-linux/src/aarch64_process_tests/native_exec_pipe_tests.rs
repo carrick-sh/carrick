@@ -1,4 +1,7 @@
 //! Production native fork/exec successors retain IPC and memory-wait custody.
+//! Executable-link cases here are dispatch/copyout controls with supplied
+//! physical custody; real executable population witnesses are in
+//! carrick-conformance-next/tests/native_exe_lifecycle.rs.
 use super::*;
 use crate::native_process_runtime::{NativeResume, NativeServiceCall, host_test_support::Physical};
 use crate::sched::LinuxSchedEntry;
