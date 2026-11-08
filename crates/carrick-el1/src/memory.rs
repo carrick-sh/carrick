@@ -15,7 +15,7 @@ use carrick_mmu_core::aarch64::{
 use carrick_personality_linux::mm::LinuxReservationPolicy;
 #[cfg(test)]
 use carrick_sched_core::AddressSpaces;
-use carrick_sched_core::spaces::notification::SpaceAccess;
+use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceWaitCause};
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
@@ -865,7 +865,7 @@ impl AnonymousRetirementEditor for HardwareAnonymousEditor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegatedAnonymous {
     /// No effect occurred; park the unchanged syscall on its exact MM queue.
-    PreparedConflict,
+    Contended(SpaceWaitCause),
     /// No admitted root owns this MM's anonymous memory: the caller keeps its
     /// pre-delegation path, unchanged.
     NotDelegated,
@@ -1006,14 +1006,19 @@ pub fn serve_delegated_anonymous<
         DelegatedAnonymous::Forward
     };
     use carrick_el1_abi::AnonymousLeave as Leave;
-    // Busy: the host venue holds the root; it serves the syscall itself.
-    let Ok(mut model) = table.lock_in(
+    // A competing owner holds the root. Retain the syscall for this MM's
+    // release notification; a native child has no host venue to forward to.
+    let mut model = match table.lock_in(
         spaces,
         index.index(),
         mm,
         frame.slot().map_or(u32::MAX, |slot| slot.index() as u32),
-    ) else {
-        return forward(Leave::RootBusy);
+    ) {
+        Ok(model) => model,
+        Err(reservations::Refusal::Busy) => {
+            return DelegatedAnonymous::Contended(SpaceWaitCause::Reservations);
+        }
+        Err(_) => return forward(Leave::RootUnavailableStale),
     };
     let decision = decide_reservation_syscall(frame, current, &mut model, file);
     // Node exhaustion is a metadata-capacity request, not a refusal of the
@@ -1028,12 +1033,20 @@ pub fn serve_delegated_anonymous<
         decision,
         ReservationDisposition::Unavailable(reservations::Refusal::MetadataRequired)
     ) {
+        // A root pending edit has a per-MM release. Global bank publication
+        // currently has no Metadata producer on that source; do not park it.
+        let pending_edit = model.pending().is_some();
         if let Err(refusal) = model.provision_metadata(&crate::alloc::GLOBAL_ALLOCATOR) {
-            return forward(match refusal {
-                reservations::Refusal::Busy => Leave::RootUnavailableBusy,
-                reservations::Refusal::MetadataRequired => Leave::RootUnavailableMetadataRequired,
-                _ => Leave::RootUnavailableStale,
-            });
+            return match refusal {
+                reservations::Refusal::Busy if pending_edit => {
+                    DelegatedAnonymous::Contended(SpaceWaitCause::PendingEdit)
+                }
+                reservations::Refusal::Busy => forward(Leave::RootUnavailableBusy),
+                reservations::Refusal::MetadataRequired => {
+                    forward(Leave::RootUnavailableMetadataRequired)
+                }
+                _ => forward(Leave::RootUnavailableStale),
+            };
         }
         model = match table.lock_in(
             spaces,
@@ -1042,7 +1055,10 @@ pub fn serve_delegated_anonymous<
             frame.slot().map_or(u32::MAX, |slot| slot.index() as u32),
         ) {
             Ok(model) => model,
-            Err(_) => return forward(Leave::RootBusy),
+            Err(reservations::Refusal::Busy) => {
+                return DelegatedAnonymous::Contended(SpaceWaitCause::Reservations);
+            }
+            Err(_) => return forward(Leave::RootUnavailableStale),
         };
         decide_reservation_syscall(frame, current, &mut model, file)
     } else {
@@ -1055,14 +1071,18 @@ pub fn serve_delegated_anonymous<
         }
         ReservationDisposition::Forward => return forward(Leave::RootDeclined),
         ReservationDisposition::Unavailable(reservations::Refusal::PreparedConflict) => {
-            return DelegatedAnonymous::PreparedConflict;
+            return DelegatedAnonymous::Contended(SpaceWaitCause::PreparedOverlap);
         }
         ReservationDisposition::Unavailable(refusal) => {
-            return forward(match refusal {
-                reservations::Refusal::Busy => Leave::RootUnavailableBusy,
-                reservations::Refusal::MetadataRequired => Leave::RootUnavailableMetadataRequired,
-                _ => Leave::RootUnavailableStale,
-            });
+            return match refusal {
+                reservations::Refusal::Busy => {
+                    DelegatedAnonymous::Contended(SpaceWaitCause::PendingEdit)
+                }
+                reservations::Refusal::MetadataRequired => {
+                    forward(Leave::RootUnavailableMetadataRequired)
+                }
+                _ => forward(Leave::RootUnavailableStale),
+            };
         }
         ReservationDisposition::Work(pending) => pending,
     };
@@ -1081,9 +1101,24 @@ pub fn serve_delegated_anonymous<
     ) else {
         return refuse(pending, &mut model, Leave::NoGrant);
     };
-    let Some(_editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
-        return refuse(pending, &mut model, Leave::EditorBusy);
-    };
+    let _editor_guard =
+        match spaces
+            .table()
+            .try_begin_edit_cause(index, mm_key, owner, spaces.venue())
+        {
+            Ok(editor_guard) => editor_guard,
+            Err(carrick_sched_core::spaces::EditAdmissionRefusal::Editor) => {
+                let _ = pending.cancel(&mut model);
+                return DelegatedAnonymous::Contended(SpaceWaitCause::Editor);
+            }
+            Err(carrick_sched_core::spaces::EditAdmissionRefusal::Gate) => {
+                let _ = pending.cancel(&mut model);
+                return DelegatedAnonymous::Contended(SpaceWaitCause::Gate);
+            }
+            Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => {
+                return refuse(pending, &mut model, Leave::RootUnavailableStale);
+            }
+        };
     editor.bind_operation(request.sequence);
     let (va, len) = (request.range.start(), request.range.len());
     if request.operation == carrick_el1_abi::ReservationOperation::Move {
