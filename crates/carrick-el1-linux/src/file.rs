@@ -180,6 +180,7 @@ pub(crate) struct CopyDiagnostic<'a> {
     pub counters: &'a carrick_el1_abi::Counters,
     pub ordinal: carrick_syscall_abi::CanonicalNr,
     pub arguments: [u64; 6],
+    pub pc: u64,
     pub presented: Option<carrick_el1_abi::ExecutionBinding>,
     pub expected: Option<carrick_el1_abi::ExecutionBinding>,
 }
@@ -194,6 +195,8 @@ impl CopyDiagnostic<'_> {
         self.counters
             .record_copy_refusal(carrick_el1_abi::CopyRefusal {
                 ordinal: self.ordinal,
+                arguments: self.arguments,
+                pc: self.pc,
                 address,
                 len,
                 argument: self.arguments.iter().position(|&arg| arg == address.raw()),

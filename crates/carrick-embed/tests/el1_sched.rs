@@ -4074,6 +4074,9 @@ fn prepared_fork_copy_refusals() -> String {
     counters
         .write_copy_refusals(&mut rows)
         .expect("write to String");
+    counters
+        .write_syscall_frames(&mut rows)
+        .expect("write to String");
     rows
 }
 
