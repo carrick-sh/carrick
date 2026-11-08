@@ -3460,12 +3460,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     self.entry(entry_id).sibling.load(Ordering::Relaxed),
                     Ordering::Relaxed,
                 );
-                if rec.entry_count.fetch_sub(1, Ordering::Relaxed) == 1 {
-                    if let Some(record) =
+                if rec.entry_count.fetch_sub(1, Ordering::Relaxed) == 1
+                    && let Some(record) =
                         RecordId::from_raw(self.entry(entry_id).record.load(Ordering::Relaxed))
-                    {
-                        self.timers.cancel_record(record);
-                    }
+                {
+                    self.timers.cancel_record(record);
                 }
                 break;
             }

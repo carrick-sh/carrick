@@ -787,13 +787,14 @@ impl HvpatchRuntimeDirectory {
         let zone = carrick_el1_abi::zone_tables().ok_or_else(|| {
             RuntimeError::Configuration("native deadline zone unavailable".into())
         })?;
-        let deadlines = crate::deadline_driver::DeadlineDriver::start(Arc::new(
-            super::zone::NativeDeadlineTarget {
-                zone,
-                _mapping: Box::new(authority.clone()),
-            },
-        ))
-        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let target = super::zone::NativeDeadlineTarget::new(zone, Box::new(authority.clone()))
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "native deadline counter calibration unavailable".into(),
+                )
+            })?;
+        let deadlines = crate::deadline_driver::DeadlineDriver::start(Arc::new(target))
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let deadline_changed = deadlines.notifier();
         let scheduler = Arc::downgrade(&services.scheduler);
         carrick_kernel::el1_zone::register_handback_publisher(Arc::new(move |event| {
@@ -870,7 +871,12 @@ impl HvpatchRuntimeDirectory {
             .shutdown()
             .map(|_| ())
             .map_err(|error| RuntimeError::Configuration(error.to_string()));
-        self.native_deadlines.lock().take();
+        let deadlines = self
+            .native_deadlines
+            .lock()
+            .take()
+            .map_or(Ok(()), |driver| driver.shutdown())
+            .map_err(|error| RuntimeError::Configuration(error.to_string()));
         *self.continuation_wait_service.lock() = None;
         *self.scheduler.lock() = None;
         for endpoint in self.endpoints.lock().values_mut() {
@@ -882,7 +888,7 @@ impl HvpatchRuntimeDirectory {
         // the affected descriptions.
         carrick_kernel::el1_delegation::recall_all_delegated();
         carrick_kernel::el1_delegation::clear_el1_region_host_ptr();
-        result
+        result.and(deadlines)
     }
 
     /// Bind the kernel the runner's liveness invariant observes. Idempotent
