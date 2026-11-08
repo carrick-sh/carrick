@@ -1021,10 +1021,8 @@ enum NativeServiceStage {
     Operation,
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 struct HostFileCopy<'a, V: file::MemoryValidator>(file::ValidatedCopy<'a, V>);
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::HostFileUser
     for HostFileCopy<'_, V>
 {
@@ -1034,6 +1032,20 @@ impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::Host
     fn writable(&mut self, dst: u64, len: usize) -> usize {
         self.0.validator.writable_bytes(dst, len)
     }
+}
+
+/// Stage an ISA-decoded host-file call against the caller's ring namespace.
+/// Both exception venues use the same validated user-copy implementation;
+/// transports retain the resulting record until its service completes.
+#[inline(never)]
+pub fn stage_native_host_file<V: file::MemoryValidator>(
+    call: carrick_personality_linux::native_host_file::HostFileCall,
+    task: &CurrentTask,
+    validator: &V,
+    namespace: &mut carrick_personality_linux::native_host_file::NativeNamespace<'_>,
+) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
+    let mut user = HostFileCopy(file::ValidatedCopy { task, validator });
+    carrick_personality_linux::native_host_file::stage(call, namespace, &mut user)
 }
 
 /// Route a native SVC through the host-file venue. `None` keeps the call on
@@ -1049,7 +1061,7 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
     mut descriptor: impl FnMut(i32) -> Option<NativeDescriptor>,
     releases: &mut dyn FnMut(&mut [carrick_core_abi::host_file::MapSourceReply]) -> usize,
 ) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
-    use carrick_personality_linux::native_host_file::{HostFileCall, NativeNamespace, stage};
+    use carrick_personality_linux::native_host_file::{HostFileCall, NativeNamespace};
     if (frame.esr >> 26) & 0x3f != 0x15 {
         return None;
     }
@@ -1060,13 +1072,12 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
             frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
         ],
     )?;
-    let mut user = HostFileCopy(file::ValidatedCopy { task, validator });
     let mut namespace = NativeNamespace {
         table,
         resolve: &mut descriptor,
         releases,
     };
-    stage(call, &mut namespace, &mut user)
+    stage_native_host_file(call, task, validator, &mut namespace)
 }
 
 /// The byte sources the caller's reservation owner retired, for the
