@@ -603,6 +603,16 @@ impl NativeSignalFixture {
         process: carrick_core_abi::EntryTaskKey,
         process_birth: carrick_core_abi::BirthSerial,
     ) -> Self {
+        let fixture = Self::admit_host_root(binding, process, process_birth);
+        fixture.runtime.give_fixture_root_a_cwd();
+        fixture
+    }
+
+    fn admit_host_root(
+        binding: ExecutionBinding,
+        process: carrick_core_abi::EntryTaskKey,
+        process_birth: carrick_core_abi::BirthSerial,
+    ) -> Self {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: one aligned allocation owns this zero-valid compact zone for
         // the entire leaked host-test fixture lifetime.
@@ -680,7 +690,6 @@ impl NativeSignalFixture {
             )
             .unwrap(),
         );
-        runtime.give_fixture_root_a_cwd();
         let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
         registry
             .register_root(runtime.clone(), source, task, address)
@@ -3599,11 +3608,12 @@ fn sigkill_wins_over_an_in_progress_native_exec_drain() {
 }
 
 /// Missing cwd is the other access-admission refusal from #1409. Exercise
-/// the real service entry with a non-1 namespace root and no carrier ticket.
+/// the real exec and host-file entries with production host-root admission,
+/// a non-1 namespace root and no carrier ticket.
 #[cfg(test)]
 #[test]
 fn root_exec_access_refusal_is_counted_before_service_publication() {
-    let fixture = NativeSignalFixture::new(
+    let fixture = NativeSignalFixture::admit_host_root(
         ExecutionBinding {
             task: carrick_core_abi::EntryTaskKey::from_raw(7001),
             generation: carrick_core_abi::SnapshotGeneration::INITIAL,
@@ -3615,7 +3625,7 @@ fn root_exec_access_refusal_is_counted_before_service_publication() {
             NonZeroU64::MIN,
         )),
     );
-    let counters = carrick_el1_abi::Counters::new();
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
     let mut service = fixture.service();
     let mut root = fixture
         .runtime
@@ -3645,13 +3655,52 @@ fn root_exec_access_refusal_is_counted_before_service_publication() {
     assert!(!root.is_root_process());
     root.key = admitted_key;
     fixture.runtime.graph.lock().root_key = admitted_key;
-    {
-        let mut graph = fixture.runtime.graph.lock();
-        graph.owner.task_mut(root.key).unwrap().fs = None;
-    }
+    // Production root admission retains host filesystem authority, even
+    // when register_root transfers execution to the native scheduler owner.
+    assert!(root.owns_descriptor_namespace());
+    assert!(
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(root.key)
+            .unwrap()
+            .fs
+            .is_none()
+    );
+    let path = b"/lib/libc.so.6";
+    let mut open =
+        alloc::vec![0u8; carrick_core_abi::host_file::record_len(path.len(), 0).unwrap()];
+    carrick_core_abi::host_file::encode(
+        &mut open,
+        carrick_core_abi::host_file::HostFileHeader {
+            op: carrick_core_abi::host_file::HostFileOp::Openat,
+            table: [1, 1, 1],
+            fd: -100,
+            flags: 0,
+            args: [0; 4],
+        },
+        path,
+        0,
+    )
+    .unwrap();
+    // This is the same shared service entry the CPL0 loader binding needs.
+    // Reject unknown pathname authority before any service can observe the
+    // table selector; neither a guessed cwd nor the serving task may supply it.
+    assert!(matches!(
+        root.begin_host_file_service(open.into_boxed_slice(), None, true, None, false,
+            NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(257), counters)),
+        Ok(NativeResume::Returned(result))
+            if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
+    ));
+    assert_eq!(counters.refused[257].load(Ordering::Relaxed), 1);
+    assert_eq!(counters.refused_child[257].load(Ordering::Relaxed), 0);
+    assert!(root.take_handoff_receipt().is_none());
+    assert!(fixture.task.service_notice.take().unwrap().is_none());
     for ordinal in [221, 281, 600] {
         assert!(matches!(
-            root.begin_exec_service(test_exec_payload(b"/bin/static"), None, NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(ordinal), &counters)),
+            root.begin_exec_service(test_exec_payload(b"/bin/static"), None, NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(ordinal), counters)),
             Ok(NativeResume::Returned(result)) if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
         ));
         let bucket = ordinal.min(512) as usize;
@@ -3664,7 +3713,7 @@ fn root_exec_access_refusal_is_counted_before_service_publication() {
     // A vanished caller is an ordinary ESRCH, not a routing refusal.
     root.calling_tid = u32::MAX;
     assert!(matches!(
-        root.begin_exec_service(test_exec_payload(b"/bin/static"), None, NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), &counters)),
+        root.begin_exec_service(test_exec_payload(b"/bin/static"), None, NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), counters)),
         Ok(NativeResume::Returned(result)) if result.raw() == carrick_syscall_abi::LINUX_ESRCH.guest_retval()
     ));
     assert_eq!(counters.refused[221].load(Ordering::Relaxed), 1);
