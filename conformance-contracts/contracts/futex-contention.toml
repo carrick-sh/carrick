@@ -29,6 +29,7 @@ rationale = "Blocking futex operations must park without redispatch and wake wit
 # crates/carrick-thread/src/thread.rs confirm contention scaling, continuation
 # budgets, and waiter enrollment invariants remain intact.
 vm_free = [
+  "carrick-kernel-example::futex_contention_contract",
   "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::native_futex_mapping_deadline_starts_at_first_attempt_aarch64",
   "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::native_futex_mapping_deadline_starts_at_first_attempt_x86",
   "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::native_futex_word_deadline_starts_at_first_attempt_aarch64",
@@ -37,7 +38,6 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::native_futex_mapping_owner_busy_once_x86",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_futex_atomic_owner_retry_keeps_deadline_and_key_scope",
-  "carrick-kernel-example::futex_contention_contract",
   "carrick-el1-linux::aarch64_process_tests::futex_unbacked_word_waits_for_owner_with_two_live_threads",
   "carrick-el1-linux::aarch64_process_tests::futex_relative_deadline_survives_owner_wait_with_two_live_threads",
   "carrick-el1-linux::aarch64_process_tests::futex_relative_deadline_survives_synchronous_owner_redispatch_with_two_live_threads",
@@ -56,9 +56,9 @@ vm_free = [
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::futex_pi_lock_and_unlock_wait_for_owner_refused_copyout_without_waking_waiters",
 ]
 embed = [
+  "carrick-embed::futex_contention_contract",
   "carrick-vmm-kvm::cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent (production native shared-on-private handshake and clear-tid join)",
   "carrick-vmm-kvm::cpl0_entry::production_native_futex_timeout_returns_etimedout (sole production native wait, exact errno 110, no counted refusal)",
-  "carrick-embed::futex_contention_contract",
 ]
 docker = [
   "probe:futexpingpong",
