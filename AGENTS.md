@@ -538,9 +538,11 @@ verification, the signed evidence and landing.
 - **Review findings are triaged by severity, and only P0s block landing**
   (owner, 2026-11-08, #231; superseding P0s and P1s, 2026-11-03). A reviewer rates every finding:
   - **P0:** a wrong guest-visible result, a crash or hang, data loss, a
-    security hole or a broken invariant;
-  - **P1:** a real defect that will bite, or a missing witness for the
-    change's own claim;
+    security hole, a broken invariant, or **a missing witness for the
+    change's own claim** (no test that drives the production path the PR
+    changes, including a macOS-only path never run on a Mac);
+  - **P1:** a real defect that will bite but isn't the change's own claim
+    (a latent race in an API nothing calls yet, an adjacent capacity limit);
   - **P2:** everything else: improvements, style, wider coverage, adjacent
     gaps.
 
