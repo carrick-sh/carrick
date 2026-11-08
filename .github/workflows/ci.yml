@@ -54,9 +54,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just,sccache@0.18.0
+          tools: just,sccache
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure compiler cache
@@ -126,9 +126,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just,sccache@0.18.0
+          tools: just,sccache
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure compiler cache
@@ -286,9 +286,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just,sccache@0.18.0
+          tools: just,sccache
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure compiler cache
@@ -343,9 +343,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just,sccache@0.18.0
+          tools: just,sccache
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure compiler cache
@@ -488,9 +488,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -517,9 +517,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -560,9 +560,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just,cargo-deny
+          tools: just,cargo-deny
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -588,9 +588,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -658,9 +658,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Fetch and validate probe coverage base commit
         env:
           CI_EVENT: ${{ github.event_name }}
@@ -690,9 +690,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -743,9 +743,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -771,9 +771,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -867,9 +867,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -895,9 +895,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -941,9 +941,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -969,9 +969,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -997,9 +997,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -1028,9 +1028,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1074,9 +1074,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Fetch and validate authority debt base commit
         env:
           CI_EVENT: ${{ github.event_name }}
@@ -1127,9 +1127,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1163,9 +1163,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Fetch and validate authority debt base commit
         env:
           CI_EVENT: ${{ github.event_name }}
@@ -1216,9 +1216,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1249,9 +1249,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain (infrastructure)
         shell: bash
         run: |
@@ -1298,9 +1298,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1336,9 +1336,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain (infrastructure)
         shell: bash
         run: |
@@ -1385,9 +1385,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1418,9 +1418,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain (infrastructure)
         shell: bash
         run: |
@@ -1467,9 +1467,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1500,9 +1500,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain (infrastructure)
         shell: bash
         run: |
@@ -1549,9 +1549,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1581,9 +1581,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -1609,9 +1609,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1680,9 +1680,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -1708,9 +1708,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1746,9 +1746,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -1774,9 +1774,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -1974,9 +1974,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -2002,9 +2002,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -2102,9 +2102,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -2130,9 +2130,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -2222,9 +2222,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -2250,9 +2250,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
@@ -2351,9 +2351,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Detect a run superseded on the same head

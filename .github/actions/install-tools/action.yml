@@ -1,0 +1,51 @@
+name: Install pinned CI tools
+description: >-
+  Install pinned prebuilt CI tools through a SHA-pinned taiki-e/install-action,
+  each invocation in a private HOME, TMPDIR and CARGO_HOME (#1873).
+inputs:
+  tools:
+    description: >-
+      Comma- or space-separated tool names (no versions). Versions come only
+      from the table below; an unknown name fails the step.
+    required: true
+runs:
+  using: composite
+  steps:
+    # The single version table for every workflow tool install. Change a
+    # version here and nowhere else; install-action must list it in the
+    # manifests at the pinned SHA below, because `fallback: none` refuses
+    # source builds.
+    #
+    # Why a private HOME per invocation: install-action downloads into the
+    # fixed `$HOME/.install-action/tmp` and deletes it after extraction, so
+    # two concurrent jobs sharing a HOME (several runner instances under one
+    # account on the self-hosted Macs) truncate, overwrite or delete each
+    # other's download. The private directories live under this job's
+    # RUNNER_TEMP and are set only on the install step, so HOME, TMPDIR and
+    # CARGO_HOME are unchanged for every later step.
+    - name: Resolve pinned tools
+      id: resolve
+      shell: bash
+      env:
+        PINNED_TOOLS: just=1.58.0 cargo-deny=0.20.2 sccache=0.18.0
+        REQUESTED_TOOLS: ${{ inputs.tools }}
+        RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      run: bash "$GITHUB_ACTION_PATH/install-tools.sh" resolve
+    - name: Download pinned tools (private HOME, checksums required)
+      if: steps.resolve.outputs.download != ''
+      uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      env:
+        HOME: ${{ steps.resolve.outputs.home }}
+        TMPDIR: ${{ steps.resolve.outputs.tmpdir }}
+        CARGO_HOME: ${{ steps.resolve.outputs.cargo-home }}
+      with:
+        tool: ${{ steps.resolve.outputs.download }}
+        checksum: "true"
+        fallback: none
+    - name: Verify and publish pinned tools
+      if: steps.resolve.outputs.download != ''
+      shell: bash
+      env:
+        DOWNLOADED_TOOLS: ${{ steps.resolve.outputs.download }}
+        PRIVATE_HOME: ${{ steps.resolve.outputs.home }}
+      run: bash "$GITHUB_ACTION_PATH/install-tools.sh" publish
