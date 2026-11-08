@@ -3423,6 +3423,159 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
     }
 }
 
+/// #1846/#1863 P0 witness: a parked anonymous edit leaves its OWN replay
+/// receipt in the record the host resumes. The IPC adapter arena cannot name
+/// that token, so the record must not attribute it to the adapter — on the HVF
+/// lane that attribution is what makes `EL1 zone resume` manufacture an adapter
+/// handback for a token the adapter never pinned and fail the run with
+/// "IPC operation token is not ours" (`el1_files_exit_group_stress`, 10/10).
+#[test]
+fn parked_anonymous_edit_receipt_is_not_the_adapters_operation() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1::substrate::ipc::from_sched_token;
+    use carrick_el1::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served};
+    use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, Handback, SlotId, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_sched_core::object_wait::OperationToken;
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    use carrick_sched_core::{HostClaim, RecordId, ShortLockSpin};
+
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let _portal = MmPortal::new(NonZeroU64::MIN, region.table(), &zone.spaces, &view)
+        .with_zone(zone)
+        .unwrap();
+    let slot = SlotId::from_index(0).unwrap();
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, mm.raw(), None, 0);
+    assert!(
+        zone.occupancy
+            .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, mm.raw())
+    );
+    zone.enter_guest(slot);
+    let task = CurrentTask::new();
+    task.set(
+        El1TaskId::from_linux_tid(101),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        5,
+    );
+    task.mm.key.store(mm.raw(), Ordering::Release);
+    task.mm.thread_generation.store(1101, Ordering::Release);
+    // The host needs this thread runnable (an exit or control drain): the exact
+    // doorbell that makes the parked edit leave to the host at its boundary.
+    task.linux.mark_pending_host_work();
+    let counters = Counters::default();
+    let tables = Tables::new(ROOT, IPA, 0);
+    let access = crate::sched::object_wait::space_access(zone, slot);
+    let held_editor = access
+        .try_begin_edit(
+            zone.spaces.find(mm.raw()).unwrap(),
+            mm.raw(),
+            NonZeroU64::new(2).unwrap(),
+        )
+        .unwrap();
+    let mut frame = TrapFrame {
+        slot: 0,
+        elr: 0x1004,
+        ..TrapFrame::default()
+    };
+    frame.x[0] = VA;
+    frame.x[1] = 4096;
+    frame.x[8] = 215;
+    let mut editor = ForkAnonymousEditor {
+        arenas: &[&tables],
+        pool: TableWindow {
+            words: tables.words.as_ptr().cast_mut(),
+            physical_base: tables.base,
+            byte_len: tables.words.len() * 8,
+        },
+    };
+    assert_eq!(
+        serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &task,
+            access,
+            region.table(),
+            &mut editor,
+            None,
+        ),
+        DelegatedAnonymous::Contended(SpaceWaitCause::Editor),
+    );
+    let mut cpu = FakeCpu::default();
+    let mut sched = Sched {
+        handoff: None,
+        zone,
+        slot,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: &counters,
+    };
+    assert_eq!(
+        park_anonymous_edit(
+            &mut sched,
+            &mut frame,
+            region.table(),
+            SpaceWaitCause::Editor
+        ),
+        Some(Served::Idle),
+        "the contended edit parks and leaves its thread to the host"
+    );
+
+    let source = zone
+        .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+        .unwrap()
+        .live_notifications()
+        .unwrap();
+    let key = source.key(SpaceWaitCause::Editor);
+    let queue = zone.object_queue_census(key.index()).unwrap();
+    assert_eq!(queue.waiters, 1, "the edit enrolled its own thread");
+    let record = RecordId::from_raw(queue.head).expect("the parked thread is the queue head");
+    let reference = zone.record_ref(record);
+    let parked = zone.record(record);
+    assert!(
+        parked.has_object_operation(),
+        "the park leaves its replay receipt in the record the host resumes"
+    );
+    let census = parked
+        .object_wait_census()
+        .expect("a parked wait always has a census");
+    assert_eq!(census.operation, u64::from(key.index()));
+    assert_eq!(census.operation_generation, key.generation());
+    // The IPC adapter authority cannot name this token: it owns no arena entry,
+    // so an adapter handback for it would be fabricated.
+    let token = OperationToken::new(census.operation, census.operation_generation).unwrap();
+    let identity = token.identity();
+    assert!(
+        from_sched_token(token).is_none(),
+        "an anonymous edit replay is not an IPC operation"
+    );
+    assert!(
+        !parked.has_adapter_operation(),
+        "the record must attribute its receipt to the anonymous edit, not the adapter"
+    );
+    // The drain takes the parked thread back for the host to resume, exactly as
+    // the failing EL1 zone resume does, and releasing the record recycles it.
+    assert_eq!(
+        zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin),
+        HostClaim::Claimed
+    );
+    assert_eq!(parked.entry_count(), 0, "the host claim unlinked the wait");
+    assert!(
+        parked.has_object_operation(),
+        "the receipt is not the host's to answer"
+    );
+    // SAFETY: this fixture owns the claimed record exclusively.
+    let released = unsafe { parked.take_object_operation() }.expect("the receipt is retained");
+    assert_eq!(released.identity(), identity);
+    drop(held_editor);
+    zone.free_record(record);
+    assert!(zone.live(reference).is_none(), "the record recycles");
+}
+
 #[test]
 fn anonymous_contention_then_metadata_provisions_without_park_serial_host() {
     use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
