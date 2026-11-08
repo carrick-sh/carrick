@@ -471,3 +471,20 @@ impl LinuxWaitOptions {
 
 /// Linux 64-bit rusage contains two timevals and fourteen signed counters.
 pub const LINUX_RUSAGE_BYTES: usize = 144;
+
+// Linux memory advice ordinals, shared by host and ring policy.
+pub const LINUX_MADV_NORMAL: u64 = 0;
+pub const LINUX_MADV_RANDOM: u64 = 1;
+pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
+pub const LINUX_MADV_WILLNEED: u64 = 3;
+pub const LINUX_MADV_DONTNEED: u64 = 4;
+pub const LINUX_MADV_FREE: u64 = 8;
+pub const LINUX_MADV_DONTFORK: u64 = 10;
+pub const LINUX_MADV_DOFORK: u64 = 11;
+pub const LINUX_MADV_WIPEONFORK: u64 = 18;
+pub const LINUX_MADV_KEEPONFORK: u64 = 19;
+pub const LINUX_MADV_DONTDUMP: u64 = 16;
+pub const LINUX_MADV_DODUMP: u64 = 17;
+pub const LINUX_MADV_HUGEPAGE: u64 = 14;
+pub const LINUX_MADV_NOHUGEPAGE: u64 = 15;
+pub const LINUX_MADV_COLLAPSE: u64 = 25;
