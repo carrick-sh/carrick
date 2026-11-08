@@ -647,6 +647,12 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
         (pollfd, deadline, None)
     };
 
+    // Negative pollfds do not name an object. The shared poll body clears
+    // revents and handles an all-negative set's timeout without taking a pin.
+    if pollfd.fd < 0 {
+        return IpcServed::Forward;
+    }
+
     let Some(raw_table) = venue.tables.table_of(sched.task) else {
         return IpcServed::Forward;
     };
@@ -710,17 +716,22 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
             return IpcServed::Forward;
         };
-        let lane = if pollfd.events & crate::file_table::LINUX_POLLIN != 0 {
-            WaitFor::Readable
-        } else if pollfd.events & crate::file_table::LINUX_POLLOUT != 0 {
-            WaitFor::Writable
-        } else {
-            if let Some((token, _)) = active.take() {
-                finish(sched, token, region);
-            } else if let Some(pin) = fresh_pin {
-                release_pin(sched, pin, region);
+        // Subscribe to changes of the endpoint, including unconditional HUP
+        // and ERR. A pipe writer cannot become readable: with IN|OUT its
+        // progress depends on the writer lane, which a peer drain notifies.
+        // An eventfd with both interests cannot have both levels clear; when
+        // only output is requested its full counter waits for a read.
+        let lane = match member {
+            EpollMember::PipeReader => WaitFor::Readable,
+            EpollMember::PipeWriter => WaitFor::Writable,
+            EpollMember::EventFd
+                if pollfd.events as u16 as u32
+                    & carrick_el1_abi::ipc::epoll::events::WRITE_SIDE
+                    != 0 =>
+            {
+                WaitFor::Writable
             }
-            return IpcServed::Forward;
+            EpollMember::EventFd => WaitFor::Readable,
         };
         let mut guard = match region.lock(object, &EL1_WAIT) {
             Ok(guard) => guard,
