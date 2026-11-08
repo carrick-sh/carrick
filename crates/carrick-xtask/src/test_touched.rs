@@ -180,12 +180,20 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
     for name in selected {
         println!("test-touched: {name}");
         let Some(records) = by_package.get(&name) else {
-            // Architecture-specific and freestanding crates have no host-test
-            // selection in just test. Report that explicitly, never as a pass.
-            println!(
-                "test-touched: {name}: no just test selection on {}",
-                std::env::consts::OS
-            );
+            let has_tests = meta["packages"]
+                .as_array()
+                .ok_or("missing packages")?
+                .iter()
+                .find(|p| p["name"].as_str() == Some(&name))
+                .and_then(|p| p["targets"].as_array())
+                .is_some_and(|targets| targets.iter().any(|t| t["test"] == true));
+            let reason = format!("{name}: no just test selection on {}", std::env::consts::OS);
+            println!("test-touched: {reason}");
+            if has_tests && !args.plan {
+                failures.push(format!(
+                    "{reason}; required test lane unavailable on this host"
+                ));
+            }
             continue;
         };
         if args.plan {
