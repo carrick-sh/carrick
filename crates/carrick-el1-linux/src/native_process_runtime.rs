@@ -3296,7 +3296,8 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
     }
 }
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
-    #[cfg(test)]
+    // Used only by the metadata-window tests gated off macOS (#1910).
+    #[cfg(all(test, not(target_os = "macos")))]
     pub(super) fn identity_number_reserved(&self, id: TaskId) -> bool {
         self.graph
             .lock()
@@ -3308,7 +3309,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
 
     /// Force cursor wrap without creating or releasing any identity. Tests
     /// still allocate through the production fork entry point.
-    #[cfg(test)]
+    // Used only by the metadata-window tests gated off macOS (#1910).
+    #[cfg(all(test, not(target_os = "macos")))]
     pub(super) fn set_next_identity_for_test(&self, id: TaskId) {
         self.graph
             .lock()
