@@ -120,7 +120,7 @@ fn retired_fork_children_release_cow_pool_grants_across_pool_capacity() {
             "COW grant pool exhausted at fork/exit cycle {cycle}: retired children leaked grants"
         );
         assert_eq!(pool.ready(mm_raw).count(), 1);
-        let absence = SlotAbsence::scan(child_mm, [1u64].into_iter()).unwrap();
+        let absence = SlotAbsence::scan(child_mm, [1u64]).unwrap();
         release_retired_child(&mut memory, &*inventory, &absence).unwrap();
     }
     // SAFETY: initialized above inside the retained carrier region.
