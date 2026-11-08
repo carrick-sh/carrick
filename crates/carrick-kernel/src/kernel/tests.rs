@@ -2237,3 +2237,51 @@ fn production_root_domains_retire(retire_bootstrap: bool) {
         );
     }
 }
+
+#[test]
+fn production_namespaced_roots_grow_local_identity_storage() {
+    use super::{Container, LaunchContext, RunId};
+    use crate::namespace::pid::NsSharedRegion;
+    use carrick_kernel_arena::arena::KernelArena;
+
+    let arena = Box::leak(Box::new(KernelArena::create().unwrap()));
+    let make_container = || {
+        let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "growing-roots",
+        ))));
+        container
+            .install_pid_ns(NsSharedRegion::allocate(arena).unwrap())
+            .unwrap();
+        container
+    };
+    let bootstrap = RootBootstrap::for_prepared_launch(
+        41,
+        ThreadId::synthetic_for_tests(41),
+        "growing-roots".into(),
+        make_container(),
+        Arc::new(carrick_hal::NullHostSignalBridge::default()),
+    )
+    .unwrap();
+    let (kernel, root) = Kernel::bootstrap_root(bootstrap).unwrap();
+    let mut roots = vec![root];
+    for ordinal in 2..=9 {
+        let prepared = kernel.prepare_container_root(
+            ThreadId::synthetic_for_tests(40 + ordinal),
+            None,
+            "growing-roots".into(),
+            make_container(),
+            None,
+        );
+        let prepared = prepared.unwrap_or_else(|error| panic!("prepare root {ordinal}: {error:?}"));
+        roots.push(prepared.commit().unwrap());
+        assert_eq!(kernel.container_count(), ordinal as usize);
+        assert_eq!(kernel.ids().visible_namespace_count(), ordinal as usize);
+        for root in &roots {
+            assert_eq!(
+                crate::namespace::pid::try_ns_self_pid_for(root, root.task().key().id.raw() as u32,),
+                Some(1),
+            );
+        }
+    }
+    assert_eq!(kernel.ids().counts().task_claims, 9);
+}
