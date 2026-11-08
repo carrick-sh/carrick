@@ -12092,12 +12092,6 @@ fn native_descriptor_metadata_witness(
             sys::PIPE2.raw(),
             [output.arg(), carrick_syscall_abi::LINUX_O_CLOEXEC, 0, 0],
         );
-        if route == CompletionRoute::Forward {
-            println!(
-                "prepared-fork-vmfree owner=host inherited_zero=true prot_none_bytes=true ready=true child_exit=0 two_live_isolation=true"
-            );
-            return;
-        }
         assert!(
             matches!(
                 route,
