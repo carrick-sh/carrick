@@ -14,5 +14,5 @@ vm_free = [
 ]
 
 [bindings.unresolved]
-embed = "Director: signed real go-build row on this exact head; this worker has no HVF"
+embed_structural = "Director: signed real go-build row on this exact head; this worker has no HVF"
 docker = "Director: native arm64 go-build differential"
