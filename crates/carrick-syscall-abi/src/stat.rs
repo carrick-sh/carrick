@@ -147,8 +147,6 @@ impl LinuxStatFields {
         }
     }
 
-    /// Every carrick pipe end, in the dispatcher and in the ring alike.
-    pub const CARRICK_PIPE: Self = Self::synthetic(b"pipe:[carrick]", LINUX_S_IFIFO | 0o600);
     /// Every carrick eventfd.
     pub const CARRICK_EVENTFD: Self = Self::synthetic(b"anon_inode:[eventfd]", 0o600);
     /// Every carrick epoll instance.
@@ -310,4 +308,23 @@ pub struct LinuxStatx {
     pub stx_atomic_write_unit_max_opt: u32,
     pub __spare2: [u32; 1],
     pub __spare3: [u64; 8],
+}
+
+/// Identity of one pipe incarnation in the shared IPC object namespace.
+/// Both ends and every alias retain the same object index and generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxPipeIdentity {
+    index: u32,
+    generation: u32,
+}
+impl LinuxPipeIdentity {
+    pub const fn new(index: u32, generation: u32) -> Self {
+        Self { index, generation }
+    }
+    pub const fn stat_fields(self) -> LinuxStatFields {
+        LinuxStatFields {
+            ino: ((self.generation as u64) << 32) | (self.index as u64),
+            ..LinuxStatFields::synthetic(b"pipe:[carrick]", LINUX_S_IFIFO | 0o600)
+        }
+    }
 }

@@ -13,8 +13,8 @@ pub use stat::{
     LINUX_STATX_BASIC_STATS, LINUX_STATX_BLOCKS, LINUX_STATX_BTIME, LINUX_STATX_CTIME,
     LINUX_STATX_DIOALIGN, LINUX_STATX_GID, LINUX_STATX_INO, LINUX_STATX_MNT_ID,
     LINUX_STATX_MNT_ID_UNIQUE, LINUX_STATX_MODE, LINUX_STATX_MTIME, LINUX_STATX_NLINK,
-    LINUX_STATX_RESERVED, LINUX_STATX_SIZE, LINUX_STATX_TYPE, LINUX_STATX_UID, LinuxStat,
-    LinuxStatFields, LinuxStatx, LinuxStatxTimestamp, linux_blocks_512, linux_dev_major,
+    LINUX_STATX_RESERVED, LINUX_STATX_SIZE, LINUX_STATX_TYPE, LINUX_STATX_UID, LinuxPipeIdentity,
+    LinuxStat, LinuxStatFields, LinuxStatx, LinuxStatxTimestamp, linux_blocks_512, linux_dev_major,
     linux_dev_minor, linux_synthetic_inode,
 };
 pub mod syscall_x86_64;

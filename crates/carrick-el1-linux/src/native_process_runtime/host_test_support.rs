@@ -228,6 +228,14 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             .ok_or(NativeProcessError::Stale)?;
         Ok(())
     }
+    fn exec_ipc_binding(
+        &self,
+    ) -> Option<(
+        carrick_el1_abi::ipc::IpcRegion<'_>,
+        &carrick_el1_abi::ipc_tables::IpcTableMap,
+    )> {
+        Some((self.native_ipc?, carrick_el1_abi::ipc_table_map_host()?))
+    }
     fn exec_fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
         static MAP: std::sync::OnceLock<&'static [carrick_el1_abi::FdMapSlot]> =
             std::sync::OnceLock::new();

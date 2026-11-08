@@ -1637,7 +1637,11 @@ fn fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms() {
         words: &words,
         root: Aarch64Mmu::root(child_tables.base).unwrap(),
     };
-    let mut resolve = |_| Some(NativeDescriptor::InZone(InZoneKind::Pipe));
+    let mut resolve = |_| {
+        Some(NativeDescriptor::InZone(InZoneKind::Pipe(
+            carrick_syscall_abi::LinuxPipeIdentity::new(1, 1),
+        )))
+    };
     let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
     let mut namespace = NativeNamespace {
         table: [1, 2, 3],

@@ -10868,6 +10868,42 @@ fn native_descriptor_metadata_witness(
         assert!(runtime.task_binding(binding.key).is_some());
     }
 
+    if matches!(metadata, Some(pipe_metadata_tests::Case::Contended)) {
+        let start = crate::dispatch::NATIVE_FD_CONTENTIONS.load(Ordering::Acquire);
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let owner = &owner;
+            let holder = scope.spawn(move || {
+                let guard = owner
+                    .region()
+                    .lock(object, &carrick_kernel::el1_zone::HostLockWait)
+                    .unwrap();
+                send.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while crate::dispatch::NATIVE_FD_CONTENTIONS.load(Ordering::Acquire) == start {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "metadata never encountered Busy"
+                    );
+                    std::thread::yield_now();
+                }
+                drop(guard);
+            });
+            receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let (route, result) =
+                run_in_child_full(0, sys_fcntl, [3, carrick_abi::LINUX_F_GETPIPE_SZ, 0, 0]);
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
+            assert_eq!(result, 65536);
+            holder.join().unwrap();
+        });
+        assert!(crate::dispatch::NATIVE_FD_CONTENTIONS.load(Ordering::Acquire) > start);
+        return;
+    }
     if let Some(case) = metadata {
         pipe_metadata_tests::exercise(case, |nr, args| {
             let served = counters.served[nr as usize].load(Ordering::Relaxed);

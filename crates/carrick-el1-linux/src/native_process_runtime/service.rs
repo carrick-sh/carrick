@@ -2594,8 +2594,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         let predecessor = self.caller_address;
         let successor_address = successor.address;
-        let (_table, releases) = carrick_fd_core::exec::commit(prepared_fds);
+        let (table_custody, releases) = carrick_fd_core::exec::commit(prepared_fds);
         drop(releases);
+        // Adoption consumed the exec receipt: failure is terminal from here.
+        // No delegated-map guard survives this point and no table/object lock
+        // crosses graph publication. Native fork owns a private table and the
+        // sole-member check above excludes concurrent descriptor mutation.
+        if let Some((region, map)) = self.service.exec_ipc_binding()
+            && let Some(raw) = map.lookup_owned(table_custody.file_table())
+        {
+            if region
+                .fd(carrick_sched_core::ShortLockSpin)
+                .exec_deferred(carrick_fd_core::TableId::from_raw(raw))
+                .is_err()
+            {
+                return Ok(self.kill_refused_exec());
+            }
+            self.current.linux.mark_pending_host_work();
+        }
+
         if self
             .commit_exec_successor(successor, service_rebind, comm, validated)
             .is_err()

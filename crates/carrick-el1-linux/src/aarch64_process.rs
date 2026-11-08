@@ -1997,6 +1997,14 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         self.crossing
             .cross_exec_settle(predecessor_mm, successor_mm, u64::from(self.worker()))
     }
+    fn exec_ipc_binding(
+        &self,
+    ) -> Option<(
+        carrick_el1_abi::ipc::IpcRegion<'_>,
+        &carrick_el1_abi::ipc_tables::IpcTableMap,
+    )> {
+        self.crossing.ipc_binding()
+    }
     fn exec_fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
         self.crossing.fd_map()
     }

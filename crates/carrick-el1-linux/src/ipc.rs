@@ -182,20 +182,31 @@ pub(crate) fn notify_native_wake<C: carrick_el1_abi::EntryContext>(
     let Some((zone, slot)) = zone else {
         return;
     };
-    let Some(key) = wait_key(wake.object, WaitFor::Readable) else {
-        return;
-    };
-    let result = loop {
-        match carrick_core::wait::notify_object(zone, slot, key) {
-            Err(ObjectWaitError::Busy) => core::hint::spin_loop(),
-            result => break result,
+    for (due, object, lane) in [
+        (wake.readers, wake.object, WaitFor::Readable),
+        (wake.writers, wake.object, WaitFor::Writable),
+    ]
+    .into_iter()
+    .chain(
+        wake.epolls
+            .iter()
+            .map(|object| (true, object, WaitFor::Readable)),
+    ) {
+        let Some(key) = due.then(|| wait_key(object, lane)).flatten() else {
+            continue;
+        };
+        let result = loop {
+            match carrick_core::wait::notify_object(zone, slot, key) {
+                Err(ObjectWaitError::Busy) => core::hint::spin_loop(),
+                result => break result,
+            }
+        };
+        if let Ok((report, effects)) = result {
+            if report.deferred != 0 {
+                task.linux.mark_pending_host_work();
+            }
+            crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
         }
-    };
-    if let Ok((report, effects)) = result {
-        if report.deferred != 0 {
-            task.linux.mark_pending_host_work();
-        }
-        crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
     }
 }
 
@@ -358,7 +369,9 @@ pub fn native_descriptor(
                     AccessMode::Path => DescriptionAccess::Path,
                 },
             },
-            IpcBacking::Pipe { .. } => NativeDescriptor::InZone(InZoneKind::Pipe),
+            IpcBacking::Pipe { object, .. } => NativeDescriptor::InZone(InZoneKind::Pipe(
+                carrick_abi::LinuxPipeIdentity::new(object.index(), object.generation()),
+            )),
             IpcBacking::EventFd { .. } => NativeDescriptor::InZone(InZoneKind::EventFd),
             IpcBacking::Epoll { .. } => NativeDescriptor::InZone(InZoneKind::Epoll),
         }),
