@@ -2322,6 +2322,7 @@ fn park_anonymous_sibling(
     use carrick_sched_core::object_wait::ObjectWaitError;
     use carrick_sched_core::spaces::notification::SpaceWaitCause;
 
+    assert!(fixture.zone.mark_native_owned(sibling.record.id));
     let space = fixture.zone.space_entry(NonZeroU64::MIN).unwrap();
     space
         .admit_notifications(
@@ -2380,12 +2381,36 @@ fn park_anonymous_sibling(
             .waiters,
         1
     );
+    let census = fixture
+        .zone
+        .record(sibling.record.id)
+        .object_wait_census()
+        .unwrap();
+    assert_eq!(
+        (
+            census.queue,
+            census.generation,
+            census.operation,
+            census.operation_generation,
+        ),
+        (
+            key.index(),
+            key.generation(),
+            u64::from(key.index()),
+            key.generation(),
+        )
+    );
+    assert!(matches!(
+        fixture.zone.record(sibling.record.id).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
     key
 }
 
 #[test]
 fn caught_signal_entry_interrupts_parked_anonymous_edit_without_eintr() {
     let fixture = native_exec_fixture();
+    fixture.install_sigint_handler(false);
     let sibling = add_signal_sibling(&fixture, None, false);
     let key = park_anonymous_sibling(&fixture, &sibling);
     let binding = crate::common_entry::execution_binding(sibling.task);
