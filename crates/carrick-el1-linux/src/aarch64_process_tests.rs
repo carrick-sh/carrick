@@ -282,6 +282,8 @@ impl Drop for MetadataLifecycleAllocation {
     }
 }
 
+// Maps host memory at the EL1 metadata window; macOS 27's VM_MEMORY_GUARD covers it (#1910).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_metadata_window_reuses_released_chunks() {
     let page_bytes = core::mem::size_of::<ThreadLifecyclePage>().next_multiple_of(16384);
@@ -339,14 +341,14 @@ struct TestStockCrossing {
     refuse_root_seed: core::sync::atomic::AtomicBool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 struct MetadataScope {
     zone: &'static ZoneTables<Aarch64ParkedContext>,
     roots: &'static carrick_el1::memory::reservations::SharedReservations,
     allocations: Arc<std::sync::Mutex<Vec<MetadataLifecycleAllocation>>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 impl MetadataScope {
     fn new(fixture: &Fixture) -> Self {
         Self {
@@ -357,7 +359,7 @@ impl MetadataScope {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 impl Drop for MetadataScope {
     fn drop(&mut self) {
         registry().unregister_zone_for_test(self.zone);
@@ -14083,11 +14085,15 @@ fn futex_owner_wait_episode(
     registry().unregister_root_for_test(&runtime);
 }
 
+// Maps host memory at the EL1 metadata window; macOS 27's VM_MEMORY_GUARD covers it (#1910).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_pid_excludes_live_host_thread_tids() {
     native_fork_with_live_host_threads([42, 43], NamespaceScenario::Collision);
 }
 
+// Maps host memory at the EL1 metadata window; macOS 27's VM_MEMORY_GUARD covers it (#1910).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_live_threads_identity_and_wait_control() {
     // Qualify the child identity and reap assertions independently of the
@@ -14095,7 +14101,7 @@ fn serial_host_native_fork_live_threads_identity_and_wait_control() {
     native_fork_with_live_host_threads([52, 53], NamespaceScenario::Control);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NamespaceScenario {
     Collision,
@@ -14106,24 +14112,32 @@ enum NamespaceScenario {
     Exhaustion,
 }
 
+// Maps host memory at the EL1 metadata window; macOS 27's VM_MEMORY_GUARD covers it (#1910).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_namespace_ring_pid_excludes_host_reservation() {
     native_fork_with_live_host_threads([42, 43], NamespaceScenario::Reverse);
 }
+// Maps host memory at the EL1 metadata window; macOS 27's VM_MEMORY_GUARD covers it (#1910).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_namespace_reap_releases_number_to_host() {
     native_fork_with_live_host_threads([42, 43], NamespaceScenario::Reap);
 }
+// Maps host memory at the EL1 metadata window; macOS 27's VM_MEMORY_GUARD covers it (#1910).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_namespace_fork_waits_for_host_leaf_lock() {
     native_fork_with_live_host_threads([42, 43], NamespaceScenario::Contention);
 }
+// Maps host memory at the EL1 metadata window; macOS 27's VM_MEMORY_GUARD covers it (#1910).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_namespace_exhaustion_is_eagain_and_recovers_after_reap() {
     native_fork_with_live_host_threads([42, 43], NamespaceScenario::Exhaustion);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: NamespaceScenario) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let metadata_scope = MetadataScope::new(fixture);

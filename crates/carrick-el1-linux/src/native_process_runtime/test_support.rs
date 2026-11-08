@@ -65,6 +65,7 @@ pub(crate) fn seed_fixture_namespace<C: ProcessContext>(
 #[cfg(test)]
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     /// Release all registrations before a fixture returns its metadata mappings.
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn unregister_zone_for_test(&self, zone: &ZoneTables<C>) {
         let carrier = core::ptr::from_ref(zone).addr();
         let groups: Vec<_> = self
