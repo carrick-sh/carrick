@@ -1639,7 +1639,7 @@ fn fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms() {
     };
     let mut resolve = |_| {
         Some(NativeDescriptor::InZone(InZoneKind::Pipe(
-            carrick_syscall_abi::LinuxPipeIdentity::new(1, 1),
+            carrick_personality_linux::native_host_file::LinuxPipeIdentity::new(1, 1),
         )))
     };
     let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
