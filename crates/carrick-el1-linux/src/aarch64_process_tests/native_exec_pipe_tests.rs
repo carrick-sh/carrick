@@ -370,6 +370,7 @@ fn fork_exec_probe(
     };
     let mut call_full = |nr, fd, address, count, extra| {
         let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
             elr: 0x400004,
             slot: u64::from(fixture.slot.raw()),
             ..Default::default()
@@ -447,6 +448,123 @@ fn fork_exec_probe(
             None,
             |_| core::ptr::null_mut(),
         );
+        if readlink && route == carrick_personality_linux::dispatch::CompletionRoute::Forward {
+            // The carrier service follows the normal family's unclaimed result.
+            // Drive the production staging/continuation entry used by the SVC exit.
+            struct Resident;
+            impl crate::file::MemoryValidator for Resident {
+                fn readable_bytes(&self, _: u64, len: usize) -> usize {
+                    len
+                }
+                fn writable_bytes(&self, _: u64, len: usize) -> usize {
+                    len
+                }
+            }
+            let raw = map.lookup(child_table).unwrap();
+            let Some(carrick_personality_linux::native_host_file::HostFileStage::Request {
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+            }) = crate::dispatch::native_host_file_stage(
+                &frame,
+                &fixture.task,
+                &Resident,
+                [raw.authority, raw.index, raw.generation],
+                |_| panic!("absolute readlink does not inspect a descriptor"),
+                &mut |_| 0,
+            )
+            else {
+                panic!("readlink must stage through the native venue");
+            };
+            assert!(matches!(
+                entry.begin_host_file_service(
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                    chdir,
+                    NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(nr), &counters)
+                ),
+                Ok(NativeResume::Left(None))
+            ));
+            assert!(entry.take_handoff_receipt().is_some());
+            drop(entry);
+            let selector = fixture.task.service_notice.take().unwrap().unwrap();
+            let member = fixture.zone.record(selector.record.id).identity();
+            // SAFETY: the fixture retains this live member and its service record.
+            let control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
+            let ticket = unsafe {
+                ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, member)
+            }
+            .unwrap();
+            let carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } =
+                ticket.request().operation
+            else {
+                panic!("host file ticket");
+            };
+            // The physical test adapter retains a real CurrentExecutable in
+            // the same neutral MM custody consumed by the production carrier.
+            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+            dispatcher
+                .capture_one_task_context()
+                .unwrap()
+                .kernel()
+                .ipc()
+                .unwrap();
+            let mut custody = carrick_hal::fork_stock::ForkHostBackingCustody::default();
+            let image = std::fs::File::open("Cargo.toml").unwrap();
+            custody.bind_executable(
+                dispatcher.retain_native_executable(
+                    carrick_kernel::dispatch::executable_authority::ExecSource::host(
+                        image,
+                        "/bin/pipe-writer".into(),
+                    )
+                    .unwrap(),
+                ),
+            );
+            // SAFETY: the service ticket retains the exact staged buffer through ACK.
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    payload.address().raw() as *mut u8,
+                    payload.length().raw() as usize,
+                )
+            };
+            dispatcher
+                .serve_native_host_file(bytes, custody.executable())
+                .unwrap();
+            ticket.complete(true).unwrap();
+            fixture
+                .zone
+                .object_wait(
+                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
+                        .unwrap(),
+                    &ShortLockSpin,
+                )
+                .unwrap()
+                .notify_object(fixture.slot, &mut Default::default())
+                .unwrap();
+            activate_target(source, &fixture.task, &child_binding);
+            let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+            let binding =
+                unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+            let mut entry = runtime
+                .enter_registered(
+                    registry,
+                    source,
+                    &fixture.task,
+                    binding.address,
+                    &binding.words,
+                    &mut service,
+                )
+                .unwrap();
+            let NativeResume::Returned(result) = entry.resume_checkpoint(|_| Ok(None)).unwrap()
+            else {
+                panic!("readlink reply");
+            };
+            return result.raw() as u64;
+        }
         if route == carrick_personality_linux::dispatch::CompletionRoute::Forward {
             let (page, _) = fixture.task.lifecycle_refs().unwrap();
             let owner = registry.thread_group_owner(
@@ -516,7 +634,13 @@ fn fork_exec_probe(
             call_full(78, (-100i64) as u64, memory.arg(), memory.arg() + 512, 128),
             16
         );
-        assert_eq!(&memory.as_mut_bytes()[512..528], b"/bin/pipe-writer");
+        assert_eq!(
+            crate::native_process_runtime::host_test_support::take_signal_copies(),
+            vec![(
+                UserVa::new(memory.arg() + 512),
+                b"/bin/pipe-writer".to_vec()
+            )]
+        );
         assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
         registry.unregister_root_for_test(&runtime);
         return;
@@ -826,6 +950,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
             )
             .unwrap();
         let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
             elr: 0x400004,
             slot: u64::from(fixture.slot.raw()),
             ..Default::default()

@@ -1781,7 +1781,7 @@ pub(crate) fn service_native_fork_stock(
                 // sources it acquired after birth (an exec image, a native
                 // private file mapping), not only the rows its own fork
                 // inherited.
-                let inherited = stock
+                let mut inherited = stock
                     .owner
                     .pending(execution.cpu)
                     .and_then(|pending| {
@@ -1791,6 +1791,13 @@ pub(crate) fn service_native_fork_stock(
                     })
                     .map(crate::fork_stock::NativeChildPhysical::fork_sources)
                     .unwrap_or_default();
+                if let Some((seed, executable)) = stock.root_executables.remove(&execution.cpu)
+                    && seed == execution
+                    && inherited.executable().is_none()
+                {
+                    inherited.bind_executable(executable);
+                }
+                let executable = inherited.executable();
                 let result = stock.owner.reserve_custody(
                     execution,
                     settlement,
@@ -1814,7 +1821,13 @@ pub(crate) fn service_native_fork_stock(
                             count,
                             inherited,
                         )
-                        .map(crate::fork_stock::NativeChildPhysical::new)
+                        .map(|rows| {
+                            let mut physical = crate::fork_stock::NativeChildPhysical::new(rows);
+                            if let Some(executable) = executable {
+                                physical.sources.bind_executable(executable);
+                            }
+                            physical
+                        })
                     },
                 );
                 if let Err(refusal) = &result {
@@ -2003,7 +2016,18 @@ fn service_root_fork_seed(
         return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
     };
     match custody.native_exec_services.resolve(capability) {
-        Ok(service) if service.root_fork_seed(record) => [METADATA_GRANT_SUCCESS, 0, 0, 0],
+        Ok(service) if service.root_fork_seed(record) => {
+            let executable = service.root_executable_seed();
+            let Some(execution) = stopped_execution(region, cpu, ttbr0) else {
+                return refused;
+            };
+            let mut stock = custody.fork_stock.lock();
+            stock.root_executables.remove(&cpu);
+            if let Some(executable) = executable {
+                stock.root_executables.insert(cpu, (execution, executable));
+            }
+            [METADATA_GRANT_SUCCESS, 0, 0, 0]
+        }
         _ => refused,
     }
 }
