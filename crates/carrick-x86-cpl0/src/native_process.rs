@@ -54,6 +54,40 @@ fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcess
 pub(super) fn registry() -> &'static NativeProcessRegistry<'static, Mm, ParkedContextWords> {
     &REGISTRY
 }
+
+/// Test-image-only external signal entry after an anonymous wait has parked.
+/// The event uses the same registry and exact execution binding as production
+/// signal ingress; only its deterministic trigger belongs to the fixture.
+#[cfg(feature = "test-support")]
+pub(super) fn inject_caught_signal_on_park(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    task: &'static CurrentTask,
+) {
+    let record = source
+        .zone
+        .slot(source.slot)
+        .current()
+        .or_else(|| source.zone.slot(source.slot).host_record())
+        .map(|record| source.zone.record_ref(record))
+        .unwrap_or_else(|| fatal());
+    let binding = carrick_el1_linux::common_entry::execution_binding(task);
+    let event = carrick_el1_abi::ExternalSignalRecord::new(
+        carrick_core_abi::EntryEventIdentity::from_binding(binding),
+        binding,
+        record,
+        carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::MIN),
+        carrick_personality_linux::signal::policy::Signal::from_number(10)
+            .unwrap_or_else(|| fatal()),
+        carrick_el1_abi::ExternalSignalSource::InZoneIpc,
+    );
+    let mut service = Service::new(task, source.slot);
+    if !REGISTRY
+        .admit_external_event(source.zone, event, source.slot, &mut service)
+        .unwrap_or_else(|_| fatal())
+    {
+        fatal()
+    }
+}
 pub(super) fn drain_external_ingress(
     source: BornInZoneSource<'static, ParkedContextWords>,
     service: &mut Service,
