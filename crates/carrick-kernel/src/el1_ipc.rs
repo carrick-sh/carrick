@@ -23,22 +23,8 @@ static NEXT_REGION: AtomicU64 = AtomicU64::new(1);
 static INJECT_OBJECT_WAIT_KEY_OUT_OF_RANGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
-static LAST_OBJECT_WAIT_BIND_OBJECT: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
 pub(crate) fn inject_object_wait_key_out_of_range_once() {
     INJECT_OBJECT_WAIT_KEY_OUT_OF_RANGE.store(true, Ordering::Release);
-}
-
-#[cfg(test)]
-pub(crate) fn take_last_object_wait_bind_object() -> Option<carrick_el1_abi::ipc::RawIpcObject> {
-    let raw = LAST_OBJECT_WAIT_BIND_OBJECT
-        .swap(0, Ordering::AcqRel)
-        .checked_sub(1)?;
-    Some(carrick_el1_abi::ipc::RawIpcObject {
-        index: raw as u32,
-        generation: (raw >> 32) as u32,
-    })
 }
 
 /// Admission failure, before any descriptor or host reservation is published.
@@ -803,11 +789,6 @@ impl HostIpc {
         &self,
         object: IpcObjectHandle,
     ) -> Result<(), carrick_sched_core::object_wait::ObjectWaitError> {
-        #[cfg(test)]
-        LAST_OBJECT_WAIT_BIND_OBJECT.store(
-            ((u64::from(object.generation()) << 32) | u64::from(object.index())) + 1,
-            Ordering::Release,
-        );
         if let Some(zone) = crate::el1_zone::zone() {
             let mut bound: [Option<carrick_sched_core::object_wait::ObjectWaitKey>; 2] =
                 [None, None];
