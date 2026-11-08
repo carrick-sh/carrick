@@ -440,7 +440,9 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
     let tools = root.join("tools-without-lsof");
     std::fs::create_dir(&tools).unwrap();
     let paths = std::env::var_os("PATH").unwrap();
-    for name in ["cargo", "rustc", "git", "just", "python3", "sh", "bash"] {
+    for name in [
+        "cargo", "rustc", "git", "just", "python3", "sh", "bash", "env",
+    ] {
         let binary = std::env::split_paths(&paths)
             .map(|dir| dir.join(name))
             .find(|path| path.is_file())
