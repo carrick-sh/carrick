@@ -85,3 +85,17 @@ ISA also has a pipe control requiring an in-ring completion and FIFO mode in
 its native stat layout. These are routing and staging witnesses, not a claim
 of signed path-service execution. The native amd64 Linux syscall oracle
 returns 0 for the same three forms and the pipe control.
+
+## Queue-release integration (round 5)
+
+The shared `notify_native_wake` retains reader, writer and attached-epoll
+publication and supplies the existing scheduler completion venue for every
+notification. Queue custody, initialization, deferred handbacks and ISA
+doorbells remain owned by the scheduler's queue-release protocol (#1909).
+No new completion mechanism or per-ISA metadata path is introduced.
+
+After rebasing, removing only the production cwd classification makes both
+ARM and decoded-x86 empty-cwd witnesses return EBADF(9) instead of forwarding
+to the path owner. Restoring it passes all eight pathname/control witnesses.
+The automatically merged surface registry also needs its existing allocation
+binding placed after the x86 integration bindings to retain sorted admission.
