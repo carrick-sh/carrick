@@ -11,6 +11,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(clap::Args, Debug)]
 pub struct TestBatchArgs {
+    /// Maximum Cargo compilation jobs.
+    #[arg(long)]
+    pub jobs: Option<usize>,
     /// Recipe whose Cargo test commands define the lanes.
     pub recipe: String,
     /// Compile the unified selection without executing binaries or rustdoc.
@@ -27,9 +30,9 @@ pub struct TestBatchArgs {
     pub args: Vec<String>,
 }
 
-struct Lane {
+pub(crate) struct Lane {
     record: Vec<String>,
-    packages: BTreeSet<String>,
+    pub(crate) packages: BTreeSet<String>,
     targets: BTreeSet<(String, String)>,
     features: BTreeSet<String>,
     harness: Vec<String>,
@@ -41,7 +44,7 @@ struct Lane {
     target_dir: Option<String>,
 }
 
-fn metadata(root: &Path) -> Result<Value> {
+pub(crate) fn metadata(root: &Path) -> Result<Value> {
     let out = crate::command::offline_cargo()
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(root)
@@ -52,7 +55,7 @@ fn metadata(root: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 
-fn parse(record: Vec<String>, meta: &Value) -> Result<Lane> {
+pub(crate) fn parse(record: Vec<String>, meta: &Value) -> Result<Lane> {
     let start = record
         .iter()
         .skip(3)
@@ -225,6 +228,68 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
         .into_iter()
         .map(|record| parse(record, &meta))
         .collect::<Result<Vec<_>>>()?;
+    execute(&root, args, imported, meta, lanes)
+}
+
+/// Run a captured source command with its original compile-time feature closure,
+/// selecting only the requested packages' test executables. Keeping the compile
+/// unit intact is essential: narrowing Cargo's package set changes dev features.
+pub(crate) fn selected_records(
+    root: &Path,
+    records: Vec<Vec<String>>,
+    selected: &BTreeSet<String>,
+    jobs: usize,
+) -> Result<()> {
+    let meta = metadata(root)?;
+    let lanes = records
+        .into_iter()
+        .map(|record| parse(record, &meta))
+        .collect::<Result<Vec<_>>>()?;
+    let ids: BTreeSet<_> = meta["packages"]
+        .as_array()
+        .ok_or("missing packages")?
+        .iter()
+        .filter(|p| selected.contains(p["name"].as_str().unwrap_or_default()))
+        .filter_map(|p| p["id"].as_str().map(str::to_owned))
+        .collect();
+    let execution_targets: BTreeSet<_> = lanes
+        .iter()
+        .flat_map(|l| l.targets.iter())
+        .filter(|(id, _)| ids.contains(id))
+        .cloned()
+        .collect();
+    if execution_targets.is_empty() {
+        return Ok(());
+    }
+    let args = TestBatchArgs {
+        jobs: Some(jobs),
+        recipe: String::new(),
+        no_run: false,
+        export: None,
+        artifacts: None,
+        args: Vec::new(),
+    };
+    execute_selected(root, args, None, meta, lanes, Some(execution_targets))
+}
+
+fn execute(
+    root: &Path,
+    args: TestBatchArgs,
+    imported: Option<BatchArtifact>,
+    meta: Value,
+    lanes: Vec<Lane>,
+) -> Result<()> {
+    execute_selected(root, args, imported, meta, lanes, None)
+}
+
+fn execute_selected(
+    root: &Path,
+    args: TestBatchArgs,
+    imported: Option<BatchArtifact>,
+    meta: Value,
+    mut lanes: Vec<Lane>,
+    execution_targets: Option<BTreeSet<(String, String)>>,
+) -> Result<()> {
     if lanes.is_empty() {
         return Err("batch selected no tests".into());
     }
@@ -297,13 +362,15 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
         }
         binaries
     } else {
-        let (binaries, files) = compile(&root, &lanes, &meta, &packages, &features, &targets)?;
+        let (binaries, files) = compile(
+            &root, &lanes, &meta, &packages, &features, &targets, args.jobs,
+        )?;
         if let Some(path) = &args.export {
             if lanes.iter().any(|l| l.doc || l.implicit_doc) {
                 return Err("cannot export rustdoc lanes".into());
             }
             let manifest = BatchArtifact {
-                root: root.clone(),
+                root: root.to_path_buf(),
                 metadata: meta.clone(),
                 features,
                 no_default,
@@ -346,6 +413,12 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
     if args.no_run {
         return Ok(());
     }
+    if let Some(selected) = execution_targets {
+        for lane in &mut lanes {
+            lane.targets.retain(|target| selected.contains(target));
+            lane.implicit_doc = false;
+        }
+    }
     let mut red = Vec::new();
     for lane in &lanes {
         if lane.no_run {
@@ -362,7 +435,7 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
             continue;
         }
         if lane.targets.is_empty() {
-            return Err("lane selected no test targets".into());
+            continue;
         }
         for target in &lane.targets {
             let exe = binaries
@@ -445,6 +518,7 @@ fn compile(
     packages: &BTreeSet<String>,
     features: &BTreeSet<String>,
     targets: &BTreeSet<(String, String)>,
+    jobs: Option<usize>,
 ) -> Result<(Binaries, BTreeSet<PathBuf>)> {
     let mut cmd = crate::command::offline_cargo();
     let first = lanes.first().ok_or("missing lanes")?;
@@ -481,6 +555,9 @@ fn compile(
         "--no-run",
         "--message-format=json-render-diagnostics",
     ]);
+    if let Some(jobs) = jobs {
+        cmd.args(["--jobs", &jobs.to_string()]);
+    }
     if lanes.iter().any(|l| l.no_default) {
         cmd.arg("--no-default-features");
     }

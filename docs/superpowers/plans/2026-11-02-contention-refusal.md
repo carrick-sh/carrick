@@ -22,7 +22,7 @@ The existing portal wire remains a legacy crossing, authenticated by its owner.
 - [x] Add ticket front doors to existing object and portal enrollment paths.
 - [x] Migrate the two approved HVF/editor and EL1 fault source sites.
 - [x] Add semgrep enforcement and a monotone contention-variant debt family.
-- [ ] Run focused suites in both partitions, doctests, contract/debt checks,
+- [ ] Run `just test-touched <main-sha>`, doctests, contract/debt checks,
   cross checks supported here, review the diff, and commit with evidence.
 
 ## Review focus

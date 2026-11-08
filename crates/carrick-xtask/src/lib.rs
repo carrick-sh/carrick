@@ -48,6 +48,7 @@ pub mod test_batch;
 pub mod test_isolated;
 pub mod test_lanes;
 pub mod test_shards;
+pub mod test_touched;
 pub mod workorder;
 pub mod worktree_admission;
 pub mod worktree_gc;

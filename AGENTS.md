@@ -611,8 +611,8 @@ verification, the signed evidence and landing.
 - **Worktree lifecycle:** remove the worktree and `target/` on every host when
   a PR merges (`git worktree remove --force <path>` and prune).
 - **Workers prove their slice; CI and the director gate the rest** (owner,
-  2026-10-30, #231 items 4 and 5). Workers run the focused suites of the
-  crates they touched (regular and `serial_host` partitions),
+  2026-10-30, #231 items 4 and 5). Workers run `just test-touched <main-sha>` (changed crates and reverse
+  dependencies, using `just test` features and serial partitions),
   `just check-contract-change <main-sha> HEAD`,
   `just xtask authority-debt --source-only` and the pre-push clippy hook,
   plus the checks their change calls for:

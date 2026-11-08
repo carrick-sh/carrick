@@ -198,8 +198,8 @@ on unmerged work. The director owns routing-policy edits and signed acceptance.
    proof; it does not substitute for this CLI red-first witness.
 
 Every behavior slice records false lines on pre-fix code, restores the fix,
-and proves the same production witness green. Run regular and serial_host
-focused suites (native tests via `just test-el1-native`), contract-change,
+and proves the same production witness green. Run `just test-touched <main-sha>` for regular and serial_host suites
+(and native tests via `just test-el1-native`), contract-change,
 source/base debt checks and pre-push clippy. Apply macOS cross checks and
 Linux/KVM checks to touched code as required. The director promotes one signed
 artifact through smoke-signed, conformance-probes, smoke and full conformance,
