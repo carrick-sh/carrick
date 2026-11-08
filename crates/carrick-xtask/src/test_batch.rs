@@ -33,7 +33,7 @@ pub struct TestBatchArgs {
 pub(crate) struct Lane {
     record: Vec<String>,
     pub(crate) packages: BTreeSet<String>,
-    targets: BTreeSet<(String, String)>,
+    pub(crate) targets: BTreeSet<(String, String)>,
     features: BTreeSet<String>,
     harness: Vec<String>,
     doc: bool,
@@ -347,7 +347,7 @@ fn execute_selected(
         for binary in manifest.binaries {
             let path = root.join(&binary.path);
             if binary.path.is_absolute()
-                || !path.starts_with(&root)
+                || !path.starts_with(root)
                 || binary
                     .path
                     .components()
@@ -363,7 +363,7 @@ fn execute_selected(
         binaries
     } else {
         let (binaries, files) = compile(
-            &root, &lanes, &meta, &packages, &features, &targets, args.jobs,
+            root, &lanes, &meta, &packages, &features, &targets, args.jobs,
         )?;
         if let Some(path) = &args.export {
             if lanes.iter().any(|l| l.doc || l.implicit_doc) {
@@ -380,7 +380,7 @@ fn execute_selected(
                         Ok(ArtifactBinary {
                             package: package.clone(),
                             target: target.clone(),
-                            path: path.strip_prefix(&root)?.to_path_buf(),
+                            path: path.strip_prefix(root)?.to_path_buf(),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -397,7 +397,7 @@ fn execute_selected(
             header.set_cksum();
             archive.append_data(&mut header, "target/test-batch.json", json.as_slice())?;
             for file in files {
-                archive.append_path_with_name(&file, file.strip_prefix(&root)?)?;
+                archive.append_path_with_name(&file, file.strip_prefix(root)?)?;
             }
             archive.into_inner()?.finish()?;
             return Ok(());
@@ -413,6 +413,7 @@ fn execute_selected(
     if args.no_run {
         return Ok(());
     }
+    let restricted = execution_targets.is_some();
     if let Some(selected) = execution_targets {
         for lane in &mut lanes {
             lane.targets.retain(|target| selected.contains(target));
@@ -435,7 +436,10 @@ fn execute_selected(
             continue;
         }
         if lane.targets.is_empty() {
-            continue;
+            if restricted {
+                continue;
+            }
+            return Err("lane selected no test targets".into());
         }
         for target in &lane.targets {
             let exe = binaries

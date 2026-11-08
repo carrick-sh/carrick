@@ -158,7 +158,16 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
     for records in units.into_values() {
         let mut packages = BTreeSet::new();
         for record in &records {
-            packages.extend(crate::test_batch::parse(record.clone(), &meta)?.packages);
+            let lane = crate::test_batch::parse(record.clone(), &meta)?;
+            for package in meta["packages"].as_array().ok_or("missing packages")? {
+                if lane
+                    .targets
+                    .iter()
+                    .any(|(id, _)| Some(id.as_str()) == package["id"].as_str())
+                {
+                    packages.insert(package["name"].as_str().ok_or("missing name")?.to_owned());
+                }
+            }
         }
         for name in packages.intersection(&selected) {
             by_package
