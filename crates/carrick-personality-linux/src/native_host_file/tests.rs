@@ -976,3 +976,28 @@ fn readlink_decodes_and_bounds_the_output_without_a_nul() {
     );
     assert_eq!(copied, b"/bi");
 }
+
+#[test]
+fn readlink_validates_only_the_bytes_returned_by_the_link() {
+    let mut user = memory(b"/proc/self/exe\0");
+    let call = HostFileCall::Readlinkat {
+        dirfd: carrick_fd_core::Fd(LINUX_AT_FDCWD),
+        path: carrick_guest_arch::UserVa::new(BASE),
+        buf: carrick_guest_arch::UserVa::new(BASE + 4090),
+        bufsiz: ReadlinkSize(8192),
+    };
+    // The target fits in the mapped prefix. Linux never accesses the unused
+    // tail of bufsiz, even when that tail crosses into unmapped memory.
+    let (mut record, output, _) = request(run(call, &mut user));
+    HostFileRequestView::parse(&mut record)
+        .unwrap()
+        .reply(3, b"/bi")
+        .unwrap();
+    assert_eq!(
+        complete(&record, output, &mut |address, bytes| {
+            user.writable(address, bytes.len()) == bytes.len()
+        })
+        .raw(),
+        3
+    );
+}
