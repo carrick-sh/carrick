@@ -66,6 +66,9 @@ pub enum HostFileOp {
     Unlinkat = 14,
     /// `symlinkat`: input is the verbatim target, NUL, then the link path.
     Symlinkat = 15,
+    /// `linkat`: input is the source path, NUL, then the target path;
+    /// `flags` carries the Linux `AT_*` flags.
+    Linkat = 16,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -184,6 +187,7 @@ impl HostFileOp {
             13 => Self::Mkdirat,
             14 => Self::Unlinkat,
             15 => Self::Symlinkat,
+            16 => Self::Linkat,
             _ => return None,
         })
     }
@@ -201,6 +205,7 @@ impl HostFileOp {
                 | Self::Mkdirat
                 | Self::Unlinkat
                 | Self::Symlinkat
+                | Self::Linkat
         )
     }
 }
