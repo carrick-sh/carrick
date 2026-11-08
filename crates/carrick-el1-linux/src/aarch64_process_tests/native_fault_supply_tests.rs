@@ -284,7 +284,7 @@ enum ChildStockCase {
 #[cfg(not(target_os = "macos"))]
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let metadata_scope = MetadataScope::new(&fixture);
+    let metadata_scope = MetadataScope::new(fixture);
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
     let pages: Vec<_> = (0..16).map(|index| 0x20000 + index * 4096).collect();
