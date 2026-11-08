@@ -67,3 +67,21 @@ ioctl, duplication, close and errno numbers. The full x86 I/O reproduction
 still waits on #1756: `ipc_transfer` requires an ARM frame. No per-ISA IPC
 implementation is introduced. Signed/HVF execution and CPython subprocess
 remain director-owned verification; VM-free ARM-frame tests are not that proof.
+
+## AT_EMPTY_PATH pathname admission (round 3)
+
+`stat(2)` permits an empty pathname with `AT_EMPTY_PATH`; it does not
+require one. `AT_FDCWD` selects cwd even for an empty path, and an absolute
+path ignores dirfd. The shared metadata handler must classify these inputs
+before consulting the pipe descriptor authority. Nonempty paths and cwd
+queries return unchanged to the existing `Newfstatat` path staging owner.
+Only a genuine empty-path query on a zone pipe retains the ring stat owner.
+
+`x86_production_forward::at_empty_path_*` drives the production dispatcher
+with both ARM and decoded x86 frames against a real IPC descriptor table.
+The three pathname forms must forward with untouched output, then stage one
+path request through the existing owner without a descriptor lookup. Each
+ISA also has a pipe control requiring an in-ring completion and FIFO mode in
+its native stat layout. These are routing and staging witnesses, not a claim
+of signed path-service execution. The native amd64 Linux syscall oracle
+returns 0 for the same three forms and the pipe control.

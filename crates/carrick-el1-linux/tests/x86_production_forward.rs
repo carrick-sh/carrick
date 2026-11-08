@@ -702,3 +702,248 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
     );
     assert!(!peer_task.linux.has_pending_host_work());
 }
+
+// #1901: pathname classification must precede authoritative descriptor lookup.
+// Both register decoders drive the real shared dispatcher with a live IPC table.
+#[derive(Clone, Copy)]
+enum AtEmptyPathCase {
+    CwdEmpty,
+    CwdDot,
+    AbsoluteBadFd,
+    Pipe,
+}
+
+fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
+    use carrick_abi::{LINUX_AT_EMPTY_PATH, LINUX_AT_FDCWD, LinuxStat, LinuxX8664Stat};
+    use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
+    use carrick_el1_linux::ipc::{IpcVenue, MapTables};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_personality_linux::native_host_file::{
+        HostFileCall, HostFileStage, NativeNamespace,
+    };
+    use carrick_test_support::GuestUserBuffer;
+    use std::sync::Arc;
+
+    let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+    let table = HostTable::create(Arc::clone(&owner), 64, 8).unwrap();
+    let object = owner.create_pipe(65536).unwrap();
+    let reader = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    reader.install(table.id(), fd::Fd(3), false).unwrap();
+    let region = carrick_test_support::TestEl1Region::zeroed();
+    // SAFETY: TestEl1Region provides ABI-aligned zeroed storage for this map.
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish_owned(7, table.id().to_raw()).unwrap();
+    let tables = MapTables(map);
+    let venue = IpcVenue {
+        region: owner.region(),
+        tables: &tables,
+    };
+    let task = CurrentTask::new();
+    task.set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        7,
+    );
+    let counters = Counters::new();
+    let names = InotifyNameCache::new();
+    let (dirfd, path): (i32, &[u8]) = match case {
+        AtEmptyPathCase::CwdEmpty => (LINUX_AT_FDCWD as i32, b"\0"),
+        AtEmptyPathCase::CwdDot => (LINUX_AT_FDCWD as i32, b".\0"),
+        AtEmptyPathCase::AbsoluteBadFd => (63, b"/\0"),
+        AtEmptyPathCase::Pipe => (3, b"\0"),
+    };
+    let path = GuestUserBuffer::from_bytes(path);
+    let output = GuestUserBuffer::zeroed(if x86 {
+        core::mem::size_of::<LinuxX8664Stat>()
+    } else {
+        core::mem::size_of::<LinuxStat>()
+    });
+    let args = [
+        dirfd as u64,
+        path.arg(),
+        output.arg(),
+        LINUX_AT_EMPTY_PATH,
+        0,
+        0,
+    ];
+    let mut arm = TrapFrame {
+        esr: 0x15 << 26,
+        elr: 0x4004,
+        ..Default::default()
+    };
+    arm.x[8] = carrick_personality_linux::crossing::nr::NEWFSTATAT.raw();
+    arm.x[..6].copy_from_slice(&args);
+    let isa_unsupported = AtomicU64::new(0);
+    let call = decode_x86_64(262, args, 0x7fff_0000);
+    let mut amd = X86Frame {
+        native: call.native,
+        canonical: call.canonical,
+        args,
+        rax: 0xfeed,
+        isa_unsupported: &isa_unsupported,
+    };
+    let (route, result) = if x86 {
+        let route = dispatch::dispatch_syscall_with_native::<
+            _,
+            NoCpu,
+            sched::HardwareUserWord,
+            _,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >(
+            &mut amd,
+            &counters,
+            core::slice::from_ref(&task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None,
+            Some(&venue),
+            None,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        (route, amd.rax as i64)
+    } else {
+        let route = dispatch::dispatch_syscall_with_native::<
+            _,
+            NoCpu,
+            sched::HardwareUserWord,
+            _,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >(
+            &mut arm,
+            &counters,
+            core::slice::from_ref(&task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None,
+            Some(&venue),
+            None,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        (route, arm.x[0] as i64)
+    };
+    if matches!(case, AtEmptyPathCase::Pipe) {
+        assert_eq!(route, CompletionRoute::Served, "pipe query stays in ring");
+        assert_eq!(result, 0);
+        let mode = if x86 {
+            zerocopy::FromBytes::read_from_bytes(output.as_bytes())
+                .map(|s: LinuxX8664Stat| s.st_mode)
+                .unwrap()
+        } else {
+            zerocopy::FromBytes::read_from_bytes(output.as_bytes())
+                .map(|s: LinuxStat| s.st_mode)
+                .unwrap()
+        };
+        assert_eq!(mode & carrick_abi::LINUX_S_IFMT, carrick_abi::LINUX_S_IFIFO);
+    } else {
+        assert_eq!(
+            route,
+            CompletionRoute::Forward,
+            "path owner must receive the call; result {result} (EBADF = -9)"
+        );
+        assert_eq!(result, if x86 { 0xfeed } else { dirfd as i64 });
+        assert!(output.as_bytes().iter().all(|byte| *byte == 0));
+        // Continue the handoff through the existing shared Newfstatat path
+        // owner: cwd and absolute paths must stage a path request without
+        // consulting the descriptor namespace at all.
+        let Some(HostFileStage::Request {
+            mut record,
+            resolves_path,
+            output: staged_output,
+            ..
+        }) = dispatch::stage_native_host_file(
+            HostFileCall::Newfstatat {
+                dirfd,
+                path: path.arg(),
+                statbuf: output.arg(),
+                flags: LINUX_AT_EMPTY_PATH,
+            },
+            &task,
+            &carrick_el1_linux::file::HardwareValidator,
+            &mut NativeNamespace {
+                table: [1, 2, 3],
+                resolve: &mut |_| panic!("path form must not resolve dirfd"),
+                releases: &mut |_| 0,
+            },
+        )
+        else {
+            panic!("existing path owner must stage newfstatat");
+        };
+        assert!(resolves_path);
+        assert_eq!(staged_output.unwrap().address, output.arg());
+        let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(
+            view.header().op,
+            carrick_core_abi::host_file::HostFileOp::Newfstatat
+        );
+        assert_eq!(view.header().fd, LINUX_AT_FDCWD as i32);
+        assert_eq!(
+            view.input(),
+            if matches!(case, AtEmptyPathCase::AbsoluteBadFd) {
+                b"/"
+            } else {
+                b"."
+            }
+        );
+    }
+}
+
+#[test]
+fn at_empty_path_arm_cwd_empty() {
+    at_empty_path_dispatch(false, AtEmptyPathCase::CwdEmpty);
+}
+#[test]
+fn at_empty_path_arm_cwd_dot() {
+    at_empty_path_dispatch(false, AtEmptyPathCase::CwdDot);
+}
+#[test]
+fn at_empty_path_arm_absolute_bad_fd() {
+    at_empty_path_dispatch(false, AtEmptyPathCase::AbsoluteBadFd);
+}
+#[test]
+fn at_empty_path_arm_pipe_control() {
+    at_empty_path_dispatch(false, AtEmptyPathCase::Pipe);
+}
+#[test]
+fn at_empty_path_x86_cwd_empty() {
+    at_empty_path_dispatch(true, AtEmptyPathCase::CwdEmpty);
+}
+#[test]
+fn at_empty_path_x86_cwd_dot() {
+    at_empty_path_dispatch(true, AtEmptyPathCase::CwdDot);
+}
+#[test]
+fn at_empty_path_x86_absolute_bad_fd() {
+    at_empty_path_dispatch(true, AtEmptyPathCase::AbsoluteBadFd);
+}
+#[test]
+fn at_empty_path_x86_pipe_control() {
+    at_empty_path_dispatch(true, AtEmptyPathCase::Pipe);
+}

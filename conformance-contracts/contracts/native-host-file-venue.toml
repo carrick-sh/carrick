@@ -25,6 +25,7 @@ dispatcher's syscalls byte for byte and prove the in-zone routing.
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit}",
+  "carrick-el1-linux::x86_production_forward::at_empty_path_* (#1901: ARM and x86 production dispatch hand cwd/absolute path forms to the existing path stager without descriptor lookup; empty-path zone pipes complete in ring)",
   "carrick-el1-linux::native_process_runtime::host_test_support::host_root_open_publishes_unstamped_record_through_service_notice",
   "carrick-el1-linux::native_process_runtime::host_test_support::root_exec_access_refusal_is_counted_before_service_publication (production admitted and registered root has no filesystem authority: host-file open and exec refuse before service publication)",
   "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls",
