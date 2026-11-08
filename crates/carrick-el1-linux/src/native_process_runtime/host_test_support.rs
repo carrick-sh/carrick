@@ -2787,9 +2787,16 @@ mod anonymous_wait_cancellation_tests {
             0,
             "the real exit entry must unlink the anonymous waiter"
         );
-        assert_eq!(
-            fixture.zone.record(sibling.record.id).handback(),
-            Some(carrick_sched_core::Handback::Cancelled)
+        assert!(
+            !fixture
+                .zone
+                .record(sibling.record.id)
+                .has_object_operation(),
+            "exit cancellation must release scheduler-owned anonymous custody"
+        );
+        assert!(
+            fixture.zone.live(sibling.record).is_none(),
+            "exit cancellation must retire the unpinned anonymous record"
         );
         assert_eq!(
             fixture
@@ -2872,9 +2879,16 @@ mod anonymous_wait_cancellation_tests {
             0,
             "the real exec entry must unlink the anonymous waiter"
         );
-        assert_eq!(
-            fixture.zone.record(sibling.record.id).handback(),
-            Some(carrick_sched_core::Handback::Cancelled)
+        assert!(
+            !fixture
+                .zone
+                .record(sibling.record.id)
+                .has_object_operation(),
+            "exec cancellation must release scheduler-owned anonymous custody"
+        );
+        assert!(
+            fixture.zone.live(sibling.record).is_none(),
+            "exec cancellation must retire the unpinned anonymous record"
         );
     }
 }
