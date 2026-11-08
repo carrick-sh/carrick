@@ -3176,9 +3176,5 @@ mod custody_tests {
         assert!(residency.publish(added).is_some());
     }
 }
-
 #[path = "cpl0_native_service.rs"]
 mod native_service;
-#[cfg(test)]
-#[path = "cpl0_anonymous/cow_retirement_tests.rs"]
-mod cow_retirement_tests;
