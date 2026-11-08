@@ -210,6 +210,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_exec_pipe_tests.rs", contract = "kernel.el1.ipc-fd-authority" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_exec_pipe_tests.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_exec_pipe_tests.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/pipe_metadata_tests.rs", contract = "kernel.el1.ipc-fd-authority" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "kernel.el1.anonymous-permissions" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "kernel.el1.fork-cow" },
