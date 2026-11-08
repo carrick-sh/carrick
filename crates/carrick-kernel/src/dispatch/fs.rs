@@ -1621,6 +1621,18 @@ impl<'a> FsView<'a> {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         }
         let path = read_guest_c_string(memory, pathname.0)?;
+        self.truncate_path(Some(context), &path, length)
+    }
+
+    pub(in crate::dispatch) fn truncate_path(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        path: &str,
+        length: i64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if length < 0 {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        }
         if path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
@@ -1629,7 +1641,10 @@ impl<'a> FsView<'a> {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
-        if self.is_synthetic_virtual_path(context, &resolved) {
+        if self.mutation_path_needs_task(context, &resolved) {
+            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+        }
+        if context.is_some_and(|context| self.is_synthetic_virtual_path(context, &resolved)) {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
         // Layered metadata (overlay/disk first, then rootfs) — not rootfs-only,
@@ -1651,7 +1666,9 @@ impl<'a> FsView<'a> {
         // zone first, or its older size and pages would be written back over
         // the truncation.
         crate::el1_delegation::recall_path(self.fs, &resolved);
-        if let Some(errno) = self.rlimit_fsize_errno(length) {
+        if context.is_some()
+            && let Some(errno) = self.rlimit_fsize_errno(length)
+        {
             return Ok(DispatchOutcome::errno(errno));
         }
         // Disk-backed: open the real file and ftruncate it. The whole rootfs
@@ -2351,138 +2368,154 @@ impl<'a> FsView<'a> {
             if let Some(errno) = this.rlimit_fsize_errno(length) {
                 return Ok(DispatchOutcome::errno(errno));
             }
-            // Snapshot the path + new contents in a scope so the borrow drops
-            // before we touch this.fs.rootfs_vfs.overlay.
-            let writeback: Option<(String, Vec<u8>)>;
-            let outcome: DispatchOutcome;
+            this.truncate_description(Some(cx.kernel), &open_file.description, length)
+        }
+    }
+
+    pub(in crate::dispatch) fn truncate_description(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        description: &Arc<crate::kernel::FileDescription>,
+        length: i64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let this = self;
+        if length < 0 {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        }
+        // Snapshot the path + new contents in a scope so the borrow drops
+        // before we touch this.fs.rootfs_vfs.overlay.
+        let writeback: Option<(String, Vec<u8>)>;
+        let outcome: DispatchOutcome;
+        {
+            let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            if open
+                .open_path()
+                .is_some_and(|path| this.mutation_path_needs_task(context, path))
             {
-                let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                };
-                match &mut *open {
-                    OpenDescription::File {
-                        path,
-                        contents,
-                        offset,
-                        writable,
-                        metadata,
-                        ..
-                    } => {
-                        if !*writable {
-                            // RO fd is a valid fd opened the wrong way → EINVAL,
-                            // not EBADF (ftruncate03). EBADF is for an invalid fd
-                            // (handled by open_file→None above).
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                        }
-                        if !contents.accepts_len(length as u64) {
-                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                        }
-                        let cur_len = match contents.len() {
-                            Ok(l) => l,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                        };
-                        let new_len = length as usize;
-                        // memfd resize seals: F_SEAL_SHRINK blocks shrink,
-                        // F_SEAL_GROW blocks grow (memfd_create01).
-                        if let Err(errno) = memfd_seal_resize_check(
-                            open_file.description.common().seals(),
-                            new_len,
-                            usize::try_from(cur_len).unwrap_or(usize::MAX),
-                        ) {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        if let Err(errno) = contents.resize(length as u64) {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        if *offset > new_len {
-                            *offset = new_len;
-                        }
-                        let confirmed_len = match contents.len() {
-                            Ok(l) => l,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                        };
-                        metadata.size = usize::try_from(confirmed_len).unwrap_or(new_len);
-                        let writeback_vec = if !is_anon_overlay_path(path) {
-                            let mut vec = vec![0u8; metadata.size];
-                            if let Err(errno) = contents.read_at(0, &mut vec) {
-                                return Ok(DispatchOutcome::errno(errno));
-                            }
-                            Some((path.clone(), vec))
-                        } else {
-                            None
-                        };
-                        writeback = writeback_vec;
-                        outcome = DispatchOutcome::Returned { value: 0 };
-                    }
-                    OpenDescription::InMemoryFile {
-                        path,
-                        contents,
-                        offset,
-                        writable,
-                        max_size,
-                        ..
-                    } => {
-                        if !*writable {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                        }
-                        if length as usize > *max_size {
-                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                        }
-                        let new_len = length as usize;
-                        let mut data = contents.write();
-                        data.set_len(new_len);
-                        if *offset > new_len {
-                            *offset = new_len;
-                        }
-                        this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                        writeback = None;
-                        outcome = DispatchOutcome::Returned { value: 0 };
-                    }
-                    OpenDescription::HostFile {
-                        host_fd, writable, ..
-                    } => {
-                        if !*writable {
-                            // RO fd → EINVAL (ftruncate03), not EBADF.
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                        }
-                        // Real fd: ftruncate the kernel file directly (the
-                        // change is visible across fork).
-                        if let Err(errno) =
-                            (unsafe { libc::ftruncate(host_fd.raw(), length as libc::off_t) })
-                                .host_syscall_errno()
-                        {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        this.fs
-                            .truncate_host_sparse_extents(host_fd.raw(), length as u64);
-                        this.invalidate_dentry_host_fd(host_fd.raw());
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    OpenDescription::SyntheticFile { .. } => {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    OpenDescription::ProcExecutable { .. } => {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    OpenDescription::Directory { .. } => {
-                        return Ok(DispatchOutcome::errno(LINUX_EISDIR));
-                    }
-                    _ => {
+                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+            }
+            match &mut *open {
+                OpenDescription::File {
+                    path,
+                    contents,
+                    offset,
+                    writable,
+                    metadata,
+                    ..
+                } => {
+                    if !*writable {
+                        // RO fd is a valid fd opened the wrong way → EINVAL,
+                        // not EBADF (ftruncate03). EBADF is for an invalid fd
+                        // (handled by open_file→None above).
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
+                    if !contents.accepts_len(length as u64) {
+                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                    }
+                    let cur_len = match contents.len() {
+                        Ok(l) => l,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
+                    let new_len = length as usize;
+                    // memfd resize seals: F_SEAL_SHRINK blocks shrink,
+                    // F_SEAL_GROW blocks grow (memfd_create01).
+                    if let Err(errno) = memfd_seal_resize_check(
+                        description.common().seals(),
+                        new_len,
+                        usize::try_from(cur_len).unwrap_or(usize::MAX),
+                    ) {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    if let Err(errno) = contents.resize(length as u64) {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    if *offset > new_len {
+                        *offset = new_len;
+                    }
+                    let confirmed_len = match contents.len() {
+                        Ok(l) => l,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
+                    metadata.size = usize::try_from(confirmed_len).unwrap_or(new_len);
+                    let writeback_vec = if !is_anon_overlay_path(path) {
+                        let mut vec = vec![0u8; metadata.size];
+                        if let Err(errno) = contents.read_at(0, &mut vec) {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        Some((path.clone(), vec))
+                    } else {
+                        None
+                    };
+                    writeback = writeback_vec;
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::InMemoryFile {
+                    path,
+                    contents,
+                    offset,
+                    writable,
+                    max_size,
+                    ..
+                } => {
+                    if !*writable {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    if length as usize > *max_size {
+                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                    }
+                    let new_len = length as usize;
+                    let mut data = contents.write();
+                    data.set_len(new_len);
+                    if *offset > new_len {
+                        *offset = new_len;
+                    }
+                    this.fs.rootfs_vfs.notify_inode_changed(path, None);
+                    writeback = None;
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::HostFile {
+                    host_fd, writable, ..
+                } => {
+                    if !*writable {
+                        // RO fd → EINVAL (ftruncate03), not EBADF.
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    // Real fd: ftruncate the kernel file directly (the
+                    // change is visible across fork).
+                    if let Err(errno) =
+                        (unsafe { libc::ftruncate(host_fd.raw(), length as libc::off_t) })
+                            .host_syscall_errno()
+                    {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    this.fs
+                        .truncate_host_sparse_extents(host_fd.raw(), length as u64);
+                    this.invalidate_dentry_host_fd(host_fd.raw());
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                OpenDescription::SyntheticFile { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                OpenDescription::ProcExecutable { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                OpenDescription::Directory { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+                }
+                _ => {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             }
-            if let Some((path, contents)) = writeback {
-                let _ = this
-                    .fs
-                    .rootfs_vfs
-                    .set_file_contents(&path, contents);
-            }
-            Ok(outcome)
-
         }
+        if let Some((path, contents)) = writeback {
+            let _ = this.fs.rootfs_vfs.set_file_contents(&path, contents);
+        }
+        Ok(outcome)
+    }
 
-
+    define_syscall! {
         fn sync(this, cx) {
 
             this.with_host_wait(cx, || {

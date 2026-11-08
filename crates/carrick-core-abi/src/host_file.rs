@@ -74,6 +74,11 @@ pub enum HostFileOp {
     Utimensat = 17,
     /// `utimensat(fd, NULL, ...)` with the same timespec words.
     SetFdTimes = 18,
+    /// `truncate` of the staged path (`args[0]` signed length,
+    /// `args[1]` caller's RLIMIT_FSIZE soft limit).
+    Truncate = 19,
+    /// `ftruncate` with the same length and limit words.
+    Ftruncate = 20,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -197,6 +202,8 @@ impl HostFileOp {
             16 => Self::Linkat,
             17 => Self::Utimensat,
             18 => Self::SetFdTimes,
+            19 => Self::Truncate,
+            20 => Self::Ftruncate,
             _ => return None,
         })
     }
@@ -216,6 +223,7 @@ impl HostFileOp {
                 | Self::Symlinkat
                 | Self::Linkat
                 | Self::Utimensat
+                | Self::Truncate
         )
     }
 }
