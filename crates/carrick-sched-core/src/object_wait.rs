@@ -312,7 +312,7 @@ pub struct OperationToken {
     generation: u64,
 }
 
-const ANONYMOUS_EDIT_OPERATION_TAG: u64 = 1 << 63;
+const PREPARED_EDIT_OPERATION_TAG: u64 = 1 << 63;
 
 /// Authentication of an operation held by a scheduler record; not ownership.
 #[derive(
@@ -338,7 +338,7 @@ impl OperationToken {
     pub const fn new(index: u64, generation: u64) -> Option<Self> {
         if index == 0
             || index == u64::MAX
-            || index & ANONYMOUS_EDIT_OPERATION_TAG != 0
+            || index & PREPARED_EDIT_OPERATION_TAG != 0
             || generation == 0
         {
             None
@@ -347,10 +347,10 @@ impl OperationToken {
         }
     }
 
-    /// An anonymous reservation edit replay, distinct from prepared portal
-    /// waits that share the same address-space notification queue.
-    pub const fn anonymous_edit(key: ObjectWaitKey) -> Option<Self> {
-        let index = ANONYMOUS_EDIT_OPERATION_TAG | key.index as u64;
+    /// A prepared portal edit replay, distinct from anonymous waits that
+    /// share the same address-space notification queue.
+    pub const fn prepared_edit(key: ObjectWaitKey) -> Option<Self> {
+        let index = PREPARED_EDIT_OPERATION_TAG | key.index as u64;
         if key.generation == 0 {
             None
         } else {
@@ -361,13 +361,13 @@ impl OperationToken {
         }
     }
 
-    pub const fn is_anonymous_edit_for(&self, key: ObjectWaitKey) -> bool {
-        self.index == ANONYMOUS_EDIT_OPERATION_TAG | key.index as u64
+    pub const fn is_prepared_edit_for(&self, key: ObjectWaitKey) -> bool {
+        self.index == PREPARED_EDIT_OPERATION_TAG | key.index as u64
             && self.generation == key.generation
     }
 
-    const fn stored_anonymous_edit(index: u64, generation: u64) -> Option<Self> {
-        if index & !ANONYMOUS_EDIT_OPERATION_TAG == 0 || generation == 0 {
+    const fn stored_prepared_edit(index: u64, generation: u64) -> Option<Self> {
+        if index & !PREPARED_EDIT_OPERATION_TAG == 0 || generation == 0 {
             None
         } else {
             Some(Self { index, generation })
@@ -1670,7 +1670,7 @@ impl ObjectWaitCensus {
     /// address-space notification incarnation.
     pub const fn is_anonymous_edit(&self) -> bool {
         self.queue as usize >= ADDRESS_SPACE_WAIT_BASE
-            && self.operation == ANONYMOUS_EDIT_OPERATION_TAG | self.queue as u64
+            && self.operation == self.queue as u64
             && self.operation_generation == self.generation
     }
 }
@@ -1757,7 +1757,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     /// tokens are scheduler-owned and have no adapter arena entry.
     pub fn has_adapter_operation(&self) -> bool {
         let operation = self.object.operation.load(Ordering::Acquire);
-        !matches!(operation, 0 | u64::MAX) && operation & ANONYMOUS_EDIT_OPERATION_TAG == 0
+        !matches!(operation, 0 | u64::MAX) && operation & PREPARED_EDIT_OPERATION_TAG == 0
     }
 
     /// Whether this record's last object park ended at its deadline rather
@@ -1844,8 +1844,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         let generation = self.object.operation_generation.load(Ordering::Relaxed);
         if index == u64::MAX {
             OperationToken::metadata_request(generation)
-        } else if index & ANONYMOUS_EDIT_OPERATION_TAG != 0 {
-            OperationToken::stored_anonymous_edit(index, generation)
+        } else if index & PREPARED_EDIT_OPERATION_TAG != 0 {
+            OperationToken::stored_prepared_edit(index, generation)
         } else {
             OperationToken::new(index, generation)
         }

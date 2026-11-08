@@ -319,10 +319,9 @@ where
             return EditWaitOutcome::NoConflict;
         };
         let key = source.key(cause);
-        if resumed
-            .as_ref()
-            .is_some_and(|token| !token.is_anonymous_edit_for(key))
-        {
+        if resumed.as_ref().is_some_and(|token| {
+            token.index() != u64::from(key.index()) || token.generation() != key.generation()
+        }) {
             return EditWaitOutcome::StaleToken;
         }
         let Some(snapshot) = CAUSES
@@ -332,7 +331,7 @@ where
         else {
             return EditWaitOutcome::Refused;
         };
-        let Some(token) = OperationToken::anonymous_edit(key) else {
+        let Some(token) = OperationToken::new(u64::from(key.index()), key.generation()) else {
             return EditWaitOutcome::Refused;
         };
         // SAFETY: the source observation precedes the failed predicate probe;
@@ -382,9 +381,10 @@ where
         let Some(key) = root.prepared_wait_key() else {
             return EditWaitOutcome::Refused;
         };
-        if resumed.as_ref().is_some_and(|token| {
-            token.index() != u64::from(key.index()) || token.generation() != key.generation()
-        }) {
+        if resumed
+            .as_ref()
+            .is_some_and(|token| !token.is_prepared_edit_for(key))
+        {
             return EditWaitOutcome::StaleToken;
         }
 
@@ -407,7 +407,7 @@ where
         if !conflict {
             return EditWaitOutcome::NoConflict;
         }
-        let Some(token) = OperationToken::new(u64::from(key.index()), key.generation()) else {
+        let Some(token) = OperationToken::prepared_edit(key) else {
             return EditWaitOutcome::Refused;
         };
         match park(key, snapshot, token) {
