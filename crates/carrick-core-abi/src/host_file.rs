@@ -64,6 +64,8 @@ pub enum HostFileOp {
     Mkdirat = 13,
     /// `unlinkat` of the staged path (`flags` may contain `AT_REMOVEDIR`).
     Unlinkat = 14,
+    /// `symlinkat`: input is the verbatim target, NUL, then the link path.
+    Symlinkat = 15,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -181,6 +183,7 @@ impl HostFileOp {
             12 => Self::Poll,
             13 => Self::Mkdirat,
             14 => Self::Unlinkat,
+            15 => Self::Symlinkat,
             _ => return None,
         })
     }
@@ -197,6 +200,7 @@ impl HostFileOp {
                 | Self::Statx
                 | Self::Mkdirat
                 | Self::Unlinkat
+                | Self::Symlinkat
         )
     }
 }

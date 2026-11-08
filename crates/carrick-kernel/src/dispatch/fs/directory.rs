@@ -1489,53 +1489,68 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             let link = read_guest_c_string(&*cx.memory, linkpath)?;
-            if link.is_empty() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-            }
-            let resolved_link = this.resolve_at_path(newdirfd, &link)?;
-            if this.is_synthetic_virtual_path(cx.kernel, &resolved_link) {
-                return Ok(DispatchOutcome::errno(LINUX_EEXIST));
-            }
-            // If the link path already exists (anywhere in the layered
-            // view), report EEXIST. Otherwise the overlay can't create
-            // symlinks today, so we return EROFS.
-            if this.layered_metadata(&resolved_link).is_ok() {
-                return Ok(DispatchOutcome::errno(LINUX_EEXIST));
-            }
-            if let Some(m) = this.fs.vfs_mounts.resolve(&resolved_link) {
-                return match m.vfs.symlink(&target_path, &m.full_path) {
-                    Ok(()) => {
-                        this.dnotify_child(cx.kernel, &resolved_link, LinuxDnotifyMask::CREATE);
-                        crate::el1_inotify::invalidate_name_cache_all();
-                        Ok(DispatchOutcome::Returned { value: 0 })
-                    }
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                };
-            }
-            // DAC: creating the symlink entry needs write+search on the parent
-            // directory (symlink03 case 1 → EACCES). Root bypasses.
-            if let Some(parent) = Path::new(&resolved_link).parent()
-                && !this.guest_can_modify_dir(&display_rootfs_path(parent))
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EACCES));
-            }
-            // Create a real symlink in the writable backend (cap-std). The
-            // target is stored verbatim, matching symlinkat(2). MemoryBackend
-            // returns Unsupported → EROFS.
-            match this
-                .fs
-                .rootfs_vfs
-                .symlink(&target_path, &resolved_link)
-            {
+            this.symlink_path(Some(cx.kernel), &target_path, newdirfd, &link)
+        }
+    }
+
+    pub(in crate::dispatch) fn symlink_path(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        target_path: &str,
+        newdirfd: u64,
+        link: &str,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let this = self;
+        if target_path.is_empty() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
+        if link.is_empty() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
+        let resolved_link = this.resolve_at_path(newdirfd, link)?;
+        if this.mutation_path_needs_task(context, &resolved_link) {
+            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+        }
+        if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &resolved_link)) {
+            return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+        }
+        // If the link path already exists (anywhere in the layered
+        // view), report EEXIST. Otherwise the overlay can't create
+        // symlinks today, so we return EROFS.
+        if this.layered_metadata(&resolved_link).is_ok() {
+            return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+        }
+        if let Some(m) = this.fs.vfs_mounts.resolve(&resolved_link) {
+            return match m.vfs.symlink(target_path, &m.full_path) {
                 Ok(()) => {
-                    this.dnotify_child(cx.kernel, &resolved_link, LinuxDnotifyMask::CREATE);
+                    this.mutation_dnotify_child(context, &resolved_link, LinuxDnotifyMask::CREATE);
                     crate::el1_inotify::invalidate_name_cache_all();
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
+            };
         }
+        // DAC: creating the symlink entry needs write+search on the parent
+        // directory (symlink03 case 1 → EACCES). Root bypasses.
+        if let Some(parent) = Path::new(&resolved_link).parent()
+            && !this.guest_can_modify_dir(&display_rootfs_path(parent))
+        {
+            return Ok(DispatchOutcome::errno(LINUX_EACCES));
+        }
+        // Create a real symlink in the writable backend (cap-std). The
+        // target is stored verbatim, matching symlinkat(2). MemoryBackend
+        // returns Unsupported → EROFS.
+        match this.fs.rootfs_vfs.symlink(target_path, &resolved_link) {
+            Ok(()) => {
+                this.mutation_dnotify_child(context, &resolved_link, LinuxDnotifyMask::CREATE);
+                crate::el1_inotify::invalidate_name_cache_all();
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            Err(errno) => Ok(DispatchOutcome::errno(errno)),
+        }
+    }
 
+    define_syscall! {
         fn renameat(this, cx, olddirfd: u64, oldpath: GuestPtr, newdirfd: u64, newpath: GuestPtr) {
             this.do_renameat(
                 cx.kernel,

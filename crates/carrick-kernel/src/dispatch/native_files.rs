@@ -618,6 +618,7 @@ impl SyscallDispatcher {
             | HostFileOp::Newfstatat
             | HostFileOp::Mkdirat
             | HostFileOp::Unlinkat
+            | HostFileOp::Symlinkat
             | HostFileOp::Poll => Served::Refused,
         }
     }
@@ -632,6 +633,16 @@ impl SyscallDispatcher {
     ) -> Served {
         let fs = self.fs_view();
         match header.op {
+            HostFileOp::Symlinkat => {
+                let Some((target, path)) = native_path_pair(path) else {
+                    return Served::Refused;
+                };
+                match fs.symlink_path(None, target, LINUX_AT_FDCWD, path) {
+                    Ok(outcome) => served_mutation(outcome),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::Unlinkat => {
                 if u64::from(header.flags) & !carrick_abi::LINUX_AT_REMOVEDIR != 0 {
                     return Served::errno(carrick_abi::LINUX_EINVAL);
@@ -874,6 +885,11 @@ fn served_mutation(outcome: DispatchOutcome) -> Served {
         DispatchOutcome::Errno { errno } if errno == carrick_abi::LINUX_ENOSYS => Served::Refused,
         outcome => served_outcome(outcome, Vec::new()),
     }
+}
+
+fn native_path_pair(input: &str) -> Option<(&str, &str)> {
+    let (first, second) = input.split_once('\0')?;
+    (!second.contains('\0')).then_some((first, second))
 }
 
 fn native_stat_bytes(op: HostFileOp, record: &super::StatRecord) -> Vec<u8> {
