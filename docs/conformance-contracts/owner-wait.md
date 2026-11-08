@@ -236,3 +236,30 @@ cache lacked a dependency; fetching dependencies allowed the real suite to run.
 Independent source re-review found no findings. This Linux evidence does not
 supply signed HVF, Docker, runtime ratios or the merge-queue KVM gate; those
 acceptance layers remain outstanding.
+
+### Prepared-fork ppoll arguments (#1877)
+
+Poll argument reads use the existing typed lifecycle copy and exact-MM
+`wait_guest_copy` preparation, including pollfd, timespec and signal-mask input.
+The single-zone readiness path retains its refused input until the same owner
+prepares it; it must not fall through to a second copy that returns EFAULT.
+The same wrapper retains pre-effect IPC input refusals (eventfd values and
+iovec headers); a successful prefix keeps its existing short result instead
+of replaying input. The eventfd binding
+requires a single value of five after preparation. The shared dispatcher uses ISA-specific syscall restart mechanics (four bytes
+for SVC, two for SYSCALL). Completed output still uses the retained output
+owner, preserving its original ready answer across memory waits.
+
+The native prepared-pollfd and prepared-timespec bindings were each red with
+errno 14. A real native fork leaves the parent's private prepared descriptor
+invalid with deferred COW. The host-only guarded-copy projection checks that
+live descriptor; the physical-service fixture supplies one private frame only
+after the production MM portal selects the exact parent owner. Neither input
+preparation nor a forbidden/unmapped input can publish `revents`. These tests
+prove dispatch and owner selection, not hardware translation or HVF supply.
+The signed prepared-fork fixture remains the required higher-layer evidence.
+
+The diagnostic pipe carries an eight-byte readiness word before twelve child
+fields. Decoding drains any unread readiness bytes even after ppoll EFAULT;
+the native control covers zero, partial and complete readiness consumption and
+requires the last child byte observation (68) in the final field.
