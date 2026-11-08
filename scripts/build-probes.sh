@@ -33,6 +33,7 @@
 # (and `lane_runnable_here` SKIPs the ARM64 lane there).
 set -e
 cd "$(dirname "$0")/.."
+. scripts/lib/cargo-target-dir.sh
 
 CARRICK_DOCKER_CARGO_CACHE=()
 if [ "${CARGO_NET_OFFLINE:-false}" = true ]; then
@@ -155,15 +156,44 @@ build_native() {
   # Native build via the host rustc (no container). Adds the rustup target,
   # wipes the prior release dir so stale binaries don't leak into the gate, and
   # keeps going past arch-specific probes that can't compile for this target.
+  #
+  # cargo may write somewhere other than conformance-probes/target: worker VMs
+  # set CARGO_TARGET_DIR (and CARGO_BUILD_TARGET_DIR or a build.target-dir
+  # config do the same), so ask cargo where it built and publish the probe
+  # executables at the fixed consumer path the count loop and harness read.
   triple="$1"
   linker_env="$2"
   rustup target add "$triple" >/dev/null 2>&1 || true
-  rm -rf "conformance-probes/target/$triple/release"
+  real_target="$(cargo_target_dir conformance-probes)"
+  if [ -z "$real_target" ]; then
+    echo "build-probes: cargo did not report a target directory" >&2
+    exit 1
+  fi
+  rm -rf "$real_target/$triple/release"
   (
     cd conformance-probes
     # shellcheck disable=SC2086 # linker_env is a deliberate "VAR=val" prefix
     env $linker_env cargo build --locked --release --target "$triple" --keep-going || true
   )
+  built="$real_target/$triple/release"
+  consumer_release="conformance-probes/target/$triple/release"
+  if [ -d "$built" ]; then
+    # With no target-dir override cargo builds straight into the consumer path;
+    # wiping it there would delete the binaries about to be copied. Compare
+    # resolved paths so another spelling of that same directory (e.g. a relative
+    # CARGO_TARGET_DIR) is not mistaken for a move.
+    if [ -d "$consumer_release" ] &&
+      [ "$(cd "$built" && pwd -P)" = "$(cd "$consumer_release" && pwd -P)" ]; then
+      return 0
+    fi
+    rm -rf "$consumer_release"
+    mkdir -p "$consumer_release"
+    find "$built" -maxdepth 1 -type f ! -name '*.*' -exec cp -f {} "$consumer_release/" \;
+  else
+    # Nothing built (every probe failed for this target): leave no stale
+    # binaries behind at the consumer path.
+    rm -rf "$consumer_release"
+  fi
 }
 
 if [ "$HOST_ARCH" = "x86_64" ] || [ "$HOST_ARCH" = "amd64" ]; then
