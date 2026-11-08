@@ -91,7 +91,7 @@ pub(crate) fn run() -> i32 {
         // Diagnostic payload follows the original 8-byte readiness count. It is
         // sent after the parent acknowledgement, so it cannot be read as ready.
         // -999 means not reached; errno is zero on success, numeric on failure.
-        let mut steps = [-999i64; 9];
+        let mut steps = [-999i64; 12];
         let mut sent = false;
         let ok = (|| {
             steps[0] = unsafe { libc::mprotect(hidden.cast(), page, libc::PROT_READ) } as i64;
@@ -124,13 +124,16 @@ pub(crate) fn run() -> i32 {
             steps[7] = errno_if_failed(steps[6]);
             sent = true;
             // Native child blocking read stays bounded by alarm and peer EOF.
-            steps[6] == 8
-                && read_count(p2c_read.as_raw_fd()) == Some(1)
-                && unsafe {
-                    data.read_volatile() == 0x11
-                        && data.add(page).read_volatile() == 0x33
-                        && hidden.read_volatile() == 0x44
+            steps[6] == 8 && read_count(p2c_read.as_raw_fd()) == Some(1) && {
+                steps[9] = unsafe { data.read_volatile() } as i64;
+                steps[9] == 0x11 && {
+                    steps[10] = unsafe { data.add(page).read_volatile() } as i64;
+                    steps[10] == 0x33 && {
+                        steps[11] = unsafe { hidden.read_volatile() } as i64;
+                        steps[11] == 0x44
+                    }
                 }
+            }
         })();
         if !sent {
             // An early failure formerly closed the pipe without a count. Zero
@@ -147,7 +150,7 @@ pub(crate) fn run() -> i32 {
             }
         }
         steps[8] = i64::from(!ok);
-        let mut bytes = [0u8; 72];
+        let mut bytes = [0u8; 96];
         for (chunk, value) in bytes.chunks_exact_mut(8).zip(steps) {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
@@ -221,8 +224,8 @@ pub(crate) fn run() -> i32 {
     let mut status = 0;
     let waited = unsafe { libc::wait4(pid, &mut status, 0, std::ptr::null_mut()) };
     let wait_errno = errno_if_failed(waited as i64);
-    let mut child = [-999i64; 9];
-    let mut payload = [0u8; 72];
+    let mut child = [-999i64; 12];
+    let mut payload = [0u8; 96];
     // Child has exited (or alarm will terminate this fixture); EOF cannot hang.
     let diagnostic_read = unsafe {
         libc::read(
@@ -252,7 +255,7 @@ pub(crate) fn run() -> i32 {
     // unreached/missing observations; *_errno is 0 on success or errno NUMBER.
     // child_exit is requested _exit status; wait_status is the raw wait4 status.
     println!(
-        "prepared-fork-steps child_mprotect_r={} child_mprotect_r_errno={} child_hidden={} child_mprotect_rw={} child_mprotect_rw_errno={} child_middle={} child_write={} child_write_errno={} child_exit={} parent_mprotect_r={parent_protect} parent_mprotect_r_errno={parent_errno} parent_hidden={parent_hidden} parent_middle={parent_middle} ppoll={polled} ppoll_errno={poll_errno} revents={} read={read_rc} read_errno={read_errno} wait4={waited} wait4_errno={wait_errno} wait_status={status} diagnostic_read={diagnostic_read} diagnostic_errno={diagnostic_errno}",
+        "prepared-fork-steps child_mprotect_r={} child_mprotect_r_errno={} child_hidden={} child_mprotect_rw={} child_mprotect_rw_errno={} child_middle={} child_write={} child_write_errno={} child_exit={} child_final_first={} child_final_middle={} child_final_hidden={} parent_mprotect_r={parent_protect} parent_mprotect_r_errno={parent_errno} parent_hidden={parent_hidden} parent_middle={parent_middle} ppoll={polled} ppoll_errno={poll_errno} revents={} read={read_rc} read_errno={read_errno} wait4={waited} wait4_errno={wait_errno} wait_status={status} diagnostic_read={diagnostic_read} diagnostic_errno={diagnostic_errno}",
         child[0],
         child[1],
         child[2],
@@ -262,6 +265,9 @@ pub(crate) fn run() -> i32 {
         child[6],
         child[7],
         child[8],
+        child[9],
+        child[10],
+        child[11],
         pfd.revents
     );
     if ok { 0 } else { 1 }
