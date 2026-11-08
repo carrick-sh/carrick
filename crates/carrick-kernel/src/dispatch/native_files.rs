@@ -661,6 +661,7 @@ impl SyscallDispatcher {
             | HostFileOp::Linkat
             | HostFileOp::Utimensat
             | HostFileOp::Truncate
+            | HostFileOp::Renameat
             | HostFileOp::Poll => Served::Refused,
         }
     }
@@ -675,6 +676,36 @@ impl SyscallDispatcher {
     ) -> Served {
         let fs = self.fs_view();
         match header.op {
+            HostFileOp::Renameat => {
+                let Some((old, new)) = native_path_pair(path) else {
+                    return Served::Refused;
+                };
+                let flags = u64::from(header.flags);
+                if flags
+                    & !(carrick_abi::LINUX_RENAME_NOREPLACE | carrick_abi::LINUX_RENAME_EXCHANGE)
+                    != 0
+                    || flags
+                        == (carrick_abi::LINUX_RENAME_NOREPLACE
+                            | carrick_abi::LINUX_RENAME_EXCHANGE)
+                {
+                    return Served::errno(carrick_abi::LINUX_EINVAL);
+                }
+                match fs.rename_paths(
+                    None,
+                    super::fs::directory::RenameAtRequest {
+                        olddirfd: LINUX_AT_FDCWD,
+                        oldpath: old,
+                        newdirfd: LINUX_AT_FDCWD,
+                        newpath: new,
+                        flags,
+                        target_tid: None,
+                    },
+                ) {
+                    Ok(outcome) => served_mutation(outcome),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::Truncate => {
                 if (header.args[0] as i64) < 0 {
                     return Served::errno(carrick_abi::LINUX_EINVAL);
@@ -1579,7 +1610,7 @@ mod tests {
         assert_eq!(rename(38, b"missing", b"new", 0), -2);
         assert_eq!(rename(38, b"", b"new", 0), -2);
         assert_eq!(rename(38, b"target", b"/tmp", 0), -21);
-        assert_eq!(rename(38, b"/etc", b"target", 0), -20);
+        assert_eq!(rename(38, b"/etc", b"target", 0), -38);
         assert_eq!(rename(38, b"target", b"/etc/ld.so.cache/x", 0), -20);
         assert_eq!(rename(38, b"target", &[b'x'; 256], 0), -36);
         assert_eq!(rename(276, b"target", b"x", 4), -22);
@@ -1609,6 +1640,62 @@ mod tests {
             fixture.venue_contents(&authority, b"same-inode"),
             b"source\n"
         );
+    }
+
+    #[test]
+    fn native_child_rename_refuses_directory_and_memory_name_publication_before_effects() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = mutation_child(upper);
+            let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+            let file = fixture.venue_open(&authority, b"old", CREATE, 0o644);
+            assert_eq!(fixture.venue_write(file, b"kept"), 4);
+            let rename = |old: &[u8], new: &[u8]| {
+                fixture.child_call(
+                    &authority,
+                    38,
+                    [FDCWD as u64, 0, FDCWD as u64, 0, 0, 0],
+                    &[(1, old), (3, new)],
+                )
+            };
+            assert_eq!(rename(b"/tmp", b"/moved-tmp"), -38);
+            assert_eq!(fixture.venue_contents(&authority, b"old"), b"kept");
+            assert_eq!(fixture.venue_open(&authority, b"/moved-tmp", 0, 0), -2);
+            if matches!(upper, Upper::Memory) {
+                assert_eq!(rename(b"old", b"new"), -38);
+                assert_eq!(fixture.venue_contents(&authority, b"old"), b"kept");
+                assert_eq!(fixture.venue_open(&authority, b"new", 0, 0), -2);
+                assert_eq!(fixture.venue_write(file, b"-still-old"), 10);
+                assert_eq!(
+                    fixture.venue_contents(&authority, b"old"),
+                    b"kept-still-old"
+                );
+            } else {
+                let swap = fixture.venue_open(&authority, b"swap", CREATE, 0o644);
+                assert_eq!(fixture.venue_write(swap, b"swap"), 4);
+                assert_eq!(
+                    fixture.child_call(
+                        &authority,
+                        276,
+                        [FDCWD as u64, 0, FDCWD as u64, 0, 2, 0],
+                        &[(1, b"old"), (3, b"swap")],
+                    ),
+                    0
+                );
+                assert_eq!(fixture.venue_contents(&authority, b"old"), b"swap");
+                assert_eq!(fixture.venue_contents(&authority, b"swap"), b"kept");
+                assert_eq!(
+                    fixture.child_call(
+                        &authority,
+                        36,
+                        [0, FDCWD as u64, 0, 0, 0, 0],
+                        &[(0, b"swap"), (2, b"old-link")],
+                    ),
+                    0
+                );
+                assert_eq!(rename(b"old-link", b"new-link"), 0);
+                assert_eq!(fixture.venue_contents(&authority, b"new-link"), b"kept");
+            }
+        }
     }
 
     #[test]
