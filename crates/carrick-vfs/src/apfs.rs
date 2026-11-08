@@ -259,22 +259,51 @@ pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
     Ok(CACHE.get_or_init(resolve_scratch_root).clone())
 }
 
+/// Environment variable naming the scratch root explicitly. When set and
+/// non-empty it wins outright: the conventional `/Volumes/carrick` mount is
+/// not even probed. Signed-gate runners set it to an internal volume because
+/// the conventional mount can be cold external storage, and one stalled
+/// `open()` of the case probe there wedged a two-hour gate (#1727).
+pub const SCRATCH_ROOT_ENV: &str = "CARRICK_SCRATCH_ROOT";
+
 fn resolve_scratch_root() -> PathBuf {
+    let conventional = Path::new("/Volumes").join(DEFAULT_VOLUME_NAME);
+    resolve_scratch_root_from(
+        std::env::var_os(SCRATCH_ROOT_ENV),
+        &conventional,
+        |path| path.is_dir() && probe_case_sensitive(path),
+        std::env::var_os("CARRICK_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Pure scratch-root resolution, so the precedence is testable without
+/// mutating the process environment or touching real volumes.
+fn resolve_scratch_root_from(
+    explicit: Option<std::ffi::OsString>,
+    conventional: &Path,
+    conventional_usable: impl FnOnce(&Path) -> bool,
+    carrick_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    // An operator-chosen root wins without probing anything else.
+    if let Some(root) = explicit.filter(|root| !root.is_empty()) {
+        return PathBuf::from(root);
+    }
     // Fast path: the conventional mount point of the carrick volume. Verify
     // it's actually case-sensitive (a Linux ABI requirement) so a coincidental
     // dir at that path on a case-insensitive boot volume can't be mistaken for
     // our volume.
-    let conventional = Path::new("/Volumes").join(DEFAULT_VOLUME_NAME);
-    if conventional.is_dir() && probe_case_sensitive(&conventional) {
-        return conventional;
+    if conventional_usable(conventional) {
+        return conventional.to_path_buf();
     }
     // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick. (No
     // diskutil: a host without the conventional mount almost certainly has no
     // carrick volume, and an exotic mount can be pointed at via $CARRICK_HOME.)
-    let home = std::env::var_os("CARRICK_HOME")
+    let home = carrick_home
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
+            home.map(|h| {
                 let mut p = PathBuf::from(h);
                 p.push(".carrick");
                 p
@@ -353,6 +382,50 @@ mod fs_default_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_scratch_root_wins_without_probing_the_conventional_volume() {
+        let root = resolve_scratch_root_from(
+            Some("/Volumes/carrick-gate/scratch".into()),
+            Path::new("/Volumes/carrick"),
+            |_| panic!("the conventional volume must not be probed (#1727)"),
+            Some("/ignored/home".into()),
+            Some("/Users/ignored".into()),
+        );
+        assert_eq!(root, PathBuf::from("/Volumes/carrick-gate/scratch"));
+    }
+
+    #[test]
+    fn empty_explicit_scratch_root_keeps_existing_precedence() {
+        let conventional = Path::new("/Volumes/carrick");
+        let mut probed = false;
+        let root = resolve_scratch_root_from(
+            Some("".into()),
+            conventional,
+            |path| {
+                probed = path == conventional;
+                true
+            },
+            None,
+            None,
+        );
+        assert!(probed);
+        assert_eq!(root, conventional);
+        let fallback = resolve_scratch_root_from(
+            None,
+            conventional,
+            |_| false,
+            Some("/Volumes/CaseSensitive/home".into()),
+            Some("/Users/u".into()),
+        );
+        assert_eq!(
+            fallback,
+            PathBuf::from("/Volumes/CaseSensitive/home/scratch")
+        );
+        let home_fallback =
+            resolve_scratch_root_from(None, conventional, |_| false, None, Some("/Users/u".into()));
+        assert_eq!(home_fallback, PathBuf::from("/Users/u/.carrick/scratch"));
+    }
 
     #[test]
     fn parse_apfs_list_finds_named_case_sensitive_volume() {
