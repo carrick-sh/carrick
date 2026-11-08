@@ -340,7 +340,6 @@ impl PipeInner {
         assert_eq!(step.result, Ok(bytes.len()));
         guard.publish(step.wake);
     }
-    #[cfg(test)]
     pub(crate) fn ipc_object(&self) -> IpcObjectHandle {
         self.object
     }

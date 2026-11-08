@@ -457,6 +457,15 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }
+    /// The same admitted descriptor namespace used by fork and metadata.
+    fn exec_ipc_binding(
+        &self,
+    ) -> Option<(
+        carrick_el1_abi::ipc::IpcRegion<'_>,
+        &carrick_el1_abi::ipc_tables::IpcTableMap,
+    )> {
+        None
+    }
     fn exec_fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
         &[]
     }

@@ -11,7 +11,7 @@ pub(crate) use carrick_abi::{
 use carrick_guest_mem::CurrentMmMemory;
 
 use super::copyout::copyout_record;
-use super::{DispatchOutcome, RootFsMetadata, StatRecord, blocks_512};
+use super::{DispatchOutcome, RootFsMetadata, StatRecord};
 
 pub(crate) fn linux_statx_flags_are_supported(flags: u64) -> bool {
     const SUPPORTED: u64 = LINUX_AT_SYMLINK_NOFOLLOW
@@ -55,31 +55,7 @@ pub(super) fn write_x8664_stat_record(
     statbuf: u64,
     record: &StatRecord,
 ) -> DispatchOutcome {
-    let size = record.size_usize();
-    let blocks = record
-        .blocks
-        .map(|b| b as i64)
-        .unwrap_or_else(|| blocks_512(size));
-    let stat = LinuxX8664Stat {
-        st_dev: 1,
-        st_ino: record.ino,
-        st_nlink: record.nlink as u64,
-        st_mode: record.mode,
-        st_uid: record.uid.raw(),
-        st_gid: record.gid.raw(),
-        __pad0: 0,
-        st_rdev: record.rdev,
-        st_size: record.size as i64,
-        st_blksize: 4096,
-        st_blocks: blocks,
-        st_atime: record.atime.0,
-        st_atime_nsec: record.atime.1,
-        st_mtime: record.mtime.0,
-        st_mtime_nsec: record.mtime.1,
-        st_ctime: record.ctime.0,
-        st_ctime_nsec: record.ctime.1,
-        __reserved: [0; 3],
-    };
+    let stat = LinuxX8664Stat::from_fields(&record.linux_fields());
 
     copyout_record(
         context,

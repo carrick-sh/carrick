@@ -2507,7 +2507,45 @@ impl<
     fn may_serve_descriptor(&self) -> bool {
         let ordinal = self.frame.canonical_ordinal().raw();
         if self.native_descriptor_owner() {
+            let canonical =
+                carrick_personality_linux::dispatch::owner_ordinal(self.frame.canonical_ordinal());
+            if matches!(
+                canonical,
+                carrick_personality_linux::crossing::nr::FSTAT
+                    | carrick_personality_linux::crossing::nr::NEWFSTATAT
+                    | carrick_personality_linux::crossing::nr::IOCTL
+                    | carrick_personality_linux::crossing::nr::LSEEK
+            ) {
+                if canonical == carrick_personality_linux::crossing::nr::NEWFSTATAT
+                    && self.frame.argument(3).unwrap_or(0) & carrick_abi::LINUX_AT_EMPTY_PATH == 0
+                {
+                    return false;
+                }
+                let NativeDescriptorNamespace::Native(Some(raw)) =
+                    self.native_descriptor_namespace()
+                else {
+                    return false;
+                };
+                let Some(venue) = self.ipc else {
+                    return false;
+                };
+                return match venue.region.fd(NativeFdWait).get(
+                    carrick_fd_core::TableId::from_raw(raw),
+                    carrick_fd_core::Fd(self.frame.argument(0).unwrap_or(0) as i32),
+                ) {
+                    Ok(description) => matches!(
+                        carrick_el1_abi::ipc::IpcBacking::decode(description.backing),
+                        Some(carrick_el1_abi::ipc::IpcBacking::Pipe { .. })
+                    ),
+                    Err(carrick_fd_core::Error::BadFd) => true,
+                    Err(_) => false,
+                };
+            }
             if [
+                carrick_personality_linux::crossing::nr::FSTAT,
+                carrick_personality_linux::crossing::nr::NEWFSTATAT,
+                carrick_personality_linux::crossing::nr::IOCTL,
+                carrick_personality_linux::crossing::nr::LSEEK,
                 carrick_personality_linux::crossing::nr::PIPE2,
                 carrick_personality_linux::crossing::nr::EVENTFD2,
                 carrick_personality_linux::crossing::nr::EPOLL_CREATE1,
@@ -2518,7 +2556,12 @@ impl<
             ]
             .iter()
             .any(|nr| nr.raw() == ordinal)
-                || ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
+                || matches!(
+                    ordinal,
+                    carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
+                        | carrick_syscall_abi::CARRICK_PRIVATE_X86_FSTAT
+                        | carrick_syscall_abi::CARRICK_PRIVATE_X86_NEWFSTATAT
+                )
             {
                 return true;
             }
@@ -2531,6 +2574,8 @@ impl<
                         | carrick_abi::LINUX_F_GETFL
                         | carrick_abi::LINUX_F_SETFL
                         | carrick_abi::LINUX_F_DUPFD_CLOEXEC
+                        | carrick_abi::LINUX_F_GETPIPE_SZ
+                        | carrick_abi::LINUX_F_SETPIPE_SZ
                 );
             }
             return false;
@@ -3399,9 +3444,14 @@ enum NativeDescriptorNamespace {
     Native(Option<carrick_el1_abi::ipc::RawTableId>),
 }
 
+#[cfg(test)]
+pub(crate) static NATIVE_FD_CONTENTIONS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 struct NativeFdWait;
 impl carrick_el1_abi::ipc::LockWait for NativeFdWait {
     fn wait(&self, _attempt: u32) -> bool {
+        #[cfg(test)]
+        NATIVE_FD_CONTENTIONS.fetch_add(1, Ordering::Release);
         core::hint::spin_loop();
         true
     }
@@ -3571,7 +3621,13 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     carrick_el1_abi::ipc::fd::TableId::from_raw(raw),
                     carrick_el1_abi::ipc::fd::Fd(self.frame.argument(0).unwrap_or(0) as i32),
                 )
-                .is_ok_and(ipc::is_zone_releasable_backing)
+                .map_or_else(
+                    |error| {
+                        error == carrick_fd_core::Error::BadFd
+                            && carrick_personality_linux::dispatch::descriptor_ordinal(ordinal)
+                    },
+                    ipc::is_zone_releasable_backing,
+                )
         });
         if constructor || zone_description {
             return NativeDescriptorNamespace::Native(table);
@@ -3683,6 +3739,226 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         Ok(new_fd)
     }
 
+    /// Metadata snapshots retain the exact description until object work is
+    /// complete, then release all locks and the pin before owner copyout.
+    #[inline(never)]
+    fn serve_pipe_metadata(&mut self) -> FamilyCompletion {
+        use crate::ipc;
+        use carrick_abi::*;
+        use carrick_el1_abi::ipc::{
+            IpcBacking,
+            fd::{Fd, TableId},
+        };
+        use carrick_personality_linux::crossing::nr;
+        use zerocopy::IntoBytes;
+        let Some(venue) = self.ipc else {
+            return FamilyCompletion::Forward;
+        };
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+            return FamilyCompletion::Forward;
+        };
+        let NativeDescriptorNamespace::Native(Some(raw)) = self.native_descriptor_namespace()
+        else {
+            return FamilyCompletion::Forward;
+        };
+        let table = TableId::from_raw(raw);
+        let fd = Fd(self.frame.argument(0).unwrap_or(0) as i32);
+        let authority = venue.region.fd(NativeFdWait);
+        let zone = self
+            .zone
+            .as_ref()
+            .zip(self.frame.slot())
+            .map(|(z, slot)| (z.tables, slot));
+        let ordinal = self.frame.canonical_ordinal();
+        let arg = self.frame.argument(1).unwrap_or(0);
+        let value = self.frame.argument(2).unwrap_or(0);
+        // Import scalar input before admitting an owned metadata operation.
+        // A refused page uses the existing exact-MM copy wait and redispatch;
+        // no description, object guard or output has been retained yet.
+        let input = if ordinal == nr::IOCTL && arg == LINUX_FIONBIO {
+            Some((value, 4))
+        } else if ordinal == nr::NEWFSTATAT || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT {
+            Some((arg, 1))
+        } else {
+            None
+        };
+        let mut imported = [0u8; 4];
+        if let Some((address, len)) = input {
+            match authority.get(table, fd) {
+                Ok(description)
+                    if matches!(
+                        IpcBacking::decode(description.backing),
+                        Some(IpcBacking::Pipe { .. })
+                    ) => {}
+                Ok(_) => return FamilyCompletion::Forward,
+                Err(error) => return map_fd_error(error),
+            }
+            let mut copy = file::ValidatedCopy {
+                task,
+                validator: &file::HardwareValidator,
+            };
+            match carrick_core::user_copy::UserCopy::copy_in(
+                &mut copy,
+                &mut imported[..len],
+                carrick_guest_arch::UserVa::new(address),
+            ) {
+                lifecycle::CopyOutcome::Done => {}
+                lifecycle::CopyOutcome::Fault => {
+                    return FamilyCompletion::Complete(LINUX_EFAULT.guest_retval());
+                }
+                lifecycle::CopyOutcome::NotYet(request) => {
+                    let Some(process) = self.process.as_deref_mut() else {
+                        return FamilyCompletion::Forward;
+                    };
+                    let outcome = process.wait_guest_copy(request);
+                    return lifecycle::lifecycle_effect(&outcome);
+                }
+            }
+        }
+        let (pin, description) = match authority.pin(table, fd) {
+            Ok(value) => value,
+            Err(error) => return map_fd_error(error),
+        };
+        let mut output = None;
+        let result = (|| {
+            let Some(IpcBacking::Pipe { object, .. }) = IpcBacking::decode(description.backing)
+            else {
+                return FamilyCompletion::Forward;
+            };
+            if ordinal == nr::LSEEK {
+                return FamilyCompletion::Complete(LINUX_ESPIPE.guest_retval());
+            }
+            if ordinal == nr::FCNTL {
+                if arg == LINUX_F_SETPIPE_SZ {
+                    let requested = value as u32 as i32;
+                    if requested < 0 {
+                        return FamilyCompletion::Complete(LINUX_EINVAL.guest_retval());
+                    }
+                    return match venue.region.resize_pipe(
+                        object,
+                        requested as usize,
+                        1024 * 1024,
+                        &NativeFdWait,
+                        |wake| ipc::notify_native_wake(wake, zone, task),
+                    ) {
+                        Ok(capacity) => FamilyCompletion::Complete(capacity as i64),
+                        Err(carrick_el1_abi::ipc::IpcError::Object(error)) => {
+                            FamilyCompletion::Complete(
+                                match error {
+                                    carrick_el1_abi::ipc::pipe::Error::Busy => LINUX_EBUSY,
+                                    carrick_el1_abi::ipc::pipe::Error::Permission => LINUX_EPERM,
+                                    _ => LINUX_EINVAL,
+                                }
+                                .guest_retval(),
+                            )
+                        }
+                        Err(error) => map_ipc_error(error),
+                    };
+                }
+                let mut guard = match venue.region.lock(object, &NativeFdWait) {
+                    Ok(g) => g,
+                    Err(e) => return map_ipc_error(e),
+                };
+                return match guard.pipe() {
+                    Ok(pipe) => FamilyCompletion::Complete(pipe.capacity() as i64),
+                    Err(e) => map_ipc_error(e),
+                };
+            }
+            if ordinal == nr::FSTAT
+                || ordinal.raw() == CARRICK_PRIVATE_X86_FSTAT
+                || ordinal == nr::NEWFSTATAT
+                || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT
+            {
+                let at =
+                    ordinal == nr::NEWFSTATAT || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT;
+                if at {
+                    let flags = self.frame.argument(3).unwrap_or(0);
+                    if flags
+                        & !(LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT)
+                        != 0
+                    {
+                        return FamilyCompletion::Complete(LINUX_EINVAL.guest_retval());
+                    }
+                    if flags & LINUX_AT_EMPTY_PATH == 0 {
+                        return FamilyCompletion::Forward;
+                    }
+                    if imported[0] != 0 {
+                        return FamilyCompletion::Forward;
+                    }
+                }
+                // Authenticate the live object under the same lock as pipe I/O.
+                let guard = match venue.region.lock(object, &NativeFdWait) {
+                    Ok(g) => g,
+                    Err(e) => return map_ipc_error(e),
+                };
+                let fields =
+                    LinuxPipeIdentity::new(guard.handle().index(), guard.handle().generation())
+                        .stat_fields();
+                drop(guard);
+                // x86 legacy and newfstatat both use its native stat layout.
+                let bytes = if ordinal.raw() == CARRICK_PRIVATE_X86_FSTAT
+                    || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT
+                {
+                    LinuxX8664Stat::from_fields(&fields).as_bytes().to_vec()
+                } else {
+                    LinuxStat::from_fields(&fields).as_bytes().to_vec()
+                };
+                output = Some((if at { value } else { arg }, bytes));
+                return FamilyCompletion::Complete(0);
+            }
+            if ordinal == nr::IOCTL {
+                match arg {
+                    LINUX_FIONREAD => {
+                        let count = {
+                            let mut guard = match venue.region.lock(object, &NativeFdWait) {
+                                Ok(g) => g,
+                                Err(e) => return map_ipc_error(e),
+                            };
+                            match guard.pipe() {
+                                Ok(pipe) => pipe.unread_bytes() as i32,
+                                Err(e) => return map_ipc_error(e),
+                            }
+                        };
+                        output = Some((value, count.to_ne_bytes().to_vec()));
+                    }
+                    LINUX_FIONBIO => {
+                        let mut flags = description.flags;
+                        flags.nonblock = i32::from_ne_bytes(imported) != 0;
+                        if let Err(e) = authority.set_pinned_flags(&pin, flags) {
+                            return map_fd_error(e);
+                        }
+                    }
+                    LINUX_FIOCLEX | LINUX_FIONCLEX => {
+                        if let Err(e) = authority.setfd(table, fd, arg == LINUX_FIOCLEX) {
+                            return map_fd_error(e);
+                        }
+                    }
+                    _ => return FamilyCompletion::Complete(LINUX_ENOTTY.guest_retval()),
+                }
+                return FamilyCompletion::Complete(0);
+            }
+            FamilyCompletion::Forward
+        })();
+        match authority.unpin_filtered(pin, ipc::is_zone_releasable_backing) {
+            Ok(release) => {
+                if let Err(e) = ipc::settle_native_release(&venue.region, release, zone, task) {
+                    return map_ipc_error(e);
+                }
+            }
+            Err(e) => return map_fd_error(e),
+        }
+        if let Some((address, bytes)) = output {
+            return complete_poll_copyout(
+                self.process.as_deref_mut(),
+                task,
+                carrick_guest_arch::UserVa::new(address),
+                &bytes,
+                SyscallResult::new(0),
+            );
+        }
+        result
+    }
+
     #[inline(never)]
     fn serve_owned_ipc_descriptor(&mut self) -> FamilyCompletion {
         use carrick_el1_abi::ipc::fd::{AccessMode, Fd, TableId};
@@ -3706,6 +3982,22 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             .zip(self.frame.slot())
             .map(|(z, slot)| (z.tables, slot));
 
+        let owner =
+            carrick_personality_linux::dispatch::owner_ordinal(self.frame.canonical_ordinal());
+        if matches!(
+            owner,
+            carrick_personality_linux::crossing::nr::IOCTL
+                | carrick_personality_linux::crossing::nr::LSEEK
+                | carrick_personality_linux::crossing::nr::NEWFSTATAT
+                | carrick_personality_linux::crossing::nr::FSTAT
+        ) || (owner == carrick_personality_linux::crossing::nr::FCNTL
+            && matches!(
+                self.frame.argument(1),
+                Some(carrick_abi::LINUX_F_GETPIPE_SZ | carrick_abi::LINUX_F_SETPIPE_SZ)
+            ))
+        {
+            return self.serve_pipe_metadata();
+        }
         match ordinal {
             nr if nr == carrick_personality_linux::crossing::nr::PIPE2.raw() => {
                 use carrick_el1_abi::ipc::{
@@ -5001,7 +5293,9 @@ mod tests {
                 table,
                 |fd| {
                     asked = Some(fd);
-                    Some(NativeDescriptor::InZone(InZoneKind::Pipe))
+                    Some(NativeDescriptor::InZone(InZoneKind::Pipe(
+                        carrick_syscall_abi::LinuxPipeIdentity::new(1, 1),
+                    )))
                 },
                 &mut |_| 0
             ),
@@ -5150,7 +5444,9 @@ mod tests {
                 &Resident,
                 table,
                 |fd| Some(if fd == 0 {
-                    NativeDescriptor::InZone(InZoneKind::Pipe)
+                    NativeDescriptor::InZone(InZoneKind::Pipe(
+                        carrick_syscall_abi::LinuxPipeIdentity::new(1, 1),
+                    ))
                 } else {
                     NativeDescriptor::HostBacked {
                         access: DescriptionAccess::ReadWrite,

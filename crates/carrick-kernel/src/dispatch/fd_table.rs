@@ -3728,10 +3728,6 @@ impl StatRecord {
             self.rdev = rdev;
         }
     }
-
-    pub(super) fn size_usize(&self) -> usize {
-        self.size.min(usize::MAX as u64) as usize
-    }
 }
 
 pub(super) fn host_stream_stat_label(identity: u64, linux_type: u32) -> String {
@@ -4006,9 +4002,11 @@ impl OpenDescription {
             OpenDescription::BpfProg { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:bpf-prog", 0, 0o600))
             }
-            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
+            OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
+                let object = pipe.ipc_object();
                 OpenStatSource::Record(StatRecord::from_linux_fields(
-                    carrick_abi::LinuxStatFields::CARRICK_PIPE,
+                    carrick_abi::LinuxPipeIdentity::new(object.index(), object.generation())
+                        .stat_fields(),
                 ))
             }
             OpenDescription::HostPipe {

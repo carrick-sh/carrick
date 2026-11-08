@@ -5,6 +5,7 @@ use carrick_test_support::GuestUserBuffer;
 
 #[derive(Clone, Copy)]
 pub(super) enum Case {
+    Contended,
     Stat,
     EmptyPath,
     Flags,
@@ -25,158 +26,537 @@ pub(super) enum Case {
     Close,
 }
 
-macro_rules! witness {
-    ($root:ident, $child:ident, $case:ident) => {
-        #[test]
-        fn $root() {
-            super::native_descriptor_metadata_witness(
-                None,
-                true,
-                false,
-                false,
-                false,
-                false,
-                Some(Case::$case),
-            );
-        }
-        #[test]
-        fn $child() {
-            super::native_descriptor_metadata_witness(
-                None,
-                false,
-                false,
-                false,
-                false,
-                false,
-                Some(Case::$case),
-            );
-        }
-    };
+#[test]
+fn serial_host_pipe_metadata_root_stat() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Stat),
+    );
 }
 
-witness!(
-    serial_host_pipe_metadata_root_stat,
-    serial_host_pipe_metadata_child_stat,
-    Stat
-);
-witness!(
-    serial_host_pipe_metadata_root_empty_path,
-    serial_host_pipe_metadata_child_empty_path,
-    EmptyPath
-);
-witness!(
-    serial_host_pipe_metadata_root_flags,
-    serial_host_pipe_metadata_child_flags,
-    Flags
-);
-witness!(
-    serial_host_pipe_metadata_root_fdflags,
-    serial_host_pipe_metadata_child_fdflags,
-    DescriptorFlags
-);
-witness!(
-    serial_host_pipe_metadata_root_dupfd,
-    serial_host_pipe_metadata_child_dupfd,
-    Duplicate
-);
-witness!(
-    serial_host_pipe_metadata_root_dupfd_cloexec,
-    serial_host_pipe_metadata_child_dupfd_cloexec,
-    DuplicateCloexec
-);
-witness!(
-    serial_host_pipe_metadata_root_size,
-    serial_host_pipe_metadata_child_size,
-    PipeSize
-);
-witness!(
-    serial_host_pipe_metadata_root_shrink_busy,
-    serial_host_pipe_metadata_child_shrink_busy,
-    PipeShrinkBusy
-);
-witness!(
-    serial_host_pipe_metadata_root_subprocess,
-    serial_host_pipe_metadata_child_subprocess,
-    SubprocessPattern
-);
-witness!(
-    serial_host_pipe_metadata_root_fionread,
-    serial_host_pipe_metadata_child_fionread,
-    Readable
-);
-witness!(
-    serial_host_pipe_metadata_root_fionbio,
-    serial_host_pipe_metadata_child_fionbio,
-    Nonblocking
-);
-witness!(
-    serial_host_pipe_metadata_root_terminal,
-    serial_host_pipe_metadata_child_terminal,
-    Terminal
-);
-witness!(
-    serial_host_pipe_metadata_root_seek,
-    serial_host_pipe_metadata_child_seek,
-    Seek
-);
-witness!(
-    serial_host_pipe_metadata_root_dup,
-    serial_host_pipe_metadata_child_dup,
-    Dup
-);
-witness!(
-    serial_host_pipe_metadata_root_dup3,
-    serial_host_pipe_metadata_child_dup3,
-    Dup3
-);
-witness!(
-    serial_host_pipe_metadata_root_close,
-    serial_host_pipe_metadata_child_close,
-    Close
-);
-
-macro_rules! exec_witness {
-    ($name:ident, $case:ident) => {
-        #[test]
-        fn $name() {
-            super::native_exec_pipe_tests::metadata_successor(Case::$case);
-        }
-    };
+#[test]
+fn serial_host_pipe_metadata_child_stat() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Stat),
+    );
 }
 
-witness!(
-    serial_host_pipe_metadata_root_ioctl_cloexec,
-    serial_host_pipe_metadata_child_ioctl_cloexec,
-    IoctlCloexec
-);
-exec_witness!(serial_host_pipe_metadata_exec_stat, Stat);
-exec_witness!(serial_host_pipe_metadata_exec_empty_path, EmptyPath);
-exec_witness!(serial_host_pipe_metadata_exec_flags, Flags);
-exec_witness!(
-    serial_host_pipe_metadata_exec_descriptor_flags,
-    DescriptorFlags
-);
-exec_witness!(serial_host_pipe_metadata_exec_duplicate, Duplicate);
-exec_witness!(
-    serial_host_pipe_metadata_exec_duplicate_cloexec,
-    DuplicateCloexec
-);
-exec_witness!(serial_host_pipe_metadata_exec_pipe_size, PipeSize);
-exec_witness!(serial_host_pipe_metadata_exec_shrink_busy, PipeShrinkBusy);
-exec_witness!(serial_host_pipe_metadata_exec_subprocess, SubprocessPattern);
-exec_witness!(serial_host_pipe_metadata_exec_readable, Readable);
-exec_witness!(serial_host_pipe_metadata_exec_nonblocking, Nonblocking);
-exec_witness!(serial_host_pipe_metadata_exec_ioctl_cloexec, IoctlCloexec);
-exec_witness!(serial_host_pipe_metadata_exec_terminal, Terminal);
-exec_witness!(serial_host_pipe_metadata_exec_seek, Seek);
-exec_witness!(serial_host_pipe_metadata_exec_dup, Dup);
-exec_witness!(serial_host_pipe_metadata_exec_dup3, Dup3);
-exec_witness!(serial_host_pipe_metadata_exec_close, Close);
+#[test]
+fn serial_host_pipe_metadata_root_empty_path() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::EmptyPath),
+    );
+}
 
-exec_witness!(
-    serial_host_pipe_metadata_exec_inherited_cloexec,
-    ExecCloexec
-);
+#[test]
+fn serial_host_pipe_metadata_child_empty_path() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::EmptyPath),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_flags() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Flags),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_flags() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Flags),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_fdflags() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::DescriptorFlags),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_fdflags() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::DescriptorFlags),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_dupfd() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Duplicate),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_dupfd() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Duplicate),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_dupfd_cloexec() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::DuplicateCloexec),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_dupfd_cloexec() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::DuplicateCloexec),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_size() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::PipeSize),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_size() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::PipeSize),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_shrink_busy() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::PipeShrinkBusy),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_shrink_busy() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::PipeShrinkBusy),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_subprocess() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::SubprocessPattern),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_subprocess() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::SubprocessPattern),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_fionread() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Readable),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_fionread() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Readable),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_fionbio() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Nonblocking),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_fionbio() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Nonblocking),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_terminal() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Terminal),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_terminal() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Terminal),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_seek() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Seek),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_seek() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Seek),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_dup() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Dup),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_dup() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Dup),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_dup3() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Dup3),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_dup3() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Dup3),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_close() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Close),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_close() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Close),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_root_ioctl_cloexec() {
+    super::native_descriptor_metadata_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::IoctlCloexec),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_child_ioctl_cloexec() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::IoctlCloexec),
+    );
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_stat() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Stat);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_empty_path() {
+    super::native_exec_pipe_tests::metadata_successor(Case::EmptyPath);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_flags() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Flags);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_descriptor_flags() {
+    super::native_exec_pipe_tests::metadata_successor(Case::DescriptorFlags);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_duplicate() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Duplicate);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_duplicate_cloexec() {
+    super::native_exec_pipe_tests::metadata_successor(Case::DuplicateCloexec);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_pipe_size() {
+    super::native_exec_pipe_tests::metadata_successor(Case::PipeSize);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_shrink_busy() {
+    super::native_exec_pipe_tests::metadata_successor(Case::PipeShrinkBusy);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_subprocess() {
+    super::native_exec_pipe_tests::metadata_successor(Case::SubprocessPattern);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_readable() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Readable);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_nonblocking() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Nonblocking);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_ioctl_cloexec() {
+    super::native_exec_pipe_tests::metadata_successor(Case::IoctlCloexec);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_terminal() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Terminal);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_seek() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Seek);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_dup() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Dup);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_dup3() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Dup3);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_close() {
+    super::native_exec_pipe_tests::metadata_successor(Case::Close);
+}
+
+#[test]
+fn serial_host_pipe_metadata_exec_inherited_cloexec() {
+    super::native_exec_pipe_tests::metadata_successor(Case::ExecCloexec);
+}
 
 pub(super) fn exercise(case: Case, mut call: impl FnMut(u64, [u64; 4]) -> i64) {
     let output = GuestUserBuffer::zeroed(8);
@@ -192,6 +572,7 @@ pub(super) fn exercise(case: Case, mut call: impl FnMut(u64, [u64; 4]) -> i64) {
     let (read, write) = (fds[0], fds[1]);
     let data = GuestUserBuffer::from_bytes(b"hi\n");
     match case {
+        Case::Contended => unreachable!("fixture owns the contention schedule"),
         Case::Stat | Case::EmptyPath => {
             let empty = GuestUserBuffer::from_bytes(b"\0");
             let mut stat = |fd| {
@@ -399,4 +780,17 @@ pub(super) fn exercise(case: Case, mut call: impl FnMut(u64, [u64; 4]) -> i64) {
     }
     assert_eq!(call(nr::CLOSE.raw(), [read, 0, 0, 0]), 0);
     assert_eq!(call(nr::CLOSE.raw(), [write, 0, 0, 0]), 0);
+}
+
+#[test]
+fn serial_host_pipe_metadata_busy_once_then_success() {
+    super::native_descriptor_metadata_witness(
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(Case::Contended),
+    );
 }

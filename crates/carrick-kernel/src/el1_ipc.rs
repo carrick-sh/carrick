@@ -878,49 +878,15 @@ impl HostIpc {
         requested: usize,
         limit: usize,
     ) -> Result<usize, AdmissionError> {
-        let region = self.region();
-        loop {
-            let (current, backed) = {
-                let mut guard = region.lock(object, &HostLockWait)?;
-                let pipe = guard.pipe()?;
-                (pipe.capacity(), pipe.is_backed())
-            };
-            let rounded = pipe::Pipe::rounded_capacity(IPC_PIPE_PAGE_SIZE, requested)
-                .map_err(IpcError::Object)?;
-            if rounded > current && rounded > limit {
-                return Err(IpcError::Object(pipe::Error::Permission).into());
-            }
-            // An unbacked pipe only records its capacity; its first write
-            // sizes the ring.
-            let mut replacement = if rounded > current && backed {
-                Some(self.provision_pipe(rounded as u64, (rounded / IPC_PIPE_PAGE_SIZE) as u64)?)
-            } else {
-                None
-            };
-            let result = (|| {
-                let mut guard = region.lock(object, &HostLockWait)?;
-                if let Some(storage) = &mut replacement {
-                    guard.replace_pipe_storage(storage)?;
-                }
-                let step = guard.pipe()?.set_capacity(requested, limit);
+        self.region()
+            .resize_pipe(object, requested, limit, &HostLockWait, |wake| {
                 let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
-                delivery.collect(guard.publish(step.wake));
-                drop(guard);
+                delivery.collect(wake);
                 delivery.deliver();
-                step.result.map_err(IpcError::Object)
-            })();
-            let without_ring = replacement.is_none();
-            if let Some(mut storage) = replacement {
-                region.reclaim_pipe_storage(&mut storage, &HostLockWait)?;
-            }
-            match result {
-                // A first write gave the pipe its ring (for the old capacity)
-                // between the sample and the lock: size it again.
-                Err(IpcError::Object(pipe::Error::Storage)) if without_ring => continue,
-                result => return result.map_err(Into::into),
-            }
-        }
+            })
+            .map_err(Into::into)
     }
+
     fn provision_descriptors(&self, capacity: usize) -> Result<fd::Extent, AdmissionError> {
         self.region()
             .provision_descriptors(capacity, &HostLockWait)

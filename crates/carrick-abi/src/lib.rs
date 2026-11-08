@@ -564,6 +564,32 @@ pub struct LinuxX8664Stat {
     pub __reserved: [i64; 3],
 }
 
+impl LinuxX8664Stat {
+    /// Encode the same facts as the asm-generic stat writer in x86 wire order.
+    pub const fn from_fields(fields: &LinuxStatFields) -> Self {
+        Self {
+            st_dev: 1,
+            st_ino: fields.ino,
+            st_nlink: fields.nlink as u64,
+            st_mode: fields.mode,
+            st_uid: fields.uid,
+            st_gid: fields.gid,
+            __pad0: 0,
+            st_rdev: fields.rdev,
+            st_size: fields.size as i64,
+            st_blksize: 4096,
+            st_blocks: fields.blocks() as i64,
+            st_atime: fields.atime.0,
+            st_atime_nsec: fields.atime.1,
+            st_mtime: fields.mtime.0,
+            st_mtime_nsec: fields.mtime.1,
+            st_ctime: fields.ctime.0,
+            st_ctime_nsec: fields.ctime.1,
+            __reserved: [0; 3],
+        }
+    }
+}
+
 #[repr(C, packed)]
 #[derive(
     ::core::fmt::Debug,
@@ -3815,6 +3841,8 @@ pub const LINUX_TIOCSWINSZ: u64 = 0x5414;
 pub const LINUX_TIOCGPTN: u64 = 0x8004_5430;
 pub const LINUX_TIOCSPTLCK: u64 = 0x4004_5431;
 pub const LINUX_FIONREAD: u64 = 0x541B;
+pub const LINUX_FIOCLEX: u64 = 0x5451;
+pub const LINUX_FIONCLEX: u64 = 0x5450;
 pub const LINUX_FIONBIO: u64 = 0x5421;
 pub const LINUX_TIOCNOTTY: u64 = 0x5422;
 pub const LINUX_TIOCGSID: u64 = 0x5429;
