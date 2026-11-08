@@ -7266,16 +7266,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         ns.release(number, ClaimKind::Task);
                         return Err(NativeProcessError::Exhausted);
                     }
-                    let Ok(visible) = ns.reserve_visible(visible_namespace) else {
-                        ns.release(number, ClaimKind::Thread);
-                        ns.release(number, ClaimKind::Task);
-                        return Err(NativeProcessError::Exhausted);
+                    let visible = match ns.assign_visible(number, visible_namespace) {
+                        Ok(visible) => visible,
+                        Err(error) => {
+                            ns.release(number, ClaimKind::Thread);
+                            ns.release(number, ClaimKind::Task);
+                            return Err(namespace_error(error));
+                        }
                     };
-                    if let Err(error) = ns.bind_visible_domain(number.get(), visible_namespace) {
-                        ns.release(number, ClaimKind::Thread);
-                        ns.release(number, ClaimKind::Task);
-                        return Err(namespace_error(error));
-                    }
                     Ok((number, visible))
                 })?;
             let child_key = TaskKey {

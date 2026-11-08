@@ -207,22 +207,24 @@ impl NsSharedRegion {
 
     pub(crate) fn reserve_init_identity(
         self: &Arc<Self>,
+        identities: &crate::kernel::IdRegistry,
         internal_id: u32,
-    ) -> Option<PreparedNamespaceIdentity> {
+    ) -> Result<Option<PreparedNamespaceIdentity>, crate::kernel::IdError> {
         let _guard = self
             .lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !self.claim_is_live() || self.init_host_pid_locked() != 0 {
-            return None;
+            return Ok(None);
         }
-        Some(PreparedNamespaceIdentity {
+        self.bind_identity_domain_locked(identities, internal_id)?;
+        Ok(Some(PreparedNamespaceIdentity {
             region: Arc::clone(self),
             internal_id,
             visible_id: NS_INIT_PID,
             parent_internal_id: 0,
             active: Some(Arc::new(AtomicBool::new(true))),
-        })
+        }))
     }
 
     pub(crate) fn reserve_identity(
@@ -239,6 +241,28 @@ impl NsSharedRegion {
         if !self.claim_is_live() {
             return Err(IdError::AuthorityTransferred);
         }
+        let domain = self.bind_identity_domain_locked(identities, internal_id)?;
+        let visible_id = identities.reserve_visible(domain)?.get();
+        Ok(PreparedNamespaceIdentity {
+            region: Arc::clone(self),
+            internal_id,
+            visible_id,
+            parent_internal_id,
+            active: None,
+        })
+    }
+
+    /// The lifecycle lock covers owner attachment, cursor creation and retirement.
+    /// Both root and later member reservations use this single binding operation.
+    fn bind_identity_domain_locked(
+        &self,
+        identities: &crate::kernel::IdRegistry,
+        internal_id: u32,
+    ) -> Result<
+        carrick_sched_core::process::identity_allocator::VisibleNamespace,
+        crate::kernel::IdError,
+    > {
+        use crate::kernel::IdError;
         let owner = self.visible_owner.get_or_init(|| identities.clone());
         if !owner.same_owner(identities) {
             return Err(IdError::AuthorityTransferred);
@@ -253,14 +277,7 @@ impl NsSharedRegion {
         )
         .map_err(|_| IdError::AuthorityTransferred)?;
         identities.bind_visible_domain(task, domain)?;
-        let visible_id = identities.reserve_visible(domain)?.get();
-        Ok(PreparedNamespaceIdentity {
-            region: Arc::clone(self),
-            internal_id,
-            visible_id,
-            parent_internal_id,
-            active: None,
-        })
+        Ok(domain)
     }
 
     pub(crate) fn visible_domain(

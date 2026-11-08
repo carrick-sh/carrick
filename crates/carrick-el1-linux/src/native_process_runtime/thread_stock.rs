@@ -191,7 +191,8 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
                 self.namespace
                     .with_view(&carrick_sched_core::ShortLockSpin, |namespace| {
                         let number = namespace.reserve_next(ClaimKind::Thread).ok()?;
-                        let Ok(visible) = namespace.reserve_visible(self.visible_namespace) else {
+                        let Ok(visible) = namespace.assign_visible(number, self.visible_namespace)
+                        else {
                             namespace.release(number, ClaimKind::Thread);
                             return None;
                         };

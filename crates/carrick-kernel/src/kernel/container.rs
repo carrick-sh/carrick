@@ -1356,17 +1356,22 @@ impl Container {
     pub(super) fn prepare_pid_root(
         &self,
         key: TaskKey,
+        identities: &super::IdRegistry,
     ) -> Result<Option<crate::namespace::pid::PreparedNamespaceIdentity>, super::KernelError> {
         if self.pid_root().is_some() {
             return Err(super::KernelError::ContainerRootAlreadyPublished(self.id));
         }
         let Some(region) = self.pid_region() else {
+            identities.bind_visible_domain(
+                key.id,
+                carrick_sched_core::process::identity_allocator::VisibleNamespace::unmapped(),
+            )?;
             return Ok(None);
         };
         let pid = u32::try_from(key.id.raw())
             .map_err(|_| super::KernelError::PidNamespaceMembership(self.id))?;
         region
-            .reserve_init_identity(pid)
+            .reserve_init_identity(identities, pid)?
             .map(Some)
             .ok_or(super::KernelError::PidNamespaceMembership(self.id))
     }
