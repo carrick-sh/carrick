@@ -396,6 +396,39 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         slot: SlotId,
         service: &mut S,
     ) -> Result<(), NativeProcessError> {
+        let member = self.zone.record(record.id);
+        if let Some(census) = member.object_wait_census()
+            && census.queue as usize >= carrick_sched_core::object_wait::ADDRESS_SPACE_WAIT_BASE
+            && census.operation == u64::from(census.queue)
+            && census.operation_generation == census.generation
+        {
+            let terminal = {
+                let graph = self.graph.lock();
+                graph.owner.tasks().values().any(|row| {
+                    let resources = row.native().resources();
+                    resources
+                        .members
+                        .iter()
+                        .any(|member| member.record == record)
+                        && resources
+                            .page
+                            .process_exit_custody()
+                            .cancellation()
+                            .is_some()
+                })
+            };
+            let _ = self.zone.claim_for_host(
+                record,
+                None,
+                if terminal {
+                    Handback::Cancelled
+                } else {
+                    Handback::Signal
+                },
+                &carrick_sched_core::ShortLockSpin,
+            );
+            return Ok(());
+        }
         let pending = self
             .graph
             .lock()
@@ -409,19 +442,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             // Its queue owns cancellation and the existing deferred handback.
             // This is only a snapshot. The queue owner authenticates the
             // exact record incarnation and operation under its guard below.
-            let member = self.zone.record(record.id);
-            if !member.is_native_owned() || !member.has_adapter_operation() {
+            if !member.has_object_operation() {
                 return Ok(());
             }
             let Some(census) = member.object_wait_census() else {
                 return Ok(());
             };
-            // substrate::ipc::wait_key admits only the disjoint readiness
-            // domain below this boundary. Metadata and MM edit waits retain
-            // their own cancellation policy despite using adapter tokens too.
-            if census.queue as usize >= carrick_sched_core::object_wait::ADDRESS_SPACE_WAIT_BASE {
-                return Ok(());
-            }
             let Some(key) = ObjectWaitKey::new(census.queue, census.generation) else {
                 return Ok(());
             };
@@ -430,6 +456,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             else {
                 return Ok(());
             };
+            if census.queue as usize >= carrick_sched_core::object_wait::ADDRESS_SPACE_WAIT_BASE {
+                // Portal service waits carry a distinct operation identity and
+                // retain their own cancellation policy. Anonymous edits use
+                // the exact space-cause key as their replay token.
+                return Ok(());
+            }
+            if !member.is_native_owned() || !member.has_adapter_operation() {
+                return Ok(());
+            }
             let completion =
                 |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
                     crate::sched::object_wait::deliver_completion(self.zone, slot, owned)
