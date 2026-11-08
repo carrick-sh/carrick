@@ -77,19 +77,31 @@ impl DeadlineDriver {
         Arc::new(move || doorbell.notify())
     }
 }
-impl Drop for DeadlineDriver {
-    fn drop(&mut self) {
+impl DeadlineDriver {
+    /// Teardown reports a failed worker through the run's existing error owner.
+    /// The join still precedes release of the callback's mapping custody.
+    pub(crate) fn shutdown(mut self) -> std::io::Result<()> {
+        self.stop()
+    }
+    fn stop(&mut self) -> std::io::Result<()> {
         {
             let mut state = self.doorbell.state.lock();
             state.shutdown = true;
             self.doorbell.changed.notify_one();
         }
         if let Some(worker) = self.worker.take() {
-            // Mapping custody outlives the in-flight callback and this join.
-            if worker.join().is_err() {
-                carrick_fatal::carrick_fatal!("carrier-deadlines", "deadline worker panicked");
-            }
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("carrier deadline worker panicked"))?;
         }
+        Ok(())
+    }
+}
+impl Drop for DeadlineDriver {
+    fn drop(&mut self) {
+        // Error/implicit teardown must join too. Normal carrier shutdown uses
+        // the fallible method above and propagates its result to RuntimeError.
+        let _ = self.stop();
     }
 }
 
@@ -190,7 +202,7 @@ mod tests {
         driver.notifier()();
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), exact);
         assert!(origin.elapsed() >= Duration::from_nanos(deadline));
-        drop(driver);
+        driver.shutdown().unwrap();
         assert!(matches!(
             target.zone.record(record).claim(),
             Claim::Host { .. }
@@ -240,12 +252,30 @@ mod tests {
         let (joined_tx, joined_rx) = mpsc::sync_channel(1);
         std::thread::scope(|scope| {
             scope.spawn(move || {
-                drop(driver);
+                driver.shutdown().unwrap();
                 joined_tx.send(()).unwrap();
             });
             assert!(joined_rx.try_recv().is_err());
             release_tx.send(()).unwrap();
             joined_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         });
+    }
+    #[test]
+    #[allow(clippy::panic)]
+    fn worker_failure_is_reported_by_carrier_shutdown() {
+        struct BrokenTarget(mpsc::SyncSender<()>);
+        impl DeadlineTarget for BrokenTarget {
+            fn remaining(&self) -> Option<Duration> {
+                Some(Duration::ZERO)
+            }
+            fn expire(&self) {
+                self.0.send(()).unwrap();
+                panic!("intentional deadline callback failure");
+            }
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        let driver = DeadlineDriver::start(Arc::new(BrokenTarget(tx))).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(driver.shutdown().is_err());
     }
 }

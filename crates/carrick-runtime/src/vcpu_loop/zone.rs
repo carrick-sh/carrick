@@ -355,14 +355,40 @@ mod affinity_tests;
 
 /// Exact native expiry target with retained carrier mapping custody.
 pub(crate) struct NativeDeadlineTarget {
-    pub(crate) zone: &'static carrick_el1_abi::ZoneTables,
-    pub(crate) _mapping: Box<dyn Send + Sync>,
+    zone: &'static carrick_el1_abi::ZoneTables,
+    _mapping: Box<dyn Send + Sync>,
+    numer: std::num::NonZeroU32,
+    denom: std::num::NonZeroU32,
+}
+impl NativeDeadlineTarget {
+    /// The HVF binding uses host monotonic ticks for guest CNTVCT. Validate
+    /// its scale before any executor can transfer a native deadline.
+    pub(crate) fn new(
+        zone: &'static carrick_el1_abi::ZoneTables,
+        mapping: Box<dyn Send + Sync>,
+    ) -> Option<Self> {
+        let scale = carrick_host::clock::tick_scale()?;
+        Some(Self {
+            zone,
+            _mapping: mapping,
+            numer: std::num::NonZeroU32::new(scale.numer)?,
+            denom: std::num::NonZeroU32::new(scale.denom)?,
+        })
+    }
 }
 impl crate::deadline_driver::DeadlineTarget for NativeDeadlineTarget {
     fn remaining(&self) -> Option<std::time::Duration> {
-        self.zone
-            .native_timed_park()
-            .map(|park| until_deadline(park.deadline.raw()))
+        self.zone.native_timed_park().map(|park| {
+            let ticks = park
+                .deadline
+                .raw()
+                .saturating_sub(carrick_host::clock::monotonic_ticks());
+            // Round upwards: even a sub-nanosecond residual must sleep rather
+            // than repeatedly ask the index about a deadline still in future.
+            let ns = (u128::from(ticks) * u128::from(self.numer.get()))
+                .div_ceil(u128::from(self.denom.get()));
+            std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+        })
     }
     fn expire(&self) {
         carrick_kernel::el1_zone::expire_native_timers(
@@ -372,14 +398,12 @@ impl crate::deadline_driver::DeadlineTarget for NativeDeadlineTarget {
     }
 }
 
-/// HVF's guest CNTVCT has the host monotonic tick epoch and TickScale.
+/// How long until the guest virtual counter reaches `deadline` (guest
+/// `CNTVCT_EL0` is the host's `mach_absolute_time` tick count).
 fn until_deadline(deadline: u64) -> std::time::Duration {
     let ticks = deadline.saturating_sub(carrick_host::clock::monotonic_ticks());
     let scale = carrick_host::clock::tick_scale()
-        .filter(|scale| scale.numer != 0 && scale.denom != 0)
-        .unwrap_or_else(|| {
-            carrick_fatal!("carrier-deadlines", "host counter calibration unavailable")
-        });
+        .unwrap_or(carrick_host::clock::TickScale { numer: 1, denom: 1 });
     let ns = u128::from(ticks) * u128::from(scale.numer) / u128::from(scale.denom.max(1));
     std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
 }
