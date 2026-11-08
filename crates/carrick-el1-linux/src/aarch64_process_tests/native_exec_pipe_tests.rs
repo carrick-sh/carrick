@@ -39,7 +39,7 @@ fn fork_exec_successor(futex: Option<u64>) {
 
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let metadata_scope = MetadataScope::new(&fixture);
+    let metadata_scope = MetadataScope::new(fixture);
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
         fn drop(&mut self) {
@@ -503,7 +503,7 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
 #[test]
 fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let metadata_scope = MetadataScope::new(&fixture);
+    let metadata_scope = MetadataScope::new(fixture);
     fixture
         .control
         .initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[1]));

@@ -52,7 +52,6 @@ use carrick_sched_core::process::{TaskKey, TaskSerial};
 use carrick_sched_core::{Aarch64ParkedContext, ThreadCtx, ZoneTables};
 use core::num::{NonZeroU32, NonZeroU64};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-#[cfg(test)]
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -178,12 +177,12 @@ enum CommitFault {
 type ControlsArray = [ThreadControlSlot; carrick_el1_abi::THREAD_POOL_ENTRIES + 1];
 
 fn metadata_lifecycle_allocation() -> (core::ptr::NonNull<u8>, usize, usize) {
-    static NEXT_OFFSET: AtomicU64 = AtomicU64::new(0x100_0000);
     let page_bytes = core::mem::size_of::<ThreadLifecyclePage>().next_multiple_of(16384);
     let chunk_bytes = (page_bytes + core::mem::size_of::<ControlsArray>()).next_multiple_of(16384);
     // Hosts may ignore a hint this low (macOS 27), and an
     // unrelated host allocation can already occupy part of
-    // the window. Take the next chunk an exact,
+    // the window. Scan from the start so dropped fixtures return capacity.
+    // Take the next chunk an exact,
     // non-replacing allocation admits.
     /// Map `len` zeroed read-write bytes at exactly `addr`, or `None` when any
     /// part of the range is already mapped. Never replaces an existing mapping.
@@ -241,8 +240,8 @@ fn metadata_lifecycle_allocation() -> (core::ptr::NonNull<u8>, usize, usize) {
             Some(mapped)
         }
     }
+    let mut offset = 0x100_0000;
     let mapped = loop {
-        let offset = NEXT_OFFSET.fetch_add(chunk_bytes as u64, Ordering::Relaxed);
         assert!(
             offset + chunk_bytes as u64 <= carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
             "no free metadata window chunk left"
@@ -251,6 +250,7 @@ fn metadata_lifecycle_allocation() -> (core::ptr::NonNull<u8>, usize, usize) {
         if let Some(mapped) = map_exact_unreplaced(hint, chunk_bytes) {
             break mapped;
         }
+        offset += chunk_bytes as u64;
     };
     let base = mapped as u64;
     assert!(
@@ -339,12 +339,14 @@ struct TestStockCrossing {
     refuse_root_seed: core::sync::atomic::AtomicBool,
 }
 
+#[cfg(test)]
 struct MetadataScope {
     zone: &'static ZoneTables<Aarch64ParkedContext>,
     roots: &'static carrick_el1::memory::reservations::SharedReservations,
     allocations: Arc<std::sync::Mutex<Vec<MetadataLifecycleAllocation>>>,
 }
 
+#[cfg(test)]
 impl MetadataScope {
     fn new(fixture: &Fixture) -> Self {
         Self {
@@ -355,10 +357,14 @@ impl MetadataScope {
     }
 }
 
+#[cfg(test)]
 impl Drop for MetadataScope {
     fn drop(&mut self) {
         registry().unregister_zone_for_test(self.zone);
-        super::aarch64_process::drain_and_clear_retired_scope(self.zone, self.roots);
+        let leftover = super::aarch64_process::drain_and_clear_retired_scope(self.zone, self.roots);
+        if !std::thread::panicking() {
+            assert_eq!(leftover, 0, "metadata scope has unretired spaces");
+        }
     }
 }
 
@@ -14120,7 +14126,7 @@ fn serial_host_namespace_exhaustion_is_eagain_and_recovers_after_reap() {
 #[cfg(test)]
 fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: NamespaceScenario) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let metadata_scope = MetadataScope::new(&fixture);
+    let metadata_scope = MetadataScope::new(fixture);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
