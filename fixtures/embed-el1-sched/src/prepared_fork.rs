@@ -45,7 +45,8 @@ fn read_diagnostics(fd: libc::c_int, consumed: usize, payload: &mut [u8; 96]) ->
 
 /// Keep both processes alive while publishing inherited prepared backing,
 /// restoring PROT_NONE data and writing both inherited pages independently.
-pub(crate) fn run(touch_arguments: bool) -> i32 {
+pub(crate) fn run<const TOUCH_ARGUMENTS: bool>() -> i32 {
+    let touch_arguments = TOUCH_ARGUMENTS;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page <= 0 {
