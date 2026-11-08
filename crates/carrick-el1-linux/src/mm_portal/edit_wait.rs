@@ -126,7 +126,7 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
     frame: &mut TrapFrame,
     table: &SharedReservations,
     _initial_cause: SpaceWaitCause,
-    _metadata: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
+    metadata: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
 ) -> Option<Served> {
     let mm = ReservationMm::new(sched.task.mm.key.load(Ordering::Acquire))?;
     let index = sched.zone.spaces.find(mm.raw())?;
@@ -168,7 +168,12 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
                 ) => return Some(Some(SpaceWaitCause::PendingEdit)),
                 ReservationDisposition::Unavailable(
                     carrick_el1::memory::reservations::Refusal::MetadataRequired,
-                ) => return None,
+                ) => {
+                    if root.provision_metadata(metadata).is_err() {
+                        return None;
+                    }
+                    return Some(None);
+                }
                 ReservationDisposition::Unavailable(_) => return None,
                 ReservationDisposition::Work(pending) => {
                     if pending.cancel(&mut root).is_err() {
