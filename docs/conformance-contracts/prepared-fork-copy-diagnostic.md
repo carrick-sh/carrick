@@ -64,3 +64,88 @@ Their failed output assertions and unwound harness failures include the
 carrier counter rows directly, with original reason and both bindings,
 without LLDB. Signed AT/LDTRB
 attribution remains required before claiming a cause fix.
+
+## Round 13: frame provenance
+
+The refused argument index is **zero-based**, found by matching the copy VA
+against the six decoded argument words. Thus argument 3 means x3, not x2;
+duplicate values select the first match, and 6 means a derived address.
+Rows now retain all six actual decoded words and the frame PC. The sibling
+`syscall-frame` store records the first 32 ppoll frames with typed sources,
+PC, slot, execution binding and syndrome. Both stores appear in the existing
+embed failure formatter, including harness unwinds. Source labels name the
+actual code boundary, not an inference from register values:
+
+- `fresh-trap`: the frame delivered to the ARM syscall dispatcher;
+- `decoded-dispatch`: the shared dispatch entry before serving any family;
+- `owner-input-redispatch`: the frame after synchronous input preparation
+  rewound its SVC;
+- `scheduler-object-replay`, `scheduler-owner-replay`,
+  `scheduler-saved-replay`, `scheduler-saved-return`: the actual frame loaded
+  by the production scheduler, before an optional result is installed.
+
+A fresh trap may itself be a replayed SVC. Correlate the preceding replay
+sample's PC (at SVC) with the fresh trap's PC (after SVC), exact binding and
+argument words. These bounded prefixes are observations, never a complete
+population or an authority to resume. Saturated or missing samples do not
+exclude an unsampled path. Only ppoll consumes sibling slots, so unrelated
+startup syscalls cannot displace the target. Publication is bounded and
+allocation-free; syscall and scheduling policies and budgets are unchanged.
+
+The production native-dispatch prepared-pollfd and prepared-timeout witnesses
+check the recorded raw words and dispatch source. The ABI test drives the
+public recorder/formatter and checks source labels, word order, incomplete
+publication, snapshot and prefix saturation. The ARM save/load witness drives
+the same `save_frame` and `load_frame` used by HardwareCpu over all 31 GPRs.
+None of these witnesses executes HVF instructions.
+
+### What inspection establishes
+
+The HVF `GPR_TABLE` maps each index 0 through 30 to X0 through X30, both in
+main and in this branch. Snapshot, restore and thread-start restore iterate
+that same table. The fork-quiesce module re-exports the neutral barrier; it
+does not reconstruct syscall arguments. The ARM scheduler saves and loads
+`frame.x` as a whole array. Native fork derives a separate child context with
+x0 zero and its own MM; a running parent gets the child's PID as x0, without
+assigning x3. Owner input redispatch rewinds PC; scheduler owner replay loads
+the saved context and rewinds PC when required. Signal restart also preserves
+x1 through x5, and ppoll is excluded from SA_RESTART.
+
+A locally rebuilt static aarch64-musl `el1-sched` was disassembled, including
+both prepared-fork variants and libc, rather than assuming libc's ABI. Both
+call sites explicitly zero x3 before calling `ppoll`. Musl copies the timespec
+into its own stack, passes the mask through x4 at the seven-argument
+`__syscall_cp` C boundary, and passes size 8 in x5 there. `__syscall_cp_c`
+moves x4 to architectural x3, x5 to x4, x6 (zero) to x5 and issues SVC 73.
+The architectural x2 therefore points at libc's timespec copy, not necessarily
+the fixture's original timeout. This local rebuild is not proof of the
+director's signed fixture identity; restore/verify the matching bundle there.
+
+No inspected assignment identifies the origin of 4999. It resembles a
+remaining millisecond timeout, but neither a millisecond-to-mask conversion
+nor a child/stale frame substitution is established. The table-index typo
+and the claim that normal musl intentionally supplies 4999 as sigmask are
+excluded by inspection. Live snapshot/restore corruption, a stale saved
+context, and a replay at the wrong instruction remain open. No frame-source
+fix is justified yet.
+
+### Signed interpretation
+
+Rebuild the host and image together, restore/verify the matching signed fixture
+bundle, and run on the exact head:
+
+```
+just test-embed el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes
+just test-embed el1_prepared_fork_poll_arguments_touched_after_fork
+```
+
+Both use `scripts/test-signed.sh`; also run `just smoke-signed` before reporting
+signed evidence. Retain artifact identity and scoped cleanup. If the failure
+persists, the copy row identifies the raw words used for the refusal. If x3
+is already 4999 at `fresh-trap`, the source precedes shared dispatch; compare
+scheduler replay rows before attributing it to HVF or libc. If fresh x3 is
+zero but decoded x3 is 4999 on that binding/PC, the entry boundary is implicated.
+If a saved/replay row first shows 4999, inspect that saved-context producer.
+If both tests pass, that establishes only this artifact's signed outcomes;
+this diagnostic-only round does not establish a cause fix. If only touch
+passes, operand residency/timing still matters and requires attribution.

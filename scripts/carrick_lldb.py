@@ -1080,12 +1080,12 @@ def _copy_refusal_lines(raw):
     """Decode committed, immutable diagnostic rows; never infer COW from PAR."""
     import struct
 
-    if len(raw) != 16 * 128:
+    if len(raw) != 16 * 23 * 8:
         raise ValueError("invalid copy refusal extent")
     lines = []
-    for offset in range(0, len(raw), 128):
+    for offset in range(0, len(raw), 23 * 8):
         (committed, nr, va, length, role, direction, reason, owner,
-         pmm, pgen, ptask, pthread, emm, egen, etask, ethread) = struct.unpack_from("<16Q", raw, offset)
+         pmm, pgen, ptask, pthread, emm, egen, etask, ethread, pc, *args) = struct.unpack_from("<23Q", raw, offset)
         if committed != 1:
             continue
         label = {1: "forbidden-range", 2: "validator-other", 3: "guarded-fault", 4: "owner-efault", 5: "owner-absent", 6: "owner-mismatch", 7: "owner-busy", 8: "owner-wait"}.get(reason, "other")
@@ -1093,7 +1093,7 @@ def _copy_refusal_lines(raw):
             fsc = reason & 0x3f
             label = "unmapped" if 4 <= fsc <= 7 else "forbidden" if 12 <= fsc <= 15 else "translation-other"
             label += f"(PAR.FST={fsc:#x})"
-        lines.append(f"copy-refusal nr={nr} va={va:#x} len={length} argument={role} direction={'out' if direction else 'in'} reason={label} owner={owner} presented[mm={pmm},generation={pgen},task={ptask},thread={pthread}] expected[mm={emm},generation={egen},task={etask},thread={ethread}]")
+        lines.append(f"copy-refusal nr={nr} va={va:#x} len={length} argument={role} direction={'out' if direction else 'in'} reason={label} owner={owner} presented[mm={pmm},generation={pgen},task={ptask},thread={pthread}] expected[mm={emm},generation={egen},task={etask},thread={ethread}] source=decoded-dispatch pc={pc:#x} args=[{','.join(hex(arg) for arg in args)}]")
     return lines
 
 
@@ -1151,7 +1151,7 @@ def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
         if field.GetName() != "copy_refusals":
             continue
         size = field.GetType().GetByteSize()
-        if size != 16 * 16 * 8:
+        if size != 16 * 23 * 8:
             result.SetError("invalid copy refusal extent in DWARF")
             return
         raw = process.ReadMemory(pointer + field.GetOffsetInBytes(), size, error)
