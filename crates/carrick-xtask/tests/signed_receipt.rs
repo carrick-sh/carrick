@@ -2106,3 +2106,181 @@ fn cli_refusal_removes_previous_passing_json() {
     assert!(!run().status.success());
     assert!(!diff_path.exists(), "refusal left stale passing diff.json");
 }
+
+/// A paired PR request and its gate evidence, published through the real
+/// `signed-gate publish` command with a `gh` stub that records POSTs.
+#[cfg(unix)]
+struct PublishBench {
+    dir: tempfile::TempDir,
+    base: String,
+    head: String,
+}
+
+#[cfg(unix)]
+impl PublishBench {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(
+            bin.join("gh"),
+            r#"#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+if '--method' in args and args[args.index('--method')+1] == 'POST':
+    with open(os.environ['TEST_POSTS'], 'a') as out:
+        out.write(json.dumps({'endpoint': args[args.index('POST')+1], 'body': json.load(sys.stdin)})+'\n')
+else:
+    raise SystemExit('unexpected gh invocation: '+repr(args))
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bench = Self {
+            dir,
+            base: "a".repeat(40),
+            head: "b".repeat(40),
+        };
+        std::fs::create_dir(bench.results()).unwrap();
+        std::fs::write(
+            bench.dir.path().join("request.json"),
+            json!({"kind":"PullRequest","prs":[123],"sha":bench.head,"base":bench.base})
+                .to_string(),
+        )
+        .unwrap();
+        bench
+    }
+
+    fn results(&self) -> std::path::PathBuf {
+        self.dir.path().join("results")
+    }
+
+    /// Evidence `execute` leaves for one side: receipt, identity, cleanup and
+    /// the recorded acceptance exit status.
+    fn write_side(&self, dir: &std::path::Path, name: &str, receipt: &AcceptReceipt, ok: bool) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), serde_json::to_vec(receipt).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("identity.json"),
+            serde_json::to_vec(&receipt.artifact).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cleanup.json"),
+            serde_json::to_vec(&receipt.cleanup_counts).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("accept-exit.json"),
+            json!({ "success": ok }).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn write_base(&self, receipt: &AcceptReceipt, accepted: bool) {
+        self.write_side(&self.results().join("base"), "base.json", receipt, accepted);
+    }
+
+    fn write_candidate(&self, receipt: &AcceptReceipt, accepted: bool) {
+        self.write_side(&self.results(), "candidate.json", receipt, accepted);
+    }
+
+    fn publish(&self) -> (bool, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.dir.path().join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("TEST_POSTS", self.dir.path().join("posts.jsonl"))
+            .env_remove("GITHUB_STEP_SUMMARY")
+            .args(["signed-gate", "publish", "--request"])
+            .arg(self.dir.path().join("request.json"))
+            .arg("--results")
+            .arg(self.results())
+            .args([
+                "--run-url",
+                "https://github.com/carrick-sh/carrick/actions/runs/300",
+                "--execution-result",
+                "success",
+            ])
+            .output()
+            .unwrap();
+        let body = std::fs::read_to_string(self.results().join("comment.md")).unwrap_or_default();
+        (output.status.success(), body)
+    }
+}
+
+/// Review P1 on #1889: an interrupted paired base must block before any
+/// comparison. Its killed binary would otherwise read as FIXED and let a
+/// complete candidate PASS. Completed known failures stay comparable.
+#[cfg(unix)]
+#[test]
+fn incomplete_paired_base_blocks_publication_but_known_failures_compare() {
+    let bench = PublishBench::new();
+    let candidate = admitted(&bench.head);
+    bench.write_candidate(&candidate, false);
+
+    // Completed base with the same itemized failures: differential PASS.
+    let complete = admitted(&bench.base);
+    bench.write_base(&complete, false);
+    let (passed, body) = bench.publish();
+    assert!(
+        passed,
+        "completed known failures must stay comparable: {body}"
+    );
+
+    // The reviewer's case: an unfinished base binary, complete candidate.
+    let mut unfinished = complete.clone();
+    unfinished.steps[2].unfinished_binaries.push("embed".into());
+    bench.write_base(&unfinished, false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "unfinished base binary published PASS: {body}");
+    assert!(body.contains("paired base incomplete"), "{body}");
+
+    // A base that never reported a step (NotRun) cannot be admitted either.
+    let mut not_run = complete.clone();
+    not_run.steps[3].passed = false;
+    not_run.steps[3].exit_code = None;
+    not_run.steps[3].failed_tests.clear();
+    bench.write_base(&not_run, false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "NotRun base step published PASS: {body}");
+    assert!(body.contains("paired base incomplete"), "{body}");
+
+    // Tests skipped after the binary budget expired are an interrupted run.
+    let mut interrupted = complete.clone();
+    interrupted.steps[4]
+        .not_run_tests
+        .push("probe::after_budget".into());
+    bench.write_base(&interrupted, false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "interrupted base published PASS: {body}");
+    assert!(body.contains("paired base incomplete"), "{body}");
+
+    // A failing acceptance exit with nothing completed to explain it is an
+    // infrastructure failure, even when every recorded step passed.
+    let mut clean = complete.clone();
+    for step in &mut clean.steps {
+        step.passed = true;
+        step.exit_code = Some(0);
+        step.failed_tests.clear();
+    }
+    clean.el1.as_mut().unwrap().failed_tests.clear();
+    clean.el1.as_mut().unwrap().unexpected_failures.clear();
+    bench.write_base(&clean, false);
+    let (passed, body) = bench.publish();
+    assert!(
+        !passed,
+        "unexplained base acceptance failure published PASS: {body}"
+    );
+    assert!(body.contains("paired base incomplete"), "{body}");
+    // Missing exit evidence is not success.
+    std::fs::remove_file(bench.results().join("base/accept-exit.json")).unwrap();
+    let (passed, body) = bench.publish();
+    assert!(!passed, "missing base exit status published PASS: {body}");
+}
