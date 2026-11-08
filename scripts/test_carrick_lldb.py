@@ -26,6 +26,15 @@ PLUGIN = _load_plugin()
 
 
 class CarrickLldbHelperTests(unittest.TestCase):
+    def test_copy_refusals_decode_committed_rows_only(self):
+        import struct
+        rows = bytearray(16 * 64)
+        struct.pack_into("<8Q", rows, 0, 1, 73, 0x4000, 16, 2, 0, 0x105, 0)
+        struct.pack_into("<8Q", rows, 64, 0, 73, 0x8000, 8, 0, 1, 3, 1)
+        self.assertEqual(PLUGIN._copy_refusal_lines(rows), [
+            "copy-refusal nr=73 va=0x4000 len=16 argument=2 direction=in reason=unmapped(PAR.FST=0x5) owner=0"
+        ])
+
     def test_clone_refusal_producer_decodes_the_actual_error_stage(self):
         formatter = PLUGIN._EVENTRING_KINDS[81][1]
         for stage, name in enumerate(["admission_refused", "cancelled", "nproc", "runtime_reservation"]):

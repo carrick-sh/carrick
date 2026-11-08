@@ -42,6 +42,33 @@ impl<
     Context: super::dispatch::DispatchContext,
 > El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
+    fn record_copy_refusal(
+        &self,
+        address: UserVa,
+        len: usize,
+        write: bool,
+        reason: carrick_el1_abi::CopyRefusalReason,
+        owner: bool,
+    ) {
+        let role = (0..6)
+            .find(|&i| self.frame.argument(i) == Some(address.raw()))
+            .unwrap_or(6);
+        self.counters
+            .record_copy_refusal(carrick_el1_abi::CopyRefusal {
+                ordinal: self.frame.canonical_ordinal(),
+                address,
+                len: carrick_guest_arch::GuestLen::new(len as u64),
+                argument: (role < 6).then_some(role),
+                access: if write {
+                    carrick_guest_arch::Access::Write
+                } else {
+                    carrick_guest_arch::Access::Read
+                },
+                reason,
+                owner_present: owner,
+            });
+    }
+
     fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
         let binding = LifecycleNative::binding(self)?;
         let venue = self.process.as_deref_mut()?;
@@ -92,26 +119,29 @@ impl<
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return CopyOutcome::Fault;
         };
-        let done = crate::file::UserCopy::copy_in(
-            &mut crate::file::ValidatedCopy {
-                task,
-                validator: &crate::file::HardwareValidator,
-            },
-            dst,
-            src.raw(),
-        );
-        if done {
-            CopyOutcome::Done
-        } else if self.process_venue().is_some() {
-            CopyOutcome::NotYet(GuestCopyRequest {
-                address: src,
-                len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
-                access: carrick_guest_arch::Access::Read,
-            })
-        } else {
-            CopyOutcome::Fault
+        let copied = crate::file::ValidatedCopy {
+            task,
+            validator: &crate::file::HardwareValidator,
+        }
+        .copy_in_diagnosed(dst, src.raw());
+        match copied {
+            Ok(()) => CopyOutcome::Done,
+            Err(reason) => {
+                let owner = self.process_venue().is_some();
+                self.record_copy_refusal(src, dst.len(), false, reason, owner);
+                if owner {
+                    CopyOutcome::NotYet(GuestCopyRequest {
+                        address: src,
+                        len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                        access: carrick_guest_arch::Access::Read,
+                    })
+                } else {
+                    CopyOutcome::Fault
+                }
+            }
         }
     }
+
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
@@ -150,24 +180,26 @@ impl<
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return CopyOutcome::Fault;
         };
-        let done = crate::file::UserCopy::copy_out(
-            &mut crate::file::ValidatedCopy {
-                task,
-                validator: &crate::file::HardwareValidator,
-            },
-            dst.raw(),
-            src,
-        );
-        if done {
-            CopyOutcome::Done
-        } else if self.process_venue().is_some() {
-            CopyOutcome::NotYet(GuestCopyRequest {
-                address: dst,
-                len: carrick_guest_arch::GuestLen::new(src.len() as u64),
-                access: carrick_guest_arch::Access::Write,
-            })
-        } else {
-            CopyOutcome::Fault
+        let copied = crate::file::ValidatedCopy {
+            task,
+            validator: &crate::file::HardwareValidator,
+        }
+        .copy_out_diagnosed(dst.raw(), src);
+        match copied {
+            Ok(()) => CopyOutcome::Done,
+            Err(reason) => {
+                let owner = self.process_venue().is_some();
+                self.record_copy_refusal(dst, src.len(), true, reason, owner);
+                if owner {
+                    CopyOutcome::NotYet(GuestCopyRequest {
+                        address: dst,
+                        len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                        access: carrick_guest_arch::Access::Write,
+                    })
+                } else {
+                    CopyOutcome::Fault
+                }
+            }
         }
     }
 }
@@ -187,6 +219,15 @@ impl<
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
         });
         let mut outcome = venue.wait_guest_copy(request);
+        if matches!(&outcome, LifecycleOutcome::Returned { result, .. } if result.raw() == -14) {
+            self.record_copy_refusal(
+                request.address,
+                request.len.raw() as usize,
+                request.access == carrick_guest_arch::Access::Write,
+                carrick_el1_abi::CopyRefusalReason::OwnerFault,
+                true,
+            );
+        }
         if matches!(outcome, LifecycleOutcome::Redispatch) {
             self.frame.restart_syscall();
         }
