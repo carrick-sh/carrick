@@ -358,11 +358,10 @@ fn el1_ipc_zero_progress_interruption_restarts_or_returns_eintr() {
     for (cause, expected) in [
         (
             IpcCause::Signal { restart: true },
-            IpcHostOutcome::Restart {
+            IpcHostOutcome::Restart(IpcRestart::Original {
                 x0: r.0 as u64,
                 nr: 63,
-                timeout_ms: None,
-            },
+            }),
         ),
         (
             IpcCause::Signal { restart: false },
@@ -373,21 +372,19 @@ fn el1_ipc_zero_progress_interruption_restarts_or_returns_eintr() {
         ),
         (
             IpcCause::Control,
-            IpcHostOutcome::Restart {
+            IpcHostOutcome::Restart(IpcRestart::Original {
                 x0: r.0 as u64,
                 nr: 63,
-                timeout_ms: None,
-            },
+            }),
         ),
         // read(2) is not among the calls a stop interrupts (man 7 signal):
         // after SIGCONT it continues.
         (
             IpcCause::Stop,
-            IpcHostOutcome::Restart {
+            IpcHostOutcome::Restart(IpcRestart::Original {
                 x0: r.0 as u64,
                 nr: 63,
-                timeout_ms: None,
-            },
+            }),
         ),
     ] {
         let token = w.operation(r, IpcOpKind::PipeRead, 16, 63);
@@ -414,11 +411,10 @@ fn el1_epoll_wait_interruption_is_eintr_and_continuation_restarts() {
         result: LINUX_EINTR.guest_retval(),
         sigpipe: false,
     };
-    let restart = IpcHostOutcome::Restart {
+    let restart = IpcHostOutcome::Restart(IpcRestart::EpollPwait {
         x0: r.0 as u64,
-        nr: 22,
-        timeout_ms: None,
-    };
+        timeout_ms: -1,
+    });
     let timed_out = IpcHostOutcome::Complete {
         result: 0,
         sigpipe: false,
@@ -520,10 +516,9 @@ fn el1_epoll_timed_wait_host_rerun_waits_only_what_is_left() {
             &services,
         )
         .unwrap();
-        let IpcHostOutcome::Restart {
-            timeout_ms: Some(left),
-            ..
-        } = outcome
+        let IpcHostOutcome::Restart(IpcRestart::EpollPwait {
+            timeout_ms: left, ..
+        }) = outcome
         else {
             panic!("a timed wait re-runs with its remaining time: {outcome:?}");
         };
@@ -563,11 +558,10 @@ fn el1_epoll_timed_wait_host_rerun_waits_only_what_is_left() {
         let expected = if at > deadline { 0 } else { 70 };
         assert_eq!(
             outcome,
-            IpcHostOutcome::Restart {
+            IpcHostOutcome::Restart(IpcRestart::EpollPwait {
                 x0: r.0 as u64,
-                nr: 22,
-                timeout_ms: Some(expected),
-            }
+                timeout_ms: expected
+            })
         );
     }
     let (pin, _) = w.region.fd(HostIpcWait).pin(w.table, r).unwrap();
@@ -797,11 +791,10 @@ fn el1_ipc_exit_cancellation_releases_the_last_pin_and_wakes_the_peer() {
     let wakes = Wakes::default();
     assert_eq!(
         interrupt(w.region, token, IpcCause::Control, &wakes).unwrap(),
-        IpcHostOutcome::Restart {
+        IpcHostOutcome::Restart(IpcRestart::Original {
             x0: r.0 as u64,
-            nr: 63,
-            timeout_ms: None,
-        }
+            nr: 63
+        })
     );
     // Final release: the writer lane learns the reader is gone (EPIPE).
     assert_eq!(
@@ -1508,9 +1501,22 @@ fn poll_handback_retains_admission(cause: Option<IpcCause>) {
         &clock(1_000_000),
     )
     .unwrap();
-    let IpcHostOutcome::Blocked { token, .. } = outcome else {
+    assert_eq!(
+        outcome.replay_argument(),
+        None,
+        "ppoll must preserve x2 (timespec pointer) and x3 (NULL sigmask)"
+    );
+    let IpcHostOutcome::Blocked {
+        token, deadline, ..
+    } = outcome
+    else {
         panic!("ppoll must retain its admission without any argument-register replay: {outcome:?}");
     };
+    assert_eq!(
+        deadline,
+        op.deadline.get(),
+        "host park must use the original deadline"
+    );
     let saved = w.region.operation(&token).unwrap();
     assert_eq!(saved.deadline, op.deadline);
     assert_eq!(saved.value, op.value);
@@ -1602,4 +1608,82 @@ fn ppoll_deadline_elapsed_during_park_completes_without_a_fresh_relative_wait() 
         mem.read_bytes(BUF, 8).unwrap(),
         [reader.0 as u8, 0, 0, 0, 1, 0, 0, 0]
     );
+}
+
+// Test convenience only: all interruption cases drive the production owner.
+fn interrupt(
+    region: &IpcRegion<'_>,
+    token: IpcOpToken,
+    cause: IpcCause,
+    wake: &impl IpcHostServices,
+) -> Result<IpcHostOutcome, IpcError> {
+    super::interrupt(&caller(), region, token, MM, &mut memory(&[]), cause, wake)
+}
+
+#[test]
+fn ppoll_completed_answer_survives_owner_copyout_refusal_and_readiness_change() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    let w = world();
+    let (reader, _, object) = w.pipe();
+    w.region
+        .lock(object, &HostIpcWait)
+        .unwrap()
+        .pipe()
+        .unwrap()
+        .try_write(b"x");
+    let token = w.operation(reader, IpcOpKind::PollWait, 0, 73);
+    let mut op = w.region.operation(&token).unwrap();
+    op.orig_x0 = BUF;
+    op.value = carrick_el1_abi::ipc::IpcEventValue(1 << 32 | reader.0 as u64);
+    op.deadline = carrick_el1_abi::ipc::IpcCounterDeadline::at(5_000_000_000);
+    op.handback = IpcHandback::Continue;
+    w.region.update_operation(&token, op).unwrap();
+    let mut memory = OwnerRefusingMemory::new(BUF, 4096, 0xff);
+    memory.refuse_next();
+    let outcome = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut memory,
+        None,
+        &Clocked {
+            wakes: Wakes::default(),
+            now: 1,
+        },
+    )
+    .unwrap();
+    let IpcHostOutcome::OwnerMemory { token, .. } = outcome else {
+        panic!("{outcome:?}");
+    };
+    let saved = w.region.operation(&token).unwrap();
+    assert_eq!(saved.result, 1);
+    assert_eq!(saved.progress, WriteProgress::new(8));
+    w.region
+        .lock(object, &HostIpcWait)
+        .unwrap()
+        .pipe()
+        .unwrap()
+        .try_read(&mut [0; 1]);
+    let outcome = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut memory,
+        None,
+        &Clocked {
+            wakes: Wakes::default(),
+            now: 6_000_000_000,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        IpcHostOutcome::Complete {
+            result: 1,
+            sigpipe: false
+        }
+    );
+    assert_eq!(memory.inner.read_bytes(BUF + 6, 2).unwrap(), [1, 0]);
 }
