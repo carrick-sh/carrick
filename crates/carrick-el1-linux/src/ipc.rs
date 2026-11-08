@@ -1063,9 +1063,11 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     if kind == IpcOpKind::EventFdWrite
         && PrefixCopy::new(user).copy_in(&mut value, frame.x[1]) != value.len()
     {
-        // No effect yet: the host resolves the fault (first touch or EFAULT).
+        // No effect yet: retain preparable input through the owner, or
+        // complete a genuine bad address through explicit fault admission.
         release_pin(sched, OfdPin::from_raw(op.pin), region);
-        return refuse(sched, IpcLeave::CopyInFault);
+        let _ = refuse(sched, IpcLeave::CopyInFault);
+        return Admission::CopyInFault;
     }
     op.kind = kind;
     op.object = object.to_raw();

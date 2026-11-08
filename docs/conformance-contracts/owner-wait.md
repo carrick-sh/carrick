@@ -273,3 +273,14 @@ refusal remains an invariant failure after user-range admission succeeds.
 Non-prefix completed records validate their entire range before copying a
 page-sized piece. Prefix I/O retains its existing progress/fault policy. The
 owner-invariant output control requires a run failure, never errno 22 or 5.
+
+For the retained one-description zone ppoll completion (#1877), readiness
+uses the admitted fd/events snapshot, while publication writes only the two
+`revents` bytes at the ABI field offset. The production writer-close binding
+changes fd/events while parked and requires them to survive completion.
+The native output-owner binding splits those two bytes across pages, suspends
+after the first byte, drains readiness, and requires only the remaining byte
+on resume with the original ready count. No input bytes are published or
+completed output replayed. The native prepared-fork eventfd-input binding
+also requires forbidden input to complete with EFAULT without changing the
+counter; valid inherited input retains exact-MM read preparation.
