@@ -311,6 +311,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "process.exec.custody" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "process.native.terminal-child" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/test_support.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/futex_contention.rs", contract = "kernel.futex.contention" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.copyout.owner-refusal" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.el1.signal-delivery-owner" },
