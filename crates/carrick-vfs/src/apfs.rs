@@ -249,8 +249,11 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 /// list` — that enumerates every APFS container on the system and costs
 /// ~250 ms, which a profile showed dominated trivial-guest startup. A
 /// volume named `carrick` is mounted by `diskutil apfs addVolume` at the
-/// conventional `/Volumes/carrick`, so a single `stat` of that path is an
-/// equivalent (and instant) probe for the common case. The slow
+/// conventional `/Volumes/carrick`. Classify that mount from cached mount
+/// metadata and CoreFoundation's volume properties before touching it:
+/// only local, internal, non-removable storage may be case-probed.
+/// Device classification has a two-second caller deadline; unknown storage
+/// falls through to the existing configured/home scratch root. The slow
 /// `diskutil`-backed `find_carrick_volume` is reserved for the explicit
 /// `carrick volume` subcommands, not this per-run path.
 pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
@@ -267,7 +270,7 @@ fn resolve_scratch_root() -> PathBuf {
     let conventional = Path::new("/Volumes").join(DEFAULT_VOLUME_NAME);
     resolve_scratch_root_from(
         &conventional,
-        true,
+        conventional_mount_usable(&conventional),
         |path| path.is_dir() && probe_case_sensitive(path),
         std::env::var_os("CARRICK_HOME"),
         std::env::var_os("HOME"),
@@ -275,8 +278,141 @@ fn resolve_scratch_root() -> PathBuf {
 }
 
 fn conventional_volume_usable(local: bool, removable: bool, internal: bool) -> bool {
-    let _ = (local, removable, internal);
-    true
+    local && !removable && internal
+}
+
+#[cfg(not(target_os = "macos"))]
+fn conventional_mount_usable(_: &Path) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn bounded_volume_query(
+    deadline: std::time::Duration,
+    query: impl FnOnce() -> std::io::Result<bool> + Send + 'static,
+) -> std::io::Result<bool> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("scratch-volume-classifier".into())
+        .spawn(move || {
+            let _ = sender.send(query());
+        })?;
+    receiver.recv_timeout(deadline).map_err(|error| {
+        std::io::Error::other(format!(
+            "scratch volume classification did not complete: {error}"
+        ))
+    })?
+}
+
+#[cfg(target_os = "macos")]
+fn conventional_mount_usable(path: &Path) -> bool {
+    let path = path.to_owned();
+    match bounded_volume_query(std::time::Duration::from_secs(2), move || {
+        classify_conventional_mount(&path)
+    }) {
+        Ok(usable) => usable,
+        Err(error) => {
+            tracing::warn!(%error, "skipping conventional scratch volume");
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn classify_conventional_mount(path: &Path) -> std::io::Result<bool> {
+    use core_foundation_sys::{
+        array::{CFArrayCreate, kCFTypeArrayCallBacks},
+        base::{CFIndex, CFRelease},
+        dictionary::CFDictionaryGetValue,
+        number::{kCFBooleanFalse, kCFBooleanTrue},
+        url::{
+            CFURLCopyResourcePropertiesForKeys, CFURLCreateFromFileSystemRepresentation,
+            kCFURLVolumeIsInternalKey, kCFURLVolumeIsRemovableKey,
+        },
+    };
+    // NOWAIT reads cached mount records without asking any filesystem to
+    // refresh its statistics. Do not replace this with statfs(path).
+    // SAFETY: a null buffer with zero size requests only the mount count.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let count = usize::try_from(count).map_err(std::io::Error::other)?;
+    let size = count
+        .checked_mul(std::mem::size_of::<libc::statfs>())
+        .and_then(|size| libc::c_int::try_from(size).ok())
+        .ok_or_else(|| std::io::Error::other("mount table is too large"))?;
+    if count == 0 {
+        return Ok(false);
+    }
+    let mut mounts = vec![std::mem::MaybeUninit::<libc::statfs>::uninit(); count];
+    // SAFETY: size describes the allocated buffer. Only returned entries are
+    // read; a concurrent mount addition can at worst omit our candidate.
+    let filled = unsafe { libc::getfsstat(mounts.as_mut_ptr().cast(), size, libc::MNT_NOWAIT) };
+    if filled < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for mount in mounts.iter().take((filled as usize).min(count)) {
+        // SAFETY: getfsstat initialized each of the returned records.
+        let mount = unsafe { mount.assume_init_ref() };
+        // SAFETY: the kernel's fixed-size mount names are NUL terminated.
+        let mounted_at = unsafe { std::ffi::CStr::from_ptr(mount.f_mntonname.as_ptr()) };
+        if mounted_at.to_bytes() != path.as_os_str().as_encoded_bytes() {
+            continue;
+        }
+        if mount.f_flags & libc::MNT_LOCAL as u32 == 0 {
+            return Ok(false);
+        }
+        // Internal excludes external fixed USB disks too, unlike MNT_LOCAL.
+        // Query volume metadata only; never create or open a probe file here.
+        // SAFETY: Create/Copy objects are checked and released; dictionary
+        // values are borrowed only while their dictionary lives.
+        return unsafe {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            let url = CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as CFIndex,
+                1,
+            );
+            if url.is_null() {
+                return Err(std::io::Error::other("volume URL unavailable"));
+            }
+            let keys = [
+                kCFURLVolumeIsInternalKey.cast(),
+                kCFURLVolumeIsRemovableKey.cast(),
+            ];
+            let array = CFArrayCreate(std::ptr::null(), keys.as_ptr(), 2, &kCFTypeArrayCallBacks);
+            if array.is_null() {
+                CFRelease(url.cast());
+                return Err(std::io::Error::other("volume property keys unavailable"));
+            }
+            let properties = CFURLCopyResourcePropertiesForKeys(url, array, std::ptr::null_mut());
+            let usable = if properties.is_null() {
+                Err(std::io::Error::other("volume properties unavailable"))
+            } else {
+                let internal = CFDictionaryGetValue(properties, kCFURLVolumeIsInternalKey.cast());
+                let removable = CFDictionaryGetValue(properties, kCFURLVolumeIsRemovableKey.cast());
+                let usable = if internal.is_null() || removable.is_null() {
+                    Err(std::io::Error::other(
+                        "volume device properties unavailable",
+                    ))
+                } else {
+                    Ok(conventional_volume_usable(
+                        true,
+                        removable != kCFBooleanFalse.cast(),
+                        internal == kCFBooleanTrue.cast(),
+                    ))
+                };
+                CFRelease(properties.cast());
+                usable
+            };
+            CFRelease(array.cast());
+            CFRelease(url.cast());
+            usable
+        };
+    }
+    Ok(false)
 }
 
 fn resolve_scratch_root_from(
@@ -286,8 +422,7 @@ fn resolve_scratch_root_from(
     carrick_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> PathBuf {
-    let _ = classified_usable;
-    if probe(conventional) {
+    if classified_usable && probe(conventional) {
         return conventional.to_path_buf();
     }
     // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick. (No
@@ -382,6 +517,7 @@ mod tests {
         assert!(!conventional_volume_usable(true, true, true));
         assert!(!conventional_volume_usable(false, false, true));
         assert!(!conventional_volume_usable(true, false, false));
+        assert!(!conventional_volume_usable(true, true, false));
     }
 
     #[test]
@@ -390,6 +526,7 @@ mod tests {
             (true, true, true),
             (false, false, true),
             (true, false, false),
+            (true, true, false),
         ] {
             let usable = conventional_volume_usable(local, removable, internal);
             let root = resolve_scratch_root_from(
@@ -431,6 +568,38 @@ mod tests {
         assert_eq!(root, conventional);
         let root = resolve_scratch_root_from(conventional, usable, |_| false, None, None);
         assert_eq!(root, PathBuf::from("/tmp/carrick/scratch"));
+    }
+
+    #[test]
+    fn conventional_volume_query_known_answer_and_deadline() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        assert!(bounded_volume_query(Duration::from_secs(5), || Ok(true)).unwrap());
+        assert!(
+            bounded_volume_query(Duration::from_secs(5), || {
+                Err(std::io::Error::other("device query failed"))
+            })
+            .is_err()
+        );
+        let (release, blocked) = sync_channel(1);
+        let (finished, completion) = sync_channel(1);
+        let result = bounded_volume_query(Duration::from_millis(20), move || {
+            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            finished.send(()).unwrap();
+            Ok(true)
+        });
+        assert!(result.is_err());
+        let root = resolve_scratch_root_from(
+            Path::new("/Volumes/carrick"),
+            result.unwrap_or(false),
+            |_| panic!("unknown volume must not be probed"),
+            Some("/internal/home".into()),
+            None,
+        );
+        assert_eq!(root, PathBuf::from("/internal/home/scratch"));
+        release.send(()).unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
     #[test]
