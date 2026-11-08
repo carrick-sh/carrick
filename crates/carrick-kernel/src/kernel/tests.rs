@@ -2142,3 +2142,71 @@ fn clear_child_tid_codec_limit_covers_every_guest_user_va_ceiling() {
         );
     }
 }
+
+#[test]
+fn production_root_domains_retire_after_bootstrap() {
+    production_root_domains_retire(true);
+}
+
+#[test]
+fn production_root_domains_retire_after_cancel() {
+    production_root_domains_retire(false);
+}
+
+fn production_root_domains_retire(retire_bootstrap: bool) {
+    use super::{Container, LaunchContext, RunId};
+    use crate::namespace::pid::NsSharedRegion;
+    use carrick_kernel_arena::arena::KernelArena;
+    let arena = Box::leak(Box::new(KernelArena::create().unwrap()));
+    let region = NsSharedRegion::allocate(arena).unwrap();
+    let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+        "cursor-root",
+    ))));
+    container.install_pid_ns(region.clone()).unwrap();
+    let bootstrap = RootBootstrap::for_prepared_launch(
+        41,
+        ThreadId::synthetic_for_tests(41),
+        "cursor-root".into(),
+        container,
+        Arc::new(carrick_hal::NullHostSignalBridge::default()),
+    )
+    .unwrap();
+    let (kernel, _root) = Kernel::bootstrap_root(bootstrap).unwrap();
+    assert_eq!(kernel.ids().visible_namespace_count(), 1);
+    if retire_bootstrap {
+        assert!(region.retire());
+        assert_eq!(
+            kernel.ids().visible_namespace_count(),
+            0,
+            "initial bootstrap cursor leaked"
+        );
+        return;
+    }
+    let cursor_baseline = kernel.ids().visible_namespace_count();
+    let baseline = kernel.ids().counts();
+    for round in 0..4 {
+        let region = NsSharedRegion::allocate(arena).unwrap();
+        let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "cancelled",
+        ))));
+        container.install_pid_ns(region.clone()).unwrap();
+        let preparation = kernel
+            .prepare_container_root(
+                ThreadId::synthetic_for_tests(42 + round),
+                None,
+                "cancelled".into(),
+                container,
+                None,
+            )
+            .unwrap();
+        assert_eq!(kernel.ids().visible_namespace_count(), cursor_baseline + 1);
+        drop(preparation);
+        assert!(region.retire());
+        assert_eq!(kernel.ids().counts(), baseline);
+        assert_eq!(
+            kernel.ids().visible_namespace_count(),
+            cursor_baseline,
+            "cancelled root {round} leaked cursor"
+        );
+    }
+}

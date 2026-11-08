@@ -613,6 +613,19 @@ impl NativeSignalFixture {
         process: carrick_core_abi::EntryTaskKey,
         process_birth: carrick_core_abi::BirthSerial,
     ) -> Self {
+        Self::with_identity(true, |_| (binding, process, process_birth))
+    }
+
+    fn with_identity(
+        seed: bool,
+        identity: impl FnOnce(
+            &'static ZoneTables<ParkedContextWords>,
+        ) -> (
+            ExecutionBinding,
+            carrick_core_abi::EntryTaskKey,
+            carrick_core_abi::BirthSerial,
+        ),
+    ) -> Self {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: one aligned allocation owns this zero-valid compact zone for
         // the entire leaked host-test fixture lifetime.
@@ -621,6 +634,7 @@ impl NativeSignalFixture {
             assert!(!ptr.is_null());
             Box::leak(Box::from_raw(ptr))
         };
+        let (binding, process, process_birth) = identity(zone);
         let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
         let control = Box::leak(Box::new(ThreadControlSlot::new()));
         let child_page = Box::leak(Box::new(ThreadLifecyclePage::new()));
@@ -678,7 +692,9 @@ impl NativeSignalFixture {
         )
         .unwrap();
         let source = BornInZoneSource { zone, slot };
-        seed_fixture_namespace(zone, task, page);
+        if seed {
+            seed_fixture_namespace(zone, task, page);
+        }
         let runtime = Arc::new(
             NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
@@ -8051,4 +8067,111 @@ fn host_root_open_publishes_unstamped_record_through_service_notice() {
     assert_eq!(counters.refused[257].load(Ordering::Relaxed), 0);
     assert!(ticket.complete(false).is_ok());
     drop(queue);
+}
+
+
+#[test]
+fn production_unmapped_root_early_bind_admits_and_forks() {
+    production_unmapped_root_admits_and_forks(false);
+}
+
+#[test]
+fn production_unmapped_root_late_bind_admits_and_forks() {
+    production_unmapped_root_admits_and_forks(true);
+}
+
+#[cfg(test)]
+fn production_unmapped_root_admits_and_forks(late_bind: bool) {
+    use carrick_hal::birth_serial::test_support::OwnedBirthZone;
+    use carrick_kernel::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
+    {
+        let mut retained = None;
+        let fixture = NativeSignalFixture::with_identity(false, |zone| {
+            let source = Arc::new(OwnedBirthZone::from_static(zone));
+            let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+                "unmapped",
+            ))));
+            assert!(container.pid_region().is_none());
+            let mut bootstrap = RootBootstrap::for_prepared_launch(
+                41,
+                carrick_hal::ThreadId::synthetic_for_tests(41),
+                "unmapped".into(),
+                container,
+                Arc::new(carrick_hal::NullHostSignalBridge::default()),
+            )
+            .unwrap();
+            if !late_bind {
+                bootstrap = bootstrap.with_birth_source(source.clone());
+            }
+            let (kernel, root) = Kernel::bootstrap_root(bootstrap).unwrap();
+            if late_bind {
+                kernel.bind_initial_birth_source(source).unwrap();
+            }
+            let task = root.task().key();
+            let thread = root.thread().key();
+            let binding = ExecutionBinding {
+                task: carrick_core_abi::EntryTaskKey::from_raw(task.id.raw() as u64),
+                generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+                mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(
+                    thread.serial.raw(),
+                ),
+            };
+            retained = Some((kernel, root));
+            (
+                binding,
+                binding.task,
+                carrick_core_abi::BirthSerial::of_task(task.serial),
+            )
+        });
+        assert_eq!(fixture.task.visible_pid(), Some(41));
+        let (kernel, _root) = retained.as_ref().unwrap();
+        let (host_id, _host_claim) = kernel.ids().reserve_task().unwrap();
+        let (host_id2, _host_claim2) = kernel.ids().reserve_task().unwrap();
+        let mut service = fixture.service();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("native fork did not return");
+        };
+        drop(entry);
+        let child_pid = result.raw();
+        for index in 0..fixture.child_page.entry_count() {
+            if let Some((generation, _)) = fixture.child_page.state(index) {
+                let identity = fixture
+                    .child_page
+                    .identity(EntryRef::new(index as u32, generation))
+                    .unwrap();
+                assert_eq!(
+                    identity.visible_tid, identity.tid,
+                    "unmapped thread stock must preserve TID"
+                );
+            }
+        }
+        assert!(child_pid > 0);
+        assert_ne!(child_pid, 41);
+        assert_ne!(child_pid, host_id.raw() as i64);
+        assert_ne!(child_pid, host_id2.raw() as i64);
+        assert!(
+            fixture
+                .zone
+                .namespace()
+                .with_view(&carrick_sched_core::ShortLockSpin, |ns| ns
+                    .is_reserved_number(child_pid as i32)),
+            "unmapped visible PID must be its internal claim"
+        );
+    }
 }
