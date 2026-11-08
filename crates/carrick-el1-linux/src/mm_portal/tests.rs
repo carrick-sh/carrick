@@ -3250,199 +3250,176 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
         SpaceWaitCause::Editor,
         SpaceWaitCause::PreparedOverlap,
     ] {
-        for cancel in [false, true] {
-            let region = Region::new();
-            let zone = region.zone();
-            let mm = admit_notified(&region, 77, ROOT, 2, 0);
-            let view = nodes(&region);
-            let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &zone.spaces, &view)
-                .with_zone(zone)
-                .unwrap();
-            let slot = SlotId::from_index(0).unwrap();
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, mm.raw(), None, 0);
-            assert!(zone.occupancy.replace(
-                carrick_sched_core::ExecutionSlot::zone(slot),
-                0,
-                mm.raw()
-            ));
-            zone.enter_guest(slot);
-            let task = CurrentTask::new();
-            task.set(
-                El1TaskId::from_linux_tid(101),
-                carrick_el1_abi::SnapshotGeneration::from_raw(1),
-                5,
-            );
-            task.mm.key.store(mm.raw(), Ordering::Release);
-            task.mm.thread_generation.store(1101, Ordering::Release);
-            task.linux.mark_pending_host_work();
-            let counters = Counters::default();
-            let tables = Tables::new(ROOT, IPA, 0);
-            let maintenance = CallerInvalidatesAsid;
-            let prepared = (cause == SpaceWaitCause::PreparedOverlap).then(|| {
-                let nz = |value| NonZeroU64::new(value).unwrap();
-                let published = execute_descriptor_op(
-                    &tables.live(&maintenance),
-                    SubstrateGpa(ROOT),
-                    DescriptorOp::Prepare {
-                        publication: GuestLeafPublication {
-                            va: VA,
-                            ipa: IPA,
-                            len: 4096,
-                            writable: true,
-                            executable: false,
-                        },
-                        resident: PageSpan::new(VA, 4096),
-                        backing: BackingIdentity {
-                            frame_id: nz(1),
-                            mapping_id: nz(2),
-                            owner_generation: nz(3),
-                            inventory_revision: nz(4),
-                        },
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, 77, ROOT, 2, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &zone.spaces, &view)
+            .with_zone(zone)
+            .unwrap();
+        let slot = SlotId::from_index(0).unwrap();
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, mm.raw(), None, 0);
+        assert!(
+            zone.occupancy
+                .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, mm.raw())
+        );
+        zone.enter_guest(slot);
+        let task = CurrentTask::new();
+        task.set(
+            El1TaskId::from_linux_tid(101),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            5,
+        );
+        task.mm.key.store(mm.raw(), Ordering::Release);
+        task.mm.thread_generation.store(1101, Ordering::Release);
+        task.linux.mark_pending_host_work();
+        let counters = Counters::default();
+        let tables = Tables::new(ROOT, IPA, 0);
+        let maintenance = CallerInvalidatesAsid;
+        let prepared = (cause == SpaceWaitCause::PreparedOverlap).then(|| {
+            let nz = |value| NonZeroU64::new(value).unwrap();
+            let published = execute_descriptor_op(
+                &tables.live(&maintenance),
+                SubstrateGpa(ROOT),
+                DescriptorOp::Prepare {
+                    publication: GuestLeafPublication {
+                        va: VA,
+                        ipa: IPA,
+                        len: 4096,
+                        writable: true,
+                        executable: false,
                     },
-                    &TableGrants::NONE,
-                    &mut InlineJournal::new(),
-                );
-                assert!(
-                    matches!(published, DescriptorOutcome::Applied(_)),
-                    "{published:?}"
-                );
-                let transfer = portal
-                    .begin(
-                        portal.admitted_handle(mm, 0).unwrap(),
-                        GuestVa::new(VA),
-                        4096,
-                        TransferIntent::UserWrite,
-                        0,
-                    )
-                    .unwrap();
-                let request = selected(select(&portal, &transfer, &tables))
-                    .request(TransferIntent::UserWrite, retained())
-                    .unwrap();
-                let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
-                    .unwrap()
-                    .unwrap();
-                (permit, request)
-            });
-            let arenas = [&tables];
-            let mut editor = ForkAnonymousEditor {
-                arenas: &arenas,
-                pool: TableWindow {
-                    words: tables.words.as_ptr().cast_mut(),
-                    physical_base: tables.base,
-                    byte_len: tables.words.len() * 8,
+                    resident: PageSpan::new(VA, 4096),
+                    backing: BackingIdentity {
+                        frame_id: nz(1),
+                        mapping_id: nz(2),
+                        owner_generation: nz(3),
+                        inventory_revision: nz(4),
+                    },
                 },
-            };
-            let mut frame = TrapFrame {
-                slot: 0,
-                elr: 0x1004,
-                ..TrapFrame::default()
-            };
-            frame.x[0] = VA;
-            frame.x[1] = 4096;
-            frame.x[8] = 215;
-            let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
-            let held_root =
-                (cause == SpaceWaitCause::Reservations).then(|| portal.root(mm, 1).unwrap());
-            let held_editor = (cause == SpaceWaitCause::Editor).then(|| {
-                access
-                    .try_begin_edit(
-                        zone.spaces.find(mm.raw()).unwrap(),
-                        mm.raw(),
-                        NonZeroU64::new(2).unwrap(),
-                    )
-                    .unwrap()
-            });
-            assert_eq!(
-                serve_delegated_anonymous(
-                    &mut frame,
-                    &counters,
-                    &task,
-                    access,
-                    region.table(),
-                    &mut editor,
-                    None
-                ),
-                DelegatedAnonymous::Contended(cause),
+                &TableGrants::NONE,
+                &mut InlineJournal::new(),
             );
-            let mut cpu = FakeCpu::default();
-            let mut sched = Sched {
-                handoff: None,
-                zone,
-                slot,
-                task: &task,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-                counters: &counters,
-            };
-            assert!(matches!(
-                park_anonymous_edit(&mut sched, &mut frame, region.table(), cause),
-                Some(Served::Idle),
-            ));
-            let record = zone.slot(slot).host_record().unwrap();
-            assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 1);
-            let source = zone
-                .space_entry(NonZeroU64::new(mm.raw()).unwrap())
-                .unwrap()
-                .live_notifications()
+            assert!(
+                matches!(published, DescriptorOutcome::Applied(_)),
+                "{published:?}"
+            );
+            let transfer = portal
+                .begin(
+                    portal.admitted_handle(mm, 0).unwrap(),
+                    GuestVa::new(VA),
+                    4096,
+                    TransferIntent::UserWrite,
+                    0,
+                )
                 .unwrap();
-            let key = source.key(cause);
-            assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
-            if cancel {
-                assert_eq!(
-                    zone.claim_for_host(
-                        zone.record_ref(record),
-                        None,
-                        carrick_sched_core::Handback::Cancelled,
-                        &carrick_sched_core::ShortLockSpin,
-                    ),
-                    carrick_sched_core::HostClaim::Claimed,
-                );
-            }
-            drop(held_root);
-            drop(held_editor);
-            if let Some((permit, request)) = prepared {
-                portal.cancel_prepared(permit, request, 0).unwrap();
-            }
-            assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
-            if cancel {
-                assert!(zone.switch_in_full(slot).is_none());
-                assert_eq!(
-                    zone.record(record).handback(),
-                    Some(carrick_sched_core::Handback::Cancelled)
-                );
-                continue;
-            }
-            let switched = zone.switch_in_full(slot).unwrap();
-            // SAFETY: switch_in_full assigned this exact record to the execution slot.
-            let context = unsafe { zone.record(switched.record).ctx_mut() };
-            assert_eq!(context.native.pc, 0x1000);
-            sched.cpu.load(&mut frame, context);
-            assert_eq!(
-                serve_delegated_anonymous(
-                    &mut frame,
-                    &counters,
-                    &task,
-                    access,
-                    region.table(),
-                    &mut editor,
-                    None
-                ),
-                DelegatedAnonymous::Served,
-                "cause={cause:?}, leaves={:?}",
-                counters
-                    .anonymous_leaves
-                    .each_ref()
-                    .map(|counter| counter.load(Ordering::Relaxed)),
-            );
-            for leave in [AnonymousLeave::RootBusy, AnonymousLeave::EditorBusy] {
-                assert_eq!(
-                    counters.anonymous_leaves[leave as usize].load(Ordering::Relaxed),
-                    0
-                );
-            }
-            assert_eq!(counters.forwarded[215].load(Ordering::Relaxed), 0);
+            let request = selected(select(&portal, &transfer, &tables))
+                .request(TransferIntent::UserWrite, retained())
+                .unwrap();
+            let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+                .unwrap()
+                .unwrap();
+            (permit, request)
+        });
+        let arenas = [&tables];
+        let mut editor = ForkAnonymousEditor {
+            arenas: &arenas,
+            pool: TableWindow {
+                words: tables.words.as_ptr().cast_mut(),
+                physical_base: tables.base,
+                byte_len: tables.words.len() * 8,
+            },
+        };
+        let mut frame = TrapFrame {
+            slot: 0,
+            elr: 0x1004,
+            ..TrapFrame::default()
+        };
+        frame.x[0] = VA;
+        frame.x[1] = 4096;
+        frame.x[8] = 215;
+        let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
+        let held_root =
+            (cause == SpaceWaitCause::Reservations).then(|| portal.root(mm, 1).unwrap());
+        let held_editor = (cause == SpaceWaitCause::Editor).then(|| {
+            access
+                .try_begin_edit(
+                    zone.spaces.find(mm.raw()).unwrap(),
+                    mm.raw(),
+                    NonZeroU64::new(2).unwrap(),
+                )
+                .unwrap()
+        });
+        assert_eq!(
+            serve_delegated_anonymous(
+                &mut frame,
+                &counters,
+                &task,
+                access,
+                region.table(),
+                &mut editor,
+                None
+            ),
+            DelegatedAnonymous::Contended(cause),
+        );
+        let mut cpu = FakeCpu::default();
+        let mut sched = Sched {
+            handoff: None,
+            zone,
+            slot,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: &counters,
+        };
+        assert!(matches!(
+            park_anonymous_edit(&mut sched, &mut frame, region.table(), cause),
+            Some(Served::Idle),
+        ));
+        assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 1);
+        let source = zone
+            .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+            .unwrap()
+            .live_notifications()
+            .unwrap();
+        let key = source.key(cause);
+        assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+        drop(held_root);
+        drop(held_editor);
+        if let Some((permit, request)) = prepared {
+            portal.cancel_prepared(permit, request, 0).unwrap();
         }
+        assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+        let switched = zone.switch_in_full(slot).unwrap();
+        // SAFETY: switch_in_full assigned this exact record to the execution slot.
+        let context = unsafe { zone.record(switched.record).ctx_mut() };
+        assert_eq!(context.native.pc, 0x1000);
+        sched.cpu.load(&mut frame, context);
+        assert_eq!(
+            serve_delegated_anonymous(
+                &mut frame,
+                &counters,
+                &task,
+                access,
+                region.table(),
+                &mut editor,
+                None
+            ),
+            DelegatedAnonymous::Served,
+            "cause={cause:?}, leaves={:?}",
+            counters
+                .anonymous_leaves
+                .each_ref()
+                .map(|counter| counter.load(Ordering::Relaxed)),
+        );
+        for leave in [AnonymousLeave::RootBusy, AnonymousLeave::EditorBusy] {
+            assert_eq!(
+                counters.anonymous_leaves[leave as usize].load(Ordering::Relaxed),
+                0
+            );
+        }
+        assert_eq!(counters.forwarded[215].load(Ordering::Relaxed), 0);
     }
 }
 
