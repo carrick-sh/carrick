@@ -27,10 +27,17 @@ mod test_support {
     pub const INJECT_METADATA_REQUIRED_ONCE: u64 = 0xffff_ffff_ffff_fe14;
     pub const INJECT_WAIT_HANDBACK_CENSUS: u64 = 0xffff_ffff_ffff_fe15;
     pub const INJECT_METADATA_ON_REPROBE_ONCE: u64 = 0xffff_ffff_ffff_fe16;
+    pub const INJECT_CAUGHT_SIGNAL_ON_PARK: u64 = 0xffff_ffff_ffff_fe17;
     static ANONYMOUS_WAIT_HANDBACKS: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
     static METADATA_ON_REPROBE: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+    static CAUGHT_SIGNAL_ON_PARK: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    pub fn take_caught_signal_on_park() -> bool {
+        CAUGHT_SIGNAL_ON_PARK.swap(false, Ordering::AcqRel)
+    }
 
     pub fn record_anonymous_wait_handback() {
         ANONYMOUS_WAIT_HANDBACKS.fetch_add(1, Ordering::Relaxed);
@@ -78,6 +85,15 @@ mod test_support {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
                 .then_some(0),
+            INJECT_CAUGHT_SIGNAL_ON_PARK => {
+                if !CAUGHT_SIGNAL_ON_PARK.swap(true, Ordering::AcqRel)
+                    && carrick_sched_core::spaces::inject_editor_busy_once()
+                {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }

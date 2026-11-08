@@ -546,6 +546,7 @@ fn production_image_has_no_anonymous_injection_statics() {
         "INJECT_METADATA_REQUIRED",
         "ANONYMOUS_WAIT_HANDBACKS",
         "METADATA_ON_REPROBE",
+        "CAUGHT_SIGNAL_ON_PARK",
     ] {
         assert!(
             image.syms.iter().all(|symbol| image
@@ -561,7 +562,7 @@ fn production_image_has_no_anonymous_injection_statics() {
 fn production_image_refuses_anonymous_injection_ordinals() {
     let mut code = Vec::new();
     let mut failures = Vec::new();
-    for ordinal in 0xffff_ffff_ffff_fe10..=0xffff_ffff_ffff_fe16 {
+    for ordinal in 0xffff_ffff_ffff_fe10..=0xffff_ffff_ffff_fe17 {
         append_mov(&mut code, &[0x48, 0xb8], ordinal);
         code.extend_from_slice(&[0x0f, 0x05]);
         append_result_check(&mut code, &mut failures, -38);
@@ -581,7 +582,7 @@ fn production_image_refuses_anonymous_injection_ordinals() {
     let outcome = run_pool_fixture(&production_probe_elf(&code), 16);
     assert_eq!(outcome.run.exit_code, 7);
     assert_eq!(outcome.run.terminating_signal, None);
-    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 7);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 8);
 }
 
 #[test]
@@ -920,6 +921,104 @@ fn production_anonymous_editor_busy_once_parks_and_completes() {
         0
     );
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// A caught signal enters through the production x86 signal owner after the
+/// real anonymous munmap has parked.  The guest handler returns through
+/// rt_sigreturn, the saved syscall instruction re-executes, and munmap
+/// completes rather than reporting EINTR.
+#[test]
+fn production_anonymous_caught_signal_returns_and_reexecutes() {
+    const INJECT_CAUGHT_SIGNAL_ON_PARK: u64 = 0xffff_ffff_ffff_fe17;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+    const IMAGE_BASE: u64 = 0x0040_00b0;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12,rax
+
+    // This probe carries a private writable ELF stack because the KVM pool
+    // fixture intentionally has no host-backed anonymous-fault service.
+    code.extend_from_slice(&[0x48, 0xbc]); // movabs rsp,stack
+    let stack_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+
+    append_mov(&mut code, &[0x48, 0xbf], 10); // SIGUSR1
+    code.extend_from_slice(&[0x48, 0xbe]); // movabs rsi,action
+    let action_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xd2]); // xor edx,edx
+    append_mov(&mut code, &[0x49, 0xba], 8); // kernel sigset size
+    append_mov(&mut code, &[0x48, 0xb8], 13); // rt_sigaction
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_CAUGHT_SIGNAL_ON_PARK);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi,r12
+    append_mov(&mut code, &[0x48, 0xbe], 0x1000);
+    append_mov(&mut code, &[0x48, 0xb8], 11); // munmap
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 1);
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let handler = IMAGE_BASE + code.len() as u64;
+    code.push(0xc3); // ret to the kernel-provided SA_RESTORER address
+    let restorer = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&[0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
+    while code.len() % 8 != 0 {
+        code.push(0x90);
+    }
+    let action = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&handler.to_le_bytes());
+    code.extend_from_slice(&0x0400_0000_u64.to_le_bytes()); // SA_RESTORER
+    code.extend_from_slice(&restorer.to_le_bytes());
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code[action_pointer..action_pointer + 8].copy_from_slice(&action.to_le_bytes());
+    code.resize(0x1_0000, 0);
+    let stack = IMAGE_BASE + 0xfff0;
+    code[stack_pointer..stack_pointer + 8].copy_from_slice(&stack.to_le_bytes());
+
+    let mut elf = production_probe_elf(&code);
+    elf[68..72].copy_from_slice(&7_u32.to_le_bytes()); // fixture-private RWX load segment
+    let file_size = elf.len() as u64;
+    elf[104..112].copy_from_slice(&file_size.to_le_bytes());
+    let outcome = run_instrumented_pool_fixture(&elf, 32);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "caught signal must replay munmap without EINTR: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
 }
 
 /// A real mprotect reaches the shared prepared-overlap check, parks on the
