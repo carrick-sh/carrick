@@ -31,6 +31,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=cpl0_inputs.rs");
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
     let target_dir = out.join("cpl0-target");
+    let status = Command::new(&cargo)
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "-p",
+            "carrick-x86-cpl0",
+            "--bin",
+            "carrick-x86-cpl0",
+            "--target",
+            "x86_64-unknown-none",
+            "--target-dir",
+        ])
+        .arg(&target_dir)
+        .env_remove("CARGO_MAKEFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .status()?;
+    if !status.success() {
+        return Err(format!("production CPL0 image build failed: {status}").into());
+    }
+    let built = target_dir.join("x86_64-unknown-none/release");
+    let production = out.join("carrick-x86-cpl0");
+    std::fs::copy(built.join("carrick-x86-cpl0"), &production)?;
+    println!(
+        "cargo:rustc-env=CARRICK_X86_CPL0_IMAGE={}",
+        production.display()
+    );
+
+    // Injection witnesses use a second production entry artifact. Build it
+    // only after preserving the feature-free production image above.
     let status = Command::new(cargo)
         .args([
             "build",
@@ -53,21 +83,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .status()?;
     if !status.success() {
-        return Err(format!("CPL0 image build failed: {status}").into());
+        return Err(format!("test CPL0 image build failed: {status}").into());
     }
-    // Both images come from this one build of the current sources. Tests load
-    // them through these exported paths, never from a shared `target/` that a
-    // separate (possibly stale) `cargo build` populated. The fixture keeps its
-    // file name: the carrier recognises the fixture image by it.
-    for (bin, variable) in [
-        ("carrick-x86-cpl0", "CARRICK_X86_CPL0_IMAGE"),
-        ("carrick-x86-cpl0-fixture", "CARRICK_X86_CPL0_FIXTURE_IMAGE"),
+    for (bin, output, variable) in [
+        (
+            "carrick-x86-cpl0",
+            "carrick-x86-cpl0-test",
+            "CARRICK_X86_CPL0_TEST_IMAGE",
+        ),
+        (
+            "carrick-x86-cpl0-fixture",
+            "carrick-x86-cpl0-fixture",
+            "CARRICK_X86_CPL0_FIXTURE_IMAGE",
+        ),
     ] {
-        let image = out.join(bin);
-        std::fs::copy(
-            target_dir.join("x86_64-unknown-none/release").join(bin),
-            &image,
-        )?;
+        let image = out.join(output);
+        std::fs::copy(built.join(bin), &image)?;
         println!("cargo:rustc-env={variable}={}", image.display());
     }
     Ok(())
