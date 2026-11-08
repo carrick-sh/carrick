@@ -428,7 +428,7 @@ pub(super) fn dispatch_arm_syscall_with_native_process<F, C, U, X>(
     cache_lookup: F,
 ) -> Result<
     carrick_personality_linux::dispatch::CompletionRoute,
-    super::native_process_runtime::NativeProcessError,
+    super::native_process_runtime::NativeAdmissionError,
 >
 where
     F: Fn(u32) -> *mut u8,
@@ -1531,7 +1531,7 @@ fn arm_native_service_exit(
     )
     // Keep entry admission separate from dispatch/settlement: these source
     // locations and the exact error survive the existing fatal transport.
-    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
+    .unwrap_or_else(|error| fatal_admission(error));
     let result = native_service_completion(result, phase)
         .unwrap_or_else(|reason| invalid_completion(reason));
     Some(match result {
@@ -1682,10 +1682,15 @@ where
 /// thread on the owner and reruns the fault, exactly as a supply wait does.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) fn declined_fault_admission_result(
-    result: Result<Action, super::native_process_runtime::NativeProcessError>,
+    result: Result<Action, impl Into<super::native_process_runtime::NativeAdmissionError>>,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
 ) -> Result<Action, super::native_process_runtime::NativeProcessError> {
-    use super::native_process_runtime::NativeProcessError;
+    use super::native_process_runtime::{NativeAdmissionError, NativeProcessError};
+    let result = match result.map_err(Into::into) {
+        Err(NativeAdmissionError::Contended(_)) => return Ok(Action::Forward),
+        Err(NativeAdmissionError::Failure(error)) => Err(error),
+        Ok(action) => Ok(action),
+    };
     match result {
         Ok(action) => Ok(action),
         Err(NativeProcessError::OwnerWait(wait)) => {
@@ -1739,7 +1744,7 @@ fn declined_fault_admission_busy_once_then_success() {
         );
     }
     assert_eq!(
-        declined_fault_admission_result(Ok(Action::Served), &mut None),
+        declined_fault_admission_result(Ok::<_, NativeProcessError>(Action::Served), &mut None),
         Ok(Action::Served)
     );
 }
@@ -1921,8 +1926,19 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
-    .unwrap_or_else(|error| match error {
-        super::native_process_runtime::NativeProcessError::AdmissionContended(contention) => {
+    .unwrap_or_else(|error| fatal_admission(error));
+    match delivered {
+        None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
+        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
+        Some(_) => invalid_completion(NativeInvariant::EntryBinding),
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[track_caller]
+fn fatal_admission(error: super::native_process_runtime::NativeAdmissionError) -> ! {
+    match error {
+        super::native_process_runtime::NativeAdmissionError::Contended(contention) => {
             // Explicit diagnostic-only terminal policy for #887. This is not
             // an invariant conversion or an errno; the owned retry is separate.
             #[cfg(target_os = "none")]
@@ -1936,12 +1952,9 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
                 "admission contention: {contention:?}"
             )
         }
-        error => invalid_completion(native_service_invariant(error)),
-    });
-    match delivered {
-        None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
-        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
-        Some(_) => invalid_completion(NativeInvariant::EntryBinding),
+        super::native_process_runtime::NativeAdmissionError::Failure(error) => {
+            invalid_completion(native_service_invariant(error))
+        }
     }
 }
 
@@ -2400,7 +2413,6 @@ fn native_service_fatal_reason(
         Error::Unsupported => Fatal::NativeServiceUnsupported,
         Error::GroupExitCustody => Fatal::NativeServiceGroupExit,
         Error::Busy => Fatal::NativeServiceBusy,
-        Error::AdmissionContended(contention) => contention.fatal_reason(),
         Error::Quarantined => Fatal::NativeServiceQuarantined,
         Error::NoChild => Fatal::NativeServiceNoChild,
         Error::OwnerWait(_) => Fatal::NativeServiceOwnerWait,
