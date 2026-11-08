@@ -22,8 +22,14 @@ fn zone() -> Box<ZoneTables> {
     }
 }
 
-#[test]
-fn anonymous_wait_cancellation_drops_queue_and_reexecutes_without_effects() {
+#[derive(Clone, Copy)]
+enum AnonymousWaitEvent {
+    Signal,
+    Exit,
+    Exec,
+}
+
+fn exercise_anonymous_wait_event(event: AnonymousWaitEvent) {
     let zone = zone();
     let slot = SlotId::new(0);
     let mm = 77;
@@ -45,6 +51,7 @@ fn anonymous_wait_cancellation_drops_queue_and_reexecutes_without_effects() {
         )
         .unwrap();
     let source = entry.live_notifications().unwrap();
+    let reservation_revision = source.observe(SpaceWaitCause::Reservations);
     let identity = ThreadIdentity {
         tid: 41,
         serial: 101,
@@ -87,11 +94,38 @@ fn anonymous_wait_cancellation_drops_queue_and_reexecutes_without_effects() {
     handoff(turn, parked.take_receipt().unwrap()).unwrap();
     let key = source.key(SpaceWaitCause::Reservations);
     assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+    let cancellation = match event {
+        AnonymousWaitEvent::Signal => None,
+        AnonymousWaitEvent::Exit => {
+            let cancellation = carrick_core::terminal::ProcessExitCustody::new();
+            cancellation
+                .publish_cancellation(carrick_core::terminal::ProcessCancellation::GroupExit);
+            assert_eq!(
+                cancellation.cancellation(),
+                Some(carrick_core::terminal::ProcessCancellation::GroupExit)
+            );
+            Some(cancellation)
+        }
+        AnonymousWaitEvent::Exec => {
+            let cancellation = carrick_core::terminal::ProcessExitCustody::new();
+            cancellation.publish_cancellation(carrick_core::terminal::ProcessCancellation::Exec);
+            assert_eq!(
+                cancellation.cancellation(),
+                Some(carrick_core::terminal::ProcessCancellation::Exec)
+            );
+            Some(cancellation)
+        }
+    };
+    let handback = if cancellation.is_some() {
+        carrick_sched_core::Handback::Cancelled
+    } else {
+        carrick_sched_core::Handback::Signal
+    };
     assert_eq!(
         zone.claim_for_host(
             zone.record_ref(record),
             None,
-            carrick_sched_core::Handback::Cancelled,
+            handback,
             &carrick_sched_core::ShortLockSpin,
         ),
         carrick_sched_core::HostClaim::Claimed
@@ -99,17 +133,53 @@ fn anonymous_wait_cancellation_drops_queue_and_reexecutes_without_effects() {
     assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
     assert!(!zone.object_queue_census(key.index()).unwrap().locked);
     assert!(zone.spaces.active_editor(entry.index()).is_none());
-    let replay: EditWaitOutcome<()> = coordinate_anonymous_edit_wait(
-        &source,
-        None,
-        || {
-            probes += 1;
-            Some(None)
-        },
-        |_, _, _| panic!("released operation must re-execute without parking"),
+    assert_eq!(
+        source.observe(SpaceWaitCause::Reservations),
+        reservation_revision,
+        "cancellation cannot publish an anonymous-edit effect"
     );
-    assert_eq!(replay, EditWaitOutcome::NoConflict);
-    assert_eq!(probes, 2);
+    // SAFETY: the concrete event just transferred this exact record to the
+    // host claimant and unlinked every queue entry before returning Claimed.
+    let operation = unsafe { zone.record(record).take_object_operation() }
+        .expect("the event owns the exact parked operation");
+    // SAFETY: the same host claim remains exclusive until this test frees it.
+    assert!(unsafe { zone.record(record).take_object_operation() }.is_none());
+    if matches!(event, AnonymousWaitEvent::Signal) {
+        let replay: EditWaitOutcome<()> = coordinate_anonymous_edit_wait(
+            &source,
+            Some(operation),
+            || {
+                probes += 1;
+                Some(None)
+            },
+            |_, _, _| panic!("signal resume must re-execute without parking"),
+        );
+        assert_eq!(replay, EditWaitOutcome::NoConflict);
+        assert_eq!(probes, 2);
+    } else {
+        drop(operation);
+        assert_eq!(probes, 1, "terminal events must not re-execute the call");
+    }
+    assert!(!zone.record(record).has_object_operation());
+    if let Some(cancellation) = cancellation {
+        assert!(cancellation.cancellation().is_some());
+    }
+    zone.free_record(record);
+}
+
+#[test]
+fn signal_reexecutes_anonymous_wait_without_effects_or_custody() {
+    exercise_anonymous_wait_event(AnonymousWaitEvent::Signal);
+}
+
+#[test]
+fn exit_drops_anonymous_wait_without_effects_or_custody() {
+    exercise_anonymous_wait_event(AnonymousWaitEvent::Exit);
+}
+
+#[test]
+fn exec_drops_anonymous_wait_without_effects_or_custody() {
+    exercise_anonymous_wait_event(AnonymousWaitEvent::Exec);
 }
 
 #[test]
