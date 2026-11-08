@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use carrick_xtask::accept::{AcceptReceipt, ProbeDiff};
-use carrick_xtask::signed_gate::{allowed, label_authorized, trusted_run, validate_receipt};
+use carrick_xtask::signed_gate::{allowed, label_authorized, validate_receipt};
 use carrick_xtask::signed_receipt::compare;
 use serde_json::json;
 use std::process::Command;
@@ -164,26 +164,26 @@ fn owner_only_and_latest_label_transition_is_authority() {
 }
 
 #[test]
-fn baseline_workflow_provenance_and_receipt_admission_fail_closed() {
-    let run = json!({"path":".github/workflows/signed-gate.yml","head_branch":"main","event":"workflow_dispatch","status":"completed","repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"},"actor":{"login":"tjfontaine"},"triggering_actor":{"login":"tjfontaine"}});
-    assert!(trusted_run(&run));
-    let mut pushed = run.clone();
-    pushed["event"] = json!("push");
-    pushed["actor"]["login"] = json!("github-merge-queue[bot]");
-    pushed["triggering_actor"]["login"] = json!("github-merge-queue[bot]");
-    assert!(trusted_run(&pushed));
-    pushed["head_repository"]["full_name"] = json!("someone/fork");
-    assert!(!trusted_run(&pushed));
-    let mut bot = run.clone();
-    bot["triggering_actor"]["login"] = json!("carrick-workers[bot]");
-    assert!(!trusted_run(&bot));
-    let mut wrong = run.clone();
-    wrong["head_branch"] = json!("feature");
-    assert!(!trusted_run(&wrong));
-    wrong = run;
-    wrong["triggering_actor"]["login"] = json!("someone-else");
-    assert!(!trusted_run(&wrong));
+fn receipt_admission_fails_closed() {
     assert!(validate_receipt(&base(), &"a".repeat(40)).is_err());
+}
+
+/// Write the evidence the gate job leaves for its paired base run (#1884).
+fn write_paired_base(results: &std::path::Path, base: &AcceptReceipt) -> std::path::PathBuf {
+    let paired = results.join("base");
+    std::fs::create_dir_all(&paired).unwrap();
+    std::fs::write(paired.join("base.json"), serde_json::to_vec(base).unwrap()).unwrap();
+    std::fs::write(
+        paired.join("identity.json"),
+        serde_json::to_vec(&base.artifact).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        paired.join("cleanup.json"),
+        serde_json::to_vec(&base.cleanup_counts).unwrap(),
+    )
+    .unwrap();
+    paired
 }
 
 fn admitted(head: &str) -> AcceptReceipt {
@@ -319,7 +319,7 @@ fn baseline_admission_requires_every_population_identity_and_scoped_cleanup() {
 
 #[cfg(unix)]
 #[test]
-fn actions_prepare_download_and_publish_use_exact_baseline_and_fail_closed() {
+fn actions_prepare_and_publish_use_the_paired_base_and_fail_closed() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -388,15 +388,12 @@ os.execv({real_git:?}, ['git'] + args)
     std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     let gh = bin.join("gh");
     std::fs::write(&gh, r#"#!/usr/bin/env python3
-import json, os, pathlib, shutil, sys
+import json, os, sys
 args = sys.argv[1:]
 base, head = os.environ['TEST_BASE_SHA'], os.environ['TEST_HEAD_SHA']
-if args[:2] == ['run', 'watch']:
-    assert args[2] == '100'
-    pathlib.Path(os.environ['TEST_POSTS']+'.waited').touch()
-elif args[:2] == ['run', 'download']:
-    assert args[2] == '100' and args[args.index('--name')+1] in ['signed-baseline-'+base+'-1', 'signed-baseline-'+base+'-2']
-    shutil.copyfile(os.environ['TEST_BASE'], pathlib.Path(args[args.index('--dir')+1])/'candidate.json')
+# The paired gate executes its own base; stored receipts are never fetched.
+if args[:2] in (['run', 'watch'], ['run', 'download']):
+    raise SystemExit('stored signed baseline access is retired: '+repr(args))
 elif '--method' in args and args[args.index('--method')+1] == 'POST':
     endpoint = args[args.index('POST')+1]
     with open(os.environ['TEST_POSTS'], 'a') as out:
@@ -415,25 +412,8 @@ elif args[0] == 'api':
         print(json.dumps({'merge_base_commit':{'sha':base}}))
     elif '/commits/' in endpoint and '/pulls?' in endpoint:
         print(json.dumps([json.loads(os.environ.get('TEST_REST_PULLS', '[]'))]))
-    elif '/actions/runs/100' == endpoint[-17:]:
-        print(json.dumps({'id':100,'path':'.github/workflows/signed-gate.yml','head_branch':'main','event':'push','head_sha':base,'status':'completed','repository':{'full_name':'carrick-sh/carrick'},'head_repository':{'full_name':'carrick-sh/carrick'}}))
-    elif '/workflows/signed-gate.yml/runs' in endpoint:
-        run = {'id':100,'path':'.github/workflows/signed-gate.yml','head_branch':'main','event':'workflow_dispatch','status':'completed','repository':{'full_name':'carrick-sh/carrick'},'head_repository':{'full_name':'carrick-sh/carrick'},'actor':{'login':'tjfontaine'},'triggering_actor':{'login':'tjfontaine'}}
-        if os.environ.get('TEST_AUTOMATIC_BASE'):
-            run.update(event='push', head_sha=base)
-        if os.environ.get('TEST_PENDING_BASE'):
-            run.update(event='push', head_sha=base, status='in_progress')
-        discovery = pathlib.Path(os.environ['TEST_POSTS']+'.discovered')
-        if os.environ.get('TEST_PENDING_BASE') and not discovery.exists():
-            discovery.touch()
-            print(json.dumps([{'workflow_runs':[]}]))
-        else:
-            print(json.dumps([{'workflow_runs':[run]}]))
     elif '/events?' in endpoint:
         print(json.dumps([[{'id':1,'event':'labeled','label':{'name':'gate:signed'},'actor':{'login':os.environ.get('TEST_LABEL_ACTOR','tjfontaine')}}]]))
-    elif '/artifacts?' in endpoint:
-        rows = [] if os.environ.get('TEST_NO_BASE') else [{'name':'signed-baseline-'+base+'-4','expired':True},{'name':'signed-baseline-'+base+'-1','expired':False},{'name':'signed-baseline-'+base+'-2','expired':False}]
-        print(json.dumps([{'artifacts':rows}]))
     else:
         raise SystemExit('unexpected API endpoint: '+endpoint)
 else:
@@ -441,8 +421,6 @@ else:
 "#).unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
     let base = admitted(&a);
-    let baseline_path = dir.path().join("source-base.json");
-    std::fs::write(&baseline_path, serde_json::to_vec(&base).unwrap()).unwrap();
     let event = dir.path().join("event.json");
     std::fs::write(&event, json!({"repository":{"full_name":"carrick-sh/carrick"},"inputs":{"pr":"123","sha":b.clone()}}).to_string()).unwrap();
     let posts = dir.path().join("posts.jsonl");
@@ -456,7 +434,6 @@ else:
         .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
         .env("GITHUB_EVENT_NAME", "workflow_dispatch")
         .env("GITHUB_REF", "refs/heads/main")
-        .env("TEST_BASE", &baseline_path)
         .env("TEST_BASE_SHA", &a)
         .env("TEST_HEAD_SHA", &b)
         .env("TEST_GRAPH", &repo)
@@ -478,21 +455,12 @@ else:
         "{}",
         String::from_utf8_lossy(&prepared.stderr)
     );
-    assert_eq!(
-        std::fs::read(request_dir.join("base-00000000000000000100-00000000000000000002.json"))
-            .unwrap(),
-        std::fs::read(&baseline_path).unwrap()
-    );
-    let missing = child()
-        .env("TEST_NO_BASE", "1")
-        .args(["signed-gate", "prepare", "--event"])
-        .arg(&event)
-        .arg("--output")
-        .arg(dir.path().join("no-baseline"))
-        .output()
-        .unwrap();
-    assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("pr=main"));
+    // Authorization names the pair only; no stored base receipt is fetched.
+    let names: Vec<_> = std::fs::read_dir(&request_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["request.json"]);
     let denied = child()
         .env("GITHUB_TRIGGERING_ACTOR", "someone-else")
         .args(["signed-gate", "prepare", "--event"])
@@ -545,7 +513,6 @@ else:
                 "GITHUB_SHA",
                 payload["merge_group"]["head_sha"].as_str().unwrap_or(&b),
             )
-            .env("TEST_PENDING_BASE", "1")
             .env("TEST_QUEUE_ENTRIES", entries)
             .env("TEST_QUEUE_HAS_NEXT", has_next)
             .env("TEST_QUEUE_OMIT_NODES", omit_nodes)
@@ -581,7 +548,6 @@ else:
         "{}",
         String::from_utf8_lossy(&queued.stderr)
     );
-    assert!(posts.with_extension("jsonl.waited").exists());
     let queue_request: serde_json::Value =
         serde_json::from_slice(&std::fs::read(queue_dir.join("request.json")).unwrap()).unwrap();
     assert_eq!(queue_request["kind"], "MergeGroup");
@@ -737,6 +703,9 @@ else:
 
     let results = dir.path().join("results");
     std::fs::create_dir(&results).unwrap();
+    // The gate job executed base A on the same Mac with the same bundle.
+    let paired = write_paired_base(&results, &base);
+    let paired_path = paired.join("base.json");
     let candidate = admitted(&b);
     let candidate_path = results.join("candidate.json");
     std::fs::write(&candidate_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
@@ -867,6 +836,20 @@ else:
     );
     std::fs::write(&candidate_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
 
+    // Without its paired base, or with unadmitted base evidence, a request
+    // cannot pass; publication never falls back to a stored receipt.
+    std::fs::write(paired.join("cleanup.json"), "[]").unwrap();
+    assert!(!publish("success").status.success());
+    let body = std::fs::read_to_string(results.join("comment.md")).unwrap();
+    assert!(body.contains("Base evidence admission failed"), "{body}");
+    write_paired_base(&results, &base);
+    std::fs::rename(&paired_path, paired.join("moved.json")).unwrap();
+    assert!(!publish("success").status.success());
+    let body = std::fs::read_to_string(results.join("comment.md")).unwrap();
+    assert!(body.contains("No valid comparison"), "{body}");
+    std::fs::rename(paired.join("moved.json"), &paired_path).unwrap();
+    assert!(publish("success").status.success());
+
     // A valid receipt cannot hide a failed execution job, nor can an unrelated
     // identity file stand in for independently inspected artifact identity.
     assert!(!publish("failure").status.success());
@@ -895,7 +878,6 @@ else:
         .env("GITHUB_SHA", a.clone())
         .env("GITHUB_ACTOR", "merge-bot")
         .env("GITHUB_TRIGGERING_ACTOR", "merge-bot")
-        .env("TEST_NO_BASE", "1")
         .args(["signed-gate", "prepare", "--event"])
         .arg(&event)
         .arg("--output")
@@ -943,9 +925,7 @@ else:
     std::fs::write(&event, next_main.to_string()).unwrap();
     let next_child = || {
         let mut cmd = child();
-        cmd.env("TEST_BASE_SHA", &b)
-            .env("TEST_HEAD_SHA", &c)
-            .env("TEST_AUTOMATIC_BASE", "1");
+        cmd.env("TEST_BASE_SHA", &b).env("TEST_HEAD_SHA", &c);
         cmd
     };
     let main = next_child()
@@ -964,7 +944,6 @@ else:
         "{}",
         String::from_utf8_lossy(&main.stderr)
     );
-    std::fs::write(&baseline_path, serde_json::to_vec(&admitted(&b)).unwrap()).unwrap();
     let mut next_queue = queue_payload;
     next_queue["merge_group"]["head_ref"] = json!("refs/heads/gh-readonly-queue/main/pr-123-next");
     next_queue["merge_group"]["head_sha"] = json!(c.clone());
@@ -1859,6 +1838,7 @@ else:
     // on both PASS and FAIL paths.
     let results = dir.path().join("results");
     std::fs::create_dir(&results).unwrap();
+    write_paired_base(&results, &base_receipt);
     let cand = admitted(&b);
     std::fs::write(
         results.join("candidate.json"),

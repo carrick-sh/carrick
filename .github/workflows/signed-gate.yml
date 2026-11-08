@@ -24,8 +24,9 @@ jobs:
   authorize:
     if: github.repository == 'carrick-sh/carrick' && (github.event_name == 'merge_group' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.label.name == 'gate:signed')
     runs-on: ubuntu-latest
-    # May wait for the exact base push baseline to finish on the Mac.
-    timeout-minutes: 300
+    # Authorization only names the candidate and its merge base; the gate job
+    # executes that base itself, so nothing waits for a main push baseline.
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: read
@@ -50,7 +51,7 @@ jobs:
         with:
           ref: main
           persist-credentials: false
-      - name: Authorize exact SHA and retrieve merge-base baseline
+      - name: Authorize exact SHA and merge base
         id: request
         env:
           GH_TOKEN: ${{ github.token }}
@@ -112,11 +113,14 @@ jobs:
   gate:
     needs: [authorize, signed-fixtures]
     runs-on: [self-hosted, macOS, ARM64, carrick-signed-gate]
+    # Paired execution (#1884): the merge base and then the candidate run on
+    # this one Mac, each about 22-35 min (60 min worst observed), under one
+    # gate lease whose acquisition may wait up to an hour. 2 x 60 + 60 = 180.
     timeout-minutes: 240
     # GitHub has not assigned runner.name when it evaluates concurrency.
-    # The runner schedules one job at a time; execute holds the per-host gate
-    # lease across restore/build/accept/identity inspection. This additional
-    # group suppresses duplicate requests for one SHA across both Macs.
+    # The runner schedules one job at a time; execute holds one per-host gate
+    # lease across both runs' restore/build/accept/identity inspection. This
+    # additional group suppresses duplicate requests for one SHA across Macs.
     concurrency:
       group: signed-gate-${{ needs.authorize.outputs.sha }}
       cancel-in-progress: false
@@ -168,7 +172,9 @@ jobs:
           bundles=("$RUNNER_TEMP"/signed-fixtures/*.tar.gz)
           test "${#bundles[@]}" -eq 1
           printf 'bundle=%s\n' "${bundles[0]}" >> "$GITHUB_OUTPUT"
-      - name: Execute approved SHA in a fresh detached worktree
+      # Both runs restore this one candidate bundle; a base whose fixture
+      # inputs differ is refused rather than served by another bundle.
+      - name: Execute merge base and approved SHA on this Mac under one lease
         env:
           CARRICK_RUN_ID: signed-gate-${{ github.run_id }}-${{ github.run_attempt }}
           # Same-run artifact; no API credential is passed to candidate code.
@@ -176,7 +182,7 @@ jobs:
         run: >-
           cargo run --locked -p carrick-xtask -- signed-gate execute
           --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/signed-result"
-      - name: Upload receipt, artifact identity and step logs
+      - name: Upload paired receipts, artifact identities and step logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -210,7 +216,7 @@ jobs:
         with:
           name: signed-result-${{ github.run_attempt }}
           path: ${{ runner.temp }}/signed-result
-      - name: Compare typed receipts and publish verdict
+      - name: Compare candidate with its paired base and publish verdict
         id: verdict
         env:
           GH_TOKEN: ${{ github.token }}
