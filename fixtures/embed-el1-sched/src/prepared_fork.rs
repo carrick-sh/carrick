@@ -16,15 +16,28 @@ fn read_diagnostics(fd: libc::c_int, consumed: usize, payload: &mut [u8; 96]) ->
     let mut remainder = [0u8; 8];
     let mut skipped = consumed;
     while skipped < remainder.len() {
-        let rc = unsafe { libc::read(fd, remainder.as_mut_ptr().cast(), remainder.len() - skipped) };
-        if rc <= 0 { return rc; }
+        let rc =
+            unsafe { libc::read(fd, remainder.as_mut_ptr().cast(), remainder.len() - skipped) };
+        if rc <= 0 {
+            return rc;
+        }
         skipped += rc as usize;
     }
     let mut have = 0;
     while have < payload.len() {
-        let rc = unsafe { libc::read(fd, payload[have..].as_mut_ptr().cast(), payload.len() - have) };
-        if rc < 0 { return rc; }
-        if rc == 0 { break; }
+        let rc = unsafe {
+            libc::read(
+                fd,
+                payload[have..].as_mut_ptr().cast(),
+                payload.len() - have,
+            )
+        };
+        if rc < 0 {
+            return rc;
+        }
+        if rc == 0 {
+            break;
+        }
         have += rc as usize;
     }
     have as isize
@@ -297,16 +310,34 @@ mod tests {
         for consumed in [0, 3, 8] {
             let mut fds = [-1; 2];
             assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-            let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            let (reader, writer) =
+                unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
             let mut stream = 1u64.to_le_bytes().to_vec();
-            for field in expected { stream.extend(field.to_le_bytes()); }
+            for field in expected {
+                stream.extend(field.to_le_bytes());
+            }
             // Simulate exactly the bytes already consumed by the readiness path.
             let remaining = &stream[consumed..];
-            assert_eq!(unsafe { libc::write(writer.as_raw_fd(), remaining.as_ptr().cast(), remaining.len()) }, remaining.len() as isize);
+            assert_eq!(
+                unsafe {
+                    libc::write(
+                        writer.as_raw_fd(),
+                        remaining.as_ptr().cast(),
+                        remaining.len(),
+                    )
+                },
+                remaining.len() as isize
+            );
             drop(writer);
             let mut payload = [0; 96];
-            assert_eq!(super::read_diagnostics(reader.as_raw_fd(), consumed, &mut payload), 96);
-            let actual: Vec<_> = payload.chunks_exact(8).map(|word| i64::from_le_bytes(word.try_into().unwrap())).collect();
+            assert_eq!(
+                super::read_diagnostics(reader.as_raw_fd(), consumed, &mut payload),
+                96
+            );
+            let actual: Vec<_> = payload
+                .chunks_exact(8)
+                .map(|word| i64::from_le_bytes(word.try_into().unwrap()))
+                .collect();
             assert_eq!(actual, expected, "readiness bytes consumed: {consumed}");
         }
     }
