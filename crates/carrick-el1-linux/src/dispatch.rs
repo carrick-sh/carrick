@@ -4460,17 +4460,17 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
             }
             if let Some(output) = output {
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        (&raw const output.pollfd).cast::<u8>(),
-                        core::mem::size_of_val(&output.pollfd),
-                    )
-                };
+                // Readiness is frozen, but fd/events remain caller-owned even
+                // while this task is parked. Publish only the output field.
+                let bytes = output.pollfd.revents.to_ne_bytes();
                 return complete_poll_copyout(
                     self.process.as_deref_mut(),
                     task,
-                    carrick_guest_arch::UserVa::new(output.address.0),
-                    bytes,
+                    carrick_guest_arch::UserVa::new(
+                        output.address.0
+                            + core::mem::offset_of!(crate::file_table::PollFd, revents) as u64,
+                    ),
+                    &bytes,
                     SyscallResult::new(output.result),
                 );
             }

@@ -1374,7 +1374,8 @@ impl NativeOwnerSignalFixture {
             tables,
         };
         let pages = GuestUserBuffer::zeroed(8192);
-        let address = pages.arg() + 4092;
+        // Place the two-byte revents across a page boundary.
+        let address = pages.arg() + 4089;
         let pollfd = PollFd {
             fd: 0,
             events: LINUX_POLLIN,
@@ -1385,18 +1386,6 @@ impl NativeOwnerSignalFixture {
             (address as *mut PollFd).write_unaligned(pollfd);
         }
         let mut physical = self.physical();
-        for at in [address, address + 4] {
-            physical
-                .tid_words
-                .insert((self.address.mm.raw().get(), at), 0);
-        }
-        let take_output =
-            |physical: &mut Physical<'_, carrick_sched_core::Aarch64ParkedContext>| {
-                core::mem::take(&mut physical.tid_writes)
-                    .into_iter()
-                    .map(|(_, at, value)| (UserVa::new(at), value.to_ne_bytes().to_vec()))
-                    .collect::<Vec<_>>()
-            };
         let handle = physical.service_mm_handle(&self.address).unwrap();
         let space = self
             .zone
@@ -1418,7 +1407,7 @@ impl NativeOwnerSignalFixture {
         let slot = SlotId::new(0);
         let access = crate::sched::object_wait::space_access(self.zone, slot);
         physical.on_copy_complete = Some(Box::new(move |at| {
-            if at.raw() == address {
+            if at.raw() == address + 6 {
                 access.raise(space.index());
             }
         }));
@@ -1431,7 +1420,7 @@ impl NativeOwnerSignalFixture {
             )
         };
         physical.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
-        physical.child_copy_error_at = Some(address + 4);
+        physical.child_copy_error_at = Some(address + 7);
         take_signal_copies();
         let source = BornInZoneSource {
             zone: self.zone,
@@ -1486,8 +1475,11 @@ impl NativeOwnerSignalFixture {
             );
         }
         assert_eq!(
-            take_output(&mut physical),
-            [(UserVa::new(address), 0i32.to_ne_bytes().to_vec())]
+            take_signal_copies(),
+            [(
+                UserVa::new(address + 6),
+                vec![LINUX_POLLIN.to_ne_bytes()[0]]
+            )]
         );
         let record = self.root_control.zone_record().unwrap();
         // Change readiness after completion. Output must not be re-polled.
@@ -1528,12 +1520,12 @@ impl NativeOwnerSignalFixture {
             matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), NativeResume::Returned(result) if result.raw() == 1)
         );
         drop(entry);
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&LINUX_POLLIN.to_ne_bytes());
-        tail.extend_from_slice(&LINUX_POLLIN.to_ne_bytes());
         assert_eq!(
-            take_output(&mut physical),
-            [(UserVa::new(address + 4), tail)]
+            take_signal_copies(),
+            [(
+                UserVa::new(address + 7),
+                vec![LINUX_POLLIN.to_ne_bytes()[1]]
+            )]
         );
     }
 
