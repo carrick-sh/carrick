@@ -59,3 +59,26 @@ for it. These are custody/venue proofs, not substitutes for live
 vfork/thread/exec population tests. Signed native Go, full lifecycle
 population witnesses, Docker differential and runtime ratios remain required
 for acceptance.
+
+## Round 3 semantic red
+
+The dispatch/copyout fixture is a lower-layer control, not prepare/adopt
+coverage. With only the READLINKAT routing arm in
+`carrick-personality-linux/src/dispatch.rs::route_shared` temporarily
+removed, the repaired control reaches the real fork/exec successor syscall:
+
+```text
+CARGO_BUILD_JOBS=3 cargo test -p carrick-el1-linux --lib serial_host_native_fork_exec_child_readlink_exe -- --nocapture --test-threads=1
+exit 101
+assertion left == right failed: native child readlinkat(/proc/self/exe):
+expected executable bytes; negative result is Linux errno
+left: -38
+right: 16
+```
+
+The control now returns the production refusal's result to the semantic
+assertion instead of failing on its route first. Its SVC syndrome and
+scheduler activation are the corrected head fixture, and it reaches errno
+**38**, not Declined or a non-runnable record. Restore the routing arm after
+this mutation; no production mutation is committed. Durable worker log:
+`/var/lib/carrick-conductor/evidence/1862-r3/semantic-red.log`.

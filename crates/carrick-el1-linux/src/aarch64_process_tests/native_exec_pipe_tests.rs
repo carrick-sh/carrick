@@ -47,7 +47,8 @@ fn serial_host_native_fork_exec_child_timed_futex() {
     );
 }
 
-/// The exec successor resolves its live MM's executable through native service.
+/// Dispatch/copyout control: the physical adapter supplies executable custody.
+/// Production prepare/adopt and population coverage lives in native_exe_lifecycle.
 #[test]
 fn serial_host_native_fork_exec_child_readlink_exe() {
     fork_exec_probe_with_departure(None, u32::MAX as u64, false, None, None, true);
@@ -55,12 +56,12 @@ fn serial_host_native_fork_exec_child_readlink_exe() {
 
 #[test]
 fn serial_host_native_readlink_copyout_busy_once_then_success() {
-    fork_exec_probe_copy(None, u32::MAX as u64, None, true, Some(NativeProcessError::Busy));
+    fork_exec_probe_copy(None, u32::MAX as u64, false, None, None, true, Some(NativeProcessError::Busy));
 }
 
 #[test]
 fn serial_host_native_readlink_copyout_fault_returns_errno_14() {
-    fork_exec_probe_copy(None, u32::MAX as u64, None, true, Some(NativeProcessError::Fault));
+    fork_exec_probe_copy(None, u32::MAX as u64, false, None, None, true, Some(NativeProcessError::Fault));
 }
 
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
@@ -144,13 +145,15 @@ fn fork_exec_probe_with_departure(
     departure: Option<TimerDeparture>,
     readlink: bool,
 ) {
-    fork_exec_probe_copy(futex, bitset, metadata, readlink, None);
+    fork_exec_probe_copy(futex, bitset, timed, metadata, departure, readlink, None);
 }
 
 fn fork_exec_probe_copy(
     futex: Option<u64>,
     bitset: u64,
+    timed: bool,
     metadata: Option<super::pipe_metadata_tests::Case>,
+    departure: Option<TimerDeparture>,
     readlink: bool,
     copy_error: Option<NativeProcessError>,
 ) {
@@ -740,6 +743,10 @@ fn fork_exec_probe_copy(
             );
             assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
             assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 1);
+            if readlink {
+                return frame.x[0];
+            }
+        }
         drop(entry);
         if metadata.is_some() {
             assert_eq!(
@@ -789,7 +796,8 @@ fn fork_exec_probe_copy(
                 -14
             } else {
                 16
-            }
+            },
+            "native child readlinkat(/proc/self/exe): expected executable bytes; negative result is Linux errno"
         );
         assert_eq!(
             crate::native_process_runtime::host_test_support::take_signal_copies(),
