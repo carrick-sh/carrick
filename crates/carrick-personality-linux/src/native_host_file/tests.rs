@@ -60,9 +60,11 @@ fn caller(fd: i32) -> Option<NativeDescriptor> {
     Some(match fd {
         0 => NativeDescriptor::InZone(InZoneKind::Pipe),
         1 => NativeDescriptor::HostBacked {
+            pin: None,
             access: DescriptionAccess::ReadWrite,
         },
         3 => NativeDescriptor::HostBacked {
+            pin: None,
             access: DescriptionAccess::ReadOnly,
         },
         4 => NativeDescriptor::InZone(InZoneKind::EventFd),
@@ -195,10 +197,7 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
     let stat = |fields: &carrick_syscall_abi::LinuxStatFields| -> Box<[u8]> {
         zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStat::from_fields(fields)).into()
     };
-    let output = HostFileOutput {
-        address: BASE,
-        len: LINUX_STAT_BYTES,
-    };
+    let output = HostFileOutput::scalar(BASE, LINUX_STAT_BYTES);
     let pipe = run(
         HostFileCall::Fstat {
             fd: 0,
@@ -209,7 +208,7 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
     assert_eq!(
         pipe,
         Some(HostFileStage::InRingReply {
-            output,
+            output: output.clone(),
             bytes: stat(&carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE),
         })
     );
@@ -250,10 +249,7 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
             &mut empty
         ),
         Some(HostFileStage::InRingReply {
-            output: HostFileOutput {
-                address: BASE + 0x100,
-                len: LINUX_STATX_BYTES,
-            },
+            output: HostFileOutput::scalar(BASE + 0x100, LINUX_STATX_BYTES),
             bytes: zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStatx::from_fields(
                 &carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE
             ))
@@ -406,10 +402,7 @@ fn empty_path_stat_names_the_descriptor() {
     assert!(!resolves_path);
     assert_eq!(
         output,
-        Some(HostFileOutput {
-            address: BASE + 0x100,
-            len: LINUX_STAT_BYTES
-        })
+        Some(HostFileOutput::scalar(BASE + 0x100, LINUX_STAT_BYTES))
     );
     let view = HostFileRequestView::parse(&mut record).unwrap();
     assert_eq!(view.header().op, HostFileOp::Fstat);
@@ -653,7 +646,7 @@ fn unserved_epoll_reads_do_not_prepare_output() {
 #[test]
 fn write_records_carry_the_writers_file_size_limit() {
     let staged = |op: HostFileOp, args: [u64; 4]| {
-        let mut record = vec![0u8; record_len(3, 0).unwrap()];
+            let mut record = vec![0u8; record_len(3, 0).unwrap()];
         host_file::encode(
             &mut record,
             HostFileHeader {
@@ -662,6 +655,7 @@ fn write_records_carry_the_writers_file_size_limit() {
                 fd: 4,
                 flags: 0,
                 args,
+                pin: None,
             },
             b"abc",
             0,
@@ -849,10 +843,10 @@ fn ppoll_over_host_stdio_stages_one_readiness_snapshot() {
     assert!(!resolves_path);
     assert_eq!(
         output,
-        Some(HostFileOutput {
-            address: BASE,
-            len: entries.len() * host_file::POLLFD_BYTES,
-        })
+        Some(HostFileOutput::scalar(
+            BASE,
+            entries.len() * host_file::POLLFD_BYTES,
+        ))
     );
     let view = HostFileRequestView::parse(&mut record).unwrap();
     assert_eq!(view.header().op, HostFileOp::Poll);
@@ -1052,6 +1046,204 @@ fn file_staging_not_yet_input_builds_no_request_before_supply() {
         );
         assert_eq!(user.refused, 1);
     }
+}
+
+#[test]
+fn retained_staging_keeps_pin_and_partial_progress_across_rw_rwv_faults() {
+    use carrick_core::user_copy::GuestCopyRequest;
+    use carrick_core_abi::OfdPinIdentity;
+    use carrick_guest_arch::{GuestLen, UserVa};
+    use core::num::NonZeroU64;
+
+    let pin = OfdPinIdentity {
+        authority: NonZeroU64::new(11).unwrap(),
+        index: 3,
+        generation: 7,
+    };
+
+    struct TwoPageLazy {
+        bytes: Vec<u8>,
+        second_page_resident: bool,
+        first_page_reads: usize,
+        writable_checks_page0: usize,
+    }
+    impl carrick_core::user_copy::UserCopy for TwoPageLazy {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+            let src = src.raw();
+            let Some(off) = src.checked_sub(BASE) else {
+                return CopyOutcome::Fault;
+            };
+            let off = off as usize;
+            if off < 4096 {
+                self.first_page_reads += 1;
+            }
+            if off + dst.len() > 4096 && !self.second_page_resident {
+                let fault_va = BASE + 4096;
+                return CopyOutcome::NotYet(GuestCopyRequest {
+                    address: UserVa::new(fault_va),
+                    len: GuestLen::new((off + dst.len() - 4096) as u64),
+                    access: Access::Read,
+                });
+            }
+            dst.copy_from_slice(&self.bytes[off..off + dst.len()]);
+            CopyOutcome::Done
+        }
+        fn copy_out(&mut self, _: UserVa, _: &[u8]) -> CopyOutcome {
+            panic!("staging does not copy output bytes")
+        }
+    }
+    impl HostFileUser for TwoPageLazy {
+        fn writable(&mut self, dst: u64, len: usize) -> usize {
+            let off = (dst - BASE) as usize;
+            if off < 4096 {
+                self.writable_checks_page0 += 1;
+            }
+            let limit = if self.second_page_resident { 8192 } else { 4096 };
+            limit.saturating_sub(off).min(len)
+        }
+    }
+
+    // 1. write across a page boundary retains pin and prefix bytes without re-resolving fd or re-reading page 0.
+    let mut mem = vec![0u8; 8192];
+    mem[4093..4099].copy_from_slice(b"abcdef");
+    let mut user = TwoPageLazy {
+        bytes: mem,
+        second_page_resident: false,
+        first_page_reads: 0,
+        writable_checks_page0: 0,
+    };
+    let mut resolves = 0usize;
+    let mut retained = None;
+    let write_call = HostFileCall::Write {
+        fd: 1,
+        buf: BASE + 4093,
+        count: 6,
+    };
+    {
+        let mut resolve = |fd: i32| {
+            resolves += 1;
+            assert_eq!(fd, 1);
+            Some(NativeDescriptor::HostBacked {
+                pin: Some(pin),
+                access: DescriptionAccess::ReadWrite,
+            })
+        };
+        let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+        let mut ns = NativeNamespace {
+            table: TABLE,
+            resolve: &mut resolve,
+            releases: &mut releases,
+        };
+        assert_eq!(
+            stage_with_retained(write_call, &mut ns, &mut user, &mut retained),
+            Some(HostFileStage::Fault {
+                address: BASE + 4096,
+                access: Access::Read,
+            })
+        );
+    }
+    assert_eq!(resolves, 1);
+    assert_eq!(user.first_page_reads, 1);
+    assert_eq!(retained.as_ref().unwrap().pin, Some(pin));
+    assert_eq!(retained.as_ref().unwrap().input, b"abc");
+
+    // Mutate page 0 in memory and make fd resolution return Absent; retry must use retained pin and prefix.
+    user.bytes[4093..4096].copy_from_slice(b"ZZZ");
+    user.second_page_resident = true;
+    let staged = {
+        let mut resolve = |_: i32| {
+            resolves += 1;
+            Some(NativeDescriptor::Absent)
+        };
+        let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+        let mut ns = NativeNamespace {
+            table: TABLE,
+            resolve: &mut resolve,
+            releases: &mut releases,
+        };
+        stage_with_retained(write_call, &mut ns, &mut user, &mut retained)
+    };
+    assert_eq!(resolves, 1, "retry must not re-resolve fd");
+    assert_eq!(user.first_page_reads, 1, "retry must not re-read page 0");
+    assert!(retained.is_none());
+    let (mut record, _, _) = request(staged);
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().pin, Some(pin));
+    assert_eq!(view.input(), b"abcdef");
+
+    // 2. readv across two segments retains pin, iovec table, and page-0 writability progress.
+    let mut mem = vec![0u8; 8192];
+    mem[0..8].copy_from_slice(&(BASE + 64).to_le_bytes());
+    mem[8..16].copy_from_slice(&2u64.to_le_bytes());
+    mem[16..24].copy_from_slice(&(BASE + 4096).to_le_bytes());
+    mem[24..32].copy_from_slice(&4u64.to_le_bytes());
+    let mut user = TwoPageLazy {
+        bytes: mem,
+        second_page_resident: false,
+        first_page_reads: 0,
+        writable_checks_page0: 0,
+    };
+    let readv_call = HostFileCall::Readv {
+        fd: 3,
+        iov: BASE,
+        iovcnt: 2,
+    };
+    let mut resolves = 0usize;
+    {
+        let mut resolve = |_: i32| {
+            resolves += 1;
+            Some(NativeDescriptor::HostBacked {
+                pin: Some(pin),
+                access: DescriptionAccess::ReadOnly,
+            })
+        };
+        let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+        let mut ns = NativeNamespace {
+            table: TABLE,
+            resolve: &mut resolve,
+            releases: &mut releases,
+        };
+        assert_eq!(
+            stage_with_retained(readv_call, &mut ns, &mut user, &mut retained),
+            Some(HostFileStage::Fault {
+                address: BASE + 4096,
+                access: Access::Write,
+            })
+        );
+    }
+    assert_eq!(resolves, 1);
+    assert_eq!(user.first_page_reads, 1, "iovec read once");
+    assert_eq!(user.writable_checks_page0, 1);
+    assert_eq!(retained.as_ref().unwrap().prepared, 2);
+
+    user.second_page_resident = true;
+    let staged = {
+        let mut resolve = |_: i32| {
+            resolves += 1;
+            Some(NativeDescriptor::Absent)
+        };
+        let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+        let mut ns = NativeNamespace {
+            table: TABLE,
+            resolve: &mut resolve,
+            releases: &mut releases,
+        };
+        stage_with_retained(readv_call, &mut ns, &mut user, &mut retained)
+    };
+    assert_eq!(resolves, 1, "readv retry must not re-resolve fd");
+    assert_eq!(user.first_page_reads, 1, "readv retry must not re-read iov");
+    assert_eq!(user.writable_checks_page0, 1, "readv retry must skip prepared segment 0");
+    let (mut record, output, _) = request(staged);
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Read);
+    assert_eq!(view.header().pin, Some(pin));
+    assert_eq!(
+        output,
+        Some(HostFileOutput::vectored(
+            vec![(BASE + 64, 2), (BASE + 4096, 4)],
+            6,
+        ))
+    );
 }
 
 /// Outcome classification at the production staging entry. This does not

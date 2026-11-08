@@ -70,7 +70,10 @@ pub enum NativeDescriptor {
     /// An in-zone object; the ring owns every operation on it.
     InZone(InZoneKind),
     /// A host-backed open description.
-    HostBacked { access: DescriptionAccess },
+    HostBacked {
+        pin: Option<carrick_core_abi::OfdPinIdentity>,
+        access: DescriptionAccess,
+    },
     /// No open descriptor with this number.
     Absent,
 }
@@ -134,6 +137,11 @@ pub enum HostFileCall {
         fd: i32,
         buf: u64,
         count: u64,
+    },
+    Readv {
+        fd: i32,
+        iov: u64,
+        iovcnt: u64,
     },
     Pread {
         fd: i32,
@@ -265,6 +273,11 @@ impl HostFileCall {
                 buf: args[1],
                 count: args[2],
             },
+            c if c == nr::READV => Self::Readv {
+                fd,
+                iov: args[1],
+                iovcnt: args[2],
+            },
             c if c == nr::PREAD64 => Self::Pread {
                 fd,
                 buf: args[1],
@@ -313,10 +326,46 @@ pub trait HostFileUser: UserCopy {
 }
 
 /// User output the ring copies back after the carrier replies.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostFileOutput {
     pub address: u64,
     pub len: usize,
+    /// Scatter segments for vectored output (`readv`); empty for scalar output.
+    pub segments: Vec<(u64, usize)>,
+}
+
+impl HostFileOutput {
+    pub const fn scalar(address: u64, len: usize) -> Self {
+        Self {
+            address,
+            len,
+            segments: Vec::new(),
+        }
+    }
+
+    pub fn vectored(segments: Vec<(u64, usize)>, len: usize) -> Self {
+        let address = match segments.first() {
+            Some(&(addr, _)) => addr,
+            None => 0,
+        };
+        Self {
+            address,
+            len,
+            segments,
+        }
+    }
+}
+
+/// Staging progress and descriptor pin retained across an owner-memory wait.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedHostFileStage {
+    pub call: HostFileCall,
+    pub table: [u64; 3],
+    pub pin: Option<carrick_core_abi::OfdPinIdentity>,
+    pub access: DescriptionAccess,
+    pub iov: Option<Vec<(u64, usize)>>,
+    pub input: Vec<u8>,
+    pub prepared: usize,
 }
 
 /// The ring's routing decision for one decoded call.
@@ -428,17 +477,19 @@ struct Staging<'n, 'u> {
 }
 
 impl Staging<'_, '_> {
+    #[allow(clippy::too_many_arguments)]
     fn request(
         &self,
         op: HostFileOp,
         fd: i32,
         flags: u32,
         args: [u64; 4],
+        pin: Option<carrick_core_abi::OfdPinIdentity>,
         input: &[u8],
         output: Option<HostFileOutput>,
     ) -> HostFileStage {
-        let output_cap = output.map_or(0, |output| output.len);
-        self.request_with_reply(op, fd, flags, args, input, output, output_cap)
+        let output_cap = output.as_ref().map_or(0, |output| output.len);
+        self.request_with_reply(op, fd, flags, args, pin, input, output, output_cap)
     }
 
     /// A request whose reply area (`output_cap`) is not copied to the user:
@@ -450,6 +501,7 @@ impl Staging<'_, '_> {
         fd: i32,
         flags: u32,
         args: [u64; 4],
+        pin: Option<carrick_core_abi::OfdPinIdentity>,
         input: &[u8],
         output: Option<HostFileOutput>,
         output_cap: usize,
@@ -464,6 +516,7 @@ impl Staging<'_, '_> {
             fd,
             flags,
             args,
+            pin,
         };
         if host_file::encode(&mut record, header, input, output_cap).is_err() {
             return errno(carrick_syscall_abi::LINUX_EINVAL);
@@ -521,29 +574,9 @@ impl Staging<'_, '_> {
         Some(match self.descriptor(fd)? {
             NativeDescriptor::InZone(kind) => in_zone_stat(op, kind, output),
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
-            NativeDescriptor::HostBacked { .. } => {
-                self.request(op, fd, flags, args, &[], Some(output))
+            NativeDescriptor::HostBacked { pin, .. } => {
+                self.request(op, fd, flags, args, pin, &[], Some(output))
             }
-        })
-    }
-
-    fn write(
-        &mut self,
-        fd: i32,
-        user: &mut dyn HostFileUser,
-        gather: impl FnOnce(&mut dyn HostFileUser) -> Result<Vec<u8>, HostFileStage>,
-    ) -> Option<HostFileStage> {
-        Some(match self.descriptor(fd)? {
-            NativeDescriptor::InZone(_) => HostFileStage::InRing,
-            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
-            NativeDescriptor::HostBacked { access } if !access.writable() => {
-                errno(carrick_syscall_abi::LINUX_EBADF)
-            }
-            NativeDescriptor::HostBacked { .. } => match gather(user) {
-                Ok(input) if input.is_empty() => HostFileStage::Returned(SyscallResult::new(0)),
-                Ok(input) => self.request(HostFileOp::Write, fd, 0, [0; 4], &input, None),
-                Err(stage) => stage,
-            },
         })
     }
 }
@@ -552,12 +585,14 @@ fn chunk(count: u64) -> usize {
     (count as usize).min(HOST_FILE_CHUNK_BYTES)
 }
 
-/// Gather `writev` vectors into one bounded chunk, in order.
-fn gather_vectors(
+/// Copy and validate an `iovec` table, capping total segment length to one
+/// [`HOST_FILE_CHUNK_BYTES`] transfer.
+#[allow(clippy::type_complexity)]
+fn copy_iovec_segments(
     user: &mut dyn HostFileUser,
     iov: u64,
     iovcnt: u64,
-) -> Result<Vec<u8>, HostFileStage> {
+) -> Result<Vec<(u64, usize)>, HostFileStage> {
     if iovcnt > LINUX_UIO_MAXIOV {
         return Err(errno(carrick_syscall_abi::LINUX_EINVAL));
     }
@@ -576,7 +611,7 @@ fn gather_vectors(
     }
     // Linux rejects a negative total before any transfer.
     let mut total: u64 = 0;
-    let mut segments = Vec::with_capacity(iovcnt as usize);
+    let mut raw_segments = Vec::with_capacity(iovcnt as usize);
     for vector in vectors.chunks_exact(IOVEC_BYTES) {
         let base = u64::from_le_bytes(vector[0..8].try_into().unwrap_or([0; 8]));
         let len = u64::from_le_bytes(vector[8..16].try_into().unwrap_or([0; 8]));
@@ -584,29 +619,21 @@ fn gather_vectors(
             Some(total) if total <= i64::MAX as u64 => total,
             _ => return Err(errno(carrick_syscall_abi::LINUX_EINVAL)),
         };
-        segments.push((base, len));
+        raw_segments.push((base, len));
     }
-    let mut input = Vec::with_capacity(chunk(total));
-    for (base, len) in segments {
-        let room = HOST_FILE_CHUNK_BYTES - input.len();
+    let mut segments = Vec::with_capacity(raw_segments.len());
+    let mut room = HOST_FILE_CHUNK_BYTES;
+    for (base, len) in raw_segments {
         if room == 0 {
             break;
         }
         let take = (len as usize).min(room);
-        let start = input.len();
-        input.resize(start + take, 0);
-        match user.copy_in(&mut input[start..], UserVa::new(base)) {
-            CopyOutcome::Done => {}
-            CopyOutcome::Fault => return Err(errno(carrick_syscall_abi::LINUX_EFAULT)),
-            CopyOutcome::NotYet(request) => {
-                return Err(HostFileStage::Fault {
-                    address: request.address.raw(),
-                    access: request.access,
-                });
-            }
+        if take > 0 {
+            segments.push((base, take));
+            room -= take;
         }
     }
-    Ok(input)
+    Ok(segments)
 }
 
 /// Route and stage one decoded call. `None` keeps the call on its existing
@@ -617,12 +644,28 @@ pub fn stage(
     namespace: &mut NativeNamespace<'_>,
     user: &mut dyn HostFileUser,
 ) -> Option<HostFileStage> {
-    let staged = stage_call(call, namespace, user)?;
-    if let HostFileStage::Request {
-        output: Some(output),
-        ..
-    }
-    | HostFileStage::InRingReply { output, .. } = &staged
+    let mut retained = None;
+    stage_with_retained(call, namespace, user, &mut retained)
+}
+
+/// Route and stage one decoded call, retaining any descriptor pin and
+/// partial copy-in or writability progress across an owner-memory wait.
+pub fn stage_with_retained(
+    call: HostFileCall,
+    namespace: &mut NativeNamespace<'_>,
+    user: &mut dyn HostFileUser,
+    retained: &mut Option<RetainedHostFileStage>,
+) -> Option<HostFileStage> {
+    let prior = retained
+        .take()
+        .filter(|prior| prior.call == call && prior.table == namespace.table);
+    let staged = stage_call(call, namespace, user, prior, retained)?;
+    if !matches!(call, HostFileCall::Read { .. } | HostFileCall::Readv { .. })
+        && let HostFileStage::Request {
+            output: Some(output),
+            ..
+        }
+        | HostFileStage::InRingReply { output, .. } = &staged
     {
         let writable = user.writable(output.address, output.len);
         if writable < output.len {
@@ -639,39 +682,157 @@ fn stage_call(
     call: HostFileCall,
     namespace: &mut NativeNamespace<'_>,
     user: &mut dyn HostFileUser,
+    prior: Option<RetainedHostFileStage>,
+    retained: &mut Option<RetainedHostFileStage>,
 ) -> Option<HostFileStage> {
     let mut staging = Staging { namespace };
     Some(match call {
         HostFileCall::Write { fd, buf, count } => {
-            return staging.write(fd, user, |user| {
-                let mut input = vec![0u8; chunk(count)];
-                if !input.is_empty() {
-                    match user.copy_in(&mut input, UserVa::new(buf)) {
-                        CopyOutcome::Done => {}
-                        CopyOutcome::Fault => return Err(errno(carrick_syscall_abi::LINUX_EFAULT)),
+            let (pin, access, mut input) = if let Some(prior) = prior {
+                (prior.pin, prior.access, prior.input)
+            } else {
+                match staging.descriptor(fd)? {
+                    NativeDescriptor::InZone(_) => return Some(HostFileStage::InRing),
+                    NativeDescriptor::Absent => {
+                        return Some(errno(carrick_syscall_abi::LINUX_EBADF));
+                    }
+                    NativeDescriptor::HostBacked { access, .. } if !access.writable() => {
+                        return Some(errno(carrick_syscall_abi::LINUX_EBADF));
+                    }
+                    NativeDescriptor::HostBacked { pin, access } => {
+                        (pin, access, Vec::with_capacity(chunk(count)))
+                    }
+                }
+            };
+            let target = chunk(count);
+            if target == 0 {
+                return Some(HostFileStage::Returned(SyscallResult::new(0)));
+            }
+            while input.len() < target {
+                let done = input.len();
+                let Some(addr) = buf.checked_add(done as u64) else {
+                    return Some(errno(carrick_syscall_abi::LINUX_EFAULT));
+                };
+                let step = (target - done).min((PAGE_BYTES - (addr % PAGE_BYTES)) as usize);
+                let mut temp = vec![0u8; step];
+                match user.copy_in(&mut temp, UserVa::new(addr)) {
+                    CopyOutcome::Done => input.extend_from_slice(&temp),
+                    CopyOutcome::Fault => return Some(errno(carrick_syscall_abi::LINUX_EFAULT)),
+                    CopyOutcome::NotYet(request) => {
+                        if let Some(prefix) = request.address.raw().checked_sub(addr) {
+                            let prefix = (prefix as usize).min(temp.len());
+                            input.extend_from_slice(&temp[..prefix]);
+                        }
+                        *retained = Some(RetainedHostFileStage {
+                            call,
+                            table: staging.namespace.table,
+                            pin,
+                            access,
+                            iov: None,
+                            input,
+                            prepared: 0,
+                        });
+                        return Some(HostFileStage::Fault {
+                            address: request.address.raw(),
+                            access: request.access,
+                        });
+                    }
+                }
+            }
+            staging.request(HostFileOp::Write, fd, 0, [0; 4], pin, &input, None)
+        }
+        HostFileCall::Writev { fd, iov, iovcnt } => {
+            let (pin, access, prior_iov, mut input) = if let Some(prior) = prior {
+                (prior.pin, prior.access, prior.iov, prior.input)
+            } else {
+                match staging.descriptor(fd)? {
+                    NativeDescriptor::InZone(_) => return Some(HostFileStage::InRing),
+                    NativeDescriptor::Absent => {
+                        return Some(errno(carrick_syscall_abi::LINUX_EBADF));
+                    }
+                    NativeDescriptor::HostBacked { access, .. } if !access.writable() => {
+                        return Some(errno(carrick_syscall_abi::LINUX_EBADF));
+                    }
+                    NativeDescriptor::HostBacked { pin, access } => (pin, access, None, Vec::new()),
+                }
+            };
+            let segments = if let Some(segments) = prior_iov {
+                segments
+            } else {
+                match copy_iovec_segments(user, iov, iovcnt) {
+                    Ok(segments) => segments,
+                    Err(stage @ HostFileStage::Fault { .. }) => {
+                        *retained = Some(RetainedHostFileStage {
+                            call,
+                            table: staging.namespace.table,
+                            pin,
+                            access,
+                            iov: None,
+                            input: Vec::new(),
+                            prepared: 0,
+                        });
+                        return Some(stage);
+                    }
+                    Err(stage) => return Some(stage),
+                }
+            };
+            let target: usize = segments.iter().map(|&(_, len)| len).sum();
+            if target == 0 {
+                return Some(HostFileStage::Returned(SyscallResult::new(0)));
+            }
+            input.reserve(target.saturating_sub(input.len()));
+            let mut skipped = 0usize;
+            for &(seg_base, seg_len) in &segments {
+                if input.len() >= skipped + seg_len {
+                    skipped += seg_len;
+                    continue;
+                }
+                let mut seg_off = input.len() - skipped;
+                while seg_off < seg_len {
+                    let Some(addr) = seg_base.checked_add(seg_off as u64) else {
+                        return Some(errno(carrick_syscall_abi::LINUX_EFAULT));
+                    };
+                    let step = (seg_len - seg_off).min((PAGE_BYTES - (addr % PAGE_BYTES)) as usize);
+                    let mut temp = vec![0u8; step];
+                    match user.copy_in(&mut temp, UserVa::new(addr)) {
+                        CopyOutcome::Done => {
+                            input.extend_from_slice(&temp);
+                            seg_off += step;
+                        }
+                        CopyOutcome::Fault => {
+                            return Some(errno(carrick_syscall_abi::LINUX_EFAULT));
+                        }
                         CopyOutcome::NotYet(request) => {
-                            return Err(HostFileStage::Fault {
+                            if let Some(prefix) = request.address.raw().checked_sub(addr) {
+                                let prefix = (prefix as usize).min(temp.len());
+                                input.extend_from_slice(&temp[..prefix]);
+                            }
+                            *retained = Some(RetainedHostFileStage {
+                                call,
+                                table: staging.namespace.table,
+                                pin,
+                                access,
+                                iov: Some(segments),
+                                input,
+                                prepared: 0,
+                            });
+                            return Some(HostFileStage::Fault {
                                 address: request.address.raw(),
                                 access: request.access,
                             });
                         }
                     }
                 }
-                Ok(input)
-            });
-        }
-        HostFileCall::Writev { fd, iov, iovcnt } => {
-            return staging.write(fd, user, |user| gather_vectors(user, iov, iovcnt));
+                skipped += seg_len;
+            }
+            staging.request(HostFileOp::Write, fd, 0, [0; 4], pin, &input, None)
         }
         HostFileCall::Fstat { fd, statbuf } => staging.descriptor_stat(
             HostFileOp::Fstat,
             fd,
             0,
             [0; 4],
-            HostFileOutput {
-                address: statbuf,
-                len: LINUX_STAT_BYTES,
-            },
+            HostFileOutput::scalar(statbuf, LINUX_STAT_BYTES),
         )?,
         HostFileCall::Openat {
             dirfd,
@@ -694,6 +855,7 @@ fn stage_call(
                 LINUX_AT_FDCWD,
                 0,
                 [flags, mode, 0, 0],
+                None,
                 &path,
                 None,
             )
@@ -725,6 +887,7 @@ fn stage_call(
                 LINUX_AT_FDCWD,
                 flags as u32,
                 [mode, 0, 0, 0],
+                None,
                 &path,
                 None,
             )
@@ -739,10 +902,7 @@ fn stage_call(
                 Path::Bytes(path) => path,
                 Path::Stage(stage) => return Some(stage),
             };
-            let output = HostFileOutput {
-                address: statbuf,
-                len: LINUX_STAT_BYTES,
-            };
+            let output = HostFileOutput::scalar(statbuf, LINUX_STAT_BYTES);
             if path.is_empty() {
                 if flags as u32 & LINUX_AT_EMPTY_PATH == 0 {
                     return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
@@ -760,6 +920,7 @@ fn stage_call(
                 LINUX_AT_FDCWD,
                 flags as u32,
                 [0; 4],
+                None,
                 path,
                 Some(output),
             )
@@ -775,10 +936,7 @@ fn stage_call(
                 Path::Bytes(path) => path,
                 Path::Stage(stage) => return Some(stage),
             };
-            let output = HostFileOutput {
-                address: buf,
-                len: LINUX_STATX_BYTES,
-            };
+            let output = HostFileOutput::scalar(buf, LINUX_STATX_BYTES);
             if path.is_empty() {
                 if flags as u32 & LINUX_AT_EMPTY_PATH == 0 {
                     return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
@@ -802,40 +960,153 @@ fn stage_call(
                 LINUX_AT_FDCWD,
                 flags as u32,
                 [mask, 0, 0, 0],
+                None,
                 path,
                 Some(output),
             )
         }
-        HostFileCall::Read { fd, buf, count } => match staging.descriptor(fd)? {
-            NativeDescriptor::InZone(InZoneKind::Pipe | InZoneKind::EventFd) => {
-                let len = chunk(count);
-                let writable = user.writable(buf, len);
-                if writable < len {
-                    HostFileStage::Fault {
-                        address: buf.saturating_add(writable as u64),
-                        access: Access::Write,
+        HostFileCall::Read { fd, buf, count } => {
+            let (pin, access, prepared) = if let Some(prior) = prior {
+                (prior.pin, prior.access, prior.prepared)
+            } else {
+                match staging.descriptor(fd)? {
+                    NativeDescriptor::InZone(InZoneKind::Pipe | InZoneKind::EventFd) => {
+                        let len = chunk(count);
+                        let writable = user.writable(buf, len);
+                        return Some(if writable < len {
+                            HostFileStage::Fault {
+                                address: buf.saturating_add(writable as u64),
+                                access: Access::Write,
+                            }
+                        } else {
+                            HostFileStage::InRing
+                        });
                     }
-                } else {
-                    HostFileStage::InRing
+                    NativeDescriptor::InZone(InZoneKind::Epoll) => {
+                        return Some(HostFileStage::InRing);
+                    }
+                    NativeDescriptor::Absent => {
+                        return Some(errno(carrick_syscall_abi::LINUX_EBADF));
+                    }
+                    NativeDescriptor::HostBacked { access, .. } if !access.readable() => {
+                        return Some(errno(carrick_syscall_abi::LINUX_EBADF));
+                    }
+                    NativeDescriptor::HostBacked { pin, access } => (pin, access, 0),
+                }
+            };
+            let len = chunk(count);
+            let rem = len.saturating_sub(prepared);
+            if rem > 0 {
+                let Some(addr) = buf.checked_add(prepared as u64) else {
+                    return Some(errno(carrick_syscall_abi::LINUX_EFAULT));
+                };
+                let writable = user.writable(addr, rem);
+                if writable < rem {
+                    *retained = Some(RetainedHostFileStage {
+                        call,
+                        table: staging.namespace.table,
+                        pin,
+                        access,
+                        iov: None,
+                        input: Vec::new(),
+                        prepared: prepared + writable,
+                    });
+                    return Some(HostFileStage::Fault {
+                        address: addr.saturating_add(writable as u64),
+                        access: Access::Write,
+                    });
                 }
             }
-            NativeDescriptor::InZone(InZoneKind::Epoll) => HostFileStage::InRing,
-            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
-            NativeDescriptor::HostBacked { access } if !access.readable() => {
-                errno(carrick_syscall_abi::LINUX_EBADF)
-            }
-            NativeDescriptor::HostBacked { .. } => staging.request(
+            staging.request(
                 HostFileOp::Read,
                 fd,
                 0,
                 [0; 4],
+                pin,
                 &[],
-                Some(HostFileOutput {
-                    address: buf,
-                    len: chunk(count),
-                }),
-            ),
-        },
+                Some(HostFileOutput::scalar(buf, len)),
+            )
+        }
+        HostFileCall::Readv { fd, iov, iovcnt } => {
+            let (pin, access, prior_iov, prepared) = if let Some(prior) = prior {
+                (prior.pin, prior.access, prior.iov, prior.prepared)
+            } else {
+                match staging.descriptor(fd)? {
+                    NativeDescriptor::InZone(_) => return Some(HostFileStage::InRing),
+                    NativeDescriptor::Absent => {
+                        return Some(errno(carrick_syscall_abi::LINUX_EBADF));
+                    }
+                    NativeDescriptor::HostBacked { access, .. } if !access.readable() => {
+                        return Some(errno(carrick_syscall_abi::LINUX_EBADF));
+                    }
+                    NativeDescriptor::HostBacked { pin, access } => (pin, access, None, 0),
+                }
+            };
+            let segments = if let Some(segments) = prior_iov {
+                segments
+            } else {
+                match copy_iovec_segments(user, iov, iovcnt) {
+                    Ok(segments) => segments,
+                    Err(stage @ HostFileStage::Fault { .. }) => {
+                        *retained = Some(RetainedHostFileStage {
+                            call,
+                            table: staging.namespace.table,
+                            pin,
+                            access,
+                            iov: None,
+                            input: Vec::new(),
+                            prepared: 0,
+                        });
+                        return Some(stage);
+                    }
+                    Err(stage) => return Some(stage),
+                }
+            };
+            let total_len: usize = segments.iter().map(|&(_, len)| len).sum();
+            if total_len == 0 {
+                return Some(HostFileStage::Returned(SyscallResult::new(0)));
+            }
+            let mut skipped = 0usize;
+            let mut cursor = prepared;
+            for &(seg_base, seg_len) in &segments {
+                if cursor >= skipped + seg_len {
+                    skipped += seg_len;
+                    continue;
+                }
+                let seg_off = cursor - skipped;
+                let rem = seg_len - seg_off;
+                let Some(addr) = seg_base.checked_add(seg_off as u64) else {
+                    return Some(errno(carrick_syscall_abi::LINUX_EFAULT));
+                };
+                let writable = user.writable(addr, rem);
+                if writable < rem {
+                    *retained = Some(RetainedHostFileStage {
+                        call,
+                        table: staging.namespace.table,
+                        pin,
+                        access,
+                        iov: Some(segments),
+                        input: Vec::new(),
+                        prepared: cursor + writable,
+                    });
+                    return Some(HostFileStage::Fault {
+                        address: addr.saturating_add(writable as u64),
+                        access: Access::Write,
+                    });
+                }
+                skipped += seg_len;
+                cursor = skipped;
+            }
+            staging.request(
+                HostFileOp::Read,
+                fd,
+                0,
+                [0; 4],
+                pin,
+                &[],
+                Some(HostFileOutput::vectored(segments, total_len)),
+            )
+        }
         HostFileCall::Pread {
             fd,
             buf,
@@ -845,45 +1116,41 @@ fn stage_call(
             NativeDescriptor::InZone(InZoneKind::Pipe) => errno(carrick_syscall_abi::LINUX_ESPIPE),
             NativeDescriptor::InZone(_) => HostFileStage::InRing,
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
-            NativeDescriptor::HostBacked { access } if !access.readable() => {
+            NativeDescriptor::HostBacked { access, .. } if !access.readable() => {
                 errno(carrick_syscall_abi::LINUX_EBADF)
             }
             NativeDescriptor::HostBacked { .. } if (offset as i64) < 0 => {
                 errno(carrick_syscall_abi::LINUX_EINVAL)
             }
-            NativeDescriptor::HostBacked { .. } => staging.request(
+            NativeDescriptor::HostBacked { pin, .. } => staging.request(
                 HostFileOp::Pread,
                 fd,
                 0,
                 [offset, 0, 0, 0],
+                pin,
                 &[],
-                Some(HostFileOutput {
-                    address: buf,
-                    len: chunk(count),
-                }),
+                Some(HostFileOutput::scalar(buf, chunk(count))),
             ),
         },
         HostFileCall::Lseek { fd, offset, whence } => match staging.descriptor(fd)? {
             NativeDescriptor::InZone(InZoneKind::Pipe) => errno(carrick_syscall_abi::LINUX_ESPIPE),
             NativeDescriptor::InZone(_) => HostFileStage::InRing,
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
-            NativeDescriptor::HostBacked { .. } => {
-                staging.request(HostFileOp::Lseek, fd, 0, [offset, whence, 0, 0], &[], None)
+            NativeDescriptor::HostBacked { pin, .. } => {
+                staging.request(HostFileOp::Lseek, fd, 0, [offset, whence, 0, 0], pin, &[], None)
             }
         },
         HostFileCall::Getdents64 { fd, dirp, count } => match staging.descriptor(fd)? {
             NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENOTDIR),
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
-            NativeDescriptor::HostBacked { .. } => staging.request(
+            NativeDescriptor::HostBacked { pin, .. } => staging.request(
                 HostFileOp::Getdents64,
                 fd,
                 0,
                 [0; 4],
+                pin,
                 &[],
-                Some(HostFileOutput {
-                    address: dirp,
-                    len: chunk(count),
-                }),
+                Some(HostFileOutput::scalar(dirp, chunk(count))),
             ),
         },
         HostFileCall::Ioctl { fd, request } => match staging.descriptor(fd)? {
@@ -900,7 +1167,7 @@ fn stage_call(
             // Linux: a pipe, eventfd or epoll has no mmap operation.
             NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENODEV),
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
-            NativeDescriptor::HostBacked { access } if !access.readable() => {
+            NativeDescriptor::HostBacked { access, .. } if !access.readable() => {
                 errno(carrick_syscall_abi::LINUX_EACCES)
             }
             NativeDescriptor::HostBacked { .. }
@@ -908,13 +1175,14 @@ fn stage_call(
             {
                 errno(carrick_syscall_abi::LINUX_EINVAL)
             }
-            NativeDescriptor::HostBacked { .. } => {
+            NativeDescriptor::HostBacked { pin, .. } => {
                 let releases = staging.releases();
                 let staged = staging.request_with_reply(
                     HostFileOp::MapPrivate,
                     key.fd,
                     0,
                     [key.offset, key.length, 0, 0],
+                    pin,
                     &releases,
                     None,
                     host_file::MapSourceReply::BYTES,
@@ -957,6 +1225,7 @@ fn stage_call(
                 LINUX_AT_FDCWD,
                 0,
                 [0; 4],
+                None,
                 &path,
                 None,
                 CHDIR_REPLY_BYTES,
@@ -1074,8 +1343,9 @@ fn stage_ppoll(
         -1,
         0,
         [wait.raw(), 0, 0, 0],
+        None,
         &entries,
-        Some(HostFileOutput { address: fds, len }),
+        Some(HostFileOutput::scalar(fds, len)),
     ))
 }
 

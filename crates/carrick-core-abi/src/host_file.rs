@@ -202,12 +202,15 @@ pub struct HostFileHeader {
     pub flags: u32,
     /// Operation-specific scalar arguments.
     pub args: [u64; 4],
+    /// Exact open-file-description pin identity retained in the ring before
+    /// user copy or service suspension for direct descriptor operations.
+    pub pin: Option<crate::OfdPinIdentity>,
 }
 
 const MAGIC: u32 = u32::from_le_bytes(*b"CHFR");
-const VERSION: u16 = 1;
-/// Fixed header, including the reply words.
-pub const HOST_FILE_HEADER_BYTES: usize = 96;
+const VERSION: u16 = 2;
+/// Fixed header, including the reply words and retained OFD pin identity.
+pub const HOST_FILE_HEADER_BYTES: usize = 120;
 /// Largest input or output area one record carries. Larger transfers are
 /// split by the ring continuation.
 pub const HOST_FILE_CHUNK_BYTES: usize = 64 * 1024;
@@ -226,6 +229,7 @@ const OUTPUT_CAP: usize = 76;
 const RESULT: usize = 80;
 const OUTPUT_LEN: usize = 88;
 const STATE: usize = 92;
+const PIN: usize = 96;
 
 const REPLY_PENDING: u32 = 0;
 const REPLY_WRITTEN: u32 = 1;
@@ -252,6 +256,25 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
+fn valid_pin_identity(pin: crate::OfdPinIdentity) -> bool {
+    pin.authority != 0 && pin.generation != 0 && u32::try_from(pin.index).is_ok()
+}
+
+fn decode_pin_identity(bytes: &[u8]) -> Option<Option<crate::OfdPinIdentity>> {
+    let authority = read_u64(bytes, PIN)?;
+    let index = read_u64(bytes, PIN + 8)?;
+    let generation = read_u64(bytes, PIN + 16)?;
+    if authority == 0 && index == 0 && generation == 0 {
+        return Some(None);
+    }
+    let pin = crate::OfdPinIdentity {
+        authority,
+        index,
+        generation,
+    };
+    valid_pin_identity(pin).then_some(Some(pin))
+}
+
 /// Total record length for `input_len` staged bytes and `output_cap` reply
 /// bytes, or `None` when either exceeds one chunk.
 pub const fn record_len(input_len: usize, output_cap: usize) -> Option<usize> {
@@ -273,6 +296,9 @@ pub fn encode(
     if bytes.len() != expected {
         return Err(HostFileRecordError::Invalid);
     }
+    if header.pin.is_some_and(|pin| !valid_pin_identity(pin)) {
+        return Err(HostFileRecordError::Invalid);
+    }
     bytes.fill(0);
     bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
@@ -290,6 +316,11 @@ pub fn encode(
     bytes[INPUT_LEN..INPUT_LEN + 4].copy_from_slice(&(input.len() as u32).to_le_bytes());
     bytes[OUTPUT_CAP..OUTPUT_CAP + 4].copy_from_slice(&(output_cap as u32).to_le_bytes());
     bytes[STATE..STATE + 4].copy_from_slice(&REPLY_PENDING.to_le_bytes());
+    if let Some(pin) = header.pin {
+        bytes[PIN..PIN + 8].copy_from_slice(&pin.authority.to_le_bytes());
+        bytes[PIN + 8..PIN + 16].copy_from_slice(&pin.index.to_le_bytes());
+        bytes[PIN + 16..PIN + 24].copy_from_slice(&pin.generation.to_le_bytes());
+    }
     bytes[HOST_FILE_HEADER_BYTES..HOST_FILE_HEADER_BYTES + input.len()].copy_from_slice(input);
     Ok(())
 }
@@ -320,6 +351,7 @@ impl<'a> HostFileRequestView<'a> {
         for (index, arg) in args.iter_mut().enumerate() {
             *arg = read_u64(bytes, ARGS + index * 8).ok_or(invalid)?;
         }
+        let pin = decode_pin_identity(bytes).ok_or(invalid)?;
         let input_len = read_u32(bytes, INPUT_LEN).ok_or(invalid)? as usize;
         let output_cap = read_u32(bytes, OUTPUT_CAP).ok_or(invalid)? as usize;
         if read_u32(bytes, STATE) != Some(REPLY_PENDING)
@@ -335,6 +367,7 @@ impl<'a> HostFileRequestView<'a> {
                 fd,
                 flags,
                 args,
+                pin,
             },
             input_len,
             output_cap,
@@ -390,9 +423,13 @@ pub struct HostFileReply<'a> {
 /// Read the carrier's reply. `None` when no reply was written (refused or
 /// cancelled service) or the record is inconsistent.
 pub fn reply(bytes: &[u8]) -> Option<HostFileReply<'_>> {
-    if read_u32(bytes, 0)? != MAGIC || read_u32(bytes, STATE)? != REPLY_WRITTEN {
+    if read_u32(bytes, 0)? != MAGIC
+        || read_u16(bytes, 4)? != VERSION
+        || read_u32(bytes, STATE)? != REPLY_WRITTEN
+    {
         return None;
     }
+    decode_pin_identity(bytes)?;
     let input_len = read_u32(bytes, INPUT_LEN)? as usize;
     let output_cap = read_u32(bytes, OUTPUT_CAP)? as usize;
     if record_len(input_len, output_cap)? != bytes.len() {
@@ -585,6 +622,7 @@ pub fn request_parts(bytes: &[u8]) -> Option<(HostFileHeader, &[u8], usize)> {
     for (index, arg) in args.iter_mut().enumerate() {
         *arg = read_u64(bytes, ARGS + index * 8)?;
     }
+    let pin = decode_pin_identity(bytes)?;
     let input_len = read_u32(bytes, INPUT_LEN)? as usize;
     let output_cap = read_u32(bytes, OUTPUT_CAP)? as usize;
     if record_len(input_len, output_cap) != Some(bytes.len()) {
@@ -597,6 +635,7 @@ pub fn request_parts(bytes: &[u8]) -> Option<(HostFileHeader, &[u8], usize)> {
             fd: read_u32(bytes, FD)? as i32,
             flags: read_u32(bytes, FLAGS)?,
             args,
+            pin,
         },
         &bytes[HOST_FILE_HEADER_BYTES..HOST_FILE_HEADER_BYTES + input_len],
         output_cap,
@@ -667,6 +706,11 @@ mod tests {
             fd: 1,
             flags: 0,
             args: [1, 2, 3, 4],
+            pin: Some(crate::OfdPinIdentity {
+                authority: 11,
+                index: 12,
+                generation: 13,
+            }),
         }
     }
 
@@ -685,6 +729,7 @@ mod tests {
 
     #[test]
     fn record_round_trips_input_and_reply() {
+        assert_eq!(HOST_FILE_HEADER_BYTES, 120);
         let mut bytes = vec![0u8; record_len(5, 16).unwrap()];
         encode(&mut bytes, header(HostFileOp::Write), b"hello", 16).unwrap();
         assert_eq!(reply(&bytes), None, "a fresh record has no reply");
@@ -702,6 +747,46 @@ mod tests {
         );
         // A written record is never served a second time.
         assert!(HostFileRequestView::parse(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn record_validates_pin_identity_and_version() {
+        let mut bad_header = header(HostFileOp::Write);
+        bad_header.pin = Some(crate::OfdPinIdentity {
+            authority: 0,
+            index: 1,
+            generation: 1,
+        });
+        let mut bytes = vec![0u8; record_len(0, 0).unwrap()];
+        assert_eq!(
+            encode(&mut bytes, bad_header, &[], 0),
+            Err(HostFileRecordError::Invalid)
+        );
+        bad_header.pin = Some(crate::OfdPinIdentity {
+            authority: 1,
+            index: u64::from(u32::MAX) + 1,
+            generation: 1,
+        });
+        assert_eq!(
+            encode(&mut bytes, bad_header, &[], 0),
+            Err(HostFileRecordError::Invalid)
+        );
+
+        let mut no_pin = header(HostFileOp::Openat);
+        no_pin.pin = None;
+        encode(&mut bytes, no_pin, &[], 0).unwrap();
+        assert_eq!(request_parts(&bytes).unwrap().0.pin, None);
+
+        // Corrupt the pin word in the wire buffer (authority = 0, generation != 0).
+        bytes[PIN + 16..PIN + 24].copy_from_slice(&1u64.to_le_bytes());
+        assert!(HostFileRequestView::parse(&mut bytes).is_err());
+        assert!(request_parts(&bytes).is_none());
+
+        // Version 1 records are rejected.
+        encode(&mut bytes, header(HostFileOp::Write), &[], 0).unwrap();
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        assert!(HostFileRequestView::parse(&mut bytes).is_err());
+        assert!(request_parts(&bytes).is_none());
     }
 
     #[test]
