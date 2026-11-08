@@ -1951,6 +1951,26 @@ fn live_fork_child_cannot_supply_renewed_roots_entry_pid() {
         Some(child.record.id)
     );
     assert_eq!(fixture.task.visible_pid(), Some(child_pid));
+    // Exact execution lookup must not bypass the supplied lifecycle binding:
+    // a child return with the root's page is still refused in shared admission.
+    // SAFETY: production fork retained this live child's control allocation.
+    let child_control = unsafe { &*(child_identity.control_slot as *const ThreadControlSlot) };
+    let wrong_page = admit_entry(
+        source,
+        &fixture.task,
+        &child.words.native,
+        child.address.root.address().raw(),
+        child.record.id,
+        fixture.page,
+        child_control,
+    );
+    assert!(matches!(
+        wrong_page,
+        Err(
+            crate::native_process_runtime::NativeAdmissionError::Failure(NativeProcessError::Stale)
+        )
+    ));
+
     assert!(
         fixture
             .zone

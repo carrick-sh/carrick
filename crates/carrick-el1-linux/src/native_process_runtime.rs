@@ -2725,6 +2725,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         page: &'a ThreadLifecyclePage,
         control: &'a ThreadControlSlot,
     ) -> Result<NativeGroupAdmission<'a, M, C>, NativeAdmissionError> {
+        if !current.owns_lifecycle_page(page) || !current.owns_control_slot(control) {
+            return Err(NativeProcessError::Stale.into());
+        }
         let binding = super::common_entry::execution_binding(current);
         let key = NativeExecutionKey::new(source.zone, binding, address)?;
         let record = source
