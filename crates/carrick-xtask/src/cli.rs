@@ -44,6 +44,8 @@ pub enum Commands {
     WorkflowPatches,
     #[command(about = "Compile all recipe lanes once and run their test binaries")]
     TestBatch(crate::test_batch::TestBatchArgs),
+    /// Run just-test selections for changed crates and reverse dependencies.
+    TestTouched(crate::test_touched::TestTouchedArgs),
     #[command(about = "Run each lib test of one package in its own process")]
     TestIsolated(crate::test_isolated::TestIsolatedArgs),
     #[command(about = "Build loom binaries separately, then stream tests under a deadline")]
@@ -510,6 +512,10 @@ where
                     .unwrap_or(1),
                 message: e.to_string(),
             })
+        }
+        Commands::TestTouched(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::test_touched::run(&root, args).map_err(|e| CliError::TestShards(e.to_string()))
         }
         Commands::TestBatch(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
