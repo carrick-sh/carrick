@@ -12,26 +12,13 @@ pub(super) fn stage(
         carrick_syscall_abi::CanonicalNr::new(call.canonical.raw()),
         &call.args,
     )?;
-    match decoded {
-        HostFileCall::Read { fd, .. }
-        | HostFileCall::Pread { fd, .. }
-        | HostFileCall::Lseek { fd, .. }
-        | HostFileCall::Getdents64 { fd, .. }
-        | HostFileCall::Fstat { fd, .. }
-            if (0..=2).contains(&fd) =>
-        {
-            return None;
-        }
-        HostFileCall::Openat { .. }
-        | HostFileCall::Faccessat { .. }
-        | HostFileCall::Statx { .. }
-        | HostFileCall::Read { .. }
-        | HostFileCall::Pread { .. }
-        | HostFileCall::Lseek { .. }
-        | HostFileCall::Getdents64 { .. }
-        | HostFileCall::Fstat { .. }
-        | HostFileCall::Newfstatat { .. } => {}
-        _ => return None,
+    // Descriptor-based reads remain on their existing route until slice 3
+    // binds retained read/output preparation for every descriptor population.
+    if !matches!(
+        decoded,
+        HostFileCall::Openat { .. } | HostFileCall::Faccessat { .. } | HostFileCall::Statx { .. }
+    ) {
+        return None;
     }
     let Some(venue) = carrick_el1_linux::ipc::guest_venue(cpu_slot) else {
         return Some(HostFileStage::InRing);
@@ -52,15 +39,5 @@ pub(super) fn stage(
         },
     )
     .unwrap_or(HostFileStage::InRing);
-    // These two legacy stat layouts differ by ISA. Their wire binding is a
-    // later slice; never let a ring descriptor reach the host task table.
-    if matches!(
-        decoded,
-        HostFileCall::Fstat { .. } | HostFileCall::Newfstatat { .. }
-    ) && matches!(staged, HostFileStage::Request { .. })
-    {
-        Some(HostFileStage::InRing)
-    } else {
-        Some(staged)
-    }
+    Some(staged)
 }

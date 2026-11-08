@@ -111,3 +111,52 @@ MapPrivate records. Widening that transport to open would not satisfy the
 required retained-service binding. The shared intake must preserve exact
 member/MM authentication, metadata retention, cancellation exclusion,
 completion publication and waiter notification, outside physical custody.
+
+## Step 2: retained CPL0 service binding
+
+The open/close/reopen binding is now green on real KVM: three pairs reuse
+one ring descriptor, the guest exits 0 after seven entries, and no guest
+refusals are recorded. The stacked pre-routing control returned 16 after
+four entries and two host forwards. These are focused descriptor-custody
+results, not a claim that the complete Ubuntu loader works.
+
+Both payload descriptors expose `ring_storage()` for carrier authentication
+of supervisor staging. The shared ring entry publishes host-root records
+without access-context stamping when the admitted root still has no ring
+filesystem. Its existing stamped entry continues to refuse that root. Write
+(including staged writev) and chdir remain refused by the new host-root entry.
+
+CPL0 claims the existing native service notice and retains its ticket with
+RAM custody. File I/O executes after dropping physical custody and the CPU-I/O
+borrow. Completion reauthenticates the stopped context and staging, writes the
+reply before ACK, and counts genuine carrier refusal without publishing a
+reply. MapPrivate stays on its existing HostFileCrossing transport.
+
+The runtime selects host-root resources for Initial service origins and
+native authority for Descendant origins. CPL0 admits only Openat, Faccessat and Statx to shared staging. Descriptor-based
+Read, Pread, Lseek and Getdents64 retain their existing routes, including for
+ring-opened descriptors; binding those descriptors is slice 3. Legacy stat
+layouts, write/FSIZE and staging-fault supply remain later work. The
+director-owned crossing policy is unchanged.
+
+The first full regression run exposed the planned Pread admission as a
+regression: `private_file_write_preserves_source_bytes` returned exit 33, and
+a bounded fixture reduction observed errno 38 from pread64 instead of one
+byte. The stacked baseline passed twice. The director therefore narrowed
+this slice to the three pathname calls above, rather than expand read/output
+preparation or introduce a fallback for open. The diagnostic fixture and the
+speculative copyout binding were removed. The narrowed regression results
+are recorded on the draft PR.
+
+After narrowing, the full KVM target passes 43 tests with zero failures,
+one existing ignore and the requested child-retirement exclusion. This
+includes every private-file case, all eight getrandom cases and reopen.
+The exact reopen command also passes separately. The native EL1 lib suite
+passes 779 tests; its three existing ignores are unchanged.
+
+The release Ubuntu `/bin/true` run still exits 127. Its complete terminal
+refusal census contains exactly one refusal: writev, x86 native ordinal 20
+(canonical 66), in the root ring venue. Thus writev is the first recorded
+refusal, not a claim about the first failing syscall. Faccessat and openat
+record no refusals. Scoped cleanup finds no remaining processes. The
+remaining fd-based loader reads are deliberately not routed in this slice.
