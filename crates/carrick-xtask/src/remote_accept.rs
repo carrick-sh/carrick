@@ -1548,6 +1548,7 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
             cleanup_counts: vec![],
             host_load: Default::default(),
             failures: vec![],
+            host_identity: None,
             fixture_bundle: None,
         };
         fs::write(

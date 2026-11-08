@@ -44,6 +44,8 @@ struct RetiredTestsDoc {
 
 #[derive(Debug, Error)]
 pub enum ReceiptError {
+    #[error("incomparable base: {0}; merge group blocked, no NEW/FIXED comparison performed")]
+    IncomparableBase(String),
     #[error("I/O at '{path}': {source}")]
     Io {
         path: PathBuf,

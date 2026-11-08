@@ -35,5 +35,19 @@
   },
   "failures": [
     "arbitrary human text: never a key"
-  ]
+  ],
+  "host_identity": {
+    "runner_name": "fixture-mac",
+    "hardware_model": "Mac14,2",
+    "product_build": "25A1"
+  },
+  "fixture_validation": {
+    "validation_method": "input_identity",
+    "checkout_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkout_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "bundle_source_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkout_dirty": false,
+    "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "inputs_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  }
 }

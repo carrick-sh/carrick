@@ -688,7 +688,7 @@ fn download_run_baseline(
         Some("artifacts"),
     )?;
     let prefix = format!("signed-baseline-{base}-");
-    let artifact = artifacts
+    let mut artifacts = artifacts
         .iter()
         .filter(|a| a["expired"] == false)
         .filter_map(|a| {
@@ -696,8 +696,10 @@ fn download_run_baseline(
             let attempt = name.strip_prefix(&prefix)?.parse::<u64>().ok()?;
             Some((attempt, name))
         })
-        .max();
-    if let Some((_, name)) = artifact {
+        .collect::<Vec<_>>();
+    artifacts.sort_by_key(|(attempt, _)| std::cmp::Reverse(*attempt));
+    let found = !artifacts.is_empty();
+    for (attempt, name) in artifacts {
         let dir = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
         checked(
             "gh",
@@ -716,9 +718,13 @@ fn download_run_baseline(
         )?;
         fs::copy(dir.path().join("candidate.json"), output.join("base.json"))
             .map_err(|e| fail(e.to_string()))?;
-        return Ok(Some(id));
+        fs::copy(
+            dir.path().join("candidate.json"),
+            output.join(format!("base-{id:020}-{attempt:020}.json")),
+        )
+        .map_err(|e| fail(e.to_string()))?;
     }
-    Ok(None)
+    Ok(found.then_some(id))
 }
 
 fn exact_base_push(run: &Value, base: &str) -> bool {
@@ -732,10 +738,16 @@ fn exact_base_push(run: &Value, base: &str) -> bool {
 
 fn download_baseline(base: &str, output: &Path, wait_for_push: bool) -> Result<u64, ReceiptError> {
     let runs = baseline_runs()?;
+    // Runner assignment happens after prepare, so retain all exact-SHA
+    // receipts and defer host selection until the candidate is available.
+    let mut newest = None;
     for run in &runs {
         if let Some(id) = download_run_baseline(run, base, output)? {
-            return Ok(id);
+            newest.get_or_insert(id);
         }
+    }
+    if let Some(id) = newest {
+        return Ok(id);
     }
     if wait_for_push {
         // The queue event may precede registration of the base's push workflow.
@@ -980,7 +992,14 @@ fn execute(
         )?;
         // accept rebuilds once under the same lease before testing. Its receipt
         // names that artifact; inspect it independently before releasing the lease.
-        let receipt = load(&output.join("candidate.json"))?;
+        let mut receipt = load(&output.join("candidate.json"))?;
+        // Capture on the execution Mac, including when the requested SHA predates
+        // host-aware accept receipts. Never infer identity on the hosted publisher.
+        receipt.host_identity = crate::accept::SignedHostIdentity::capture();
+        write(
+            &output.join("candidate.json"),
+            serde_json::to_vec_pretty(&receipt).map_err(|e| fail(e.to_string()))?,
+        )?;
         // Older accept receipts encode an unknown reap as remaining_count=0
         // plus human diagnostics. Prove cleanup again without parsing those
         // diagnostics or allowing them to disappear behind known test failures.
@@ -1055,7 +1074,33 @@ fn publish(
         let base = if request.kind == RequestKind::Main {
             candidate.clone()
         } else {
-            load(&request_path.with_file_name("base.json"))?
+            let dir = request_path
+                .parent()
+                .ok_or_else(|| fail("request has no parent"))?;
+            let mut paths = fs::read_dir(dir)
+                .map_err(|e| fail(e.to_string()))?
+                .map(|entry| entry.map(|e| e.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| fail(e.to_string()))?;
+            paths.retain(|path| {
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.starts_with("base-") && name.ends_with(".json"))
+            });
+            paths.sort_by(|a, b| b.cmp(a));
+            if paths.is_empty() {
+                paths.push(dir.join("base.json"));
+            }
+            let bases = paths
+                .iter()
+                .map(|path| load(path))
+                .collect::<Result<Vec<_>, _>>()?;
+            let base = signed_receipt::select_base(&bases, &candidate)?.clone();
+            write(
+                &results.join("selected-base.json"),
+                serde_json::to_vec_pretty(&base).map_err(|e| fail(e.to_string()))?,
+            )?;
+            base
         };
         validate_receipt(&base, &request.base)?;
         let diff = signed_receipt::compare(&base, &candidate)?;
@@ -1064,6 +1109,10 @@ fn publish(
             serde_json::to_vec_pretty(&diff).map_err(|e| fail(e.to_string()))?,
         )?;
         let mut body = diff.markdown();
+        body.push_str(&format!(
+            "\nExecution host: {:?}\nFixture bundle: {:?}\n",
+            candidate.host_identity, candidate.fixture_validation
+        ));
         let valid = validate_receipt(&candidate, &request.sha);
         if let Err(error) = &valid {
             body.push_str(&format!("\nReceipt admission failed: {error}\n"));
@@ -1109,17 +1158,23 @@ fn publish(
             && execution_result == "success";
         Ok::<_, ReceiptError>((passed, body))
     })();
-    let (passed, mut body) = match comparison {
-        Ok(result) => result,
+    let (passed, mut body, incomparable) = match comparison {
+        Ok((passed, body)) => (passed, body, false),
+        Err(error @ ReceiptError::IncomparableBase(_)) => (
+            false,
+            format!("Signed gate: **INCOMPARABLE BASE — BLOCKED**\n\n{error}\n"),
+            true,
+        ),
         Err(error) => (
             false,
             format!(
                 "Signed gate: **FAIL**\n\nCandidate `{}`; base `{}`\n\nNo valid comparison: {error}\n",
                 request.sha, request.base
             ),
+            false,
         ),
     };
-    if !passed && !body.starts_with("Signed gate: **FAIL**") {
+    if !passed && !body.starts_with("Signed gate: **FAIL**") && !incomparable {
         body.insert_str(
             0,
             "Signed gate: **FAIL** (receipt or execution admission)\n\n",
@@ -1146,9 +1201,16 @@ fn publish(
         write(Path::new(&summary), &body)?;
     }
     // Status is written even if comment publication fails.
+    let description = if incomparable {
+        "Incomparable base: host or fixture evidence; blocked"
+    } else if passed {
+        "No new failures; populations and completion preserved"
+    } else {
+        "Signed receipt regression or incomplete gate"
+    };
     let status = post(
         &format!("repos/{REPOSITORY}/statuses/{}", request.sha),
-        json!({"state": if passed {"success"} else {"failure"}, "context": "signed-gate", "description": if passed {"No new failures; populations and completion preserved"} else {"Signed receipt regression or incomplete gate"}, "target_url": run_url}),
+        json!({"state": if passed {"success"} else {"failure"}, "context": "signed-gate", "description": description, "target_url": run_url}),
     );
     let comment = request.prs.iter().try_for_each(|pr| {
         post(
@@ -1158,6 +1220,11 @@ fn publish(
     });
     status?;
     comment?;
+    if incomparable {
+        return Err(ReceiptError::IncomparableBase(
+            "see comment and artifacts".into(),
+        ));
+    }
     if !passed {
         return Err(fail("signed gate FAIL; see comment and artifacts"));
     }
