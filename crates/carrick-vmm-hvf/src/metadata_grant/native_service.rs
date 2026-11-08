@@ -713,8 +713,7 @@ impl NativeService {
             .ok_or_else(|| stale())?;
         let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
+                carrick_el1::substrate::sched::object_wait::deliver_host_completion(
                     owned.zone(),
                     owned,
                 )
@@ -1033,8 +1032,7 @@ impl NativeService {
         }
         let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
+                carrick_el1::substrate::sched::object_wait::deliver_host_completion(
                     owned.zone(),
                     owned,
                 )
@@ -1068,8 +1066,7 @@ impl NativeService {
                 drop(prepared);
                 let queue = zone
                     .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                        carrick_sched_core::LockWait::complete_object_wake(
-                            &carrick_kernel::el1_zone::HostLockWait,
+                        carrick_el1::substrate::sched::object_wait::deliver_host_completion(
                             owned.zone(),
                             owned,
                         )
@@ -1395,8 +1392,7 @@ impl NativeService {
         // cancellation releases it before physical/table undo or backing drop.
         let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
+                carrick_el1::substrate::sched::object_wait::deliver_host_completion(
                     owned.zone(),
                     owned,
                 )
@@ -1429,8 +1425,7 @@ impl NativeService {
                 drop(stock);
                 let queue = zone
                     .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                        carrick_sched_core::LockWait::complete_object_wake(
-                            &carrick_kernel::el1_zone::HostLockWait,
+                        carrick_el1::substrate::sched::object_wait::deliver_host_completion(
                             owned.zone(),
                             owned,
                         )
@@ -1484,8 +1479,7 @@ impl NativeService {
             .ok_or_else(|| stale())?;
         let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
+                carrick_el1::substrate::sched::object_wait::deliver_host_completion(
                     owned.zone(),
                     owned,
                 )
@@ -1571,11 +1565,7 @@ pub(super) fn take(
             return consumed.miss("invalid native-service wait key");
         };
         let Ok(queue) = zone.object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-            carrick_sched_core::LockWait::complete_object_wake(
-                &carrick_kernel::el1_zone::HostLockWait,
-                owned.zone(),
-                owned,
-            )
+            carrick_el1::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
         }) else {
             return consumed.miss("native-service wait queue unavailable");
         };
@@ -1645,8 +1635,7 @@ pub(super) fn take(
         };
         let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
+                carrick_el1::substrate::sched::object_wait::deliver_host_completion(
                     owned.zone(),
                     owned,
                 )

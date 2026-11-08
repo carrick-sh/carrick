@@ -1574,8 +1574,7 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
             region.operation_slot_generation(),
             &carrick_sched_core::BoundedSpin(0),
             &|owned| {
-                carrick_sched_core::LockWait::complete_object_wake(
-                    &carrick_kernel::el1_zone::HostLockWait,
+                carrick_el1::substrate::sched::object_wait::deliver_host_completion(
                     owned.zone(),
                     owned,
                 );
