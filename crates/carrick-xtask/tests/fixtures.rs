@@ -3307,26 +3307,31 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     .unwrap_err();
     assert!(error.to_string().contains("input identity"), "{error}");
 
-    // The paired merge-base run checks out another commit with unchanged
-    // fixture inputs and restores the candidate publisher's bundle (#1884).
+    // Both paired runs restore the bundle main published for the merge base
+    // (`sha` here). The candidate checks out a later commit with unchanged
+    // fixture inputs and is admitted against that trusted bundle (#1889).
     git(
         f.repo.path(),
-        &["commit", "--allow-empty", "-m", "paired base"],
+        &["commit", "--allow-empty", "-m", "paired candidate"],
     );
-    let base = git(f.repo.path(), &["rev-parse", "HEAD"]);
-    assert_ne!(base, sha);
-    carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &base, &sha)
+    let candidate = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(candidate, sha);
+    carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &candidate, &sha)
         .unwrap();
-    // The bundle still has to come from the authorized candidate SHA...
-    let error =
-        carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &base, &base)
-            .unwrap_err();
+    // The bundle still has to come from the merge base's exact SHA...
+    let error = carrick_xtask::signed_gate::verify_fixture_artifact(
+        f.repo.path(),
+        &artifact,
+        &candidate,
+        &candidate,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("source SHA differs"), "{error}");
-    // ...and a base whose inputs differ is refused, never given another bundle.
+    // ...and a candidate whose inputs differ is refused, never given another bundle.
     let error = carrick_xtask::signed_gate::verify_fixture_artifact(
         f.repo.path(),
         &wrong_inputs,
-        &base,
+        &candidate,
         &sha,
     )
     .unwrap_err();
