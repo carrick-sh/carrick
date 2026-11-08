@@ -61,6 +61,7 @@ rationale = "Admission creates one native process owner for the retained root an
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue",
+  "carrick-el1-linux::aarch64_process_tests::live_fork_child_cannot_supply_renewed_roots_entry_pid",
   "carrick-el1-linux::native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable",
   "carrick-el1-linux::native_process_runtime::host_test_support::register_thread_preserves_existing_credential_storage",
   "carrick-el1-linux::aarch64_process_tests::native_retirement_tests::two_live_processes_reauthenticate_birth_settlement_after_parent_generation_moves",

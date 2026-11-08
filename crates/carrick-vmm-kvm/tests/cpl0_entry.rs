@@ -1409,6 +1409,33 @@ fn shared_kernel_transport_yield_and_fatal() {
     );
 }
 
+#[test]
+fn shared_kernel_transport_retains_admission_identity() {
+    let program = transport_program(2);
+    let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program])
+        .expect("real KVM + CPL0 image");
+    let error = carrier
+        .observe(0)
+        .expect_err("admission refusal must be terminal")
+        .to_string();
+    assert!(
+        error.contains("AdmissionFreshRootPendingCustody"),
+        "{error}"
+    );
+    assert!(
+        error.contains("admission_identity=[1, 2, 3, 4, 5, 6, 7, 8]"),
+        "{error}"
+    );
+    assert!(
+        error.contains("admission_lookup=[9, 10, 11, 12, 13, 14, 15, 16]"),
+        "{error}"
+    );
+    assert!(
+        error.contains("line:"),
+        "caller coordinates must survive: {error}"
+    );
+}
+
 fn context_program() -> Vec<u8> {
     const CONTEXT_WITNESS: u64 = 0xffff_ffff_ffff_ff30;
     let mut bytes = Vec::new();
