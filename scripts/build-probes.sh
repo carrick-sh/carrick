@@ -57,7 +57,7 @@ if [ "$MODE" = "--closure-arm64" ]; then
   rm -rf conformance-probes/target/aarch64-unknown-linux-musl/release
   rm -rf conformance-probes/target/aarch64-unknown-linux-gnu/release
 
-  docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
+  docker run --rm ${CARRICK_DOCKER_CARGO_CACHE[@]+"${CARRICK_DOCKER_CARGO_CACHE[@]}"} --platform linux/arm64 \
     -e CARRICK_CLOSURE_BINS \
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:alpine sh -ec '
@@ -73,7 +73,7 @@ if [ "$MODE" = "--closure-arm64" ]; then
   python3 scripts/probe-inventory.py check-binaries \
     conformance-probes/target/aarch64-unknown-linux-musl/release arm64-musl
 
-  docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
+  docker run --rm ${CARRICK_DOCKER_CARGO_CACHE[@]+"${CARRICK_DOCKER_CARGO_CACHE[@]}"} --platform linux/arm64 \
     -e CARRICK_CLOSURE_BINS \
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:bookworm sh -ec '
@@ -96,7 +96,7 @@ if [ "$MODE" = "--native-pie" ] || [ "$MODE" = "--native-pie-musl" ]; then
     exit 2
   fi
 
-  docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
+  docker run --rm ${CARRICK_DOCKER_CARGO_CACHE[@]+"${CARRICK_DOCKER_CARGO_CACHE[@]}"} --platform linux/arm64 \
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:alpine sh -ec '
       rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
@@ -120,7 +120,7 @@ if [ "$MODE" = "--native-pie" ] || [ "$MODE" = "--native-pie-musl" ]; then
     exit 0
   fi
 
-  docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
+  docker run --rm ${CARRICK_DOCKER_CARGO_CACHE[@]+"${CARRICK_DOCKER_CARGO_CACHE[@]}"} --platform linux/arm64 \
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:bookworm sh -ec '
       rustup target add aarch64-unknown-linux-gnu >/dev/null 2>&1 || true
@@ -185,7 +185,7 @@ fi
 # ── macOS / aarch64 host: build via arm64 rust containers (cross-compile) ─────
 
 # ── aarch64-musl (static) + x86_64-musl (static, Rust-only cross-link) ───────
-docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
+docker run --rm ${CARRICK_DOCKER_CARGO_CACHE[@]+"${CARRICK_DOCKER_CARGO_CACHE[@]}"} --platform linux/arm64 \
     -v "$PWD/conformance-probes:/p" -w /p \
   rust:alpine sh -c '
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
@@ -201,7 +201,7 @@ docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
   '
 
 # ── aarch64-gnu (dynamic glibc) ─────────────────────────────────────────────
-docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
+docker run --rm ${CARRICK_DOCKER_CARGO_CACHE[@]+"${CARRICK_DOCKER_CARGO_CACHE[@]}"} --platform linux/arm64 \
     -v "$PWD/conformance-probes:/p" -w /p \
   rust:bookworm sh -c '
     rustup target add aarch64-unknown-linux-gnu >/dev/null 2>&1 || true
