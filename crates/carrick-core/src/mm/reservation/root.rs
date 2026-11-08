@@ -6670,9 +6670,10 @@ mod tests {
         assert_eq!(owed.len(), 1);
         assert!(g.is_reserved(reserve_span));
         assert!(!g.is_committed(commit_span));
+        // Physical return is still owed; this is not lock contention.
         assert_eq!(
             g.commit_range(commit_span, ReservationProtection::READ_WRITE),
-            Err(Refusal::Busy)
+            Err(Refusal::DeferredReturn)
         );
         assert_eq!(g.acknowledge_deferred_returns(request.sequence).unwrap(), 1);
         assert!(g.is_reserved(reserve_span));
