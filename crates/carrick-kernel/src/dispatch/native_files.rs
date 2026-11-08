@@ -1269,6 +1269,50 @@ mod tests {
     }
 
     #[test]
+    fn native_child_unlink_and_rmdir_dispatch_with_errno_matrix() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = mutation_child(upper);
+            let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+            assert!(fixture.venue_open(&authority, b"remove-file", CREATE, 0o644) >= 0);
+            let unlink = |path: &[u8], flags| {
+                fixture.child_call(
+                    &authority,
+                    35,
+                    [FDCWD as u64, 0, flags, 0, 0, 0],
+                    &[(1, path)],
+                )
+            };
+            assert_eq!(unlink(b"remove-file", 0), 0, "{upper:?}");
+            assert_eq!(unlink(b"remove-file", 0), -2);
+            assert_eq!(
+                fixture.child_call(
+                    &authority,
+                    34,
+                    [FDCWD as u64, 0, 0o755, 0, 0, 0],
+                    &[(1, b"remove-dir")],
+                ),
+                0,
+            );
+            assert_eq!(unlink(b"remove-dir", 0), -21);
+            assert!(fixture.venue_open(&authority, b"remove-dir/member", CREATE, 0o644) >= 0);
+            assert_eq!(unlink(b"remove-dir", 0x200), -39);
+            assert_eq!(unlink(b"remove-dir/member", 0x200), -20);
+            assert_eq!(unlink(b"remove-dir/member", 0), 0);
+            assert_eq!(unlink(b"remove-dir", 0x200), 0);
+            assert_eq!(unlink(b".", 0x200), -22);
+            assert_eq!(unlink(b"/etc/ld.so.cache", 0), 0, "whiteout a lower file");
+            assert_eq!(unlink(b"/etc/ld.so.cache", 0), -2);
+            assert_eq!(unlink(b"", 0), -2);
+            assert_eq!(unlink(b"missing", 1), -22);
+            assert_eq!(unlink(&[b'x'; 256], 0), -36);
+            assert_eq!(
+                fixture.child_call(&authority, 35, [999, 0, 0, 0, 0, 0], &[(1, b"x")]),
+                -9,
+            );
+        }
+    }
+
+    #[test]
     fn native_child_write_serves_parent_redirected_stdout_after_host_close() {
         for upper in [Upper::Memory, Upper::Host] {
             let mut fixture = writable_fixture(upper);
