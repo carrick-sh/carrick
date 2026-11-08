@@ -2378,6 +2378,32 @@ mod host_tests {
         zone
     }
 
+    /// Both APIs protect the same object queue; completion admission must not
+    /// create a second exclusive owner while an IPC readiness holder is live.
+    #[test]
+    fn legacy_object_holder_excludes_completion_admission() {
+        let zone = fixture(true);
+        let key = key(1);
+        let held = zone.object_wait(key, &BoundedSpin(0)).unwrap();
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.deliver_handbacks(&mut |_| {});
+        };
+        let second = zone.lock_completion_index(key, &BoundedSpin(0), &completion);
+        let excluded = match second {
+            Err(ObjectWaitError::Busy) => true,
+            Err(other) => panic!("unexpected refusal: {other:?}"),
+            Ok(second) => {
+                // The known-bad implementation grants overlapping exclusive
+                // custody. Do not run that invalid second owner's destructor.
+                core::mem::forget(second);
+                false
+            }
+        };
+        drop(held);
+        assert!(excluded, "completion admission acquired a live IPC queue lock");
+        zone.object_wait(key, &BoundedSpin(0)).unwrap();
+    }
+
     #[test]
     fn native_service_wake_preserves_exception_and_exact_operation() {
         let zone = fixture(true);
