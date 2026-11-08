@@ -1542,6 +1542,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
     }
 
     fn unlink(&self, record: RecordId) {
+        self.zone.timers.cancel_record(record);
         let rec = self.zone.record(record);
         let prev = rec.object.prev.load(Ordering::Relaxed);
         let next = rec.object.next.load(Ordering::Relaxed);
@@ -1793,9 +1794,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         }
     }
 
-    /// Whether this record's last object park ended at its deadline rather
-    /// than by a notification. Meaningful to the owner of the record's
-    /// context once the record was claimed off its park.
+    /// The exclusive expiry transfer retains the object operation's marker.
+    pub(super) fn mark_object_timeout(&self) {
+        self.object
+            .expired
+            .fetch_or(OBJECT_EXPIRED, Ordering::Release);
+    }
+
+    /// Whether the last object park ended at its deadline, after claim.
     pub fn object_wait_expired(&self) -> bool {
         self.object.expired.load(Ordering::Acquire) & OBJECT_EXPIRED != 0
     }
@@ -4565,6 +4571,100 @@ mod host_tests {
         );
         assert!(matches!(zone.record(later).claim(), Claim::Queued { .. }));
         assert_eq!(zone.timer_deadline(SLOT), None);
+    }
+
+    #[test]
+    fn native_epoll_departure_timeout_drains_enrollment_and_retains_operation() {
+        let zone = fixture(true);
+        let record = allocate(&zone, 310);
+        assert!(zone.mark_native_owned(record));
+        let exact = zone.record_ref(record);
+        let seq = zone.next_seq(record);
+        zone.arm_timer(SLOT, record, seq).unwrap();
+        let guard = zone
+            .object_wait(key(1), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+        guard
+            .park_until(
+                guard.snapshot(),
+                record,
+                OperationToken::new(310, 1).unwrap(),
+                1_000,
+            )
+            .unwrap();
+        drop(guard);
+        zone.leave_guest(SLOT, &SpinForever);
+        assert_eq!(zone.take_foreign_timer(SLOT).unwrap().record, exact);
+        assert!(zone.reset_slot(SLOT));
+        assert_eq!(
+            zone.expire_native_timer(crate::CounterTick::new(999), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            None
+        );
+        assert_eq!(
+            zone.expire_native_timer(crate::CounterTick::new(1_000), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            Some(exact)
+        );
+        let rec = zone.record(record);
+        assert!(rec.object_wait_expired());
+        assert!(rec.needs_native_handback());
+        assert_eq!(rec.handback(), Some(Handback::Resumed));
+        assert_eq!(notify(&zone, 1).0.visited, 0);
+        assert_eq!(zone.timer_node_count(), 0);
+        assert_eq!(
+            zone.expire_native_timer(crate::CounterTick::new(2_000), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            None
+        );
+        // SAFETY: the completed transfer gave this fixture exclusive custody.
+        assert_eq!(unsafe { rec.take_object_operation() }.unwrap().index(), 310);
+        zone.free_record(record);
+        assert!(zone.live(exact).is_none());
+    }
+
+    #[test]
+    fn native_epoll_departure_preserves_timer_until_notification() {
+        let zone = fixture(true);
+        let record = allocate(&zone, 310);
+        assert!(zone.mark_native_owned(record));
+        let seq = zone.next_seq(record);
+        zone.arm_timer(SLOT, record, seq).unwrap();
+        let guard = zone
+            .object_wait(key(1), &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+        guard
+            .park_until(
+                guard.snapshot(),
+                record,
+                OperationToken::new(310, 1).unwrap(),
+                1_000,
+            )
+            .unwrap();
+        drop(guard);
+        let foreign = zone.take_foreign_timer(SLOT).unwrap();
+        assert_eq!(foreign.record, zone.record_ref(record));
+        assert_eq!(
+            zone.timer_node_count(),
+            1,
+            "native timer remains admitted across departure"
+        );
+        assert_eq!(zone.record(record).claim(), Claim::Parked { seq });
+        assert_eq!(notify(&zone, 1).0.queued, 1);
+        assert_eq!(
+            zone.timer_node_count(),
+            0,
+            "notification cancels transferred deadline"
+        );
+        assert_eq!(notify(&zone, 1).0.visited, 0, "one notification winner");
+        assert!(!zone.record(record).object_wait_expired());
     }
 
     /// A slot's timer has exactly one owner, and whichever record owns it

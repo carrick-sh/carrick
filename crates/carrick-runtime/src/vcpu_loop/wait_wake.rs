@@ -215,6 +215,7 @@ pub(crate) struct HvpatchRuntimeDirectory {
     >,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     guest_capture: Mutex<Option<Arc<carrick_vmm_hvf::guest_capture::GuestCapture>>>,
+    native_deadlines: Mutex<Option<crate::deadline_driver::DeadlineDriver>>,
     /// Carrier-owned logical process jobs. No process child owns a host thread;
     /// the root waits these exact completions before shutting the shared pool.
     pub(crate) process_jobs: Mutex<ProcessJobDirectoryState>,
@@ -661,6 +662,7 @@ impl Default for HvpatchRuntimeDirectory {
             persistent_pool: Mutex::new(None),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             guest_capture: Mutex::new(None),
+            native_deadlines: Mutex::new(None),
             process_jobs: Mutex::new(ProcessJobDirectoryState::default()),
             process_jobs_changed: Condvar::new(),
             shutdown: Mutex::new(RuntimeDirectoryShutdown::Open),
@@ -780,6 +782,19 @@ impl HvpatchRuntimeDirectory {
         carrick_kernel::el1_zone::register_slot_kicker(Box::new(|slot| {
             carrick_vmm_hvf::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
         }));
+        // No executor may transfer a deadline until the carrier server is
+        // durably admitted. Its mapping reference stays live through shutdown.
+        let zone = carrick_el1_abi::zone_tables().ok_or_else(|| {
+            RuntimeError::Configuration("native deadline zone unavailable".into())
+        })?;
+        let deadlines = crate::deadline_driver::DeadlineDriver::start(Arc::new(
+            super::zone::NativeDeadlineTarget {
+                zone,
+                _mapping: Box::new(authority.clone()),
+            },
+        ))
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let deadline_changed = deadlines.notifier();
         let scheduler = Arc::downgrade(&services.scheduler);
         carrick_kernel::el1_zone::register_handback_publisher(Arc::new(move |event| {
             if let Some(scheduler) = scheduler.upgrade() {
@@ -795,6 +810,9 @@ impl HvpatchRuntimeDirectory {
                     }
                     carrick_kernel::el1_zone::HandbackEvent::NativeQueued => {
                         scheduler.poke_executor_control();
+                    }
+                    carrick_kernel::el1_zone::HandbackEvent::NativeDeadlineChanged => {
+                        deadline_changed();
                     }
                 }
             }
@@ -819,6 +837,7 @@ impl HvpatchRuntimeDirectory {
             )
             .map_err(|error| RuntimeError::Configuration(error.to_string()))
         })?;
+        *self.native_deadlines.lock() = Some(deadlines);
         *pool = Some(started);
         *self.guest_capture.lock() = Some(guest_capture);
         crate::el1_census::init_from_env();
@@ -851,6 +870,7 @@ impl HvpatchRuntimeDirectory {
             .shutdown()
             .map(|_| ())
             .map_err(|error| RuntimeError::Configuration(error.to_string()));
+        self.native_deadlines.lock().take();
         *self.continuation_wait_service.lock() = None;
         *self.scheduler.lock() = None;
         for endpoint in self.endpoints.lock().values_mut() {

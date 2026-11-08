@@ -86,13 +86,14 @@ extern crate alloc;
 extern crate std;
 
 /// Shared deadline-index publication protocol, authenticated by the image ABI.
-pub const TIMER_INDEX_PROTOCOL: u64 = 1;
+pub const TIMER_INDEX_PROTOCOL: u64 = 2;
 /// Reschedule through the carrier when no architectural SGI route exists.
 pub const HOST_RESCHEDULE_TARGET: u64 = 1 << 63;
 pub mod affinity;
 pub mod affinity_source;
 pub use affinity_source::AffinitySource;
 pub mod process;
+pub use carrick_guest_arch::{CounterTick, NativeReturnWord};
 mod timer_index;
 
 mod aarch64_context;
@@ -1209,15 +1210,29 @@ pub struct TimerOwner {
 )]
 pub struct TimerBusy;
 
-/// A timed park of a record other than the slot's home record, taken off
-/// the slot's timer as its executor left EL1. Nothing serves that deadline
-/// any longer: the host claims the record (a control handback; its thread
-/// re-runs the call with what is left of its deadline).
-#[must_use = "a foreign timed park taken off its slot must be claimed by the host"]
+/// Departure receipt: host waits owe control delivery; native parks have
+/// transferred serving custody to CarrierDeadline and must stay enrolled.
+#[must_use = "deliver host handbacks and notify the native deadline server"]
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct ForeignTimer {
     pub record: RecordRef,
     pub seq: u32,
+    /// Native ownership stays parked; only deadline serving custody moved.
+    pub native: bool,
+}
+
+/// An authenticated native park served independently of execution slots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeTimedPark {
+    pub record: RecordRef,
+    pub seq: u32,
+    pub deadline: CounterTick,
+    pub completion: NativeTimerCompletion,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeTimerCompletion {
+    Scalar(NativeReturnWord),
+    Object,
 }
 
 /// Custody before physical retirement versus its owed completion wake.
@@ -2992,7 +3007,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 self.timers
                     .admission(self.record_ref(record), seq, deadline)
             })
-            .filter(|ticket| ticket.slot == slot);
+            .filter(|ticket| ticket.slot == timer_index::Serving::SlotTimer(slot));
         let from = rec.claim();
         let previous_seq = rec.last_seq.load(Ordering::Relaxed);
         let previous_handback = rec.handback.load(Ordering::Relaxed);
@@ -3445,7 +3460,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     self.entry(entry_id).sibling.load(Ordering::Relaxed),
                     Ordering::Relaxed,
                 );
-                rec.entry_count.fetch_sub(1, Ordering::Relaxed);
+                if rec.entry_count.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    if let Some(record) =
+                        RecordId::from_raw(self.entry(entry_id).record.load(Ordering::Relaxed))
+                    {
+                        self.timers.cancel_record(record);
+                    }
+                }
                 break;
             }
             link = &self.entry(current).sibling;
@@ -4150,7 +4171,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     pub fn timer_owner(&self, slot: SlotId) -> Option<TimerOwner> {
         let ticket = self
             .timers
-            .minimum(slot, |ticket| self.timer_ticket_live(ticket))?;
+            .minimum(timer_index::Serving::SlotTimer(slot), |ticket| {
+                self.timer_ticket_live(ticket)
+            })?;
         Some(TimerOwner {
             record: ticket.record,
             seq: ticket.seq,
@@ -4161,9 +4184,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Publication activates it in the slot's shared deadline heap. One node
     /// per record bounds capacity independently of executor population.
     pub fn arm_timer(&self, slot: SlotId, record: RecordId, seq: u32) -> Result<(), TimerBusy> {
+        self.arm_timer_result(slot, record, seq, NativeReturnWord(0))
+    }
+
+    /// The personality supplies the scalar timeout answer at admission, before
+    /// the operation relinquishes its native syscall continuation.
+    pub fn arm_timer_result(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        seq: u32,
+        result: NativeReturnWord,
+    ) -> Result<(), TimerBusy> {
         self.timers
             .reserve(timer_index::Ticket {
-                slot,
+                slot: timer_index::Serving::SlotTimer(slot),
+                result: result.0,
                 record: self.record_ref(record),
                 seq,
                 deadline: 0,
@@ -4191,21 +4227,75 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Take one foreign deadline when an executor leaves the guest. The
     /// carrier drains these receipts before settling the home record.
     pub fn take_foreign_timer(&self, slot: SlotId) -> Option<ForeignTimer> {
-        let ticket = self
-            .timers
-            .take_foreign(slot, self.slot(slot).host_record(), |ticket| {
-                self.timer_ticket_live(ticket)
-            })?;
+        let (ticket, native) = self.timers.take_foreign(
+            timer_index::Serving::SlotTimer(slot),
+            self.slot(slot).host_record(),
+            |ticket| self.timer_ticket_live(ticket),
+            |ticket| {
+                self.live(ticket.record)
+                    .is_some_and(ZoneRecord::has_native_execution_owner)
+            },
+        )?;
         Some(ForeignTimer {
             record: ticket.record,
             seq: ticket.seq,
+            native,
         })
+    }
+
+    /// Minimum of the carrier heap, independent of every slot's lifetime.
+    pub fn native_timed_park(&self) -> Option<NativeTimedPark> {
+        let ticket = self
+            .timers
+            .minimum(timer_index::Serving::CarrierDeadline, |ticket| {
+                self.timer_ticket_live(ticket)
+            })?;
+        let rec = self.live(ticket.record)?;
+        Some(NativeTimedPark {
+            record: ticket.record,
+            seq: ticket.seq,
+            deadline: CounterTick::new(ticket.deadline),
+            completion: if rec.has_object_operation() {
+                NativeTimerCompletion::Object
+            } else {
+                NativeTimerCompletion::Scalar(NativeReturnWord(ticket.result))
+            },
+        })
+    }
+
+    /// Expiry and wake arbitrate on the same Parked sequence. The owned
+    /// transfer keeps cancellation/reuse out while unlinking and publishing
+    /// the scalar answer or retained object timeout. No host syscall is run.
+    pub fn expire_native_timer(
+        &self,
+        now: CounterTick,
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
+    ) -> Option<RecordRef> {
+        let park = self.native_timed_park()?;
+        if park.deadline.raw() > now.raw() {
+            return None;
+        }
+        let rec = self.live(park.record)?;
+        let transfer = self.begin_host_transfer(park.record, Claim::Parked { seq: park.seq })?;
+        match park.completion {
+            NativeTimerCompletion::Scalar(result) => self.mark_woken(rec, result.0),
+            NativeTimerCompletion::Object => {
+                rec.mark_object_timeout();
+                self.mark_woken(rec, 0);
+            }
+        }
+        self.unlink_all(park.record.id, wait, completion);
+        self.counters.el1_timeouts.fetch_add(1, Ordering::Relaxed);
+        transfer.publish()
     }
 
     /// Earliest live deadline, pruning cancelled or completed park leases.
     pub fn timer_deadline(&self, slot: SlotId) -> Option<u64> {
         self.timers
-            .minimum(slot, |ticket| self.timer_ticket_live(ticket))
+            .minimum(timer_index::Serving::SlotTimer(slot), |ticket| {
+                self.timer_ticket_live(ticket)
+            })
             .map(|ticket| ticket.deadline)
     }
 
@@ -4239,7 +4329,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     ) -> Result<bool, ()> {
         let Some(ticket) = self
             .timers
-            .minimum(slot, |ticket| self.timer_ticket_live(ticket))
+            .minimum(timer_index::Serving::SlotTimer(slot), |ticket| {
+                self.timer_ticket_live(ticket)
+            })
         else {
             return Ok(false);
         };
@@ -4536,12 +4628,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let s = self.slot(slot);
         let rec = self.record(record);
         rec.set_affinity(affinity);
-        let timer = self
-            .timers
-            .owned(self.record_ref(record))
-            .filter(|ticket| self.timer_ticket_live(*ticket))
+        let owned = self.timers.owned(self.record_ref(record));
+        let timer = owned
+            .filter(|ticket| {
+                matches!(ticket.slot, timer_index::Serving::SlotTimer(_))
+                    && self.timer_ticket_live(*ticket)
+            })
             .map(|ticket| (ticket.seq, ticket.deadline));
-        self.timers.cancel_record(record);
+        if !owned.is_some_and(|ticket| ticket.slot == timer_index::Serving::CarrierDeadline) {
+            self.timers.cancel_record(record);
+        }
         // Only clear `slot`'s host home if it still names `record`; unhoming or
         // updating affinity for a distinct record on `slot` must not clobber a
         // home record owned by `slot` (which would break authentication when
@@ -5178,6 +5274,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         {
             return None;
         }
+        self.timers.cancel_record(record.id);
         Some(HostTransfer {
             zone: self,
             record,

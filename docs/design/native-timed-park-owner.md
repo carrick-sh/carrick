@@ -1,8 +1,8 @@
 # Native timed parks across executor departure (#1862)
 
-Status: proposed, not implemented. PR #1894 still has the confirmed P0.
-The departure and slot-reset timeout witnesses remain acceptance blockers.
-This note does not claim that preserving a node alone fixes the hang.
+Status: implemented in PR #1894; VM-free and build evidence is recorded on
+that draft PR. Signed acceptance, smoke and the Go workload remain director
+work. This note describes the owner and its runtime serving obligation.
 
 ## Confirmed ownership gap
 
@@ -20,13 +20,16 @@ leaves the hardware timer unserved while its executor is away. Moving all
 native timers to a shared heap also needs a server when every vCPU is away;
 a timer armed on some other current vCPU is not a lifetime guarantee.
 
-## Proposed neutral owner and state machine
+## Neutral owner and state machine
 
 The semantic owner is the exact zone record, not a vCPU or host continuation.
-Add `NativeTimedPark` in `carrick-sched-core`, containing authenticated
+`NativeTimedPark` in `carrick-sched-core` contains authenticated
 `RecordRef`, park sequence, original counter deadline and a neutral completion
 kind. The completion kind distinguishes scalar result from object timeout;
-Linux supplies the scalar timeout value. Index storage remains bounded to one
+Linux supplies the scalar timeout value at futex admission, through the
+existing neutral scheduler transport. The descriptor is an authenticated view
+of the index ticket and record, rather than a second copy of park state.
+Index storage remains bounded to one
 node per admitted record. Its serving authority is a typed enum:
 `SlotTimer(SlotId)` or `CarrierDeadline`, never an unauthenticated slot number.
 The parked record keeps the node through serving-authority transfer.
@@ -46,10 +49,22 @@ State transitions:
    expired marker for epoll's retained operation. Dispatch is not replayed for
    scalar futex completion. Object operation resumption preserves its token.
 5. Cancellation consumes the same node; stale generation/sequence receipts do
-   nothing to a reused record. Slot reset cannot cancel CarrierDeadline nodes.
-6. Busy retains the owned operation and notification obligation. Release of the
-   actual contended queue/placement authority wakes the retry. No deadline
-   restart, periodic polling, timeout increase or guest-visible Busy errno.
+   nothing to a reused record. Slot reset and home-record settlement cannot cancel CarrierDeadline nodes.
+6. The driver takes the existing non-refusing host short-lock path. After
+   the Parked CAS wins, a `HostTransfer` owns cleanup through contention;
+   no ticket can be abandoned as Busy and no guest executor lease is held.
+   The contended-cleanup test holds the original bucket, observes that exact
+   transfer awaiting release, then checks one completion and zero nodes.
+   No new fallible refusal arm, deadline retry or guest Busy errno is added.
+
+The implemented detail differs from the proposal at expiry: arbitration
+uses the existing Parked-to-HostTransfer CAS before cleanup, rather than
+acquiring the wait queue before the CAS. This reuses the scheduler's exclusive
+cleanup authority, closes cancellation/reuse during unlink, and avoids a new
+Busy retry protocol. Wake uses the same Parked sequence, so its competing CAS
+still decides the one winner; native readiness is published only after cleanup.
+The index lease is cancelled by the winning transfer, or the final guest wake
+unlink, never by mere executor departure.
 
 The carrier driver's work is deadline delivery, not Linux syscall handling.
 It must remain armed with zero active guest slots and wake the existing native
@@ -67,7 +82,7 @@ Do not create a thread or host readiness pipe per guest park.
   as the execution owner. `reset_slot` checks only its actual obligations.
 - `carrick-sched-core/src/object_wait.rs`: retain object timeout semantics
   through the same owner; no epoll-specific timer implementation.
-- `carrick-kernel/src/el1_zone.rs`: carrier-lifetime deadline driver and
+- `carrick-kernel/src/el1_zone.rs`: carrier deadline delivery and
   authenticated delivery into native readiness. Adapt the existing
   `HandbackEvent::NativeQueued` notification; do not route through host waits.
 - Shared runtime carrier lifecycle: start/stop the driver with zone lifetime,
@@ -99,26 +114,64 @@ expiry with no running vCPU, and driver shutdown while a callback is admitted.
 A test that manually calls expiry with the deadline proves arbitration only;
 it does not prove a live driver will ever call it.
 
-Only after futex is green, add the epoll_pwait timeout-drain witness and retain
-its operation token through this owner. Nanosleep has not been implemented in
-this round. The director identified PR #1836 / #1808 as the existing lane; read
-and reuse that work before any implementation. It is not absorbed here.
-Nanosleep needs a native operation carrying selected clock, absolute/relative
-mode, original deadline and remaining-time output on interruption. Routing
-changes in crossing.rs and the flip table remain director-owned. No proposed
-routing diff has yet been validated against #1836.
+The same owner covers native epoll object timers. The departure/notification
+witness first failed with zero admitted nodes on the original head; the
+expiry witness requires the original deadline, one retained operation, the
+expired marker, empty enrollment and zero timer nodes before record retirement.
+This is neutral object-owner evidence, not a signed epoll workload claim.
 
-### Inspection of #1836
+## Runtime driver and clocks
 
-Fetched `work/1808-arm-nanosleep` and inspected its clock-service, sleep owner
-and zone wake changes. It provides a container-scoped `ClockResourceService`
-with a Condvar-driven timer hub and a non-Copy `NativeSleep` that retains its
-subscription through arm/cancel ACKs. Reuse that driver infrastructure rather
-than introduce another host timer thread mechanism. It is not absorbed in this
-round: its wake channel notifies `native_service` and wakes a synthetic futex
-address; it does not authenticate or expire the original timed-futex park
-sequence, transfer the existing timer-index node, or preserve futex wake XOR
-timeout arbitration. Adapting it needs a neutral exact-park deadline target,
-not a call to `wake_native_sleep_channel` for the user's original futex address.
-Its existing remaining-time and absolute-sleep owner tests are relevant to the
-later nanosleep step, after the timed-futex owner is fixed.
+The base contains no carrier-lifetime server for abandoned slot timer nodes:
+`IpcCounterDeadline` supplies retained operation metadata; the idle/hardware
+timer path only serves live slots. Host-owned records instead have a host
+continuation which owns the remaining wait. Neither can serve a native park
+with every executor away.
+
+`carrick-runtime::deadline_driver` factors a shared Condvar deadline driver
+using the lifetime/wait/shutdown discipline inspected in #1836. It sleeps on
+the minimum of the same neutral heap and owns no second timer inventory.
+Transfer notifies it before returning from the departure boundary. Earlier
+insertion interrupts the sleep; cancellation can leave an obsolete earlier
+sleep, which is harmless and pruned on wake. Shutdown interrupts sleep and
+joins an admitted callback before releasing the target's mapping custody.
+The runtime target retains the persistent executor factory authority, whose
+Arc owns the carrier mappings. Startup failure drops and joins the driver guard; its published doorbell
+retains only inactive notification state, never the mapping target.
+
+The HVF binding samples host monotonic ticks, the same epoch and timebase as
+its guest CNTVCT, and converts through the host TickScale. No nanosecond
+interpretation is applied to a guest TSC. The shared driver accepts a target
+which supplies its calibrated remaining time and exact expiry; KVM/CPL0 can
+use that same neutral owner without copying a syscall state machine. The
+existing KVM persistent-runtime seam and x86 timed-futex routing (#1899)
+remain open; this PR does not claim to close those existing gaps. The real
+KVM entry gate verifies the current CPL0 image, not an unbound runtime driver.
+
+The live-driver unit witness uses an explicit nanosecond counter calibration,
+real neutral futex enrollment and heap transfer with every slot stopped. Only
+the worker thread calls expiry; it must deliver one original-deadline result,
+clear enrollment and free the node. A separate admitted-callback shutdown
+witness checks the join obligation.
+
+## Nanosleep and #1836
+
+Native nanosleep intentionally stays red here: it requires the retained sleep
+operation and wire protocol implemented by #1836, rather than a bounded
+addition to the futex timeout result owner. The exact proposed continuation is
+to carry #1836's non-Copy `NativeSleep` through arm/cancel ACK, retain clock id,
+absolute/relative mode, original deadline and remaining-time output, and bind
+its resource timer delivery to the shared deadline driver. A scalar futex
+return cannot represent interruption output or a clock-change subscription.
+No edits to crossing.rs or the ring-first flip table are proposed in this PR;
+any routing change is director-owned. Clock_nanosleep and pselect remain
+crossings too.
+
+#1836 is **partly absorbed** at the driver-mechanism level only: the shared
+Condvar worker here is reusable by its clock service, while its sleep owner,
+wire protocol and clock subscriptions are not imported. Its current synthetic
+address/native_service wake channel is not used for futex timeout completion.
+When integrating the two PRs, adapt its timer hub to this shared driver and
+reconcile the ABI hash and overlapping zone code; do not retain two workers
+for the same carrier deadline heap. This PR makes no native nanosleep success
+claim.
