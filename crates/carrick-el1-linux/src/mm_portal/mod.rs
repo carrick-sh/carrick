@@ -7,7 +7,7 @@ use core::num::NonZeroU64;
 mod edit_wait;
 mod fork;
 mod maintenance;
-pub use edit_wait::{park_anonymous_edit, park_prepared_edit};
+pub use edit_wait::{complete_anonymous_edit_replay, park_anonymous_edit, park_prepared_edit};
 pub use maintenance::*;
 pub mod production;
 pub use fork::*;
