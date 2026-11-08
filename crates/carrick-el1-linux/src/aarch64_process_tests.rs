@@ -9976,6 +9976,9 @@ fn arm_terminal_entries_release_parked_anonymous_edit() {
                         )
                         .unwrap(),
                         &carrick_sched_core::ShortLockSpin,
+                        &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                        },
                     )
                     .unwrap();
                 let mut effects = WakeEffects::default();

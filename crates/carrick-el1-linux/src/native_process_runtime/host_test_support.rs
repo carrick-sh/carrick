@@ -2811,6 +2811,7 @@ mod anonymous_wait_cancellation_tests {
                 None,
                 carrick_sched_core::Handback::Control,
                 &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             ),
             carrick_sched_core::HostClaim::Claimed,
         );
@@ -3022,6 +3023,7 @@ mod anonymous_wait_cancellation_tests {
                 None,
                 carrick_sched_core::Handback::Cancelled,
                 &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             ),
             carrick_sched_core::HostClaim::Claimed
         );
