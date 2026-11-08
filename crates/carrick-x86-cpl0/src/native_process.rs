@@ -90,7 +90,7 @@ pub(super) fn admit_root(
     words: ParkedContextWords,
     source: BornInZoneSource<'static, ParkedContextWords>,
     task: &'static CurrentTask,
-) -> Result<(), NativeProcessError> {
+) -> Result<(), carrick_el1_linux::native_process_runtime::NativeAdmissionError> {
     let root =
         carrick_el1::isa::x86::hardware_live_root().map_err(|_| NativeProcessError::Stale)?;
     let mm = MmGeneration::new(
@@ -121,7 +121,7 @@ pub(super) fn admit_root(
             page.release_live(1)
                 .map_err(|_| NativeProcessError::Stale)?;
         }
-        _ => return Err(NativeProcessError::Invalid),
+        _ => return Err(NativeProcessError::Invalid.into()),
     }
     let owner = NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
         source, task, page, control, address, address, words,

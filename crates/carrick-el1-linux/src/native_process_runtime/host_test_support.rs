@@ -7641,3 +7641,237 @@ fn entropy_fault_completion(cancel_wait: bool) {
     }
     assert_eq!(fixture.page.claimed_count(), 0);
 }
+
+#[test]
+fn admission_root_registration_collision_reports_identity() {
+    let fixture = native_exec_fixture();
+    let binding = super::super::common_entry::execution_binding(fixture.task);
+    let error = fixture
+        .registry
+        .register_root(
+            fixture.runtime.clone(),
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+            NativeAdmissionContention {
+                origin: NativeAdmissionOrigin::RootRegistrationCollision,
+                binding,
+                old_record: Some(fixture.record),
+                new_record: fixture.record,
+                conflicting_owner: Some(binding),
+            }
+        ))
+    );
+}
+
+#[test]
+fn admission_old_record_retained_reports_identity() {
+    let fixture = native_exec_fixture();
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 1);
+    fixture.zone.publish_slot(slot, 1, Some(0), 1);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, 1).unwrap();
+    let record = fixture
+        .zone
+        .current_or_new(slot, fixture.zone.record(fixture.record.id).identity())
+        .unwrap();
+    let reference = fixture.zone.record_ref(record);
+    let binding = super::super::common_entry::execution_binding(fixture.task);
+    let error = fixture
+        .registry
+        .rehome_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+            NativeAdmissionContention {
+                origin: NativeAdmissionOrigin::OldRecordRetained,
+                binding,
+                old_record: Some(fixture.record),
+                new_record: reference,
+                conflicting_owner: Some(binding),
+            }
+        ))
+    );
+}
+
+#[test]
+fn admission_execution_key_collision_reports_identity() {
+    admission_rehome_collision(false);
+}
+
+#[test]
+fn admission_record_key_collision_reports_identity() {
+    admission_rehome_collision(true);
+}
+
+/// Hold a destination registry reservation made from a real registered member.
+/// A steady-state successful registration cannot create duplicate keys; this
+/// schedule exercises the refusing production seam with the destination held.
+fn admission_rehome_collision(record_collision: bool) {
+    let fixture = native_exec_fixture();
+    let old_binding = super::super::common_entry::execution_binding(fixture.task);
+    let old_record = fixture.record;
+    fixture
+        .zone
+        .discard_unpublished(fixture.slot, old_record.id);
+    fixture.task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+        5,
+    );
+    let binding = super::super::common_entry::execution_binding(fixture.task);
+    let mut identity = fixture.zone.record(old_record.id).identity();
+    identity.generation = 12;
+    let record = fixture.zone.current_or_new(fixture.slot, identity).unwrap();
+    let reference = fixture.zone.record_ref(record);
+    let key = NativeExecutionKey::new(fixture.zone, binding, fixture.address).unwrap();
+    let old_key = NativeExecutionKey::new(fixture.zone, old_binding, fixture.address).unwrap();
+    {
+        let mut state = fixture.registry.state.lock();
+        if record_collision {
+            state.records.insert(
+                NativeProcessRegistry::<AddressContext<RootGpa>, ParkedContextWords>::record_key(
+                    fixture.zone,
+                    reference,
+                ),
+                old_key,
+            );
+        } else {
+            let owner = state.members.get(&old_key).unwrap().clone();
+            state.members.insert(key, owner);
+        }
+    }
+    let error = fixture
+        .registry
+        .rehome_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+            NativeAdmissionContention {
+                origin: if record_collision {
+                    NativeAdmissionOrigin::RecordKeyCollision
+                } else {
+                    NativeAdmissionOrigin::ExecutionKeyCollision
+                },
+                binding,
+                old_record: Some(old_record),
+                new_record: reference,
+                conflicting_owner: Some(if record_collision {
+                    old_binding
+                } else {
+                    binding
+                }),
+            }
+        ))
+    );
+}
+
+#[test]
+fn admission_thread_registration_collision_reports_identity() {
+    let fixture = native_exec_fixture();
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    control.publish_visible_tid(42);
+    let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+        carrick_core_abi::EntryTaskKey::from_raw(42),
+        carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+        carrick_core_abi::EntryThreadGeneration::from_raw(102),
+    )
+    .unwrap();
+    control.publish_host_birth_identity(birth);
+    let birth_slot = fixture.page.reserve_host_birth().unwrap();
+    carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
+    assert!(fixture.page.publish_host_birth(birth_slot, birth));
+    let task = CurrentTask::new();
+    task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+        5,
+    );
+    task.mm.key.store(1, Ordering::Release);
+    task.mm.thread_generation.store(102, Ordering::Release);
+    task.publish_visible_pid(41);
+    task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 1);
+    fixture.zone.publish_slot(slot, 1, Some(0), 1);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, 1).unwrap();
+    let mut identity = fixture.zone.record(fixture.record.id).identity();
+    identity.tid = 42;
+    identity.generation = 12;
+    identity.serial = 102;
+    identity.control_slot = control as *const _ as u64;
+    let record = fixture.zone.current_or_new(slot, identity).unwrap();
+    let reference = fixture.zone.record_ref(record);
+    control.bind_zone_record(reference);
+    let owner = NativeExecutionKey::new(
+        fixture.zone,
+        super::super::common_entry::execution_binding(fixture.task),
+        fixture.address,
+    )
+    .unwrap();
+    fixture.registry.state.lock().records.insert(
+        NativeProcessRegistry::<AddressContext<RootGpa>, ParkedContextWords>::record_key(
+            fixture.zone,
+            reference,
+        ),
+        owner,
+    );
+    let error = fixture
+        .registry
+        .register_thread(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            &task,
+            fixture.address,
+            fixture.page,
+            control,
+        )
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+            NativeAdmissionContention {
+                origin: NativeAdmissionOrigin::ThreadRegistrationCollision,
+                binding: super::super::common_entry::execution_binding(&task),
+                old_record: Some(fixture.record),
+                new_record: reference,
+                conflicting_owner: Some(owner.binding()),
+            }
+        ))
+    );
+}
