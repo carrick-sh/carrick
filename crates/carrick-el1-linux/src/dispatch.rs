@@ -1445,7 +1445,7 @@ fn arm_native_service_exit(
         sched::CpuExitCause::Svc,
     );
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
-        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+        .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     let (result, phase) = super::aarch64_process::with_process_entry(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
@@ -1806,7 +1806,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_current(
     );
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
-        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+        .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     arm_deliver_declined_fault_signal(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
@@ -1819,7 +1819,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_current(
         owner_wait,
         |process, frame| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding))
+    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)))
 }
 
 /// Lower-EL data abort, translation fault at level 0, used only to carry the
@@ -1910,7 +1910,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     );
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
-        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+        .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     let delivered = super::aarch64_process::with_process_entry(
         source,
         task,
@@ -1921,7 +1921,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     match delivered {
         None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
