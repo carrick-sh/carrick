@@ -623,46 +623,47 @@ fn clear_tid_stopped_join_driver<C, B>(
                 &mut service,
             )
             .unwrap();
-        let mut pending: crate::dispatch::El1PendingFamilies<
-            '_,
-            '_,
-            _,
-            crate::sched::FakeCpu,
-            crate::sched::HardwareUserWord,
-            _,
-            C,
-        > = crate::dispatch::El1PendingFamilies {
-            handoff: None,
-            lifecycle_user: None,
-            frame: &mut ExitFrame(isa),
-            counters: &counters,
-            current_tasks: core::slice::from_ref(task),
-            fd_map: &[],
-            object_table: &[],
-            open_table: &[],
-            inotify_table: &[],
-            name_cache: &names,
-            zone: None,
-            ipc: None,
-            lifecycle: Some(&venue),
-            process: Some(entry.as_mut()),
-            source: Some(child_source),
-            anonymous: None,
-            cache_lookup: |_| core::ptr::null_mut(),
-        };
-        assert_eq!(
-            dispatch(
-                carrick_syscall_abi::CanonicalNr::new(
-                    carrick_personality_linux::lifecycle::SYS_EXIT as u64
-                )
-                .raw(),
-                u64::MAX,
-                &mut pending
-            ),
-            CompletionRoute::Suspended,
-            "raw nonfinal exit must never forward to host custody"
-        );
-        drop(pending);
+        {
+            let mut pending: crate::dispatch::El1PendingFamilies<
+                '_,
+                '_,
+                _,
+                crate::sched::FakeCpu,
+                crate::sched::HardwareUserWord,
+                _,
+                C,
+            > = crate::dispatch::El1PendingFamilies {
+                handoff: None,
+                lifecycle_user: None,
+                frame: &mut ExitFrame(isa),
+                counters: &counters,
+                current_tasks: core::slice::from_ref(task),
+                fd_map: &[],
+                object_table: &[],
+                open_table: &[],
+                inotify_table: &[],
+                name_cache: &names,
+                zone: None,
+                ipc: None,
+                lifecycle: Some(&venue),
+                process: Some(entry.as_mut()),
+                source: Some(child_source),
+                anonymous: None,
+                cache_lookup: |_| core::ptr::null_mut(),
+            };
+            assert_eq!(
+                dispatch(
+                    carrick_syscall_abi::CanonicalNr::new(
+                        carrick_personality_linux::lifecycle::SYS_EXIT as u64
+                    )
+                    .raw(),
+                    u64::MAX,
+                    &mut pending
+                ),
+                CompletionRoute::Suspended,
+                "raw nonfinal exit must never forward to host custody"
+            );
+        }
         // The dispatcher consumed and authenticated the terminal receipt.
         assert!(entry.take_handoff_receipt().is_none());
         assert!(entry.take_run_failure().is_none());
