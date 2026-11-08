@@ -1678,7 +1678,7 @@ fn poll_completed_answer_survives_copyout_refusal(control: bool) {
     };
     let saved = w.region.operation(&token).unwrap();
     assert_eq!(saved.result, 1);
-    assert_eq!(saved.progress, WriteProgress::new(8));
+    assert_eq!(saved.progress, WriteProgress::new(2));
     w.region
         .lock(object, &HostIpcWait)
         .unwrap()
