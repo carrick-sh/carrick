@@ -2,13 +2,16 @@
 //! EL1 scheduler context. They have performed no effect before this park.
 
 use carrick_core::wait::{
-    EditWaitOutcome, EditWaitTarget, OperationResumePc, coordinate_prepared_edit_wait,
+    EditWaitOutcome, EditWaitTarget, OperationResumePc, coordinate_anonymous_edit_wait,
+    coordinate_prepared_edit_wait,
 };
 use carrick_el1::memory::reservations::SharedReservations;
 use carrick_el1::substrate::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1_abi::{ReservationMm, ReservationRange, TrapFrame};
 use carrick_personality_linux::dispatch::AnonymousCall;
+use carrick_sched_core::spaces::notification::SpaceWaitCause;
 use carrick_syscall_abi::CanonicalNr;
+use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
 /// No result means the existing syscall venue continues. A result means its
@@ -86,7 +89,7 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
                 .linux
                 .orig_arg0
                 .store(frame.x[0], Ordering::Relaxed);
-            frame.x[0] = (-3i64) as u64;
+            frame.elr = resume.raw();
             Some(Served::Returned { switched: false })
         }
         EditWaitOutcome::Parked(parked) => {
@@ -97,5 +100,99 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
             }
         }
         EditWaitOutcome::NoConflict | EditWaitOutcome::Refused => None,
+    }
+}
+
+/// A native anonymous refusal has made no effects. Recheck the exact MM
+/// resource after observing every release source, then park or replay the
+/// original SVC. The pre-dispatch prepared check above remains a fast probe.
+pub fn park_anonymous_edit<C: ThreadCpu, U: UserWord>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut TrapFrame,
+    table: &SharedReservations,
+    _initial_cause: SpaceWaitCause,
+) -> Option<Served> {
+    let mm = ReservationMm::new(sched.task.mm.key.load(Ordering::Acquire))?;
+    let index = sched.zone.spaces.find(mm.raw())?;
+    if !table.admitted(index.index(), mm) {
+        return None;
+    }
+    let source = sched
+        .zone
+        .space_entry(NonZeroU64::new(mm.raw())?)?
+        .live_notifications()
+        .ok()?;
+    let resume = OperationResumePc::new(frame.elr.checked_sub(4)?)?;
+    let resumed = sched.take_object_operation().ok().flatten();
+    let slot = sched.slot;
+    let access = carrick_el1::substrate::sched::object_wait::space_access(sched.zone, slot);
+    let owner = NonZeroU64::new(slot.index() as u64 + 1)?;
+    let task = sched.task;
+    AnonymousCall::from_canonical(CanonicalNr::new(frame.x[8]))?;
+    let zone = sched.zone;
+    let outcome = coordinate_anonymous_edit_wait(
+        &source,
+        resumed,
+        || {
+            let mut root = match table.lock_in(access, index.index(), mm, slot.index() as u32) {
+                Ok(root) => root,
+                Err(carrick_el1::memory::reservations::Refusal::Busy) => {
+                    return Some(Some(SpaceWaitCause::Reservations));
+                }
+                Err(_) => return None,
+            };
+            use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall};
+            let decision = decide_reservation_syscall(frame, task, &mut root, None);
+            match decision {
+                ReservationDisposition::Unavailable(
+                    carrick_el1::memory::reservations::Refusal::PreparedConflict,
+                ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
+                ReservationDisposition::Unavailable(
+                    carrick_el1::memory::reservations::Refusal::Busy,
+                ) => return Some(Some(SpaceWaitCause::PendingEdit)),
+                ReservationDisposition::Unavailable(
+                    carrick_el1::memory::reservations::Refusal::MetadataRequired,
+                ) => return None,
+                ReservationDisposition::Unavailable(_) => return None,
+                ReservationDisposition::Work(pending) => {
+                    if pending.cancel(&mut root).is_err() {
+                        return None;
+                    }
+                }
+                ReservationDisposition::Return(_) | ReservationDisposition::Forward => {}
+            }
+            drop(root);
+            match zone
+                .spaces
+                .try_begin_edit_cause(index, mm.raw(), owner, access.venue())
+            {
+                Ok(editor) => {
+                    drop(editor);
+                    Some(None)
+                }
+                Err(carrick_sched_core::spaces::EditAdmissionRefusal::Editor) => {
+                    Some(Some(SpaceWaitCause::Editor))
+                }
+                Err(carrick_sched_core::spaces::EditAdmissionRefusal::Gate) => {
+                    Some(Some(SpaceWaitCause::Gate))
+                }
+                Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => None,
+            }
+        },
+        |key, snapshot, token| sched.park_object(frame, key, snapshot, resume, token, None),
+    );
+    match outcome {
+        EditWaitOutcome::Parked(parked) => {
+            if sched.task.linux.has_pending_host_work() {
+                sched.leave_after_object_park(parked)
+            } else {
+                sched.resume_after_object_park(frame, parked, 0)
+            }
+        }
+        EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => {
+            frame.elr = resume.raw();
+            Some(Served::Returned { switched: false })
+        }
+        EditWaitOutcome::Refused => None,
     }
 }

@@ -1,10 +1,11 @@
 //! Anonymous-family entry ordering; order 7 retains the native MM operation hooks.
 use crate::abi::entry::{LinuxTaskState, SyscallResult};
 use crate::dispatch::{AnonymousCall, FamilyCompletion};
+use carrick_sched_core::spaces::notification::SpaceWaitCause;
 
 pub enum DelegatedStep {
     NotDelegated,
-    PreparedConflict,
+    Contended(SpaceWaitCause),
     Served(SyscallResult),
     Forward,
 }
@@ -24,9 +25,21 @@ pub trait PendingAnonymousVenue {
     fn task_state(&self) -> Option<&LinuxTaskState>;
     fn delegated(&mut self) -> DelegatedStep;
     fn park_prepared(&mut self) -> Option<FamilyCompletion>;
+    fn park_contended(&mut self, cause: SpaceWaitCause) -> Option<FamilyCompletion> {
+        if cause == SpaceWaitCause::PreparedOverlap {
+            self.park_prepared()
+        } else {
+            None
+        }
+    }
     fn permission(&mut self) -> PermissionStep;
     fn retirement(&mut self) -> RetirementStep;
     fn install_result(&mut self, result: SyscallResult);
+    fn take_x86_handoff_receipt(
+        &mut self,
+    ) -> Option<carrick_core_abi::EntryHandoffReceipt<carrick_sched_core::ParkedContextWords>> {
+        None
+    }
 }
 
 /// Delegated ownership wins; only its explicit NotDelegated allows the legacy
@@ -37,8 +50,10 @@ pub fn serve(
 ) -> FamilyCompletion {
     let original = venue.original_argument0();
     match venue.delegated() {
-        DelegatedStep::PreparedConflict => {
-            return venue.park_prepared().unwrap_or(FamilyCompletion::Handback);
+        DelegatedStep::Contended(cause) => {
+            return venue
+                .park_contended(cause)
+                .unwrap_or(FamilyCompletion::Handback);
         }
         DelegatedStep::Served(result) => {
             record_original(venue, original);
