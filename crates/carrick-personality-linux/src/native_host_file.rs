@@ -119,6 +119,11 @@ pub enum HostFileCall {
         path: u64,
         flags: u64,
     },
+    Symlinkat {
+        target: u64,
+        dirfd: i32,
+        path: u64,
+    },
     Faccessat {
         dirfd: i32,
         path: u64,
@@ -252,6 +257,11 @@ impl HostFileCall {
                 dirfd: fd,
                 path: args[1],
                 flags: args[2],
+            },
+            c if c == nr::SYMLINKAT => Self::Symlinkat {
+                target: args[0],
+                dirfd: args[1] as i32,
+                path: args[2],
             },
             c if c == nr::FACCESSAT => Self::Faccessat {
                 dirfd: fd,
@@ -588,6 +598,14 @@ fn chunk(count: u64) -> usize {
     (count as usize).min(HOST_FILE_CHUNK_BYTES)
 }
 
+fn path_pair(first: &[u8], second: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(first.len() + 1 + second.len());
+    input.extend_from_slice(first);
+    input.push(0);
+    input.extend_from_slice(second);
+    input
+}
+
 /// Gather `writev` vectors into one bounded chunk, in order.
 fn gather_vectors(
     user: &mut dyn HostFileUser,
@@ -723,6 +741,31 @@ fn stage_call(
                 flags as u32,
                 [0; 4],
                 &path,
+                None,
+            )
+        }
+        HostFileCall::Symlinkat {
+            target,
+            dirfd,
+            path,
+        } => {
+            let target = match copy_path(user, target) {
+                Path::Bytes(target) if target.is_empty() => {
+                    return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
+                }
+                Path::Bytes(target) => target,
+                Path::Stage(stage) => return Some(stage),
+            };
+            let path = match staging.path_input(user, dirfd, path)? {
+                Ok(path) => path,
+                Err(stage) => return Some(stage),
+            };
+            staging.request(
+                HostFileOp::Symlinkat,
+                LINUX_AT_FDCWD,
+                0,
+                [0; 4],
+                &path_pair(&target, &path),
                 None,
             )
         }
