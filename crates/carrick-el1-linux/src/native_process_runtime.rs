@@ -978,7 +978,7 @@ fn host_admitted_process(
         .host_birth_identity()
         .ok_or(NativeProcessError::Stale)?;
     if birth.task().raw() != id.raw() as u64 {
-        return Err(NativeProcessError::Stale.into());
+        return Err(NativeProcessError::Stale);
     }
     Ok(TaskKey {
         id,
@@ -1716,7 +1716,7 @@ impl NativeExecutionKey {
     ) -> Result<Self, NativeProcessError> {
         let task = NativeThreadIdentity::from_binding(binding)?;
         if binding.mm.raw() != address.mm.raw().get() {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         Ok(Self {
             carrier: core::ptr::from_ref(zone).addr(),
@@ -2780,7 +2780,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .runtime
             .clone();
         if !core::ptr::eq(Arc::as_ptr(&runtime), parent) {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let child_key = NativeExecutionKey {
             carrier: core::ptr::from_ref(parent.zone).addr(),
@@ -3190,7 +3190,7 @@ impl IssuedHostThread {
         record: carrick_sched_core::RecordId,
     ) -> Result<Self, NativeProcessError> {
         if !binding.issued() || control.entry().is_some() {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let key = NativeThreadIdentity::from_binding(binding)?
             .issued()
@@ -3206,11 +3206,11 @@ impl IssuedHostThread {
             || !(0..carrick_el1_abi::THREAD_POOL_ENTRIES)
                 .any(|index| page.host_birth_identity(index) == Some(birth))
         {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let record_ref = source.zone.record_ref(record);
         if control.zone_record() != Some(record_ref) {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let identity = source.zone.record(record).identity();
         if identity.tid != binding.task.raw()
@@ -3220,7 +3220,7 @@ impl IssuedHostThread {
             || identity.lifecycle_page != core::ptr::from_ref(page).addr() as u64
             || identity.control_slot != core::ptr::from_ref(control).addr() as u64
         {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         Ok(Self {
             key,
@@ -3241,7 +3241,7 @@ impl IssuedHostThread {
     ) -> Result<bool, NativeProcessError> {
         let namespace_pid = row.metadata().namespace_pid;
         if self.visible_pid != namespace_pid || self.visible_tid == namespace_pid {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let resources = row.native().resources();
         if !core::ptr::eq(resources.page, page)
@@ -3251,7 +3251,7 @@ impl IssuedHostThread {
             || !resources.page.gate().serves_ring()
             || resources.page.live() <= 1
         {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         if let Some(existing) = resources
             .members
@@ -3263,7 +3263,7 @@ impl IssuedHostThread {
                 || (existing.record != self.record
                     && signal_record_exists(source.zone, existing.record))
             {
-                return Err(NativeProcessError::Stale.into());
+                return Err(NativeProcessError::Stale);
             }
             return Ok(true);
         }
@@ -3272,7 +3272,7 @@ impl IssuedHostThread {
         }) || resources.members.len() >= resources.page.live() as usize
             || row.credentials_for(self.visible_tid).is_ok()
         {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         Ok(false)
     }
@@ -3656,7 +3656,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             let control = owned_control(page, leader, address).ok_or(NativeProcessError::Stale)?;
             let record = control.zone_record().ok_or(NativeProcessError::Stale)?;
             if !signal_record_exists(zone, record) {
-                return Err(NativeProcessError::Stale.into());
+                return Err(NativeProcessError::Stale);
             }
             let retained = zone.record(record.id).identity();
             let visible = NonZeroU32::new(identity.visible_tid).ok_or(NativeProcessError::Stale)?;
@@ -3684,7 +3684,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     },
                 )
             {
-                return Err(NativeProcessError::Stale.into());
+                return Err(NativeProcessError::Stale);
             }
             members.push((
                 NativeMember {
@@ -4043,7 +4043,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         service: &'r mut S,
     ) -> Result<NativeProcessEntry<'r, 'a, M, C, S>, NativeProcessError> {
         if !core::ptr::eq(source.zone, self.zone) {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let binding = super::common_entry::execution_binding(current);
         let record = source
@@ -4072,7 +4072,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .task_mut(key)
             .map_err(|_| NativeProcessError::Stale)?;
         if !words.authenticates(row.native().resources().address) {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let control = owned_control(
             row.native().resources().page,
@@ -4089,7 +4089,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             || current.metadata.control_slot.load(Ordering::Acquire)
                 != resources.control as *const _ as u64
         {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let slot = Some(resources.control);
         let calling_tid = resources
@@ -4207,7 +4207,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: &C,
     ) -> Result<AuthenticatedProcessEntry<'a>, NativeProcessError> {
         if !core::ptr::eq(source.zone, self.zone) {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let binding = super::common_entry::execution_binding(current);
         let member_key = NativeExecutionKey::new(source.zone, binding, address)?;
@@ -4221,7 +4221,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         if !core::ptr::eq(Arc::as_ptr(&member.runtime), self)
             || !words.authenticates(member.address)
         {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let record = source
             .zone
@@ -4243,7 +4243,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 != core::ptr::from_ref(resources.page).addr() as u64
             || current.visible_pid() != Some(row.metadata().namespace_pid)
         {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let member_control = resources
             .members
@@ -4254,13 +4254,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         if current.metadata.control_slot.load(Ordering::Acquire)
             != member_control as *const _ as u64
         {
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let record_ref = source.zone.record_ref(record);
         member_control.bind_zone_record(record_ref);
         if core::ptr::eq(member_control, resources.control) {
             if resources.record != record_ref {
-                return Err(NativeProcessError::Stale.into());
+                return Err(NativeProcessError::Stale);
             }
             *row.context_mut() = *words;
         }
@@ -5569,7 +5569,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     && core::ptr::eq(member.control.control(), self.control)
             }) || !signal_record_exists(zone, self.record)
             {
-                return Err(NativeProcessError::Stale.into());
+                return Err(NativeProcessError::Stale);
             }
             NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
             resources.interrupted_child_waits.insert(
@@ -6136,7 +6136,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         .begin();
         let Some(entry) = entry else {
             if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
-                return Err(NativeProcessError::Stale.into());
+                return Err(NativeProcessError::Stale);
             }
             return Ok(LifecycleOutcome::HostCustody);
         };
@@ -6148,7 +6148,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 | carrick_core::lifecycle::MemberMembershipError::InFlight,
             )) => {
                 if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
-                    return Err(NativeProcessError::Stale.into());
+                    return Err(NativeProcessError::Stale);
                 }
                 return Ok(LifecycleOutcome::HostCustody);
             }
@@ -6907,7 +6907,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             >::admitted(identity)
             .begin();
             if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
-                return Err(NativeProcessError::Stale.into());
+                return Err(NativeProcessError::Stale);
             }
         }
 
@@ -7540,7 +7540,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(task) => task.native().resources(),
                 Err(_) => {
                     graph.owner.rollback_birth(&permit);
-                    return Err(NativeProcessError::Stale.into());
+                    return Err(NativeProcessError::Stale);
                 }
             };
             (
@@ -7626,7 +7626,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if let Err((_, p)) = self.service.abort_mm(prepared) {
                 self.service.quarantine_prepared(p)
             };
-            return Err(NativeProcessError::Stale.into());
+            return Err(NativeProcessError::Stale);
         }
         let lifecycle = self.service.child_lifecycle(&prepared);
         let page = lifecycle.page;
