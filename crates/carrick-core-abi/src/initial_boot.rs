@@ -14,6 +14,8 @@ pub const X86_INITIAL_MAX_STRINGS: usize = 256;
 /// into one virtual region so root release authenticates the exact zone.
 pub const X86_CPL0_RESERVATIONS_OFFSET: u64 = 0x2_0000;
 pub const X86_CPL0_ZONE_OFFSET: u64 = 0x40_0000;
+/// Physical base of the retained CPL0 metadata region.
+pub const X86_CPL0_METADATA_GPA: u64 = 0xc0_0000;
 
 pub const X86_INITIAL_BOOT_PENDING: u32 = 0;
 pub const X86_INITIAL_BOOT_LOADED: u32 = 1;
@@ -127,5 +129,11 @@ const _: () = {
 /// Retained initial-image frames use their own supervisor alias, never the
 /// short bootstrap direct window. The full 512 MiB budget fits here.
 pub const X86_CPL0_INITIAL_EXTENT_VA: u64 = 0xffff_fffe_0000_0000;
-pub const X86_CPL0_INITIAL_EXTENT_GPA: u64 = 0x40_00000;
+/// The image follows the actual shared scheduler geometry, rather than a
+/// fixed gap that a new notification domain could silently outgrow.
+pub const X86_CPL0_INITIAL_EXTENT_GPA: u64 = (X86_CPL0_METADATA_GPA
+    + X86_CPL0_ZONE_OFFSET
+    + core::mem::size_of::<carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>>()
+        as u64)
+    .next_multiple_of(0x20_0000);
 pub const X86_CPL0_INITIAL_EXTENT_MAX_SIZE: u64 = 0x2000_0000;

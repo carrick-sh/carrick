@@ -20,14 +20,16 @@ There is no callback registry or separate release queue implementation.
 `IPC_DESCRIPTOR_TABLE_CAPACITY` owns the following table-slot range; the ABI's
 `IPC_FD_TABLES` consumes that same constant. `IpcLockIndex` admits only those
 ranges, and the compile-time domain gate proves they do not overlap readiness,
-MM, delegated-file, service, or member-control queues. Object wait protocol 17
+MM, delegated-file, service, or member-control queues. The x86 initial-image GPA follows the actual metadata and scheduler end,
+rounded to its existing 2 MiB granule; the compile-time non-overlap gate
+remains in place as the domain grows. Object wait protocol 17
 includes the new range and storage offset in its layout hash.
 
 The source identity is the carrier IPC authority plus its directory slot,
 not an object incarnation or numeric fd. The physical lock survives object
 and table reuse. The carrier owns a base publisher from admission until zone
 destruction. Admission must precede exposure of the corresponding slot; it is
-idempotent only for the exact carrier. Views borrow the venue, and guard
+idempotent only for the exact carrier. Views authenticate the carrier identity before borrowing the venue, and guard
 release reserves a counted ticket from that already admitted base. No binding,
 allocation, or waiting occurs on unlock. Object and descriptor table guards
 release exclusion before advancing the notification revision.

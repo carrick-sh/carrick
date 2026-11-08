@@ -1124,11 +1124,14 @@ impl<'a> IpcRegion<'a> {
     pub fn with_lock_release(
         self,
         release: &'a dyn carrick_sched_core::object_wait::ipc_release::IpcLockRelease,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, IpcError> {
+        if release.carrier() != self.operation_slot_generation() {
+            return Err(IpcError::BadRegion);
+        }
+        Ok(Self {
             lock_release: Some(release),
             ..self
-        }
+        })
     }
 
     /// Who holds `object`'s lock right now (`None`: free), for a caller
