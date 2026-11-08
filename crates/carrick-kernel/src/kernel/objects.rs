@@ -1191,6 +1191,25 @@ pub(crate) enum MappingAdmission<'a> {
 }
 
 impl IpcPhysicalHold {
+    /// Admit I/O from this pinned IPC resource, including after the host's
+    /// last descriptor closed. The projection cannot retain its own
+    /// publication pin; the existing functional lease owns the operation.
+    pub(crate) fn retain_io(&self) -> Option<FileDescriptionFdLease> {
+        let description = self.mapping_description.as_ref()?;
+        let lifecycle = self.physical.transition.lock();
+        if !self.admitted.load(Ordering::Acquire)
+            || lifecycle.ipc_holds == 0
+            || !Arc::ptr_eq(&self.physical, &description.common.physical)
+        {
+            return None;
+        }
+        description.common.retain_fd_ref();
+        description.revision.publish();
+        Some(FileDescriptionFdLease {
+            description: Arc::clone(description),
+        })
+    }
+
     /// Project only the physical byte source. The projection cannot reach the
     /// publication pin, so retaining it never keeps its own IPC resource alive.
     /// The caller owns a pinned resource for the entire admission.
