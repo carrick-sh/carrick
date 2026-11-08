@@ -71,9 +71,7 @@ pub trait FutexVenue {
     fn retained_deadline(&self) -> Option<CounterTick> {
         None
     }
-    fn invalid(&mut self, _result: SyscallResult) -> Option<Self::Served> {
-        None
-    }
+    fn invalid(&mut self, result: SyscallResult) -> Option<Self::Served>;
 
     fn wake(
         &mut self,

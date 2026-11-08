@@ -31,6 +31,9 @@ impl FutexVenue for ClockVenue {
     fn now(&self) -> CounterTick {
         CounterTick::new(1000)
     }
+    fn invalid(&mut self, _: carrick_personality_linux::entry::SyscallResult) -> Option<FutexWait> {
+        None
+    }
     fn wake(&mut self, _: ReservationMm, _: UserVa, _: u32, _: u32) -> Option<FutexWait> {
         None
     }
