@@ -325,3 +325,24 @@ fn native_futex_mapping_owner_busy_once_aarch64() {
         arm_words, true, false,
     );
 }
+
+#[test]
+fn native_futex_mapping_deadline_starts_at_first_attempt_x86() {
+    episode::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(words, true, true);
+}
+#[test]
+fn native_futex_mapping_deadline_starts_at_first_attempt_aarch64() {
+    episode::<carrick_sched_core::Aarch64ParkedContext, carrick_mmu_core::owner_mmu::Aarch64Mmu>(
+        arm_words, true, true,
+    );
+}
+#[test]
+fn native_futex_word_deadline_starts_at_first_attempt_x86() {
+    episode::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(words, false, true);
+}
+#[test]
+fn native_futex_word_deadline_starts_at_first_attempt_aarch64() {
+    episode::<carrick_sched_core::Aarch64ParkedContext, carrick_mmu_core::owner_mmu::Aarch64Mmu>(
+        arm_words, false, true,
+    );
+}
