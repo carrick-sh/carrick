@@ -628,12 +628,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         mut output: OwnedCopyout<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
-        if !output.prefix_on_fault {
-            if let CopyoutData::Bytes { address, bytes } = &output.data {
-                if !carrick_guest_arch::lower_half_range(address.raw(), bytes.len() as u64) {
-                    return Err(NativeProcessError::Fault);
-                }
-            }
+        if !output.prefix_on_fault
+            && let CopyoutData::Bytes { address, bytes } = &output.data
+            && !carrick_guest_arch::lower_half_range(address.raw(), bytes.len() as u64)
+        {
+            return Err(NativeProcessError::Fault);
         }
         let mut prepared_offset = None;
         while output.offset < output.data.len() {
