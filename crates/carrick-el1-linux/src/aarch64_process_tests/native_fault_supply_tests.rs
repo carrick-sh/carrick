@@ -10,7 +10,7 @@ struct FaultMemory {
     pages: RefCell<BTreeMap<u64, Vec<u8>>>,
     copies: Cell<usize>,
 }
-struct SelectionWords<'a>(&'a dyn LiveDescriptorWords);
+pub(super) struct SelectionWords<'a>(pub(super) &'a dyn LiveDescriptorWords);
 impl carrick_el1::fault::PreparedPageResolver for SelectionWords<'_> {
     fn select_backing_window(
         &mut self,

@@ -175,12 +175,13 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
 }
 
 /// Bind ring output to the existing exact-MM native write protocol. Input
-/// remains guarded copy; a refused output carries its producer observation.
+/// refusals retain their access direction; outputs carry producer observations.
 pub(crate) struct OwnerCopy<'a, 'p, 'ipc, U, C: carrick_core_abi::EntryContext> {
     pub inner: U,
     pub owner:
         Option<&'a mut (dyn carrick_personality_linux::lifecycle::ProcessNative<'ipc, C> + 'p)>,
     pub wait: Option<carrick_core::mm::transaction::CopyoutRequest>,
+    pub input_wait: Option<carrick_core::user_copy::GuestCopyRequest>,
 }
 impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, '_, '_, U, C> {
     fn service_origin(&self) -> carrick_core_abi::service::ServiceOrigin {
@@ -196,7 +197,18 @@ impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, 
     }
 
     fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
-        self.inner.copy_in(dst, address)
+        let done = self.inner.copy_in(dst, address);
+        if !done
+            && self.owner.is_some()
+            && carrick_guest_arch::lower_half_range(address, dst.len() as u64)
+        {
+            self.input_wait = Some(carrick_core::user_copy::GuestCopyRequest {
+                address: carrick_guest_arch::UserVa::new(address),
+                len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                access: carrick_guest_arch::Access::Read,
+            });
+        }
+        done
     }
     fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
         if self.inner.copy_out(address, bytes) {

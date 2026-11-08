@@ -103,6 +103,10 @@ impl SyscallFrame for NativeDispatch<'_> {
 }
 
 impl GuestDispatchFrame for NativeDispatch<'_> {
+    fn restart_syscall(&mut self) {
+        // RCX holds the saved user return PC in the SYSCALL frame.
+        self.frame.rcx = self.frame.rcx.wrapping_sub(2);
+    }
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
         self.call.native
     }
