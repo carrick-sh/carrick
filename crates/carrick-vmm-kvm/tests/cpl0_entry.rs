@@ -442,6 +442,17 @@ fn production_probe_elf(code: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn append_mov(code: &mut Vec<u8>, register: &[u8], value: u64) {
+    code.extend_from_slice(register);
+    code.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_result_check(code: &mut Vec<u8>, failures: &mut Vec<usize>, expected: i8) {
+    code.extend_from_slice(&[0x48, 0x83, 0xf8, expected as u8, 0x0f, 0x85]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+}
+
 #[test]
 fn production_image_rejects_fixture_syscalls() {
     let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));
@@ -599,7 +610,12 @@ fn production_anonymous_root_busy_once_parks_and_completes() {
     }
 
     let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
-    assert_eq!(outcome.run.exit_code, 7, "mmap must complete after replay");
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "mmap must complete after replay: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(
         outcome
@@ -614,6 +630,128 @@ fn production_anonymous_root_busy_once_parks_and_completes() {
         0,
         "the test-only injection must not enter production refusal accounting"
     );
+}
+
+/// A real munmap reaches the shared editor admission, parks on one injected
+/// owner, and replays without falling out to the host or refusal accounting.
+#[test]
+fn production_anonymous_editor_busy_once_parks_and_completes() {
+    const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    // mmap(NULL, one page, RW, PRIVATE|ANONYMOUS, -1, 0), retain in r12.
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        code.extend_from_slice(register);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc4, 0x48, 0xb8]); // mov r12,rax; movabs rax
+    code.extend_from_slice(&INJECT_EDITOR_BUSY_ONCE.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x05]);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi,r12
+    append_mov(&mut code, &[0x48, 0xbe], 0x1000);
+    append_mov(&mut code, &[0x48, 0xb8], 11); // munmap
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 1);
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(215))
+            .unwrap(),
+        0
+    );
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// A real mprotect reaches the shared prepared-overlap check, parks on the
+/// one injected conflict, and applies the permission change after replay.
+#[test]
+fn production_anonymous_prepared_conflict_once_parks_and_completes() {
+    const INJECT_PREPARED_CONFLICT_ONCE: u64 = 0xffff_ffff_ffff_fe12;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        code.extend_from_slice(register);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc4, 0x48, 0xb8]);
+    code.extend_from_slice(&INJECT_PREPARED_CONFLICT_ONCE.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x05]);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    append_mov(&mut code, &[0x48, 0xbe], 0x1000);
+    append_mov(&mut code, &[0x48, 0xba], 1); // PROT_READ
+    append_mov(&mut code, &[0x48, 0xb8], 10); // mprotect
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 1);
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(226))
+            .unwrap(),
+        0
+    );
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
 
 /// Production Linux entry, including first touch and partial-range retirement.

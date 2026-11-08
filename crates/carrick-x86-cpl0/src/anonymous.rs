@@ -28,6 +28,7 @@ pub(super) struct X86AnonymousVenue<'a> {
     source: BornInZoneSource<'static, ParkedContextWords>,
     saved: ParkedContextWords,
     handoff: Option<carrick_el1_abi::EntryHandoffReceipt<ParkedContextWords>>,
+    resumed: Option<carrick_sched_core::object_wait::OperationToken>,
     retry: bool,
 }
 impl<'a> X86AnonymousVenue<'a> {
@@ -40,12 +41,27 @@ impl<'a> X86AnonymousVenue<'a> {
         saved: ParkedContextWords,
     ) -> Option<Self> {
         let frame = crate::anonymous_call(*call, slot, UserVa::new(return_pc))?;
+        let resumed = source
+            .zone
+            .slot(source.slot)
+            .current()
+            .or_else(|| source.zone.slot(source.slot).host_record())
+            .and_then(|record| {
+                carrick_core::wait::take_object_operation(
+                    source.zone,
+                    source.slot,
+                    source.zone.record(record).identity(),
+                )
+                .ok()
+                .flatten()
+            });
         Some(Self {
             frame,
             task,
             source,
             saved,
             handoff: None,
+            resumed,
             retry: false,
         })
     }
@@ -68,6 +84,54 @@ impl<'a> X86AnonymousVenue<'a> {
                 sequence: None,
             },
         ))
+    }
+}
+
+/// Test images release the synthetic edit holder only after the real
+/// suspension has entered the scheduler, matching an external holder's edge.
+#[cfg(feature = "test-support")]
+pub(super) fn release_injected_edit_wait(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    task: &CurrentTask,
+) {
+    let cause = if carrick_core::mm::reservation::release_injected_root_busy() {
+        Some(SpaceWaitCause::Reservations)
+    } else if carrick_sched_core::spaces::release_injected_editor_busy() {
+        Some(SpaceWaitCause::Editor)
+    } else if carrick_core::mm::reservation::release_injected_prepared_conflict() {
+        Some(SpaceWaitCause::PreparedOverlap)
+    } else {
+        None
+    };
+    let Some(cause) = cause else {
+        return;
+    };
+    let mm = task.mm.key.load(Ordering::Acquire);
+    let Some(notifications) = NonZeroU64::new(mm)
+        .and_then(|mm| source.zone.space_entry(mm))
+        .and_then(|entry| entry.live_notifications().ok())
+    else {
+        return;
+    };
+    fn release_while_scheduling(
+        _: &X86Cpl0Zone,
+        _: carrick_sched_core::Waker,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, ParkedContextWords>,
+    ) {
+        let _ = effects.deliver_handbacks(&mut |_| carrick_x86_carrier::entry::fatal_boot());
+        // This CPU has already entered its scheduler because of the injected
+        // suspension. The queued record needs no self-IPI to become visible.
+    }
+    let venue = carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+        zone: source.zone,
+        waker: carrick_sched_core::Waker::El1 { slot: source.slot },
+        deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+            release_while_scheduling,
+        ),
+    };
+    venue.publish(notifications.reserve(cause));
+    if source.zone.slot(source.slot).queued() == 0 {
+        carrick_x86_carrier::entry::fatal_boot();
     }
 }
 
@@ -208,10 +272,9 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     fn park_contended(&mut self, _: SpaceWaitCause) -> Option<FamilyCompletion> {
         use carrick_core::wait::{
             EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait, park_object_record,
-            space_access, take_object_operation,
+            space_access,
         };
         use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall};
-        use carrick_guest_arch::ProcessContext;
         use carrick_sched_core::Waker;
         let zone = self.source.zone;
         let slot = self.source.slot;
@@ -227,13 +290,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         let index = zone.spaces.find(mm.raw())?;
         let access = space_access(zone, slot, crate::native_process::release);
         let owner = NonZeroU64::new(slot.index() as u64 + 1)?;
-        let record = zone
-            .slot(slot)
-            .current()
-            .or_else(|| zone.slot(slot).host_record())?;
-        let resumed = take_object_operation(zone, slot, zone.record(record).identity())
-            .ok()
-            .flatten();
+        let resumed = self.resumed.take();
         let saved = self.saved;
         let task = self.task;
         let frame = &self.frame;
@@ -301,9 +358,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                         // SAFETY: the executing slot owns its current record until the park publishes.
                         let context = unsafe { zone.record(record).ctx_mut() };
                         replaced = Some((record, *context));
-                        let mut restart = saved;
-                        restart.restart_syscall();
-                        *context = restart;
+                        *context = saved;
                         Ok((record, false))
                     },
                 );
