@@ -393,6 +393,7 @@ impl PreparedNativeExecSuccessor {
     #[cfg(test)]
     pub(crate) fn installed_cancel_fixture(
         custody: &std::sync::Arc<CarrierVmCustody>,
+        executable: std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>,
     ) -> Result<Self, TrapError> {
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x20_0000)?;
         let ipa = lease.key().0;
@@ -412,8 +413,10 @@ impl PreparedNativeExecSuccessor {
             .asid_allocator()
             .allocate_unpublished()
             .map_err(|error| TrapError::Hypervisor(format!("test exec ASID: {error}")))?;
+        let mut physical = crate::fork_stock::NativeChildPhysical::default();
+        physical.sources.bind_executable(executable);
         Ok(Self {
-            physical: Default::default(),
+            physical,
             asid,
             root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
                 0x90_0000,
