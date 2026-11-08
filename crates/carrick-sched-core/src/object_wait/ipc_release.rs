@@ -117,6 +117,23 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         guard.publish_ipc_generation(carrier);
         Ok(())
     }
+
+    /// Borrow only a source admitted by this carrier's IPC directory owner.
+    pub fn ipc_lock_release_source(
+        &self,
+        index: IpcLockIndex,
+        carrier: NonZeroU64,
+    ) -> Result<BorrowedObjectNotificationSource<'_, '_, C>, ObjectWaitError> {
+        let key = index.key(carrier);
+        if self.notification_generation(key) != key.generation {
+            return Err(ObjectWaitError::Stale);
+        }
+        Ok(BorrowedObjectNotificationSource {
+            zone: self,
+            key,
+            _source: core::marker::PhantomData,
+        })
+    }
 }
 
 #[cfg(all(test, not(feature = "loom")))]
@@ -223,8 +240,21 @@ mod tests {
                 1,
                 "both counted admissions must return to the permanent base publisher"
             );
-            for record in records {
-                assert!(unsafe { zone.record(record).take_object_operation() }.is_some());
+            for (i, record) in records.into_iter().enumerate() {
+                assert_eq!(
+                    handed
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r.id == record)
+                        .count(),
+                    1
+                );
+                // SAFETY: the completed admission returned this host-owned record.
+                let operation = unsafe { zone.record(record).take_object_operation() }.unwrap();
+                assert_eq!(operation.index(), i as u64 + 1);
+                assert_eq!(operation.generation(), 11);
+                assert!(unsafe { zone.record(record).take_object_operation() }.is_none());
                 zone.free_record(record);
             }
         }
@@ -238,24 +268,5 @@ mod tests {
     #[test]
     fn concurrent_ipc_admission_cpl0_keeps_guard_generation() {
         concurrent_admission::<ParkedContextWords>();
-    }
-}
-
-impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
-    /// Borrow only a source admitted by this carrier's IPC directory owner.
-    pub fn ipc_lock_release_source(
-        &self,
-        index: IpcLockIndex,
-        carrier: NonZeroU64,
-    ) -> Result<BorrowedObjectNotificationSource<'_, '_, C>, ObjectWaitError> {
-        let key = index.key(carrier);
-        if self.notification_generation(key) != key.generation {
-            return Err(ObjectWaitError::Stale);
-        }
-        Ok(BorrowedObjectNotificationSource {
-            zone: self,
-            key,
-            _source: core::marker::PhantomData,
-        })
     }
 }
