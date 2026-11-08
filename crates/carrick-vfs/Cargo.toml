@@ -52,3 +52,6 @@ tracing.workspace = true
 carrick-host-bsd = { path = "../carrick-host-bsd" }
 [target.'cfg(target_os = "linux")'.dependencies]
 carrick-host-linux = { path = "../carrick-host-linux" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8"

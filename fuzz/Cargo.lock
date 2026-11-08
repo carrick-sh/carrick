@@ -697,6 +697,7 @@ dependencies = [
  "carrick-observability",
  "carrick-portable",
  "carrick-spec",
+ "core-foundation-sys",
  "fd-lock",
  "flate2",
  "libc",

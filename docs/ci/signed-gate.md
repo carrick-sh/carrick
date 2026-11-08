@@ -154,6 +154,14 @@ and the same scoped sudo/cleanup configuration as the existing signed lane.
 Keep Apple ld64 and debuginfo. The workflow neither installs runner software
 nor changes host permissions. The runner pool serves whichever Mac is free.
 
+The conventional scratch mount `/Volumes/carrick` is automatically considered
+only when cached mount metadata identifies a local filesystem and public
+volume properties identify internal, non-removable storage (#1727). External
+USB storage is skipped without creating the case-probe file there. Unknown
+or timed-out classification also falls through to the existing scratch default.
+On cloudmac, set `CARRICK_HOME` to an internal case-sensitive directory so
+`$CARRICK_HOME/scratch` is usable; explicitly configured roots are not classified.
+
 main's Linux ARM fixture job (`kernel-runtime.yml`) publishes an exact-SHA
 archive on every push to main. The `base-fixtures` job fetches the merge
 base's archive from that authenticated run; the Mac verifies its producing
