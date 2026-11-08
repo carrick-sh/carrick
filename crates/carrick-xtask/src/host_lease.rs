@@ -893,6 +893,50 @@ pub fn extract_exit_code(status: &ExitStatus) -> i32 {
     }
 }
 
+/// Disk floors are gate admission, never a measurement beside shared builds.
+#[derive(clap::Args, Debug)]
+pub struct DiskArgs {
+    #[arg(long, default_value_t = 20)]
+    pub floor_gib: u64,
+    #[arg(long, default_value_t = 75)]
+    pub warn_gib: u64,
+}
+
+pub fn check_disk(root: &Path, args: DiskArgs) -> Result<(), HostLeaseError> {
+    let _lease = HostLease::acquire(HostLeaseMode::Gate)?;
+    let result = (|| -> io::Result<()> {
+        let output = Command::new("df").args(["-Pk"]).arg(root).output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let kib = text
+            .lines()
+            .nth(1)
+            .and_then(|line| line.split_whitespace().nth(3))
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| io::Error::other("unable to parse available KiB from df -Pk"))?;
+        let free = kib / 1_048_576;
+        if free < args.floor_gib {
+            return Err(io::Error::other(format!(
+                "only {free} GiB free (floor {} GiB); reclaim idle build output with just worktree-gc",
+                args.floor_gib
+            )));
+        }
+        println!(
+            "disk: {free} GiB free (floor {} GiB, warning mark {} GiB)",
+            args.floor_gib, args.warn_gib
+        );
+        Ok(())
+    })();
+    result.map_err(|source| HostLeaseError::Io {
+        path: root.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,48 +1439,4 @@ mod tests {
             libc::close(fd2);
         }
     }
-}
-
-/// Disk floors are gate admission, never a measurement beside shared builds.
-#[derive(clap::Args, Debug)]
-pub struct DiskArgs {
-    #[arg(long, default_value_t = 20)]
-    pub floor_gib: u64,
-    #[arg(long, default_value_t = 75)]
-    pub warn_gib: u64,
-}
-
-pub fn check_disk(root: &Path, args: DiskArgs) -> Result<(), HostLeaseError> {
-    let _lease = HostLease::acquire(HostLeaseMode::Gate)?;
-    let result = (|| -> io::Result<()> {
-        let output = Command::new("df").args(["-Pk"]).arg(root).output()?;
-        if !output.status.success() {
-            return Err(io::Error::other(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        let kib = text
-            .lines()
-            .nth(1)
-            .and_then(|line| line.split_whitespace().nth(3))
-            .and_then(|value| value.parse::<u64>().ok())
-            .ok_or_else(|| io::Error::other("unable to parse available KiB from df -Pk"))?;
-        let free = kib / 1_048_576;
-        if free < args.floor_gib {
-            return Err(io::Error::other(format!(
-                "only {free} GiB free (floor {} GiB); reclaim idle build output with just worktree-gc",
-                args.floor_gib
-            )));
-        }
-        println!(
-            "disk: {free} GiB free (floor {} GiB, warning mark {} GiB)",
-            args.floor_gib, args.warn_gib
-        );
-        Ok(())
-    })();
-    result.map_err(|source| HostLeaseError::Io {
-        path: root.to_path_buf(),
-        source,
-    })
 }
