@@ -154,6 +154,23 @@ and the same scoped sudo/cleanup configuration as the existing signed lane.
 Keep Apple ld64 and debuginfo. The workflow neither installs runner software
 nor changes host permissions. The runner pool serves whichever Mac is free.
 
+A gate Mac whose conventional `/Volumes/carrick` mount is external or cold
+storage (cloudmac's USB volume) must keep gates off it (#1727). Set both in
+the runner's `.env`, pointing at an internal case-sensitive APFS volume:
+
+```text
+CARRICK_SCRATCH_ROOT=/Volumes/carrick-gate/scratch
+SCCACHE_DIR=/Volumes/carrick-gate/.sccache
+```
+
+`CARRICK_SCRATCH_ROOT` makes carrick skip probing `/Volumes/carrick` entirely
+(`carrick_vfs::apfs::SCRATCH_ROOT_ENV`). Use an absolute path. Without
+`SCCACHE_DIR`, `scripts/lib/build-env.sh` defaults the compiler cache to
+`/Volumes/carrick/dev/.sccache` whenever that directory exists.
+`signed-gate execute` keeps the runner environment, so both reach the gate.
+Jobs started by the macOS JIT controller clear their environment, so they
+don't see these values; the remaining #1727 items cover them.
+
 main's Linux ARM fixture job (`kernel-runtime.yml`) publishes an exact-SHA
 archive on every push to main. The `base-fixtures` job fetches the merge
 base's archive from that authenticated run; the Mac verifies its producing
