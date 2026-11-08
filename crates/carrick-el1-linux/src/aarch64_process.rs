@@ -44,23 +44,6 @@ use carrick_el1::memory::reservations::{NativeReservationGeometry, SharedReserva
 
 pub type Mm = AddressContext<RootGpa>;
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn native_user_write_error(
-    failure: carrick_core::mm::transaction::UserWriteError<NativeProcessError>,
-) -> NativeProcessError {
-    use carrick_core::mm::transaction::{MmError, UserWriteError};
-    match failure {
-        UserWriteError::Owner(MmError::Wait(wait)) => NativeProcessError::OwnerWait(wait),
-        UserWriteError::Owner(MmError::Busy) | UserWriteError::Busy => NativeProcessError::Busy,
-        UserWriteError::Owner(MmError::Stale) => NativeProcessError::Stale,
-        UserWriteError::Owner(MmError::UnsupportedExecutableCow)
-        | UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
-        UserWriteError::Owner(_) | UserWriteError::Fault => NativeProcessError::Fault,
-        UserWriteError::Mechanics(error) => error,
-        UserWriteError::InvalidSource => NativeProcessError::Invalid,
-    }
-}
-
 #[cfg(test)]
 #[test]
 fn native_user_write_preserves_nonfault_refusals() {
@@ -75,7 +58,7 @@ fn native_user_write_preserves_nonfault_refusals() {
         (MmError::Fault, NativeProcessError::Fault),
     ] {
         assert_eq!(
-            native_user_write_error(UserWriteError::Owner(error)),
+            NativeProcessError::from_user_write(UserWriteError::Owner(error)),
             expected
         );
     }
@@ -987,6 +970,21 @@ impl core::fmt::Debug for Born {
     }
 }
 
+#[cfg(test)]
+type TestOwnerAccess = Box<
+    dyn Fn(
+        &Mm,
+        UserVa,
+        carrick_guest_arch::GuestLen,
+        Option<&[u8]>,
+        carrick_guest_arch::Access,
+    ) -> Option<Result<(), NativeProcessError>>,
+>;
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static TEST_OWNER_ACCESS: std::cell::RefCell<Option<TestOwnerAccess>> = const { std::cell::RefCell::new(None) };
+}
+
 pub trait ForkStockCrossing {
     /// The carrier's complete shared descriptor namespace, if admitted.
     fn ipc_binding(
@@ -1624,9 +1622,9 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
             let handle = owner
                 .admitted_handle(mm_key, self.worker())
                 .map_err(|error| {
-                    native_user_write_error(carrick_core::mm::transaction::UserWriteError::Owner(
-                        error,
-                    ))
+                    NativeProcessError::from_user_write(
+                        carrick_core::mm::transaction::UserWriteError::Owner(error),
+                    )
                 })?;
             let live = if let Some(words) = self.words {
                 PreparedWords::Borrowed(words)
@@ -1692,10 +1690,18 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
                     &mut venue,
                 )
             };
-            result.map_err(native_user_write_error)
+            result.map_err(NativeProcessError::from_user_write)
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
+            #[cfg(test)]
+            if let Some(result) = TEST_OWNER_ACCESS.with(|hook| {
+                hook.borrow()
+                    .as_ref()
+                    .and_then(|access_user| access_user(mm, address, len, bytes, access))
+            }) {
+                return result;
+            }
             let mut copy = crate::lifecycle::LinuxUserCopy(crate::file::ValidatedCopy {
                 task: self.task,
                 validator: &crate::file::HardwareValidator,

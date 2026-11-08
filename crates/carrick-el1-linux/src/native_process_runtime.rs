@@ -312,6 +312,23 @@ pub enum NativeProcessError {
     NoChild,
 }
 impl NativeProcessError {
+    /// Preserve owner contention and preparation requests on every ISA.
+    pub fn from_user_write(
+        failure: carrick_core::mm::transaction::UserWriteError<NativeProcessError>,
+    ) -> NativeProcessError {
+        use carrick_core::mm::transaction::{MmError, UserWriteError};
+        match failure {
+            UserWriteError::Owner(MmError::Wait(wait)) => NativeProcessError::OwnerWait(wait),
+            UserWriteError::Owner(MmError::Busy) | UserWriteError::Busy => NativeProcessError::Busy,
+            UserWriteError::Owner(MmError::Stale) => NativeProcessError::Stale,
+            UserWriteError::Owner(MmError::UnsupportedExecutableCow)
+            | UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
+            UserWriteError::Owner(_) | UserWriteError::Fault => NativeProcessError::Fault,
+            UserWriteError::Mechanics(error) => error,
+            UserWriteError::InvalidSource => NativeProcessError::Invalid,
+        }
+    }
+
     pub fn run_failure_reason(self) -> carrick_core_abi::NativeRunFailureReason {
         use carrick_core_abi::NativeRunFailureReason as R;
         match self {
