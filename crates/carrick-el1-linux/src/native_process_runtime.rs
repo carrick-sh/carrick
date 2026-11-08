@@ -4179,6 +4179,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                 }
             }
             Ok(_) => self.run_failed(NativeProcessError::Quarantined.run_failure_reason()),
+            Err(
+                error @ (NativeProcessError::Invalid
+                | NativeProcessError::Stale
+                | NativeProcessError::Quarantined),
+            ) => self.run_failed(error.run_failure_reason()),
             Err(error) => self.fail(error),
         }
     }
@@ -4953,6 +4958,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         request: carrick_core::mm::transaction::CopyoutRequest,
     ) -> Result<(), NativeProcessError> {
+        if !carrick_guest_arch::lower_half_range(request.address.raw(), request.len.raw()) {
+            return Err(NativeProcessError::Fault);
+        }
         let mm = self
             .runtime
             .graph
@@ -4971,6 +4979,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        if !carrick_guest_arch::lower_half_range(address.raw(), bytes.len() as u64) {
+            return Err(NativeProcessError::Fault);
+        }
         let mm = self
             .runtime
             .graph
