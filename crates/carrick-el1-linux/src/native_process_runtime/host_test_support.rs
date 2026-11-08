@@ -8313,3 +8313,69 @@ fn admission_group_lookup_distinguishes_missing_indexes() {
     };
     assert_eq!(lookup.0, [0, 0, 0, 0, 0, 0, 1 << 32, 0]);
 }
+
+// A known-answer diagnostic check, not attribution of the signed producer:
+// deliberately publish a different PID through the normal task metadata API.
+#[cfg(test)]
+#[test]
+fn admission_group_lookup_captures_stored_and_observed_keys() {
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let identity = fixture.zone.record(fixture.record.id).identity();
+    fixture
+        .zone
+        .discard_unpublished(fixture.slot, fixture.record.id);
+    let renewed = fixture.zone.current_or_new(fixture.slot, identity).unwrap();
+    let renewed = fixture.zone.record_ref(renewed);
+    fixture.task.publish_visible_pid(99);
+    let NativeGroupAdmission::FreshRoot(lookup) = fixture
+        .registry
+        .admit_existing_group(
+            source,
+            fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .unwrap()
+    else {
+        panic!("expected diagnostic miss")
+    };
+    assert_eq!(lookup.0[6] >> 32, 7, "by_process still agrees");
+    let (observed, stored, registered) = lookup.1.unwrap();
+    assert_eq!(&observed[..4], &stored[..4]);
+    assert_eq!(observed[4], 99);
+    assert_eq!(stored[4], 41);
+    assert_eq!(registered, fixture.record);
+    let error = NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        source,
+        fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        words(fixture.address),
+    )
+    .err()
+    .unwrap()
+    .with_group_lookup(*lookup);
+    let NativeAdmissionError::Contended(contention) = error else {
+        panic!("expected custody refusal")
+    };
+    assert_eq!(
+        contention.origin,
+        NativeAdmissionOrigin::FreshRootPendingCustody
+    );
+    let (first, second) = contention.diagnostic_payload();
+    assert_eq!(&first[..5], &observed);
+    assert_eq!(&second[..5], &stored);
+    assert_eq!(first[5], u64::from(registered.id.raw()));
+    assert_eq!(first[6], registered.incarnation);
+    assert_eq!(first[7], u64::from(renewed.id.raw()));
+    assert_eq!(second[5], renewed.incarnation);
+    assert_eq!(second[6], 0x0700_0007);
+    assert_eq!(second[7], carrick_el1_abi::ADMISSION_GROUP_KEYS_TAG);
+}

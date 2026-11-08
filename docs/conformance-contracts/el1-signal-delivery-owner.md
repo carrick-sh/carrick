@@ -94,3 +94,25 @@ and x20–x21 at the existing terminal HVC, leaving platform-reserved x18 alone.
 The formatted terminal record remains 1024 bytes; the maximum-width rendering
 witness includes all sixteen words. This is attribution only, not a lifecycle
 fix, a cross-holder wait, or permission to wait for a self-held projection.
+
+### #887 round 3 key attribution
+
+On fresh-root refusal with a retained member and process index, the existing
+sixteen-word terminal payload carries both group keys. Each tuple is
+`[carrier, MM, root GPA, lifecycle page, namespace PID]`. The output also
+records the registered and observed scheduler record IDs/incarnations and
+packs the four existing lookup flag bytes in member, record, direct-group,
+process-index order (least-significant byte first). The last lookup word
+`0x47524f55504b4559` selects this view; other admission refusals retain the
+identity view. This changes diagnostic contents, not register count or layout.
+
+The VM-free known-answer test renews a scheduler record and deliberately
+publishes a different PID before calling production classification and
+fresh-root admission. It proves that the snapshot names both keys, both records
+and self-held pending custody. It does not identify the signed workload's
+producer or claim PID is the drifting component. The maximum-width formatter
+test enforces the existing 1024-byte sink limit.
+
+Registration still prepares custody before consuming an adopted host birth
+(#1882). Existing-group recovery, source correction, x86 fatal transport and
+paired signed proof remain outstanding pending the actual key snapshot.

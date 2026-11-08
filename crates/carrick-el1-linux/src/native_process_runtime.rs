@@ -348,7 +348,11 @@ pub struct NativeAdmissionContention {
 /// Pairs: members[execution], records[record], groups[group],
 /// groups[by_process[process].group]. Absent identities are zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeGroupLookup(pub [u64; 8]);
+pub struct NativeGroupLookup(
+    pub [u64; 8],
+    /// Observed and stored group tuples, plus the registered record.
+    pub Option<([u64; 5], [u64; 5], RecordRef)>,
+);
 
 pub enum NativeGroupAdmission<'a, M: Clone, C: ProcessContext> {
     Existing(Arc<NativeProcessRuntime<'a, M, C>>),
@@ -380,6 +384,46 @@ impl NativeAdmissionContention {
                 R::AdmissionRootRegistrationCollision
             }
         }
+    }
+
+    /// Reuse the sixteen terminal words for key attribution when the process
+    /// index still reaches a group. No pointer is dereferenced by the host.
+    /// Each tuple is carrier, MM, root GPA, lifecycle page, namespace PID.
+    pub fn diagnostic_payload(&self) -> ([u64; 8], [u64; 8]) {
+        if let Some(NativeGroupLookup(indices, Some((observed, stored, registered)))) =
+            self.group_lookup
+        {
+            let flags = indices
+                .chunks_exact(2)
+                .enumerate()
+                .fold(0, |bits, (i, pair)| bits | ((pair[0] >> 32) << (8 * i)));
+            return (
+                [
+                    observed[0],
+                    observed[1],
+                    observed[2],
+                    observed[3],
+                    observed[4],
+                    u64::from(registered.id.raw()),
+                    registered.incarnation,
+                    u64::from(self.new_record.id.raw()),
+                ],
+                [
+                    stored[0],
+                    stored[1],
+                    stored[2],
+                    stored[3],
+                    stored[4],
+                    self.new_record.incarnation,
+                    flags,
+                    carrick_el1_abi::ADMISSION_GROUP_KEYS_TAG,
+                ],
+            );
+        }
+        (
+            self.diagnostic_words(),
+            self.group_lookup.map_or([0; 8], |lookup| lookup.0),
+        )
     }
 
     /// Lossless compact identities: record ids, incarnations, task ids,
@@ -2723,7 +2767,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     indexed_group.map_or(0, |(_, p)| p.serial.raw()),
                 );
                 return Ok(NativeGroupAdmission::FreshRoot(Box::new(
-                    NativeGroupLookup([m[0], m[1], r[0], r[1], g[0], g[1], b[0], b[1]]),
+                    NativeGroupLookup(
+                        [m[0], m[1], r[0], r[1], g[0], g[1], b[0], b[1]],
+                        member.zip(by_process).map(|(member, (stored, _))| {
+                            let words = |key: NativeGroupKey| {
+                                [key.0 as u64, key.1, key.2, key.3 as u64, u64::from(key.4)]
+                            };
+                            (words(group_key), words(*stored), member.record)
+                        }),
+                    ),
                 )));
             }
         }

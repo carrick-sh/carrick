@@ -1,3 +1,9 @@
+# #887 round 3 attribution only: the same sixteen terminal register words
+# can now carry observed/stored group tuples, registered/current records and
+# all four lookup flags. No admission, wait, signal or work-budget policy changes.
+# The known-answer PID mismatch is deliberately published in the fixture;
+# it proves diagnostic capture, not that PID is the signed workload's drift.
+# Full-width rendering remains below the existing 1024-byte terminal limit.
 # #1881: shared thread registration prepares custody before publication.
 # This family's operations and budgets are unchanged. Atomicity is witnessed by
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable
@@ -49,6 +55,8 @@ structural_budgets = []
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_signal_resume_tests::{arm_retained_sigprocmask_copyout_delivers_before_svc_user_return,arm_parked_signal_copyout_rejects_stale_owner_after_peer_selection,arm_parked_signal_input_rejects_stale_owner_after_peer_selection}",
   "carrick-el1-linux::native_process_runtime::host_test_support::admission_group_lookup_distinguishes_missing_indexes",
+  "carrick-el1-linux::native_process_runtime::host_test_support::admission_group_lookup_captures_stored_and_observed_keys",
+  "carrick-el1-abi::entry_binding_fatal::tests::admission_group_keys_fit_the_terminal_record",
   "carrick-el1-linux::aarch64_process_tests::native_signal_work_return_tests::*",
   "carrick-el1-linux::aarch64_process_tests::native_host_owned_signal_resume_tests::*",
   "carrick-el1-linux::aarch64_process_tests::{arm_classified_maperr_and_bus_use_signal_owner,arm_classified_fault_default_ignored_and_blocked_return_to_host_core_path,arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path,arm_classified_fault_racing_live_sibling_exit_group_settles,arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome,arm_permission_fault_keeps_signal_owner_after_admission_home_release}",
