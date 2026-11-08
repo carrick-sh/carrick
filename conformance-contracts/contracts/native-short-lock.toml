@@ -1,3 +1,8 @@
+# #1881: shared thread registration prepares custody before publication.
+# This family's operations and budgets are unchanged. Atomicity is witnessed by
+# native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable
+# under process.native.arm-admission; the full VM-free native suite passes.
+# No additional signed, Docker or runtime-ratio evidence is claimed here.
 # #1572: metadata allocation consumes a response before allocation and
 # selects already freed dynamic grants for return afterwards. Unused grants
 # retire only during the explicit test-control drain after transactions finish. The allocator lock
