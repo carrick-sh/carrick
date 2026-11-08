@@ -495,7 +495,8 @@ fn fork_exec_probe(futex: Option<u64>, bitset: u64, readlink: bool) {
                 .unwrap()
                 .notify_object(fixture.slot, &mut Default::default())
                 .unwrap();
-            activate_target(source, &fixture.task, &child_binding);
+            let successor = unsafe { runtime.record_binding(child_binding.record) }.unwrap();
+            activate_target(source, &fixture.task, &successor);
             let selected = fixture.zone.slot(fixture.slot).current().unwrap();
             let binding =
                 unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();

@@ -255,7 +255,7 @@ impl carrick_hal::fork_stock::ExecutableIdentity for CurrentExecutable {
     }
 }
 
-impl super::SyscallDispatcher {
+impl SyscallDispatcher {
     /// Preserve the loaded object's live namespace identity in successor custody.
     pub fn retain_native_executable(
         &self,
@@ -268,10 +268,7 @@ impl super::SyscallDispatcher {
     pub fn root_executable_seed(
         &self,
     ) -> Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>> {
-        self.proc
-            .lock()
-            .current_executable
-            .clone()
+        self.current_executable()
             .map(|current| Arc::new(current) as _)
     }
 }
