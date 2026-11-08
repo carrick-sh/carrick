@@ -84,6 +84,8 @@ embed = [
 # zone admission record has already been released. One control-wake batch is
 # applied per retained lifecycle page; this does not complete guest waits.
 vm_free = [
+  "carrick-el1-linux::native_process_runtime::host_test_support::{production_unmapped_root_early_bind_admits_and_forks,production_unmapped_root_late_bind_admits_and_forks} (production bootstrap without PID remapping, native admission and fork; shared internal/visible PID and TID)",
+  "carrick-kernel::kernel::tests::{production_root_domains_retire_after_bootstrap,production_root_domains_retire_after_cancel} (production root binding and four cancelled preparations; namespace retirement returns cursor population and claims to baseline)",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_pid_excludes_live_host_thread_tids",
   "carrick-kernel::kernel::ids::tests::carrier_births_cover_reserved_unpublished_replenished_and_two_roots",

@@ -28,3 +28,14 @@ and stock replenishment follow clear-child-tid notification. Zone mode refuses
 boot export rather than leaving a second transferable owner. These VM-free
 checks do not prove the signed Node workload or attribute its carrier crash;
 paired signed proof and merge-group acceptance remain required.
+
+The review regressions in #1841 are covered at production root admission:
+`production_unmapped_root_{early,late}_bind_admits_and_forks` boots a
+`for_prepared_launch` container without a PID region, binds the zone before
+or after bootstrap, and calls native admission without fixture namespace
+seeding. Host reservations remain live across native fork. The child PID and
+stocked TIDs must retain their internal numbers and avoid those reservations.
+`production_root_domains_retire_after_{bootstrap,cancel}` checks initial
+root retirement and four cancelled `prepare_container_root` operations. Each
+namespace retirement must return the cursor count to baseline, and each
+cancelled preparation must return all number claims to baseline.
