@@ -1453,10 +1453,11 @@ where
             self.state.service_kernel_context = Some(context.retain_exact());
             if taken
                 .as_ref()
-                .is_some_and(|token| token.metadata_generation().is_some())
+                .is_some_and(|token| token.kind().replays_syscall())
             {
-                // Metadata readiness resumes the saved control SVC with every
-                // original register intact. A wake is not its return value.
+                // Scheduler-owned metadata and edit replays resume the saved SVC
+                // with every original register intact. They own no IPC pin,
+                // and a wake is not their return value.
                 let pc = engine.current_pc()?;
                 if let Some(outcome) = service_signals_threaded(
                     &self.kernel,
