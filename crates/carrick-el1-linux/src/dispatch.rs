@@ -2402,42 +2402,80 @@ pub fn invalid_completion(reason: NativeInvariant) -> ! {
     )
 }
 
-fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
+/// Linux publishes only each `pollfd`'s `revents`; `fd` and `events` are
+/// inputs the caller may have rewritten while the call waited. The guest
+/// array therefore gets one two-byte field per entry, never the resolver's
+/// frozen whole-record array (which would restore the values read before the
+/// wait).
+fn complete_poll_revents<'p, C: carrick_core_abi::EntryContext>(
     process: Option<&mut (dyn lifecycle::ProcessNative<'_, C> + 'p)>,
-    task: &CurrentTask,
-    address: carrick_guest_arch::UserVa,
-    bytes: &[u8],
+    current_tasks: &[CurrentTask],
+    task_index: usize,
+    pollfds: carrick_guest_arch::UserVa,
+    resolved: &[super::file_table::PollFd],
     result: SyscallResult,
 ) -> FamilyCompletion {
+    let revents = resolved.iter().map(|entry| entry.revents).collect();
     if let Some(process) = process {
-        return carrick_personality_linux::lifecycle::lifecycle_effect(&process.complete_copyout(
-            address,
-            bytes.to_vec(),
-            result,
-        ));
+        return carrick_personality_linux::lifecycle::lifecycle_effect(
+            &process.complete_poll_revents(pollfds, resolved.len(), revents, result),
+        );
     }
+    let Some(task) = current_tasks.get(task_index) else {
+        return FamilyCompletion::Forward;
+    };
+    if !copy_poll_revents(task, pollfds, resolved) {
+        // Host-owned legacy callers retain their existing owner-memory path.
+        return FamilyCompletion::Forward;
+    }
+    FamilyCompletion::Complete(result.raw())
+}
+
+/// The legacy venue's direct publication of the same `revents`-only output.
+fn copy_poll_revents(
+    task: &CurrentTask,
+    pollfds: carrick_guest_arch::UserVa,
+    resolved: &[super::file_table::PollFd],
+) -> bool {
     let mut copy = file::ValidatedCopy {
         task,
         validator: &file::HardwareValidator,
     };
-    if copy.copy_out(address.raw(), bytes) {
-        FamilyCompletion::Complete(result.raw())
-    } else {
-        // Host-owned legacy callers retain their existing owner-memory path.
-        FamilyCompletion::Forward
+    let mut entry = 0;
+    while entry < resolved.len() {
+        let Some(address) = pollfds
+            .raw()
+            .checked_add((entry * core::mem::size_of::<super::file_table::PollFd>()) as u64)
+            .and_then(|base| {
+                base.checked_add(core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64)
+            })
+        else {
+            return false;
+        };
+        if !copy.copy_out(address, &resolved[entry].revents.to_ne_bytes()) {
+            return false;
+        }
+        entry += 1;
     }
+    true
 }
 
 #[cfg(test)]
 #[test]
 fn host_owned_poll_copyout_refusal_keeps_the_host_fallback() {
     let task = CurrentTask::new();
+    let resolved = [super::file_table::PollFd {
+        fd: 3,
+        events: 1,
+        revents: 1,
+    }];
     assert!(matches!(
-        complete_poll_copyout::<carrick_sched_core::ThreadCtx>(
+        complete_poll_revents::<carrick_sched_core::ThreadCtx>(
             None,
-            &task,
+            core::slice::from_ref(&task),
+            0,
             carrick_guest_arch::UserVa::new(carrick_guest_arch::USER_CEILING),
-            &[0; 8],
+            &resolved,
             SyscallResult::new(1),
         ),
         FamilyCompletion::Forward
@@ -2787,20 +2825,12 @@ impl<
                 let Some(ready) = ready else {
                     return FamilyCompletion::Forward;
                 };
-                let out_bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        pollfds.as_ptr() as *const u8,
-                        nfds * core::mem::size_of::<super::file_table::PollFd>(),
-                    )
-                };
-                let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
-                    return FamilyCompletion::Forward;
-                };
-                return complete_poll_copyout(
+                return complete_poll_revents(
                     self.process.as_deref_mut(),
-                    task,
+                    self.current_tasks,
+                    self.frame.task_index(),
                     carrick_guest_arch::UserVa::new(fds_ptr),
-                    out_bytes,
+                    &pollfds,
                     SyscallResult::new(ready as i64),
                 );
             }
@@ -2808,9 +2838,6 @@ impl<
         if !matches!(sig_mask, PollSignalMask::Inherit) {
             return FamilyCompletion::Forward;
         }
-        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
-            return FamilyCompletion::Forward;
-        };
         let ready = super::file_table::resolve_poll(
             self.fd_map,
             self.open_table,
@@ -2822,18 +2849,13 @@ impl<
         let Some(ready) = ready else {
             return FamilyCompletion::Forward;
         };
-        let out_bytes = unsafe {
-            core::slice::from_raw_parts(
-                pollfds.as_ptr() as *const u8,
-                nfds * core::mem::size_of::<super::file_table::PollFd>(),
-            )
-        };
         if ready > 0 || timeout_ms == 0 {
-            complete_poll_copyout(
+            complete_poll_revents(
                 self.process.as_deref_mut(),
-                task,
+                self.current_tasks,
+                self.frame.task_index(),
                 carrick_guest_arch::UserVa::new(fds_ptr),
-                out_bytes,
+                &pollfds,
                 SyscallResult::new(ready as i64),
             )
         } else {

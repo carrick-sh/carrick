@@ -4760,6 +4760,7 @@ fn completed_output_busy_yields(in_preparation: bool) {
             offset: 0,
             result: SyscallResult::new(37),
             prefix_on_fault: false,
+            shape: service::CopyoutShape::Bytes,
         });
         assert!(
             matches!(result, Ok(NativeResume::Left(None))),

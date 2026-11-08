@@ -331,6 +331,24 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
             work: false,
         }
     }
+    /// Retain a completed poll answer whose output is one `revents` field per
+    /// entry, at `offset_of!(LinuxPollFd, revents)` into each guest record.
+    ///
+    /// Linux writes only `revents` back; `fd` and `events` stay whatever the
+    /// caller has in memory, including a value it changed during the wait.
+    /// A whole-array copy-out would restore stale `fd`/`events`.
+    fn complete_poll_revents(
+        &mut self,
+        _pollfds: UserVa,
+        _nfds: usize,
+        _revents: alloc::vec::Vec<i16>,
+        _result: SyscallResult,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::new(carrick_syscall_abi::LINUX_EFAULT.guest_retval()),
+            work: false,
+        }
+    }
     /// The private file byte source the native host-file venue retained for
     /// exactly this thread's retried `mmap` with `key`, consumed once, and
     /// every source this thread was given but will not map (to retire).

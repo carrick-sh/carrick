@@ -4954,6 +4954,9 @@ mod tests {
         frame: TrapFrame,
         native: u64,
         queries: Vec<(usize, i32)>,
+        /// Run once, inside the readiness crossing, while the caller's poll is
+        /// still waiting: a guest thread rewriting its own `pollfd` array.
+        during_wait: Option<Box<dyn FnMut()>>,
     }
     impl X86PollFrame {
         fn new(native: u64, args: [u64; 5]) -> Self {
@@ -4963,6 +4966,7 @@ mod tests {
                 frame,
                 native,
                 queries: Vec::new(),
+                during_wait: None,
             }
         }
     }
@@ -5010,6 +5014,9 @@ mod tests {
             _: crate::dispatch::PollSignalMask,
         ) -> Option<i64> {
             self.queries.push((entries.len(), timeout_ms));
+            if let Some(mut during_wait) = self.during_wait.take() {
+                during_wait();
+            }
             for entry in entries.iter_mut() {
                 entry.revents = entry.events & LINUX_POLLOUT;
             }
@@ -5287,6 +5294,189 @@ mod tests {
     /// x86 CPL0's native `poll`/`ppoll` reach the one shared poll body.
     /// Production x86 has no ring descriptor table yet (#1040), so its sets
     /// resolve through the delegated fd map: an absent descriptor is a
+    /// The production AArch64 `TrapFrame` with the carrier readiness crossing
+    /// the EL1 carrier installs: the frame records each query, runs the
+    /// test's wait-time mutation while the caller is still blocked, and
+    /// reports every queried entry writable.
+    struct ArmPollFrame {
+        frame: TrapFrame,
+        queries: Vec<(usize, i32)>,
+        during_wait: Option<Box<dyn FnMut()>>,
+    }
+    impl ArmPollFrame {
+        fn new(args: [u64; 5]) -> Self {
+            let mut frame = TrapFrame::default();
+            frame.x[..5].copy_from_slice(&args);
+            frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+            Self {
+                frame,
+                queries: Vec::new(),
+                during_wait: None,
+            }
+        }
+    }
+    impl carrick_personality_linux::dispatch::SyscallFrame for ArmPollFrame {
+        fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+            carrick_personality_linux::dispatch::SyscallFrame::canonical_ordinal(&self.frame)
+        }
+        fn argument(&self, index: usize) -> Option<u64> {
+            carrick_personality_linux::dispatch::SyscallFrame::argument(&self.frame, index)
+        }
+        fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+            carrick_personality_linux::dispatch::SyscallFrame::result(&self.frame)
+        }
+        fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
+            carrick_personality_linux::dispatch::SyscallFrame::set_result(&mut self.frame, result);
+        }
+        fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
+            carrick_personality_linux::dispatch::SyscallFrame::slot(&self.frame)
+        }
+        fn user_sp(&self) -> Option<carrick_guest_arch::UserVa> {
+            carrick_personality_linux::dispatch::SyscallFrame::user_sp(&self.frame)
+        }
+    }
+    impl crate::dispatch::GuestDispatchFrame for ArmPollFrame {
+        fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+            carrick_guest_arch::NativeOrdinal::new(self.frame.x[8])
+        }
+        fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+            carrick_personality_linux::crossing::HostCrossingSet::Aarch64
+        }
+        fn may_serve_poll(&self) -> bool {
+            true
+        }
+        fn poll_timeout_kind(&self) -> crate::dispatch::PollTimeoutKind {
+            crate::dispatch::PollTimeoutKind::Timespec
+        }
+        fn query_host_readiness(
+            &mut self,
+            entries: &mut [carrick_el1_abi::HostReadinessEntry],
+            timeout_ms: i32,
+            _: crate::dispatch::PollSignalMask,
+        ) -> Option<i64> {
+            self.queries.push((entries.len(), timeout_ms));
+            if let Some(mut during_wait) = self.during_wait.take() {
+                during_wait();
+            }
+            for entry in entries.iter_mut() {
+                entry.revents = entry.events & LINUX_POLLOUT;
+            }
+            Some(entries.len() as i64)
+        }
+        fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
+            Some(&mut self.frame)
+        }
+        fn arm_frame_ref(&self) -> Option<&TrapFrame> {
+            Some(&self.frame)
+        }
+        fn arm_scheduler(&self) -> bool {
+            true
+        }
+        fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+            None
+        }
+    }
+
+    /// Poll output is Linux's per-entry `revents` field only. A caller that
+    /// rewrites `fd`/`events` while the call waits keeps those values: Linux
+    /// never republishes the array it read at entry. Both production ISAs
+    /// reach the same shared body; x86 through its CPL0 host crossing and
+    /// aarch64 through the EL1 carrier crossing.
+    #[test]
+    fn host_wait_publishes_only_revents_and_keeps_the_callers_rewrites() {
+        let w = world();
+        let tables = delegated();
+        let file_table = w.task.linux.file_table.load(Ordering::Acquire).max(1);
+        let mut pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        crate::file_table::admit_host_fd(
+            &tables.fd_map,
+            &tables.opens,
+            &tables.objects,
+            file_table,
+            4,
+            pipe[1],
+            0,
+        )
+        .unwrap();
+        let zero = zero_timespec();
+        // Two host-bound entries: the readiness crossing owns both, and the
+        // caller rewrites the second record's fd/events during the wait.
+        let original = [
+            PollFd {
+                fd: 4,
+                events: LINUX_POLLOUT,
+                revents: 0,
+            },
+            PollFd {
+                fd: 4,
+                events: LINUX_POLLOUT,
+                revents: 0x7777,
+            },
+        ];
+        let rewritten = PollFd {
+            fd: -1,
+            events: LINUX_POLLIN,
+            revents: 0x7777,
+        };
+        for native in [false, true] {
+            let fds = GuestUserBuffer::from_values(&original);
+            let record_va = fds.va_of::<PollFd>(1);
+            let mut rewrite = Some(rewritten);
+            let mutate = move || {
+                let record = rewrite.take().expect("one wait-time rewrite");
+                // The guest thread's own store while the syscall blocks.
+                let mut bytes = [0u8; core::mem::size_of::<PollFd>()];
+                bytes[..4].copy_from_slice(&record.fd.to_ne_bytes());
+                bytes[4..6].copy_from_slice(&record.events.to_ne_bytes());
+                bytes[6..].copy_from_slice(&record.revents.to_ne_bytes());
+                // SAFETY: the buffer is live guest user memory for this test.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        record_va.raw() as *mut u8,
+                        bytes.len(),
+                    );
+                }
+            };
+            let (route, queries) = if native {
+                let mut frame = X86PollFrame::new(
+                    carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw(),
+                    [fds.arg(), 2, zero.arg(), 0, 0],
+                );
+                frame.during_wait = Some(Box::new(mutate));
+                let route = dispatch_poll(&w, &mut frame, Some(&w.venue()), &tables);
+                (route, frame.queries)
+            } else {
+                let mut frame = ArmPollFrame::new([fds.arg(), 2, zero.arg(), 0, 0]);
+                frame.during_wait = Some(Box::new(mutate));
+                let route = dispatch_poll(&w, &mut frame, Some(&w.venue()), &tables);
+                (route, frame.queries)
+            };
+            assert_eq!(route, CompletionRoute::Served, "native={native}");
+            assert_eq!(queries, [(2, 0)], "native={native}: one host crossing");
+            // Only `revents` is published, and the rewritten record is not
+            // restored from the frozen input array.
+            assert_eq!(revents(&fds, 0), LINUX_POLLOUT, "native={native}");
+            let kept = fds.get::<PollFd>(1);
+            assert_eq!(kept.fd, rewritten.fd, "native={native}: fd survives");
+            assert_eq!(
+                kept.events, rewritten.events,
+                "native={native}: events survives"
+            );
+            // Linux resolves the array it read at entry, so the frozen
+            // `fd = 4` entry is ready even though the caller rewrote it.
+            assert_eq!(
+                kept.revents, LINUX_POLLOUT,
+                "native={native}: revents comes from the frozen entry"
+            );
+        }
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
     /// ready POLLNVAL served in ring, host-bound entries and an empty set
     /// take the carrier readiness crossing with the caller's timeout, and
     /// the delegated cap stays 1024. With a ring table, the same frame is

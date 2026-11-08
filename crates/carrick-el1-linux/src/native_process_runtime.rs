@@ -7795,6 +7795,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             offset: 0,
             result: SyscallResult::new(0),
             prefix_on_fault: false,
+            shape: service::CopyoutShape::Bytes,
             effect: Some(effect),
         });
         self.finish_output_outcome(result)
@@ -7810,8 +7811,32 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             bytes,
             offset: 0,
             prefix_on_fault: false,
+            shape: service::CopyoutShape::Bytes,
             result,
             effect: None,
+        });
+        self.finish_output_outcome(result)
+    }
+    fn complete_poll_revents(
+        &mut self,
+        pollfds: UserVa,
+        nfds: usize,
+        revents: Vec<i16>,
+        result: SyscallResult,
+    ) -> LifecycleOutcome {
+        debug_assert_eq!(revents.len(), nfds);
+        let bytes = revents
+            .into_iter()
+            .flat_map(i16::to_ne_bytes)
+            .collect::<Vec<u8>>();
+        let result = self.finish_copyout(service::OwnedCopyout {
+            address: pollfds,
+            bytes,
+            offset: 0,
+            result,
+            prefix_on_fault: false,
+            effect: None,
+            shape: service::CopyoutShape::PollRevents,
         });
         self.finish_output_outcome(result)
     }

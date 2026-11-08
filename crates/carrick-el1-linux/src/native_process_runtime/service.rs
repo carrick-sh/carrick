@@ -132,6 +132,25 @@ struct PendingHostFile<'a> {
     chdir: bool,
 }
 
+/// What a retained output publishes.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(super) enum CopyoutShape {
+    /// One contiguous byte run from `address`.
+    Bytes,
+    /// Linux's per-entry `revents` field: `bytes` holds two native-endian
+    /// bytes per `pollfd`, published at `offset_of!(LinuxPollFd, revents)`
+    /// into each successive guest record. `fd` and `events` are inputs the
+    /// caller may have rewritten while the call waited, so they are never
+    /// published.
+    PollRevents,
+}
+
 /// Ring-owned input of a typed service, retained until completion ACK.
 pub(super) struct OwnedCopyout<'a> {
     pub address: UserVa,
@@ -140,6 +159,45 @@ pub(super) struct OwnedCopyout<'a> {
     pub result: SyscallResult,
     pub prefix_on_fault: bool,
     pub effect: Option<Box<dyn carrick_personality_linux::lifecycle::CopyoutEffect + 'a>>,
+    pub shape: CopyoutShape,
+}
+
+impl OwnedCopyout<'_> {
+    /// Publication units: bytes for a byte run, `pollfd` entries for `revents`.
+    fn units(&self) -> usize {
+        match self.shape {
+            CopyoutShape::Bytes => self.bytes.len(),
+            CopyoutShape::PollRevents => self.bytes.len() / 2,
+        }
+    }
+
+    /// Bytes already published, which is what a fault prefix reports. The
+    /// cursor counts units, and one `revents` unit is two bytes.
+    fn committed_bytes(&self) -> usize {
+        match self.shape {
+            CopyoutShape::Bytes => self.offset,
+            CopyoutShape::PollRevents => self.offset * 2,
+        }
+    }
+
+    /// The unit at `index`: a page-bounded byte run, or one complete
+    /// `revents` field. A field is one unit even when it crosses a page.
+    fn unit(&self, index: usize) -> Option<(UserVa, &[u8])> {
+        match self.shape {
+            CopyoutShape::Bytes => {
+                let address = self.address.raw().checked_add(index as u64)?;
+                let count = (4096 - (address as usize & 4095)).min(self.bytes.len() - index);
+                Some((UserVa::new(address), self.bytes.get(index..index + count)?))
+            }
+            CopyoutShape::PollRevents => {
+                let field = self.bytes.get(index * 2..index * 2 + 2)?;
+                let offset = (index as u64)
+                    .checked_mul(core::mem::size_of::<carrick_abi::LinuxPollFd>() as u64)?
+                    .checked_add(core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64)?;
+                Some((UserVa::new(self.address.raw().checked_add(offset)?), field))
+            }
+        }
+    }
 }
 
 /// Physical preparation is enrolled only after the IPC dispatch stack unwinds.
@@ -592,19 +650,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         mut output: OwnedCopyout<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
         let mut prepared_offset = None;
-        while output.offset < output.bytes.len() {
+        while output.offset < output.units() {
             let previous_prepared_offset = prepared_offset.take();
-            let address = output
-                .address
-                .raw()
-                .checked_add(output.offset as u64)
+            let (address, unit) = output
+                .unit(output.offset)
                 .ok_or(NativeProcessError::Fault)?;
-            let count = (4096 - (address as usize & 4095)).min(output.bytes.len() - output.offset);
-            match self.copy_owner_frame(
-                UserVa::new(address),
-                &output.bytes[output.offset..output.offset + count],
-            ) {
-                Ok(()) => output.offset += count,
+            let count = unit.len();
+            match self.copy_owner_frame(address, unit) {
+                // One unit per iteration, whether a byte or a `revents` field.
+                Ok(()) => output.offset += 1,
                 Err(NativeProcessError::OwnerWait(wait)) => {
                     return self.begin_service_inner(
                         ServiceOperation::CarrierWork {
@@ -633,7 +687,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }
                     let preparation =
                         self.prepare_owner_output(carrick_core::mm::transaction::CopyoutRequest {
-                            address: UserVa::new(address),
+                            address,
                             len: carrick_guest_arch::GuestLen::new(count as u64),
                         });
                     match preparation {
@@ -666,7 +720,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         Err(NativeProcessError::Unsupported) => {
                             let (fault, sequence) = self
                                 .service
-                                .copyout_fault(UserVa::new(address))
+                                .copyout_fault(address)
                                 .ok_or(NativeProcessError::Unsupported)?;
                             return self.begin_service_inner(
                                 ServiceOperation::Fault(fault),
@@ -677,13 +731,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             );
                         }
                         Err(NativeProcessError::Fault) if output.prefix_on_fault => {
-                            return Ok(entropy_copy_fault(output.offset));
+                            return Ok(entropy_copy_fault(output.committed_bytes()));
                         }
                         Err(error) => return Err(error),
                     }
                 }
                 Err(NativeProcessError::Fault) if output.prefix_on_fault => {
-                    return Ok(entropy_copy_fault(output.offset));
+                    return Ok(entropy_copy_fault(output.committed_bytes()));
                 }
                 Err(error) => return Err(error),
             }
@@ -2980,6 +3034,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }),
                 prefix_on_fault: true,
                 effect: None,
+                shape: CopyoutShape::Bytes,
             }));
         }
         if pending.adapter {

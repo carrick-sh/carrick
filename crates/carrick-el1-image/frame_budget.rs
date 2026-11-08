@@ -563,7 +563,12 @@ impl Frames {
                     ])
                     + self.maximum("::complete_copyout::")
                     + self.qualified("El1PendingFamilies", "::poll::")
-                    + self.maximum("::complete_poll_copyout::")
+                    // Poll output is one `revents` field per entry; the native
+                    // venue retains it through `complete_poll_revents`, and
+                    // the legacy venue copies it in `copy_poll_revents`. Both
+                    // are charged: either can stand in for the other.
+                    + self.maximum("::complete_poll_revents::")
+                    + self.maximum("::copy_poll_revents::")
                     + write,
             ),
             (
