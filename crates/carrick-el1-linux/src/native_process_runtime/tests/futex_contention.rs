@@ -346,3 +346,378 @@ fn native_futex_word_deadline_starts_at_first_attempt_aarch64() {
         arm_words, false, true,
     );
 }
+
+/// A native frame routes exit through the common lifecycle dispatcher on
+/// either context type, without selecting the separate ARM scheduler adapter.
+struct ExitFrame;
+impl carrick_personality_linux::dispatch::SyscallFrame for ExitFrame {
+    fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+        carrick_syscall_abi::CanonicalNr::new(carrick_personality_linux::lifecycle::SYS_EXIT as u64)
+    }
+    fn argument(&self, _: usize) -> Option<u64> {
+        Some(0)
+    }
+    fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+        carrick_guest_arch::NativeReturnWord(0)
+    }
+    fn set_result(&mut self, _: carrick_guest_arch::NativeReturnWord) {}
+    fn slot(&self) -> Option<SlotId> {
+        Some(SlotId::new(1))
+    }
+    fn task_index(&self) -> usize {
+        0
+    }
+    fn user_sp(&self) -> Option<UserVa> {
+        Some(UserVa::new(0x8000))
+    }
+}
+impl crate::dispatch::GuestDispatchFrame for ExitFrame {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        carrick_guest_arch::NativeOrdinal::new(60)
+    }
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::X86
+    }
+    fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> {
+        None
+    }
+    fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> {
+        None
+    }
+    fn arm_scheduler(&self) -> bool {
+        false
+    }
+    fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+        None
+    }
+}
+
+fn clear_tid_stopped_join_driver<C, B>(make: impl Fn(AddressContext<RootGpa>) -> C)
+where
+    C: ProcessContext + crate::dispatch::DispatchContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+{
+    use carrick_el1_abi::{BornRecord, EntryIdentity, Lifecycle, ThreadIdentity};
+    use carrick_personality_linux::dispatch::{CompletionRoute, dispatch};
+    use carrick_sched_core::{Claim, WakeRefusal};
+    let fixture = Fixture::<C>::new::<B>(&make);
+    let zone = fixture.zone;
+    // Publish an actual Born lifecycle member, then authenticate it through
+    // the production registry. Only physical user memory is substituted.
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let birth = carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap());
+    let member = fixture
+        .page
+        .stock(
+            0,
+            EntryIdentity {
+                tid: 42,
+                visible_tid: 42,
+                thread_serial: 102,
+                birth,
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(member, control as *const _ as u64)
+        .unwrap();
+    control
+        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, member)
+        .unwrap();
+    assert!(control.publish_visible_tid(42));
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(42),
+            birth,
+            carrick_core_abi::EntryThreadGeneration::from_raw(102),
+        )
+        .unwrap(),
+    );
+    let claim = fixture.page.claim(member).unwrap();
+    fixture
+        .page
+        .record_born(
+            claim,
+            BornRecord {
+                caller_task: 41,
+                caller_serial: 101,
+                clone_flags: 0x10000,
+                clear_child_tid: 0x1000,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+    fixture.page.thread_born().unwrap();
+    fixture.page.publish(member).unwrap();
+    control.set_clear_child_tid(0x1000);
+    let task = Box::leak(Box::new(CurrentTask::new()));
+    task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(42),
+        carrick_core_abi::SnapshotGeneration::from_raw(12),
+        5,
+    );
+    task.mm.key.store(1, Ordering::Release);
+    task.mm.thread_generation.store(102, Ordering::Release);
+    task.publish_visible_pid(41);
+    task.publish_root_generation(fixture.address.generation);
+    task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    let child_slot = SlotId::new(1);
+    zone.drive(child_slot, 2);
+    zone.publish_slot(child_slot, 1, Some(1), 2);
+    zone.enter_guest(child_slot);
+    zone.install_space(child_slot, 1).unwrap();
+    let child = zone
+        .alloc_record(ThreadIdentity {
+            tid: 42,
+            serial: 102,
+            mm: 1,
+            file_table: 5,
+            generation: 12,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 2,
+            lifecycle_page: fixture.page as *const _ as u64,
+            control_slot: control as *const _ as u64,
+        })
+        .unwrap();
+    // A ring-born member has no host home or continuation.
+    assert!(zone.mark_native_owned(child));
+    // SAFETY: this newly allocated record is unpublished and fixture-owned.
+    unsafe {
+        *zone.record(child).ctx_mut() = make(fixture.address);
+    }
+    assert!(zone.requeue_preempted(child_slot, child).is_queued());
+    assert_eq!(zone.switch_in_full(child_slot).unwrap().record, child);
+    control.bind_zone_record(zone.record_ref(child));
+    let child_source = BornInZoneSource {
+        zone,
+        slot: child_slot,
+    };
+    fixture
+        .registry
+        .register_thread(child_source, task, fixture.address, fixture.page, control)
+        .unwrap();
+    assert!(zone.mark_native_owned(child));
+    assert!(zone.mark_native_owned(fixture.record.id));
+    let mut service = Physical {
+        zone,
+        page: fixture.page,
+        controls: core::slice::from_ref(control),
+        copies: Vec::new(),
+        tid_words: BTreeMap::from([((1, 0x1000), 42)]),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        on_signal_clock: None,
+    };
+    FUTEX_MAPPING.with(|slot| slot.set(Some(Ok(true))));
+    // Enroll the joiner through the registered native futex syscall. Its
+    // affinity permits CPU 0 only; CPU 1 continues running the exiting member.
+    let mut copy = Copy {
+        refuse_word: false,
+        loads: 0,
+    };
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &make(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.native_futex(
+                FutexCall {
+                    args: [0x1000, 0, 0, 0x2000, 0, 0],
+                },
+                &mut copy
+            ),
+            Some(LifecycleOutcome::Transferred { .. })
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+        assert!(entry.take_run_failure().is_none());
+    }
+    zone.leave_guest(fixture.slot, &ShortLockSpin);
+    assert!(zone.step_away(
+        fixture.slot,
+        1,
+        &mut |_| panic!("no ready records"),
+        &mut |_| panic!("no placement")
+    ));
+    let key = carrick_personality_linux::sched::MmFutexKey::shared_private(UserVa::new(0x1000))
+        .unwrap()
+        .scheduler_address();
+    let guard = zone.short_lock(
+        ZoneTables::<C>::bucket_of_with_context(1, key),
+        &ShortLockSpin,
+    );
+    assert_eq!(
+        zone.wake_placed(
+            &guard,
+            1,
+            key,
+            u32::MAX,
+            1,
+            Waker::El1 { slot: child_slot },
+            &mut [],
+            &mut WakeEffects::default()
+        ),
+        Err(WakeRefusal::Unplaceable),
+        "schedule must actually withhold the only eligible driver"
+    );
+    drop(guard);
+    struct Venue<'a> {
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+    }
+    impl crate::thread_setup::LifecycleVenue for Venue<'_> {
+        fn thread<'a>(
+            &'a self,
+            _: &'a CurrentTask,
+        ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+            Some(carrick_personality_linux::thread::LifecycleThread {
+                page: self.page,
+                slot: self.control,
+            })
+        }
+        fn born_slot(&self, _: &ThreadLifecyclePage, _: EntryRef) -> Option<&ThreadControlSlot> {
+            None
+        }
+    }
+    let venue = Venue {
+        page: fixture.page,
+        control,
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let names = carrick_el1_abi::InotifyNameCache::new();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                child_source,
+                task,
+                fixture.address,
+                &make(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let mut pending: crate::dispatch::El1PendingFamilies<
+            '_,
+            '_,
+            _,
+            crate::sched::FakeCpu,
+            crate::sched::HardwareUserWord,
+            _,
+            C,
+        > = crate::dispatch::El1PendingFamilies {
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut ExitFrame,
+            counters: &counters,
+            current_tasks: core::slice::from_ref(task),
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names,
+            zone: None,
+            ipc: None,
+            lifecycle: Some(&venue),
+            process: Some(entry.as_mut()),
+            source: Some(child_source),
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            dispatch(
+                carrick_syscall_abi::CanonicalNr::new(
+                    carrick_personality_linux::lifecycle::SYS_EXIT as u64
+                )
+                .raw(),
+                u64::MAX,
+                &mut pending
+            ),
+            CompletionRoute::Suspended,
+            "raw nonfinal exit must never forward to host custody"
+        );
+        drop(pending);
+        assert!(entry.take_handoff_receipt().is_some());
+        assert!(entry.take_run_failure().is_none());
+    }
+    assert!(
+        task.service_notice.take().unwrap().is_none(),
+        "no host service forward"
+    );
+    assert_eq!(fixture.page.live(), 1);
+    assert_eq!(control.clear_child_tid(), 0);
+    assert_eq!(service.tid_writes, [(1, 0x1000, 0)]);
+    assert!(matches!(
+        zone.record(fixture.record.id).claim(),
+        Claim::Queued { .. }
+    ));
+    assert_eq!(zone.timer_node_count(), 0);
+    // Fixed scheduler steps only: no polling or host blocking waits. The guest
+    // wait above is timed, and returning the driver consumes one completion.
+    zone.step_back(fixture.slot, 1);
+    zone.enter_guest(fixture.slot);
+    zone.install_space(fixture.slot, 1).unwrap();
+    let selected = zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    assert_eq!(selected.result, Some(0));
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &make(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::NoPending)
+    ));
+    assert!(entry.take_handoff_receipt().is_none());
+    assert!(entry.take_run_failure().is_none());
+    assert!(
+        matches!(entry.native_futex(FutexCall { args: [0x1000, 1, 1, 0, 0, 0] }, &mut copy),
+        Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == 0),
+        "exit consumed the join wait exactly once"
+    );
+    assert_eq!(zone.slot(fixture.slot).queued(), 0);
+    assert_eq!(zone.slot(child_slot).queued(), 0);
+    FUTEX_MAPPING.with(|slot| slot.set(None));
+}
+
+#[test]
+fn native_clear_tid_stopped_join_driver_x86() {
+    clear_tid_stopped_join_driver::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words,
+    );
+}
+#[test]
+fn native_clear_tid_stopped_join_driver_aarch64() {
+    clear_tid_stopped_join_driver::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}

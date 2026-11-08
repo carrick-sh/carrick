@@ -90,6 +90,7 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::{production_unmapped_root_early_bind_admits_and_forks,production_unmapped_root_late_bind_admits_and_forks} (production bootstrap without PID remapping, native admission and fork; shared internal/visible PID and TID)",
   "carrick-kernel::kernel::tests::{production_root_domains_retire_after_bootstrap,production_root_domains_retire_after_cancel} (production root binding and four cancelled preparations; namespace retirement returns cursor population and claims to baseline)",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_root_stock_claim_rollback_and_nproc_limit",
+  "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::{native_clear_tid_stopped_join_driver_aarch64,native_clear_tid_stopped_join_driver_x86} (registered native raw exit, stopped eligible join driver, no host custody and exactly one join completion)",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_root_stock_busy_claim_parks_then_release_retries_same_clone",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_pid_excludes_live_host_thread_tids",
