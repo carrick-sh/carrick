@@ -643,7 +643,7 @@ impl SyscallDispatcher {
         let fs = self.fs_view();
         match header.op {
             HostFileOp::Readlinkat => {
-                if let Err(errno) = fs.readlink_trailing_slash(LINUX_AT_FDCWD, path) {
+                if let Err(errno) = fs.readlink_trailing_slash(fd::Fd(LINUX_AT_FDCWD as i32), path) {
                     return Served::errno(errno);
                 }
                 let resolved = match fs.resolve_at_path(LINUX_AT_FDCWD, path) {

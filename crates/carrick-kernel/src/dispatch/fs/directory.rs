@@ -846,7 +846,7 @@ impl<'a> FsView<'a> {
             }
 
             let path = read_guest_c_string(&*cx.memory, pathname)?;
-            if let Err(errno) = this.readlink_trailing_slash(dirfd, &path) {
+            if let Err(errno) = this.readlink_trailing_slash(carrick_fd_core::Fd(dirfd as i32), &path) {
                 return Ok(DispatchOutcome::errno(errno));
             }
             // An empty pathname with an O_PATH|O_NOFOLLOW dirfd naming a SYMLINK
@@ -1752,13 +1752,13 @@ impl<'a> FsView<'a> {
 impl super::super::FsView<'_> {
     pub(in crate::dispatch) fn readlink_trailing_slash(
         &self,
-        dirfd: u64,
+        dirfd: carrick_fd_core::Fd,
         path: &str,
     ) -> Result<(), LinuxErrno> {
         if path.len() <= 1 || !path.ends_with('/') {
             return Ok(());
         }
-        let resolved = self.resolve_at_path(dirfd, path)?;
+        let resolved = self.resolve_at_path(dirfd.0 as u64, path)?;
         let canonical = self.canonicalize_following(&resolved).unwrap_or(resolved);
         let md = self.layered_metadata(&canonical)?;
         Err(if md.kind == RootFsEntryKind::Directory {
