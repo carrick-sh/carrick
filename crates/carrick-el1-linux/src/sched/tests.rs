@@ -539,10 +539,10 @@ fn a_timed_wait_ends_in_guest_with_etimedout() {
     assert_eq!(task.execution.task.load(Ordering::Relaxed), 101);
 }
 
-/// A switched-in thread's timed wait is forwarded (its deadline would
-/// outlive this vCPU's hold on it); so is an invalid timespec.
+/// A switched-in thread owns its timer lease even when it is not this
+/// vCPU's host record. Invalid timespecs keep their existing refusal.
 #[test]
-fn timed_waits_this_vcpu_cannot_keep_forward() {
+fn switched_in_timed_wait_uses_its_own_timer_lease() {
     let zone = zone();
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
@@ -561,7 +561,14 @@ fn timed_waits_this_vcpu_cannot_keep_forward() {
     let ts = libc_timespec(0, 1_000_000);
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     frame.x[3] = &ts as *const [u64; 2] as u64;
-    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), None);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
+    assert_eq!(
+        frame.x[0] as i64, -110,
+        "the selected thread times out in ring"
+    );
+    assert_eq!(zone.slot(SLOT).current(), Some(b));
+    assert_eq!(zone.counters.el1_timeouts.load(Ordering::Relaxed), 1);
+    assert_eq!(zone.timer_deadline(SLOT), None, "expired lease is consumed");
 }
 
 /// A handoff across vCPUs: the woken thread is the other vCPU's home
