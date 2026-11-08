@@ -423,6 +423,14 @@ impl OperationToken {
             && self.generation == key.generation
     }
 
+    const fn stored_anonymous_edit(index: u64, generation: u64) -> Option<Self> {
+        if index & !ANONYMOUS_EDIT_OPERATION_TAG == 0 || generation == 0 {
+            None
+        } else {
+            Some(Self { index, generation })
+        }
+    }
+
     /// An owned metadata request wait; no IPC operation arena owns this token.
     pub const fn metadata_request(generation: u64) -> Option<Self> {
         if generation == 0 {
@@ -1750,9 +1758,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     }
 
     /// Whether this record holds an adapter-owned IPC operation token
-    /// (`index != 0 && index != u64::MAX`) with an external endpoint pin.
+    /// with an external endpoint pin. Metadata and anonymous-edit replay
+    /// tokens are scheduler-owned and have no adapter arena entry.
     pub fn has_adapter_operation(&self) -> bool {
-        !matches!(self.object.operation.load(Ordering::Acquire), 0 | u64::MAX)
+        let operation = self.object.operation.load(Ordering::Acquire);
+        !matches!(operation, 0 | u64::MAX) && operation & ANONYMOUS_EDIT_OPERATION_TAG == 0
     }
 
     /// Whether this record's last object park ended at its deadline rather
@@ -1839,6 +1849,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         let generation = self.object.operation_generation.load(Ordering::Relaxed);
         if index == u64::MAX {
             OperationToken::metadata_request(generation)
+        } else if index & ANONYMOUS_EDIT_OPERATION_TAG != 0 {
+            OperationToken::stored_anonymous_edit(index, generation)
         } else {
             OperationToken::new(index, generation)
         }
