@@ -186,3 +186,18 @@ mod signal_return_tests {
         assert!(!super::valid_user_return_words(1 << 47, 0x700000, restored));
     }
 }
+
+#[cfg(test)]
+mod anonymous_restart_tests {
+    use carrick_guest_arch::ProcessContext;
+
+    #[test]
+    fn parked_syscall_restarts_at_instruction_without_losing_ordinal() {
+        let mut words = super::ParkedContextWords::ZERO;
+        words.frame[15] = 0x401002;
+        words.frame[10] = 11; // x86 munmap ordinal in saved RAX.
+        words.restart_syscall();
+        assert_eq!(words.frame[15], 0x401000);
+        assert_eq!(words.syscall_return(), 11);
+    }
+}

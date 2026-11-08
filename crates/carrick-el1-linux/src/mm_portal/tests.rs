@@ -3233,6 +3233,159 @@ fn anonymous_munmap_editor_busy_requests_wait_without_counted_forward() {
 }
 
 #[test]
+fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served, ThreadCpu};
+    use carrick_el1_abi::{AnonymousLeave, Counters, CurrentTask, El1TaskId, SlotId, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+
+    for cause in [SpaceWaitCause::Reservations, SpaceWaitCause::Editor] {
+        for cancel in [false, true] {
+            let region = Region::new();
+            let zone = region.zone();
+            let mm = admit_notified(&region, 77, ROOT, 2, 0);
+            let view = nodes(&region);
+            let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &zone.spaces, &view)
+                .with_zone(zone)
+                .unwrap();
+            let slot = SlotId::from_index(0).unwrap();
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, mm.raw(), None, 0);
+            assert!(zone.occupancy.replace(
+                carrick_sched_core::ExecutionSlot::zone(slot),
+                0,
+                mm.raw()
+            ));
+            zone.enter_guest(slot);
+            let task = CurrentTask::new();
+            task.set(
+                El1TaskId::from_linux_tid(101),
+                carrick_el1_abi::SnapshotGeneration::from_raw(1),
+                5,
+            );
+            task.mm.key.store(mm.raw(), Ordering::Release);
+            task.mm.thread_generation.store(1101, Ordering::Release);
+            task.linux.mark_pending_host_work();
+            let counters = Counters::default();
+            let tables = Tables::new(ROOT, IPA, 0);
+            let arenas = [&tables];
+            let mut editor = ForkAnonymousEditor {
+                arenas: &arenas,
+                pool: TableWindow {
+                    words: tables.words.as_ptr().cast_mut(),
+                    physical_base: tables.base,
+                    byte_len: tables.words.len() * 8,
+                },
+            };
+            let mut frame = TrapFrame {
+                slot: 0,
+                elr: 0x1004,
+                ..TrapFrame::default()
+            };
+            frame.x[0] = VA;
+            frame.x[1] = 4096;
+            frame.x[8] = 215;
+            let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
+            let held_root =
+                (cause == SpaceWaitCause::Reservations).then(|| portal.root(mm, 1).unwrap());
+            let held_editor = (cause == SpaceWaitCause::Editor).then(|| {
+                access
+                    .try_begin_edit(
+                        zone.spaces.find(mm.raw()).unwrap(),
+                        mm.raw(),
+                        NonZeroU64::new(2).unwrap(),
+                    )
+                    .unwrap()
+            });
+            assert_eq!(
+                serve_delegated_anonymous(
+                    &mut frame,
+                    &counters,
+                    &task,
+                    access,
+                    region.table(),
+                    &mut editor,
+                    None
+                ),
+                DelegatedAnonymous::Contended(cause),
+            );
+            let mut cpu = FakeCpu::default();
+            let mut sched = Sched {
+                handoff: None,
+                zone,
+                slot,
+                task: &task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: &counters,
+            };
+            assert!(matches!(
+                park_anonymous_edit(&mut sched, &mut frame, region.table(), cause),
+                Some(Served::Idle),
+            ));
+            let record = zone.slot(slot).host_record().unwrap();
+            assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 1);
+            let source = zone
+                .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+                .unwrap()
+                .live_notifications()
+                .unwrap();
+            let key = source.key(cause);
+            assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+            if cancel {
+                assert_eq!(
+                    zone.claim_for_host(
+                        zone.record_ref(record),
+                        None,
+                        carrick_sched_core::Handback::Cancelled,
+                        &carrick_sched_core::ShortLockSpin,
+                    ),
+                    carrick_sched_core::HostClaim::Claimed,
+                );
+            }
+            drop(held_root);
+            drop(held_editor);
+            assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+            if cancel {
+                assert!(zone.switch_in_full(slot).is_none());
+                assert_eq!(
+                    zone.record(record).handback(),
+                    Some(carrick_sched_core::Handback::Cancelled)
+                );
+                continue;
+            }
+            let switched = zone.switch_in_full(slot).unwrap();
+            // SAFETY: switch_in_full assigned this exact record to the execution slot.
+            let context = unsafe { zone.record(switched.record).ctx_mut() };
+            assert_eq!(context.native.pc, 0x1000);
+            sched.cpu.load(&mut frame, context);
+            assert_eq!(
+                serve_delegated_anonymous(
+                    &mut frame,
+                    &counters,
+                    &task,
+                    access,
+                    region.table(),
+                    &mut editor,
+                    None
+                ),
+                DelegatedAnonymous::Served,
+            );
+            let leave = if cause == SpaceWaitCause::Reservations {
+                AnonymousLeave::RootBusy
+            } else {
+                AnonymousLeave::EditorBusy
+            };
+            assert_eq!(
+                counters.anonymous_leaves[leave as usize].load(Ordering::Relaxed),
+                0
+            );
+        }
+    }
+}
+
+#[test]
 fn anonymous_edit_wait_reruns_when_root_releases_between_probe_and_park() {
     use carrick_core::wait::{EditWaitOutcome, coordinate_anonymous_edit_wait};
     use carrick_sched_core::object_wait::ObjectWaitError;

@@ -992,12 +992,18 @@ impl Personality for LinuxPersonality {
                 .map_or(core::ptr::null_mut(), |ptr| ptr.as_ptr())
         };
 
-        let mut anonymous =
-            anonymous::X86AnonymousVenue::new(&call, task, binding.cpu_slot, frame.rcx);
         let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
             .unwrap_or_else(|| fatal_boot());
         let source = carrick_x86_carrier::native_execution::source(slot);
         let words = capture(frame, early_xstate);
+        let mut anonymous = anonymous::X86AnonymousVenue::new(
+            &call,
+            task,
+            binding.cpu_slot,
+            frame.rcx,
+            source,
+            words,
+        );
         native_process::admit_root(words, source, task).unwrap_or_else(|_| fatal_boot());
         admit_stdio_cached(binding, task, &files);
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
@@ -1067,6 +1073,11 @@ impl Personality for LinuxPersonality {
                     }
                     _ => fatal_boot(),
                 };
+            if let Some(venue) = anonymous.as_mut()
+                && venue.take_retry()
+            {
+                frame.rcx = frame.rcx.checked_sub(2).unwrap_or_else(|| fatal_boot());
+                frame.rax = venue.original_syscall_number();
             }
             if route == CompletionRoute::Forward
                 && let Some(stage) = crate::native_host_file::stage(&call, task, binding.cpu_slot)
