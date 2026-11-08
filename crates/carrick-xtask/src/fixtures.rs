@@ -252,6 +252,16 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Bind executed content, excluding the publishing commit and checkout provenance.
+    pub fn content_identity(&self) -> Result<ContentHash> {
+        Ok(hash_bytes(&serde_json::to_vec(&(
+            &self.schema,
+            self.input_identity()?,
+            &self.toolchain,
+            &self.executables,
+        ))?))
+    }
+
     /// SHA-256 over the scoped source inventory, recorded compiler inputs and
     /// build policy. The compiler pin is a source input; the toolchain record
     /// is checked against it. Canonical JSON frames every path and digest
@@ -294,6 +304,9 @@ pub struct ValidationReceipt {
     pub manifest_sha256: ContentHash,
     /// Fixture input identity shared by the bundle and this checkout.
     pub inputs_sha256: ContentHash,
+    /// Legacy receipts lack executed-content evidence and cannot be compared.
+    #[serde(default)]
+    pub content_sha256: Option<ContentHash>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +342,7 @@ fn validation_receipt(
             .is_empty(),
         manifest_sha256: hash_bytes(&manifest_bytes(manifest)?),
         inputs_sha256: manifest.input_identity()?,
+        content_sha256: Some(manifest.content_identity()?),
     })
 }
 

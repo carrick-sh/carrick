@@ -1542,6 +1542,7 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
                 checkout_dirty: false,
                 manifest_sha256: "1".repeat(64).try_into().unwrap(),
                 inputs_sha256: "2".repeat(64).try_into().unwrap(),
+                content_sha256: Some("3".repeat(64).try_into().unwrap()),
             }),
             el1: None,
             probe_diffs: vec![],

@@ -198,7 +198,7 @@ fn admitted(head: &str) -> AcceptReceipt {
         "inotify09-el0"
     ]);
     value["artifact"] = json!({"path":"target/release/carrick","sha256":"1".repeat(64),"cdhash":"2".repeat(40),"lc_uuid":"some-uuid","hypervisor_entitlement":true,"dof_present":true});
-    value["fixture_validation"] = json!({"validation_method":"input_identity","elf_hash_verification":"recomputed","checkout_head":head,"checkout_tree":"3".repeat(40),"bundle_source_head":"a".repeat(40),"checkout_dirty":false,"manifest_sha256":"4".repeat(64),"inputs_sha256":"5".repeat(64)});
+    value["fixture_validation"] = json!({"validation_method":"input_identity","elf_hash_verification":"recomputed","checkout_head":head,"checkout_tree":"3".repeat(40),"bundle_source_head":"a".repeat(40),"checkout_dirty":false,"manifest_sha256":"4".repeat(64),"content_sha256":"6".repeat(64),"inputs_sha256":"5".repeat(64)});
     let names = [
         "fixtures",
         "build",
@@ -2001,7 +2001,7 @@ fn legacy_or_incomplete_identity_and_different_bundles_are_incomparable() {
             .contains("missing fixture bundle identity")
     );
     let mut old = serde_json::to_value(&candidate).unwrap();
-    old["fixture_validation"]["manifest_sha256"] = json!("9".repeat(64));
+    old["fixture_validation"]["content_sha256"] = json!("9".repeat(64));
     assert!(
         compare(&serde_json::from_value(old).unwrap(), &candidate)
             .unwrap_err()
@@ -2056,6 +2056,7 @@ fn identical_fixture_content_from_different_commits_is_comparable() {
         let validation = receipt.fixture_validation.as_mut().unwrap();
         validation.bundle_source_head = manifest.source_head.clone();
         validation.inputs_sha256 = manifest.input_identity().unwrap();
+        validation.content_sha256 = Some(manifest.content_identity().unwrap());
         validation.manifest_sha256 = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(manifest).unwrap())
@@ -2072,6 +2073,27 @@ fn identical_fixture_content_from_different_commits_is_comparable() {
         republished.input_identity().unwrap()
     );
     assert!(compare(&old, &receipt(&republished)).unwrap().passed);
+    for field in ["executable", "input", "toolchain"] {
+        let mut changed = republished.clone();
+        match field {
+            "executable" => changed.executables[0].sha256 = "9".repeat(64).try_into().unwrap(),
+            "input" => {
+                changed
+                    .sources
+                    .insert("fixture.rs".into(), "9".repeat(64).try_into().unwrap());
+            }
+            _ => changed.toolchain.rustc = "other compiler".into(),
+        }
+        assert!(matches!(
+            compare(&old, &receipt(&changed)),
+            Err(carrick_xtask::ci_receipt::ReceiptError::IncomparableBase(_))
+        ));
+    }
+    let mut legacy = old.clone();
+    legacy.fixture_validation.as_mut().unwrap().content_sha256 = None;
+    assert!(compare(&legacy, &legacy).is_err());
+    assert!(compare(&legacy, &old).is_err());
+    assert!(compare(&old, &legacy).is_err());
 }
 
 #[test]

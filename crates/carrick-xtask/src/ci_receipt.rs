@@ -1857,6 +1857,18 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
             candidate,
             json,
         } => {
+            if let Some(path) = &json {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(ReceiptError::Io {
+                            path: path.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
             let result = crate::signed_receipt::compare(&load(&base)?, &load(&candidate)?)?;
             println!("{}", result.markdown());
             if let Some(path) = json {
