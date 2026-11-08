@@ -3179,3 +3179,6 @@ mod custody_tests {
 
 #[path = "cpl0_native_service.rs"]
 mod native_service;
+#[cfg(test)]
+#[path = "cpl0_anonymous/cow_retirement_tests.rs"]
+mod cow_retirement_tests;
