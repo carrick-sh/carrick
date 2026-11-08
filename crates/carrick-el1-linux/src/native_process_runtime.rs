@@ -1643,7 +1643,13 @@ impl NativeExecutionKey {
     }
 }
 
+enum NativeThreadAdmission {
+    CurrentEntry,
+    AdmittedBirth,
+}
+
 struct NativeThreadRegistration<'a, C: ProcessContext> {
+    admission: NativeThreadAdmission,
     source: BornInZoneSource<'a, C>,
     address: AddressContext<RootGpa>,
     page: &'a ThreadLifecyclePage,
@@ -2667,6 +2673,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             (issued.visible_tid, Some(issued))
         };
         let (runtime, closing) = self.register_thread_member(NativeThreadRegistration {
+            admission: NativeThreadAdmission::CurrentEntry,
             source,
             address,
             page,
@@ -2688,6 +2695,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         registration: NativeThreadRegistration<'a, C>,
     ) -> Result<(Arc<NativeProcessRuntime<'a, M, C>>, bool), NativeProcessError> {
         let NativeThreadRegistration {
+            admission,
             source,
             address,
             page,
@@ -2703,7 +2711,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         // from a lifecycle-page snapshot.
         let group_key = Self::group_key(source.zone, address, page, visible_pid);
         let mut state = self.state.lock();
-        if !page.gate().serves_ring() {
+        // A Born member already owns its live unit. Terminal close may
+        // reserve topology while this admitted participant finishes publication.
+        if !page.gate().serves_ring() && matches!(admission, NativeThreadAdmission::CurrentEntry) {
             return Err(NativeProcessError::Stale);
         }
         let (runtime, process) = state
@@ -2929,6 +2939,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             address,
         )?;
         let (registered, closing) = self.register_thread_member(NativeThreadRegistration {
+            admission: NativeThreadAdmission::AdmittedBirth,
             source,
             address,
             page,
@@ -6438,6 +6449,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         ))
                     }
                 };
+                thread_stock::drain_closed(resources)?;
                 // Already admitted sibling retirement still needs its own
                 // exact-record cancellation binding. Pre-live claims are
                 // refused by thread_spawned after this terminal close.
@@ -8075,16 +8087,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         if mm != self.binding.mm {
             return false;
         }
+        let Some(key) = carrick_personality_linux::sched::MmFutexKey::shared_private(address)
+        else {
+            // exit's best-effort futex wake cannot wake an aligned neighbour
+            // when clear_child_tid itself is unaligned.
+            return true;
+        };
         let zone = self.source.zone;
         let guard = zone.short_lock(
-            ZoneTables::<C>::bucket_of_with_context(mm.raw(), futex::shared_private_key(address)),
+            ZoneTables::<C>::bucket_of_with_context(mm.raw(), key.scheduler_address()),
             &carrick_sched_core::ShortLockSpin,
         );
         let mut effects = WakeEffects::default();
         let result = zone.wake_placed(
             &guard,
             mm.raw(),
-            futex::shared_private_key(address),
+            key.scheduler_address(),
             carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
             carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
             carrick_sched_core::Waker::El1 {
@@ -8364,6 +8382,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         let wake = {
             let mut graph = self.runtime.graph.lock();
             if graph.pending.has_exit(&self.key) {
+                let resources = graph
+                    .owner
+                    .task_mut(self.key)
+                    .map_err(|_| NativeProcessError::Stale.errno())?
+                    .native_mut()
+                    .resources_mut();
+                thread_stock::drain_closed(resources).map_err(|error| error.errno())?;
                 let page = graph
                     .owner
                     .task(self.key)

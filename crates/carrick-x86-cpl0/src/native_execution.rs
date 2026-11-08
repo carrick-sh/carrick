@@ -247,7 +247,7 @@ pub fn expire_signal_timer(slot: SlotId) {
         .expire_timer_and_rearm(
             slot,
             now.raw(),
-            carrick_personality_linux::abi::signal::LINUX_EAGAIN.guest_retval() as u64,
+            carrick_personality_linux::sched::ETIMEDOUT_RESULT,
             retry_ticks,
         )
         .map(|ticks| Deadline(CounterTick::new(ticks)));

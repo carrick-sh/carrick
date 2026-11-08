@@ -522,6 +522,13 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     ) -> Result<(), NativeProcessError> {
         Ok(())
     }
+    fn counter_frequency(
+        &self,
+    ) -> Result<carrick_personality_linux::sched::FutexFrequency, NativeProcessError> {
+        Ok(carrick_personality_linux::sched::FutexFrequency::from_hz(
+            1000,
+        ))
+    }
     fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
         if let Some(mut hook) = self.on_signal_clock.take() {
             hook();
@@ -8172,4 +8179,123 @@ fn native_root_stock_busy_claim_parks_then_release_retries_same_clone() {
             Some((_, carrick_el1_abi::EntryState::Revoked))
         ));
     }
+}
+
+#[test]
+fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
+    use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest, UserCopy};
+    use carrick_guest_arch::{Access, GuestLen};
+    use carrick_personality_linux::sched::{ETIMEDOUT_RESULT, FutexCall};
+    struct Copy {
+        refuse: bool,
+        loads: usize,
+    }
+    impl UserCopy for Copy {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+            assert_eq!(dst.len(), 8);
+            dst.copy_from_slice(&(if src.raw() == 0x2000 { 1_u64 } else { 0 }).to_le_bytes());
+            CopyOutcome::Done
+        }
+        fn copy_out(&mut self, _: UserVa, _: &[u8]) -> CopyOutcome {
+            panic!("futex must not write guest bytes")
+        }
+        fn atomic_load_u32(&mut self, address: UserVa, out: &mut u32) -> CopyOutcome {
+            assert_eq!(address, UserVa::new(0x1000));
+            self.loads += 1;
+            if core::mem::take(&mut self.refuse) {
+                CopyOutcome::NotYet(GuestCopyRequest {
+                    address,
+                    len: GuestLen::new(4),
+                    access: Access::Read,
+                })
+            } else {
+                *out = 0;
+                CopyOutcome::Done
+            }
+        }
+    }
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let mut copy = Copy {
+        refuse: true,
+        loads: 0,
+    };
+    let call = FutexCall {
+        args: [0x1000, 128, 0, 0x2000, 0, 0],
+    };
+    assert!(matches!(
+        entry.native_futex(call, &mut copy),
+        Some(LifecycleOutcome::Redispatch)
+    ));
+    assert_eq!(copy.loads, 1);
+    assert!(fixture.zone.timer_deadline(fixture.slot).is_none());
+    // Advance the physical clock after owner preparation, then redispatch the
+    // exact operation. Its original deadline is already 2000, not 3000.
+    fixture
+        .zone
+        .counters
+        .el1_timeouts
+        .store(1, Ordering::Release);
+    assert!(matches!(
+        entry.native_futex(call, &mut copy),
+        Some(LifecycleOutcome::Transferred { .. })
+    ));
+    assert_eq!(copy.loads, 2);
+    assert_eq!(fixture.zone.timer_deadline(fixture.slot), Some(2000));
+    assert!(entry.take_handoff_receipt().is_some());
+    let shared_key =
+        carrick_personality_linux::sched::MmFutexKey::shared_private(UserVa::new(0x1000))
+            .unwrap()
+            .scheduler_address();
+    let guard = fixture.zone.short_lock(
+        ZoneTables::<ParkedContextWords>::bucket_of_with_context(1, shared_key),
+        &carrick_sched_core::ShortLockSpin,
+    );
+    let mut effects = WakeEffects::default();
+    assert_eq!(
+        fixture.zone.wake_placed(
+            &guard,
+            1,
+            shared_key,
+            u32::MAX,
+            1,
+            Waker::El1 { slot: fixture.slot },
+            &mut [],
+            &mut effects
+        ),
+        Ok(0),
+        "a shared wake cannot release a PRIVATE waiter"
+    );
+    drop(guard);
+    assert_eq!(fixture.zone.timer_deadline(fixture.slot), Some(2000));
+    assert_eq!(
+        fixture
+            .zone
+            .expire_timer(fixture.slot, 2000, ETIMEDOUT_RESULT),
+        Ok(true)
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().result,
+        Some(ETIMEDOUT_RESULT)
+    );
+    assert_eq!(fixture.zone.timer_node_count(), 0);
+    assert_eq!(
+        copy.loads, 2,
+        "expiry must not re-read or replay the guest comparison"
+    );
 }

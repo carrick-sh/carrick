@@ -74,11 +74,46 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
         }
         Err(NativeProcessError::Exhausted)
     }
+    fn drain_closed(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeProcessError> {
+        if page.gate() == carrick_el1_abi::GateState::Open {
+            return Ok(());
+        }
+        for index in 0..page.entry_count() {
+            let Some((generation, carrick_el1_abi::EntryState::Reserved)) = page.state(index)
+            else {
+                continue;
+            };
+            let entry = EntryRef::new(index as u32, generation);
+            match carrick_core::lifecycle::revoke_unborn_control(
+                page,
+                entry,
+                &self.controls[index + 1],
+            ) {
+                Ok(()) => {}
+                // The claim owns its rollback/live decision and its mandatory
+                // admission-settled callback. Never consume that participant.
+                Err(carrick_core::lifecycle::TransitionError::WrongState(
+                    carrick_el1_abi::EntryState::Claimed,
+                )) => {}
+                Err(_) => return Err(NativeProcessError::Stale),
+            }
+        }
+        self.settle(page)
+    }
     fn settle(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeProcessError> {
         self.identities
             .settle(page, self.controls)
             .map_err(|_| NativeProcessError::Stale)
     }
+}
+
+pub(super) fn drain_closed<M, C: ProcessContext>(
+    resources: &mut NativeResources<'_, M, C>,
+) -> Result<(), NativeProcessError> {
+    if let Some(stock) = resources.thread_stock.as_mut() {
+        stock.drain_closed(resources.page)?;
+    }
+    Ok(())
 }
 
 pub(super) fn at_limit<M: Clone, C: ProcessContext>(
@@ -143,6 +178,9 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
     let Some(stock) = resources.thread_stock.as_mut() else {
         return Ok(());
     };
+    if resources.page.gate() != carrick_el1_abi::GateState::Open {
+        return stock.drain_closed(resources.page);
+    }
     stock.settle(resources.page)?;
     struct Stock<'s, 'a, C: ProcessContext> {
         stock: &'s mut NativeThreadStock<'a, C>,

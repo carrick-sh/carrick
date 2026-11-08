@@ -2517,10 +2517,18 @@ impl<
     fn resume_owned_continuation(&mut self) -> Option<lifecycle::LifecycleOutcome> {
         let process = self.process.as_deref_mut()?;
         let args = core::array::from_fn(|index| self.frame.argument(index).unwrap_or(0));
-        if !carrick_personality_linux::sched::is_served_futex_op(
-            self.frame.canonical_ordinal().raw(),
-            args,
-        ) {
+        let native_shared_candidate = self.source.is_some()
+            && self.frame.canonical_ordinal().raw()
+                == carrick_personality_linux::sched::SYS_FUTEX as u64
+            && carrick_personality_linux::sched::FutexCall { args }
+                .shared_private_candidate()
+                .is_some();
+        if !native_shared_candidate
+            && !carrick_personality_linux::sched::is_served_futex_op(
+                self.frame.canonical_ordinal().raw(),
+                args,
+            )
+        {
             let _ = process.take_relative_futex_wait();
         }
         process.resume_owned_continuation()
