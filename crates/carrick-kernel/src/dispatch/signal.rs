@@ -2241,8 +2241,13 @@ impl<'a> SignalView<'a> {
             let new_mask = if new_set != 0 {
                 let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
                     Ok(bytes) => bytes,
-                    Err(_) => {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    // An owner-memory suspension means "not now": park and
+                    // redispatch. Only a real fault is EFAULT. Collapsing the
+                    // suspension made glibc's block-all mask call fail, leave
+                    // `old_set` unwritten and restore garbage (#1677).
+                    Err(error) => {
+                        return Ok(DispatchOutcome::from_owner_memory_error(error)
+                            .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT)));
                     }
                 };
                 let set = SigSet::from_raw(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])));
