@@ -2976,6 +2976,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         self.unregister_process(runtime, key);
     }
 
+    /// Exercise the production unregister path while the root is still live.
+    ///
+    /// Unlike fixture cleanup, this deliberately leaves the runtime and its
+    /// signal projections retained so entry classification sees the same
+    /// ownership overlap as a terminal publication racing user return.
+    #[cfg(test)]
+    pub(crate) fn attempt_live_root_unregister_for_test(
+        &self,
+        runtime: &NativeProcessRuntime<'a, M, C>,
+    ) {
+        let key = runtime.graph.lock().root_key;
+        self.unregister_process(runtime, key);
+    }
+
     fn unregister_process(&self, runtime: &NativeProcessRuntime<'a, M, C>, process: TaskKey) {
         let mut state = self.state.lock();
         let carrier = core::ptr::from_ref(runtime.zone).addr();
