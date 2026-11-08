@@ -1076,6 +1076,16 @@ def _c_global_load_addr(target, name: str) -> Optional[int]:
 
 # ----- the top-level `carrick` multiplex command --------------------------
 
+def _format_mmap_failure(words):
+    if len(words) != 15:
+        raise ValueError("mmap failure record must have 15 words")
+    names = ("mm", "tid", "hint", "length", "prot", "flags", "reason",
+             "arena_start", "arena_end", "address_limit", "data_limit",
+             "external_address", "external_data", "root_address", "root_data")
+    return " ".join(f"{name}={value:#x}" for name, value in zip(names, words)) + (
+        " refusal=Limit" if words[6] == 1 else " refusal=UNKNOWN")
+
+
 def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
     """Read the mapped ARM counters, using this artifact's DWARF layout."""
     import struct
@@ -1106,7 +1116,7 @@ def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
     for index in range(layout.GetNumberOfFields()):
         field = layout.GetFieldAtIndex(index)
         name = field.GetName()
-        if name not in ("served", "forwarded", "refused"):
+        if name not in ("served", "forwarded", "refused", "anonymous_leaves"):
             continue
         size = field.GetType().GetByteSize()
         if size == 0 or size % 8 != 0 or size > 8192:
@@ -1117,14 +1127,64 @@ def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
             result.SetError("counter array unreadable: " + name + ": " + str(error))
             return
         values[name] = struct.unpack("<" + "Q" * (size // 8), raw)
-    if set(values) != {"served", "forwarded", "refused"}:
+    if set(values) != {"served", "forwarded", "refused", "anonymous_leaves"}:
         result.SetError("incomplete ARM Counters DWARF layout")
         return
     lines = [f"# ARM EL1 syscall counters host_pid={process.GetProcessID()} pointer={pointer:#x}"]
+    leaves = values.pop("anonymous_leaves")
+    for index, count in enumerate(leaves):
+        if count:
+            lines.append(f"anonymous_leave[{index}]={count}")
     for nr in range(max(map(len, values.values()))):
         row = {name: counts[nr] if nr < len(counts) else 0 for name, counts in values.items()}
         if any(row.values()):
             lines.append(f"nr={nr} " + " ".join(f"{name}={count}" for name, count in row.items()))
+    # Appended mmap refusal storage uses this artifact's DWARF too. Read it
+    # while the carrier is stopped; ready=0 is incomplete, never zero evidence.
+    failure_field = next((layout.GetFieldAtIndex(i) for i in range(layout.GetNumberOfFields())
+                          if layout.GetFieldAtIndex(i).GetName() == "mmap_failures"), None)
+    if failure_field is None:
+        result.SetError("mmap failure census DWARF field unavailable")
+        return
+    failure_type = failure_field.GetType()
+    failure_base = pointer + failure_field.GetOffsetInBytes()
+    fields = {failure_type.GetFieldAtIndex(i).GetName(): failure_type.GetFieldAtIndex(i)
+              for i in range(failure_type.GetNumberOfFields())}
+    if set(fields) != {"attempted", "records"}:
+        result.SetError("mmap failure census DWARF layout mismatch")
+        return
+    attempts = process.ReadUnsignedFromMemory(
+        failure_base + fields["attempted"].GetOffsetInBytes(), 8, error)
+    if error.Fail():
+        result.SetError("mmap failure count unreadable: " + str(error))
+        return
+    records_type = fields["records"].GetType()
+    record_type = records_type.GetArrayElementType()
+    stride = record_type.GetByteSize()
+    capacity = records_type.GetNumberOfElements()
+    record_fields = {record_type.GetFieldAtIndex(i).GetName(): record_type.GetFieldAtIndex(i)
+                     for i in range(record_type.GetNumberOfFields())}
+    if (capacity != 16 or set(record_fields) != {"ready", "words"}
+            or record_fields["words"].GetType().GetByteSize() != 15 * 8):
+        result.SetError("mmap failure record DWARF layout mismatch")
+        return
+    lines.append(f"mmap_enomem attempted={attempts} capacity={capacity} "
+                 f"dropped={max(0, attempts - capacity)}")
+    for index in range(min(attempts, capacity)):
+        base = failure_base + fields["records"].GetOffsetInBytes() + index * stride
+        ready = process.ReadUnsignedFromMemory(base + record_fields["ready"].GetOffsetInBytes(), 8, error)
+        if error.Fail():
+            result.SetError("mmap failure publication unreadable: " + str(error))
+            return
+        if ready != 1:
+            lines.append(f"mmap_enomem[{index}] INCOMPLETE ready={ready}")
+            continue
+        raw = process.ReadMemory(base + record_fields["words"].GetOffsetInBytes(), 15 * 8, error)
+        if error.Fail() or len(raw) != 15 * 8:
+            result.SetError("mmap failure arguments unreadable: " + str(error))
+            return
+        words = struct.unpack("<15Q", raw)
+        lines.append(f"mmap_enomem[{index}] " + _format_mmap_failure(words))
     result.AppendMessage("\n".join(lines))
 
 

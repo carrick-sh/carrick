@@ -2957,7 +2957,10 @@ pub struct MmapFailureRecord {
 }
 impl MmapFailureRecord {
     const fn new() -> Self {
-        Self { ready: AtomicU64::new(0), words: [const { AtomicU64::new(0) }; 15] }
+        Self {
+            ready: AtomicU64::new(0),
+            words: [const { AtomicU64::new(0) }; 15],
+        }
     }
 }
 
@@ -2985,16 +2988,36 @@ impl MmapFailures {
         charges: carrick_core_abi::Charges,
     ) {
         let index = self.attempted.fetch_add(1, Ordering::Relaxed);
-        let Some(record) = usize::try_from(index).ok().and_then(|i| self.records.get(i)) else { return; };
+        let Some(record) = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.records.get(i))
+        else {
+            return;
+        };
         let policy = layout.policy.words();
-        let words = [mm.raw(), task.execution.task.load(Ordering::Relaxed), args[0], args[1], args[2], args[3], 1,
-            layout.arena.start(), layout.arena.end(), policy[1], policy[2],
-            policy[3], policy[4], charges.bytes, charges.data];
-        for (target, value) in record.words.iter().zip(words) { target.store(value, Ordering::Relaxed); }
+        let words = [
+            mm.raw(),
+            task.execution.task.load(Ordering::Relaxed),
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            1,
+            layout.arena.start(),
+            layout.arena.end(),
+            policy[1],
+            policy[2],
+            policy[3],
+            policy[4],
+            charges.bytes,
+            charges.data,
+        ];
+        for (target, value) in record.words.iter().zip(words) {
+            target.store(value, Ordering::Relaxed);
+        }
         record.ready.store(1, Ordering::Release);
     }
     fn copy_to(&self, snapshot: &Self) {
-        snapshot.attempted.store(self.attempted.load(Ordering::Acquire), Ordering::Relaxed);
         for (source, target) in self.records.iter().zip(&snapshot.records) {
             if source.ready.load(Ordering::Acquire) == 1 {
                 for (source, target) in source.words.iter().zip(&target.words) {
@@ -3003,6 +3026,9 @@ impl MmapFailures {
                 target.ready.store(1, Ordering::Release);
             }
         }
+        snapshot
+            .attempted
+            .store(self.attempted.load(Ordering::Acquire), Ordering::Relaxed);
     }
 }
 
@@ -4821,7 +4847,8 @@ mod tests {
                 + LifecycleDecline::COUNT
                 + AnonymousLeave::COUNT
                 + 4 * 513)
-                * 8 + core::mem::size_of::<MmapFailures>()
+                * 8
+                + core::mem::size_of::<MmapFailures>()
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);

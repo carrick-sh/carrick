@@ -1050,6 +1050,18 @@ pub fn serve_delegated_anonymous<
     };
     let mut pending = match decision {
         ReservationDisposition::Return(value) => {
+            // This decoder's mmap ENOMEM is Refusal::Limit: placement or
+            // charging, not metadata pressure or a descriptor rollback. Hold
+            // the exact-MM guard while capturing its layout and aggregates.
+            if nr == SYS_MMAP && value == -ENOMEM {
+                counters.mmap_failures.record_limit(
+                    mm,
+                    current,
+                    frame.arguments(),
+                    model.layout(),
+                    model.charges(),
+                );
+            }
             frame.set_result(carrick_guest_arch::NativeReturnWord(value as u64));
             return DelegatedAnonymous::Served;
         }

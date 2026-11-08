@@ -26,6 +26,18 @@ PLUGIN = _load_plugin()
 
 
 class CarrickLldbHelperTests(unittest.TestCase):
+    def test_mmap_failure_formats_native_known_answer_and_rejects_missing_words(self):
+        words = [1, 42, 0, 262144, 3, 0x22, 1, 0x6000000000, 0x6800000000,
+                 (1 << 64) - 1, 0, 0, 0, 192 << 30, 512 << 20]
+        result = PLUGIN._format_mmap_failure(words)
+        for expected in ["mm=0x1", "tid=0x2a", "length=0x40000", "prot=0x3",
+                         "flags=0x22", "data_limit=0x0", "refusal=Limit"]:
+            self.assertIn(expected, result)
+        words[6] = 9
+        self.assertIn("refusal=UNKNOWN", PLUGIN._format_mmap_failure(words))
+        with self.assertRaises(ValueError):
+            PLUGIN._format_mmap_failure(words[:-1])
+
     def test_clone_refusal_producer_decodes_the_actual_error_stage(self):
         formatter = PLUGIN._EVENTRING_KINDS[81][1]
         for stage, name in enumerate(["admission_refused", "cancelled", "nproc", "runtime_reservation"]):

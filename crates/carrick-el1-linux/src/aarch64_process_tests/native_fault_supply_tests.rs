@@ -5617,7 +5617,10 @@ fn native_go_large_reservations_then_persistentalloc() {
                 DelegatedAnonymous::Served => {
                     DelegatedStep::Served(SyscallResult::new(self.call.result().0 as i64))
                 }
-                other => panic!("owner-admitted native mapping left its owner: {other:?}; leaves={:?}", self.counters.anonymous_leaves),
+                other => panic!(
+                    "owner-admitted native mapping left its owner: {other:?}; leaves={:?}",
+                    self.counters.anonymous_leaves
+                ),
             }
         }
         fn park_prepared(&mut self) -> Option<FamilyCompletion> {
@@ -5659,8 +5662,9 @@ fn native_go_large_reservations_then_persistentalloc() {
     let residency = carrick_el1::cow::test_support::residency_table();
     let counters = Box::new(Counters::new());
     let names = Box::new(InotifyNameCache::new());
+    let (sibling_control, sibling) = imported_thread(fixture);
     let mut service = fixture.process_service();
-    let mut invoke = |nr: u64, args: [u64; 6]| {
+    let mut invoke = |control: &'static ThreadControlSlot, nr: u64, args: [u64; 6]| {
         let mut frame = TrapFrame::default();
         frame.x[8] = nr;
         frame.x[..6].copy_from_slice(&args);
@@ -5717,7 +5721,12 @@ fn native_go_large_reservations_then_persistentalloc() {
         );
         assert_eq!(
             counters.served[nr as usize].load(Ordering::Relaxed),
-            before + 1
+            before + 1,
+            "nr={nr} result={} route={route:?} tid={} refused={} leaves={:?}",
+            frame.x[0] as i64,
+            fixture.task.execution.task.load(Ordering::Acquire),
+            counters.refused[nr as usize].load(Ordering::Acquire),
+            counters.anonymous_leaves,
         );
         assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
         frame.x[0]
@@ -5727,30 +5736,77 @@ fn native_go_large_reservations_then_persistentalloc() {
     // persistentalloc's nil-hint 256 KiB chunks. The expanded VA layout lets
     // this control exercise the ring decoder even for the high Go hint;
     // real production's out-of-layout hints instead require host placement.
-    for hint in [0xc0 << 32, (0xc0 << 32) + 128 * GIB, (0xc0 << 32) + 32 * GIB] {
-        let reserved = invoke(222, [hint, 64 * GIB, 0, 0x22, u64::MAX, 0]);
-        assert!(reserved < i64::MAX as u64, "reserve returned errno {}", reserved as i64);
-        assert_eq!(invoke(222, [reserved + 4096, 32 * 4096, 3, 0x32, u64::MAX, 0]), reserved + 4096);
+    for hint in [
+        0xc0 << 32,
+        (0xc0 << 32) + 128 * GIB,
+        (0xc0 << 32) + 32 * GIB,
+    ] {
+        let reserved = invoke(control, 222, [hint, 64 * GIB, 0, 0x22, u64::MAX, 0]);
+        assert!(
+            reserved < i64::MAX as u64,
+            "reserve returned errno {}",
+            reserved as i64
+        );
+        assert_eq!(
+            invoke(
+                control,
+                222,
+                [reserved + 4096, 32 * 4096, 3, 0x32, u64::MAX, 0]
+            ),
+            reserved + 4096
+        );
     }
     for index in 0..1024 {
-        let address = invoke(222, [0, 256 * 1024, 3, 0x22, u64::MAX, 0]);
-        assert!(address < i64::MAX as u64, "persistentalloc index={index} returned errno {}", address as i64);
+        let address = invoke(control, 222, [0, 256 * 1024, 3, 0x22, u64::MAX, 0]);
+        assert!(
+            address < i64::MAX as u64,
+            "persistentalloc index={index} returned errno {}",
+            address as i64
+        );
     }
+    assert_eq!(fixture.page.live(), 2);
+    assert!(fixture.zone.live(sibling).is_some());
+    // Use the harness's host-boundary settlement before switching members;
+    // simply rebinding would strand the prior call's served-work notice.
+    run_as(fixture, 42, 12, 102, sibling_control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        sibling.id
+    );
+    for index in 0..1024 {
+        let address = invoke(sibling_control, 222, [0, 256 * 1024, 3, 0x22, u64::MAX, 0]);
+        assert!(
+            address < i64::MAX as u64,
+            "sibling persistentalloc index={index} returned errno {}",
+            address as i64
+        );
+    }
+
     // A known-answer refusal validates the diagnostic against a production
     // native mmap returning errno 12. This deliberately finite RLIMIT_DATA
     // is NOT a reproduction of Go's unexplained startup failure on the Mac.
     let portal = super::super::aarch64_process::Portal::for_zone(
-        NonZeroU64::MIN, fixture.region.table(), fixture.zone,
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
     );
-    portal.root(ReservationMm::new(1).unwrap(), 0).unwrap().set_limits(u64::MAX, 0);
-    assert_eq!(invoke(222, [0, 256 * 1024, 3, 0x22, u64::MAX, 0]) as i64, -12);
-    assert_eq!(counters.mmap_failures.attempted.load(Ordering::Acquire), 1,
-        "ring ENOMEM must publish its refusal, length, protection and flags");
+    portal
+        .root(ReservationMm::new(1).unwrap(), 0)
+        .unwrap()
+        .set_limits(u64::MAX, 0);
+    assert_eq!(
+        invoke(sibling_control, 222, [0, 256 * 1024, 3, 0x22, u64::MAX, 0]) as i64,
+        -12
+    );
+    assert_eq!(
+        counters.mmap_failures.attempted.load(Ordering::Acquire),
+        1,
+        "ring ENOMEM must publish its refusal, length, protection and flags"
+    );
     let record = &counters.mmap_failures.records[0];
     assert_eq!(record.ready.load(Ordering::Acquire), 1);
     assert_eq!(record.words[3].load(Ordering::Relaxed), 256 * 1024);
     assert_eq!(record.words[4].load(Ordering::Relaxed), 3);
     assert_eq!(record.words[5].load(Ordering::Relaxed), 0x22);
     assert_eq!(record.words[6].load(Ordering::Relaxed), 1); // Refusal::Limit
-
 }
