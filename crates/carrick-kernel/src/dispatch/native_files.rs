@@ -1382,6 +1382,62 @@ mod tests {
     }
 
     #[test]
+    fn native_child_link_dispatch_preserves_inode_and_errno_matrix() {
+        let fixture = mutation_child(Upper::Host);
+        let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+        let opened = fixture.venue_open(&authority, b"source", CREATE, 0o644);
+        assert!(opened >= 0);
+        assert_eq!(fixture.venue_write(opened, b"hardlink\n"), 9);
+        let link = |source: &[u8], target: &[u8], flags| {
+            fixture.child_call(
+                &authority,
+                37,
+                [FDCWD as u64, 0, FDCWD as u64, 0, flags, 0],
+                &[(1, source), (3, target)],
+            )
+        };
+        assert_eq!(link(b"source", b"target", 0), 0);
+        assert_eq!(fixture.venue_contents(&authority, b"target"), b"hardlink\n");
+        use std::os::unix::fs::MetadataExt;
+        let root = fixture._upper.as_ref().unwrap().path();
+        let source = std::fs::metadata(root.join("tmp/source")).unwrap();
+        let target = std::fs::metadata(root.join("tmp/target")).unwrap();
+        assert_eq!(source.ino(), target.ino());
+        assert_eq!(source.nlink(), 2);
+        assert_eq!(link(b"source", b"target", 0), -17);
+        assert_eq!(link(b"missing", b"another", 0), -2);
+        assert_eq!(link(b"/tmp", b"directory-link", 0), -1);
+        assert_eq!(link(b"source", b"/etc/ld.so.cache/link", 0), -20);
+        assert_eq!(link(b"source", b"invalid-flags", 0x100), -22);
+        assert_eq!(link(b"", b"empty-source", 0), -2);
+        assert_eq!(link(b"source", b"", 0), -2);
+        assert_eq!(link(b"source", &[b'x'; 256], 0), -36);
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                36,
+                [0, FDCWD as u64, 0, 0, 0, 0],
+                &[(0, b"source"), (2, b"source-link")],
+            ),
+            0,
+        );
+        assert_eq!(link(b"source-link", b"followed", 0x400), 0);
+        assert_eq!(
+            std::fs::metadata(root.join("tmp/followed")).unwrap().ino(),
+            source.ino()
+        );
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                37,
+                [999, 0, FDCWD as u64, 0, 0, 0],
+                &[(1, b"source"), (3, b"bad-source-fd")],
+            ),
+            -9,
+        );
+    }
+
+    #[test]
     fn native_child_write_serves_parent_redirected_stdout_after_host_close() {
         for upper in [Upper::Memory, Upper::Host] {
             let mut fixture = writable_fixture(upper);
