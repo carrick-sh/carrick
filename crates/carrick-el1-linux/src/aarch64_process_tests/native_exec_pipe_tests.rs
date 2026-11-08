@@ -59,6 +59,44 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
 }
 
 fn fork_exec_probe(futex: Option<u64>, bitset: u64, readlink: bool, timed: bool) {
+    fork_exec_probe_with_departure(futex, bitset, readlink, timed, None);
+}
+
+#[derive(Clone, Copy)]
+enum TimerDeparture {
+    CarrierExit,
+    SlotReset,
+}
+
+#[test]
+fn serial_host_native_child_timed_futex_carrier_exit() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        false,
+        true,
+        Some(TimerDeparture::CarrierExit),
+    );
+}
+
+#[test]
+fn serial_host_native_child_timed_futex_slot_reset() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        false,
+        true,
+        Some(TimerDeparture::SlotReset),
+    );
+}
+
+fn fork_exec_probe_with_departure(
+    futex: Option<u64>,
+    bitset: u64,
+    readlink: bool,
+    timed: bool,
+    departure: Option<TimerDeparture>,
+) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let metadata_scope = MetadataScope::new(fixture);
     struct RestoreRegion(usize);
@@ -331,7 +369,7 @@ fn fork_exec_probe(futex: Option<u64>, bitset: u64, readlink: bool, timed: bool)
             &mut service,
             parent,
             child,
-            (operation, bitset, timed),
+            (operation, bitset, timed, departure),
         );
         registry.unregister_root_for_test(&runtime);
         return;
@@ -1021,9 +1059,9 @@ fn child_futex<'a>(
     service: &mut Physical<'a, Aarch64ParkedContext>,
     parent: TaskKey,
     child: TaskKey,
-    futex: (u64, u64, bool),
+    futex: (u64, u64, bool, Option<TimerDeparture>),
 ) {
-    let (operation, bitset, timed) = futex;
+    let (operation, bitset, timed, departure) = futex;
     let counters = &carrick_el1_abi::Counters::new();
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
     use carrick_guest_arch::{Access, GuestLen};
@@ -1468,6 +1506,83 @@ fn child_futex<'a>(
     drop(entry);
     if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
         work.settled();
+    }
+    if let Some(departure) = departure {
+        let waiter = fixture.zone.record(binding.record.id);
+        let deadline = waiter
+            .deadline()
+            .expect("matching wait has its original deadline");
+        assert_eq!(fixture.zone.timer_node_count(), 1);
+        assert!(matches!(
+            waiter.claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        assert!(deadline > crate::sched::ThreadCpu::now(&cpu));
+        // The sibling has executed gettid while the exec leader is parked.
+        // Model the stopped carrier boundary using the same public entry
+        // points as reconcile_zone_exit and executor slot reuse.
+        fixture.zone.leave_guest(fixture.slot, &ShortLockSpin);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, worker.record.id)
+                .is_queued()
+        );
+        carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+            carrick_kernel::el1_zone::hand_back_foreign_timer(fixture.slot);
+        });
+        if matches!(departure, TimerDeparture::SlotReset) {
+            assert!(
+                fixture.zone.reset_slot(fixture.slot),
+                "slot reuse must settle timer custody"
+            );
+        }
+        assert_eq!(
+            waiter.deadline(),
+            Some(deadline),
+            "departure cannot restart the deadline"
+        );
+        assert!(
+            !waiter.host_resume_ready(),
+            "native timed futex has no host syscall continuation: claim={:?}, handback={:?}, timer nodes={}",
+            waiter.claim(),
+            waiter.handback(),
+            fixture.zone.timer_node_count(),
+        );
+        // No timeout before the original deadline, then exactly one timeout.
+        assert!(
+            !fixture
+                .zone
+                .expire_timer(fixture.slot, deadline - 1, (-110_i64) as u64, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
+                .unwrap()
+        );
+        assert!(
+            fixture
+                .zone
+                .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .zone
+                .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
+                .unwrap()
+        );
+        assert_eq!(fixture.zone.timer_node_count(), 0);
+        assert_eq!(waiter.result() as i64, -110);
+        assert!(!matches!(
+            waiter.claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        let selected = activate_target(source, &fixture.task, &binding);
+        assert_eq!(selected.result, Some((-110_i64) as u64));
+        return;
     }
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
     frame.x[..6].copy_from_slice(&[VA, crate::sched::FUTEX_WAKE_PRIVATE, 1, 0, 0, 0]);
