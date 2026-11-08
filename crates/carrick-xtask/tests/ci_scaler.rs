@@ -1588,10 +1588,18 @@ fn cloudmac_hvf_workflow_enforces_disk_admission_before_checkout_and_signed_gate
 
     let run_admission = |avail_kib: &str, ws: Option<&std::path::Path>| {
         let mut cmd = std::process::Command::new("bash");
-        cmd.args(["-c", admission_script])
-            .env("PATH", &path_env)
-            .env("HVF_DISK_FLOOR_GIB", "60")
-            .env("STUB_AVAIL_KIB", avail_kib);
+        cmd.args([
+            "-c",
+            &admission_script.replace(
+                "/usr/local/bin/carrick-xtask",
+                env!("CARGO_BIN_EXE_carrick-xtask"),
+            ),
+        ])
+        .env("CARRICK_HOST_LEASE_PATH", temp.path().join("host-lease"))
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env("PATH", &path_env)
+        .env("HVF_DISK_FLOOR_GIB", "60")
+        .env("STUB_AVAIL_KIB", avail_kib);
         match ws {
             Some(dir) => {
                 cmd.env("RUNNER_WORKSPACE", dir);
