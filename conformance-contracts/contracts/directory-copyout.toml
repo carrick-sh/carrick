@@ -18,6 +18,10 @@
 # capture witnesses. Only core capture's read path changes; this
 # contract's semantics and work budgets are unchanged and its existing
 # bindings remain the evidence.
+# Inherited redirected-write service changes only HostFileOp::Write.
+# native_files::tests::native_directory_listing_and_unserved_opens remains
+# green in the complete 36-test venue suite; directory copyout and budgets
+# are unchanged. No signed directory result is claimed.
 schema_version = 1
 id = "kernel.fs.directory-copyout"
 title = "Directory streams commit complete records into private destinations"
