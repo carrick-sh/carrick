@@ -321,6 +321,8 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         NativeProcessRuntime, NativeProcessService,
     };
     use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+    use carrick_hal::birth_serial::test_support::OwnedBirthZone;
+    use carrick_kernel::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
     use carrick_mmu_core::x86::owner_mmu::X86Mmu;
     use carrick_personality_linux::lifecycle::{LifecycleOutcome, LinuxWaitStatus, ProcessNative};
     use carrick_sched_core::{ParkedContextWords, WakeEffects, X86_XSAVE_BYTES, ZoneTables};
@@ -483,6 +485,25 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         assert!(!ptr.is_null());
         Box::from_raw(ptr)
     };
+    let zone = Arc::from(zone);
+    // Keep the production root and its claims alive throughout native child
+    // retirement. Bootstrap binds the same namespace authority native admission
+    // uses; scheduler publication below only projects these issued identities.
+    let bootstrap = RootBootstrap::for_prepared_launch(
+        41,
+        carrick_hal::ThreadId::synthetic_for_tests(41),
+        "stock-reclaim".into(),
+        Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+            "stock-reclaim",
+        )))),
+        Arc::new(carrick_hal::NullHostSignalBridge::default()),
+    )
+    .unwrap()
+    .with_birth_source(Arc::new(OwnedBirthZone::new(Arc::clone(&zone))));
+    let (_kernel, root) = Kernel::bootstrap_root(bootstrap).unwrap();
+    let root_task = root.task().key();
+    let root_thread = root.thread().key();
+    let generation = carrick_el1_abi::SnapshotGeneration::INITIAL;
     let registry = Box::leak(Box::new(NativeProcessRegistry::<
         AddressContext<RootGpa>,
         ParkedContextWords,
@@ -494,23 +515,19 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         Box::new(core::array::from_fn(|_| ThreadControlSlot::new()));
     let task = CurrentTask::new();
     let peer_task = CurrentTask::new();
-    task.set(
-        El1TaskId::from_linux_tid(41),
-        carrick_el1_abi::SnapshotGeneration::from_raw(11),
-        5,
-    );
+    task.set(El1TaskId::from_linux_tid(root_task.id.raw()), generation, 5);
     task.mm.key.store(1, Ordering::Release);
-    task.mm.thread_generation.store(101, Ordering::Release);
-    task.publish_visible_pid(41);
+    task.mm
+        .thread_generation
+        .store(root_thread.serial.raw(), Ordering::Release);
+    task.publish_visible_pid(root_task.id.raw() as u32);
     task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
     // The host records the leader's birth identity when it allocates the slot.
     control.publish_host_birth_identity(
         carrick_core::terminal::ThreadBirthIdentity::from_parts(
-            carrick_core_abi::EntryTaskKey::from_raw(41),
-            carrick_core_abi::BirthSerial::of_task(
-                carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
-            ),
-            carrick_core_abi::EntryThreadGeneration::from_raw(101),
+            carrick_core_abi::EntryTaskKey::from_raw(root_task.id.raw() as u64),
+            carrick_core_abi::BirthSerial::of_task(root_task.serial),
+            carrick_core_abi::EntryThreadGeneration::from_raw(root_thread.serial.raw()),
         )
         .unwrap(),
     );
@@ -533,11 +550,11 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
     zone.current_or_new(
         slot,
         ThreadIdentity {
-            tid: 41,
-            serial: 101,
+            tid: root_task.id.raw() as u64,
+            serial: root_thread.serial.raw(),
             mm: 1,
             file_table: 5,
-            generation: 11,
+            generation: generation.raw(),
             affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 3,
             lifecycle_page: &*page as *const _ as u64,
@@ -556,14 +573,6 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         retired_count: 0,
         retired_fd_tables: Vec::new(),
     };
-    // This fixture published its root identities by hand rather than issuing
-    // them from the production host registry. Account for that exact published
-    // birth before actual native admission, including its separate MM domain.
-    let root_birth = control.host_birth_identity().unwrap();
-    zone.serial_issuer()
-        .advance_past(NonZeroU64::new(root_birth.birth().raw()).unwrap());
-    zone.serial_issuer()
-        .advance_past(NonZeroU64::new(root_birth.thread().raw()).unwrap());
     zone.mm_issuer().observe_existing(address.mm);
     let runtime = Arc::new(
         NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
@@ -695,10 +704,6 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         delivered,
         "terminal fd release must reach the host work boundary"
     );
-    peer_task.set(
-        El1TaskId::from_linux_tid(41),
-        carrick_el1_abi::SnapshotGeneration::from_raw(11),
-        5,
-    );
+    peer_task.set(El1TaskId::from_linux_tid(root_task.id.raw()), generation, 5);
     assert!(!peer_task.linux.has_pending_host_work());
 }
