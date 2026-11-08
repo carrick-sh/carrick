@@ -1,5 +1,8 @@
 //! Real Cargo recipes with an isolated PATH and no installed compiler cache.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "support/cargo_env.rs"]
+mod cargo_env;
+
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -89,6 +92,7 @@ impl Build {
 
     fn command(&self, recipe: &str) -> Command {
         let mut command = Command::new(&self.just);
+        cargo_env::clean_cargo_env(&mut command);
         command
             .current_dir(self.root.path())
             .arg(recipe)

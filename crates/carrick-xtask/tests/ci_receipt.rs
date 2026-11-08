@@ -1,4 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "support/cargo_env.rs"]
+mod cargo_env;
+
 use carrick_xtask::accept::{
     AcceptReceipt, CLEANUP_UNKNOWN, CleanupCount, ProbeDiff, StepResult, evaluate_el1_step,
     parse_failed_tests, parse_test_log, parse_unitemized_failures, populate_step_from_log,
@@ -3071,7 +3074,9 @@ fn review_signed_build_diagnostics_reach_receipt() {
     )
     .unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "#[test] fn missing_link() { unsafe extern \"C\" { fn carrick_receipt_missing_symbol(); } unsafe { carrick_receipt_missing_symbol(); } }\n").unwrap();
-    let output = carrick_xtask::command::offline_cargo()
+    let mut command = carrick_xtask::command::offline_cargo();
+    cargo_env::clean_cargo_env(&mut command);
+    let output = command
         .current_dir(dir.path())
         .args(["test", "--offline", "--no-run", format])
         .env_remove("CARGO_TARGET_DIR")

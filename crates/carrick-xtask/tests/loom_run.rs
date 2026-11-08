@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/cargo_env.rs"]
+mod cargo_env;
+
 use std::fs;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -37,7 +40,9 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
     let spawn = |recipe: &str, timeout: &str| {
         let log = dir.path().join(format!("{recipe}.log"));
         let output = fs::File::create(&log).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+        cargo_env::clean_cargo_env(&mut command);
+        let child = command
             .args([
                 "--root",
                 dir.path().to_str().unwrap(),

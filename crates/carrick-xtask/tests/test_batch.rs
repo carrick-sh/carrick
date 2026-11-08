@@ -1,6 +1,15 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/cargo_env.rs"]
+mod cargo_env;
+
 use std::process::Command;
+
+fn xtask_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+    cargo_env::clean_cargo_env(&mut command);
+    command
+}
 
 #[test]
 fn batch_builds_once_and_preserves_filters_serial_environment_and_failures() {
@@ -66,7 +75,7 @@ fn batch_fixture(isolated: bool) {
     )
     .unwrap();
     let run = |recipe| {
-        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        xtask_command()
             .args(["--root", dir.path().to_str().unwrap(), "test-batch", recipe])
             .env("CARGO_TARGET_DIR", dir.path().join("target"))
             .env_remove("CARGO_LOG")
@@ -108,7 +117,7 @@ fn batch_fixture(isolated: bool) {
         !red.status.success(),
         "a failing binary must fail the batch"
     );
-    let compile_only = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+    let compile_only = xtask_command()
         .args([
             "--root",
             dir.path().to_str().unwrap(),
@@ -171,7 +180,7 @@ fn exported_batch_fixture(symlinked: bool) {
     )
     .unwrap();
     let run = |extra: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        xtask_command()
             .args(["--root", root.to_str().unwrap(), "test-batch"])
             .args(extra)
             .env("CARGO_TARGET_DIR", root.join("target"))
