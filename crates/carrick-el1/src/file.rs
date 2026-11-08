@@ -1,5 +1,6 @@
 //! File operations for delegated regular files at EL1.
 
+use carrick_el1_abi::CopyRefusalReason;
 use carrick_el1_abi::{
     CurrentTask, DELEGATED_FILE_MAX_SIZE, DELEGATED_FLAG_APPEND, DELEGATED_FLAG_READABLE,
     DELEGATED_FLAG_WRITABLE, DELEGATED_PAGE_SIZE, DELEGATED_STATE_GUEST, DelegatedFile,
@@ -402,23 +403,74 @@ pub struct ValidatedCopy<'a, V: MemoryValidator> {
     pub validator: &'a V,
 }
 
+impl<V: MemoryValidator> ValidatedCopy<'_, V> {
+    /// Copyout counterpart of `copy_in_diagnosed` with the same reason codes.
+    pub fn copy_out_diagnosed(&mut self, dst: u64, src: &[u8]) -> Result<(), CopyRefusalReason> {
+        let checked = self.validator.writable_bytes(dst, src.len());
+        if checked < src.len() {
+            return Err(if valid_lower_half_range(dst, src.len()) {
+                copy_validation_reason(dst + checked as u64, true)
+            } else {
+                CopyRefusalReason::ForbiddenRange
+            });
+        }
+        // SAFETY: user faults are intercepted by the fixup.
+        if unsafe { copy_to_user_guarded(self.task, dst as *mut u8, src.as_ptr(), src.len()) } {
+            Ok(())
+        } else {
+            Err(CopyRefusalReason::GuardedFault)
+        }
+    }
+
+    /// Refusal provenance, before the boolean interface discards it.
+    /// 1 = forbidden range, 2 = validator refusal, 3 = guarded instruction
+    /// fault. On ARM, 0x100 | PAR.FST identifies the failed translation.
+    pub fn copy_in_diagnosed(&mut self, dst: &mut [u8], src: u64) -> Result<(), CopyRefusalReason> {
+        let checked = self.validator.readable_bytes(src, dst.len());
+        if checked < dst.len() {
+            return Err(if valid_lower_half_range(src, dst.len()) {
+                copy_validation_reason(src + checked as u64, false)
+            } else {
+                CopyRefusalReason::ForbiddenRange
+            });
+        }
+        if unsafe {
+            copy_from_user_guarded(self.task, dst.as_mut_ptr(), src as *const u8, dst.len())
+        } {
+            Ok(())
+        } else {
+            Err(CopyRefusalReason::GuardedFault)
+        }
+    }
+}
+
+fn copy_validation_reason(address: u64, write: bool) -> CopyRefusalReason {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let par: u64;
+        unsafe {
+            if write {
+                core::arch::asm!("at s1e0w, {va}", va = in(reg) address, options(nostack));
+            } else {
+                core::arch::asm!("at s1e0r, {va}", va = in(reg) address, options(nostack));
+            }
+            core::arch::asm!("isb", "mrs {par}, par_el1", par = out(reg) par, options(nostack));
+        }
+        if par & 1 != 0 {
+            return CopyRefusalReason::ArmTranslation(((par >> 1) & 0x3f) as u8);
+        }
+    }
+    let _ = (address, write);
+    CopyRefusalReason::Validator
+}
+
 impl<V: MemoryValidator> UserCopy for ValidatedCopy<'_, V> {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
-        if self.validator.writable_bytes(dst_va, src.len()) < src.len() {
-            return false;
-        }
-        // SAFETY: faults on the user range are intercepted by the EL1 fixup.
-        unsafe { copy_to_user_guarded(self.task, dst_va as *mut u8, src.as_ptr(), src.len()) }
+        self.copy_out_diagnosed(dst_va, src).is_ok()
     }
 
     fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool {
-        if self.validator.readable_bytes(src_va, dst.len()) < dst.len() {
-            return false;
-        }
-        // SAFETY: faults on the user range are intercepted by the EL1 fixup.
-        unsafe {
-            copy_from_user_guarded(self.task, dst.as_mut_ptr(), src_va as *const u8, dst.len())
-        }
+        self.copy_in_diagnosed(dst, src_va).is_ok()
     }
 }
 
@@ -1039,4 +1091,40 @@ mod atomic_copy_tests {
             assert_eq!(observed, 31);
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn diagnosed_copy_distinguishes_validation_from_guarded_fault() {
+    struct Refuse;
+    impl MemoryValidator for Refuse {
+        fn readable_bytes(&self, _: u64, _: usize) -> usize {
+            0
+        }
+        fn writable_bytes(&self, _: u64, _: usize) -> usize {
+            0
+        }
+    }
+    let task = carrick_el1_abi::CurrentTask::new();
+    let mut dst = [0; 8];
+    let src = [7u8; 8];
+    let address = src.as_ptr() as u64;
+    let mut copy = ValidatedCopy {
+        task: &task,
+        validator: &Refuse,
+    };
+    assert_eq!(
+        copy.copy_in_diagnosed(&mut dst, address),
+        Err(CopyRefusalReason::Validator)
+    );
+    let mut copy = ValidatedCopy {
+        task: &task,
+        validator: &HardwareValidator,
+    };
+    SIMULATE_COPY_FAULT.with(|flag| flag.store(true, Ordering::Relaxed));
+    let result = copy.copy_in_diagnosed(&mut dst, address);
+    SIMULATE_COPY_FAULT.with(|flag| flag.store(false, Ordering::Relaxed));
+    assert_eq!(result, Err(CopyRefusalReason::GuardedFault));
+    assert_eq!(copy.copy_in_diagnosed(&mut dst, address), Ok(()));
+    assert_eq!(dst, src);
 }
