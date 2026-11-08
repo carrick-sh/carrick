@@ -26,6 +26,11 @@
 # #1115: isolate cross_process_sigqueue test credential fixtures in a
 # test-owned TempDir instead of shared /tmp/carrick-cred-<ppid>; test-only
 # change with no effect on owner-wait semantics or work budgets.
+# The inherited redirected-write lane reuses the existing carrier write
+# core and functional lease; no owner-wait continuation or settlement changes.
+# native_files::tests::native_child_write_serves_parent_redirected_stdout_after_host_close
+# proves cursor progress and lifetime after host close. The kernel's 205
+# serial-host tests pass; signed owner-wait evidence remains unchanged.
 schema_version = 1
 id = "kernel.memory.owner-wait"
 title = "Owner-memory waits have one killable settlement owner"

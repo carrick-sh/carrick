@@ -1,3 +1,8 @@
+# The inherited redirected-write change adds no fork or table implementation.
+# native_files::tests::native_child_write_serves_parent_redirected_stdout_after_host_close
+# uses the shipping ring dup2/fork path and verifies that child writes keep
+# the inherited physical cursor after the host publication owner drops.
+# Existing fork/descriptor budgets and signed bindings are unchanged.
 schema_version = 1
 id = "kernel.fork.filetable"
 title = "Fork file table copy scaling"

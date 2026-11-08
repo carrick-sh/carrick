@@ -3,6 +3,11 @@
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable
 # under process.native.arm-admission; the full VM-free native suite passes.
 # No additional signed, Docker or runtime-ratio evidence is claimed here.
+# Inherited redirected-write I/O reuses IpcPhysicalHold's detached physical
+# projection without changing retain_mapping or mapping publication.
+# serial_host_ipc_mapping_projection_shares_live_delegation_identity and
+# native_files::tests::published_private_map_source_survives_host_close_without_a_publication_cycle
+# pass. Mapping budgets and signed bindings remain unchanged.
 schema_version = 1
 id = "kernel.mm.private-file-fixed-replacement"
 title = "Private fixed file segments replace loader reservations"
