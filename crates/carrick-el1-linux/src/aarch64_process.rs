@@ -380,7 +380,11 @@ fn resume_unregistered(
         let binding = common_entry::execution_binding(task);
         let source = BornInZoneSource { zone, slot };
         let hand_back = || {
-            if carrick_core::entry::yield_current_to_host(binding, source, record).is_none() {
+            if carrick_core::entry::yield_current_to_host(binding, source, record, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .is_none()
+            {
                 // An adapter operation cannot be released by the lifecycle
                 // owner. Keep its exact token and queue it for host service.
                 let _ = zone.unswitch(slot, record);

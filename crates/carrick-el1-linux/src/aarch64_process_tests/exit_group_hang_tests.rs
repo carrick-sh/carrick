@@ -613,7 +613,9 @@ fn serial_host_adopted_fault_checkpoint_transfers_terminal_custody() {
         .unwrap_or_else(|_| panic!("cancelled ticket ACK"));
     fixture
         .zone
-        .object_wait(key, &ShortLockSpin)
+        .object_wait(key, &ShortLockSpin, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
         .unwrap()
         .notify_object(slot, &mut Default::default())
         .unwrap();

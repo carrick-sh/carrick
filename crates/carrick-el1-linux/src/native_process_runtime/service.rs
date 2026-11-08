@@ -38,13 +38,17 @@ fn bind_member_service_queue<C: ProcessContext>(
 ) -> Result<(), NativeProcessError> {
     let wait = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
     if zone
-        .object_wait(wait, &carrick_sched_core::ShortLockSpin)
+        .object_wait(wait, &carrick_sched_core::ShortLockSpin, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        })
         .is_ok()
     {
         return Ok(());
     }
-    zone.bind_object_wait(wait, &carrick_sched_core::ShortLockSpin)
-        .map_err(|_| NativeProcessError::Quarantined)
+    zone.bind_object_wait(wait, &carrick_sched_core::ShortLockSpin, &|owned| {
+        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+    })
+    .map_err(|_| NativeProcessError::Quarantined)
 }
 
 fn native_exception_signal(
@@ -364,6 +368,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .object_wait(
                 ObjectWaitKey::native_service(record).unwrap(),
                 &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             )
             .unwrap();
         let control = self
@@ -437,7 +442,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 )
             } else {
                 self.zone
-                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
             };
             let queue = match queue {
                 Ok(queue) => queue,
@@ -460,7 +467,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let key = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
         let guard = self
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .map_err(|_| NativeProcessError::Quarantined)?;
         // Completion may have consumed the captured request before this
         // queue lock was acquired. A signal targets the member, not an old
@@ -1559,7 +1568,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
                 self.source
                     .zone
-                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
                     .map_err(|_| NativeProcessError::Stale)
             })
             .transpose()?;
@@ -1700,7 +1711,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let guard = self
                 .source
                 .zone
-                .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
                 .map_err(|_| NativeProcessError::Quarantined)?;
             // SAFETY: notice publication failed, so no transport can hold
             // this identity. The queue also excludes concurrent cancellation.
@@ -2075,7 +2088,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // MM queue -> service queue is the only nested queue order.
                 let key =
                     ObjectWaitKey::native_service(self.record).ok_or(ObjectWaitError::Stale)?;
-                let _queue = zone.object_wait(key, &carrick_sched_core::ShortLockSpin)?;
+                let _queue =
+                    zone.object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })?;
                 let (interruptible, output_cancelled) =
                     self.runtime.graph.lock().service_wait(&self.record).map_or(
                         (true, false),
@@ -2141,7 +2157,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let queue = self
             .source
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .map_err(|_| NativeProcessError::Stale)?;
         let result = self
             .control
@@ -2871,7 +2889,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let queue = self
             .source
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .map_err(|_| NativeProcessError::Stale)?;
         let next = self
             .control

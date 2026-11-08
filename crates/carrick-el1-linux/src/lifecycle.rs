@@ -536,7 +536,9 @@ impl<
             .is_ok()
             && zone
                 .tables
-                .unbind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .unbind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
                 .is_ok()
     }
     fn free_record(&mut self, record: RecordRef) {

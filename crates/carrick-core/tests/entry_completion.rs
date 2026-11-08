@@ -40,8 +40,15 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
             assert!(zone.install_space(slot, mm).is_some());
             let key = ObjectWaitKey::new(1, generation).unwrap();
             let wait = carrick_sched_core::BoundedSpin(1024);
-            zone.bind_object_wait(key, &wait).unwrap();
-            let guard = zone.object_wait(key, &wait).unwrap();
+            zone.bind_object_wait(key, &wait, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+            let guard = zone
+                .object_wait(key, &wait, &|owned| {
+                    let _ = owned.into_parts();
+                })
+                .unwrap();
             let snapshot = guard.snapshot();
             drop(guard);
             let identity = ThreadIdentity {
@@ -193,7 +200,10 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
             zone.record_ref(record),
             None,
             carrick_sched_core::Handback::Signal,
-            &carrick_sched_core::BoundedSpin(1024)
+            &carrick_sched_core::BoundedSpin(1024),
+            &|owned| {
+                let _ = owned.into_parts();
+            }
         ),
         carrick_sched_core::HostClaim::El1Held { slot }
     );
@@ -227,8 +237,15 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     let stale = admit_born_in_zone(binding, source).unwrap();
     let key = ObjectWaitKey::new(1, 13).unwrap();
     let wait = carrick_sched_core::BoundedSpin(1024);
-    zone.bind_object_wait(key, &wait).unwrap();
-    let guard = zone.object_wait(key, &wait).unwrap();
+    zone.bind_object_wait(key, &wait, &|owned| {
+        let _ = owned.into_parts();
+    })
+    .unwrap();
+    let guard = zone
+        .object_wait(key, &wait, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
     let snapshot = guard.snapshot();
     drop(guard);
     let parked = park_object_record(
@@ -434,7 +451,7 @@ fn terminal_park_hands_back_only_an_exact_requested_owner() {
         let start = prepare_handoff(binding, source, record).unwrap();
         let reference = zone.record_ref(record);
         assert!(
-            matches!(zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin),
+            matches!(zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin, &|owned| { let _ = owned.into_parts(); }),
             HostClaim::El1Held { slot: owner } if owner == slot)
         );
         if owner_continuation {
@@ -853,9 +870,16 @@ fn terminal_attempt(mode: TerminalAttempt) {
         zone.current_or_new(slot, id).unwrap()
     } else {
         let key = ObjectWaitKey::new(41, 1).unwrap();
-        zone.bind_object_wait(key, &BoundedSpin(1024)).unwrap();
+        zone.bind_object_wait(key, &BoundedSpin(1024), &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
         {
-            let guard = zone.object_wait(key, &BoundedSpin(1024)).unwrap();
+            let guard = zone
+                .object_wait(key, &BoundedSpin(1024), &|owned| {
+                    let _ = owned.into_parts();
+                })
+                .unwrap();
             guard
                 .park(
                     guard.snapshot(),
@@ -866,7 +890,11 @@ fn terminal_attempt(mode: TerminalAttempt) {
         }
         zone.clear_current(slot);
         {
-            let guard = zone.object_wait(key, &BoundedSpin(1024)).unwrap();
+            let guard = zone
+                .object_wait(key, &BoundedSpin(1024), &|owned| {
+                    let _ = owned.into_parts();
+                })
+                .unwrap();
             assert_eq!(
                 guard
                     .notify_object(slot, &mut WakeEffects::default())
@@ -934,9 +962,16 @@ fn terminal_attempt(mode: TerminalAttempt) {
                 // this actor exclusively advances the fixture's native record.
                 assert!(unsafe { zone.record(record).take_object_operation() }.is_some());
                 let key = ObjectWaitKey::new(42, 1).unwrap();
-                zone.bind_object_wait(key, &BoundedSpin(1024)).unwrap();
+                zone.bind_object_wait(key, &BoundedSpin(1024), &|owned| {
+                    let _ = owned.into_parts();
+                })
+                .unwrap();
                 {
-                    let guard = zone.object_wait(key, &BoundedSpin(1024)).unwrap();
+                    let guard = zone
+                        .object_wait(key, &BoundedSpin(1024), &|owned| {
+                            let _ = owned.into_parts();
+                        })
+                        .unwrap();
                     guard
                         .park(
                             guard.snapshot(),
@@ -947,7 +982,11 @@ fn terminal_attempt(mode: TerminalAttempt) {
                 }
                 zone.clear_current(slot);
                 {
-                    let guard = zone.object_wait(key, &BoundedSpin(1024)).unwrap();
+                    let guard = zone
+                        .object_wait(key, &BoundedSpin(1024), &|owned| {
+                            let _ = owned.into_parts();
+                        })
+                        .unwrap();
                     assert_eq!(
                         guard
                             .notify_object(slot, &mut WakeEffects::default())

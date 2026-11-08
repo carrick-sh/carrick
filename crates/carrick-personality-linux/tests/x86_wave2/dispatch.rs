@@ -880,7 +880,10 @@ fn allocator_control_with_pending_host_work_and_no_token_enrolls_three_waiters()
                 let Some(key) = ObjectWaitKey::metadata_request(generation) else {
                     return false;
                 };
-                zone.bind_object_wait(key, &spin).is_ok()
+                zone.bind_object_wait(key, &spin, &|owned| {
+                    let _ = owned.into_parts();
+                })
+                .is_ok()
             },
         ),
         "owner publishes metadata grant request"

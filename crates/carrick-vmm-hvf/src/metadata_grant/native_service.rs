@@ -712,7 +712,13 @@ impl NativeService {
         let key = ObjectWaitKey::native_service(self.request().identity.birth.record)
             .ok_or_else(|| stale())?;
         let queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            })
             .map_err(|_| stale())?;
         complete(self.ticket)?;
         let mut effects = carrick_sched_core::WakeEffects::default();
@@ -1026,7 +1032,13 @@ impl NativeService {
             return Err(stale());
         }
         let queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            })
             .map_err(|_| stale())?;
         // SAFETY: the request and prepared entry retain the exact aligned slot.
         let reply = unsafe { pointer.as_ref() };
@@ -1055,7 +1067,13 @@ impl NativeService {
                 // prepared grant. Its sole Drop rolls back outside the queue.
                 drop(prepared);
                 let queue = zone
-                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                        carrick_sched_core::LockWait::complete_object_wake(
+                            &carrick_kernel::el1_zone::HostLockWait,
+                            owned.zone(),
+                            owned,
+                        )
+                    })
                     .map_err(|_| stale())?;
                 ticket.complete(false).map_err(|_| stale())?;
                 queue
@@ -1376,7 +1394,13 @@ impl NativeService {
         // only the bounded ServiceCell/descriptor publication and notification;
         // cancellation releases it before physical/table undo or backing drop.
         let queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            })
             .map_err(|_| stale())?;
         let mut offered = false;
         let delivery = self.ticket.publish_prepared((), |()| {
@@ -1404,7 +1428,13 @@ impl NativeService {
                 }
                 drop(stock);
                 let queue = zone
-                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                        carrick_sched_core::LockWait::complete_object_wake(
+                            &carrick_kernel::el1_zone::HostLockWait,
+                            owned.zone(),
+                            owned,
+                        )
+                    })
                     .map_err(|_| stale())?;
                 ticket.complete(false).map_err(|_| stale())?;
                 queue
@@ -1453,7 +1483,13 @@ impl NativeService {
         let key = ObjectWaitKey::native_service(self.request().identity.birth.record)
             .ok_or_else(|| stale())?;
         let queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            })
             .map_err(|_| stale())?;
         // Claim, cancel, and complete share this queue lock. WRITING is never
         // treated as a stale generation merely because another CPU is active.
@@ -1534,7 +1570,13 @@ pub(super) fn take(
         let Some(key) = ObjectWaitKey::native_service(selector.record) else {
             return consumed.miss("invalid native-service wait key");
         };
-        let Ok(queue) = zone.object_wait(key, &carrick_sched_core::ShortLockSpin) else {
+        let Ok(queue) = zone.object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+            carrick_sched_core::LockWait::complete_object_wake(
+                &carrick_kernel::el1_zone::HostLockWait,
+                owned.zone(),
+                owned,
+            )
+        }) else {
             return consumed.miss("native-service wait queue unavailable");
         };
         let Some(identity) = queue.native_service_member(selector.record) else {
@@ -1602,7 +1644,13 @@ pub(super) fn take(
             _carrier: Arc::clone(custody),
         };
         let queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            })
             .map_err(|_| stale())?;
         if custody.live_generation() != Some(generation)
             || queue.native_service_member(selector.record) != Some(identity)

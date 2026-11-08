@@ -242,6 +242,12 @@ pub fn expire_signal_timer(slot: SlotId) {
             now.raw(),
             carrick_personality_linux::abi::signal::LINUX_EAGAIN.guest_retval() as u64,
             retry_ticks,
+            &|owned| {
+                carrick_el1::substrate::sched::object_wait::deliver_host_completion(
+                    owned.zone(),
+                    owned,
+                )
+            },
         )
         .map(|ticks| Deadline(CounterTick::new(ticks)));
     backend.arm_timer(deadline).unwrap_or_else(|_| fatal_boot());

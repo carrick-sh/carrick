@@ -2115,6 +2115,13 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             None,
             carrick_sched_core::Handback::Resumed,
             &carrick_sched_core::BoundedSpin(0),
+            &|owned| {
+                carrick_sched_core::LockWait::complete_object_wake(
+                    &carrick_kernel::el1_zone::HostLockWait,
+                    owned.zone(),
+                    owned,
+                )
+            },
         ) != carrick_sched_core::HostClaim::Claimed
         {
             return Err(fail("fixture queue placement refused"));

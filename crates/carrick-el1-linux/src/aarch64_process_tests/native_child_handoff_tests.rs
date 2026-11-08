@@ -307,6 +307,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
             carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
                 .unwrap(),
             &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
         )
         .unwrap()
         .notify_object(fixture.slot, &mut Default::default())
@@ -1218,7 +1219,9 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
         let key = ObjectWaitKey::native_service(record).unwrap();
         let queue = fixture
             .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         assert_eq!(queue.native_service_member(record), Some(identity));
         let mut recycled = record;
@@ -1259,7 +1262,9 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             let key = ObjectWaitKey::native_service(selector.record).unwrap();
             let queue = fixture
                 .zone
-                .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
                 .unwrap();
             assert_eq!(queue.native_service_member(selector.record), Some(identity));
             let ticket = unsafe {
@@ -1283,7 +1288,9 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
     {
         let queue = fixture
             .zone
-            .object_wait(first_key, &carrick_sched_core::ShortLockSpin)
+            .object_wait(first_key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
             .unwrap();
         assert!(
             !first_control
@@ -1374,7 +1381,9 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
         {
             let queue = fixture
                 .zone
-                .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
                 .unwrap();
             if mm_wait {
                 // SAFETY: the exact admitted source was sampled before the

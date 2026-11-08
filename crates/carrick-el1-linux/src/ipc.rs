@@ -148,7 +148,9 @@ fn release_native_description<C: carrick_el1_abi::EntryContext>(
                     continue;
                 };
                 let result = loop {
-                    match carrick_core::wait::notify_object(zone, slot, key) {
+                    match carrick_core::wait::notify_object(zone, slot, key, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    }) {
                         Err(ObjectWaitError::Busy) => core::hint::spin_loop(),
                         other => break other,
                     }
@@ -186,7 +188,9 @@ pub(crate) fn notify_native_wake<C: carrick_el1_abi::EntryContext>(
         return;
     };
     let result = loop {
-        match carrick_core::wait::notify_object(zone, slot, key) {
+        match carrick_core::wait::notify_object(zone, slot, key, &|owned| {
+            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        }) {
             Err(ObjectWaitError::Busy) => core::hint::spin_loop(),
             result => break result,
         }
@@ -1393,7 +1397,9 @@ fn snapshot<C: ThreadCpu, U: UserWord>(
         // predicate and this observation, so no release can pass the probe.
         Ok(snap) => Some(unsafe { ObjectStateSnapshot::taken_under_object_lock(snap) }),
         Err(ObjectWaitError::Stale) => {
-            let _ = sched.zone.bind_object_wait(key, &EL1_WAIT);
+            let _ = sched.zone.bind_object_wait(key, &EL1_WAIT, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            });
             // SAFETY: same retained IPC object guard as the first attempt.
             sched
                 .observe_object(key)

@@ -3765,7 +3765,16 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     ] {
                         if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, lane)
                             && zone
-                                .bind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+                                .bind_object_wait(
+                                    key,
+                                    &carrick_sched_core::ShortLockSpin,
+                                    &|owned| {
+                                        crate::sched::object_wait::deliver_host_completion(
+                                            owned.zone(),
+                                            owned,
+                                        )
+                                    },
+                                )
                                 .is_err()
                         {
                             return FamilyCompletion::Complete(
@@ -3862,7 +3871,16 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     ] {
                         if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, lane)
                             && zone
-                                .bind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+                                .bind_object_wait(
+                                    key,
+                                    &carrick_sched_core::ShortLockSpin,
+                                    &|owned| {
+                                        crate::sched::object_wait::deliver_host_completion(
+                                            owned.zone(),
+                                            owned,
+                                        )
+                                    },
+                                )
                                 .is_err()
                         {
                             if let Err(error) = venue.region.release_backing(backing, &NativeFdWait)

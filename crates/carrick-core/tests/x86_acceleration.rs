@@ -1969,13 +1969,25 @@ fn x4_shared_wait_records() {
     assert!(zone.install_space(slot, mm).is_some());
 
     let key = ObjectWaitKey::new(1, 10).unwrap();
-    zone.bind_object_wait(key, &wait).unwrap();
+    zone.bind_object_wait(key, &wait, &|owned| {
+        let _ = owned.into_parts();
+    })
+    .unwrap();
 
     // Stale generation is refused
     let stale_key = ObjectWaitKey::new(1, 9).unwrap();
-    assert!(zone.object_wait(stale_key, &wait).is_err());
+    assert!(
+        zone.object_wait(stale_key, &wait, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .is_err()
+    );
 
-    let guard = zone.object_wait(key, &wait).unwrap();
+    let guard = zone
+        .object_wait(key, &wait, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
     let snapshot = guard.snapshot();
     drop(guard);
 
@@ -2016,8 +2028,15 @@ fn x4_shared_wait_records() {
     zone.publish_park(dummy, d_seq);
 
     let concurrent_key = ObjectWaitKey::new(3, 10).unwrap();
-    zone.bind_object_wait(concurrent_key, &wait).unwrap();
-    let concurrent_guard = zone.object_wait(concurrent_key, &wait).unwrap();
+    zone.bind_object_wait(concurrent_key, &wait, &|owned| {
+        let _ = owned.into_parts();
+    })
+    .unwrap();
+    let concurrent_guard = zone
+        .object_wait(concurrent_key, &wait, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
     let concurrent_snapshot = concurrent_guard.snapshot();
     drop(concurrent_guard);
     let concurrent = zone

@@ -23,7 +23,7 @@ pub fn observe_object<C: carrick_core_abi::EntryContext>(
     let guard = if zone.completion_enabled(key) {
         zone.object_wait_with_completion(key, &ShortLockSpin, completion)?
     } else {
-        zone.object_wait(key, &ShortLockSpin)?
+        zone.object_wait(key, &ShortLockSpin, completion)?
     };
     Ok(guard.snapshot())
 }
@@ -65,7 +65,7 @@ where
     let result = if zone.completion_enabled(request.key) {
         zone.object_wait_with_completion(request.key, &ShortLockSpin, completion)
     } else {
-        zone.object_wait(request.key, &ShortLockSpin)
+        zone.object_wait(request.key, &ShortLockSpin, completion)
     };
     let guard = match result {
         Ok(guard) => guard,
@@ -213,8 +213,9 @@ pub fn notify_object<C: carrick_core_abi::EntryContext>(
     zone: &ZoneTables<C>,
     slot: SlotId,
     key: ObjectWaitKey,
+    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
 ) -> Result<(ObjectWakeReport, WakeEffects), ObjectWaitError> {
-    let guard = zone.object_wait(key, &ShortLockSpin)?;
+    let guard = zone.object_wait(key, &ShortLockSpin, completion)?;
     let mut effects = WakeEffects::default();
     let report = guard.notify_object(slot, &mut effects)?;
     Ok((report, effects))

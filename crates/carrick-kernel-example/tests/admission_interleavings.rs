@@ -737,7 +737,11 @@ fn identity(tid: u64) -> ThreadIdentity {
     }
 }
 fn park(zone: &ZoneTables, key: ObjectWaitKey, tid: u64) -> carrick_sched_core::RecordId {
-    let guard = zone.object_wait(key, &BoundedSpin(0)).unwrap();
+    let guard = zone
+        .object_wait(key, &BoundedSpin(0), &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
     let record = zone.alloc_record(identity(tid)).unwrap();
     guard
         .park(
@@ -756,8 +760,16 @@ fn check_enroll_wake_interleaving_preserves_epoch() {
         let kernel = contexts[0].kernel().clone();
         let zone = zone();
         let key = ObjectWaitKey::new(1, 1).unwrap();
-        zone.bind_object_wait(key, &BoundedSpin(0)).unwrap();
-        let snapshot = zone.object_wait(key, &BoundedSpin(0)).unwrap().snapshot();
+        zone.bind_object_wait(key, &BoundedSpin(0), &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
+        let snapshot = zone
+            .object_wait(key, &BoundedSpin(0), &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap()
+            .snapshot();
         let waiter = actor(&contexts[0]);
         let producer = actor(&contexts[1]);
         let refused = Mutex::new(None);
@@ -775,7 +787,11 @@ fn check_enroll_wake_interleaving_preserves_epoch() {
                             .unwrap();
                         lane.authority_point(KPoint::BeforeLock, Authority::Object(key));
                         let record = zone.alloc_record(identity(1)).unwrap();
-                        let guard = zone.object_wait(key, &BoundedSpin(0)).unwrap();
+                        let guard = zone
+                            .object_wait(key, &BoundedSpin(0), &|owned| {
+                                let _ = owned.into_parts();
+                            })
+                            .unwrap();
                         let operation = OperationToken::new(1, 1).unwrap();
                         let refusal = guard.park(snapshot, record, operation).unwrap_err();
                         *refused.lock() = Some(refusal.0);
@@ -788,7 +804,11 @@ fn check_enroll_wake_interleaving_preserves_epoch() {
                     } else {
                         lane.after(waiter, Point::Kernel(KPoint::AfterUnlock))
                             .unwrap();
-                        let guard = zone.object_wait(key, &BoundedSpin(0)).unwrap();
+                        let guard = zone
+                            .object_wait(key, &BoundedSpin(0), &|owned| {
+                                let _ = owned.into_parts();
+                            })
+                            .unwrap();
                         let report = guard
                             .notify_object_host(&mut |_| panic!("not enrolled yet"), &mut |_| {})
                             .unwrap();
@@ -801,7 +821,11 @@ fn check_enroll_wake_interleaving_preserves_epoch() {
             )
             .unwrap();
         assert_eq!(*refused.lock(), Some(ObjectWaitError::Changed));
-        let guard = zone.object_wait(key, &BoundedSpin(0)).unwrap();
+        let guard = zone
+            .object_wait(key, &BoundedSpin(0), &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         let report = guard.notify_object_host(&mut |_| {}, &mut |_| {}).unwrap();
         assert_eq!(report.visited, 1);
         assert_eq!(report.queued + report.handed, 1);
@@ -818,8 +842,14 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
             let old = ObjectWaitKey::new(1, 7).unwrap();
             let new = ObjectWaitKey::new(1, 8).unwrap();
             let unrelated = ObjectWaitKey::new(2, 1).unwrap();
-            zone.bind_object_wait(old, &BoundedSpin(0)).unwrap();
-            zone.bind_object_wait(unrelated, &BoundedSpin(0)).unwrap();
+            zone.bind_object_wait(old, &BoundedSpin(0), &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+            zone.bind_object_wait(unrelated, &BoundedSpin(0), &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
             for tid in 100..132 {
                 park(&zone, unrelated, tid);
             }
@@ -844,7 +874,10 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
                                         *old_ref,
                                         None,
                                         Handback::Cancelled,
-                                        &BoundedSpin(0)
+                                        &BoundedSpin(0),
+                                        &|owned| {
+                                            let _ = owned.into_parts();
+                                        }
                                     ),
                                     HostClaim::Claimed
                                 );
@@ -861,7 +894,10 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
                         } else {
                             lane.after(owner, Point::Kernel(KPoint::AfterUnlock))
                                 .unwrap();
-                            zone.bind_object_wait(new, &BoundedSpin(0)).unwrap();
+                            zone.bind_object_wait(new, &BoundedSpin(0), &|owned| {
+                                let _ = owned.into_parts();
+                            })
+                            .unwrap();
                             for tid in 1..=scale {
                                 park(&zone, new, tid);
                             }
@@ -871,12 +907,19 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
                                         *old_ref,
                                         None,
                                         Handback::Control,
-                                        &BoundedSpin(0)
+                                        &BoundedSpin(0),
+                                        &|owned| {
+                                            let _ = owned.into_parts();
+                                        }
                                     ),
                                     HostClaim::Stale
                                 );
                             }
-                            let guard = zone.object_wait(new, &BoundedSpin(0)).unwrap();
+                            let guard = zone
+                                .object_wait(new, &BoundedSpin(0), &|owned| {
+                                    let _ = owned.into_parts();
+                                })
+                                .unwrap();
                             let report =
                                 guard.notify_object_host(&mut |_| {}, &mut |_| {}).unwrap();
                             assert_eq!(
@@ -892,7 +935,9 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
                 )
                 .unwrap();
             assert!(matches!(
-                zone.object_wait(old, &BoundedSpin(0)),
+                zone.object_wait(old, &BoundedSpin(0), &|owned| {
+                    let _ = owned.into_parts();
+                }),
                 Err(ObjectWaitError::Stale)
             ));
             assert_eq!(

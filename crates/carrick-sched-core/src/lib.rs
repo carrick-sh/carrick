@@ -1852,8 +1852,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
 
     /// Complete remaining waitv cleanup after releasing all bucket locks,
     /// then publish a ready reference (or retire a cancelled transfer).
-    pub fn finish(self, wait: &impl LockWait<C>) -> Option<RecordRef> {
-        self.zone.unlink_all(self.record.id, wait);
+    pub fn finish(
+        self,
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
+    ) -> Option<RecordRef> {
+        self.zone.unlink_all(self.record.id, wait, completion);
         self.publish()
     }
 
@@ -1936,11 +1940,15 @@ pub enum WakeRecord<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx>
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> WakeRecord<'_, C> {
     /// Consume a batch entry after dropping its futex bucket locks.
-    pub fn take_ready(&mut self, wait: &impl LockWait<C>) -> Option<RecordRef> {
+    pub fn take_ready(
+        &mut self,
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
+    ) -> Option<RecordRef> {
         match core::mem::replace(self, Self::Empty) {
             Self::Empty => None,
             Self::Guest(record) => Some(record),
-            Self::Host(transfer) => transfer.finish(wait),
+            Self::Host(transfer) => transfer.finish(wait, completion),
         }
     }
 }
@@ -3437,8 +3445,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// bucket lock in turn (with no other bucket lock held). Only the
     /// record's owner calls this: the host after a claim, or a parker undoing
     /// a park it never published.
-    pub fn unlink_all(&self, record: RecordId, wait: &impl LockWait<C>) {
-        self.unlink_object(record, wait);
+    pub fn unlink_all(
+        &self,
+        record: RecordId,
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
+    ) {
+        self.unlink_object(record, wait, completion);
         let rec = self.record(record);
         loop {
             let entry_id = rec.first_entry.load(Ordering::Acquire);
@@ -4184,8 +4197,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         now: u64,
         result: u64,
         retry_ticks: u64,
+        completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
     ) -> Option<u64> {
-        match self.expire_timer(slot, now, result) {
+        match self.expire_timer(slot, now, result, completion) {
             Ok(_) => self.timer_deadline(slot),
             Err(()) => Some(now.saturating_add(retry_ticks.max(1))),
         }
@@ -4196,7 +4210,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// waker won it first. `Err(())`: a bucket lock was busy or the run queue
     /// full; the caller retries at its next timer check.
     #[allow(clippy::result_unit_err)]
-    pub fn expire_timer(&self, slot: SlotId, now: u64, result: u64) -> Result<bool, ()> {
+    pub fn expire_timer(
+        &self,
+        slot: SlotId,
+        now: u64,
+        result: u64,
+        completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<bool, ()> {
         let Some(ticket) = self
             .timers
             .minimum(slot, |ticket| self.timer_ticket_live(ticket))
@@ -4215,7 +4235,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let entry_id = rec.first_entry.load(Ordering::Acquire);
         if entry_id == NIL {
             // A timed object park (an epoll wait): its queue, not a bucket.
-            let expired = self.expire_object_park(slot, ticket.record, seq)?;
+            let expired = self.expire_object_park(slot, ticket.record, seq, completion)?;
             self.timers.remove(ticket);
             if expired {
                 self.counters.el1_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -5148,6 +5168,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         seq: Option<u32>,
         kind: Handback,
         wait: &impl LockWait<C>,
+        completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
     ) -> HostClaim {
         let rec = self.record(r.id);
         if kind == Handback::GroupStop {
@@ -5159,7 +5180,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             // This tagged write is harmless even if r was retired/reused.
             rec.request_cancel(r.incarnation);
         }
-        self.claim_for_host_inner(r, rec, seq, kind, wait)
+        self.claim_for_host_inner(r, rec, seq, kind, wait, completion)
     }
 
     fn claim_for_host_inner(
@@ -5169,6 +5190,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         seq: Option<u32>,
         kind: Handback,
         wait: &impl LockWait<C>,
+        completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
     ) -> HostClaim {
         loop {
             let claim = rec.claim();
@@ -5182,7 +5204,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     }
                     if let Some(transfer) = self.begin_host_transfer(r, claim) {
                         rec.handback.store(kind as u32, Ordering::Release);
-                        self.unlink_all(r.id, wait);
+                        self.unlink_all(r.id, wait, completion);
                         if let Some(counter) = self.counters.host_claims.get(kind as usize) {
                             counter.fetch_add(1, Ordering::Relaxed);
                         }

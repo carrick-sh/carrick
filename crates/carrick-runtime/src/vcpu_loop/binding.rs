@@ -7766,7 +7766,12 @@ mod tests {
                         record,
                         None,
                         carrick_el1_abi::Handback::Control,
-                        &carrick_kernel::el1_zone::HostLockWait
+                        &carrick_kernel::el1_zone::HostLockWait,
+                        &|owned| carrick_sched_core::LockWait::complete_object_wake(
+                            &carrick_kernel::el1_zone::HostLockWait,
+                            owned.zone(),
+                            owned
+                        )
                     ),
                     carrick_el1_abi::HostClaim::Claimed
                 );

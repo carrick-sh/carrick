@@ -143,12 +143,11 @@ impl OwnerVenue<ParkedContextWords> for Venue {
         carrick_core::wait::space_access(zone, slot, release)
     }
     fn deliver_completion(
-        _: &ZoneTables<ParkedContextWords>,
-        _: SlotId,
+        zone: &ZoneTables<ParkedContextWords>,
+        slot: SlotId,
         effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, ParkedContextWords>,
     ) {
-        let (_, effects) = effects.deliver_handbacks(&mut |_| fatal());
-        deliver_wakes(effects);
+        carrick_el1::substrate::sched::object_wait::deliver_completion(zone, slot, effects);
     }
     fn encode_error(error: carrick_core::mm::transaction::MmError) -> u32 {
         error.errno()
@@ -162,8 +161,7 @@ fn release(
     _: carrick_sched_core::Waker,
     effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, ParkedContextWords>,
 ) {
-    let (_, effects) = effects.deliver_handbacks(&mut |_| fatal());
-    deliver_wakes(effects);
+    carrick_el1::substrate::sched::object_wait::deliver_host_completion(effects.zone(), effects);
 }
 fn deliver_wakes(effects: WakeEffects) {
     for slot in effects.sgi_slots() {

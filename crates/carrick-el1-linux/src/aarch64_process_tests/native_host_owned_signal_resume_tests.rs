@@ -299,6 +299,9 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
                         carrick_sched_core::object_wait::ObjectWaitKey::native_service(member)
                             .unwrap(),
                         &carrick_sched_core::ShortLockSpin,
+                        &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                        },
                     )
                     .unwrap();
                 // SAFETY: the real publication hook claims this exact member
@@ -445,6 +448,9 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
                 .object_wait(
                     carrick_sched_core::object_wait::ObjectWaitKey::native_service(member).unwrap(),
                     &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
                 )
                 .unwrap();
             // SAFETY: claim the exact live member's notice under the same service
@@ -485,6 +491,9 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
                 .object_wait(
                     carrick_sched_core::object_wait::ObjectWaitKey::native_service(member).unwrap(),
                     &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
                 )
                 .unwrap()
                 .notify_object(fixture.slot, &mut Default::default())

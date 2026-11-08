@@ -399,6 +399,7 @@ pub fn yield_current_to_host<C: EntryContext>(
     binding: ExecutionBinding,
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
+    completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let start = prepare_handoff(binding, source, record)?;
     let retained = source.zone.record(record);
@@ -414,7 +415,7 @@ pub fn yield_current_to_host<C: EntryContext>(
             None,
             carrick_sched_core::Handback::Control,
             &carrick_sched_core::ShortLockSpin,
-        ),
+         completion),
         carrick_sched_core::HostClaim::El1Held { slot } if slot == source.slot
     ) {
         return None;
@@ -564,13 +565,29 @@ mod tests {
         let start = prepare_handoff(binding, source, record).unwrap();
         let reference = zone.record_ref(record);
         assert!(matches!(
-            zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin),
+            zone.claim_for_host(
+                reference,
+                None,
+                Handback::Control,
+                &ShortLockSpin,
+                &|owned| {
+                    let _ = owned.into_parts();
+                }
+            ),
             HostClaim::El1Held { .. }
         ));
         let published = zone.unswitch(slot, record);
         // Deterministically interleave the host claimant before receipt completion.
         assert!(matches!(
-            zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin),
+            zone.claim_for_host(
+                reference,
+                None,
+                Handback::Control,
+                &ShortLockSpin,
+                &|owned| {
+                    let _ = owned.into_parts();
+                }
+            ),
             HostClaim::Claimed
         ));
         assert!(start.published_yield(published).is_some());

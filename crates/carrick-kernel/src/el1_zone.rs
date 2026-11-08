@@ -66,7 +66,9 @@ impl ObjectWakeDelivery {
             let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, direction) else {
                 continue;
             };
-            let Ok(queue) = zone.object_wait(key, &HostLockWait) else {
+            let Ok(queue) = zone.object_wait(key, &HostLockWait, &|owned| {
+                crate::el1_zone::complete_object_wake(owned.zone(), owned)
+            }) else {
                 continue;
             };
             let Self { handed, len, slots } = self;
@@ -134,7 +136,9 @@ impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
         else {
             carrick_fatal::carrick_fatal!("metadata::wake", "zero metadata request incarnation");
         };
-        let Ok(queue) = zone.object_wait(key, &HostLockWait) else {
+        let Ok(queue) = zone.object_wait(key, &HostLockWait, &|owned| {
+            crate::el1_zone::complete_object_wake(owned.zone(), owned)
+        }) else {
             // No zone participant bound a queue (e.g. guest scheduling disabled).
             publish();
             return;
@@ -319,7 +323,9 @@ pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
         route_native_handback_in_zone(zone, record);
         return HostClaim::Deferred;
     }
-    let outcome = zone.claim_for_host(record, seq, kind, &HostLockWait);
+    let outcome = zone.claim_for_host(record, seq, kind, &HostLockWait, &|owned| {
+        crate::el1_zone::complete_object_wake(owned.zone(), owned)
+    });
     if let HostClaim::El1Held { slot } = outcome {
         kick_slot(slot);
     }
@@ -360,7 +366,9 @@ pub fn cancel(record: RecordRef) {
     let Some(zone) = zone_tables() else {
         return;
     };
-    match zone.claim_for_host(record, None, Handback::Cancelled, &HostLockWait) {
+    match zone.claim_for_host(record, None, Handback::Cancelled, &HostLockWait, &|owned| {
+        crate::el1_zone::complete_object_wake(owned.zone(), owned)
+    }) {
         HostClaim::Claimed | HostClaim::AlreadyHost => {
             if zone.live(record).is_some() {
                 zone.free_record(record.id);
@@ -620,7 +628,11 @@ fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> Zone
     // A futex_waitv park is queued on other buckets too.
     wake.handed = transfers
         .into_iter()
-        .filter_map(|transfer| transfer.finish(&HostLockWait))
+        .filter_map(|transfer| {
+            transfer.finish(&HostLockWait, &|owned| {
+                crate::el1_zone::complete_object_wake(owned.zone(), owned)
+            })
+        })
         .collect();
     wake
 }
@@ -692,11 +704,11 @@ fn requeue<E>(
         }
         moved = zone.requeue(from_guard, to_guard, mm, from, to, requeue_count);
     }
-    woken.extend(
-        transfers
-            .iter_mut()
-            .filter_map(|entry| entry.take_ready(&HostLockWait)),
-    );
+    woken.extend(transfers.iter_mut().filter_map(|entry| {
+        entry.take_ready(&HostLockWait, &|owned| {
+            crate::el1_zone::complete_object_wake(owned.zone(), owned)
+        })
+    }));
     Ok((woken, moved))
 }
 
@@ -1794,8 +1806,15 @@ mod tests {
             })
             .unwrap();
         let lane = ObjectWaitKey::new(1, 1).unwrap();
-        zone.bind_object_wait(lane, &HostLockWait).unwrap();
-        let queue = zone.object_wait(lane, &HostLockWait).unwrap();
+        zone.bind_object_wait(lane, &HostLockWait, &|owned| {
+            crate::el1_zone::complete_object_wake(owned.zone(), owned)
+        })
+        .unwrap();
+        let queue = zone
+            .object_wait(lane, &HostLockWait, &|owned| {
+                crate::el1_zone::complete_object_wake(owned.zone(), owned)
+            })
+            .unwrap();
         queue
             .park(queue.snapshot(), record, OperationToken::new(1, 1).unwrap())
             .unwrap();
@@ -1816,7 +1835,11 @@ mod tests {
             .unwrap();
         let foreign_record = zone.alloc_record(identity(153_902)).unwrap();
         for (parked, token) in [(sibling_record, 2), (foreign_record, 3)] {
-            let queue = zone.object_wait(lane, &HostLockWait).unwrap();
+            let queue = zone
+                .object_wait(lane, &HostLockWait, &|owned| {
+                    crate::el1_zone::complete_object_wake(owned.zone(), owned)
+                })
+                .unwrap();
             queue
                 .park(
                     queue.snapshot(),
@@ -1908,6 +1931,7 @@ mod tests {
                         Some(seq),
                         Handback::Woken,
                         &HostLockWait,
+                        &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned)
                     ),
                     HostClaim::Claimed,
                 );
@@ -1934,7 +1958,9 @@ mod tests {
                     Claim::Host { .. }
                 ));
                 assert_eq!(
-                    zone.claim_for_host(old, None, Handback::Cancelled, &HostLockWait),
+                    zone.claim_for_host(old, None, Handback::Cancelled, &HostLockWait, &|owned| {
+                        crate::el1_zone::complete_object_wake(owned.zone(), owned)
+                    }),
                     HostClaim::AlreadyHost,
                 );
                 zone.free_record(old.id);
@@ -2019,6 +2045,153 @@ mod tests {
 
     mod serial_host {
         use super::*;
+
+        #[test]
+        fn legacy_release_completion_rings_mapped_doorbell_and_returns_exact_operation() {
+            use carrick_sched_core::object_wait::{
+                ObjectWaitKey, OperationToken, OwnedObjectWakeEffects,
+            };
+            const SLOT: usize = 3;
+            struct Restore(usize);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    carrick_el1_abi::record_el1_region_host_ptr(self.0);
+                }
+            }
+            let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
+            for host_release in [false, true] {
+                let region = carrick_test_support::TestEl1Region::zeroed();
+                carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+                // SAFETY: this is the aligned task slot of the retained ABI region.
+                let task = unsafe {
+                    &*((region.as_ptr() as usize
+                        + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+                        + SLOT * std::mem::size_of::<carrick_el1_abi::CurrentTask>())
+                        as *const carrick_el1_abi::CurrentTask)
+                };
+                let zone = heap_zone();
+                let completion =
+                    |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
+                        if host_release {
+                            carrick_el1::substrate::sched::object_wait::deliver_host_completion(
+                                owned.zone(),
+                                owned,
+                            );
+                        } else {
+                            carrick_el1::substrate::sched::object_wait::deliver_completion(
+                                owned.zone(),
+                                SlotId::new(SLOT as u8),
+                                owned,
+                            );
+                        }
+                    };
+                let key = ObjectWaitKey::new(3, 1).unwrap();
+                zone.bind_object_wait(key, &HostLockWait, &completion)
+                    .unwrap();
+                let held = zone.object_wait(key, &HostLockWait, &completion).unwrap();
+                let record = zone
+                    .alloc_record(ThreadIdentity {
+                        tid: 1845,
+                        serial: 1845,
+                        mm: 7,
+                        file_table: 1,
+                        generation: 1,
+                        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                        affinity: 0,
+                        lifecycle_page: 0,
+                        control_slot: 0,
+                    })
+                    .unwrap();
+                let operation = OperationToken::new(1845, 1).unwrap();
+                let identity = operation.identity();
+                zone.defer_object_lock_release(key, record, operation, &completion)
+                    .unwrap();
+                assert!(!task.linux.has_pending_host_work());
+                drop(held);
+                assert!(
+                    task.linux.has_pending_host_work(),
+                    "host_release={host_release}"
+                );
+                assert!(matches!(
+                    zone.record(record).claim(),
+                    Claim::Transferring { .. }
+                ));
+                let mut delivered = Vec::new();
+                zone.take_completion_handbacks(&HostLockWait, &mut |record| delivered.push(record));
+                assert_eq!(delivered, [zone.record_ref(record)]);
+                assert_eq!(
+                    unsafe { zone.record(record).take_object_operation() }
+                        .unwrap()
+                        .identity(),
+                    identity
+                );
+                zone.take_completion_handbacks(&HostLockWait, &mut |_| {
+                    panic!("duplicate legacy handback")
+                });
+            }
+        }
+
+        #[test]
+        fn host_completion_preserves_a_publishing_guests_own_slot() {
+            use carrick_el1::substrate::sched::object_wait::{
+                clear_test_wake_trace, deliver_host_completion, test_wake_trace,
+            };
+            use carrick_sched_core::object_wait::{
+                ObjectWaitKey, OperationToken, OwnedObjectWakeEffects,
+            };
+            let zone = heap_zone();
+            let slot = SlotId::new(3);
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 7, None, 0);
+            assert!(
+                zone.occupancy
+                    .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, 7)
+            );
+            zone.enter_guest(slot);
+            zone.slot(slot).set_sgi_target(42);
+            let completion = |owned: OwnedObjectWakeEffects<
+                '_,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >| deliver_host_completion(owned.zone(), owned);
+            let key = ObjectWaitKey::new(3, 1).unwrap();
+            let source = zone
+                .bind_object_notification_source(key, &HostLockWait, &completion)
+                .unwrap();
+            let record = zone
+                .alloc_record(ThreadIdentity {
+                    tid: 1846,
+                    serial: 1846,
+                    mm: 7,
+                    file_table: 1,
+                    generation: 1,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            {
+                let queue = zone
+                    .object_wait_with_completion(key, &HostLockWait, &completion)
+                    .unwrap();
+                queue
+                    .park(
+                        queue.snapshot(),
+                        record,
+                        OperationToken::new(1846, 1).unwrap(),
+                    )
+                    .unwrap();
+            }
+            clear_test_wake_trace();
+            source
+                .reserve()
+                .publish(carrick_sched_core::Waker::El1 { slot }, &completion);
+            assert!(
+                matches!(zone.record(record).claim(), Claim::Queued { slot: target, .. } if target == slot)
+            );
+            assert!(zone.take_resched(slot));
+            assert_eq!(test_wake_trace(), [(slot, 42)]);
+        }
 
         #[test]
         fn deferred_capture_does_not_hold_publisher_registration() {
@@ -2808,7 +2981,9 @@ mod tests {
                 .unwrap();
             let record = zone.record_ref(id);
             zone.publish_park(id, zone.next_seq(id));
-            zone.claim_for_host(record, None, Handback::Woken, &HostLockWait);
+            zone.claim_for_host(record, None, Handback::Woken, &HostLockWait, &|owned| {
+                crate::el1_zone::complete_object_wake(owned.zone(), owned)
+            });
             publish_handback_in_zone(&zone, record, &mut |record| published.push(record));
             assert!(
                 published.is_empty(),
@@ -2841,7 +3016,9 @@ mod tests {
                 .unwrap();
             let record = zone.record_ref(id);
             zone.publish_park(id, zone.next_seq(id));
-            zone.claim_for_host(record, None, Handback::Resumed, &HostLockWait);
+            zone.claim_for_host(record, None, Handback::Resumed, &HostLockWait, &|owned| {
+                crate::el1_zone::complete_object_wake(owned.zone(), owned)
+            });
             records.push(record);
         }
         let mut published = Vec::new();

@@ -332,9 +332,16 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
             let zone = &self.process.zone;
             let wait = BoundedSpin(1024);
             let key = ObjectWaitKey::new(45, 1).unwrap();
-            zone.bind_object_wait(key, &wait).unwrap();
+            zone.bind_object_wait(key, &wait, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
             {
-                let guard = zone.object_wait(key, &wait).unwrap();
+                let guard = zone
+                    .object_wait(key, &wait, &|owned| {
+                        let _ = owned.into_parts();
+                    })
+                    .unwrap();
                 guard
                     .park(
                         guard.snapshot(),
@@ -345,7 +352,11 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
             }
             zone.clear_current(SLOT);
             {
-                let guard = zone.object_wait(key, &wait).unwrap();
+                let guard = zone
+                    .object_wait(key, &wait, &|owned| {
+                        let _ = owned.into_parts();
+                    })
+                    .unwrap();
                 assert_eq!(
                     guard
                         .notify_object(SLOT, &mut WakeEffects::default())

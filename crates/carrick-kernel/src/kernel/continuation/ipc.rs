@@ -154,7 +154,9 @@ impl IpcHostServices for ZoneHostServices {
             let mut placed = Vec::new();
             {
                 // A queue never bound to this incarnation has no waiters.
-                let Ok(guard) = zone.object_wait(key, &HostIpcWait) else {
+                let Ok(guard) = zone.object_wait(key, &HostIpcWait, &|owned| {
+                    crate::el1_zone::complete_object_wake(owned.zone(), owned)
+                }) else {
                     continue;
                 };
                 let _ = guard
@@ -234,10 +236,14 @@ pub fn lane_snapshots(
 ) -> [Option<ObjectWaitSnapshot>; 2] {
     [WaitFor::Readable, WaitFor::Writable].map(|lane| {
         let key = wait_key(object, lane)?;
-        let _ = zone.bind_object_wait(key, &HostIpcWait);
-        zone.object_wait(key, &HostIpcWait)
-            .ok()
-            .map(|guard| guard.snapshot())
+        let _ = zone.bind_object_wait(key, &HostIpcWait, &|owned| {
+            crate::el1_zone::complete_object_wake(owned.zone(), owned)
+        });
+        zone.object_wait(key, &HostIpcWait, &|owned| {
+            crate::el1_zone::complete_object_wake(owned.zone(), owned)
+        })
+        .ok()
+        .map(|guard| guard.snapshot())
     })
 }
 

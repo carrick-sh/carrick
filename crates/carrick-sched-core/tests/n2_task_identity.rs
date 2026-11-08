@@ -83,7 +83,9 @@ fn stale_completion_after_exact_identity_reuse_at_1_8_32() {
                 let expected = Claim::Parked { seq };
                 for reason in [Handback::Woken, Handback::Cancelled, Handback::Control] {
                     assert_eq!(
-                        zone.claim_for_host(old, Some(seq), reason, &BoundedSpin(16)),
+                        zone.claim_for_host(old, Some(seq), reason, &BoundedSpin(16), &|owned| {
+                            let _ = owned.into_parts();
+                        }),
                         HostClaim::Stale
                     );
                     assert_eq!(zone.record(replacement).claim(), expected);
