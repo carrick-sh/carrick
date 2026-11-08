@@ -714,6 +714,8 @@ enum AtEmptyPathCase {
     BadFlagsBadFd,
     RelativeBadFd,
     RelativePipe,
+    NullPipe,
+    NullBadFd,
 }
 
 fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
@@ -773,6 +775,8 @@ fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
         AtEmptyPathCase::BadFlagsBadFd => (63, b"\0"),
         AtEmptyPathCase::RelativeBadFd => (63, b".\0"),
         AtEmptyPathCase::RelativePipe => (3, b".\0"),
+        AtEmptyPathCase::NullPipe => (3, b"\0"),
+        AtEmptyPathCase::NullBadFd => (63, b"\0"),
     };
     let flags = LINUX_AT_EMPTY_PATH
         | if matches!(case, AtEmptyPathCase::BadFlagsBadFd) {
@@ -781,12 +785,17 @@ fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
             0
         };
     let path = GuestUserBuffer::from_bytes(path);
+    let path_arg = if matches!(case, AtEmptyPathCase::NullPipe | AtEmptyPathCase::NullBadFd) {
+        0
+    } else {
+        path.arg()
+    };
     let output = GuestUserBuffer::zeroed(if x86 {
         core::mem::size_of::<LinuxX8664Stat>()
     } else {
         core::mem::size_of::<LinuxStat>()
     });
-    let args = [dirfd as u64, path.arg(), output.arg(), flags, 0, 0];
+    let args = [dirfd as u64, path_arg, output.arg(), flags, 0, 0];
     let mut arm = TrapFrame {
         esr: 0x15 << 26,
         elr: 0x4004,
@@ -858,7 +867,11 @@ fn at_empty_path_dispatch(x86: bool, case: AtEmptyPathCase) {
         assert_eq!(route, CompletionRoute::Served);
         assert_eq!(result, -22, "invalid flags must precede EBADF(9)");
         assert!(output.as_bytes().iter().all(|byte| *byte == 0));
-    } else if matches!(case, AtEmptyPathCase::Pipe) {
+    } else if matches!(case, AtEmptyPathCase::NullBadFd) {
+        assert_eq!(route, CompletionRoute::Served);
+        assert_eq!(result, -9, "NULL AT_EMPTY_PATH must select the descriptor");
+        assert!(output.as_bytes().iter().all(|byte| *byte == 0));
+    } else if matches!(case, AtEmptyPathCase::Pipe | AtEmptyPathCase::NullPipe) {
         assert_eq!(route, CompletionRoute::Served, "pipe query stays in ring");
         assert_eq!(result, 0);
         let mode = if x86 {
@@ -1042,4 +1055,21 @@ fn at_empty_path_arm_relative_pipe() {
 #[test]
 fn at_empty_path_x86_relative_pipe() {
     at_empty_path_dispatch(true, AtEmptyPathCase::RelativePipe);
+}
+
+#[test]
+fn at_empty_path_arm_null_pipe() {
+    at_empty_path_dispatch(false, AtEmptyPathCase::NullPipe);
+}
+#[test]
+fn at_empty_path_x86_null_pipe() {
+    at_empty_path_dispatch(true, AtEmptyPathCase::NullPipe);
+}
+#[test]
+fn at_empty_path_arm_null_bad_fd() {
+    at_empty_path_dispatch(false, AtEmptyPathCase::NullBadFd);
+}
+#[test]
+fn at_empty_path_x86_null_bad_fd() {
+    at_empty_path_dispatch(true, AtEmptyPathCase::NullBadFd);
 }

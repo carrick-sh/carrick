@@ -102,3 +102,13 @@ The nearest existing owners are `serve_pipe_metadata` for empty-path pipe
 queries and `native_host_file::path_base` for relative paths. This change
 adds no production type, lock, queue, or owner and preserves the one-byte
 pathname classification and zero host descriptor operations.
+
+`stat(2)` treats a NULL pathname with `AT_EMPTY_PATH` as empty starting
+with Linux 6.11. The recorded native ARM Docker oracle is LinuxKit 6.12.76
+([baseline](../ltp-baseline/BASELINE.md)); the director accepted this
+documented version as sufficient authority for #1927. No live native ARM
+Docker run was available to the worker. The supplementary native amd64
+Linux 6.12.115 syscall check also accepts NULL, but is not the ARM oracle.
+The `at_empty_path_{arm,x86}_null_{pipe,bad_fd}` witnesses require the
+production dispatcher to skip the NULL guest-memory read and return either
+FIFO metadata or EBADF(9). NULL without `AT_EMPTY_PATH` remains unchanged.
