@@ -5058,7 +5058,7 @@ fn poll_revents_crossing_a_page_retains_partial_copy_and_fault() {
             .unwrap();
         let output = service::OwnedCopyout {
             effect: None,
-            data: service::CopyoutData::Poll(vec![carrick_abi::PollReventsOutput::new(
+            data: service::CopyoutData::Poll(vec![carrick_syscall_abi::PollReventsOutput::new(
                 carrick_guest_arch::GuestVa::new(0x10ff9),
                 0x1234,
             )]),

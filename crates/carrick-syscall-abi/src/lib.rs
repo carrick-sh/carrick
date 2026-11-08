@@ -38,6 +38,50 @@ pub use errno::{
     LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTTY, LINUX_EPERM, LINUX_ERANGE, LINUX_ESPIPE,
     LINUX_ESRCH, LINUX_ETIMEDOUT, LinuxErrno,
 };
+
+#[repr(C, packed)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
+pub struct LinuxPollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// One poll result field; the input fields remain owned by the caller.
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub struct PollReventsOutput {
+    record: carrick_guest_arch::GuestVa,
+    bytes: [u8; 2],
+}
+
+impl PollReventsOutput {
+    pub fn new(record: carrick_guest_arch::GuestVa, revents: i16) -> Self {
+        Self {
+            record,
+            bytes: revents.to_ne_bytes(),
+        }
+    }
+
+    pub fn unit(&self) -> Result<(carrick_guest_arch::GuestVa, &[u8; 2]), LinuxErrno> {
+        let address = self
+            .record
+            .checked_add(core::mem::offset_of!(LinuxPollFd, revents) as u64)
+            .ok_or(LINUX_EFAULT)?;
+        Ok((address, &self.bytes))
+    }
+}
+
 mod signal;
 pub use signal::{
     AARCH64_EL0_USER_PSTATE_MASK, CARRICK_X8664_XSTATE_TRAILER_MAGIC,

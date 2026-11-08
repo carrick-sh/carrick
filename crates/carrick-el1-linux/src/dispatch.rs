@@ -2480,12 +2480,12 @@ fn complete_poll_array<'p, C: carrick_core_abi::EntryContext>(
     }
     for (index, pollfd) in pollfds.iter().enumerate() {
         let Some(record) = index
-            .checked_mul(core::mem::size_of::<carrick_abi::LinuxPollFd>())
+            .checked_mul(core::mem::size_of::<carrick_syscall_abi::LinuxPollFd>())
             .and_then(|offset| address.raw().checked_add(offset as u64))
         else {
             return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
         };
-        fields.push(carrick_abi::PollReventsOutput::new(
+        fields.push(carrick_syscall_abi::PollReventsOutput::new(
             carrick_guest_arch::GuestVa::new(record),
             pollfd.revents,
         ));
@@ -2502,7 +2502,8 @@ fn complete_poll_array<'p, C: carrick_core_abi::EntryContext>(
                     pc: diagnostic.3,
                     address,
                     len: carrick_guest_arch::GuestLen::new(
-                        (pollfds.len() * core::mem::size_of::<carrick_abi::LinuxPollFd>()) as u64,
+                        (pollfds.len() * core::mem::size_of::<carrick_syscall_abi::LinuxPollFd>())
+                            as u64,
                     ),
                     argument: Some(0),
                     access: carrick_guest_arch::Access::Write,

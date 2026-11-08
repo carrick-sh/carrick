@@ -143,7 +143,7 @@ pub(super) struct OwnedCopyout<'a> {
 
 pub(super) enum CopyoutData {
     Bytes { address: UserVa, bytes: Vec<u8> },
-    Poll(Vec<carrick_abi::PollReventsOutput>),
+    Poll(Vec<carrick_syscall_abi::PollReventsOutput>),
 }
 
 impl CopyoutData {

@@ -466,10 +466,12 @@ pub struct PollFd {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<PollFd>() == core::mem::size_of::<carrick_abi::LinuxPollFd>());
+    assert!(
+        core::mem::size_of::<PollFd>() == core::mem::size_of::<carrick_syscall_abi::LinuxPollFd>()
+    );
     assert!(
         core::mem::offset_of!(PollFd, revents)
-            == core::mem::offset_of!(carrick_abi::LinuxPollFd, revents)
+            == core::mem::offset_of!(carrick_syscall_abi::LinuxPollFd, revents)
     );
 };
 

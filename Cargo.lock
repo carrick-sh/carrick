@@ -335,7 +335,6 @@ name = "carrick-abi"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
- "carrick-guest-arch",
  "carrick-syscall-abi",
  "serde",
  "zerocopy",
@@ -918,7 +917,6 @@ dependencies = [
 name = "carrick-personality-linux"
 version = "0.1.0"
 dependencies = [
- "carrick-abi",
  "carrick-core",
  "carrick-core-abi",
  "carrick-el1",
@@ -1089,6 +1087,7 @@ name = "carrick-syscall-abi"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
+ "carrick-guest-arch",
  "serde",
  "zerocopy",
 ]

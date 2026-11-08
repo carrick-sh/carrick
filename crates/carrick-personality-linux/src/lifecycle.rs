@@ -351,7 +351,7 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     /// Retain the completed poll result and its individual output fields.
     fn complete_poll_copyout(
         &mut self,
-        _fields: alloc::vec::Vec<carrick_abi::PollReventsOutput>,
+        _fields: alloc::vec::Vec<carrick_syscall_abi::PollReventsOutput>,
         _result: SyscallResult,
     ) -> LifecycleOutcome {
         LifecycleOutcome::Returned {

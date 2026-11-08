@@ -7852,7 +7852,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     }
     fn complete_poll_copyout(
         &mut self,
-        fields: Vec<carrick_abi::PollReventsOutput>,
+        fields: Vec<carrick_syscall_abi::PollReventsOutput>,
         result: SyscallResult,
     ) -> LifecycleOutcome {
         let result = self.finish_copyout(service::OwnedCopyout {
