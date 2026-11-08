@@ -14,7 +14,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const WORKFLOW: &str = ".github/workflows/signed-gate.yml";
 // Only the owner may request a signed gate. The carrick-workers App is held
 // by agents and worker VMs; admitting it would let agent-written code run on a
 // gate runner at the agent's own request (#654).
@@ -35,14 +34,15 @@ pub struct SignedGateArgs {
 }
 #[derive(clap::Subcommand, Debug)]
 pub enum SignedGateAction {
-    /// Authorize an Actions event and download the exact merge-base baseline.
+    /// Authorize an Actions event and name the exact candidate and merge base.
     Prepare {
         #[arg(long)]
         event: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
-    /// Run on macOS in a new detached worktree, under the exclusive host lease.
+    /// Run the merge base and the candidate on macOS, each in a new detached
+    /// worktree, under one exclusive host lease and one fixture bundle.
     Execute {
         #[arg(long)]
         request: PathBuf,
@@ -71,7 +71,6 @@ pub struct Request {
     pub prs: Vec<u64>,
     pub sha: String,
     pub base: String,
-    pub baseline_run: Option<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestKind {
@@ -612,21 +611,15 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
         };
         (kind, base, pr.into_iter().collect())
     };
-    let mut request = Request {
+    let request = Request {
         kind,
         prs,
         sha: requested_sha,
         base,
-        baseline_run: None,
     };
+    // The gate job executes this base beside the candidate on one Mac; no
+    // stored receipt from another host is downloaded here (#1884).
     fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
-    if request.kind != RequestKind::Main {
-        request.baseline_run = Some(download_baseline(
-            &request.base,
-            output,
-            request.kind == RequestKind::MergeGroup,
-        )?);
-    }
     write(
         &output.join("request.json"),
         serde_json::to_vec_pretty(&request).map_err(|e| fail(e.to_string()))?,
@@ -647,144 +640,6 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
         .map_err(|e| fail(e.to_string()))?;
     }
     Ok(())
-}
-
-pub fn trusted_run(run: &Value) -> bool {
-    run["path"] == WORKFLOW
-        && run["head_branch"] == "main"
-        && (run["event"] == "push" || run["event"] == "workflow_dispatch")
-        && run["status"] == "completed"
-        && run["repository"]["full_name"] == REPOSITORY
-        && run["head_repository"]["full_name"] == REPOSITORY
-        && (run["event"] == "push"
-            || (run["actor"]["login"].as_str().is_some_and(allowed)
-                && run["triggering_actor"]["login"]
-                    .as_str()
-                    .is_some_and(allowed)))
-}
-fn baseline_runs() -> Result<Vec<Value>, ReceiptError> {
-    let mut runs = pages(
-        &format!(
-            "repos/{REPOSITORY}/actions/workflows/signed-gate.yml/runs?branch=main&per_page=100"
-        ),
-        Some("workflow_runs"),
-    )?;
-    runs.sort_by_key(|r| std::cmp::Reverse(r["id"].as_u64().unwrap_or(0)));
-    Ok(runs)
-}
-
-fn download_run_baseline(
-    run: &Value,
-    base: &str,
-    output: &Path,
-) -> Result<Option<u64>, ReceiptError> {
-    if !trusted_run(run) || (run["event"] == "push" && run["head_sha"] != base) {
-        return Ok(None);
-    }
-    let id = run["id"].as_u64().ok_or_else(|| fail("missing run ID"))?;
-    let artifacts = pages(
-        &format!("repos/{REPOSITORY}/actions/runs/{id}/artifacts?per_page=100"),
-        Some("artifacts"),
-    )?;
-    let prefix = format!("signed-baseline-{base}-");
-    let mut artifacts = artifacts
-        .iter()
-        .filter(|a| a["expired"] == false)
-        .filter_map(|a| {
-            let name = a["name"].as_str()?;
-            let attempt = name.strip_prefix(&prefix)?.parse::<u64>().ok()?;
-            Some((attempt, name))
-        })
-        .collect::<Vec<_>>();
-    artifacts.sort_by_key(|(attempt, _)| std::cmp::Reverse(*attempt));
-    let found = !artifacts.is_empty();
-    for (attempt, name) in artifacts {
-        let dir = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
-        checked(
-            "gh",
-            &[
-                "run",
-                "download",
-                &id.to_string(),
-                "--repo",
-                REPOSITORY,
-                "--name",
-                name,
-                "--dir",
-                &dir.path().to_string_lossy(),
-            ],
-            None,
-        )?;
-        fs::copy(
-            dir.path().join("candidate.json"),
-            output.join(format!("base-{id:020}-{attempt:020}.json")),
-        )
-        .map_err(|e| fail(e.to_string()))?;
-    }
-    Ok(found.then_some(id))
-}
-
-fn exact_base_push(run: &Value, base: &str) -> bool {
-    run["path"] == WORKFLOW
-        && run["event"] == "push"
-        && run["head_branch"] == "main"
-        && run["head_sha"] == base
-        && run["repository"]["full_name"] == REPOSITORY
-        && run["head_repository"]["full_name"] == REPOSITORY
-}
-
-fn download_baseline(base: &str, output: &Path, wait_for_push: bool) -> Result<u64, ReceiptError> {
-    let runs = baseline_runs()?;
-    // Runner assignment happens after prepare, so retain all exact-SHA
-    // receipts and defer host selection until the candidate is available.
-    let mut newest = None;
-    for run in &runs {
-        if let Some(id) = download_run_baseline(run, base, output)? {
-            newest.get_or_insert(id);
-        }
-    }
-    if let Some(id) = newest {
-        return Ok(id);
-    }
-    if wait_for_push {
-        // The queue event may precede registration of the base's push workflow.
-        // Bound discovery of that exact run; never rerun tests or build a second
-        // baseline. Authorization's workflow timeout also bounds `gh run watch`.
-        let mut pending = runs.into_iter().find(|r| exact_base_push(r, base));
-        for _ in 0..60 {
-            if pending.is_some() {
-                break;
-            }
-            pending = baseline_runs()?
-                .into_iter()
-                .find(|r| exact_base_push(r, base));
-            if pending.is_none() {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-            }
-        }
-        if let Some(run) = pending {
-            let id = run["id"]
-                .as_u64()
-                .ok_or_else(|| fail("missing baseline run ID"))?;
-            if run["status"] != "completed" {
-                checked(
-                    "gh",
-                    &["run", "watch", &id.to_string(), "--repo", REPOSITORY],
-                    None,
-                )?;
-            }
-            let terminal = api(&format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
-            if !exact_base_push(&terminal, base) {
-                return Err(fail("base push identity changed while waiting"));
-            }
-            if let Some(id) = download_run_baseline(&terminal, base, output)? {
-                return Ok(id);
-            }
-        }
-    }
-    Err(fail(format!(
-        "no signed baseline for merge-base {base}; dispatch signed-gate.yml on main with pr=main and sha={base}, then rerun this request"
-    )))
 }
 
 /// An empty, truncated or unsigned receipt can never seed a baseline or stand for a gate.
@@ -882,17 +737,21 @@ fn logged(command: &mut Command, lease: &HostLease, log: &Path) -> Result<bool, 
 }
 /// Admit the same-run fixture archive before any installation or guest work.
 /// General fixture reuse permits equal inputs across commits; this Actions
-/// lane additionally requires the authorized publisher's exact commit.
+/// lane additionally requires the authorized publisher's exact commit. The
+/// paired base run checks out `checkout` (the merge base) and restores the
+/// candidate's bundle (`publisher`): its inputs must equal the base tree's,
+/// or the pair is refused rather than served by a substitute bundle.
 pub fn verify_fixture_artifact(
     root: &Path,
     bundle: &Path,
-    expected: &str,
+    checkout: &str,
+    publisher: &str,
 ) -> Result<(), ReceiptError> {
-    let (manifest, _) = crate::fixtures::archive::verify(root, bundle, expected)
+    let (manifest, _) = crate::fixtures::archive::verify(root, bundle, checkout)
         .map_err(|e| fail(e.to_string()))?;
-    let expected = crate::fixtures::CommitSha::try_from(expected.to_owned())
+    let publisher = crate::fixtures::CommitSha::try_from(publisher.to_owned())
         .map_err(|e| fail(e.to_string()))?;
-    if manifest.source_head != expected {
+    if manifest.source_head != publisher {
         return Err(fail(
             "signed fixture artifact source SHA differs from authorized SHA",
         ));
@@ -900,6 +759,16 @@ pub fn verify_fixture_artifact(
     Ok(())
 }
 
+/// Receipt file names inside one execution's output directory.
+const CANDIDATE_RECEIPT: &str = "candidate.json";
+const BASE_RECEIPT: &str = "base.json";
+/// The paired base's evidence lives beside the candidate's, in this subdirectory.
+const BASE_DIR: &str = "base";
+
+/// Run the merge base (unless this is a main baseline) and then the candidate
+/// on this Mac, under one exclusive host lease and with the candidate's
+/// fixture bundle. Publication compares the candidate only with this paired
+/// base, so host or fixture differences cannot surface as NEW failures (#1884).
 fn execute(
     root: &Path,
     request_path: &Path,
@@ -912,14 +781,55 @@ fn execute(
     let request: Request =
         serde_json::from_value(read_json(request_path)?).map_err(|e| fail(e.to_string()))?;
     sha(&request.sha)?;
+    sha(&request.base)?;
     fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
     let output = fs::canonicalize(output).map_err(|e| fail(e.to_string()))?;
     let bundle = fs::canonicalize(bundle).map_err(|e| fail(e.to_string()))?;
-    checked(
-        "git",
-        &["fetch", "--no-tags", "origin", &request.sha],
-        Some(root),
-    )?;
+    let result = (|| {
+        crate::host_load::check().map_err(|e| fail(e.to_string()))?;
+        let lease = HostLease::acquire(HostLeaseMode::Gate).map_err(|e| fail(e.to_string()))?;
+        if request.kind != RequestKind::Main {
+            let base_dir = output.join(BASE_DIR);
+            fs::create_dir_all(&base_dir).map_err(|e| fail(e.to_string()))?;
+            execute_one(
+                root,
+                &lease,
+                &request.base,
+                &request.sha,
+                &bundle,
+                &base_dir,
+                BASE_RECEIPT,
+            )
+            .map_err(|error| fail(format!("paired base {}: {error}", request.base)))?;
+        }
+        execute_one(
+            root,
+            &lease,
+            &request.sha,
+            &request.sha,
+            &bundle,
+            &output,
+            CANDIDATE_RECEIPT,
+        )
+    })();
+    if let Err(error) = &result {
+        write(&output.join("execution-error.txt"), error.to_string())?;
+    }
+    result
+}
+
+/// Build, accept and independently inspect one commit in a fresh detached
+/// worktree. The caller holds the exclusive gate lease for the whole pair.
+fn execute_one(
+    root: &Path,
+    lease: &HostLease,
+    commit: &str,
+    publisher: &str,
+    bundle: &Path,
+    output: &Path,
+    receipt_name: &str,
+) -> Result<(), ReceiptError> {
+    checked("git", &["fetch", "--no-tags", "origin", commit], Some(root))?;
     let temp = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
     let tree = temp.path().join("checkout");
     checked(
@@ -929,25 +839,24 @@ fn execute(
             "add",
             "--detach",
             &tree.to_string_lossy(),
-            &request.sha,
+            commit,
         ],
         Some(root),
     )?;
     // macOS TMPDIR may use /var while git reports /private/var. Use the
     // repository's physical path for exact artifact-path comparisons.
     let tree = fs::canonicalize(&tree).map_err(|e| fail(e.to_string()))?;
+    let receipt_path = output.join(receipt_name);
     let result = (|| {
-        crate::host_load::check().map_err(|e| fail(e.to_string()))?;
-        let lease = HostLease::acquire(HostLeaseMode::Gate).map_err(|e| fail(e.to_string()))?;
         let xtask = std::env::current_exe().map_err(|e| fail(e.to_string()))?;
         let mut fetch = Command::new(&xtask);
         fetch
             .current_dir(&tree)
             .args(["--root", &tree.to_string_lossy(), "fixtures", "fetch"]);
-        if !logged(&mut fetch, &lease, &output.join("fixture-fetch.log"))? {
+        if !logged(&mut fetch, lease, &output.join("fixture-fetch.log"))? {
             return Err(fail("fixture dependency fetch failed"));
         }
-        verify_fixture_artifact(&tree, &bundle, &request.sha)?;
+        verify_fixture_artifact(&tree, bundle, commit, publisher)?;
         let mut restore = Command::new(&xtask);
         restore.current_dir(&tree).args([
             "--root",
@@ -957,14 +866,14 @@ fn execute(
             "--bundle",
             &bundle.to_string_lossy(),
         ]);
-        if !logged(&mut restore, &lease, &output.join("fixture-restore.log"))? {
+        if !logged(&mut restore, lease, &output.join("fixture-restore.log"))? {
             return Err(fail(
                 "fixture restore failed for the authorized exact-SHA artifact",
             ));
         }
         let mut build = Command::new("just");
         build.current_dir(&tree).arg("build");
-        if !logged(&mut build, &lease, &output.join("build.log"))? {
+        if !logged(&mut build, lease, &output.join("build.log"))? {
             return Err(fail("just build failed"));
         }
         let mut accept = crate::command::locked_cargo();
@@ -980,21 +889,34 @@ fn execute(
             "--phase",
             "signed",
             "--receipt",
-            &output.join("candidate.json").to_string_lossy(),
+            &receipt_path.to_string_lossy(),
         ]);
-        let accepted = logged(&mut accept, &lease, &output.join("accept.log"))?;
+        let accepted = logged(&mut accept, lease, &output.join("accept.log"))?;
         write(
             &output.join("accept-exit.json"),
             json!({"success": accepted}).to_string(),
         )?;
         // accept rebuilds once under the same lease before testing. Its receipt
         // names that artifact; inspect it independently before releasing the lease.
-        let mut receipt = load(&output.join("candidate.json"))?;
-        // Capture on the execution Mac, including when the requested SHA predates
+        let mut receipt = load(&receipt_path)?;
+        // Capture on the execution Mac, including when the commit predates
         // host-aware accept receipts. Never infer identity on the hosted publisher.
         receipt.host_identity = crate::accept::SignedHostIdentity::capture();
+        // Both runs of a pair restore one bundle. Record its identity with this
+        // trusted executor's validation, so a base commit whose accept predates
+        // fixture content identity remains comparable with its candidate.
+        let trusted = crate::accept::verify_signed_fixtures(&tree)
+            .map_err(|e| fail(format!("trusted fixture validation: {e}")))?;
+        if let Some(recorded) = &receipt.fixture_validation
+            && recorded.inputs_sha256 != trusted.inputs_sha256
+        {
+            return Err(fail(
+                "accept recorded fixture inputs that differ from the restored bundle",
+            ));
+        }
+        receipt.fixture_validation = Some(trusted);
         write(
-            &output.join("candidate.json"),
+            &receipt_path,
             serde_json::to_vec_pretty(&receipt).map_err(|e| fail(e.to_string()))?,
         )?;
         // Older accept receipts encode an unknown reap as remaining_count=0
@@ -1004,7 +926,7 @@ fn execute(
             let log = output.join(format!("cleanup-{index}.log"));
             let mut reap = Command::new(tree.join("scripts/sudo/kill.sh"));
             reap.current_dir(&tree).arg(&count.run_id);
-            if !logged(&mut reap, &lease, &log)?
+            if !logged(&mut reap, lease, &log)?
                 || parse_cleanup_count(&fs::read_to_string(&log).map_err(|e| fail(e.to_string()))?)
                     != Some(0)
             {
@@ -1026,7 +948,7 @@ fn execute(
             &output.join("identity.json"),
             serde_json::to_vec_pretty(&identity).map_err(|e| fail(e.to_string()))?,
         )?;
-        validate_receipt(&receipt, &request.sha)
+        validate_receipt(&receipt, commit)
     })();
     // Preserve logs even on errors before dropping the detached worktree.
     let logs = tree.join("target/el1-gate");
@@ -1049,13 +971,27 @@ fn execute(
         &["worktree", "remove", "--force", &tree.to_string_lossy()],
         Some(root),
     );
-    if let Err(error) = &result {
-        write(&output.join("execution-error.txt"), error.to_string())?;
-    }
     result?;
     log_copy?;
     cleanup?;
     Ok(())
+}
+
+/// Independent execution evidence must match the receipt it accompanies.
+fn admit_evidence(dir: &Path, receipt: &AcceptReceipt) -> Result<ArtifactIdentity, ReceiptError> {
+    let identity: ArtifactIdentity = read_json(&dir.join("identity.json"))
+        .and_then(|value| serde_json::from_value(value).map_err(|e| fail(e.to_string())))?;
+    if receipt.artifact.as_ref() != Some(&identity) {
+        return Err(fail(
+            "independent artifact identity does not match the receipt",
+        ));
+    }
+    let cleanup: Vec<CleanupCount> = read_json(&dir.join("cleanup.json"))
+        .and_then(|value| serde_json::from_value(value).map_err(|e| fail(e.to_string())))?;
+    if cleanup != receipt.cleanup_counts {
+        return Err(fail("independent cleanup evidence differs from receipt"));
+    }
+    Ok(identity)
 }
 
 fn publish(
@@ -1073,34 +1009,17 @@ fn publish(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(fail(format!("cannot clear stale comparison: {error}"))),
         }
-        let candidate = load(&results.join("candidate.json"))?;
-        let base = if request.kind == RequestKind::Main {
-            candidate.clone()
+        let candidate = load(&results.join(CANDIDATE_RECEIPT))?;
+        // Compare only with the base executed in this run, on the same Mac and
+        // with the same fixture bundle. A stored receipt from another host is
+        // never a substitute; comparability is still checked below.
+        let (base, base_evidence) = if request.kind == RequestKind::Main {
+            (candidate.clone(), Ok(()))
         } else {
-            let dir = request_path
-                .parent()
-                .ok_or_else(|| fail("request has no parent"))?;
-            let mut paths = fs::read_dir(dir)
-                .map_err(|e| fail(e.to_string()))?
-                .map(|entry| entry.map(|e| e.path()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| fail(e.to_string()))?;
-            paths.retain(|path| {
-                path.file_name()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|name| name.starts_with("base-") && name.ends_with(".json"))
-            });
-            paths.sort_by(|a, b| b.cmp(a));
-            let bases = paths
-                .iter()
-                .map(|path| load(path))
-                .collect::<Result<Vec<_>, _>>()?;
-            let base = signed_receipt::select_base(&bases, &candidate)?.clone();
-            write(
-                &results.join("selected-base.json"),
-                serde_json::to_vec_pretty(&base).map_err(|e| fail(e.to_string()))?,
-            )?;
-            base
+            let dir = results.join(BASE_DIR);
+            let base = load(&dir.join(BASE_RECEIPT))?;
+            let evidence = admit_evidence(&dir, &base).map(|_| ());
+            (base, evidence)
         };
         validate_receipt(&base, &request.base)?;
         let diff = signed_receipt::compare(&base, &candidate)?;
@@ -1113,48 +1032,31 @@ fn publish(
             "\nExecution host: {:?}\nFixture bundle: {:?}\n",
             candidate.host_identity, candidate.fixture_validation
         ));
+        if request.kind != RequestKind::Main {
+            body.push_str(&format!(
+                "Paired base `{}` ran on the same host in this job.\n",
+                request.base
+            ));
+        }
+        if let Err(error) = &base_evidence {
+            body.push_str(&format!("\nBase evidence admission failed: {error}\n"));
+        }
         let valid = validate_receipt(&candidate, &request.sha);
         if let Err(error) = &valid {
             body.push_str(&format!("\nReceipt admission failed: {error}\n"));
         }
-        let identity: Result<ArtifactIdentity, ReceiptError> =
-            read_json(&results.join("identity.json"))
-                .and_then(|value| serde_json::from_value(value).map_err(|e| fail(e.to_string())))
-                .and_then(|identity| {
-                    if candidate.artifact.as_ref() == Some(&identity) {
-                        Ok(identity)
-                    } else {
-                        Err(fail(
-                            "independent artifact identity does not match candidate receipt",
-                        ))
-                    }
-                });
-        if let Err(error) = &identity {
-            body.push_str(&format!("\nIdentity admission failed: {error}\n"));
-        }
-        if let Ok(identity) = &identity {
-            body.push_str(&format!(
+        let identity = admit_evidence(results, &candidate);
+        match &identity {
+            Err(error) => body.push_str(&format!("\nEvidence admission failed: {error}\n")),
+            Ok(identity) => body.push_str(&format!(
                 "\nArtifact identity:\n```json\n{}\n```\n",
                 serde_json::to_string_pretty(identity).map_err(|e| fail(e.to_string()))?
-            ));
-        }
-        let cleanup: Result<Vec<CleanupCount>, ReceiptError> =
-            read_json(&results.join("cleanup.json"))
-                .and_then(|value| serde_json::from_value(value).map_err(|e| fail(e.to_string())))
-                .and_then(|counts| {
-                    if counts == candidate.cleanup_counts {
-                        Ok(counts)
-                    } else {
-                        Err(fail("independent cleanup evidence differs from receipt"))
-                    }
-                });
-        if let Err(error) = &cleanup {
-            body.push_str(&format!("\nCleanup admission failed: {error}\n"));
+            )),
         }
         let passed = diff.passed
             && valid.is_ok()
             && identity.is_ok()
-            && cleanup.is_ok()
+            && base_evidence.is_ok()
             && execution_result == "success";
         Ok::<_, ReceiptError>((passed, body))
     })();
