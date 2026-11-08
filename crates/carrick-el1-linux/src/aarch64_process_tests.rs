@@ -12337,43 +12337,72 @@ fn native_descriptor_metadata_witness(
         ));
         assert_eq!(result, 8);
         assert_eq!(ack.get::<u64>(0), 1);
-        let (route, _) = run_binding(&writer, sys::EXIT_GROUP.raw(), [0, 0, 0, 0]);
-        assert!(
-            matches!(
-                route,
-                CompletionRoute::Served
-                    | CompletionRoute::WithWork
-                    | CompletionRoute::Suspended
-                    | CompletionRoute::HostCustody
-            ),
-            "child exit route: {route:?}"
-        );
+        // Fork and lifecycle completion use the same production native owner
+        // as the existing birth above. Physical retirement is modeled by the
+        // fixture crossing; a WithWork SVC route is not an observed exit.
+        *crossing.zone.lock().unwrap() = Some(fixture.zone);
+        *crossing.child.lock().unwrap() = Some((
+            super::common_entry::execution_binding(&task),
+            writer.address,
+        ));
+        let exit = |binding: &super::native_process_runtime::NativeRecordBinding<
+            AddressContext<RootGpa>,
+            Aarch64ParkedContext,
+        >| {
+            let mut service = Aarch64NativeProcessService::with_crossing(
+                &task,
+                fixture.slot,
+                fixture.zone,
+                fixture.region.table(),
+                NonZeroU64::MIN,
+                &crossing,
+            )
+            .with_words(&words);
+            let mut entry = runtime
+                .enter(source, &task, binding.words, &mut service)
+                .unwrap();
+            assert!(matches!(
+                entry.exit_group(0),
+                LifecycleOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    ..
+                }
+            ));
+            entry.take_root_exit()
+        };
+        assert_eq!(exit(&writer), None);
+        assert_eq!(crossing.retirements.load(Ordering::Acquire), 1);
         activate(&parent_binding);
         let status = carrick_test_support::GuestUserBuffer::from_value(-1i32);
-        let (route, result) = run_binding(
-            &parent_binding,
-            carrick_syscall_abi::nr::WAIT4.raw(),
-            [u64::from(writer.visible_pid), status.arg(), 0, 0],
-        );
-        assert!(matches!(
-            route,
-            CompletionRoute::Served | CompletionRoute::WithWork
-        ));
-        assert_eq!(result, i64::from(writer.visible_pid));
+        {
+            let mut service = Aarch64NativeProcessService::with_crossing(
+                &task,
+                fixture.slot,
+                fixture.zone,
+                fixture.region.table(),
+                NonZeroU64::MIN,
+                &crossing,
+            )
+            .with_words(&words);
+            let mut entry = runtime
+                .enter(source, &task, parent_binding.words, &mut service)
+                .unwrap();
+            let LifecycleOutcome::Returned { result, .. } = entry.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::from(writer.visible_pid)),
+                status.va(),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0),
+            ) else {
+                panic!("exited child must be reaped without another wait");
+            };
+            assert_eq!(result.raw(), i64::from(writer.visible_pid));
+        }
         assert_eq!(status.get::<i32>(0), 0, "waitpid must observe child exit 0");
         // This is an IPC schedule. Memory-fault and signed execution evidence
         // belongs to its own fixtures; no memory/isolation tuple is invented.
-        println!("prepared-fork-ipc owner=zone ready=true notified=true child_ack=1 child_exit=0");
-        let (route, _) = run_binding(&parent_binding, sys::EXIT_GROUP.raw(), [0, 0, 0, 0]);
-        assert!(
-            matches!(
-                route,
-                CompletionRoute::Served
-                    | CompletionRoute::WithWork
-                    | CompletionRoute::Suspended
-                    | CompletionRoute::HostCustody
-            ),
-            "parent exit route: {route:?}"
+        assert_eq!(exit(&parent_binding), Some(LinuxWaitStatus::exited(0)));
+        println!(
+            "prepared-fork-ipc owner=zone ready=true notified=true child_ack=1 child_exit=0 parent_exit=0"
         );
         return;
     }
