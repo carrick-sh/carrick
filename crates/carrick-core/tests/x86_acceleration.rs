@@ -2091,7 +2091,10 @@ fn x4_shared_wait_records() {
     );
 
     // One-winner: Notify object wakes the waiter
-    let (report, _effects) = notify_object(&zone, slot, key).unwrap();
+    let (report, _effects) = notify_object(&zone, slot, key, &|owned| {
+        let _ = owned.into_parts();
+    })
+    .unwrap();
     assert_eq!(report.queued, 1);
 
     // Switch in the woken record

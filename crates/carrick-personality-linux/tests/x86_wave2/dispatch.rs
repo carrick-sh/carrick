@@ -1107,7 +1107,10 @@ fn allocator_control_with_pending_host_work_and_no_token_enrolls_three_waiters()
     assert!(mailbox.claim_response().is_some());
     mailbox.finish_response();
     let key = ObjectWaitKey::metadata_request(generation).unwrap();
-    let (wake, _) = notify_object(&zone, SlotId::new(0), key).expect("wake metadata wait queue");
+    let (wake, _) = notify_object(&zone, SlotId::new(0), key, &|owned| {
+        let _ = owned.into_parts();
+    })
+    .expect("wake metadata wait queue");
     assert_eq!(wake.queued, 3);
     assert_eq!(
         zone.object_queue_census(METADATA_WAIT_QUEUE_INDEX)

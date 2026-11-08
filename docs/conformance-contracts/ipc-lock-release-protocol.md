@@ -44,3 +44,12 @@ notification transition. No guard, endpoint operation, or publication custody
 is discarded when acquisition refuses. Guest memory, ISA execution and default
 executor-pool exhaustion still require the following layer's production
 witnesses and signed/KVM acceptance; no runtime ratio is claimed here.
+
+The CPL0 host native-service callback uses the stopped CPU's retained task,
+not the ARM host-aperture helper, and retains reschedule obligations. These
+legacy service queues cannot currently inherit a production lock admission.
+There is no production `X86Cpl0Zone` completion-handback consumer yet: KVM's
+WORK port reaches the ARM-context host drain. The following #1845 layer must
+supply the exact x86-context drain/owner and physical wake integration before
+enabling x86 host contention parks. This layer does not make that missing
+consumer an accepted guest behavior or claim an x86 contention pass.
