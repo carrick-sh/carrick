@@ -3,6 +3,16 @@
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable
 # under process.native.arm-admission; the full VM-free native suite passes.
 # No additional signed, Docker or runtime-ratio evidence is claimed here.
+# #887 round 2A, policy reversal: the remaining dispatch.rs change only
+# retains the refusal reason at five existing fatal boundaries. Admission,
+# completion, signal delivery, service settlement and successful dispatch
+# are unchanged from main; existing semantic and work bindings stay intact.
+# Diagnostic mapping evidence: carrick-el1-linux::dispatch::tests::
+# native_service_refusals_keep_the_error_in_the_fatal_transport and
+# stale_service_diagnostic_distinguishes_owners_without_reclassifying_busy
+# (just test-el1-native). These prove reason selection, not producer identity
+# or signal progress under contention. Typed attribution and its seven real
+# authority witnesses remain outstanding; signed evidence is director-owned.
 schema_version = 1
 id = "kernel.native.entropy"
 title = "Native tasks receive host entropy through their own service custody"
