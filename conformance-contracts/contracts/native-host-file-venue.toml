@@ -46,6 +46,7 @@ vm_free = [
 ]
 
 [bindings.unresolved]
+kvm = "carrick-vmm-kvm::cpl0_initial_mm::serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace: production three-open/close sequence, exact descriptor reuse, bounded native Linux control; initial red returns EBUSY(16) on the second open."
 embed_structural = "The director owns the signed carrier binding and exact-artifact verification for this venue."
 observation = "No versioned WorkObservation counts venue crossings yet; the routing witnesses prove zero host requests for in-zone objects."
 embed = "The signed native pipeline witnesses (`sh -c 'ls / | head -2'`, `true | true`) bind the exec successor's image import and RELRO end to end (#894 ruling 1); acceptance waits on the director's recorded signed run. A static-pie successor witness is tracked as a follow-up."
