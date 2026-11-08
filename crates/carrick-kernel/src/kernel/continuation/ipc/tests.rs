@@ -1557,7 +1557,7 @@ fn poll_handback_retains_admission(cause: Option<IpcCause>) {
     );
     assert_eq!(
         mem.read_bytes(BUF, 8).unwrap(),
-        [reader.0 as u8, 0, 0, 0, 1, 0, 1, 0]
+        [255, 255, 255, 255, 255, 255, 1, 0]
     );
     assert!(w.region.operation(&IpcOpToken::from_raw(raw)).is_err());
 }
@@ -1606,7 +1606,7 @@ fn ppoll_deadline_elapsed_during_park_completes_without_a_fresh_relative_wait() 
     );
     assert_eq!(
         mem.read_bytes(BUF, 8).unwrap(),
-        [reader.0 as u8, 0, 0, 0, 1, 0, 0, 0]
+        [255, 255, 255, 255, 255, 255, 0, 0]
     );
 }
 
@@ -1706,4 +1706,50 @@ fn poll_completed_answer_survives_copyout_refusal(control: bool) {
         }
     );
     assert_eq!(memory.inner.read_bytes(BUF + 6, 2).unwrap(), [1, 0]);
+}
+
+#[test]
+fn ppoll_handback_only_revents_requires_write_permission() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    let w = world();
+    let (reader, _, object) = w.pipe();
+    w.region
+        .lock(object, &HostIpcWait)
+        .unwrap()
+        .pipe()
+        .unwrap()
+        .try_write(b"x");
+    let token = w.operation(reader, IpcOpKind::PollWait, 0, 73);
+    let mut op = w.region.operation(&token).unwrap();
+    // The six input bytes end on a read-only page; only revents is writable.
+    let address = BUF + 4096 - 6;
+    op.buf = IpcUserVa(address);
+    op.orig_x0 = address;
+    op.value = carrick_el1_abi::ipc::IpcEventValue(1 << 32 | reader.0 as u64);
+    op.handback = IpcHandback::Continue;
+    w.region.update_operation(&token, op).unwrap();
+    let mut memory = OwnerRefusingMemory::new(BUF, 8192, 0xff);
+    memory.protect_readonly(BUF, 4096);
+    let outcome = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut memory,
+        None,
+        &Wakes::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        IpcHostOutcome::Complete {
+            result: 1,
+            sigpipe: false
+        }
+    );
+    assert_eq!(
+        memory.inner.read_bytes(address, 8).unwrap(),
+        [255, 255, 255, 255, 255, 255, 1, 0]
+    );
+    assert_eq!(memory.commits, vec![(address + 6, vec![1, 0])]);
 }
