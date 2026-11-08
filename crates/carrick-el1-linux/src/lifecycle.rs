@@ -56,7 +56,16 @@ impl<
             presented: self.process.as_deref().map(|venue| venue.binding()),
             expected: LifecycleNative::binding(self),
         };
-        diagnostic.record_copy_failure(address.raw(), len, write, reason);
+        diagnostic.record_copy_failure(
+            address,
+            carrick_guest_arch::GuestLen::new(len as u64),
+            if write {
+                carrick_guest_arch::Access::Write
+            } else {
+                carrick_guest_arch::Access::Read
+            },
+            reason,
+        );
     }
 
     fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
@@ -218,9 +227,9 @@ impl<
         let mut outcome = venue.wait_guest_copy_observed(request, &mut |refusal| {
             use carrick_personality_linux::lifecycle::InputPreparationRefusal;
             diagnostic.record(
-                request.address.raw(),
-                request.len.raw() as usize,
-                request.access == carrick_guest_arch::Access::Write,
+                request.address,
+                request.len,
+                request.access,
                 match refusal {
                     InputPreparationRefusal::Fault => {
                         carrick_el1_abi::CopyRefusalReason::OwnerFault
