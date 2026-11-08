@@ -8355,7 +8355,12 @@ fn admission_group_lookup_captures_stored_and_observed_keys() {
     // this mismatch. Preserve the original observed/stored diagnostic words,
     // without misrepresenting a synthetic PID write as a reachable refusal.
     let stored_key =
-        NativeProcessRegistry::group_key(fixture.zone, fixture.address, fixture.page, 41);
+        NativeProcessRegistry::<AddressContext<RootGpa>, ParkedContextWords>::group_key(
+            fixture.zone,
+            fixture.address,
+            fixture.page,
+            41,
+        );
     let stored = [
         stored_key.0 as u64,
         stored_key.1,
