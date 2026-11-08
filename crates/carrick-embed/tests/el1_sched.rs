@@ -4072,8 +4072,14 @@ fn el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes() {
     let carrier = carrier_or_fail();
     let run = run_fixture(&carrier, &["prepared-fork"], Duration::from_secs(30));
     assert_eq!(
-        run.result.stdout_utf8().trim(),
-        "prepared-fork inherited_zero=true prot_none_bytes=true two_live_isolation=true ok=true"
+        run.result
+            .stdout_utf8()
+            .lines()
+            .find(|line| line.starts_with("prepared-fork "))
+            .unwrap_or(""),
+        "prepared-fork inherited_zero=true prot_none_bytes=true two_live_isolation=true ok=true",
+        "guest output: {}",
+        run.result.stdout_utf8()
     );
 }
 
