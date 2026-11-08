@@ -1048,8 +1048,10 @@ pub fn diff_with_retired(
         // Carry it for comparison until an actual execution supplies a verdict.
         for candidate_step in candidate.steps.iter().filter(|s| s.name == base_step.name) {
             for test in &candidate_step.not_run_tests {
-                if base_failed.contains(test.as_str()) {
-                    next.insert(format!("test:{}:{test}", base_step.name));
+                for identity in [test.clone(), format!("deadline:{test}")] {
+                    if base_failed.contains(identity.as_str()) {
+                        next.insert(format!("test:{}:{identity}", base_step.name));
+                    }
                 }
             }
         }
