@@ -274,6 +274,23 @@ impl SyscallDispatcher {
         self.serve_native_host_file_in(&owner, record)
     }
 
+    /// Serve a request whose authenticated member retains host-root resources.
+    /// Descriptor allocation still belongs exclusively to the ring namespace.
+    pub fn serve_host_root_file(
+        &self,
+        resources: &super::resources::HostRootResources,
+        record: &mut [u8],
+    ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
+        let owner = self
+            .kernel_binding
+            .read()
+            .kernel()
+            .existing_ipc()
+            .ok_or(NativeHostFileRefusal)?;
+        let resources = resources.snapshot().map_err(|_| NativeHostFileRefusal)?;
+        self.serve_native_host_file_with_authority(&owner, record, Some(resources.filesystem()))
+    }
+
     /// The transient filesystem authority of one path crossing, built from
     /// the caller's access context. Fresh credential and fs-context objects:
     /// they share nothing with any host task and drop with the call.
@@ -319,6 +336,15 @@ impl SyscallDispatcher {
         owner: &Arc<HostIpc>,
         record: &mut [u8],
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
+        self.serve_native_host_file_with_authority(owner, record, None)
+    }
+
+    fn serve_native_host_file_with_authority(
+        &self,
+        owner: &Arc<HostIpc>,
+        record: &mut [u8],
+        host_root: Option<&NativeFsAuthority>,
+    ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal)?;
         let header = view.header();
         let table = fd::TableId::from_raw(fd::RawTableId {
@@ -328,11 +354,17 @@ impl SyscallDispatcher {
         });
         let served = if header.op.resolves_path() {
             // Every path record leads with its caller's access context.
-            let (context, path) =
-                AccessContext::decode(view.input()).ok_or(NativeHostFileRefusal)?;
-            let authority = self
-                .native_access_authority(&context)
-                .ok_or(NativeHostFileRefusal)?;
+            let (authority, path) = if let Some(authority) = host_root {
+                (authority.clone(), view.input())
+            } else {
+                let (context, path) =
+                    AccessContext::decode(view.input()).ok_or(NativeHostFileRefusal)?;
+                (
+                    self.native_access_authority(&context)
+                        .ok_or(NativeHostFileRefusal)?,
+                    path,
+                )
+            };
             // Carrick's VFS names paths as UTF-8; any other byte string is
             // not served rather than altered.
             let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal)?;
@@ -1360,6 +1392,53 @@ mod tests {
                 "native openat fd {fd} is live above the vector's ceiling {}",
                 ceiling()
             );
+        }
+    }
+
+    #[test]
+    fn host_root_resources_open_and_reopen_only_in_the_ring_namespace() {
+        let lower = rootfs();
+        let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let fixture = fixture_with_owner(
+            SyscallDispatcher::with_rootfs(rootfs),
+            Some(lower),
+            |context| context.kernel().ipc().unwrap(),
+        );
+        let context = fixture.dispatcher.capture_one_task_context().unwrap();
+        let resources = super::super::resources::HostRootResources::capture(&context);
+        context.resources().fs_context().set_cwd("/usr/lib".into());
+        let [authority, index, generation] = fixture.table;
+        let table = fd::TableId::from_raw(fd::RawTableId {
+            authority,
+            index,
+            generation,
+        });
+        for _ in 0..3 {
+            let mut open = record(
+                fixture.table,
+                HostFileOp::Openat,
+                FDCWD,
+                [0; 4],
+                b"libc.so.6",
+                0,
+            );
+            fixture
+                .dispatcher
+                .serve_host_root_file(&resources, &mut open)
+                .unwrap();
+            let opened = host_file::reply(&open).unwrap().result;
+            assert_eq!(opened, 4);
+            assert!(
+                context
+                    .resources()
+                    .files()
+                    .slot(FileSlotNumber::for_open_fd(4).unwrap())
+                    .is_none()
+            );
+            let region = fixture.owner.region();
+            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let released = ring.close(table, fd::Fd(4)).unwrap().unwrap();
+            fixture.owner.release(released.backing).unwrap();
         }
     }
 
