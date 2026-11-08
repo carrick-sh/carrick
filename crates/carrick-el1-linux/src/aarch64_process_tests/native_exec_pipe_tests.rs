@@ -37,17 +37,28 @@ fn fork_exec_successor(futex: Option<u64>) {
     fork_exec_successor_with_futex(futex, u32::MAX as u64);
 }
 
+#[test]
+fn serial_host_native_fork_exec_child_timed_futex() {
+    fork_exec_probe(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+    );
+}
+
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
-    fork_exec_successor_with_metadata(futex, bitset, None);
+    fork_exec_probe(futex, bitset, false, None);
 }
 
 pub(super) fn metadata_successor(case: super::pipe_metadata_tests::Case) {
-    fork_exec_successor_with_metadata(None, u32::MAX as u64, Some(case));
+    fork_exec_probe(None, u32::MAX as u64, false, Some(case));
 }
 
-fn fork_exec_successor_with_metadata(
+fn fork_exec_probe(
     futex: Option<u64>,
     bitset: u64,
+    timed: bool,
     metadata: Option<super::pipe_metadata_tests::Case>,
 ) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -321,7 +332,7 @@ fn fork_exec_successor_with_metadata(
             &mut service,
             parent,
             child,
-            (operation, bitset),
+            (operation, bitset, timed),
         );
         registry.unregister_root_for_test(&runtime);
         return;
@@ -349,6 +360,7 @@ fn fork_exec_successor_with_metadata(
     let mut call_full = |nr, fd, address, count, extra| {
         let mut frame = carrick_el1_abi::TrapFrame {
             elr: 0x400004,
+            esr: 0x15 << 26,
             slot: u64::from(fixture.slot.raw()),
             ..Default::default()
         };
@@ -456,7 +468,8 @@ fn fork_exec_successor_with_metadata(
                 carrick_personality_linux::dispatch::CompletionRoute::Served
                     | carrick_personality_linux::dispatch::CompletionRoute::WithWork
             ),
-            "production native IPC dispatch: {route:?}, nr={nr}"
+            "production native dispatch: {route:?}, nr={nr}, result={}",
+            frame.x[0] as i64
         );
         frame.x[0]
     };
@@ -766,6 +779,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
             .unwrap();
         let mut frame = carrick_el1_abi::TrapFrame {
             elr: 0x400004,
+            esr: 0x15 << 26,
             slot: u64::from(fixture.slot.raw()),
             ..Default::default()
         };
@@ -1050,9 +1064,9 @@ fn child_futex<'a>(
     service: &mut Physical<'a, Aarch64ParkedContext>,
     parent: TaskKey,
     child: TaskKey,
-    futex: (u64, u64),
+    futex: (u64, u64, bool),
 ) {
-    let (operation, bitset) = futex;
+    let (operation, bitset, timed) = futex;
     let counters = &carrick_el1_abi::Counters::new();
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
     use carrick_guest_arch::{Access, GuestLen};
@@ -1067,8 +1081,8 @@ fn child_futex<'a>(
             self.reads.set(self.reads.get() + 1);
             self.available.get().then_some(0)
         }
-        fn read_u64(&self, _: &CurrentTask, _: u64) -> Option<u64> {
-            panic!("untimed wait")
+        fn read_u64(&self, _: &CurrentTask, address: u64) -> Option<u64> {
+            Some(if address == VA + 16 { 100 } else { 0 })
         }
     }
     assert!(
@@ -1139,6 +1153,8 @@ fn child_futex<'a>(
     frame.x[1] = operation;
     frame.x[5] = bitset;
     frame.x[2] = 1;
+    // A relative timeout must preserve its deadline across owner-copy suspension.
+    frame.x[3] = if timed { VA + 16 } else { 0 };
     let mut parked = binding.words;
     crate::sched::ThreadCpu::save(
         &mut cpu,
@@ -1389,21 +1405,50 @@ fn child_futex<'a>(
     }
     // A matching WAIT switches from the exec leader to its real clone birth.
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
-    frame.x[..6].copy_from_slice(&[VA, operation, 0, 0, 0, u64::from(u32::MAX)]);
-    use crate::sched::LinuxSchedEntry;
-    assert_eq!(
-        crate::sched::Sched {
-            handoff: None,
-            zone: fixture.zone,
-            slot: fixture.slot,
-            task: &fixture.task,
+    frame.x[..6].copy_from_slice(&[
+        VA,
+        operation,
+        0,
+        if timed { VA + 16 } else { 0 },
+        0,
+        u64::from(u32::MAX),
+    ]);
+    let mut entry = runtime
+        .enter_registered(
+            registry,
+            source,
+            &fixture.task,
+            binding.address,
+            &retained,
+            service,
+        )
+        .unwrap();
+    let route = crate::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
             cpu: &mut cpu,
             user: &word,
-            counters,
-        }
-        .serve_futex(&mut frame),
-        Some(crate::sched::Served::Returned { switched: true })
+        }),
+        None,
+        Some(&venue),
+        Some(&mut *entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
     );
+    assert!(matches!(
+        route,
+        CompletionRoute::Served | CompletionRoute::WithWork
+    ));
+    drop(entry);
     assert_eq!(
         word.reads.get(),
         3,
@@ -1463,5 +1508,48 @@ fn child_futex<'a>(
         u64::from(tid),
         "post-exec cloned thread reached its first syscall"
     );
+    drop(entry);
+    if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    frame.x[8] = crate::sched::SYS_FUTEX as u64;
+    frame.x[..6].copy_from_slice(&[VA, crate::sched::FUTEX_WAKE_PRIVATE, 1, 0, 0, 0]);
+    let mut entry = runtime
+        .enter_registered(
+            registry,
+            source,
+            &fixture.task,
+            worker.address,
+            &worker.words,
+            service,
+        )
+        .unwrap();
+    let route = crate::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &word,
+        }),
+        None,
+        Some(&venue),
+        Some(&mut *entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        CompletionRoute::Served | CompletionRoute::WithWork
+    ));
+    assert_eq!(frame.x[0], 1, "one enrolled waiter, exactly one wake");
+    assert_eq!(counters.forwarded[98].load(Ordering::Relaxed), 0);
     assert!(runtime.task_binding(parent).is_some());
 }
