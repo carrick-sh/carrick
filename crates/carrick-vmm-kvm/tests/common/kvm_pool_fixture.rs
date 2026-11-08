@@ -12,6 +12,9 @@ pub fn run_pool_fixture(
     run_pool_fixture_with(elf, max_exits, |_| {})
 }
 
+// This shared module is compiled as part of every KVM integration-test crate;
+// only cpl0_entry links the separate injection-enabled CPL0 test artifact.
+#[allow(dead_code)]
 pub fn run_instrumented_pool_fixture(
     elf: &[u8],
     max_exits: usize,
