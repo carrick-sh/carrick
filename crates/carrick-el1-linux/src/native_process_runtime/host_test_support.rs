@@ -2386,7 +2386,6 @@ fn park_anonymous_sibling(
         .record(sibling.record.id)
         .object_wait_census()
         .unwrap();
-    let operation = carrick_sched_core::object_wait::OperationToken::anonymous_edit(key).unwrap();
     assert_eq!(
         (
             census.queue,
@@ -2397,8 +2396,8 @@ fn park_anonymous_sibling(
         (
             key.index(),
             key.generation(),
-            operation.index(),
-            operation.generation(),
+            u64::from(key.index()),
+            key.generation(),
         )
     );
     assert!(matches!(
