@@ -114,6 +114,11 @@ pub enum HostFileCall {
         path: u64,
         mode: u64,
     },
+    Unlinkat {
+        dirfd: i32,
+        path: u64,
+        flags: u64,
+    },
     Faccessat {
         dirfd: i32,
         path: u64,
@@ -242,6 +247,11 @@ impl HostFileCall {
                 dirfd: fd,
                 path: args[1],
                 mode: args[2],
+            },
+            c if c == nr::UNLINKAT => Self::Unlinkat {
+                dirfd: fd,
+                path: args[1],
+                flags: args[2],
             },
             c if c == nr::FACCESSAT => Self::Faccessat {
                 dirfd: fd,
@@ -695,6 +705,23 @@ fn stage_call(
                 LINUX_AT_FDCWD,
                 0,
                 [mode, 0, 0, 0],
+                &path,
+                None,
+            )
+        }
+        HostFileCall::Unlinkat { dirfd, path, flags } => {
+            if flags & !carrick_syscall_abi::LINUX_AT_REMOVEDIR != 0 {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            let path = match staging.path_input(user, dirfd, path)? {
+                Ok(path) => path,
+                Err(stage) => return Some(stage),
+            };
+            staging.request(
+                HostFileOp::Unlinkat,
+                LINUX_AT_FDCWD,
+                flags as u32,
+                [0; 4],
                 &path,
                 None,
             )

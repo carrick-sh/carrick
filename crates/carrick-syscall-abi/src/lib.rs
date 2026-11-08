@@ -21,6 +21,8 @@ pub mod syscall_x86_64;
 
 /// Linux directory descriptor selecting the calling task's working directory.
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
+/// `unlinkat` removes a directory rather than a non-directory entry.
+pub const LINUX_AT_REMOVEDIR: u64 = 0x200;
 pub use capability::{
     CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, CAP_BLOCK_SUSPEND, CAP_BPF,
     CAP_CHECKPOINT_RESTORE, CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER,
