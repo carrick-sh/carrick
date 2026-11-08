@@ -42,6 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "carrick-x86-cpl0",
             "--bin",
             "carrick-x86-cpl0-fixture",
+            "--features",
+            "test-support",
             "--target",
             "x86_64-unknown-none",
             "--target-dir",

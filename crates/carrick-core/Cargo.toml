@@ -11,6 +11,8 @@ default = []
 host-test = ["carrick-sched-core/host-test"]
 # Substitutes loom words in this crate's unit-test target only, never the ABI.
 loom = []
+# One-shot fault injection used only by freestanding guest test images.
+test-support = ["carrick-sched-core/test-support"]
 
 [dependencies]
 bitflags.workspace = true
