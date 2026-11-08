@@ -171,12 +171,22 @@ impl OwnedCopyout<'_> {
         }
     }
 
-    /// Bytes already published, which is what a fault prefix reports. The
-    /// cursor counts units, and one `revents` unit is two bytes.
+    /// Bytes already published, which is what a fault prefix reports. A byte
+    /// run's cursor is already a byte count; a `revents` cursor counts
+    /// two-byte fields.
     fn committed_bytes(&self) -> usize {
         match self.shape {
             CopyoutShape::Bytes => self.offset,
             CopyoutShape::PollRevents => self.offset * 2,
+        }
+    }
+
+    /// Advance past the unit at the cursor. A byte run publishes `published`
+    /// bytes of its chunk; a `revents` field is one complete entry.
+    fn advance(&mut self, published: usize) {
+        match self.shape {
+            CopyoutShape::Bytes => self.offset += published,
+            CopyoutShape::PollRevents => self.offset += 1,
         }
     }
 
@@ -657,8 +667,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .ok_or(NativeProcessError::Fault)?;
             let count = unit.len();
             match self.copy_owner_frame(address, unit) {
-                // One unit per iteration, whether a byte or a `revents` field.
-                Ok(()) => output.offset += 1,
+                Ok(()) => output.advance(count),
                 Err(NativeProcessError::OwnerWait(wait)) => {
                     return self.begin_service_inner(
                         ServiceOperation::CarrierWork {

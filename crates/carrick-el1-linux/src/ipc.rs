@@ -5291,9 +5291,6 @@ mod tests {
         }
     }
 
-    /// x86 CPL0's native `poll`/`ppoll` reach the one shared poll body.
-    /// Production x86 has no ring descriptor table yet (#1040), so its sets
-    /// resolve through the delegated fd map: an absent descriptor is a
     /// The production AArch64 `TrapFrame` with the carrier readiness crossing
     /// the EL1 carrier installs: the frame records each query, runs the
     /// test's wait-time mutation while the caller is still blocked, and
@@ -5477,6 +5474,73 @@ mod tests {
         }
     }
 
+    /// The immediate / zero-timeout path publishes the same per-entry
+    /// `revents` field as the wait path, for both the aarch64 `TrapFrame` and
+    /// the x86 CPL0 crossing. A ready in-zone eventfd needs no host crossing,
+    /// so the publication comes from the frozen resolver array; the test
+    /// seeds the guest's own `fd`/`events` to values the frozen entry does not
+    /// hold and requires them to survive.
+    #[test]
+    fn immediate_poll_publishes_only_revents_for_both_isa_frames() {
+        let w = world();
+        let tables = delegated();
+        let a = w.table(w.a_tid);
+        let event = w.eventfd(a, 5, EventMode::Counter, BLOCK);
+        let venue = w.venue();
+        let zero = zero_timespec();
+        let seeded = [
+            PollFd {
+                fd: event,
+                events: LINUX_POLLIN,
+                revents: 0x7777,
+            },
+            PollFd {
+                fd: event,
+                events: LINUX_POLLIN | LINUX_POLLOUT,
+                revents: 0x7777,
+            },
+        ];
+        // A counter-mode eventfd with a nonzero count is readable and, with
+        // room in the counter, writable: each entry's frozen requested events.
+        let expected = [LINUX_POLLIN, LINUX_POLLIN | LINUX_POLLOUT];
+        for native in [false, true] {
+            let fds = GuestUserBuffer::from_values(&seeded);
+            let (route, queries) = if native {
+                let mut frame = X86PollFrame::new(
+                    carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw(),
+                    [fds.arg(), seeded.len() as u64, zero.arg(), 0, 0],
+                );
+                let route = dispatch_poll(&w, &mut frame, Some(&venue), &tables);
+                (route, frame.queries)
+            } else {
+                let mut frame =
+                    ArmPollFrame::new([fds.arg(), seeded.len() as u64, zero.arg(), 0, 0]);
+                let route = dispatch_poll(&w, &mut frame, Some(&venue), &tables);
+                (route, frame.queries)
+            };
+            assert_eq!(route, CompletionRoute::Served, "native={native}");
+            assert!(
+                queries.is_empty(),
+                "native={native}: an in-zone set never crosses"
+            );
+            let published = fds.values::<PollFd>();
+            for (index, (got, seeded)) in published.iter().zip(&seeded).enumerate() {
+                assert_eq!(got.fd, seeded.fd, "native={native} entry {index}: fd");
+                assert_eq!(
+                    got.events, seeded.events,
+                    "native={native} entry {index}: events"
+                );
+                assert_eq!(
+                    got.revents, expected[index],
+                    "native={native} entry {index}: revents"
+                );
+            }
+        }
+    }
+
+    /// x86 CPL0's native `poll`/`ppoll` reach the one shared poll body.
+    /// Production x86 has no ring descriptor table yet (#1040), so its sets
+    /// resolve through the delegated fd map: an absent descriptor is a
     /// ready POLLNVAL served in ring, host-bound entries and an empty set
     /// take the carrier readiness crossing with the caller's timeout, and
     /// the delegated cap stays 1024. With a ring table, the same frame is

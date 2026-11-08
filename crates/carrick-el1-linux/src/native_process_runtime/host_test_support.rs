@@ -4858,7 +4858,34 @@ fn retained_poll_output_owner_wait(
     });
     let address =
         pages.as_ref().map_or(0x10000, |pages| pages.arg()) + if constructor { 4092 } else { 0 };
-    let piece = if constructor { 4 } else { 4096 };
+    // A completed poll answer publishes one two-byte `revents` field per
+    // entry, at `offset_of!(LinuxPollFd, revents)`; every other shape is one
+    // contiguous byte run. `piece` is the first publication unit and
+    // `first_unit` its guest address.
+    let first_unit = if production_frame && !constructor {
+        address + core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64
+    } else {
+        address
+    };
+    let unit_stride = if production_frame && !constructor {
+        core::mem::size_of::<carrick_abi::LinuxPollFd>() as u64
+    } else {
+        4096
+    };
+    let piece = if constructor {
+        4
+    } else if production_frame {
+        2
+    } else {
+        4096
+    };
+    // The second publication unit is where the injected refusal lands: the
+    // next `revents` entry, or the byte after the first chunk.
+    let second_unit = if production_frame && !constructor {
+        first_unit + unit_stride
+    } else {
+        first_unit + piece
+    };
     let expected_result = if constructor {
         0
     } else if production_frame {
@@ -4942,7 +4969,7 @@ fn retained_poll_output_owner_wait(
     let observed =
         notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
-    let output_address = address;
+    let output_address = first_unit;
     service.on_copy_complete = Some(Box::new(move |address| {
         if address.raw() == output_address {
             access.raise(space.index());
@@ -4964,26 +4991,16 @@ fn retained_poll_output_owner_wait(
         )
     };
     service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
-    service.child_copy_error_at = Some(address + piece);
+    service.child_copy_error_at = Some(second_unit);
     let bytes: Vec<u8> = if constructor {
         [0i32, 1i32]
             .into_iter()
             .flat_map(i32::to_ne_bytes)
             .collect()
     } else if production_frame {
+        // One native-endian POLLNVAL `revents` field per entry.
         (0..1024)
-            .flat_map(|_| {
-                [
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    carrick_syscall_abi::LINUX_POLLNVAL as u8,
-                    0,
-                ]
-            })
+            .flat_map(|_| carrick_syscall_abi::LINUX_POLLNVAL.to_ne_bytes())
             .collect()
     } else {
         (0..8192).map(|n| (n % 251) as u8).collect()
@@ -5064,10 +5081,29 @@ fn retained_poll_output_owner_wait(
             assert!(entry.take_handoff_receipt().is_some());
         }
     }
-    assert_eq!(
-        take_output(&mut service),
-        [(UserVa::new(address), bytes[..piece as usize].to_vec())]
-    );
+    // A `revents` field is one publication unit, so the retained tail resumes
+    // as one two-byte write per remaining entry; a byte run resumes as its
+    // page-bounded chunk.
+    let units_from = |byte_offset: usize| -> Vec<(UserVa, Vec<u8>)> {
+        if production_frame && !constructor {
+            (byte_offset / 2..1024)
+                .map(|entry| {
+                    (
+                        UserVa::new(first_unit + unit_stride * entry as u64),
+                        bytes[entry * 2..entry * 2 + 2].to_vec(),
+                    )
+                })
+                .collect()
+        } else {
+            let address = first_unit + byte_offset as u64;
+            let count = (4096 - (address as usize & 4095)).min(bytes.len() - byte_offset);
+            std::vec![(
+                UserVa::new(address),
+                bytes[byte_offset..byte_offset + count].to_vec()
+            )]
+        }
+    };
+    assert_eq!(take_output(&mut service), units_from(0)[..1].to_vec());
     if let Some(table) = constructor_table.as_ref() {
         for fd in [0, 1] {
             assert_eq!(
@@ -5150,13 +5186,7 @@ fn retained_poll_output_owner_wait(
         assert!(
             matches!(resumed, NativeResume::Returned(result) if result.raw() == expected_result)
         );
-        assert_eq!(
-            take_output(&mut service),
-            [(
-                UserVa::new(address + piece),
-                bytes[piece as usize..].to_vec()
-            )]
-        );
+        assert_eq!(take_output(&mut service), units_from(piece as usize));
     }
     if let Some(table) = constructor_table.as_ref() {
         let region = constructor_owner.as_ref().unwrap().region();
