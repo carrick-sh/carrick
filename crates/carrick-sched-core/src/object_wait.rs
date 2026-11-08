@@ -20,12 +20,14 @@ pub use delegated::{
     DELEGATED_FILE_WAIT_QUEUES, DelegatedFileWaitIndex, DelegatedLockRelease, DelegatedReleaseVenue,
 };
 
-/// Admission capacity, independent of the number of execution slots. Queue
-/// storage is provisioned once with the zone; transfers allocate no entries.
-/// IPC retains its original queue domain. Carrier metadata uses the next
-/// queue; MM permits follow it; reservation-pool progress uses the first
-/// rounded spare. Further cause and delegated-file queues follow that range.
-pub const ADDRESS_SPACE_WAIT_BASE: usize = ZONE_RECORDS;
+/// Zone-wide IPC object ceiling, shared with the elastic object store.
+pub const IPC_OBJECT_CAPACITY: usize = 1 << 18;
+/// Two readiness lanes per admitted object, plus the reserved zero index.
+pub const IPC_WAIT_QUEUES: usize = 1 + 2 * IPC_OBJECT_CAPACITY;
+/// Queue storage is provisioned once with the zone; transfers allocate no
+/// entries. Metadata and MM queues follow all admitted IPC readiness lanes,
+/// independently of the number of parked thread records or execution slots.
+pub const ADDRESS_SPACE_WAIT_BASE: usize = IPC_WAIT_QUEUES;
 pub const ORIGINAL_OBJECT_WAIT_QUEUES: usize =
     (ADDRESS_SPACE_WAIT_BASE + 1 + spaces::ADDRESS_SPACES).div_ceil(64) * 64;
 const METADATA_WAIT_INDEX: usize = ADDRESS_SPACE_WAIT_BASE;
@@ -42,7 +44,7 @@ pub const OBJECT_WAIT_QUEUES: usize = MEMBER_RELEASE_WAIT_BASE + ZONE_RECORDS;
 const _: () = {
     assert!(IPC_OPERATION_SLOT_WAIT_INDEX < ORIGINAL_OBJECT_WAIT_QUEUES);
     let domains = [
-        (1, ZONE_RECORDS),
+        (1, IPC_WAIT_QUEUES),
         (METADATA_WAIT_INDEX, METADATA_WAIT_INDEX + 1),
         (ADDRESS_SPACE_WAIT_BASE + 1, RESERVATION_POOL_WAIT_INDEX),
         (RESERVATION_POOL_WAIT_INDEX, RESERVATION_POOL_WAIT_INDEX + 1),
@@ -3053,7 +3055,7 @@ mod host_tests {
                 - core::mem::offset_of!(ZoneTables, object_admission_handbacks),
             16 * OBJECT_WAIT_QUEUES
         );
-        assert_eq!(16 * OBJECT_WAIT_QUEUES, 166_912 + 32 * ZONE_RECORDS);
+        assert_eq!(ADDRESS_SPACE_WAIT_BASE, 1 + 2 * IPC_OBJECT_CAPACITY);
         assert_eq!(DELEGATED_FILE_WAIT_QUEUES.div_ceil(64), 2);
     }
 

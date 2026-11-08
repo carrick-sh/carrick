@@ -486,6 +486,12 @@ fn el1_ipc_stale_object_generations_are_rejected() {
     let (_, new) = fx.eventfd(t, 5, EventMode::Counter);
     assert_eq!(new.index(), old.index(), "the record is reused");
     assert_ne!(new.generation(), old.generation());
+    for lane in [pipe::WaitFor::Readable, pipe::WaitFor::Writable] {
+        let old_key = object_wait_key(old, lane).unwrap();
+        let new_key = object_wait_key(new, lane).unwrap();
+        assert_eq!(old_key.index(), new_key.index());
+        assert!(new_key.generation() > old_key.generation());
+    }
     assert_eq!(fx.region.lock(old, &Spin).err(), Some(IpcError::Stale));
     assert_eq!(fx.region.observe(old), Err(IpcError::Stale));
     assert_eq!(
@@ -1109,6 +1115,30 @@ fn el1_ipc_wait_census_names_each_waiter_object_and_its_readiness() {
     write_ipc_wait_census(&zone, fx.region, &mut busy).unwrap();
     assert!(busy.contains("state=<locked>"), "{busy}");
     drop(held);
+}
+
+#[test]
+fn ipc_wait_keys_end_before_the_metadata_queue_domain() {
+    let last = IpcObjectHandle::from_raw(RawIpcObject {
+        index: IPC_MAX_OBJECTS as u32 - 1,
+        generation: 7,
+    });
+    let readable = object_wait_key(last, pipe::WaitFor::Readable).unwrap();
+    let writable = object_wait_key(last, pipe::WaitFor::Writable).unwrap();
+    assert_eq!(readable.index(), 2 * IPC_MAX_OBJECTS as u32 - 1);
+    assert_eq!(writable.index(), 2 * IPC_MAX_OBJECTS as u32);
+    assert_eq!(readable.generation(), 8);
+    assert_eq!(writable.generation(), 8);
+    let metadata = carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(1).unwrap();
+    assert_eq!(crate::METADATA_WAIT_QUEUE_INDEX, metadata.index());
+    assert_eq!(writable.index() + 1, metadata.index());
+
+    let outside = IpcObjectHandle::from_raw(RawIpcObject {
+        index: last.index() + 1,
+        generation: 7,
+    });
+    assert!(object_wait_key(outside, pipe::WaitFor::Readable).is_none());
+    assert!(object_wait_key(outside, pipe::WaitFor::Writable).is_none());
 }
 
 /// The object and description stores are elastic: a region starts with one
