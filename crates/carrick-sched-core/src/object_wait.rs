@@ -3210,6 +3210,67 @@ mod host_tests {
     }
 
     #[test]
+    fn cancellation_preserves_operation_token_domains() {
+        use spaces::notification::SpaceWaitCause;
+        // Each case goes through the production host cancellation entry.
+        // Include the boundaries and every reserved queue producer.
+        let mut cases = std::vec![
+            ("metadata", ObjectWaitKey::metadata_request(17).unwrap(),
+                OperationToken::metadata_request(17).unwrap(), false),
+        ];
+        for cause in SpaceWaitCause::ALL {
+            let key = ObjectWaitKey::address_space_cause(0, 17, cause).unwrap();
+            cases.push(("prepared", key, OperationToken::prepared_edit(key).unwrap(), false));
+            cases.push(("space", key,
+                OperationToken::new(key.index() as u64, 17).unwrap(),
+                cause != SpaceWaitCause::Metadata));
+        }
+        for index in [
+            1, ADDRESS_SPACE_WAIT_BASE, RESERVATION_POOL_WAIT_INDEX,
+            IPC_OPERATION_SLOT_WAIT_INDEX, ORIGINAL_OBJECT_WAIT_QUEUES - 1,
+            DELEGATED_FILE_WAIT_BASE, NATIVE_SERVICE_WAIT_BASE,
+            MEMBER_RELEASE_WAIT_BASE, OBJECT_WAIT_QUEUES,
+        ] {
+            // Adapter token values must not acquire anonymous retirement just
+            // because their numeric index lies above the MM queues.
+            let key = ObjectWaitKey::metadata_request(17).unwrap();
+            cases.push(("other", key, OperationToken::new(index as u64, 17).unwrap(), false));
+        }
+        for (kind, key, operation, anonymous) in cases {
+            let zone = fixture(false);
+            zone.bind_object_wait(key, &SpinForever).unwrap();
+            let id = allocate(&zone, 1);
+            let reference = zone.record_ref(id);
+            let identity = operation.identity();
+            let guard = zone.object_wait(key, &SpinForever).unwrap();
+            guard.park(guard.snapshot(), id, operation).unwrap();
+            drop(guard);
+            assert_eq!(
+                zone.claim_for_host(reference, None, Handback::Cancelled, &SpinForever),
+                if anonymous { HostClaim::Stale } else { HostClaim::Claimed },
+                "{kind}: {identity:?}"
+            );
+            if anonymous {
+                assert!(zone.live(reference).is_none());
+                assert!(!zone.record(id).has_object_operation());
+            } else {
+                assert!(zone.live(reference).is_some());
+                // Cancellation leaves non-anonymous receipts in host custody.
+                let retained = unsafe { zone.record(id).take_object_operation() }.unwrap();
+                assert_eq!(retained.identity(), identity, "{kind}");
+            }
+            assert_eq!(zone.record(id).object.queue.load(Ordering::Acquire), 0);
+        }
+        let zone = fixture(false);
+        let id = allocate(&zone, 1);
+        assert_eq!(
+            zone.claim_for_host(zone.record_ref(id), None, Handback::Cancelled, &SpinForever),
+            HostClaim::AlreadyHost
+        );
+        assert!(!zone.record(id).has_object_operation());
+    }
+
+    #[test]
     fn metadata_wait_cancellation_unlinks_its_reserved_queue() {
         let zone = fixture(false);
         let key = ObjectWaitKey::metadata_request(1).unwrap();
