@@ -994,10 +994,12 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         address: UserVa,
     ) -> Result<bool, NativeProcessError> {
         // The neutral MM owner authenticates the mapping; ISA code supplies
-        // only its portal and current worker, as for every other MM service.
+        // only its portal, the authenticated MM handle and current worker, as
+        // for every other MM service.
+        let handle = self.service_mm_handle(mm)?;
         carrick_el1_linux::native_process_runtime::private_anonymous_futex_mapping(
             &portal()?,
-            mm.mm,
+            handle,
             self.worker(),
             address,
         )

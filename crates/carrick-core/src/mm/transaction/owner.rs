@@ -465,7 +465,12 @@ impl<
                 EditAdmissionRefusal::Stale => MmError::Stale,
             })
     }
-    pub(crate) fn root_for(
+    /// Acquire the root of an already authenticated MM handle, observing its
+    /// `Reservations` source before the lock probe. A held root returns
+    /// [`MmError::Wait`] carrying that exact observation, so the caller enrols
+    /// on the holder's release instead of checkpoint-retrying a bare `Busy`.
+    /// The observation is `None` only for a source-free model fixture.
+    pub fn root_for(
         &self,
         handle: El1MmHandle,
         slot: u32,
