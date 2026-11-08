@@ -38,6 +38,7 @@ vm_free = [
   "carrick-sched-core::object_wait::host_tests::native_epoll_departure_timeout_drains_enrollment_and_retains_operation",
   "carrick-runtime::deadline_driver::tests::driver_delivers_native_park_with_no_slots_and_joins_before_zone_drop",
   "carrick-runtime::deadline_driver::tests::shutdown_joins_an_admitted_callback_before_releasing_target",
+  "carrick-runtime::deadline_driver::tests::worker_failure_is_reported_by_carrier_shutdown",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_timed_futex",
   "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::native_futex_mapping_deadline_starts_at_first_attempt_aarch64",
   "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::native_futex_mapping_deadline_starts_at_first_attempt_x86",

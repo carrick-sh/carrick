@@ -4,7 +4,7 @@ Status: implemented in PR #1894; VM-free and build evidence is recorded on
 that draft PR. Signed acceptance, smoke and the Go workload remain director
 work. This note describes the owner and its runtime serving obligation.
 
-## Confirmed ownership gap
+## Original ownership gap
 
 `carrick-kernel/src/el1_zone.rs::hand_back_foreign_timer` calls
 `ZoneTables::take_foreign_timer` before requesting `Handback::Control`.
@@ -93,8 +93,9 @@ Do not create a thread or host readiness pipe per guest park.
   share `hand_back_foreign_timer`; neither backend chooses semantic ownership.
 
 The index lock must never be held across wait-queue acquisition, driver sleep,
-executor admission or notification callbacks. Expiry authenticates its snapshot
-under the original wait queue before committing. Transfer and cancellation
+executor admission or notification callbacks. Expiry authenticates the exact
+incarnation/sequence at the Parked CAS, then cleans up under the original queue
+while retaining its exclusive transfer. Transfer and cancellation
 must share a linearization point so neither can remove a replacement lease.
 This ABI/layout and cross-crate lock protocol needs independent review before
 claiming an integrated implementation is safe.
@@ -105,8 +106,10 @@ Keep the existing production fork/exec/clone timeout witnesses and add their
 wake variants. Both retain two live threads; the sibling executes gettid before
 carrier exit/reset. Require original-deadline expiry, no early expiry, one
 resolution, zero timer nodes, native result -110 or 0, and a later timeout that
-cannot replace a wake winner. The added wake witnesses are red until the owner
-exists; their later assertions are not yet execution evidence.
+cannot replace a wake winner. All four fail at native custody on the original
+implementation and reach those final assertions with this owner. The fixture
+settles gettid's completed boundary before rebinding the sibling, matching
+carrier return-work settlement rather than skipping pending work.
 
 Add deterministic neutral schedules for Busy then release/success, simultaneous
 wake/transfer/expiry, cancellation with record reuse, every slot departing,
@@ -140,7 +143,10 @@ Arc owns the carrier mappings. Startup failure drops and joins the driver guard;
 retains only inactive notification state, never the mapping target.
 
 The HVF binding samples host monotonic ticks, the same epoch and timebase as
-its guest CNTVCT, and converts through the host TickScale. No nanosecond
+its guest CNTVCT, and validates a nonzero host TickScale before starting the
+worker. A missing scale refuses carrier startup through RuntimeError; a failed
+worker join also returns through that existing error owner, without new abort
+sites. Residual conversions round upwards to avoid a zero-duration poll. No nanosecond
 interpretation is applied to a guest TSC. The shared driver accepts a target
 which supplies its calibrated remaining time and exact expiry; KVM/CPL0 can
 use that same neutral owner without copying a syscall state machine. The
@@ -171,7 +177,7 @@ crossings too.
 Condvar worker here is reusable by its clock service, while its sleep owner,
 wire protocol and clock subscriptions are not imported. Its current synthetic
 address/native_service wake channel is not used for futex timeout completion.
-When integrating the two PRs, adapt its timer hub to this shared driver and
-reconcile the ABI hash and overlapping zone code; do not retain two workers
+When integrating the two PRs, add a runtime target adapter over its kernel clock service (no kernel to
+runtime dependency), adapt its timer hub to this shared driver, and reconcile the ABI hash and overlapping zone code; do not retain two workers
 for the same carrier deadline heap. This PR makes no native nanosleep success
 claim.
