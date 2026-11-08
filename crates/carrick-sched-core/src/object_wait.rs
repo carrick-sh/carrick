@@ -84,6 +84,8 @@ pub const OBJECT_WAIT_PROTOCOL: u64 = 17;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
+        PREPARED_EDIT_OPERATION_TAG,
+        ANONYMOUS_EDIT_OPERATION_TAG,
         OBJECT_EXPIRED as u64,
         OBJECT_HOST_CONTINUATION as u64,
         OWNER_CONTINUATION as u64,
@@ -370,6 +372,46 @@ pub struct OperationToken {
 }
 
 const PREPARED_EDIT_OPERATION_TAG: u64 = 1 << 63;
+const ANONYMOUS_EDIT_OPERATION_TAG: u64 = 1 << 62;
+const EDIT_OPERATION_TAGS: u64 = PREPARED_EDIT_OPERATION_TAG | ANONYMOUS_EDIT_OPERATION_TAG;
+
+/// The operation authority, independent of the queue it currently waits on.
+/// Replay tokens own no adapter pin, even after their queue is unlinked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationKind {
+    Adapter,
+    Metadata,
+    PreparedEdit,
+    AnonymousEdit,
+}
+
+impl OperationKind {
+    pub const fn replays_syscall(self) -> bool {
+        matches!(
+            self,
+            Self::Metadata | Self::PreparedEdit | Self::AnonymousEdit
+        )
+    }
+}
+
+const fn operation_kind(index: u64) -> OperationKind {
+    if index == u64::MAX {
+        OperationKind::Metadata
+    } else if index & PREPARED_EDIT_OPERATION_TAG != 0 {
+        OperationKind::PreparedEdit
+    } else if index & ANONYMOUS_EDIT_OPERATION_TAG != 0 {
+        OperationKind::AnonymousEdit
+    } else {
+        OperationKind::Adapter
+    }
+}
+
+const fn anonymous_edit_key(index: u32) -> bool {
+    let index = index as usize;
+    (index > ADDRESS_SPACE_WAIT_BASE && index < RESERVATION_POOL_WAIT_INDEX)
+        || (index >= ORIGINAL_OBJECT_WAIT_QUEUES
+            && index < cause_queue_index(0, spaces::notification::SpaceWaitCause::Metadata))
+}
 
 /// Authentication of an operation held by a scheduler record; not ownership.
 #[derive(
@@ -393,15 +435,32 @@ impl OperationToken {
     }
 
     pub const fn new(index: u64, generation: u64) -> Option<Self> {
-        if index == 0
-            || index == u64::MAX
-            || index & PREPARED_EDIT_OPERATION_TAG != 0
-            || generation == 0
-        {
+        if index == 0 || index == u64::MAX || index & EDIT_OPERATION_TAGS != 0 || generation == 0 {
             None
         } else {
             Some(Self { index, generation })
         }
+    }
+
+    pub const fn kind(&self) -> OperationKind {
+        operation_kind(self.index)
+    }
+
+    /// An anonymous syscall replay on one of the five published MM causes.
+    pub const fn anonymous_edit(key: ObjectWaitKey) -> Option<Self> {
+        if !anonymous_edit_key(key.index) || key.generation == 0 {
+            return None;
+        }
+        Some(Self {
+            index: ANONYMOUS_EDIT_OPERATION_TAG | key.index as u64,
+            generation: key.generation,
+        })
+    }
+
+    pub const fn is_anonymous_edit_for(&self, key: ObjectWaitKey) -> bool {
+        matches!(self.kind(), OperationKind::AnonymousEdit)
+            && self.index & !EDIT_OPERATION_TAGS == key.index as u64
+            && self.generation == key.generation
     }
 
     /// A prepared portal edit replay, distinct from anonymous waits that
@@ -423,8 +482,14 @@ impl OperationToken {
             && self.generation == key.generation
     }
 
-    const fn stored_prepared_edit(index: u64, generation: u64) -> Option<Self> {
-        if index & !PREPARED_EDIT_OPERATION_TAG == 0 || generation == 0 {
+    const fn stored_edit(index: u64, generation: u64) -> Option<Self> {
+        let key = index & !EDIT_OPERATION_TAGS;
+        if key == 0
+            || key > u32::MAX as u64
+            || generation == 0
+            || index & EDIT_OPERATION_TAGS == EDIT_OPERATION_TAGS
+            || (index & ANONYMOUS_EDIT_OPERATION_TAG != 0 && !anonymous_edit_key(key as u32))
+        {
             None
         } else {
             Some(Self { index, generation })
@@ -1672,15 +1737,7 @@ pub struct ObjectWaitCensus {
 
 impl ObjectWaitCensus {
     pub(crate) const fn has_anonymous_edit_operation(&self) -> bool {
-        // Only the five causes accepted by coordinate_anonymous_edit_wait
-        // issue replay tokens. Metadata, spare queues, services and tagged
-        // prepared edits retain their own host cancellation custody.
-        let primary = self.operation > ADDRESS_SPACE_WAIT_BASE as u64
-            && self.operation < RESERVATION_POOL_WAIT_INDEX as u64;
-        let extra = self.operation >= ORIGINAL_OBJECT_WAIT_QUEUES as u64
-            && self.operation
-                < cause_queue_index(0, spaces::notification::SpaceWaitCause::Metadata) as u64;
-        (primary || extra)
+        matches!(operation_kind(self.operation), OperationKind::AnonymousEdit)
             && self.operation_generation != 0
             && self.operation_generation == self.generation
     }
@@ -1688,7 +1745,8 @@ impl ObjectWaitCensus {
     /// Whether this census names an anonymous reservation edit on its exact
     /// address-space notification incarnation.
     pub const fn is_anonymous_edit(&self) -> bool {
-        self.operation == self.queue as u64 && self.has_anonymous_edit_operation()
+        (self.operation & !EDIT_OPERATION_TAGS) == self.queue as u64
+            && self.has_anonymous_edit_operation()
     }
 }
 
@@ -1773,8 +1831,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     /// with an external endpoint pin. Metadata and anonymous-edit replay
     /// tokens are scheduler-owned and have no adapter arena entry.
     pub fn has_adapter_operation(&self) -> bool {
-        let operation = self.object.operation.load(Ordering::Acquire);
-        !matches!(operation, 0 | u64::MAX) && operation & PREPARED_EDIT_OPERATION_TAG == 0
+        matches!(self.object_operation_kind(), Some(OperationKind::Adapter))
+    }
+
+    pub fn object_operation_kind(&self) -> Option<OperationKind> {
+        let index = self.object.operation.load(Ordering::Acquire);
+        if index == 0 {
+            None
+        } else {
+            Some(operation_kind(index))
+        }
     }
 
     /// Whether this record's last object park ended at its deadline rather
@@ -1883,8 +1949,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         let generation = self.object.operation_generation.load(Ordering::Relaxed);
         if index == u64::MAX {
             OperationToken::metadata_request(generation)
-        } else if index & PREPARED_EDIT_OPERATION_TAG != 0 {
-            OperationToken::stored_prepared_edit(index, generation)
+        } else if index & EDIT_OPERATION_TAGS != 0 {
+            OperationToken::stored_edit(index, generation)
         } else {
             OperationToken::new(index, generation)
         }
@@ -3217,6 +3283,48 @@ mod host_tests {
     }
 
     #[test]
+    fn anonymous_cancel_after_wake_has_no_ipc_handback() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::address_space(0, 17).unwrap();
+        zone.bind_object_wait(key, &SpinForever).unwrap();
+        let record = allocate(&zone, 101);
+        let reference = zone.record_ref(record);
+        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        queue
+            .park(
+                queue.snapshot(),
+                record,
+                OperationToken::anonymous_edit(key).unwrap(),
+            )
+            .unwrap();
+        queue
+            .notify_object(SLOT, &mut WakeEffects::default())
+            .unwrap();
+        drop(queue);
+        // Cancellation loses the park race: the operation is already unlinked
+        // and executing, so its current slot owns terminal settlement.
+        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(
+            zone.claim_for_host(reference, None, Handback::Cancelled, &SpinForever),
+            HostClaim::El1Held { slot: SLOT }
+        );
+        assert_eq!(
+            zone.release_current(SLOT, record, &SpinForever),
+            CurrentRelease::Requeued
+        );
+        let mut handed = Vec::new();
+        assert_eq!(
+            zone.take_host_wanted(SLOT, &mut |r| handed.push(r)),
+            0,
+            "an anonymous replay has no IPC authority on the host"
+        );
+        assert!(handed.is_empty());
+        assert_eq!(zone.sweep_cancelled(SLOT), 1);
+        assert!(zone.live(reference).is_none());
+        assert!(!zone.record(record).has_object_operation());
+    }
+
+    #[test]
     fn cancellation_preserves_operation_token_domains() {
         use spaces::notification::SpaceWaitCause;
         // Each case goes through the production host cancellation entry.
@@ -3238,13 +3346,19 @@ mod host_tests {
             cases.push((
                 "space",
                 key,
-                OperationToken::new(key.index() as u64, 17).unwrap(),
+                if cause == SpaceWaitCause::Metadata {
+                    OperationToken::new(key.index() as u64, 17).unwrap()
+                } else {
+                    OperationToken::anonymous_edit(key).unwrap()
+                },
                 cause != SpaceWaitCause::Metadata,
             ));
         }
         for index in [
             1,
             ADDRESS_SPACE_WAIT_BASE,
+            ADDRESS_SPACE_WAIT_BASE + 1,
+            ORIGINAL_OBJECT_WAIT_QUEUES,
             RESERVATION_POOL_WAIT_INDEX,
             IPC_OPERATION_SLOT_WAIT_INDEX,
             ORIGINAL_OBJECT_WAIT_QUEUES - 1,

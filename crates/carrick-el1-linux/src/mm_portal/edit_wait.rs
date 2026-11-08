@@ -46,7 +46,9 @@ pub fn complete_anonymous_edit_replay(
     };
     let anonymous = SpaceWaitCause::ALL.into_iter().any(|cause| {
         let key = notifications.key(cause);
-        census.operation == key.index() as u64 && census.operation_generation == key.generation()
+        carrick_sched_core::object_wait::OperationToken::anonymous_edit(key).is_some_and(|token| {
+            token.index() == census.operation && token.generation() == census.operation_generation
+        })
     });
     if !anonymous {
         return Ok(false);
