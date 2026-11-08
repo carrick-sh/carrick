@@ -687,6 +687,7 @@ surfaces = [
   { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.el1.open-lifetime" },
   { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.fork.filetable" },
   { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.mm.private-file-fixed-replacement" },
+  { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-kernel/src/kernel/objects/ipc.rs", contract = "kernel.el1.fd-single-owner" },
   { path = "crates/carrick-kernel/src/kernel/objects/ipc.rs", contract = "kernel.el1.ipc-fd-authority" },
   { path = "crates/carrick-kernel/src/kernel/objects/signal.rs", contract = "kernel.memory.owner-wait" },
