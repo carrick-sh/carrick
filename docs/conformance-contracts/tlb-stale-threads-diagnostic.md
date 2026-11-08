@@ -141,6 +141,13 @@ properly verified bundle cannot legitimately hide an older tlb.rs under the
 current source identity. This audit is not a verification of either Mac's
 actual installed bundle or mounted bytes.
 
+The worker also called the production `fixtures::source_hashes` against this
+checkout and required entries for main.rs, tlb.rs, the fixture lockfile and
+builder; all four were present. `fixtures identity` passed over 683 sources
+with no compiler-input manifest after preparing the locked caches and removing
+the worker's ambient Cargo job/wrapper overrides. This proves the inventory
+coverage, not the identity of either Mac's actual installed executable.
+
 The loader's `common::repo_root` is compiled from CARGO_MANIFEST_DIR. A copied
 or mis-reused test artifact could therefore load a different checkout's ELF
 than the runner verified. No such mismatch is proven here. The new lazy
@@ -150,7 +157,9 @@ It is emitted before guest execution and does not add guest output/syscalls.
 Compare its ELF hash to the el1-sched destination's row in the verified
 `target/fixtures/installed.json` manifest on each host; also retain the
 `fixture_validation` row from the signed runner. Absent probes remain missing
-evidence. Enabling this record adds one fixture-sized hash before execution.
+evidence. The trace consumer fails at END when no fixture-load record fired;
+older binaries without the provider cannot qualify this provenance capture.
+Enabling this record adds one fixture-sized hash before execution.
 
 The two tests do not install a fixed SchedulingPolicy: the default count comes
 from `host_facts::logical_cpu_count`, clamped to MAX_GUEST_CPUS. On macOS that

@@ -7290,12 +7290,8 @@ mod real {
 
     /// Construct fixture provenance only for an attached consumer.
     #[inline(never)]
-    pub fn embed_fixture_loaded_with(make_args: impl FnOnce() -> (String, String, u64, u32)) {
-        let mut storage = None;
-        carrick_usdt::embed__fixture__loaded!(|| {
-            let args = storage.get_or_insert_with(make_args);
-            (args.0.as_str(), args.1.as_str(), args.2, args.3)
-        });
+    pub fn embed_fixture_loaded(make_args: impl FnOnce() -> (String, String, u64, u32)) {
+        carrick_usdt::embed__fixture__loaded!(|| make_args());
     }
 
     #[inline(never)]
@@ -9849,7 +9845,7 @@ mod stub {
     stub!(el1_grant_refusal(row: u32, a: u64, b: u64, c: u64, d: u64));
     stub!(el1_native_diagnostic(cpu: u32, mm: u64, root: u64, reason: &str));
     #[inline(always)]
-    pub fn embed_fixture_loaded_with(_make_args: impl FnOnce() -> (String, String, u64, u32)) {}
+    pub fn embed_fixture_loaded(_make_args: impl FnOnce() -> (String, String, u64, u32)) {}
     stub!(el1_native_fork_stock_refusal(reason: &str, requested: &str, cached: &str, requested_context: &str, cached_context: &str));
     stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
 

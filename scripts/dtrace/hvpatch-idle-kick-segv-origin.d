@@ -78,7 +78,7 @@
 #pragma D option quiet
 #pragma D option strsize=512
 
-dtrace:::BEGIN { kick4 = 0; cancel0 = 0; faults = 0; sig11 = 0; secs = 0; last = 0; }
+dtrace:::BEGIN { kick4 = 0; cancel0 = 0; faults = 0; sig11 = 0; secs = 0; last = 0; fixtures = 0; diagnostics = 0; }
 
 tick-5s
 /last != 0 && timestamp - last > 60000000000/
@@ -209,12 +209,15 @@ carrick*:::el1-grant-refusal
 
 /* Fixture-load provider added for #1857; live qualification remains owed.
  * A loaded record is a positive control, not proof that later fault probes fire.
+ * END refuses an absent fixture record; older binaries without this provider
+ * cannot supply this capture's provenance.
  * Hashing costs one fixture-sized SHA-256 pass only with this probe enabled.
  */
 carrick*:::embed-fixture-loaded
 /strstr(execname, "el1_sched") != NULL/
 {
     last = timestamp;
+    fixtures++;
     printf("FIXTURE|ns=%d|host_pid=%d|path=%s|sha256=%s|bytes=%d|guest_cpus=%d\n",
         timestamp, pid, copyinstr(arg0), copyinstr(arg1), arg2, arg3);
 }
@@ -223,6 +226,7 @@ carrick*:::el1-native-diagnostic
 /strstr(execname, "el1_sched") != NULL/
 {
 	last = timestamp;
+	diagnostics++;
 	printf("DIAGNOSTIC|ns=%d|cpu=%u|mm=0x%x|root=0x%x|detail=%s\n",
 	    timestamp, (uint32_t)arg0, arg1, arg2, copyinstr(arg3));
 }
@@ -245,6 +249,10 @@ carrick*:::el1-task-record-stale
 dtrace:::END
 {
 	printa("NFAULTCOUNT|phase=%d|count=%@d\n", @nfault);
-	printf("CENSUS|kick4=%d|cancel_el0=%d|faults=%d|sig11=%d\n",
-	    kick4, cancel0, faults, sig11);
+	printf("CENSUS|kick4=%d|cancel_el0=%d|faults=%d|sig11=%d|fixtures=%d|diagnostics=%d\n",
+	    kick4, cancel0, faults, sig11, fixtures, diagnostics);
+    if (fixtures == 0) {
+        printf("ERROR|embed-fixture-loaded did not fire; fixture identity is unqualified\n");
+        exit(1);
+    }
 }
