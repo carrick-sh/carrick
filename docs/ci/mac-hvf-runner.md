@@ -457,3 +457,16 @@ Remove these entries once `main`'s baseline receipt rolls past the rename;
 delete the file when no entries remain. Empty declaration files fail the gate.
 Selector changes take effect when they reach trusted event.before.
 Comparison changes take effect when that commit supplies the chosen receipt.
+
+## Disk admission and build leases (#1693)
+
+Disk admission now takes exclusive host custody before measuring free space.
+Shared builds drain before the floor is checked; a shortage on the admitted
+host still fails with free GiB and floor GiB. The HVF checkout bootstrap and
+PR bootstrap use the installed `/usr/local/bin/carrick-xtask` supervisor;
+install it before enabling this workflow on a gate host. The HVF checkout
+xtask lives in `target/lease-tools` so the debug-tree prune cannot remove it.
+
+See [build admission and remaining direct-script limits](../host-lease-containment-follow-up.md#disk-admission-and-build-leases-1693)
+for the lock order, standalone build admission, and the direct signed-script
+bootstrap gap still requiring closure before cloudmac returns to the pool.

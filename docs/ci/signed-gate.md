@@ -233,3 +233,16 @@ prevent publication; inspect the Actions conclusion and dispatch again.
 The first live signed run is the director's macOS validation. Linux tests
 cover the receipt and Actions control logic; they cannot validate HVF,
 codesigning, local fixture provisioning or runner registration.
+
+## Disk admission and build leases (#1693)
+
+Disk admission now takes exclusive host custody before measuring free space.
+Shared builds drain before the floor is checked; a shortage on the admitted
+host still fails with free GiB and floor GiB. The HVF checkout bootstrap and
+PR bootstrap use the installed `/usr/local/bin/carrick-xtask` supervisor;
+install it before enabling this workflow on a gate host. The HVF checkout
+xtask lives in `target/lease-tools` so the debug-tree prune cannot remove it.
+
+See [build admission and remaining direct-script limits](../host-lease-containment-follow-up.md#disk-admission-and-build-leases-1693)
+for the lock order, standalone build admission, and the direct signed-script
+bootstrap gap still requiring closure before cloudmac returns to the pool.

@@ -24,6 +24,8 @@ pub enum Commands {
     Board(crate::board::Args),
     /// Start or attach to the job-local compiler cache under its socket lock.
     CompilerCacheStart,
+    /// Check free space only after exclusive host admission.
+    CheckDisk(crate::host_lease::DiskArgs),
     #[command(about = "Acquire and renew CAS leases over refs/claims/*")]
     Claims(crate::claims::ClaimsArgs),
     /// Repeat a signed test and capture the first selected failure (macOS).
@@ -426,6 +428,7 @@ where
             Commands::StressCapture(_) if cfg!(target_os = "macos") => {
                 Some((crate::host_lease::HostLeaseMode::Carrick, true))
             }
+            Commands::CheckDisk(_) => Some((crate::host_lease::HostLeaseMode::Gate, false)),
             Commands::Accept(args) => crate::accept::validate_request_for_host(
                 args,
                 std::env::consts::OS,
@@ -482,6 +485,10 @@ where
         Commands::StressCapture(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::stress_capture::run(&root, args)?;
+            Ok(())
+        }
+        Commands::CheckDisk(args) => {
+            crate::host_lease::check_disk(&cli.root.unwrap_or_else(|| PathBuf::from(".")), args)?;
             Ok(())
         }
         Commands::LintSource => run_lint_source(cli.root, writer),
