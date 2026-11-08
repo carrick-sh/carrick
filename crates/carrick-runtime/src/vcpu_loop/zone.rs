@@ -1317,10 +1317,12 @@ where
         let rec = zone.live(record).ok_or_else(|| {
             RuntimeError::Configuration(format!("EL1 zone resume: record {record:?} is gone"))
         })?;
-        if rec.has_object_operation() {
-            // An IPC operation parked with this thread: the thread is at its
-            // SVC with the original registers; the operation (not a wake
-            // value) decides the result.
+        if let Some(authority) = rec.operation_authority() {
+            // The thread is at its SVC with the original registers and the
+            // retained operation, not a wake value, decides the result. Which
+            // authority owns that token decides what the host may do with it.
+            let adapter =
+                authority == carrick_sched_core::object_wait::OperationAuthority::AdapterIpc;
             let handback = rec.handback();
             // SAFETY: the host owns this handed-back record, all of its
             // registrations are unlinked, and this executor loaded its exact
@@ -1328,12 +1330,13 @@ where
             let taken = unsafe { rec.take_object_operation() };
             zone.free_record(record.id);
             self.state.service_kernel_context = Some(context.retain_exact());
-            if taken
-                .as_ref()
-                .is_some_and(|token| token.metadata_generation().is_some())
-            {
-                // Metadata readiness resumes the saved control SVC with every
-                // original register intact. A wake is not its return value.
+            if !adapter {
+                // A scheduler-owned replay receipt (metadata request, anonymous
+                // edit, prepared edit) names no adapter pin, so the host can
+                // neither complete it nor answer it. It resumes the saved
+                // control SVC with every original register intact; a wake is
+                // not its return value, and its own producer re-probes the
+                // predicate the park was enrolled for.
                 let pc = engine.current_pc()?;
                 if let Some(outcome) = service_signals_threaded(
                     &self.kernel,
