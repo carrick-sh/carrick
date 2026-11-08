@@ -822,9 +822,16 @@ impl NamespaceState {
         raw: i32,
         namespace: VisibleNamespace,
     ) -> Result<(), IdError> {
-        self.allocation()?
-            .view()
-            .bind_visible_domain(raw, namespace)
+        let allocation = self.allocation()?;
+        if !namespace.is_unmapped()
+            && allocation
+                .header
+                .find(&allocation.nodes, NamespaceView::namespace_key(namespace))
+                .is_none()
+        {
+            allocation.provision()?;
+        }
+        allocation.view().bind_visible_domain(raw, namespace)
     }
     pub fn reserve_next(&mut self, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
         self.allocation()?.reserve_next(kind)
