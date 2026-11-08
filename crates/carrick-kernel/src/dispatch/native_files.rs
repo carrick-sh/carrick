@@ -1092,6 +1092,167 @@ mod tests {
         assert_eq!(fixture.dispatcher.stdout(), b"bin\nboot\n");
     }
 
+    #[repr(align(4096))]
+    struct MutationMemory([u8; 16384]);
+
+    impl carrick_el1_linux::file::MemoryValidator for MutationMemory {
+        fn readable_bytes(&self, address: u64, len: usize) -> usize {
+            let base = self.0.as_ptr().addr() as u64;
+            if address < base {
+                return 0;
+            }
+            (base + self.0.len() as u64)
+                .saturating_sub(address)
+                .min(len as u64) as usize
+        }
+        fn writable_bytes(&self, address: u64, len: usize) -> usize {
+            self.readable_bytes(address, len)
+        }
+    }
+
+    fn mutation_child(upper: Upper) -> Fixture {
+        let mut fixture = writable_fixture(upper);
+        fixture
+            .dispatcher
+            .kernel_binding
+            .read()
+            .kernel()
+            .install_ipc_for_test(Arc::clone(&fixture.owner));
+        let region = fixture.owner.region();
+        let mut storage = region
+            .provision_descriptors(256, &crate::el1_zone::HostLockWait)
+            .unwrap();
+        let child = region
+            .fd(crate::el1_zone::HostLockWait)
+            .fork(fixture.ring_fd(), &mut storage)
+            .unwrap()
+            .to_raw();
+        fixture.table = [child.authority, child.index, child.generation];
+        fixture
+    }
+
+    impl Fixture {
+        fn child_call(
+            &self,
+            authority: &CallerAccess,
+            ordinal: u64,
+            mut args: [u64; 6],
+            inputs: &[(usize, &[u8])],
+        ) -> i64 {
+            use carrick_personality_linux::native_host_file::{
+                HostFileCall, HostFileStage, NativeNamespace,
+            };
+            let mut memory = Box::new(MutationMemory([0; 16384]));
+            for (page, (argument, bytes)) in inputs.iter().enumerate() {
+                let start = page * 4096;
+                assert!(bytes.len() < 4096);
+                memory.0[start..start + bytes.len()].copy_from_slice(bytes);
+                args[*argument] = memory.0[start..].as_ptr().addr() as u64;
+            }
+            let Some(call) = HostFileCall::decode(carrick_abi::CanonicalNr::new(ordinal), &args)
+            else {
+                return -38;
+            };
+            let tables = carrick_el1_linux::ipc::MapTables(map());
+            let venue = carrick_el1_linux::ipc::IpcVenue {
+                region: self.owner.region(),
+                tables: &tables,
+            };
+            let mut resolve =
+                |number| carrick_el1_linux::ipc::native_descriptor(&venue, self.table, number);
+            let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+            let staged = carrick_el1_linux::dispatch::stage_native_host_file(
+                call,
+                &carrick_el1_abi::CurrentTask::new(),
+                &*memory,
+                &mut NativeNamespace {
+                    table: self.table,
+                    resolve: &mut resolve,
+                    releases: &mut releases,
+                },
+            );
+            match staged {
+                Some(HostFileStage::Request {
+                    record,
+                    resolves_path,
+                    output,
+                    ..
+                }) => {
+                    let mut record = record.into_vec();
+                    if resolves_path {
+                        authority.stamp(&mut record);
+                    }
+                    carrick_personality_linux::native_host_file::stamp_write_file_size_limit::<()>(
+                        &mut record,
+                        || Ok(UNLIMITED),
+                    )
+                    .unwrap();
+                    match self.dispatcher.serve_native_host_file(&mut record) {
+                        Ok(_) => carrick_personality_linux::native_host_file::complete(
+                            &record,
+                            output,
+                            &mut |_, _| panic!("a mutation has no user output"),
+                        )
+                        .raw(),
+                        Err(NativeHostFileRefusal) => -38,
+                    }
+                }
+                Some(HostFileStage::Returned(result)) => result.raw(),
+                Some(HostFileStage::Fault { .. }) => -14,
+                Some(HostFileStage::InRing) | None => -38,
+                other => panic!("unexpected mutation staging: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn native_child_mkdir_dispatches_with_its_cwd_umask_and_errno_matrix() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = mutation_child(upper);
+            let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+            let mkdir = |path: &[u8], dirfd| {
+                fixture.child_call(&authority, 34, [dirfd, 0, 0o777, 0, 0, 0], &[(1, path)])
+            };
+            assert_eq!(mkdir(b"child-dir", FDCWD as u64), 0, "{upper:?}");
+            let stat = fixture.result(
+                Some(&authority),
+                record(
+                    fixture.table,
+                    HostFileOp::Newfstatat,
+                    FDCWD,
+                    [0; 4],
+                    b"child-dir",
+                    carrick_personality_linux::native_host_file::LINUX_STAT_BYTES,
+                ),
+            );
+            assert_eq!(stat.0, 0);
+            let stat =
+                <carrick_abi::LinuxStat as zerocopy::FromBytes>::read_from_bytes(&stat.1).unwrap();
+            assert_eq!(stat.st_mode & 0o777, 0o777 & !authority.credentials.umask);
+            for (path, dirfd, expected) in [
+                (&b"child-dir"[..], FDCWD as u64, -17),
+                (&b"missing/dir"[..], FDCWD as u64, -2),
+                (&b"/etc/ld.so.cache/dir"[..], FDCWD as u64, -20),
+                (&b""[..], FDCWD as u64, -2),
+                (&b"."[..], FDCWD as u64, -17),
+                (&b"bad-fd"[..], 999, -9),
+                (&b"not-dir"[..], 1, -38),
+            ] {
+                assert_eq!(mkdir(path, dirfd), expected, "{upper:?}: {path:?}");
+            }
+            assert_eq!(mkdir(&[b'x'; 256], FDCWD as u64), -36);
+            assert_eq!(mkdir(b"/tmp/absolute", 999), 0, "absolute ignores dirfd");
+            assert!(
+                fixture
+                    .dispatcher
+                    .fs_view()
+                    .layered_metadata("/tmp/child-dir")
+                    .is_ok(),
+                "the parent sees the child's namespace mutation"
+            );
+        }
+    }
+
     #[test]
     fn native_child_write_serves_parent_redirected_stdout_after_host_close() {
         for upper in [Upper::Memory, Upper::Host] {
