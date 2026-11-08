@@ -5672,6 +5672,45 @@ mod tests {
         assert_eq!(published.revents, LINUX_POLLOUT);
     }
 
+    #[test]
+    fn arm_immediate_poll_writes_only_the_writable_revents_page() {
+        let w = world();
+        let tables = delegated();
+        let mut fds = GuestUserBuffer::zeroed(4104);
+        let record_offset = 4096 - 6;
+        fds.write(
+            record_offset,
+            PollFd {
+                fd: -1,
+                events: LINUX_POLLIN,
+                revents: 0x7777,
+            },
+        );
+        let record = fds.arg_at(record_offset);
+        let boundary = fds.arg_at(4096);
+        carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |address, len, access| {
+                access != carrick_guest_arch::Access::Write
+                    || address.raw() >= boundary
+                    || address.raw() + len.raw() <= record
+            }));
+        });
+        let timeout = zero_timespec();
+        let mut frame = TrapFrame::default();
+        frame.x[..5].copy_from_slice(&[record, 1, timeout.arg(), 0, 0]);
+        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+        let route = dispatch_poll(&w, &mut frame, None, &tables);
+        carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+            *hook.borrow_mut() = None;
+        });
+        let published: PollFd = fds.read(record_offset);
+        assert_eq!(route, CompletionRoute::Served);
+        assert_eq!(frame.x[0] as i64, 0);
+        assert_eq!(published.fd, -1);
+        assert_eq!(published.events, LINUX_POLLIN);
+        assert_eq!(published.revents, 0);
+    }
+
     /// ppoll(2)/poll(2): nfds above the caller's soft RLIMIT_NOFILE is
     /// EINVAL; at the limit the set is served. Linux reads the timespec and
     /// then the signal mask before it compares nfds, so their EFAULTs win.
