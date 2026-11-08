@@ -11,6 +11,14 @@ rationale = "One bounded pathname read and one retained owner copyout; no host-t
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_readlink_exe",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_readlink_copyout_busy_once_then_success",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_readlink_copyout_fault_returns_errno_14",
+  "carrick-personality-linux::native_host_file::tests::readlink_decodes_and_bounds_the_output_without_a_nul",
+  "carrick-personality-linux::native_host_file::tests::readlink_validates_only_the_bytes_returned_by_the_link",
+  "carrick-kernel::dispatch::native_files::tests::native_readlink_uses_live_mm_executable_custody",
+  "carrick-kernel::dispatch::native_files::tests::native_readlink_serves_ordinary_links_and_refuses_foreign_magic",
+  "carrick-runtime::runtime::exec::tests::native_child_exec_prepares_a_dynamic_binary_through_a_usrmerge_rootfs",
+  "carrick-hal::fork_stock::tests::committed_child_retains_physical_custody_through_quarantine",
 ]
 
 [bindings.unresolved]
