@@ -356,6 +356,74 @@ mod process_exit_tests {
         assert_eq!(WakeRetval::from_guest_retval(i64::from(i32::MAX) + 1), None);
         assert_eq!(WakeRetval::from_guest_retval(i64::from(i32::MIN) - 1), None);
     }
+
+    #[test]
+    fn native_futex_zero_realtime_bitset_completes_with_einval() {
+        use super::*;
+
+        let zone = unsafe {
+            // SAFETY: aligned zeroed allocation is the empty ZoneTables representation.
+            let pointer = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>())
+                .cast::<ZoneTables>();
+            assert!(!pointer.is_null());
+            std::boxed::Box::from_raw(pointer)
+        };
+        let task = CurrentTask::new();
+        task.mm.key.store(77, Ordering::Release);
+        let counters = Counters::new();
+        let page = ThreadLifecyclePage::new();
+        let controls = core::array::from_fn(|_| ThreadControlSlot::new());
+        let parent = ThreadIdentity {
+            tid: 41,
+            serial: 101,
+            mm: 77,
+            file_table: 5,
+            generation: 11,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        let mut lane = LifecycleLane {
+            contexts: [const { NativeBirthContext::EMPTY }; 2],
+            parent,
+            slot: SlotId::new(0),
+            maintenance_root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x1000))
+                .expect("maintenance root"),
+            data_start: 0,
+            data_end: 0,
+            wakes: 0,
+            births: 0,
+            retirements: 0,
+        };
+        let mut frame = NativeFrame::default();
+        let mut xsave = XsaveArea::ZERO;
+        #[allow(clippy::panic)]
+        fn terminal_failure(
+            _: carrick_core_abi::ExecutionBinding,
+            reason: carrick_core_abi::NativeRunFailureReason,
+        ) -> ! {
+            std::panic::panic_any(reason)
+        }
+        let mut native = NativeLane {
+            terminal_failure,
+            handoff: None,
+            frame: &mut frame,
+            xsave: &mut xsave,
+            task: &task,
+            counters: &counters,
+            zone: &zone,
+            lane: &mut lane,
+            page: &page,
+            controls: &controls,
+            args: [0x1000, 393, 0, 0, 0, 0],
+        };
+
+        let completion = PendingFamilies::futex(&mut native);
+
+        assert_eq!(completion, FamilyCompletion::Complete(-22));
+        assert_eq!(native.frame.rax as i64, -22);
+    }
 }
 
 pub const LIFECYCLE_ZONE: u64 = 0xffff_ffff_b000_0000;
