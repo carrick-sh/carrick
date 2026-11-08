@@ -356,3 +356,11 @@ nor wake may forward. The scheduler already leases timers to exact records
 and park sequences; the former host-record-only admission check was stale.
 The switched-in scheduler witness also requires numeric timeout `-110` and
 consumption of its expired timer lease. Signed Go execution remains open.
+
+The carrier-exit and slot-reset variants remain red: departure removes the
+lease and turns the native wait into Host/Control custody. Their `_wake`
+variants require the live sibling's production FUTEX_WAKE after departure to
+win before the original deadline, deliver zero through native selection,
+and leave no timer node for the later timeout. These are acceptance criteria,
+not green evidence. The proposed surviving owner and last-executor delivery
+obligation are in [native timed parks](../design/native-timed-park-owner.md).
