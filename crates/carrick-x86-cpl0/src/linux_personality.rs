@@ -1053,6 +1053,7 @@ impl Personality for LinuxPersonality {
                     }
                     _ => fatal_boot(),
                 };
+            }
             if let Some(venue) = anonymous.as_mut()
                 && venue.take_retry()
             {
