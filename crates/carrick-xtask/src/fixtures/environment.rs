@@ -35,7 +35,7 @@ impl Default for BuildPolicy {
     }
 }
 
-pub(super) fn reject_ambient_overrides() -> Result<()> {
+pub(crate) fn reject_ambient_overrides() -> Result<()> {
     for (name, _) in std::env::vars_os() {
         let name = name.to_string_lossy();
         if name.starts_with("CARGO_PROFILE_")
