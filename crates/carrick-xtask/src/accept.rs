@@ -788,10 +788,18 @@ pub fn parse_test_log(log: &str) -> ParsedTestLog {
             if let (Some(exe), Some(name)) = (words.next(), words.next())
                 && is_valid_test_name(name)
             {
-                let qualified = qualify_test(&binary_stem_from_path(exe), name);
-                failed_tests.remove(&qualified);
-                failed_tests.insert(format!("deadline:{qualified}"));
+                let binary = binary_stem_from_path(exe);
+                let qualified = qualify_test(&binary, name);
+                if current_binary == binary && started_tests.contains(&qualified) {
+                    failed_tests.remove(&qualified);
+                    failed_tests.insert(format!("deadline:{qualified}"));
+                } else {
+                    unitemized_failures.insert(format!("parse-error:{binary}:DEADLINE:{name}"));
+                }
+            } else {
+                unitemized_failures.insert(format!("parse-error:{current_binary}:DEADLINE:{rest}"));
             }
+            continue;
         }
         if let Some((name, status)) = extract_test_line(line) {
             let qualified = qualify_test(&current_binary, name);

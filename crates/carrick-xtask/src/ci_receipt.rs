@@ -1024,8 +1024,8 @@ pub fn diff_with_retired(
     }
 
     // Explicit skips are observations, not comparable failure verdicts.
-    // Suppress both synthetic failures from old receipts and missing-population
-    // keys; the deadline remains an independent, fail-closed identity.
+    // Suppress skip and missing-population keys only. Actual test failures
+    // remain comparable, even if the other receipt did not run that test.
     let skipped_keys: BTreeSet<String> = baseline
         .steps
         .iter()
@@ -1034,7 +1034,6 @@ pub fn diff_with_retired(
             step.not_run_tests.iter().flat_map(move |test| {
                 [
                     format!("not-run:{}:{test}", step.name),
-                    format!("test:{}:{test}", step.name),
                     format!("missing:{test}"),
                 ]
             })
@@ -1045,6 +1044,15 @@ pub fn diff_with_retired(
     for base_step in &baseline.steps {
         let base_failed: BTreeSet<&str> =
             base_step.failed_tests.iter().map(String::as_str).collect();
+        // An unexecuted candidate cannot prove a baseline failure fixed.
+        // Carry it for comparison until an actual execution supplies a verdict.
+        for candidate_step in candidate.steps.iter().filter(|s| s.name == base_step.name) {
+            for test in &candidate_step.not_run_tests {
+                if base_failed.contains(test.as_str()) {
+                    next.insert(format!("test:{}:{test}", base_step.name));
+                }
+            }
+        }
         let cand_started: BTreeSet<&str> = candidate
             .steps
             .iter()

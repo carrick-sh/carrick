@@ -887,7 +887,13 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     let parsed = parse_test_log(log);
     assert_eq!(parsed.unfinished_binaries, vec!["el1_wedged"]);
     assert_eq!(parsed.finished_binaries, vec!["el1_after"]);
-    assert_eq!(parsed.unitemized_failures, vec!["crash:el1_wedged"]);
+    assert_eq!(
+        parsed.unitemized_failures,
+        [
+            "crash:el1_wedged",
+            "parse-error:el1_wedged:DEADLINE:/w/target/release/deps/el1_wedged-1111111111111111 (600s, CARRICK_RUN_ID=embed-signed-99-b1)",
+        ]
+    );
     assert_eq!(
         parsed.started_tests,
         vec!["el1_after::el1_after_ok", "el1_wedged::el1_forgot_watchdog",]
