@@ -2665,7 +2665,9 @@ fn park_anonymous_sibling(
         (
             key.index(),
             key.generation(),
-            u64::from(key.index()),
+            carrick_sched_core::object_wait::OperationToken::anonymous_edit(key)
+                .unwrap()
+                .index(),
             key.generation(),
         )
     );
@@ -2753,6 +2755,11 @@ mod anonymous_wait_cancellation_tests {
             !record.has_adapter_operation(),
             "anonymous replay must not enter IPC cancellation or host IPC resume"
         );
+        // SAFETY: claim_for_host above owns the exact, now-unlinked record.
+        let token = unsafe { record.take_object_operation() }.unwrap();
+        assert!(token.kind().replays_syscall());
+        assert!(carrick_el1::substrate::ipc::from_sched_token(token).is_none());
+        fixture.zone.free_record(sibling.record.id);
     }
 
     #[test]
@@ -2788,6 +2795,179 @@ mod anonymous_wait_cancellation_tests {
             LifecycleOutcome::Transferred { .. }
         ));
         assert!(entry.take_run_failure().is_none());
+        assert_eq!(
+            fixture
+                .zone
+                .object_queue_census(key.index())
+                .unwrap()
+                .waiters,
+            0,
+            "the real exit entry must unlink the anonymous waiter"
+        );
+        assert!(
+            !fixture
+                .zone
+                .record(sibling.record.id)
+                .has_object_operation(),
+            "exit cancellation must release scheduler-owned anonymous custody"
+        );
+        assert!(
+            fixture.zone.live(sibling.record).is_none(),
+            "exit cancellation must retire the unpinned anonymous record"
+        );
+        assert_eq!(
+            fixture
+                .zone
+                .space_entry(NonZeroU64::MIN)
+                .unwrap()
+                .notifications(NonZeroU64::MIN)
+                .unwrap()
+                .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations),
+            reservation_revision,
+            "terminal cancellation cannot publish an anonymous edit"
+        );
+    }
+
+    #[test]
+    fn exit_group_keeps_pipe_pin_distinct_from_anonymous_replay() {
+        let fixture = native_exec_fixture();
+        let sibling = add_signal_sibling(&fixture, None, false);
+        let key = park_anonymous_sibling(&fixture, &sibling);
+        use carrick_el1_abi::ipc::{
+            IpcBacking, IpcMmKey, IpcOpKind, IpcOperation, IpcTaskKey, IpcUserVa, WriteProgress, fd,
+        };
+        let ipc = Box::leak(Box::new(std::sync::Arc::new(
+            carrick_kernel::el1_ipc::HostIpc::with_limits(
+                1 << 20,
+                carrick_el1_abi::ipc::IpcLimits::ZONE,
+            )
+            .unwrap(),
+        )));
+        let object = ipc.create_pipe(65536).unwrap();
+        let table = ipc.create_table(64, 64).unwrap();
+        let description = ipc
+            .admit_description(fd::Description::new(
+                IpcBacking::Pipe {
+                    object,
+                    end: carrick_el1_abi::ipc::pipe::End::Reader,
+                }
+                .encode(),
+                fd::AccessMode::ReadOnly,
+                fd::StatusFlags::default(),
+            ))
+            .unwrap();
+        description.install(table, fd::Fd(0), false).unwrap();
+        drop(description);
+        let region = ipc.region();
+        let (pin, _) = region
+            .fd(carrick_sched_core::ShortLockSpin)
+            .pin(table, fd::Fd(0))
+            .unwrap();
+        let binding = crate::common_entry::execution_binding(fixture.task);
+        let ipc_token = region
+            .begin_operation(IpcOperation {
+                kind: IpcOpKind::PipeRead,
+                pin: pin.into_raw(),
+                object: object.to_raw(),
+                task: IpcTaskKey(binding.task.raw()),
+                mm: IpcMmKey(binding.mm.raw()),
+                buf: IpcUserVa(0x10000),
+                progress: WriteProgress::new(8),
+                ..IpcOperation::EMPTY
+            })
+            .unwrap();
+        let ipc_token = carrick_el1::substrate::ipc::to_sched_token(ipc_token).unwrap();
+        // SAFETY: the fixture owns the leader's executing record. This is the
+        // same retained IPC pin a signal handler carries into exit_group.
+        unsafe {
+            fixture
+                .zone
+                .record(fixture.record.id)
+                .restore_object_operation(ipc_token)
+        }
+        .unwrap();
+        assert!(
+            fixture
+                .zone
+                .record(fixture.record.id)
+                .has_adapter_operation()
+        );
+        assert!(
+            !fixture
+                .zone
+                .record(sibling.record.id)
+                .has_adapter_operation()
+        );
+        // Only the pending operation retains the endpoint description.
+        assert!(
+            region
+                .fd(carrick_sched_core::ShortLockSpin)
+                .close(table, fd::Fd(0))
+                .unwrap()
+                .is_none()
+        );
+        let reservation_revision = fixture
+            .zone
+            .space_entry(NonZeroU64::MIN)
+            .unwrap()
+            .notifications(NonZeroU64::MIN)
+            .unwrap()
+            .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations);
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        let mut service = fixture.service();
+        service.native_ipc = Some(region);
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.exit_group(23),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(entry.take_run_failure().is_none());
+        drop(entry);
+        assert!(
+            fixture
+                .zone
+                .record(fixture.record.id)
+                .has_adapter_operation(),
+            "terminal IPC custody must survive until the adapter releases its pin"
+        );
+        assert_eq!(
+            fixture.zone.claim_for_host(
+                fixture.record,
+                None,
+                carrick_sched_core::Handback::Cancelled,
+                &carrick_sched_core::ShortLockSpin,
+            ),
+            carrick_sched_core::HostClaim::Claimed
+        );
+        // SAFETY: the production cancellation claim owns this exact unlinked record.
+        let token = unsafe {
+            fixture
+                .zone
+                .record(fixture.record.id)
+                .take_object_operation()
+        }
+        .unwrap();
+        assert_eq!(
+            token.kind(),
+            carrick_sched_core::object_wait::OperationKind::Adapter
+        );
+        service.retire_adapter_operation(binding, token).unwrap();
+        fixture.zone.free_record(fixture.record.id);
+        assert!(fixture.zone.live(fixture.record).is_none());
+
         assert_eq!(
             fixture
                 .zone

@@ -9,7 +9,7 @@ use carrick_el1_abi::ipc::pipe::{self, WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
     IpcError, IpcObjectGuard, IpcObjectHandle, IpcOpKind, IpcOpToken, IpcOperation, RawIpcOpToken,
 };
-use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+use carrick_sched_core::object_wait::{ObjectWaitKey, OperationKind, OperationToken};
 
 /// Granule at which user copies are split, so a fault ends a copy at an
 /// exact page-aligned prefix (the smallest guest page size).
@@ -35,6 +35,9 @@ pub fn to_sched_token(token: IpcOpToken) -> Result<OperationToken, IpcOpToken> {
 /// Move a scheduler token back into the IPC authority's form. `None` for a
 /// token no IPC operation could have produced (it is not ours).
 pub fn from_sched_token(token: OperationToken) -> Option<IpcOpToken> {
+    if token.kind() != OperationKind::Adapter {
+        return None;
+    }
     let index = u32::try_from(token.index().checked_sub(1)?).ok()?;
     if index as usize >= carrick_el1_abi::ipc::IPC_OPERATIONS {
         return None;

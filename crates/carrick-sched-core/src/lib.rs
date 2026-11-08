@@ -2797,6 +2797,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     pub fn free_record(&self, id: RecordId) {
         let record = self.record(id);
         record.retire_cancelled_metadata_operation();
+        record.retire_cancelled_anonymous_operation();
         // A pending operation owns an external endpoint pin. Keep this
         // record reachable until its adapter consumes/cancels that token;
         // recycling it would lose the only completion authority.
@@ -3845,7 +3846,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let result = match rec.handback() {
             Some(Handback::Resumed) => None,
             Some(Handback::Signal | Handback::Timeout)
-                if rec.is_native_owned() && rec.has_adapter_operation() =>
+                if rec.is_native_owned()
+                    && matches!(
+                        rec.object_operation_kind(),
+                        Some(
+                            object_wait::OperationKind::Adapter
+                                | object_wait::OperationKind::AnonymousEdit
+                        )
+                    ) =>
             {
                 None
             }
@@ -4701,7 +4709,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             let result = match rec.handback() {
                 Some(Handback::Resumed) => None,
                 Some(Handback::Signal | Handback::Timeout)
-                    if rec.is_native_owned() && rec.has_adapter_operation() =>
+                    if rec.is_native_owned()
+                        && matches!(
+                            rec.object_operation_kind(),
+                            Some(
+                                object_wait::OperationKind::Adapter
+                                    | object_wait::OperationKind::AnonymousEdit
+                            )
+                        ) =>
                 {
                     None
                 }
