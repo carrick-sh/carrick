@@ -17,10 +17,18 @@ impl InternalIdentity {
     }
 }
 
-/// Exact root namespace numbering domain, distinct from task IDs.
+/// Linux numbering domain: unmapped claims or an exact root namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct VisibleNamespace(NonZeroU64);
 impl VisibleNamespace {
+    /// No PID remapping: visible identities are the shared internal claims.
+    /// ID zero cannot name an arena namespace, so this domain needs no cursor.
+    pub const fn unmapped() -> Self {
+        Self(NonZeroU64::MIN)
+    }
+    const fn is_unmapped(self) -> bool {
+        self.0.get() == 1
+    }
     pub const fn new(id: NonZeroU32, incarnation: NonZeroU32) -> Self {
         let raw = ((id.get() as u64) << 32) | (incarnation.get() as u64);
         match NonZeroU64::new(raw) {
@@ -427,12 +435,16 @@ impl NamespaceView<'_> {
     fn internal_key(raw: i32) -> u64 {
         raw as u32 as u64
     }
-    // Namespace incarnations occupy all 64 bits, so keep their original key
-    // by storing internal numbers in the otherwise impossible id=0 domain.
+    // Remapped namespace incarnations occupy all 64 bits. Their cursor keys
+    // have nonzero IDs; internal numbers use id=0. Unmapped domains have no
+    // cursor node and must never be looked up as a namespace key.
     fn namespace_key(namespace: VisibleNamespace) -> u64 {
         namespace.0.get()
     }
     fn visible_entry(&mut self, namespace: VisibleNamespace) -> Result<usize, IdError> {
+        if namespace.is_unmapped() {
+            return Err(IdError::AuthorityTransferred);
+        }
         let key = Self::namespace_key(namespace);
         if let Some(index) = self.find(key) {
             return Ok(index);
@@ -462,9 +474,27 @@ impl NamespaceView<'_> {
         if old != 0 && old != namespace.0.get() {
             return Err(IdError::AlreadyReserved(raw));
         }
-        self.visible_entry(namespace)?;
+        if !namespace.is_unmapped() {
+            self.visible_entry(namespace)?;
+        }
         self.nodes[index].namespace = namespace.0.get();
         Ok(())
+    }
+    /// Bind a live internal claim and issue its Linux-visible identity.
+    /// Unmapped launches use that claim itself, never a second counter.
+    pub fn assign_visible(
+        &mut self,
+        number: InternalIdentity,
+        namespace: VisibleNamespace,
+    ) -> Result<VisibleIdentity, IdError> {
+        self.bind_visible_domain(number.get(), namespace)?;
+        if namespace.is_unmapped() {
+            Ok(VisibleIdentity(
+                NonZeroU32::new(number.get() as u32).ok_or(IdError::OutOfRange(number.get()))?,
+            ))
+        } else {
+            self.reserve_visible(namespace)
+        }
     }
     pub fn visible_domain(&self, raw: i32) -> Option<VisibleNamespace> {
         let index = self.find(Self::internal_key(raw))?;
@@ -583,6 +613,9 @@ impl NamespaceView<'_> {
         self.header.next = raw;
     }
     pub fn retire_visible_namespace(&mut self, namespace: VisibleNamespace) {
+        if namespace.is_unmapped() {
+            return;
+        }
         let key = Self::namespace_key(namespace);
         if self.find(key).is_some() {
             self.remove(key);
@@ -1400,6 +1433,29 @@ mod tests {
         assert_eq!(source.refused_attempts(), None);
         assert!(source.transfer().is_none());
         assert_eq!(source.refused_attempts(), None);
+    }
+
+    #[test]
+    fn unmapped_domain_uses_claims_without_allocating_or_retiring_a_cursor() {
+        let mut owner = NamespaceState::new(1, 100, 1);
+        let unmapped = VisibleNamespace::unmapped();
+        let first = owner.reserve_next(ClaimKind::Task).unwrap();
+        let second = owner.reserve_next(ClaimKind::Thread).unwrap();
+        for number in [first, second] {
+            let mut view = owner.allocation().unwrap().view();
+            let visible = view.assign_visible(number, unmapped).unwrap();
+            assert_eq!(visible.get(), number.get() as u32);
+            assert_eq!(view.visible_domain(number.get()), Some(unmapped));
+        }
+        assert_eq!(owner.visible_namespace_count(), 0);
+        assert_eq!(owner.reserve_visible(unmapped), None);
+        owner.retire_visible_namespace(unmapped);
+        assert!(owner.is_reserved_number(first.get()));
+        assert!(owner.is_reserved_number(second.get()));
+        assert_eq!(owner.counts().reserved_numbers, 2);
+        let mapped = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
+        assert_eq!(owner.reserve_visible(mapped).unwrap().get(), 2);
+        assert_eq!(owner.visible_namespace_count(), 1);
     }
 
     #[test]

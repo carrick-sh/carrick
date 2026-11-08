@@ -34,8 +34,16 @@ The review regressions in #1841 are covered at production root admission:
 `for_prepared_launch` container without a PID region, binds the zone before
 or after bootstrap, and calls native admission without fixture namespace
 seeding. Host reservations remain live across native fork. The child PID and
-stocked TIDs must retain their internal numbers and avoid those reservations.
+leader TID must equal the internal claim and avoid those reservations.
 `production_root_domains_retire_after_{bootstrap,cancel}` checks initial
 root retirement and four cancelled `prepare_container_root` operations. Each
 namespace retirement must return the cursor count to baseline, and each
 cancelled preparation must return all number claims to baseline.
+
+Unmapped launches bind a cursor-free domain at root preparation. Native fork
+and thread stock bind their reserved internal claim and derive the visible
+number from that same claim. Remapped launches retain the incarnation-keyed
+cursor. Root membership preparation now attaches the namespace's registry
+owner and binds the domain while holding the namespace lifecycle lock, the
+same ownership path used by later members. Retirement therefore cannot miss
+a cursor created by either bootstrap or a cancelled later root.

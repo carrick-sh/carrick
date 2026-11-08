@@ -1513,13 +1513,7 @@ impl Kernel {
             process_group_claim,
         )?);
         let session = Arc::new(Session::new(session_id, &ids, session_claim)?);
-        let pid_identity = container.prepare_pid_root(task_key)?;
-        if let Some(domain) = container
-            .pid_region()
-            .and_then(|region| region.visible_domain())
-        {
-            ids.bind_visible_domain(task_key.id, domain)?;
-        }
+        let pid_identity = container.prepare_pid_root(task_key, &ids)?;
 
         let namespace_id = pid_identity.as_ref().map_or_else(
             || {
@@ -2068,13 +2062,7 @@ impl Kernel {
             serial: self.object_ids.thread_serial()?,
         };
         let leader = task.attach_thread(leader_key, registry_id, Arc::clone(&resources))?;
-        let pid_identity = container.prepare_pid_root(task_key)?;
-        if let Some(domain) = container
-            .pid_region()
-            .and_then(|region| region.visible_domain())
-        {
-            self.ids.bind_visible_domain(task_key.id, domain)?;
-        }
+        let pid_identity = container.prepare_pid_root(task_key, &self.ids)?;
 
         container_reservation.record_prepared_task(task_key);
         let process_group = Arc::new(ProcessGroup::new(

@@ -8108,18 +8108,18 @@ fn production_unmapped_root_admits_and_forks(late_bind: bool) {
         };
         drop(entry);
         let child_pid = result.raw();
-        for index in 0..fixture.child_page.entry_count() {
-            if let Some((generation, _)) = fixture.child_page.state(index) {
-                let identity = fixture
-                    .child_page
-                    .identity(EntryRef::new(index as u32, generation))
-                    .unwrap();
-                assert_eq!(
-                    identity.visible_tid, identity.tid,
-                    "unmapped thread stock must preserve TID"
-                );
-            }
-        }
+        let child_entry = fixture
+            .child_page
+            .entry_ref_for_visible_tid(child_pid as u32)
+            .unwrap();
+        let child_identity = fixture.child_page.identity(child_entry).unwrap();
+        assert_eq!(child_identity.tid, child_pid as u32);
+        assert_eq!(child_identity.visible_tid, child_pid as u32);
+        let child_control = service
+            .child_lifecycle(&fixture.address)
+            .born_slot(child_entry)
+            .unwrap();
+        assert_eq!(child_control.visible_tid(), Some(child_pid as u32));
         assert!(child_pid > 0);
         assert_ne!(child_pid, 41);
         assert_ne!(child_pid, host_id.raw() as i64);
