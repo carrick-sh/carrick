@@ -2993,7 +2993,7 @@ mod tests {
             editor.calls.clear();
             // A held root retains the in-ring replay without forwarding.
             {
-                let held = root(&spaces, &table, &task);
+                let mut held = root(&spaces, &table, &task);
                 let generation = held.generation();
                 let (route, _) = syscall(
                     &task,
