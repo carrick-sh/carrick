@@ -543,6 +543,79 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
     assert_eq!(outcome.physical.robust_list_head(0).unwrap(), 0x2345);
 }
 
+/// Test-support arming stays inside the CPL0 image. The following mmap still
+/// enters through the production Linux syscall boundary and must retain its
+/// exact call across one reservation-root refusal.
+#[test]
+fn production_anonymous_root_busy_once_parks_and_completes() {
+    const INJECT_ROOT_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe10;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+
+    let mut code = vec![0x48, 0xb8]; // movabs rax, test-support injection
+    let mut failures = Vec::new();
+    code.extend_from_slice(&INJECT_ROOT_BUSY_ONCE.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x05]);
+    // mmap(NULL, one page, RW, PRIVATE|ANONYMOUS, -1, 0).
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        code.extend_from_slice(register);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    code.extend_from_slice(&[
+        0x0f, 0x05, // syscall
+        0x48, 0x85, 0xc0, // test rax,rax
+        0x0f, 0x88, // js failure
+    ]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xb8]); // movabs rax, park census
+    code.extend_from_slice(&INJECT_WAIT_PARK_CENSUS.to_le_bytes());
+    code.extend_from_slice(&[
+        0x0f, 0x05, // syscall
+        0x48, 0x83, 0xf8, 1, // cmp rax,1
+        0x0f, 0x85, // jne failure
+    ]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[
+        0xbf, 7, 0, 0, 0, // mov edi,7
+        0xb8, 0xe7, 0, 0, 0, // mov eax,exit_group
+        0x0f, 0x05, 0x0f, 0x0b, // syscall; ud2
+        0xbf, 9, 0, 0, 0, // failure: mov edi,9
+        0xb8, 0xe7, 0, 0, 0, // mov eax,exit_group
+        0x0f, 0x05, 0x0f, 0x0b,
+    ]);
+    let failure = code.len() - 14;
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+    assert_eq!(outcome.run.exit_code, 7, "mmap must complete after replay");
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(222))
+            .unwrap(),
+        0,
+        "mmap completion is not a counted refusal"
+    );
+    assert_eq!(
+        outcome.physical.refusal_overflow_count().unwrap(),
+        0,
+        "the test-only injection must not enter production refusal accounting"
+    );
+}
+
 /// Production Linux entry, including first touch and partial-range retirement.
 /// No fixture syscall or host mmap-family fallback can satisfy this witness.
 #[test]
