@@ -218,8 +218,15 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
             "carrick-xtask" => crate::fixtures::reject_ambient_overrides()
                 .map_err(|e| format!("host configuration unavailable: {e}").into())
                 .and_then(|()| {
-                    if crate::target_prune::lsof_binary().is_some() { Ok(()) }
-                    else { Err("host facility unavailable: lsof is required by carrick-xtask target-prune tests".into()) }
+                    if crate::target_prune::lsof_binary().is_none() {
+                        return Err("host facility unavailable: lsof is required by carrick-xtask target-prune tests".into());
+                    }
+                    let version = Command::new("rsync").arg("--version").output()
+                        .map_err(|e| format!("host facility unavailable: rsync is required by carrick-xtask remote-accept tests: {e}"))?;
+                    if !version.status.success() {
+                        return Err(format!("host facility unavailable: rsync --version failed: {}", String::from_utf8_lossy(&version.stderr)).into());
+                    }
+                    Ok(())
                 }),
             _ => Ok(()),
         };
