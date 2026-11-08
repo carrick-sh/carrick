@@ -28,7 +28,16 @@ fn serial_host_native_fork_exec_child_realtime_bitset_futex_retains_owner_refusa
     fork_exec_successor(Some(128 | 256 | 9));
 }
 
+#[test]
+fn serial_host_native_fork_exec_child_realtime_bitset_zero_mask_is_einval() {
+    fork_exec_successor_with_futex(Some(128 | 256 | 9), 0);
+}
+
 fn fork_exec_successor(futex: Option<u64>) {
+    fork_exec_successor_with_futex(futex, u32::MAX as u64);
+}
+
+fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
@@ -298,6 +307,7 @@ fn fork_exec_successor(futex: Option<u64>) {
             parent,
             child,
             operation,
+            bitset,
         );
         registry.unregister_root_for_test(&runtime);
         return;
@@ -864,6 +874,7 @@ fn child_futex<'a>(
     parent: TaskKey,
     child: TaskKey,
     operation: u64,
+    bitset: u64,
 ) {
     let counters = &carrick_el1_abi::Counters::new();
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
@@ -949,7 +960,7 @@ fn child_futex<'a>(
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
     frame.x[0] = VA;
     frame.x[1] = operation;
-    frame.x[5] = u64::from(u32::MAX);
+    frame.x[5] = bitset;
     frame.x[2] = 1;
     let mut parked = binding.words;
     crate::sched::ThreadCpu::save(
@@ -1015,21 +1026,35 @@ fn child_futex<'a>(
                 ),
                 crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
             );
-            assert_eq!(frame.x[0] as i64, -38, "native child receives ENOSYS");
+            let expected = if operation == (128 | 256 | 9) && bitset == 0 {
+                -22
+            } else {
+                -38
+            };
+            assert_eq!(frame.x[0] as i64, expected, "native child errno");
             assert_eq!(
                 word.reads.get(),
                 0,
                 "opcode refusal happens before UserCopy"
             );
         }
+        let expected_route = if operation == (128 | 256 | 9) && bitset == 0 {
+            CompletionRoute::Forward
+        } else {
+            CompletionRoute::Suspended
+        };
         assert_eq!(
             route,
-            CompletionRoute::Suspended,
+            expected_route,
             "fork child futex op={operation} address={VA:#x}, expected {:?}; result={}",
             CopyOutcome::NotYet(request),
             frame.x[0] as i64
         );
         assert!(entry.take_run_failure().is_none());
+    }
+    if operation == (128 | 256 | 9) && bitset == 0 {
+        registry.unregister_root_for_test(&runtime);
+        return;
     }
     assert_eq!(word.reads.get(), 1, "one refusal transfers to the owner");
     service.prepare_copy_error = None;
