@@ -129,6 +129,9 @@ fn exercise_anonymous_wait_event(event: AnonymousWaitEvent) {
         None,
         handback,
         &carrick_sched_core::ShortLockSpin,
+        &|owned| {
+            let _ = owned.into_parts();
+        },
     );
     assert_eq!(
         claim,
