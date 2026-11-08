@@ -36,12 +36,14 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
         &self,
         request: ServiceRequest,
         record: &mut [u8],
+        executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     ) -> Result<Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>, NativeHostFileRefused>;
 
     /// Serve the root fork seed crossing: write the host-served root's live
     /// cwd and root into `record` once ([`carrick_core_abi::service::RootForkSeed::serve`]).
     /// `false` refuses it; the fork then fails without a child.
     fn root_fork_seed(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool;
+    fn root_executable_seed(&self) -> Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>;
 }
 
 pub use carrick_hal::fork_stock::NativeHostFileRefused;
@@ -58,6 +60,7 @@ pub struct NativeExecParts {
     pub plan: crate::trap::GuestMappingPlan,
     pub lazy_regions: Vec<(u64, u64)>,
     pub sources: Vec<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+    pub executable: Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>,
 }
 
 /// Exact carrier registration for a retained exec service.
@@ -181,11 +184,18 @@ mod native_exec_service_registration_tests {
             &self,
             _request: ServiceRequest,
             _record: &mut [u8],
+            _executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
         ) -> Result<
             Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
             NativeHostFileRefused,
         > {
             Err(NativeHostFileRefused)
+        }
+
+        fn root_executable_seed(
+            &self,
+        ) -> Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>> {
+            None
         }
 
         fn root_fork_seed(&self, _record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
@@ -477,6 +487,9 @@ impl NativeService {
         let Ok(service) = self.custody.native_exec_services.resolve(capability) else {
             return self.refuse_host_file();
         };
+        let executable = self
+            .with_native_sources(|sources| sources.executable())
+            .flatten();
         let Some(record) = self.exec_payload.as_mut() else {
             return Err(stale());
         };
@@ -505,7 +518,7 @@ impl NativeService {
         let Some(record) = self.exec_payload.as_mut() else {
             return Err(stale());
         };
-        let served = service.serve_host_file(request, record.bytes_mut());
+        let served = service.serve_host_file(request, record.bytes_mut(), executable);
         match served {
             Ok(None) => {
                 self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))

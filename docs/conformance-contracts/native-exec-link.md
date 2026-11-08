@@ -1,67 +1,55 @@
-# Native exec child executable link (#1862)
+# Native executable links (part of #1862)
 
-`process.exec.native-exe-link` requires `/proc/self/exe` to select the
-exec successor's image rather than the carrier/root executable. The
-VM-free binding forks through the production native process owner, consumes
-an authenticated exec reply, and dispatches readlinkat while both processes
-remain live. It requires the executed path and zero forwarding.
+Contract: `process.exec.native-exe-link`.
 
-The futex portion uses `kernel.futex.contention`: a timed child wait must
-retain its original deadline across owner-copy refusal, enroll once and
-wake exactly one waiter. The scheduler's existing per-record timer owns
-expiry; ancestry cannot decide whether a deadline is allowed.
+`readlinkat(2)` returns at most the supplied positive buffer size, without a
+NUL. `proc_pid_exe(5)` identifies the executed object and appends ` (deleted)`
+when its name is unlinked. The executable belongs to the MM: fork inherits
+its live object, while threads and vfork share the MM until exec.
 
-Signed execution and the real go-build row remain director-owned.
+The native loader already returns `ExecSource`. Preparation converts it to
+`CurrentExecutable` in the dispatcher's existing executable registry. Its
+reference is retained in the prepared image and then in the successor's
+`ForkHostBackingCustody`. Cancellation drops preparation, adoption transfers
+custody, fork clones it, and retirement drops it. No ring capability row or
+exec manifest field is added. `ExecutableIdentity` is only the neutral
+carrier's opaque retention interface to that existing object.
 
-## Deferred design: live executable authority
+The root fork seed additionally captures the root dispatcher's current
+executable beside the filesystem seed. Its short-lived CPU slot is qualified
+by the stopped execution identity and consumed at fork reservation. This is
+part of the existing `RootOnlyState::RootForkSeed` retirement obligation;
+remove it when the host-served root is removed.
 
-The red readlink witness is deliberately not a conformance pass. A native
-exec successor has no executable object in its ring task row; the host
-`CurrentExecutable` implementation already retains the loaded object and a
-shared dentry display updated by namespace rename and unlink. Neither the
-carrier root's `ProcState` nor exec's pathname or argv[0] is the child's
-executable authority.
+Canonical syscall 78 stages a path record with the caller's access context.
+The carrier receives the executable from the authenticated caller MM, and
+uses the shared readlink target lookup under `NativeFsAuthority`. The ring
+copies only the completed reply bytes. The output allocation is bounded by
+PATH_MAX and the caller's positive signed buffer size. There is no polling,
+new wait, host-task syscall fallback, or crossing allowlist change.
 
-A follow-up should return a typed executable-object capability with successful
-exec preparation, bound to that exact successor MM and service identity.
-The ring task row owns it after the exec adoption cut, fork inherits it, a
-failed exec preserves the old capability, and final task retirement releases
-it. A carrier lookup may read the retained object's display but must never
-infer identity from the host process. The capability must keep the existing
-`CurrentExecutable` object/display registry alive, so rename, directory
-rename and unlink continue to update every holder. Exec cancellation must
-release the proposed capability; successful replacement must release the
-predecessor only after successor adoption. Late replies for an old MM or a
-reused TaskKey must fail exact identity validation.
+Non-`/` roots and foreign or other proc/fd magic links remain counted
+refusals. Ordinary symlinks use the same VFS implementation. The x86 decoder
+already desugars `readlink` to `readlinkat`; the x86 carrier has no native exec
+custody yet and supplies no executable identity. That remains a seam.
 
-One possible ABI is two nonzero words (handle and generation) in the sealed
-`ExecSuccessorManifest`, included in its digest and authenticated by the
-existing service identity/receipt. A typed native file request would carry
-that capability plus the readlink output capacity; the ring would own
-copyout and its returned byte count, including truncation without a NUL.
-No large by-value pathname belongs on EL1/CPL0 stacks. This is a proposal,
-not an implemented or independently reviewed layout.
+## Evidence
 
-Required witnesses before adopting that design: two live processes with
-different executable identities; failed exec retaining the previous identity;
-exec through a relative path and through a symlink; fork inheritance; rename
-and directory rename updating both holders; unlink appending ` (deleted)`
-while the retained image remains usable; output truncation and owner-copy
-suspension; cancelled preparation and final retirement reclaiming exactly
-one capability; stale reply rejection after MM/record reuse. Reuse the
-existing executable authority and resolver rather than adding a second procfs
-path parser. Signed real go-build and native ARM Docker remain the director's
-evidence, as does the separate post-exit hang.
+The first commit is the requested witness from `0a2481914e`, adapted only to
+exclude the separate timed-futex changes. The corrected pre-fix fixture at
+`d5bf064f0` reaches Forward, then fails because `native_unstaged_exit` returns
+Declined instead of its expected Refused(Served). This is not an errno-38
+observation. Earlier buffer-length failures are fixture errors, not semantic
+red evidence.
 
-## x86 seam
+The native fixture must model the production host-file staging and service
+continuation after the normal family's unclaimed result. The physical adapter
+retains a real executable reference and calls the carrier dispatcher, and
+checks the bytes passed to the MM copy boundary. It does not execute ELF
+instructions or prove the HVF preparation/adoption transport.
 
-The shared syscall table classifies canonical futex as the same family, but
-`El1PendingFamilies::futex` currently requires an ARM frame and forwards an
-x86 frame. The host-native x86 `NativeLane` explicitly disables timed waits.
-Neither is fixed by removing the ARM adapter's stale host-record check.
-The follow-up must supply a native x86 scheduler venue to the existing
-neutral futex client, using its per-record timer owner and ISA clock/timer
-transport, rather than copying Linux futex policy into the carrier. The
-executable-capability proposal must likewise be neutral; the x86 successor
-must inherit/adopt the same task-owned capability when native exec is wired.
-CPL0/KVM build or entry-test success alone does not prove this shape served.
+Kernel venue tests exercise simultaneous distinct executable holders,
+inheritance, root rename/unlink publication, truncation, and drop lifetime.
+These are custody/venue proofs, not substitutes for live vfork/thread/exec
+population tests. Signed native Go, full lifecycle population witnesses,
+Docker differential and runtime ratios remain required for acceptance.

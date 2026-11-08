@@ -922,6 +922,7 @@ dependencies = [
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-el1-linux",
+ "carrick-fd-core",
  "carrick-guest-arch",
  "carrick-personality-api",
  "carrick-sched-core",
