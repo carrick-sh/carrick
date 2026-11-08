@@ -137,6 +137,14 @@ pub enum HostFileCall {
         times: u64,
         flags: u64,
     },
+    Truncate {
+        path: u64,
+        length: u64,
+    },
+    Ftruncate {
+        fd: i32,
+        length: u64,
+    },
     Faccessat {
         dirfd: i32,
         path: u64,
@@ -260,6 +268,14 @@ impl HostFileCall {
                 path: args[1],
                 flags: args[2],
                 mode: args[3],
+            },
+            c if c == nr::TRUNCATE => Self::Truncate {
+                path: args[0],
+                length: args[1],
+            },
+            c if c == nr::FTRUNCATE => Self::Ftruncate {
+                fd,
+                length: args[1],
             },
             c if c == nr::UTIMENSAT => Self::Utimensat {
                 dirfd: fd,
@@ -739,6 +755,35 @@ fn stage_call(
                 len: LINUX_STAT_BYTES,
             },
         )?,
+        HostFileCall::Truncate { path, length } => {
+            if (length as i64) < 0 {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            let path = match staging.path_input(user, LINUX_AT_FDCWD, path)? {
+                Ok(path) => path,
+                Err(stage) => return Some(stage),
+            };
+            staging.request(
+                HostFileOp::Truncate,
+                LINUX_AT_FDCWD,
+                0,
+                [length, 0, 0, 0],
+                &path,
+                None,
+            )
+        }
+        HostFileCall::Ftruncate { fd, length } => {
+            if (length as i64) < 0 {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            match staging.descriptor(fd)? {
+                NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+                NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_EINVAL),
+                NativeDescriptor::HostBacked { .. } => {
+                    staging.request(HostFileOp::Ftruncate, fd, 0, [length, 0, 0, 0], &[], None)
+                }
+            }
+        }
         HostFileCall::Utimensat {
             dirfd,
             path,
@@ -1398,10 +1443,12 @@ pub fn stamp_write_file_size_limit<E>(
         return Ok(());
     };
     let mut args = view.header().args;
-    if view.header().op != HostFileOp::Write {
-        return Ok(());
-    }
-    args[0] = soft_limit()?;
+    let index = match view.header().op {
+        HostFileOp::Write => 0,
+        HostFileOp::Truncate | HostFileOp::Ftruncate => 1,
+        _ => return Ok(()),
+    };
+    args[index] = soft_limit()?;
     view.set_args(args);
     Ok(())
 }
