@@ -42,7 +42,8 @@ The native fixture drives fork, exec adoption, shared syscall dispatch,
 host-file staging and the retained service continuation. The physical adapter
 retains a real executable reference and calls the carrier dispatcher. It
 checks exact copyout bytes, zero generic forwarding, a busy copy followed by
-success, and a copy fault returning errno 14. It does not execute ELF
+success, a copy fault returning errno 14, truncation, and errno 22 for zero
+or negative buffer sizes. It does not execute ELF
 instructions or prove the HVF preparation/adoption transport. The staging
 witness for an unmapped unused buffer tail is red before the copyout change.
 
@@ -51,7 +52,9 @@ inheritance, root rename/unlink publication, truncation, and drop lifetime.
 The HAL retirement entry preserves executable custody through quarantine
 and releases it after reclamation. The HVF cancellation crossing's existing
 witness also checks executable retention returns to baseline; it needs the
-macOS lane. These are custody/venue proofs, not substitutes for live
+macOS lane. The relative/symlink/failed-exec loader witness is also behind
+`platform-macos`; a Linux test filter selects zero tests and is not evidence
+for it. These are custody/venue proofs, not substitutes for live
 vfork/thread/exec population tests. Signed native Go, full lifecycle
 population witnesses, Docker differential and runtime ratios remain required
 for acceptance.

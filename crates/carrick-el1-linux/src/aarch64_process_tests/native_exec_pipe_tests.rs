@@ -542,6 +542,9 @@ fn fork_exec_probe_copy(
                 .ipc()
                 .unwrap();
             let mut custody = carrick_hal::fork_stock::ForkHostBackingCustody::default();
+            // Test-only physical backing: retain a real file object without
+            // asking the native child to perform a host-root pathname open.
+            #[allow(clippy::disallowed_methods)]
             let image = std::fs::File::open("Cargo.toml").unwrap();
             custody.bind_executable(
                 dispatcher.retain_native_executable(
