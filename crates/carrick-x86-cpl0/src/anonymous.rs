@@ -92,7 +92,7 @@ impl<'a> X86AnonymousVenue<'a> {
 #[cfg(feature = "test-support")]
 pub(super) fn release_injected_edit_wait(
     source: BornInZoneSource<'static, ParkedContextWords>,
-    task: &CurrentTask,
+    task: &'static CurrentTask,
 ) {
     let cause = if carrick_core::mm::reservation::release_injected_root_busy() {
         Some(SpaceWaitCause::Reservations)
@@ -106,6 +106,9 @@ pub(super) fn release_injected_edit_wait(
     let Some(cause) = cause else {
         return;
     };
+    if crate::test_support::take_caught_signal_on_park() {
+        crate::native_process::inject_caught_signal_on_park(source, task);
+    }
     let mm = task.mm.key.load(Ordering::Acquire);
     let Some(notifications) = NonZeroU64::new(mm)
         .and_then(|mm| source.zone.space_entry(mm))
