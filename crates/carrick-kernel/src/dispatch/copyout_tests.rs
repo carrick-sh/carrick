@@ -1828,3 +1828,263 @@ fn retained_poll_sparse_output_keeps_prefix_across_owner_supply_and_physical() {
         }
     }
 }
+
+#[test]
+fn file_rw_lazy_source_and_destination_retain_pin_without_duplication() {
+    use carrick_abi::{LINUX_EFAULT, LINUX_O_CREAT, LINUX_O_RDWR, LINUX_SEEK_SET};
+
+    let mut g = Guest::new();
+    let witness_path = PATH;
+    let decoy_path = PATH + 0x40;
+    let src1 = BASE + 0x300;
+    let src2 = BASE + 0x340;
+    let src3 = BASE + 0x380;
+    let iov_addr = BASE + 0x400;
+    const UNMAPPED: u64 = 0xdead_0000;
+
+    g.memory.seed(witness_path, b"/witness\0");
+    g.memory.seed(decoy_path, b"/decoy\0");
+    let flags = (LINUX_O_CREAT | LINUX_O_RDWR) as u64;
+    let orig_fd = g.ok(
+        nr::OPENAT.raw(),
+        [LINUX_AT_FDCWD, witness_path, flags, 0o600, 0, 0],
+    ) as i32;
+    let keep_fd = g.ok(nr::DUP.raw(), [orig_fd as u64, 0, 0, 0, 0, 0]) as i32;
+    let decoy_fd = g.ok(
+        nr::OPENAT.raw(),
+        [LINUX_AT_FDCWD, decoy_path, flags, 0o600, 0, 0],
+    ) as i32;
+    let work_fd = g.ok(nr::DUP.raw(), [keep_fd as u64, 0, 0, 0, 0, 0]) as i32;
+
+    // 1. write(2) from a lazily backed read-only source: NotYet once, numeric fd
+    // replaced before resume, same descriptor pin retained, no duplicated bytes.
+    g.memory.seed(src1, b"abcd");
+    g.memory.protect_readonly(src1, 4);
+    let wait = g.memory.refuse_next_read();
+    let write_req = SyscallRequest::new(
+        nr::WRITE.raw(),
+        SyscallArgs::from([work_fd as u64, src1, 4, 0, 0, 0]),
+    );
+    let outcome = g.call(nr::WRITE.raw(), [work_fd as u64, src1, 4, 0, 0, 0]);
+    let DispatchOutcome::WriteCopyInSuspended(pending) = outcome else {
+        panic!("write from lazy source must suspend: {outcome:?}");
+    };
+    assert_eq!(
+        pending.wait(),
+        &carrick_guest_mem::MemoryReadWait::Owner(wait)
+    );
+    assert_eq!(
+        g.ok(
+            nr::DUP3.raw(),
+            [decoy_fd as u64, work_fd as u64, 0, 0, 0, 0]
+        ),
+        work_fd as i64
+    );
+    let context = g.dispatcher.capture_one_task_context().unwrap();
+    let resumed = g
+        .dispatcher
+        .resume_owned_write_copy_in(
+            &context,
+            write_req,
+            pending,
+            &mut g.memory,
+            &g.reporter,
+            None,
+            crate::dispatch::OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: g.lease.as_ref(),
+                mm_executor: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(resumed, DispatchOutcome::Returned { value: 4 });
+    assert_eq!(
+        g.ok(
+            nr::DUP3.raw(),
+            [keep_fd as u64, work_fd as u64, 0, 0, 0, 0]
+        ),
+        work_fd as i64
+    );
+
+    // 2. writev(2) across two read-only iovecs where the second iovec triggers NotYet:
+    // the first iovec ("ef") must not be duplicated when the second ("gh") resumes,
+    // and replacing numeric work_fd while suspended must still write to the original file.
+    g.memory.seed(src2, b"ef");
+    g.memory.seed(src3, b"gh");
+    g.memory.protect_readonly(src2, 2);
+    g.memory.protect_readonly(src3, 2);
+    let mut iov_bytes = Vec::new();
+    iov_bytes.extend_from_slice(&src2.to_ne_bytes());
+    iov_bytes.extend_from_slice(&2u64.to_ne_bytes());
+    iov_bytes.extend_from_slice(&src3.to_ne_bytes());
+    iov_bytes.extend_from_slice(&2u64.to_ne_bytes());
+    g.memory.seed(iov_addr, &iov_bytes);
+    // Reads 0 and 1 are the two 16-byte iovec structs; read 2 is src2 ("ef");
+    // read 3 is src3 ("gh"), which suspends after "ef" is committed.
+    let wait = g.memory.refuse_read_after(3);
+    let writev_req = SyscallRequest::new(
+        nr::WRITEV.raw(),
+        SyscallArgs::from([work_fd as u64, iov_addr, 2, 0, 0, 0]),
+    );
+    let outcome = g.call(nr::WRITEV.raw(), [work_fd as u64, iov_addr, 2, 0, 0, 0]);
+    let DispatchOutcome::WriteCopyInSuspended(pending) = outcome else {
+        panic!("writev second iovec must suspend: {outcome:?}");
+    };
+    assert_eq!(
+        pending.wait(),
+        &carrick_guest_mem::MemoryReadWait::Owner(wait)
+    );
+    assert_eq!(
+        g.ok(
+            nr::DUP3.raw(),
+            [decoy_fd as u64, work_fd as u64, 0, 0, 0, 0]
+        ),
+        work_fd as i64
+    );
+    let resumed = g
+        .dispatcher
+        .resume_owned_write_copy_in(
+            &context,
+            writev_req,
+            pending,
+            &mut g.memory,
+            &g.reporter,
+            None,
+            crate::dispatch::OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: g.lease.as_ref(),
+                mm_executor: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(resumed, DispatchOutcome::Returned { value: 4 });
+    assert_eq!(
+        g.ok(
+            nr::LSEEK.raw(),
+            [decoy_fd as u64, 0, carrick_abi::LINUX_SEEK_END, 0, 0, 0]
+        ),
+        0,
+        "decoy file must remain untouched across both write suspensions"
+    );
+    assert_eq!(
+        g.ok(
+            nr::DUP3.raw(),
+            [keep_fd as u64, work_fd as u64, 0, 0, 0, 0]
+        ),
+        work_fd as i64
+    );
+    assert_eq!(
+        g.ok(
+            nr::LSEEK.raw(),
+            [keep_fd as u64, 0, LINUX_SEEK_SET, 0, 0, 0]
+        ),
+        0
+    );
+
+    // 3. read(2) into a lazily backed destination: NotYet once, numeric fd replaced
+    // before resume, same descriptor pin retained, exact bytes and offset committed.
+    let wait = g.memory.refuse_next();
+    let outcome = g.call(nr::READ.raw(), [work_fd as u64, OUT, 4, 0, 0, 0]);
+    let DispatchOutcome::PipeReadSuspended(pending) = outcome else {
+        panic!("read into lazy destination must suspend with retained pin: {outcome:?}");
+    };
+    assert_eq!(
+        pending.wait(),
+        &carrick_guest_mem::MemoryReadWait::Owner(wait)
+    );
+    assert_eq!(
+        g.ok(
+            nr::DUP3.raw(),
+            [decoy_fd as u64, work_fd as u64, 0, 0, 0, 0]
+        ),
+        work_fd as i64
+    );
+    assert_eq!(
+        pending.resume(&context, &mut g.memory).unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), b"abcd");
+    assert_eq!(
+        g.ok(
+            nr::LSEEK.raw(),
+            [keep_fd as u64, 0, carrick_abi::LINUX_SEEK_CUR, 0, 0, 0]
+        ),
+        4
+    );
+    assert_eq!(
+        g.ok(
+            nr::DUP3.raw(),
+            [keep_fd as u64, work_fd as u64, 0, 0, 0, 0]
+        ),
+        work_fd as i64
+    );
+
+    // 4. readv(2) into two 2-byte destinations where the second destination triggers NotYet:
+    // the first iovec ("ef") must not be duplicated or re-consumed when the second ("gh")
+    // resumes, and replacing numeric work_fd while suspended must still read the original file.
+    let mut read_iov = Vec::new();
+    read_iov.extend_from_slice(&(OUT + 0x20).to_ne_bytes());
+    read_iov.extend_from_slice(&2u64.to_ne_bytes());
+    read_iov.extend_from_slice(&OUT2.to_ne_bytes());
+    read_iov.extend_from_slice(&2u64.to_ne_bytes());
+    g.memory.seed(iov_addr, &read_iov);
+    let wait = g.memory.refuse_after_prepares(1);
+    let outcome = g.call(nr::READV.raw(), [work_fd as u64, iov_addr, 2, 0, 0, 0]);
+    let DispatchOutcome::PipeReadSuspended(pending) = outcome else {
+        panic!("readv second iovec must suspend with retained pin: {outcome:?}");
+    };
+    assert_eq!(
+        pending.wait(),
+        &carrick_guest_mem::MemoryReadWait::Owner(wait)
+    );
+    assert_eq!(g.memory.read_bytes(OUT + 0x20, 2).unwrap(), b"ef");
+    assert_eq!(
+        g.ok(
+            nr::DUP3.raw(),
+            [decoy_fd as u64, work_fd as u64, 0, 0, 0, 0]
+        ),
+        work_fd as i64
+    );
+    assert_eq!(
+        pending.resume(&context, &mut g.memory).unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(g.memory.read_bytes(OUT + 0x20, 2).unwrap(), b"ef");
+    assert_eq!(g.memory.read_bytes(OUT2, 2).unwrap(), b"gh");
+    assert_eq!(
+        g.ok(
+            nr::LSEEK.raw(),
+            [keep_fd as u64, 0, carrick_abi::LINUX_SEEK_CUR, 0, 0, 0]
+        ),
+        8
+    );
+
+    // 5. Unmapped address still gets EFAULT on write, writev, read, and readv.
+    assert_eq!(
+        g.call(nr::WRITE.raw(), [keep_fd as u64, UNMAPPED, 4, 0, 0, 0]),
+        DispatchOutcome::errno(LINUX_EFAULT)
+    );
+    let mut bad_iov = Vec::new();
+    bad_iov.extend_from_slice(&UNMAPPED.to_ne_bytes());
+    bad_iov.extend_from_slice(&4u64.to_ne_bytes());
+    g.memory.seed(iov_addr, &bad_iov);
+    assert_eq!(
+        g.call(nr::WRITEV.raw(), [keep_fd as u64, iov_addr, 1, 0, 0, 0]),
+        DispatchOutcome::errno(LINUX_EFAULT)
+    );
+    assert_eq!(
+        g.ok(
+            nr::LSEEK.raw(),
+            [keep_fd as u64, 0, LINUX_SEEK_SET, 0, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(
+        g.call(nr::READ.raw(), [keep_fd as u64, UNMAPPED, 4, 0, 0, 0]),
+        DispatchOutcome::errno(LINUX_EFAULT)
+    );
+    assert_eq!(
+        g.call(nr::READV.raw(), [keep_fd as u64, iov_addr, 1, 0, 0, 0]),
+        DispatchOutcome::errno(LINUX_EFAULT)
+    );
+}

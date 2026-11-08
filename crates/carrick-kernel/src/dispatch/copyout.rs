@@ -659,6 +659,7 @@ pub(crate) mod owner_fixture {
         refuse_after: usize,
         supply: Option<carrick_guest_mem::MemorySupplyRequest>,
         refuse_read: std::cell::Cell<Option<PortalOwnerWait>>,
+        refuse_read_after: std::cell::Cell<usize>,
         readonly: Vec<(u64, usize)>,
         pub(crate) prepares: usize,
         pub(crate) reads: std::cell::Cell<usize>,
@@ -675,6 +676,7 @@ pub(crate) mod owner_fixture {
                 refuse_after: 0,
                 supply: None,
                 refuse_read: std::cell::Cell::new(None),
+                refuse_read_after: std::cell::Cell::new(0),
                 readonly: Vec::new(),
                 prepares: 0,
                 reads: std::cell::Cell::new(0),
@@ -712,8 +714,14 @@ pub(crate) mod owner_fixture {
 
         /// Refuse the next guest read with an Editor wait.
         pub(crate) fn refuse_next_read(&self) -> PortalOwnerWait {
+            self.refuse_read_after(0)
+        }
+
+        /// Refuse a guest read after `count` earlier reads with an Editor wait.
+        pub(crate) fn refuse_read_after(&self, count: usize) -> PortalOwnerWait {
             let wait = editor_wait();
             self.refuse_read.set(Some(wait));
+            self.refuse_read_after.set(count);
             wait
         }
 
@@ -830,7 +838,10 @@ pub(crate) mod owner_fixture {
 
         fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
             self.reads.set(self.reads.get() + 1);
-            if let Some(wait) = self.refuse_read.take() {
+            let after = self.refuse_read_after.get();
+            if after != 0 {
+                self.refuse_read_after.set(after - 1);
+            } else if let Some(wait) = self.refuse_read.take() {
                 return Err(MemoryError::ReadSuspended(Box::new(
                     carrick_guest_mem::MemoryReadSuspension {
                         wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
