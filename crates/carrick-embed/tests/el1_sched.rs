@@ -4064,11 +4064,25 @@ fn el1_fork_cow_resolves_in_guest() {
     }
 }
 
+/// The snapshot is captured by the carrier before teardown. Render that exact
+/// bounded store in-process; failures must not require a debugger attach.
+fn prepared_fork_copy_refusals() -> String {
+    let Some(counters) = read_el1_counters() else {
+        return "copy-refusal: carrier counters unavailable".into();
+    };
+    let mut rows = String::new();
+    counters
+        .write_copy_refusals(&mut rows)
+        .expect("write to String");
+    rows
+}
+
 /// Actual guest reads and writes with two live processes. VM-free descriptor
 /// checks cannot prove the backend's armed physical COW authority fires.
 #[test]
 fn el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes() {
     let _guard = common::guest_lock();
+    reset_el1_counters();
     let carrier = carrier_or_fail();
     let run = run_fixture(&carrier, &["prepared-fork"], Duration::from_secs(30));
     assert_eq!(
@@ -4078,8 +4092,9 @@ fn el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes() {
             .find(|line| line.starts_with("prepared-fork "))
             .unwrap_or(""),
         "prepared-fork inherited_zero=true prot_none_bytes=true two_live_isolation=true ok=true",
-        "guest output: {}",
-        run.result.stdout_utf8()
+        "guest output: {}\n{}",
+        run.result.stdout_utf8(),
+        prepared_fork_copy_refusals()
     );
 }
 
@@ -4087,6 +4102,7 @@ fn el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes() {
 #[test]
 fn el1_prepared_fork_poll_arguments_touched_after_fork() {
     let _guard = common::guest_lock();
+    reset_el1_counters();
     let carrier = carrier_or_fail();
     let run = run_fixture(&carrier, &["prepared-fork-touch"], Duration::from_secs(30));
     let output = run.result.stdout_utf8();
@@ -4094,11 +4110,13 @@ fn el1_prepared_fork_poll_arguments_touched_after_fork() {
         output.contains(
             "prepared-fork inherited_zero=true prot_none_bytes=true two_live_isolation=true ok=true"
         ),
-        "{output}"
+        "{output}\n{}",
+        prepared_fork_copy_refusals()
     );
     assert!(
         output.contains("pollfd_touched=true timespec_touched=true"),
-        "{output}"
+        "{output}\n{}",
+        prepared_fork_copy_refusals()
     );
 }
 
