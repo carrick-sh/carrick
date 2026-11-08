@@ -342,7 +342,8 @@ fn fork_exec_probe(futex: Option<u64>, bitset: u64, readlink: bool) {
         if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
             work.settled();
         }
-        memory.as_mut_bytes()[..15].copy_from_slice(b"/proc/self/exe\0");
+        let path = b"/proc/self/exe\0";
+        memory.as_mut_bytes()[..path.len()].copy_from_slice(path);
     }
     let mut cpu = crate::sched::FakeCpu::default();
     assert_eq!(fixture.slot.raw(), 0);
