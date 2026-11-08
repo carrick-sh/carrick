@@ -28,6 +28,16 @@ use carrick_guest_arch::{AddressContext, Asid, CpuId, RootGpa};
 
 use crate::asid::{AsidAllocator, AsidError, AsidGeneration};
 
+/// The retained service does not serve this exact host-file request.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct NativeHostFileRefused;
+
 /// Strong custody of an opaque byte source, independent of its original MM.
 /// The implementing source owner authenticates the handle and generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -44,15 +44,7 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
     fn root_fork_seed(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool;
 }
 
-/// The retained service does not serve this exact host-file request.
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-pub struct NativeHostFileRefused;
+pub use carrick_hal::fork_stock::NativeHostFileRefused;
 
 /// Opaque fallibly prepared image. Exact carrier custody retains this result
 /// until the ring consumes successor adoption or terminal cleanup drops it.
