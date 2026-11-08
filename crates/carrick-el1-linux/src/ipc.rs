@@ -5269,6 +5269,7 @@ mod tests {
         frame: TrapFrame,
         native: u64,
         queries: Vec<(usize, i32)>,
+        during_wait: Option<Box<dyn FnOnce()>>,
     }
     impl X86PollFrame {
         fn new(native: u64, args: [u64; 5]) -> Self {
@@ -5278,6 +5279,7 @@ mod tests {
                 frame,
                 native,
                 queries: Vec::new(),
+                during_wait: None,
             }
         }
     }
@@ -5325,6 +5327,9 @@ mod tests {
             _: crate::dispatch::PollSignalMask,
         ) -> Option<i64> {
             self.queries.push((entries.len(), timeout_ms));
+            if let Some(mutation) = self.during_wait.take() {
+                mutation();
+            }
             for entry in entries.iter_mut() {
                 entry.revents = entry.events & LINUX_POLLOUT;
             }
@@ -5618,6 +5623,54 @@ mod tests {
 
     const ZERO_TIMESPEC: [i64; 2] = [0, 0];
     const UNMAPPED: u64 = 0xffff_ffff_ffff_f000;
+
+    #[test]
+    fn x86_shared_poll_preserves_fields_changed_during_host_wait() {
+        let w = world();
+        let tables = delegated();
+        let file_table = w.task.linux.file_table.load(Ordering::Acquire).max(1);
+        let mut pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        crate::file_table::admit_host_fd(
+            &tables.fd_map,
+            &tables.opens,
+            &tables.objects,
+            file_table,
+            4,
+            pipe[1],
+            0,
+        )
+        .unwrap();
+        let fds = GuestUserBuffer::from_value(PollFd {
+            fd: 4,
+            events: LINUX_POLLOUT,
+            revents: 0,
+        });
+        let address = fds.arg();
+        let mut frame = X86PollFrame::new(
+            carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
+            [address, 1, 1000, 0, 0],
+        );
+        frame.during_wait = Some(Box::new(move || {
+            // SAFETY: the live guest buffer contains this pollfd throughout dispatch.
+            unsafe {
+                (address as *mut i32).write_unaligned(-1);
+                ((address + 4) as *mut i16).write_unaligned(LINUX_POLLIN);
+            }
+        }));
+        let route = dispatch_poll(&w, &mut frame, None, &tables);
+        let published = fds.get::<PollFd>(0);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert_eq!(route, CompletionRoute::Served);
+        assert_eq!(frame.queries, [(1, 1000)]);
+        assert_eq!(frame.frame.x[0] as i64, 1);
+        assert_eq!(published.fd, -1);
+        assert_eq!(published.events, LINUX_POLLIN);
+        assert_eq!(published.revents, LINUX_POLLOUT);
+    }
 
     /// ppoll(2)/poll(2): nfds above the caller's soft RLIMIT_NOFILE is
     /// EINVAL; at the limit the set is served. Linux reads the timespec and
