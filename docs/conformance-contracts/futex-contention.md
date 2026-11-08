@@ -335,3 +335,14 @@ The physical input-copy venue is Unsupported during mapping refusal, proving
 that it cannot substitute for the returned mapping notification. These
 VM-free witnesses replace physical mapping admission only, not scheduler or
 continuation logic; they do not prove signed HVF execution.
+
+The native adapter decodes relative expiry before authenticating a shared
+anonymous mapping, then moves the same `RelativeFutexWait` through either
+mapping or operand suspension. The four
+`native_futex_{mapping,word}_deadline_starts_at_first_attempt_{aarch64,x86}`
+bindings admit a one-second wait at tick 1000, refuse once, and resume at
+tick 2000. The parked timer must expire at 2000, never 3000. Mapping cases
+were red after the notification fix; word-copy cases already passed and
+remain controls. Timer and queue custody are the existing scheduler owners;
+there is no new deadline ledger or polling. Signed execution and same-image
+Docker timing remain higher-layer evidence not supplied by these fixtures.

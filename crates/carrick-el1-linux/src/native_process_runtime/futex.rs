@@ -50,9 +50,38 @@ struct Adapter<'e, 'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<
     copy: RefCell<&'e mut dyn UserCopy>,
     refusal: Cell<Option<CopyOutcome>>,
     shared: bool,
+    mapping_refusal: Option<NativeProcessError>,
     now: CounterTick,
     frequency: FutexFrequency,
     retained: Option<RelativeFutexWait>,
+}
+impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    Adapter<'_, '_, 'a, M, C, S>
+{
+    fn authenticate_mapping(&mut self, address: UserVa) -> Option<bool> {
+        if !self.shared {
+            return Some(true);
+        }
+        let mm = self
+            .entry
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.entry.key)
+            .ok()?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        match self.entry.service.futex_shared_private(&mm, address) {
+            Ok(admitted) => Some(admitted),
+            Err(error) => {
+                self.mapping_refusal = Some(error);
+                None
+            }
+        }
+    }
 }
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> FutexVenue
     for Adapter<'_, '_, 'a, M, C, S>
@@ -97,6 +126,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
         bitset: u32,
         limit: u32,
     ) -> Option<LifecycleOutcome> {
+        if !self.authenticate_mapping(address)? {
+            return None;
+        }
         let key = if self.shared {
             MmFutexKey::shared_private(address)?
         } else {
@@ -173,6 +205,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
     fn wait(&mut self, wait: FutexWait) -> Option<LifecycleOutcome> {
         if let Some(deadline) = wait.deadline {
             self.retained = Some(RelativeFutexWait { deadline });
+        }
+        // Policy decoded the original relative expiry before mapping admission.
+        // Both mapping and operand refusals now retain this same deadline.
+        if !self.authenticate_mapping(wait.address)? {
+            return None;
         }
         let key = if self.shared {
             MmFutexKey::shared_private(wait.address)?
@@ -280,41 +317,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Option<LifecycleOutcome> {
         let shared = call.shared_private_candidate();
         if let Some(candidate) = shared {
-            let mm = self
-                .runtime
-                .graph
-                .lock()
-                .owner
-                .task(self.key)
-                .ok()?
-                .native()
-                .resources()
-                .mm
-                .clone();
-            match self
-                .service
-                .futex_shared_private(&mm, UserVa::new(call.args[0]))
-            {
-                Ok(true) => call = candidate,
-                Ok(false) => return None,
-                Err(error @ (NativeProcessError::OwnerWait(_) | NativeProcessError::Busy)) => {
-                    let wait = match error {
-                        NativeProcessError::OwnerWait(wait) => Some(wait),
-                        _ => None,
-                    };
-                    return Some(
-                        self.retry_guest_input(
-                            carrick_core_abi::service::ServiceOperation::CarrierWork {
-                                entry: OwnerEntry::Syscall,
-                            },
-                            None,
-                            wait,
-                        )
-                        .unwrap_or_else(|error| self.run_failed(error.run_failure_reason())),
-                    );
-                }
-                Err(error) => return Some(self.run_failed(error.run_failure_reason())),
-            }
+            call = candidate;
         }
         if !call.admitted() {
             return None;
@@ -335,11 +338,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             copy: RefCell::new(copy),
             refusal: Cell::new(None),
             shared: shared.is_some(),
+            mapping_refusal: None,
             now,
             frequency,
             retained,
         };
         let result = carrick_personality_linux::sched::serve_futex(call, &mut adapter);
+        if let Some(error) = adapter.mapping_refusal {
+            return Some(match error {
+                NativeProcessError::OwnerWait(_) | NativeProcessError::Busy => {
+                    if let Some(retained) = adapter.retained {
+                        adapter.entry.retain_relative_futex_wait(retained);
+                    }
+                    let wait = match error {
+                        NativeProcessError::OwnerWait(wait) => Some(wait),
+                        _ => None,
+                    };
+                    adapter
+                        .entry
+                        .retry_guest_input(
+                            carrick_core_abi::service::ServiceOperation::CarrierWork {
+                                entry: OwnerEntry::Syscall,
+                            },
+                            None,
+                            wait,
+                        )
+                        .unwrap_or_else(|error| {
+                            adapter.entry.run_failed(error.run_failure_reason())
+                        })
+                }
+                error => adapter.entry.run_failed(error.run_failure_reason()),
+            });
+        }
         match adapter.refusal.get() {
             Some(CopyOutcome::Fault) => {
                 Some(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()))
