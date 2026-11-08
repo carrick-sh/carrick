@@ -48,3 +48,17 @@ It next exits 2 at `runtime.checkfds` with `errno=38` on descriptor 0 and
 `fatal error: cannot open standard fds`. Thus the table-allocation witness
 is green, but the issue's full `go version` output acceptance remains open.
 No unrelated syscall routing is changed to conceal that next failure.
+
+The initial-image handshake authenticates the shared ABI fingerprint before
+guest entry and again before publishing a completion. The embedded image header
+and boot request carry the same fact-derived fingerprint used by ARM's
+`check_image_abi`; a stale image or reply must produce
+`TrapError::ImageAbiMismatch`. This is a Carrick image compatibility invariant,
+not a Linux syscall contract. Checking the fingerprint costs one word comparison
+per admission and does not depend on the image's region or grant population.
+
+Witnesses: `production_boot_refuses_stale_layout_before_entry` exercises the
+production image loader with one fingerprint bit changed;
+`corrupted_guest_reply_cannot_change_host_grant_or_stack_geometry` checks
+completion refusal; the KVM `cpl0_initial_mm` suite boots matching images.
+ARM retains the `carrick-el1-abi` image-check tests.

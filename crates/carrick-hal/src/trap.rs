@@ -430,6 +430,10 @@ pub enum ZoneRestoreSite {
 
 #[derive(Debug, ::thiserror::Error)]
 pub enum TrapError {
+    /// A retained guest image or boot reply uses a different shared layout.
+    #[error("guest image ABI mismatch: expected {expected:#x}, found {found:#x}")]
+    ImageAbiMismatch { expected: u64, found: u64 },
+
     /// A created vCPU reached its first entry after carrier teardown began.
     /// The executor must retire through its ordinary owner-thread cleanup.
     #[error("carrier is closing before the vCPU's first run")]

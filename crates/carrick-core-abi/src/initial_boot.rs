@@ -3,7 +3,7 @@
 //! supervisor direct alias. No host pointer crosses this record.
 
 pub const X86_INITIAL_BOOT_MAGIC: u64 = u64::from_le_bytes(*b"CXRUN001");
-pub const X86_INITIAL_BOOT_VERSION: u32 = 6;
+pub const X86_INITIAL_BOOT_VERSION: u32 = 7;
 pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x10_1000;
 pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
 /// Physical stop after the initial MM is installed, before entering EL0.
@@ -27,6 +27,7 @@ pub struct X86InitialBootHeader {
     pub reserved: u32,
     pub entry_va: u64,
     pub peer_entry_va: u64,
+    pub layout_hash: u64,
 }
 
 #[repr(C)]
@@ -67,6 +68,8 @@ pub struct X86InitialBootRequest {
     /// The region prefix belonging to the executable, excluding PT_INTERP.
     pub executable_region_count: u32,
     pub reserved: u32,
+    /// Shared host/guest layout fingerprint authenticated before publication.
+    pub layout_hash: u64,
 }
 
 #[repr(C)]
@@ -99,8 +102,8 @@ pub struct X86InitialBootGrant {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<X86InitialBootHeader>() == 32);
-    assert!(core::mem::size_of::<X86InitialBootRequest>() == 200);
+    assert!(core::mem::size_of::<X86InitialBootHeader>() == 40);
+    assert!(core::mem::size_of::<X86InitialBootRequest>() == 208);
     assert!(core::mem::align_of::<X86InitialBootRequest>() == 8);
     assert!(core::mem::offset_of!(X86InitialBootRequest, magic) == 0);
     assert!(core::mem::offset_of!(X86InitialBootRequest, region_count) == 12);
