@@ -137,7 +137,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             ServiceOperation::Entropy { payload } => {
                 let pointer = self.native_service_pointer(
                     execution.context,
-                    KernelVa::new(payload.address().raw()),
+                    payload.ring_storage(),
                     payload.length().raw() as usize,
                     1,
                 )?;

@@ -26,6 +26,10 @@ impl EntropyPayloadDescriptor {
         }
         Some(Self { address, length })
     }
+    /// Ring-owned supervisor storage; carriers must authenticate the live mapping.
+    pub const fn ring_storage(self) -> carrick_guest_arch::KernelVa {
+        carrick_guest_arch::KernelVa::new(self.address.raw())
+    }
     pub const fn address(self) -> GuestVa {
         self.address
     }
@@ -127,6 +131,19 @@ fn valid_result(result: i64, capacity: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ring_storage_preserves_supervisor_address() {
+        let payload = super::EntropyPayloadDescriptor::checked(
+            carrick_guest_arch::GuestVa::new(0xffff_8000_0010_0000),
+            carrick_guest_arch::GuestLen::new(128),
+        )
+        .expect("bounded record");
+        assert_eq!(
+            payload.ring_storage(),
+            carrick_guest_arch::KernelVa::new(0xffff_8000_0010_0000)
+        );
+    }
+
     use super::*;
 
     #[test]
