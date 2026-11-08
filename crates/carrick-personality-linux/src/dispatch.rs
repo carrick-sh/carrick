@@ -73,6 +73,8 @@ pub enum Family {
     /// Typed native service (entropy on both ISAs, image replacement on ARM)
     /// after the shared entry owner authenticates the handoff.
     NativeService,
+    /// Path operation served through the caller's native file authority.
+    NativeHostFile,
     Unported,
 }
 
@@ -84,6 +86,9 @@ pub enum FamilyCompletion {
     /// Authenticated handoff to a carrier-owned native service. This is not
     /// an unported host crossing and must retain that distinction to EL1.
     NativeService,
+    /// Exact file service, with no host syscall replay. Completion copies
+    /// the carrier's bounded reply through the retained ring continuation.
+    NativeHostFile,
     FrameRestored,
     Complete(i64),
     CompleteWithWork(i64),
@@ -275,6 +280,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     }
     fn native_descriptor_owner(&self) -> bool {
         false
+    }
+    fn native_host_file(&mut self) -> FamilyCompletion {
+        FamilyCompletion::Forward
     }
     fn lifecycle_available(&self) -> bool {
         false
@@ -588,6 +596,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Sysinfo(_) => FamilyCompletion::Forward,
         Family::Ipc(_) => FamilyCompletion::Forward,
         Family::NativeService => FamilyCompletion::NativeService,
+        Family::NativeHostFile => pending.native_host_file(),
         Family::Signal(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
@@ -667,6 +676,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
     }
     match ordinal {
         nr if nr == crate::crossing::nr::GETRANDOM.raw() => Family::NativeService,
+        nr if nr == crate::crossing::nr::READLINKAT.raw() => Family::NativeHostFile,
         63 => Family::Read,
         64 | 66 => Family::Write,
         20 | 21 => Family::Descriptor,
@@ -989,7 +999,8 @@ pub const fn service_owner(ordinal: CanonicalNr, allocator_control: u64) -> Serv
         | Family::Identity(_)
         | Family::Sysinfo(_)
         | Family::Ipc(_)
-        | Family::NativeService => ServiceOwner::Ring(family),
+        | Family::NativeService
+        | Family::NativeHostFile => ServiceOwner::Ring(family),
         Family::Unported => {
             match crate::crossing::AllowedHostCrossing::from_canonical_aarch64(ordinal) {
                 Some(crossing) => match crossing.kind() {
@@ -1024,7 +1035,9 @@ pub enum CompletionRoute {
 pub fn completion_route(completion: FamilyCompletion, pending: bool) -> CompletionRoute {
     match completion {
         FamilyCompletion::HostCustody => CompletionRoute::HostCustody,
-        FamilyCompletion::NativeService => CompletionRoute::NativeService,
+        FamilyCompletion::NativeService | FamilyCompletion::NativeHostFile => {
+            CompletionRoute::NativeService
+        }
         FamilyCompletion::Complete(_)
         | FamilyCompletion::Switched(_)
         | FamilyCompletion::FrameRestored

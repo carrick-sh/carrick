@@ -2604,6 +2604,17 @@ impl<
             NativeDescriptorNamespace::Native(_)
         )
     }
+    fn native_host_file(&mut self) -> FamilyCompletion {
+        if self
+            .process
+            .as_deref()
+            .is_some_and(|process| process.owns_descriptor_namespace())
+        {
+            FamilyCompletion::NativeHostFile
+        } else {
+            FamilyCompletion::Forward
+        }
+    }
     fn may_serve_descriptor(&self) -> bool {
         let ordinal = self.frame.canonical_ordinal().raw();
         if self.native_descriptor_owner() {
