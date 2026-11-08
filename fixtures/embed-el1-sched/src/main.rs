@@ -3788,8 +3788,8 @@ fn main() {
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(16),
         ),
-        "prepared-fork" => prepared_fork::run(false),
-        "prepared-fork-touch" => prepared_fork::run(true),
+        "prepared-fork" => prepared_fork::run::<false>(),
+        "prepared-fork-touch" => prepared_fork::run::<true>(),
         "mapping-retirement" => mapping_retirement(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
