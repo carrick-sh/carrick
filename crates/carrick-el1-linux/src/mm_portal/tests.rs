@@ -3176,6 +3176,54 @@ fn anonymous_munmap_root_busy_requests_wait_without_counted_forward() {
 }
 
 #[test]
+fn anonymous_edit_wait_reruns_when_root_releases_between_probe_and_park() {
+    use carrick_core::wait::{EditWaitOutcome, coordinate_anonymous_edit_wait};
+    use carrick_sched_core::object_wait::ObjectWaitError;
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &zone.spaces, &view)
+        .with_zone(zone)
+        .unwrap();
+    let mut held = Some(portal.root(mm, 1).unwrap());
+    let incarnation = NonZeroU64::new(held.as_ref().unwrap().incarnation().raw()).unwrap();
+    let source = zone
+        .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+        .unwrap()
+        .notifications(incarnation)
+        .unwrap();
+    let mut probes = 0;
+    let mut parks = 0;
+    let outcome: EditWaitOutcome<()> = coordinate_anonymous_edit_wait(
+        &source,
+        None,
+        || {
+            probes += 1;
+            if probes == 1 {
+                drop(held.take());
+                Some(Some(SpaceWaitCause::Reservations))
+            } else {
+                Some(None)
+            }
+        },
+        |key, snapshot, token| {
+            parks += 1;
+            assert_eq!(key, source.key(SpaceWaitCause::Reservations));
+            assert_ne!(
+                source.observe(SpaceWaitCause::Reservations),
+                snapshot.observed()
+            );
+            Err((ObjectWaitError::Changed, token))
+        },
+    );
+    assert_eq!(outcome, EditWaitOutcome::NoConflict);
+    assert_eq!((probes, parks), (2, 1));
+}
+
+#[test]
 fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_writes() {
     use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
     use carrick_el1_abi::{Counters, CowDecline, CurrentTask, TrapFrame};
