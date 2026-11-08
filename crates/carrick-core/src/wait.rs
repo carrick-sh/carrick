@@ -61,6 +61,50 @@ pub fn park_object_record<'a, S, C: carrick_core_abi::EntryContext>(
 where
     S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
 {
+    park_object_record_with_recheck(zone, slot, request, completion, save_context, false, || {
+        true
+    })
+}
+
+/// Enroll an owned operation, then recheck its nonblocking predicate while
+/// the queue guard still closes publication. A false predicate or advanced
+/// revision rolls enrollment back and returns the operation to the caller.
+pub fn park_object_record_rechecked<'a, S, R, C: carrick_core_abi::EntryContext>(
+    zone: &'a ZoneTables<C>,
+    slot: SlotId,
+    request: ObjectParkRequest,
+    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    save_context: S,
+    still_blocked: R,
+) -> Result<ObjectParked<'a, C>, (ObjectWaitError, OperationToken)>
+where
+    S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
+    R: FnOnce() -> bool,
+{
+    park_object_record_with_recheck(
+        zone,
+        slot,
+        request,
+        completion,
+        save_context,
+        true,
+        still_blocked,
+    )
+}
+
+fn park_object_record_with_recheck<'a, S, R, C: carrick_core_abi::EntryContext>(
+    zone: &'a ZoneTables<C>,
+    slot: SlotId,
+    request: ObjectParkRequest,
+    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    save_context: S,
+    recheck: bool,
+    still_blocked: R,
+) -> Result<ObjectParked<'a, C>, (ObjectWaitError, OperationToken)>
+where
+    S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
+    R: FnOnce() -> bool,
+{
     if request.deadline.is_some() && !may_time_park(zone, slot) {
         return Err((ObjectWaitError::Occupied, request.operation));
     }
@@ -122,6 +166,7 @@ where
         Some(entry) => {
             guard.park_owner_until(snapshot, record, request.operation, deadline_ticks, entry)
         }
+        None if recheck => guard.park_rechecked(snapshot, record, request.operation, still_blocked),
         None => guard.park_until(snapshot, record, request.operation, deadline_ticks),
     };
     if let Err(error) = parked {

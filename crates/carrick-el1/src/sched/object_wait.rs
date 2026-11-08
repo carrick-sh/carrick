@@ -318,6 +318,58 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         result
     }
 
+    /// Save an anonymous edit and recheck its atomic revision after queue
+    /// enrollment, before publishing the park.
+    pub fn park_object_rechecked(
+        &mut self,
+        frame: &TrapFrame,
+        key: ObjectWaitKey,
+        snapshot: carrick_sched_core::object_wait::ObjectStateSnapshot,
+        resume: OperationResumePc,
+        operation: OperationToken,
+        still_blocked: impl FnOnce() -> bool,
+    ) -> Result<ObjectParked<'a, Aarch64ParkedContext>, (ObjectWaitError, OperationToken)> {
+        let zone = self.zone;
+        let slot = self.slot;
+        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            Aarch64ParkedContext,
+        >| { deliver_completion(zone, slot, effects) };
+        let request = carrick_core::wait::ObjectParkRequest::from_locked_snapshot(
+            key, snapshot, operation, None,
+        );
+        let mut replaced = None;
+        let result = carrick_core::wait::park_object_record_rechecked(
+            zone,
+            slot,
+            request,
+            &completion,
+            || {
+                let fresh = zone.slot(slot).current().is_none();
+                let record = match self.current_record() {
+                    Ok(record) => record,
+                    Err(_) => return Err(ObjectWaitError::Exhausted),
+                };
+                // SAFETY: this slot owns the current or newly allocated record.
+                let ctx = unsafe { zone.record(record).ctx_mut() };
+                replaced = Some((record, fresh, *ctx));
+                self.cpu
+                    .save(frame, ctx, crate::substrate::sched::CpuExitCause::Svc);
+                ctx.replace_saved_pc(resume.raw(), carrick_sched_core::SavedSyscallPc::AtSyscall);
+                Ok((record, fresh))
+            },
+            still_blocked,
+        );
+        if result.is_err()
+            && let Some((record, fresh, previous)) = replaced
+            && !fresh
+        {
+            // SAFETY: failed publication retains this slot's current record.
+            unsafe { *zone.record(record).ctx_mut() = previous };
+        }
+        result
+    }
+
     /// Consume the park ticket by leaving for the host at once, running
     /// nothing else on this vCPU: host work is pending here, and the host
     /// settles the parked thread at this boundary (its enrollment samples

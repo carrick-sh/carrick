@@ -200,7 +200,13 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
                 Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => None,
             }
         },
-        |key, snapshot, token| sched.park_object(frame, key, snapshot, resume, token, None),
+        |key, snapshot, token| {
+            sched.park_object_rechecked(frame, key, snapshot, resume, token, || {
+                SpaceWaitCause::ALL.into_iter().any(|cause| {
+                    source.key(cause) == key && source.observe(cause) == snapshot.observed()
+                })
+            })
+        },
     );
     match outcome {
         EditWaitOutcome::Parked(parked) => {
