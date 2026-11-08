@@ -4411,6 +4411,11 @@ fn owner_fork_census_allocates_for_live_graph_not_physical_arena_capacity() {
 // range admission without monopolizing the MM descriptor editor.
 #[test]
 fn prepared_copy_overlapping_munmap_waits_before_any_mutation() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1_abi::{Counters, CurrentTask, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceWaitCause};
+
     let region = Region::new();
     let spaces = AddressSpaces::new();
     let mm = admit(&region, &spaces, 77, ROOT, 2, 0);
@@ -4434,6 +4439,41 @@ fn prepared_copy_overlapping_munmap_waits_before_any_mutation() {
     let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
         .unwrap()
         .unwrap();
+    let task = CurrentTask::new();
+    task.execution.task.store(101, Ordering::Relaxed);
+    task.mm.thread_generation.store(1, Ordering::Relaxed);
+    task.mm.key.store(mm.raw(), Ordering::Relaxed);
+    let counters = Counters::default();
+    let arenas = [&tables];
+    let mut editor = ForkAnonymousEditor {
+        arenas: &arenas,
+        pool: TableWindow {
+            words: tables.words.as_ptr().cast_mut(),
+            physical_base: tables.base,
+            byte_len: tables.words.len() * 8,
+        },
+    };
+    let mut frame = TrapFrame {
+        slot: 0,
+        elr: 0x40004,
+        ..TrapFrame::default()
+    };
+    frame.x[0] = VA;
+    frame.x[1] = 4096;
+    frame.x[8] = 215;
+    assert_eq!(
+        serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &task,
+            SpaceAccess::source_free(&spaces),
+            region.table(),
+            &mut editor,
+            None,
+        ),
+        DelegatedAnonymous::Contended(SpaceWaitCause::PreparedOverlap)
+    );
+    assert_eq!(counters.forwarded[215].load(Ordering::Relaxed), 0);
     let mut root = portal.root(mm, 1).unwrap();
     assert!(
         matches!(
