@@ -25,6 +25,9 @@ pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_REMOVEDIR: u64 = 0x200;
 /// `linkat` follows a final source symlink.
 pub const LINUX_AT_SYMLINK_FOLLOW: u64 = 0x400;
+pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+pub const LINUX_UTIME_NOW: i64 = (1 << 30) - 1;
+pub const LINUX_UTIME_OMIT: i64 = (1 << 30) - 2;
 pub use capability::{
     CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, CAP_BLOCK_SUSPEND, CAP_BPF,
     CAP_CHECKPOINT_RESTORE, CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER,

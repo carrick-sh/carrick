@@ -131,6 +131,12 @@ pub enum HostFileCall {
         newpath: u64,
         flags: u64,
     },
+    Utimensat {
+        dirfd: i32,
+        path: u64,
+        times: u64,
+        flags: u64,
+    },
     Faccessat {
         dirfd: i32,
         path: u64,
@@ -254,6 +260,12 @@ impl HostFileCall {
                 path: args[1],
                 flags: args[2],
                 mode: args[3],
+            },
+            c if c == nr::UTIMENSAT => Self::Utimensat {
+                dirfd: fd,
+                path: args[1],
+                times: args[2],
+                flags: args[3],
             },
             c if c == nr::MKDIRAT => Self::Mkdirat {
                 dirfd: fd,
@@ -727,6 +739,78 @@ fn stage_call(
                 len: LINUX_STAT_BYTES,
             },
         )?,
+        HostFileCall::Utimensat {
+            dirfd,
+            path,
+            times,
+            flags,
+        } => {
+            if flags & !carrick_syscall_abi::LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            let words = if times == 0 {
+                [
+                    0,
+                    carrick_syscall_abi::LINUX_UTIME_NOW as u64,
+                    0,
+                    carrick_syscall_abi::LINUX_UTIME_NOW as u64,
+                ]
+            } else {
+                let mut bytes = [0u8; 32];
+                if !user.copy_in(&mut bytes, times) {
+                    return Some(HostFileStage::Fault {
+                        address: times,
+                        access: Access::Read,
+                    });
+                }
+                let mut words = [0; 4];
+                for (word, bytes) in words.iter_mut().zip(bytes.chunks_exact(8)) {
+                    let Ok(bytes) = bytes.try_into() else {
+                        return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+                    };
+                    *word = u64::from_le_bytes(bytes);
+                }
+                let valid = |nsec: i64| {
+                    (0..1_000_000_000).contains(&nsec)
+                        || nsec == carrick_syscall_abi::LINUX_UTIME_NOW
+                        || nsec == carrick_syscall_abi::LINUX_UTIME_OMIT
+                };
+                if !valid(words[1] as i64) || !valid(words[3] as i64) {
+                    return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+                }
+                words
+            };
+            let flags = flags as u32
+                | if times == 0 {
+                    host_file::UTIMENS_NULL_TIMES
+                } else {
+                    0
+                };
+            if path == 0 {
+                if dirfd == LINUX_AT_FDCWD {
+                    return Some(errno(carrick_syscall_abi::LINUX_EFAULT));
+                }
+                return Some(match staging.descriptor(dirfd)? {
+                    NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+                    NativeDescriptor::InZone(_) => HostFileStage::Returned(SyscallResult::new(0)),
+                    NativeDescriptor::HostBacked { .. } => {
+                        staging.request(HostFileOp::SetFdTimes, dirfd, flags, words, &[], None)
+                    }
+                });
+            }
+            let path = match staging.path_input(user, dirfd, path)? {
+                Ok(path) => path,
+                Err(stage) => return Some(stage),
+            };
+            staging.request(
+                HostFileOp::Utimensat,
+                LINUX_AT_FDCWD,
+                flags,
+                words,
+                &path,
+                None,
+            )
+        }
         HostFileCall::Mkdirat { dirfd, path, mode } => {
             let path = match staging.path_input(user, dirfd, path)? {
                 Ok(path) => path,
