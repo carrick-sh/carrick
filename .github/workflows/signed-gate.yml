@@ -64,54 +64,44 @@ jobs:
           path: ${{ runner.temp }}/request/
           if-no-files-found: error
 
-  signed-fixtures:
+  # The merge base's fixture bundle comes only from main's own publisher:
+  # the kernel-runtime push run that built exactly that commit. Trusted main
+  # code authenticates the producing run (repository, workflow, main branch,
+  # event) and blocks when no such bundle exists. No job builds fixtures from
+  # candidate code; both paired runs restore this one bundle (#1889).
+  base-fixtures:
     needs: authorize
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    # main's publisher takes up to 60 minutes; the fetcher waits up to 75.
+    timeout-minutes: 90
     permissions:
       contents: read
-    env:
-      FIXTURE_SHA: ${{ needs.authorize.outputs.sha }}
+      actions: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.authorize.outputs.sha }}
+          ref: main
           persist-credentials: false
-
-      - name: Verify native ARM Linux publisher
-        run: |
-          test "$(uname -s)" = Linux
-          test "$(uname -m)" = aarch64
-
-      - name: Test fixture relay transport and fallback
-        run: scripts/ci/test-fixture-relay.sh
-
-      - name: Install pinned Rust toolchain and guest targets
-        run: rustup show active-toolchain
-
-      - name: Install just
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - uses: actions/download-artifact@v4
         with:
-          tool: just
-
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
-
-      - name: Publish exact-SHA fixture bundle
-        run: just fixtures-publish "$FIXTURE_SHA"
-
-      - name: Upload exact-SHA fixture bundle
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - name: Fetch the merge base's trusted fixture bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo run --locked -p carrick-xtask -- signed-gate base-fixtures
+          --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/base-fixtures"
+      - name: Upload the trusted base fixture bundle
         uses: actions/upload-artifact@v4
         with:
-          name: signed-fixtures-${{ needs.authorize.outputs.sha }}-${{ github.run_attempt }}
-          path: target/fixtures/published/${{ needs.authorize.outputs.sha }}/*.tar.gz
+          name: signed-base-fixtures-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/base-fixtures/
           if-no-files-found: error
           compression-level: 0
 
   gate:
-    needs: [authorize, signed-fixtures]
+    needs: [authorize, base-fixtures]
     runs-on: [self-hosted, macOS, ARM64, carrick-signed-gate]
     # Paired execution (#1884): the merge base and then the candidate run on
     # this one Mac, each about 22-35 min (60 min worst observed), under one
@@ -161,7 +151,7 @@ jobs:
           path: ${{ runner.temp }}/request
       - uses: actions/download-artifact@v4
         with:
-          name: signed-fixtures-${{ needs.authorize.outputs.sha }}-${{ github.run_attempt }}
+          name: signed-base-fixtures-${{ github.run_attempt }}
           path: ${{ runner.temp }}/signed-fixtures
       - name: Select the unique content-addressed archive
         id: fixture
@@ -172,12 +162,12 @@ jobs:
           bundles=("$RUNNER_TEMP"/signed-fixtures/*.tar.gz)
           test "${#bundles[@]}" -eq 1
           printf 'bundle=%s\n' "${bundles[0]}" >> "$GITHUB_OUTPUT"
-      # Both runs restore this one candidate bundle; a base whose fixture
-      # inputs differ is refused rather than served by another bundle.
+      # Both runs restore the merge base's trusted bundle; a candidate whose
+      # fixture inputs differ is refused rather than served by its own build.
       - name: Execute merge base and approved SHA on this Mac under one lease
         env:
           CARRICK_RUN_ID: signed-gate-${{ github.run_id }}-${{ github.run_attempt }}
-          # Same-run artifact; no API credential is passed to candidate code.
+          # Trusted base artifact; no API credential is passed to candidate code.
           CARRICK_SIGNED_FIXTURE_BUNDLE: ${{ steps.fixture.outputs.bundle }}
         run: >-
           cargo run --locked -p carrick-xtask -- signed-gate execute
@@ -251,7 +241,7 @@ jobs:
   # trusted-hardware-pr.yml. Never allow skipped authorization to pass a group.
   signed-queue-gate:
     name: Signed queue gate
-    needs: [authorize, signed-fixtures, gate, publish]
+    needs: [authorize, base-fixtures, gate, publish]
     if: always() && github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -259,7 +249,7 @@ jobs:
       - name: Require a published PASS for this merge group
         env:
           AUTHORIZE: ${{ needs.authorize.result }}
-          FIXTURES: ${{ needs.signed-fixtures.result }}
+          FIXTURES: ${{ needs.base-fixtures.result }}
           GATE: ${{ needs.gate.result }}
           PUBLISH: ${{ needs.publish.result }}
         run: |

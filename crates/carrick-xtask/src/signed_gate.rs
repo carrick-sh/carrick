@@ -41,6 +41,18 @@ pub enum SignedGateAction {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Fetch the merge base's fixture bundle from an authenticated main-push
+    /// run of the trusted fixture publisher (kernel-runtime.yml), keyed by
+    /// `request.base`. A missing trusted bundle blocks.
+    BaseFixtures {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        /// Bound on waiting for main's publisher to upload the bundle.
+        #[arg(long, default_value_t = 75)]
+        wait_minutes: u64,
+    },
     /// Run the merge base and the candidate on macOS, each in a new detached
     /// worktree, under one exclusive host lease and one fixture bundle.
     Execute {
@@ -48,7 +60,8 @@ pub enum SignedGateAction {
         request: PathBuf,
         #[arg(long)]
         output: PathBuf,
-        /// Same-run exact-SHA archive; admission also checks fixture input identity.
+        /// The merge base's trusted archive (`base-fixtures`); admission checks
+        /// its publishing SHA and each checkout's fixture input identity.
         #[arg(long, env = "CARRICK_SIGNED_FIXTURE_BUNDLE")]
         fixture_bundle: PathBuf,
     },
@@ -735,12 +748,141 @@ fn logged(command: &mut Command, lease: &HostLease, log: &Path) -> Result<bool, 
         .map_err(|e| fail(e.to_string()))?;
     Ok(status.success())
 }
-/// Admit the same-run fixture archive before any installation or guest work.
+/// main's own fixture publisher: kernel-runtime.yml uploads
+/// `signed-fixtures-<sha>` on every push to main (#1581).
+const FIXTURE_WORKFLOW: &str = ".github/workflows/kernel-runtime.yml";
+const FIXTURE_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A run may supply the base's fixture authority only if it is main's own
+/// fixture publisher building exactly `base` in this repository: a push to
+/// main, or an owner dispatch on main.
+pub fn trusted_fixture_run(run: &Value, base: &str) -> bool {
+    run["path"] == FIXTURE_WORKFLOW
+        && run["head_branch"] == "main"
+        && run["head_sha"] == base
+        && run["repository"]["full_name"] == REPOSITORY
+        && run["head_repository"]["full_name"] == REPOSITORY
+        && (run["event"] == "push"
+            || (run["event"] == "workflow_dispatch"
+                && run["actor"]["login"].as_str().is_some_and(allowed)
+                && run["triggering_actor"]["login"]
+                    .as_str()
+                    .is_some_and(allowed)))
+}
+
+/// Download the merge base's bundle from its trusted producer. The newest
+/// trusted run holding a live artifact wins; untrusted runs are never asked.
+/// Waits (bounded) while a trusted run may still upload; blocks when none can.
+fn base_fixtures(
+    request_path: &Path,
+    output: &Path,
+    wait_minutes: u64,
+) -> Result<(), ReceiptError> {
+    let request: Request =
+        serde_json::from_value(read_json(request_path)?).map_err(|e| fail(e.to_string()))?;
+    let base = sha(&request.base)?;
+    let name = format!("signed-fixtures-{base}");
+    let refuse = |why: String| fail(format!("no trusted base fixture bundle for {base}: {why}"));
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(wait_minutes.saturating_mul(60));
+    loop {
+        let mut runs: Vec<Value> = pages(
+            &format!(
+                "repos/{REPOSITORY}/actions/workflows/kernel-runtime.yml/runs?branch=main&head_sha={base}&per_page=100"
+            ),
+            Some("workflow_runs"),
+        )?
+        .into_iter()
+        .filter(|run| trusted_fixture_run(run, &base))
+        .collect();
+        runs.sort_by_key(|run| std::cmp::Reverse(run["id"].as_u64().unwrap_or(0)));
+        let mut pending = false;
+        for run in &runs {
+            let id = run["id"]
+                .as_u64()
+                .ok_or_else(|| refuse("trusted run without an ID".into()))?;
+            let artifacts = pages(
+                &format!("repos/{REPOSITORY}/actions/runs/{id}/artifacts?per_page=100"),
+                Some("artifacts"),
+            )?;
+            if artifacts
+                .iter()
+                .any(|a| a["name"] == name.as_str() && a["expired"] == false)
+            {
+                return download_base_fixtures(run, id, &name, output);
+            }
+            pending |= run["status"] != "completed";
+        }
+        if !runs.is_empty() && !pending {
+            return Err(refuse(format!(
+                "{} trusted main run(s) completed without a live {name} artifact",
+                runs.len()
+            )));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(refuse(if runs.is_empty() {
+                format!("no main-push run of {FIXTURE_WORKFLOW} for this commit")
+            } else {
+                format!("timed out after {wait_minutes} min waiting for {name}")
+            }));
+        }
+        std::thread::sleep(FIXTURE_POLL);
+    }
+}
+
+fn download_base_fixtures(
+    run: &Value,
+    id: u64,
+    name: &str,
+    output: &Path,
+) -> Result<(), ReceiptError> {
+    fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
+    checked(
+        "gh",
+        &[
+            "run",
+            "download",
+            &id.to_string(),
+            "--repo",
+            REPOSITORY,
+            "--name",
+            name,
+            "--dir",
+            &output.to_string_lossy(),
+        ],
+        None,
+    )?;
+    let bundles = fs::read_dir(output)
+        .map_err(|e| fail(e.to_string()))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tar.gz"))
+        .count();
+    if bundles != 1 {
+        return Err(fail(format!(
+            "trusted base fixture artifact {name} held {bundles} archives, expected one"
+        )));
+    }
+    write(
+        &output.join("provenance.json"),
+        serde_json::to_vec_pretty(&json!({
+            "run_id": id,
+            "workflow": run["path"],
+            "event": run["event"],
+            "head_branch": run["head_branch"],
+            "head_sha": run["head_sha"],
+            "artifact": name,
+        }))
+        .map_err(|e| fail(e.to_string()))?,
+    )
+}
+
+/// Admit the trusted fixture archive before any installation or guest work.
 /// General fixture reuse permits equal inputs across commits; this Actions
-/// lane additionally requires the authorized publisher's exact commit. The
-/// paired base run checks out `checkout` (the merge base) and restores the
-/// candidate's bundle (`publisher`): its inputs must equal the base tree's,
-/// or the pair is refused rather than served by a substitute bundle.
+/// lane additionally requires the authorized publisher's exact commit. Both
+/// paired runs restore the bundle main published for the merge base
+/// (`publisher`): the base checkout must match it exactly, and the candidate
+/// checkout (`checkout`) must have equal fixture inputs, or the pair is
+/// refused rather than served by a candidate-built bundle (#1889).
 pub fn verify_fixture_artifact(
     root: &Path,
     bundle: &Path,
@@ -828,8 +970,8 @@ pub struct PairedRun {
 }
 
 /// Run the merge base (unless this is a main baseline) and then the candidate
-/// on this Mac, under one exclusive host lease and with the candidate's
-/// fixture bundle. Publication compares the candidate only with this paired
+/// on this Mac, under one exclusive host lease and with the merge base's
+/// trusted fixture bundle. Publication compares the candidate only with this paired
 /// base, so host or fixture differences cannot surface as NEW failures (#1884).
 fn execute(
     root: &Path,
@@ -887,7 +1029,7 @@ pub fn execute_pair(
             fs::create_dir_all(&base_dir).map_err(|e| fail(e.to_string()))?;
             run(&PairedRun {
                 commit: request.base.clone(),
-                fixture_publisher: request.sha.clone(),
+                fixture_publisher: request.base.clone(),
                 output: base_dir.clone(),
                 receipt_name: BASE_RECEIPT,
             })
@@ -902,7 +1044,7 @@ pub fn execute_pair(
         }
         run(&PairedRun {
             commit: request.sha.clone(),
-            fixture_publisher: request.sha.clone(),
+            fixture_publisher: request.base.clone(),
             output: output.to_path_buf(),
             receipt_name: CANDIDATE_RECEIPT,
         })?;
@@ -1128,9 +1270,9 @@ fn execute_one(
         // Capture on the execution Mac, including when the commit predates
         // host-aware accept receipts. Never infer identity on the hosted publisher.
         receipt.host_identity = crate::accept::SignedHostIdentity::capture();
-        // Both runs of a pair restore one bundle. Record its identity with this
-        // trusted executor's validation, so a base commit whose accept predates
-        // fixture content identity remains comparable with its candidate.
+        // Both runs of a pair restore the base's trusted bundle. Record its
+        // identity with this trusted executor's validation, so a base commit
+        // whose accept predates content identity remains comparable.
         let trusted = crate::accept::verify_signed_fixtures(&tree)
             .map_err(|e| fail(format!("trusted fixture validation: {e}")))?;
         if let Some(recorded) = &receipt.fixture_validation
@@ -1367,6 +1509,11 @@ fn publish(
 pub fn run(root: &Path, args: SignedGateArgs) -> Result<(), ReceiptError> {
     match args.action {
         SignedGateAction::Prepare { event, output } => prepare(&event, &output),
+        SignedGateAction::BaseFixtures {
+            request,
+            output,
+            wait_minutes,
+        } => base_fixtures(&request, &output, wait_minutes),
         SignedGateAction::Execute {
             request,
             output,
