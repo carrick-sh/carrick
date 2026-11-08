@@ -784,6 +784,8 @@ surfaces = [
   { path = "crates/carrick-personality-linux/src/lifecycle.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-personality-linux/src/lifecycle.rs", contract = "kernel.mm.private-file-fixed-replacement" },
   { path = "crates/carrick-personality-linux/src/lifecycle.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-personality-linux/src/mm/madvise.rs", contract = "kernel.mm.anonymous-discard" },
+  { path = "crates/carrick-personality-linux/src/mm/madvise/tests.rs", contract = "kernel.mm.anonymous-discard" },
   { path = "crates/carrick-personality-linux/src/mm/reservation.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-personality-linux/src/native_host_file.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-personality-linux/src/native_host_file/tests.rs", contract = "kernel.native.host-file-venue" },

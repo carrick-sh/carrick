@@ -195,8 +195,7 @@ pub fn plan<C: Coverage>(
         .checked_add(length.raw())
         .ok_or(LINUX_ENOMEM)?;
     let end = raw_end
-        .checked_add(page_size - 1)
-        .map(|end| end & !(page_size - 1))
+        .checked_next_multiple_of(page_size)
         .ok_or(LINUX_ENOMEM)?;
     let range = Range {
         start: address,
