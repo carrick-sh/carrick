@@ -484,7 +484,7 @@ fn fork_exec_probe(futex: Option<u64>, bitset: u64, readlink: bool) {
             dispatcher
                 .serve_native_host_file(bytes, custody.executable())
                 .unwrap();
-            ticket.complete(true).unwrap();
+            assert!(ticket.complete(true).is_ok());
             fixture
                 .zone
                 .object_wait(

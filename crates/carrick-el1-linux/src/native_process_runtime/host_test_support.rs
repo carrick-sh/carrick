@@ -402,6 +402,14 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         }
         Ok(())
     }
+    fn copy_syscall_output(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        self.copy_owned_bytes(mm, address, bytes)
+    }
     fn copy_owned_bytes(
         &mut self,
         mm: &Self::Mm,
