@@ -74,6 +74,24 @@ fn receive(fd: i32) -> u8 {
     byte
 }
 
+fn kill_and_reap(pid: i32) {
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        if n == pid || (n < 0 && errno() == libc::ECHILD) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("cleanup could not reap participant {pid}");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn reap(pid: i32) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut status = 0;
@@ -85,9 +103,7 @@ fn reap(pid: i32) {
         }
         assert_eq!(n, 0);
         if Instant::now() >= deadline {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
+            kill_and_reap(pid);
             panic!("bounded reap of {pid}");
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -263,9 +279,8 @@ struct Population(Vec<(i32, i32, i32)>);
 impl Drop for Population {
     fn drop(&mut self) {
         for child in &self.0 {
+            kill_and_reap(child.0);
             unsafe {
-                libc::kill(child.0, libc::SIGKILL);
-                libc::waitpid(child.0, std::ptr::null_mut(), libc::WNOHANG);
                 libc::close(child.1);
                 libc::close(child.2);
             }
@@ -356,9 +371,10 @@ fn main() {
     for child in [first, second] {
         send(child.1, b'Q');
     }
-    while let Some(child) = population.0.last().copied() {
+    while let Some(child) = population.0.pop() {
+        // reap owns timeout cleanup; a failed exit must not leave a reaped
+        // PID in the population's Drop path.
         reap(child.0);
-        population.0.pop(); // Never leave a reaped PID in failure cleanup.
         unsafe {
             libc::close(child.1);
             libc::close(child.2);
