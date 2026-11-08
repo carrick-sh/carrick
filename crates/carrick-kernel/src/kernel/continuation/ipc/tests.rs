@@ -1469,3 +1469,137 @@ fn el1_ipc_vector_handback_preserves_short_prefix_at_vector_boundary() {
     );
     assert_eq!(w.unread(object), 1);
 }
+
+/// The host owns the same admitted poll even if another task edits the
+/// pollfd/timespec or closes and reuses its numeric descriptor while parked.
+fn poll_handback_retains_admission(cause: Option<IpcCause>) {
+    const DEADLINE: u64 = 5_000_000_000;
+    let w = world();
+    let (reader, _writer, object) = w.pipe();
+    let token = w.operation(reader, IpcOpKind::PollWait, 0, 73);
+    let mut op = w.region.operation(&token).unwrap();
+    op.orig_x0 = BUF;
+    op.value = carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes([
+        reader.0 as u8,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+    ]));
+    op.deadline = carrick_el1_abi::ipc::IpcCounterDeadline::at(DEADLINE);
+    op.handback = IpcHandback::Continue;
+    w.region.update_operation(&token, op).unwrap();
+    let raw = token.into_raw();
+    let clock = |now| Clocked {
+        wakes: Wakes::default(),
+        now,
+    };
+    let mut mem = memory(&[0xff; 16]); // edited inputs must never be re-imported
+    let outcome = complete_handback(
+        &caller(),
+        w.region,
+        IpcOpToken::from_raw(raw),
+        MM,
+        &mut mem,
+        cause,
+        &clock(1_000_000),
+    )
+    .unwrap();
+    let IpcHostOutcome::Blocked { token, .. } = outcome else {
+        panic!("ppoll must retain its admission without any argument-register replay: {outcome:?}");
+    };
+    let saved = w.region.operation(&token).unwrap();
+    assert_eq!(saved.deadline, op.deadline);
+    assert_eq!(saved.value, op.value);
+    assert_eq!(saved.pin, op.pin);
+    assert_eq!(saved.object, op.object);
+    assert_eq!(token.into_raw(), raw);
+    // Close the admitted fd and install an unrelated pipe at that number.
+    let description = w.region.fd(HostIpcWait).close(w.table, reader).unwrap();
+    assert!(
+        description.is_none(),
+        "the operation keeps its description alive"
+    );
+    let (replacement, _, _) = w.pipe();
+    assert_eq!(replacement, reader);
+    // The original endpoint becomes ready after the numeric fd was reused.
+    w.region
+        .lock(object, &HostIpcWait)
+        .unwrap()
+        .pipe()
+        .unwrap()
+        .try_write(b"x");
+    let result = complete_handback(
+        &caller(),
+        w.region,
+        IpcOpToken::from_raw(raw),
+        MM,
+        &mut mem,
+        None,
+        &clock(DEADLINE - 1),
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        IpcHostOutcome::Complete {
+            result: 1,
+            sigpipe: false
+        }
+    );
+    assert_eq!(
+        mem.read_bytes(BUF, 8).unwrap(),
+        [reader.0 as u8, 0, 0, 0, 1, 0, 1, 0]
+    );
+    assert!(w.region.operation(&IpcOpToken::from_raw(raw)).is_err());
+}
+
+#[test]
+fn ppoll_readiness_handback_retains_snapshot_pin_and_original_deadline() {
+    poll_handback_retains_admission(None);
+}
+
+#[test]
+fn ppoll_control_interruption_retains_snapshot_pin_and_original_deadline() {
+    poll_handback_retains_admission(Some(IpcCause::Control));
+}
+
+#[test]
+fn ppoll_deadline_elapsed_during_park_completes_without_a_fresh_relative_wait() {
+    let w = world();
+    let (reader, _, _) = w.pipe();
+    let token = w.operation(reader, IpcOpKind::PollWait, 0, 73);
+    let mut op = w.region.operation(&token).unwrap();
+    op.orig_x0 = BUF;
+    op.value = carrick_el1_abi::ipc::IpcEventValue(1 << 32 | reader.0 as u64);
+    op.deadline = carrick_el1_abi::ipc::IpcCounterDeadline::at(5_000_000_000);
+    op.handback = IpcHandback::Continue;
+    w.region.update_operation(&token, op).unwrap();
+    let mut mem = memory(&[0xff; 16]);
+    let result = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut mem,
+        None,
+        &Clocked {
+            wakes: Wakes::default(),
+            now: 5_000_000_000,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        IpcHostOutcome::Complete {
+            result: 0,
+            sigpipe: false
+        }
+    );
+    assert_eq!(
+        mem.read_bytes(BUF, 8).unwrap(),
+        [reader.0 as u8, 0, 0, 0, 1, 0, 0, 0]
+    );
+}
