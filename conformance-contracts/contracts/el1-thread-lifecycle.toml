@@ -73,6 +73,7 @@ embed = [
   "carrick-embed::el1_files::{terminal_save_vacates_both_roots_before_publication,terminal_save_second_root_write_failure_retains_ownership} (signed production HvpatchPersistentExecutor::save; seed both hardware roots with the owned process root, inspect before detached backend publication; partial second-write failure retains binding and worker ownership; execution pending on Mac)",
   "carrick-embed::el1_sched::{el1_thread_lifecycle_spawn_slope,el1_thread_lifecycle_tgkill_right_after_clone,el1_thread_lifecycle_mask_storm_exactly_once,el1_thread_lifecycle_cleartid_tid_reuse,el1_thread_lifecycle_rlimit_nproc_exact,el1_thread_lifecycle_fork_during_clone_storm,el1_thread_lifecycle_exit_group_and_exec_during_clone_storm,el1_thread_lifecycle_ptrace_traceclone,el1_thread_lifecycle_seccomp_clone_filter,el1_thread_lifecycle_parked_threads_beyond_executor_pool}",
   "carrick-vmm-kvm::cpl0_lifecycle::x5_shared_clone_exit (real KVM; two live MMs, clone/exit/clear-tid wake, 16/64/256 births per MM; host and guest use the same sidecar)",
+  "carrick-vmm-kvm::cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent (production image and executor pool; guest clone, parent/child handshake, child raw exit and surviving parent; red on ENOSYS(38), no production thread-birth acceptance yet)",
   "carrick-vmm-kvm::cpl0_fork_e2e (real KVM; fork/COW/wait4/rusage and issued child PID; lifecycle sidecar placement red/green)",
 ]
 
