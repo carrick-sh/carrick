@@ -989,23 +989,20 @@ struct StagedHostFile {
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) fn native_entropy_stage(
     frame: &TrapFrame,
-    validator: &impl file::MemoryValidator,
 ) -> (
     carrick_guest_arch::UserVa,
     usize,
-    u32,
+    crate::native_process_runtime::NativeEntropyFlags,
     carrick_guest_arch::GuestLen,
 ) {
-    let capacity =
-        frame.x[1].min(carrick_core_abi::service::entropy::MAX_ENTROPY_BYTES as u64) as usize;
-    let capacity = validator
-        .writable_bytes(frame.x[0], capacity)
-        .max(validator.readable_bytes(frame.x[0], capacity));
-    (
-        carrick_guest_arch::UserVa::new(frame.x[0]),
-        capacity,
-        frame.x[2] as u32,
-        carrick_guest_arch::GuestLen::new(frame.x[1]),
+    crate::native_process_runtime::native_entropy_stage(
+        crate::native_process_runtime::NativeEntropyArgs {
+            address: carrick_guest_arch::UserVa::new(frame.x[0]),
+            length: carrick_guest_arch::GuestLen::new(frame.x[1]),
+            flags: crate::native_process_runtime::NativeEntropyFlags::from_bits_retain(
+                frame.x[2] as u32,
+            ),
+        },
     )
 }
 
@@ -1016,7 +1013,7 @@ enum NativeServiceStage {
     Entropy {
         address: carrick_guest_arch::UserVa,
         capacity: usize,
-        flags: u32,
+        flags: crate::native_process_runtime::NativeEntropyFlags,
         requested: carrick_guest_arch::GuestLen,
     },
     Fault(carrick_guest_arch::FaultInfo),
@@ -1262,8 +1259,7 @@ fn arm_native_service_exit(
             // staging it here would pre-empt the settlement forever.
             None if action != Action::Forward => NativeServiceStage::Operation,
             None if frame.x[8] == 278 => {
-                let (address, capacity, flags, requested) =
-                    native_entropy_stage(frame, &file::HardwareValidator);
+                let (address, capacity, flags, requested) = native_entropy_stage(frame);
                 NativeServiceStage::Entropy {
                     address,
                     capacity,

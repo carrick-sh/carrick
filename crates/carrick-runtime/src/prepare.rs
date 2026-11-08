@@ -318,7 +318,7 @@ fn run_prepared_kvm_pool_with_debug(
     use carrick_kernel::kernel::objects::MigratableTaskState;
     use carrick_kernel::kernel::scheduler::{CpuAffinity, GuestCpuId, GuestCpuPolicy};
     let parts = machine.into_worker_parts(max_traps)?;
-    let (root_cpu, physical) = parts.into_factory();
+    let (root_cpu, physical) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let physical = Arc::new(physical);
     let reporter = Arc::new(carrick_kernel::compat::CompatReporter::default());
     let stats = Arc::new(executor::cpl0::Cpl0ForwardStats::default());

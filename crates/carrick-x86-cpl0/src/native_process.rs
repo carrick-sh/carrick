@@ -402,6 +402,146 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     type Mm = Mm;
     type PreparedMm = Prepared;
     type Born = Box<Born>;
+    fn native_service_doorbell(&mut self) -> bool {
+        // SAFETY: shared owner published the exact retained notice and released
+        // its graph/MM guards. The stopped host consumes that notice, not RAX.
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") carrick_x86_carrier::entry::NATIVE_SERVICE_PORT,
+                in("eax") 0u32, options(nostack));
+        }
+        true
+    }
+    fn copyout_fault(
+        &self,
+        address: UserVa,
+    ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
+        let layout = carrick_el1::isa::x86_kernel_layout();
+        // SAFETY: boot retains the initialized per-CPU selection portal.
+        let slots = unsafe { &*(layout.portal.raw() as *const MmPortalSlots) };
+        let mm = self.task.mm.key.load(Ordering::Acquire);
+        let (sequence, _) = slots
+            .grant(usize::from(self.slot.raw()))?
+            .pending_fault_selection(mm, address.raw())?;
+        Some((
+            carrick_guest_arch::FaultInfo {
+                address,
+                access: carrick_guest_arch::Access::Write,
+                present: false,
+            },
+            NonZeroU64::new(sequence)?,
+        ))
+    }
+
+    #[inline(never)]
+    fn apply_fault_reply(
+        &mut self,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+        disposition: carrick_el1_linux::native_process_runtime::FaultReplyDisposition,
+    ) -> Result<(), carrick_core::mm::transaction::MmError> {
+        use carrick_core::mm::transaction::MmError;
+        use carrick_el1_linux::native_process_runtime::FaultReplyDisposition;
+        let Some(window) = reply.window() else {
+            return Ok(());
+        };
+        let owner = portal().map_err(|_| MmError::Stale)?;
+        // Observe the editor's release source before attempting admission.
+        // The production portal also translates reservation/gate refusal to
+        // their own typed waits; no owner Busy becomes an output errno.
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                window.operation.carrier,
+                window.operation.mm,
+                window.operation.incarnation,
+            )
+        };
+        let editor_wait = owner
+            .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)?
+            .ok_or(MmError::Stale)?;
+        let applied = if disposition == FaultReplyDisposition::Cancel {
+            None
+        } else {
+            let words = anonymous::live_words(window.operation.mm).ok_or(MmError::Stale)?;
+            let venues =
+                carrick_el1_abi::KernelFaultVenues::derive(carrick_el1::isa::x86_kernel_layout())
+                    .and_then(carrick_el1_abi::KernelFaultVenues::require_upper_half)
+                    .ok_or(MmError::Stale)?;
+            // SAFETY: boot retains the typed shared residency table.
+            let residency = unsafe {
+                &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable)
+            };
+            let retained = reply.descriptor().inspect_receipt(
+                carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxnId {
+                    mm_key: NonZeroU64::new(window.operation.mm.raw()).ok_or(MmError::Stale)?,
+                    generation: window.operation.sequence,
+                },
+            );
+            let result = if let Some(receipt) = retained {
+                Ok(Some(receipt))
+            } else {
+                carrick_core::mm::frames::serve_grant(
+                    &owner,
+                    reply,
+                    &words,
+                    residency,
+                    self.worker(),
+                    || {},
+                )
+            };
+            match result {
+                Ok(receipt) => Some(receipt.is_some_and(|receipt| {
+                    matches!(receipt.outcome,
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+                    | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
+                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot))
+                })),
+                // The shared pending owner retains this reply while it parks on
+                // the exact producer, including resumption on another CPU.
+                Err(MmError::Wait(wait)) => return Err(MmError::Wait(wait)),
+                Err(MmError::Busy) => return Err(MmError::Wait(editor_wait)),
+                Err(MmError::Stale) => None,
+                Err(_) => Some(false),
+            }
+        };
+        // All MM guards and descriptor traversal frames have unwound before
+        // returning the receipt (or withdrawing an unapplied reply) to custody.
+        let owner = unsafe {
+            // SAFETY: a candidate copied from the retained reply; host settlement
+            // authenticates the exact task, MM, generation and reply allocation.
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                window.operation.carrier,
+                window.operation.mm,
+                window.operation.incarnation,
+            )
+        };
+        let address = KernelVa::new(core::ptr::from_ref(reply).addr() as u64);
+        let mut settlement = carrick_el1_abi::NativeDescriptorSettlement::EMPTY;
+        settlement
+            .initialize(owner, window.operation.sequence, address)
+            .ok_or(MmError::Stale)?;
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT,
+                in("rax") &raw mut settlement, options(nostack));
+        }
+        match settlement.take(owner, window.operation.sequence, address) {
+            Some(Ok(())) => {}
+            Some(Err(())) => return Err(MmError::Wait(editor_wait)),
+            None => return Err(MmError::Stale),
+        }
+        if applied == Some(false) {
+            Err(MmError::Stale)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn prepare_owned_write(
+        &mut self,
+        mm: &Mm,
+        request: carrick_core::mm::transaction::CopyoutRequest,
+    ) -> Result<(), NativeProcessError> {
+        self.access_user_target(mm, request.address, request.len, None)
+    }
     fn service_mm_handle(
         &self,
         mm: &Mm,

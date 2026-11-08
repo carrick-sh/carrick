@@ -219,17 +219,28 @@ impl PortalGrantSlot {
         }))?;
         (window.operation.mm.raw() == mm_key).then_some(window)
     }
-    pub fn pending_fault_selection(
+    /// Observe a selected window for stopped native-service file preparation.
+    /// This grants no service, MM or backing authority; intake claims the exact
+    /// ticket and takes this same window before any physical publication.
+    pub fn pending_fault_selection_for_mm(
         &self,
-        mm_key: u64,
-        fault_va: u64,
+        mm: super::ReservationMm,
     ) -> Option<(u64, PortalGrantWindow)> {
         if self.state.load(Ordering::Acquire) != 3 {
             return None;
         }
         let generation = self.fault_generation.load(Ordering::Relaxed);
-        let window = self.fault_selection(mm_key, generation)?;
-        (window.fault_page == fault_va & !4095).then_some((generation, window))
+        let window = self.fault_selection(mm.raw(), generation)?;
+        Some((generation, window))
+    }
+
+    pub fn pending_fault_selection(
+        &self,
+        mm_key: u64,
+        fault_va: u64,
+    ) -> Option<(u64, PortalGrantWindow)> {
+        self.pending_fault_selection_for_mm(super::ReservationMm::new(mm_key)?)
+            .filter(|(_, window)| window.fault_page == fault_va & !4095)
     }
     pub fn cancel_fault_selection(
         &self,

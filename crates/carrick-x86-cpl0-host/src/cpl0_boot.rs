@@ -1126,7 +1126,12 @@ pub struct ProductionWorkerParts<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
 
 /// Physical CPUs are claimed once by executor workers. Shared host custody
 /// outlives every claimed CPU and is only entered for stopped host service.
+/// Runtime-supplied Linux entropy handler; the VMM retains transport only.
+pub type NativeEntropyService =
+    fn(&mut [u8]) -> Result<(), carrick_core_abi::service::entropy::InvalidEntropyRecord>;
+
 pub struct ProductionCpuFactory<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
+    native_entropy: NativeEntropyService,
     cpus: std::sync::Mutex<[Option<CarrierCpu<M>>; 2]>,
     custody: Arc<std::sync::Mutex<Cpl0HostCustody<Mem>>>,
     debug_cpus: [Arc<CarrierCpuDebug>; 2],
@@ -1140,6 +1145,7 @@ pub struct ProductionPhysicalCapture {
 }
 
 pub struct ProductionCpuLease<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
+    native_entropy: NativeEntropyService,
     cpu: CarrierCpu<M>,
     _custody: Arc<std::sync::Mutex<Cpl0HostCustody<Mem>>>,
 }
@@ -1458,8 +1464,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("idle peer service requires physical doorbell"));
         };
-        let file = if *port == OWNER_GRANT_PORT {
-            self.read_owner_file(None)?
+        let file = if *port == OWNER_GRANT_PORT || *port == NATIVE_SERVICE_PORT {
+            self.read_owner_file(None, *port == NATIVE_SERVICE_PORT)?
         } else {
             None
         };
@@ -1467,6 +1473,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
+        let native_entropy = self.native_entropy;
         let mut work_flags = None;
         let (exit, register_child, unregister_child) = self.cpu.with_idle_peer_io(|io| {
             let lease = StoppedCpuLease {
@@ -1517,6 +1524,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     custody
                         .service_root_exit(&lease)
                         .map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
+                }
+                NATIVE_SERVICE_PORT => {
+                    custody.service_native_notice(&lease, file, native_entropy)?;
+                    Ok((None, None, None))
                 }
                 WORK_PORT => {
                     work_flags = Some(take_production_work_boundary(custody.task(lease.cpu))?);
@@ -1689,8 +1700,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let slot = self
             .physical_slot()
             .ok_or_else(|| fail("production CPU has no physical slot"))?;
-        let file = if matches!(production_port(*port), Some(ProductionPort::OwnerGrant)) {
-            self.read_owner_file(Some(task))?
+        let file = if matches!(
+            production_port(*port),
+            Some(ProductionPort::OwnerGrant | ProductionPort::NativeService)
+        ) {
+            self.read_owner_file(Some(task), *port == NATIVE_SERVICE_PORT)?
         } else {
             None
         };
@@ -1698,6 +1712,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
+        let native_entropy = self.native_entropy;
         let mut work_flags = None;
         let (exit, register_child, unregister_child) = self.cpu.with_stopped_io(task, |io| {
             let lease = StoppedCpuLease { cpu: slot, io };
@@ -1743,6 +1758,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     custody.service_root_exit(&lease).map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
                 }
+                Some(ProductionPort::NativeService) => {
+                    custody.service_native_notice(&lease, file, native_entropy)?;
+                    Ok((None, None, None))
+                }
                 Some(ProductionPort::Work) => {
                     work_flags = Some(take_production_work_boundary(custody.task(slot))?);
                     Ok((None, None, None))
@@ -1784,6 +1803,7 @@ enum ProductionPort {
     ChildRetire,
     RunFailure,
     RootExit,
+    NativeService,
     Work,
 }
 
@@ -1795,6 +1815,7 @@ fn production_port(port: u16) -> Option<ProductionPort> {
         carrick_core_abi::NATIVE_RUN_FAILURE_PORT => Some(ProductionPort::RunFailure),
         carrick_core_abi::NATIVE_ROOT_EXIT_PORT => Some(ProductionPort::RootExit),
         WORK_PORT => Some(ProductionPort::Work),
+        NATIVE_SERVICE_PORT => Some(ProductionPort::NativeService),
         _ => None,
     }
 }
@@ -2334,6 +2355,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             return Err(fail("claimed CPU physical identity mismatch"));
         }
         Ok(ProductionCpuLease {
+            native_entropy: self.native_entropy,
             cpu,
             _custody: Arc::clone(&self.custody),
         })
@@ -2360,6 +2382,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionWorkerParts<M, Mem> {
 
     pub fn into_factory(
         self,
+        native_entropy: NativeEntropyService,
     ) -> (
         carrick_x86::arch_context::X86ArchContext,
         ProductionCpuFactory<M, Mem>,
@@ -2374,6 +2397,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionWorkerParts<M, Mem> {
         (
             root_state,
             ProductionCpuFactory {
+                native_entropy,
                 cpus: std::sync::Mutex::new(cpus.map(Some)),
                 custody: Arc::new(std::sync::Mutex::new(custody)),
                 debug_cpus,
@@ -2474,6 +2498,8 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     maintenance_root: Option<RootGpa>,
     anonymous_next_gpa: FrameGpa,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
+    native_backing_pending:
+        std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
     owner_grant_crossings: u64,
     root_exit_crossings: u64,
     child_retire_crossings: u64,
@@ -3863,6 +3889,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             maintenance_root: None,
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
             anonymous_pending: [None, None],
+            native_backing_pending: std::collections::BTreeMap::new(),
             owner_grant_crossings: 0,
             root_exit_crossings: 0,
             child_retire_crossings: 0,

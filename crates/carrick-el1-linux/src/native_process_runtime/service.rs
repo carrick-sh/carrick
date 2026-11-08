@@ -149,9 +149,18 @@ pub(super) struct AdapterPreparation {
     pub identity: carrick_sched_core::object_wait::OperationIdentity,
 }
 
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+struct EntropyPreparation {
+    address: UserVa,
+    prepared: usize,
+    flags: NativeEntropyFlags,
+    requested: carrick_guest_arch::GuestLen,
+}
+
 enum ServicePayload<'a> {
     None,
     Copyin,
+    EntropyPreparation(EntropyPreparation),
     Copyout(OwnedCopyout<'a>),
     Adapter,
     Exec(Box<[u8]>),
@@ -171,6 +180,8 @@ pub(super) struct PendingService<'a> {
     /// The same custody for a host-file record, which the carrier also writes.
     host_file: Option<PendingHostFile<'a>>,
     entropy: Option<(Box<[u8]>, UserVa, bool)>,
+    entropy_preparation: Option<EntropyPreparation>,
+    fault_reply_cancelling: bool,
     copyout: Option<Box<OwnedCopyout<'a>>>,
     copyin: bool,
     adapter: bool,
@@ -721,11 +732,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.service_phase = NativeServicePhase::Settlement;
         }
         if !self.retains_ipc_operation(exit) {
-            let result = result?;
-            if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
-                return Err(NativeProcessError::Quarantined);
-            }
-            return Ok(result);
+            return self.finish_service_handoff(result);
         }
         let result = result.map_err(|error| match error {
             NativeProcessError::ForkRefused(refusal) => refusal.error(),
@@ -1060,13 +1067,37 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceCompletion::Inline,
         )
     }
+    fn finish_service_handoff(
+        &mut self,
+        result: Result<NativeResume, NativeProcessError>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let result = result?;
+        if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
+            return Err(NativeProcessError::Quarantined);
+        }
+        Ok(result)
+    }
+
+    /// Stage a native entropy call through the same owner on every ISA.
+    /// Physical completion may precede enrollment, but copyout and resume still
+    /// pass through the exact service continuation and its handoff receipt.
+    pub fn begin_entropy_call(
+        &mut self,
+        args: NativeEntropyArgs,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let (address, capacity, flags, requested) = native_entropy_stage(args);
+        let result = self.begin_entropy_service(address, capacity, flags, requested);
+        let result = self.drain_copyout(result);
+        self.finish_service_handoff(result)
+    }
+
     /// Retain bounded entropy staging until this exact ticket settles. The
     /// exact MM prepares the accessible output prefix before publication.
     pub fn begin_entropy_service(
         &mut self,
         address: UserVa,
         mut capacity: usize,
-        flags: u32,
+        flags: NativeEntropyFlags,
         requested: carrick_guest_arch::GuestLen,
     ) -> Result<NativeResume, NativeProcessError> {
         use carrick_core_abi::service::entropy;
@@ -1076,7 +1107,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         capacity = capacity.min(usize::try_from(requested.raw()).unwrap_or(usize::MAX));
         // Invalid flags must reach the shared handler before any user-memory
         // decision. A zero-capacity request asks it only for that validation.
-        if !carrick_abi::getrandom_flags_valid(flags) {
+        if !carrick_abi::getrandom_flags_valid(flags.bits()) {
             capacity = 0;
         }
         // Permissions and COW are page-granular. Prepare each bounded piece
@@ -1125,7 +1156,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         ServiceOperation::Fault(fault),
                         Some(sequence),
                         None,
-                        ServicePayload::Copyin,
+                        ServicePayload::EntropyPreparation(EntropyPreparation {
+                            address,
+                            prepared,
+                            flags,
+                            requested,
+                        }),
                         ServiceCompletion::RetrySyscall,
                     );
                 }
@@ -1135,7 +1171,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         capacity = prepared;
         let mut record =
             alloc::vec![0; entropy::ENTROPY_HEADER_BYTES + capacity].into_boxed_slice();
-        entropy::encode_request(&mut record, flags).map_err(|_| NativeProcessError::Invalid)?;
+        entropy::encode_request(&mut record, flags.bits())
+            .map_err(|_| NativeProcessError::Invalid)?;
         let payload = entropy::EntropyPayloadDescriptor::checked(
             carrick_guest_arch::GuestVa::new(record.as_ptr().addr() as u64),
             carrick_guest_arch::GuestLen::new(record.len() as u64),
@@ -1272,7 +1309,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some(wait) = owner_wait {
             self.park_owner_wait(&request, wait)
         } else {
-            self.park_service(&request, adapter || completion.checkpoints_owner())
+            let physical_checkpoint = self.service.native_service_doorbell();
+            self.park_service(
+                &request,
+                physical_checkpoint || adapter || completion.checkpoints_owner(),
+            )
         }
     }
 
@@ -1286,6 +1327,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         retry_syscall_after_supply: bool,
     ) -> Result<PreparedService, NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
+        let (payload, entropy_preparation) = match payload {
+            ServicePayload::EntropyPreparation(preparation) => {
+                (ServicePayload::Copyin, Some(preparation))
+            }
+            payload => (payload, None),
+        };
         let copyin = matches!(&payload, ServicePayload::Copyin);
         let (payload, copyout, adapter) = match payload {
             ServicePayload::Copyin => (ServicePayload::None, None, false),
@@ -1329,7 +1376,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Stale);
             }
             (_, ServicePayload::None) => (None, None, None),
-            (_, ServicePayload::Copyout(_) | ServicePayload::Copyin | ServicePayload::Adapter) => {
+            (
+                _,
+                ServicePayload::Copyout(_)
+                | ServicePayload::Copyin
+                | ServicePayload::Adapter
+                | ServicePayload::EntropyPreparation(_),
+            ) => {
                 return Err(NativeProcessError::Stale);
             }
         };
@@ -1537,6 +1590,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 _exec_payload: exec_payload,
                 host_file,
                 entropy,
+                entropy_preparation,
+                fault_reply_cancelling: false,
                 copyout,
                 copyin,
                 adapter,
@@ -2664,7 +2719,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         request: &ServiceRequest,
         mut result: ServiceResult,
-        pending: Box<PendingService<'a>>,
+        mut pending: Box<PendingService<'a>>,
     ) -> Result<NativeResume, NativeProcessError> {
         self.service_phase = NativeServicePhase::Completion;
         if pending.request != *request {
@@ -2674,12 +2729,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let exiting = self.runtime.graph.lock().pending.has_exit(&self.key)
             || ((pending.copyout.is_some() || pending.copyin)
                 && pending.claim.cancellation().is_some());
-        if (exiting || result == ServiceResult::Cancelled)
+        pending.fault_reply_cancelling |=
+            matches!(&pending.reply, Some(PendingServiceReply::Fault(_)))
+                && (exiting || result == ServiceResult::Cancelled);
+        if pending.fault_reply_cancelling
             && let Some(PendingServiceReply::Fault(reply)) = &pending.reply
         {
-            self.service
+            match self
+                .service
                 .apply_fault_reply(reply, super::FaultReplyDisposition::Cancel)
-                .map_err(|_| NativeProcessError::Quarantined)?;
+            {
+                Ok(()) => {}
+                Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
+                    let next = self.prepare_fault_repark(request, pending, wait)?;
+                    return self.park_owner_wait(&next, wait);
+                }
+                Err(_) => return Err(NativeProcessError::Quarantined),
+            }
+        }
+        if pending.fault_reply_cancelling {
+            result = ServiceResult::Cancelled;
         }
         if exiting {
             let _ = ProcessNative::take_relative_futex_wait(self);
@@ -2819,6 +2888,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .zone
                 .record(self.record.id)
                 .consume_owner_continuation();
+        }
+        if retry_syscall_after_supply
+            && matches!(
+                result,
+                ServiceResult::Refused | ServiceResult::BackingFault | ServiceResult::Failed(_)
+            )
+            && let Some(preparation) = pending.entropy_preparation
+            && preparation.prepared != 0
+        {
+            self.release_service_claim(pending.claim)?;
+            return self.begin_entropy_service(
+                preparation.address,
+                preparation.prepared,
+                preparation.flags,
+                preparation.requested,
+            );
         }
         let mut output = pending.copyout.take();
         if matches!(request.operation, ServiceOperation::Entropy { .. })

@@ -294,3 +294,31 @@ fn file_region_unpublished_is_distinct_from_retired() {
         FileRegionError::Retired.fatal_payload()
     );
 }
+
+/// Copyout backing publication must retain a contended selection, then admit
+/// the same request after its predecessor releases the physical slot.
+#[test]
+fn native_output_backing_slot_busy_once_then_success() {
+    use carrick_core_abi::{PortalGrantSlot, PortalGrantWindow};
+    let slot = PortalGrantSlot::new();
+    let first = PortalGrantWindow::decode([1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0])
+        .expect("valid backing selection");
+    let mut next = first;
+    next.operation.sequence = std::num::NonZeroU64::new(4).expect("nonzero sequence");
+    assert!(slot.publish_fault_selection(3, first));
+    let mm = carrick_core_abi::ReservationMm::new(77).expect("issued MM");
+    assert_eq!(slot.pending_fault_selection_for_mm(mm), Some((3, first)));
+    assert!(
+        slot.pending_fault_selection_for_mm(
+            carrick_core_abi::ReservationMm::new(78).expect("peer MM")
+        )
+        .is_none()
+    );
+    assert!(!slot.publish_fault_selection(4, next));
+    assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((3, first)));
+    assert!(slot.cancel_fault_selection(first, 3));
+    assert!(slot.publish_fault_selection(4, next));
+    assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((4, next)));
+    assert!(slot.cancel_fault_selection(next, 4));
+    assert!(!slot.has_outstanding_for(77));
+}

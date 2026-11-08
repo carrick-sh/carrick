@@ -53,16 +53,44 @@ range. The service ticket binds birth, member, MM incarnation, execution and
 sequence. A descriptor alone still cannot enter the native service: admission
 requires its exact ring-owned allocation.
 
-## Remaining physical evidence and x86
+## x86 CPL0 transport (#1842)
 
-Signed HVF, Node/OpenSSL and runtime ratio checks are UNRUN (director). VM-free
-ARM tests do not prove physical HVF execution. The ignored x86 KVM witnesses in
-`cpl0_initial_mm` remain red: native Linux exits 8, the prior KVM run exited
-218 (errno 38 modulo 256). x86 still needs CPL0 selection of entropy, a
-physical service doorbell/intake with retained staging, a host adapter using
-the shared handler, and ticket acknowledgment/resume. Merely allowing
-`CompletionRoute::NativeService` is insufficient. Socket and mmap are outside
-this entropy slice and unchanged.
+The shared router selects the native service family for entropy on both ISAs,
+before host-crossing refusal. The x86 register adapter supplies the canonical
+arguments to the same bounded staging policy. Its exact-MM writer now supports
+preparation through the existing shared user-write protocol, including COW.
+No x86 entropy algorithm or alternate record format is introduced.
+
+CPL0 issues the physical native-service OUT after publication and after graph
+and MM guards have unwound. The stopped carrier consumes the member notice,
+checks the execution generation and live MM/root, retains its control backing,
+and claims the same service ticket under the native-service queue. It checks
+the complete staging span against retained supervisor storage and live stage-1
+translations, invokes `carrick_kernel::dispatch::serve_native_entropy`, then
+acknowledges the ticket under its queue after the reply is visible.
+
+The synchronous OUT can ACK before park enrollment. The shared owner still
+requeues its retained continuation and resumes through normal service
+consumption and exact-MM copyout. It does not return the physical reply directly
+to userspace. Busy preparation retains its operation through CarrierWork;
+resumption re-enters the saved x86 SYSCALL. OwnerWait retains the existing
+release notification. Neither path generates an errno for contention.
+
+The VM-free physical-checkpoint witnesses drive the production entropy entry,
+require no copy before owner resume, exactly one entropy crossing, eight copied
+bytes at the original destination, and no second generation on resume. The
+Busy-once variant requires one preparation checkpoint and then success. The
+two production KVM fork/getrandom/wait witnesses are enabled and pass on a
+fresh embedded CPL0 image: both default and nonblocking requests exit 8. Native
+Linux executes the identical assembly with the same result. On unchanged main
+both KVM witnesses failed with exit 218 (errno 38 modulo 256). Their parent
+remains alive while the child requests entropy.
+
+## Remaining physical evidence
+
+Signed HVF, Node/OpenSSL and runtime ratio checks remain director-owned.
+VM-free ARM tests do not prove physical HVF execution. Socket and mmap are
+outside this entropy slice.
 
 ## Earlier root-handler red-first evidence
 
@@ -88,5 +116,80 @@ The production-dispatch witness
 narrows the flags argument to its Linux width before validating supported
 bits and conflicting sources. The witness checks 54 combinations, requiring
 no preparation for zero lengths or invalid flags, one preparation for an
-eight-byte valid request, and an unchanged buffer suffix. This handler
-correction does not serve a native child's request.
+eight-byte valid request, and an unchanged buffer suffix. Native children now use this same flags-width interpretation through their
+authenticated entropy service.
+
+## x86 review witnesses (#1842 / #1851)
+
+The KVM binding also runs the same syscall as the root, prepares an untouched
+anonymous mapping in a fork child, rejects a read-only output with errno 14,
+returns the eight-byte writable prefix of a sixteen-byte boundary request,
+and checks that child entropy into inherited writable data preserves the
+parent's bytes. All variants run as raw assembly on native x86 Linux with
+exit 8. The fixture retains the existing ten-second bound and the live parent.
+
+On the rebased pre-fix head, the root witness exits 218 (errno 38), and lazy
+output exits 91 instead of 8. The other five KVM entropy witnesses pass.
+These are semantic witnesses; they do not supply signed ARM or timing evidence.
+
+The root's home record remains `Free` while the admitted host executor runs.
+It is native-owned, and the shared service owner publishes a temporary owner
+continuation before its notice. Intake must authenticate that exact incarnation
+under its queue before park enrollment, then let the service cell authenticate
+its task, MM and execution. The scheduler witness was red at `None` versus the
+home identity. It also rejects an unowned peer, a stale incarnation, and a home
+whose continuation has been consumed.
+
+### Output preparation and physical faults
+
+Staging bounds the request and its canonical user range. Hardware readability
+is not the authority for a lazy output mapping: its exact-MM reservation and
+page-wise write preparation decide the writable prefix. The original lazy
+KVM witness exits 91; allowing logical preparation alone reaches an unsupported
+physical handoff. The retained native `Fault` protocol makes that same witness
+exit 8. Root and fork-child lazy outputs both have production KVM bindings.
+
+The ring publishes its selected backing demand and retains an isolated reply
+through service acknowledgment, MM owner waits, cancellation and CPU migration.
+x86 intake claims the exact ticket and selection, uses the existing physical
+backing/table staging owner, then acknowledges the reply. File bytes are read
+outside carrier custody. The ring applies the reply through neutral
+`carrick_core::mm::frames::serve_grant`; host receipt settlement authenticates
+the exact task, MM, generation and retained allocation. The existing hardware
+fault path consumes the same backing staging and settlement helpers.
+
+Contended preparation enrolls on the existing editor release before creating
+physical journals. Contended receipt settlement leaves those journals and the
+reply retained, and the ring parks on its pre-observed editor release. A second
+entry recognizes an already applied receipt instead of applying it again.
+Cancellation retains its cleanup intent across that same wait. The host editor
+witness holds the real editor, observes Busy once without closing its gate,
+then releases it and admits exclusion. Slot publication separately witnesses
+Busy once and success after its predecessor releases the original selection.
+The existing entropy Busy/OwnerWait cursor witnesses remain unchanged.
+
+Physical refusal after a prepared prefix requests that prefix through the
+shared entropy handler once; no entropy was generated during preparation.
+The VM-free prefix witness was red at EFAULT instead of a second, eight-byte
+entropy request. The cancellation witness cancels the exact service cell under
+its queue (the general signal cancellation entry deliberately ignores internal
+copyout waits): restoring the old cleanup mapping gives NativeQuarantined.
+Both completion witnesses are green, including two cleanup attempts with the
+cancellation disposition preserved and zero output from the cancelled call.
+
+The runtime supplies `serve_native_entropy` when constructing the carrier
+factory. Lower VMM crates retain transport and depend on the kernel only for
+test support. This fixes the PR's layering failure without changing the gate.
+The same shared entropy record and handler serve root and descendant requests.
+
+Signed HVF, Docker differential, and runtime ratio evidence remain unrun in
+this Linux worker VM.
+
+### Typed register adaptation
+
+Both ISA adapters build `NativeEntropyArgs` from `UserVa`, `GuestLen`, and
+`NativeEntropyFlags`. Linux flags narrow to their unsigned-int width at the
+register adapter; unknown low bits remain available to the shared handler's
+validation. Staging and retained preparation carry the typed flags through
+completion. The positional three-word entry and its width assumptions are gone;
+the entropy wire record is unchanged.

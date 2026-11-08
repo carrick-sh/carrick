@@ -184,6 +184,8 @@ pub const CONTROL_PORT: u16 = 0xc8;
 pub const ENTRY_KICK_PORT: u16 = 0xc9;
 pub const RETURN_KICK_PORT: u16 = 0xca;
 pub const WORK_PORT: u16 = 0xcb;
+/// Consume the exact member notice; no pointer or Linux ordinal rides the OUT.
+pub const NATIVE_SERVICE_PORT: u16 = 0xd8;
 pub const FATAL_PORT: u16 = 0xcc;
 pub const YIELD_PORT: u16 = 0xd0;
 /// Physical owner-grant submission/receipt boundary; Linux policy stays in CPL0.

@@ -57,6 +57,49 @@ use core::{
     time::Duration,
 };
 
+/// Linux's opaque unsigned-int entropy flags. Unknown bits reach the shared
+/// handler so EINVAL is decided before output preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEntropyFlags(u32);
+impl NativeEntropyFlags {
+    pub const fn from_bits_retain(bits: u32) -> Self {
+        Self(bits)
+    }
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// Register adaptation ends at this typed ISA-to-shared boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEntropyArgs {
+    pub address: UserVa,
+    pub length: carrick_guest_arch::GuestLen,
+    pub flags: NativeEntropyFlags,
+}
+
+/// Bound the request; the exact-MM owner prepares its accessible prefix.
+/// A missing hardware leaf can still be a valid lazy or COW output mapping.
+pub fn native_entropy_stage(
+    args: NativeEntropyArgs,
+) -> (
+    UserVa,
+    usize,
+    NativeEntropyFlags,
+    carrick_guest_arch::GuestLen,
+) {
+    let capacity =
+        args.length
+            .raw()
+            .min(carrick_core_abi::service::entropy::MAX_ENTROPY_BYTES as u64) as usize;
+    let capacity = if carrick_guest_arch::lower_half_range(args.address.raw(), capacity as u64) {
+        capacity
+    } else {
+        0
+    };
+    (args.address, capacity, args.flags, args.length)
+}
+
 /// Outcome of re-entering the shared process owner after an ISA switches in
 /// a record with retained lifecycle work.
 pub enum NativeResume {
@@ -419,6 +462,13 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     }
     fn exec_open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
         &[]
+    }
+    /// Physical transports may consume the published notice before enrollment.
+    /// Return true to unwind and requeue through the existing owner checkpoint,
+    /// even when the carrier has already acknowledged the ticket. No graph or
+    /// MM editor is held here; the pending service retains its allocation.
+    fn native_service_doorbell(&mut self) -> bool {
+        false
     }
     /// Authenticate the admitted MM incarnation, never the address generation.
     fn service_mm_handle(
@@ -4113,6 +4163,12 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             Err(error) => self.fail(error),
         }
     }
+    /// Classify the already authenticated process, without consulting a slot
+    /// whose scheduler custody may have changed during dispatch completion.
+    pub fn is_fork_child(&self) -> bool {
+        self.key != self.runtime.graph.lock().root_key
+    }
+
     /// Saved words owned by this admitted member, before executor handback.
     pub fn resume_context(&self) -> &C {
         &self.words

@@ -252,6 +252,23 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             )
         })
     }
+    fn native_service_doorbell(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            ENTROPY_DOORBELL.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                    true
+                } else {
+                    false
+                }
+            })
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
     fn service_mm_handle(
         &self,
         mm: &Self::Mm,
@@ -404,6 +421,38 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         assert_eq!(request.access, carrick_guest_arch::Access::Read);
         self.prepare_copy_error.map_or(Ok(()), Err)
     }
+    #[cfg(test)]
+    fn copyout_fault(
+        &self,
+        address: UserVa,
+    ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
+        matches!(self.child_copy_error, Some(NativeProcessError::Unsupported)).then_some((
+            carrick_guest_arch::FaultInfo {
+                address,
+                access: carrick_guest_arch::Access::Write,
+                present: false,
+            },
+            NonZeroU64::MIN,
+        ))
+    }
+    #[cfg(test)]
+    fn apply_fault_reply(
+        &mut self,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+        disposition: super::FaultReplyDisposition,
+    ) -> Result<(), carrick_core::mm::transaction::MmError> {
+        FAULT_REPLY_CALLS.with(|calls| calls.set(calls.get() + 1));
+        FAULT_REPLY_LAST_CANCEL
+            .with(|cancel| cancel.set(disposition == super::FaultReplyDisposition::Cancel));
+        if let Some(wait) = FAULT_REPLY_WAIT_ONCE.with(|once| once.take()) {
+            return Err(carrick_core::mm::transaction::MmError::Wait(wait));
+        }
+        if disposition == super::FaultReplyDisposition::Cancel && slot.window().is_none() {
+            Ok(())
+        } else {
+            Err(carrick_core::mm::transaction::MmError::Core)
+        }
+    }
     fn prepare_owned_write(
         &mut self,
         _: &Self::Mm,
@@ -411,6 +460,10 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     ) -> Result<(), NativeProcessError> {
         #[cfg(test)]
         ENTROPY_PREPARES.with(|count| count.set(count.get() + 1));
+        #[cfg(test)]
+        if ENTROPY_PREPARE_BUSY_ONCE.with(|busy| busy.replace(false)) {
+            return Err(NativeProcessError::Busy);
+        }
         #[cfg(test)]
         if ENTROPY_WRITABLE_END.with(|limit| {
             limit.get().is_some_and(|limit| {
@@ -6658,7 +6711,7 @@ fn entropy_service_retained_cursor(owner_wait: bool) {
             entry.begin_entropy_service(
                 UserVa::new(0x10ff8),
                 16,
-                1,
+                NativeEntropyFlags::from_bits_retain(1),
                 carrick_guest_arch::GuestLen::new(16)
             ),
             Ok(NativeResume::Left(None))
@@ -6913,7 +6966,7 @@ fn entropy_service_result(case: EntropyReplyCase) {
                 .begin_entropy_service(
                     address,
                     if prefix { 13 } else { 8 },
-                    if invalid { 6 } else { 0 },
+                    NativeEntropyFlags::from_bits_retain(if invalid { 6 } else { 0 }),
                     carrick_guest_arch::GuestLen::new(if prefix { 13 } else { 16 })
                 )
                 .unwrap(),
@@ -7069,7 +7122,7 @@ fn entropy_service_preparation_busy_retries_before_generation() {
                 .begin_entropy_service(
                     UserVa::new(0x10000),
                     8,
-                    0,
+                    NativeEntropyFlags::from_bits_retain(0),
                     carrick_guest_arch::GuestLen::new(8)
                 )
                 .unwrap(),
@@ -7146,7 +7199,7 @@ fn entropy_service_preparation_busy_retries_before_generation() {
             .begin_entropy_service(
                 UserVa::new(0x10000),
                 8,
-                0,
+                NativeEntropyFlags::from_bits_retain(0),
                 carrick_guest_arch::GuestLen::new(8)
             )
             .unwrap(),
@@ -7176,4 +7229,415 @@ fn entropy_service_preparation_busy_retries_before_generation() {
     ));
     assert!(ticket.complete(false).is_ok());
     drop(queue);
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ENTROPY_PREPARE_BUSY_ONCE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static ENTROPY_DOORBELL: core::cell::RefCell<Option<Box<dyn FnMut()>>> = const { core::cell::RefCell::new(None) };
+}
+
+/// The synchronous CPL0 crossing ACKs before enrollment. Drive the same
+/// production entropy entry and prove its bytes still resume via the owner.
+#[test]
+#[cfg(test)]
+fn entropy_physical_checkpoint_ack_before_park_resumes_exact_output() {
+    entropy_physical_checkpoint(false);
+}
+
+#[test]
+#[cfg(test)]
+fn entropy_physical_checkpoint_busy_once_then_success() {
+    entropy_physical_checkpoint(true);
+}
+
+#[cfg(test)]
+fn entropy_physical_checkpoint(busy: bool) {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let (record, address, saved) = capacity.select().unwrap();
+    let fixture = &capacity.fixture;
+    assert!(fixture.zone.record(record.id).is_native_owned());
+    let parent = fixture.runtime.graph.lock().root_key;
+    assert!(fixture.runtime.task_binding(parent).is_some());
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let task = fixture.task;
+    let zone = fixture.zone;
+    let identity = zone.record(record.id).identity();
+    // SAFETY: the production fork published this fixture-retained child control.
+    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    let crossings = std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let counted = crossings.clone();
+    ENTROPY_DOORBELL.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let notice = task.service_notice.take().unwrap().unwrap();
+            let key =
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap();
+            let queue = zone
+                .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .unwrap();
+            let member = queue.native_service_member(record).unwrap();
+            // SAFETY: fixture retains this exact initialized member under its queue.
+            let ticket = unsafe {
+                ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, member)
+            }
+            .unwrap();
+            drop(queue);
+            match ticket.request().operation {
+                ServiceOperation::Entropy { payload } => {
+                    // SAFETY: the production pending service retains this staging box.
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            payload.address().raw() as *mut u8,
+                            payload.length().raw() as usize,
+                        )
+                    };
+                    carrick_kernel::dispatch::serve_native_entropy(bytes).unwrap();
+                }
+                ServiceOperation::CarrierWork { .. } if busy => {}
+                _ => panic!("entropy or its retained preparation"),
+            }
+            let _queue = zone
+                .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .unwrap();
+            assert!(ticket.complete(true).is_ok());
+        }))
+    });
+    take_signal_copies();
+    ENTROPY_PREPARE_BUSY_ONCE.with(|once| once.set(busy));
+    let mut service = fixture.service();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            entry.is_fork_child(),
+            "select from authenticated process custody"
+        );
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::NoPending
+        ));
+        assert!(matches!(
+            entry
+                .begin_entropy_call(NativeEntropyArgs {
+                    address: UserVa::new(0x10000),
+                    length: carrick_guest_arch::GuestLen::new(8),
+                    flags: NativeEntropyFlags::from_bits_retain(0)
+                })
+                .unwrap(),
+            NativeResume::Left(None)
+        ));
+    }
+    if busy {
+        assert_eq!(zone.switch_in_full(fixture.slot).unwrap().record, record.id);
+        // SAFETY: fixture owns the selected continuation and its saved words.
+        let saved = unsafe { fixture.runtime.record_binding(record) }
+            .unwrap()
+            .words;
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::RetrySyscall
+        ));
+        assert!(take_signal_copies().is_empty());
+        assert!(matches!(
+            entry
+                .begin_entropy_call(NativeEntropyArgs {
+                    address: UserVa::new(0x10000),
+                    length: carrick_guest_arch::GuestLen::new(8),
+                    flags: NativeEntropyFlags::from_bits_retain(0)
+                })
+                .unwrap(),
+            NativeResume::Left(None)
+        ));
+    }
+    ENTROPY_DOORBELL.with(|hook| *hook.borrow_mut() = None);
+    let expected_crossings = if busy { 2 } else { 1 };
+    assert_eq!(crossings.load(Ordering::Relaxed), expected_crossings);
+    assert!(
+        take_signal_copies().is_empty(),
+        "physical ACK cannot bypass owner copyout"
+    );
+    assert!(task.service_notice.take().unwrap().is_none());
+    assert_eq!(zone.switch_in_full(fixture.slot).unwrap().record, record.id);
+    // SAFETY: switch-in selected this fixture-owned exact record.
+    let saved = unsafe { fixture.runtime.record_binding(record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), NativeResume::Returned(result) if result.raw() == 8)
+    );
+    let copies = take_signal_copies();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(copies[0].0, UserVa::new(0x10000));
+    assert_eq!(copies[0].1.len(), 8);
+    assert_eq!(
+        crossings.load(Ordering::Relaxed),
+        expected_crossings,
+        "no regenerated request"
+    );
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAULT_REPLY_WAIT_ONCE: core::cell::Cell<Option<carrick_core_abi::PortalOwnerWait>> = const { core::cell::Cell::new(None) };
+    static FAULT_REPLY_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static FAULT_REPLY_LAST_CANCEL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[test]
+#[cfg(test)]
+fn entropy_fault_refusal_returns_prepared_prefix() {
+    entropy_fault_completion(false);
+}
+
+#[test]
+#[cfg(test)]
+fn entropy_fault_cancel_waits_once_then_settles() {
+    entropy_fault_completion(true);
+}
+
+#[cfg(test)]
+fn entropy_fault_completion(cancel_wait: bool) {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation, entropy};
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let address = UserVa::new(if cancel_wait { 0x10000 } else { 0x10ff8 });
+    let length = if cancel_wait { 8 } else { 16 };
+    service.child_copy_error = Some(NativeProcessError::Unsupported);
+    service.child_copy_error_at = Some(if cancel_wait { address.raw() } else { 0x11000 });
+    take_signal_copies();
+    FAULT_REPLY_CALLS.with(|calls| calls.set(0));
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry
+                .begin_entropy_service(
+                    address,
+                    length,
+                    NativeEntropyFlags::from_bits_retain(0),
+                    carrick_guest_arch::GuestLen::new(length as u64)
+                )
+                .unwrap(),
+            NativeResume::Left(None)
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let key =
+        carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+        .unwrap();
+    // SAFETY: the real pending owner and this queue retain the exact control.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(fixture.record.id).identity(),
+        )
+    }
+    .unwrap();
+    assert!(matches!(
+        ticket.request().operation,
+        ServiceOperation::Fault(_)
+    ));
+    drop(queue);
+    let gate = if cancel_wait {
+        let handle = service.service_mm_handle(&fixture.address).unwrap();
+        let space = fixture
+            .zone
+            .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+            .unwrap();
+        space
+            .admit_notifications(
+                handle.incarnation(),
+                &carrick_sched_core::BoundedSpin(0),
+                &|effects| {
+                    let _ = effects.defer_handbacks();
+                },
+            )
+            .unwrap();
+        let observed = space
+            .notifications(handle.incarnation())
+            .unwrap()
+            .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+        let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+        access.raise(space.index());
+        // SAFETY: exact source observed before the injected refusal.
+        let wait = unsafe {
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                handle,
+                carrick_core_abi::PortalWaitCause::Gate,
+                observed.revision(),
+            )
+        };
+        FAULT_REPLY_WAIT_ONCE.with(|once| once.set(Some(wait)));
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        fixture
+            .control
+            .service
+            .cancel(ticket.request().identity)
+            .unwrap();
+        drop(queue);
+        Some((access, space.index()))
+    } else {
+        None
+    };
+    let queue = fixture
+        .zone
+        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+        .unwrap();
+    assert!(ticket.complete(false).is_ok());
+    queue
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::Left(None)
+        ));
+    }
+    if let Some((access, index)) = gate {
+        assert!(take_signal_copies().is_empty());
+        access.open(index);
+    } else {
+        let notice = fixture.task.service_notice.take().unwrap().unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let ticket = unsafe {
+            ServiceCell::claim_notice(
+                &fixture.control.service,
+                notice,
+                NonZeroU64::MIN,
+                fixture.zone.record(fixture.record.id).identity(),
+            )
+        }
+        .unwrap();
+        let ServiceOperation::Entropy { payload } = ticket.request().operation else {
+            panic!("prepared entropy prefix");
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                payload.address().raw() as *mut u8,
+                payload.length().raw() as usize,
+            )
+        };
+        assert_eq!(entropy::request(bytes).unwrap().capacity, 8);
+        bytes[entropy::ENTROPY_HEADER_BYTES..].fill(0x76);
+        entropy::publish_reply(bytes, 8).unwrap();
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+        drop(queue);
+    }
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), NativeResume::Returned(result)
+        if result.raw() == if cancel_wait { -14 } else { 8 })
+    );
+    let copies = take_signal_copies();
+    if cancel_wait {
+        assert!(copies.is_empty());
+        assert_eq!(FAULT_REPLY_CALLS.with(|calls| calls.get()), 2);
+        assert!(
+            FAULT_REPLY_LAST_CANCEL.with(|cancel| cancel.get()),
+            "a repark must retain cancellation intent"
+        );
+    } else {
+        assert_eq!(copies, vec![(address, vec![0x76; 8])]);
+    }
+    assert_eq!(fixture.page.claimed_count(), 0);
 }

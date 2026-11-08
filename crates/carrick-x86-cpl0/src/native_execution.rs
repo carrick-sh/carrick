@@ -137,10 +137,12 @@ pub fn schedule(slot: SlotId) -> ! {
                     // A typed saved retry already names its x86 syscall
                     // instruction; the parked context needs no further edit.
                     carrick_el1_linux::native_process_runtime::NativeResume::RetrySavedSyscall => {}
-                    // RetrySyscall re-enters an ARM exec-staging SVC; x86 has
-                    // no native exec service, so it remains invalid here.
-                    carrick_el1_linux::native_process_runtime::NativeResume::Invalid
-                    | carrick_el1_linux::native_process_runtime::NativeResume::RetrySyscall => {
+                    // Preparation completed without generating entropy. Re-enter
+                    // the saved x86 SYSCALL with its original arguments.
+                    carrick_el1_linux::native_process_runtime::NativeResume::RetrySyscall => {
+                        carrick_guest_arch::ProcessContext::restart_syscall(&mut words);
+                    }
+                    carrick_el1_linux::native_process_runtime::NativeResume::Invalid => {
                         fatal_boot()
                     }
                 }

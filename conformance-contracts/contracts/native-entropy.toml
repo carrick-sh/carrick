@@ -1,16 +1,17 @@
 schema_version = 1
 id = "kernel.native.entropy"
-title = "Native descendants receive host entropy through their own service custody"
+title = "Native tasks receive host entropy through their own service custody"
 guest_surfaces = ["syscall:getrandom"]
 semantic_authority = ["man 2 getrandom", "docs/host-facility-boundary.md"]
 fixture = "unit:arm_native_fork_child_getrandom_default_returns_eight_bytes"
 scale_points = [1]
 structural_budgets = []
-rationale = "A fork child and parent remain live through bounded entropy staging, the existing host getrandom handler, exact ticket acknowledgment, copyout and native resume. Staging is bounded to 4096 bytes. Busy and OwnerWait retain bytes and the committed cursor rather than regenerating or replaying output. Physical signed ARM and x86 transport require their own evidence."
+rationale = "A fork child and parent remain live through bounded entropy staging, the existing host getrandom handler, exact ticket acknowledgment, copyout and native resume. Staging is bounded to 4096 bytes. Busy and OwnerWait retain bytes and the committed cursor rather than regenerating or replaying output. Physical signed ARM and x86 transport have separate bindings."
 
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_default_returns_eight_bytes",
+  "carrick-sched-core::tests::native_service_intake_authenticates_free_root_home_before_park",
   "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_nonblock_returns_eight_bytes",
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_rejects_conflicting_sources_before_output_preparation",
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_flags_use_linux_unsigned_int_width",
@@ -30,11 +31,27 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_retains_reply_through_owner_wait_and_resume",
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_cancellation_before_reply_releases_payload",
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_cancellation_after_reply_keeps_generated_bytes",
+  "carrick-personality-linux::dispatch::ring_first_tests::native_entropy_handoff_bypasses_host_crossing_refusal_on_both_isas",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_physical_checkpoint_ack_before_park_resumes_exact_output",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_physical_checkpoint_busy_once_then_success",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_fault_refusal_returns_prepared_prefix",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_fault_cancel_waits_once_then_settles",
+  "carrick-x86-cpl0::file_region::native_output_backing_slot_busy_once_then_success",
+  "carrick-x86-cpl0-host::cpl0_boot::anonymous_owner::custody_tests::native_backing_editor_exclusion_busy_once_then_success",
+]
+embed = [
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_default_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_nonblock_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_root_getrandom_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_root_getrandom_lazy_output_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_readonly_returns_efault",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_cow_preserves_parent",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_lazy_output_returns_eight_bytes",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_boundary_returns_accessible_prefix",
 ]
 
 [bindings.unresolved]
-semantics = "ARM VM-free witnesses drive asynchronous completion and native resume. Signed native-child execution remains UNRUN (director)."
+semantics = "ARM VM-free witnesses drive asynchronous completion and native resume; x86 production KVM witnesses pass through physical transport and native resume. Signed ARM native-child execution remains UNRUN (director)."
 structural = "Bounded staging and retained page cursor have VM-free witnesses, including stale-MM claim refusal. Signed work counts and runtime ratios remain UNRUN (director)."
-x86 = "The ignored KVM cpl0_initial_mm tests serial_host_native_child_getrandom_default_returns_eight_bytes and serial_host_native_child_getrandom_nonblock_returns_eight_bytes exercise fork, child getrandom and parent wait through the production pool. Native Linux exits 8 for both flags, KVM exits 218 (-38 modulo 256). The x86 carrier still needs typed entropy transport; these are defect witnesses, not acceptance."
 embed_structural = "UNRUN (director): signed fork-child getrandom, node -e and openssl rand on the implementation head."
 docker = "UNRUN: native Linux differential for flags, EFAULT and accessible-prefix short reads."

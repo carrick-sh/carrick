@@ -2,8 +2,8 @@
 
 pub use carrick_el1::isa::x86::context::native::{
     CONTROL_PORT, CpuBinding, DIRECT_VA, ENTRY_KICK_PORT, FATAL_PORT, FAULT_DOORBELL_PORT,
-    FORWARD_PORT, NativeFrame, OWNER_GRANT_PORT, RETURN_KICK_PORT, ShootdownTable, WORK_PORT,
-    checked_scheduler_slot, decode_user_page_fault,
+    FORWARD_PORT, NATIVE_SERVICE_PORT, NativeFrame, OWNER_GRANT_PORT, RETURN_KICK_PORT,
+    ShootdownTable, WORK_PORT, checked_scheduler_slot, decode_user_page_fault,
 };
 pub use carrick_el1::isa::x86::context::scheduler::{InterruptFrame, XsaveArea};
 
