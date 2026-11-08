@@ -357,6 +357,8 @@ surfaces = [
   { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.futex-handoff" },
   { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.inotify" },
   { path = "crates/carrick-el1/src/alloc.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-el1/src/alloc.rs", contract = "kernel.el1.metadata-allocation" },
   { path = "crates/carrick-el1/src/alloc.rs", contract = "process.native.short-lock" },
   { path = "crates/carrick-el1/src/cow/test_support.rs", contract = "kernel.el1.fork-cow" },
