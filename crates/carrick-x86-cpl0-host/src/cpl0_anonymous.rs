@@ -3178,4 +3178,4 @@ mod custody_tests {
 }
 
 #[path = "cpl0_native_service.rs"]
-mod native_service;
+pub(super) mod native_service;

@@ -1526,7 +1526,15 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         .map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
                 }
                 NATIVE_SERVICE_PORT => {
-                    custody.service_native_notice(&lease, file, native_entropy)?;
+                    if let anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) =
+                        custody.service_native_notice(&lease, file, native_entropy)?
+                    {
+                        custody.finish_native_host_file(
+                            &lease,
+                            *pending,
+                            Err(carrick_hal::fork_stock::NativeHostFileRefused),
+                        )?;
+                    }
                     Ok((None, None, None))
                 }
                 WORK_PORT => {
@@ -1759,7 +1767,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     custody.service_root_exit(&lease).map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
                 }
                 Some(ProductionPort::NativeService) => {
-                    custody.service_native_notice(&lease, file, native_entropy)?;
+                    if let anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) =
+                        custody.service_native_notice(&lease, file, native_entropy)? {
+                        custody.finish_native_host_file(&lease, *pending,
+                            Err(carrick_hal::fork_stock::NativeHostFileRefused))?;
+                    }
                     Ok((None, None, None))
                 }
                 Some(ProductionPort::Work) => {

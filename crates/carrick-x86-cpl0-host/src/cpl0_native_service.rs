@@ -1,8 +1,32 @@
-//! Stopped CPL0 transport for the shared native entropy service.
+//! Stopped CPL0 transport for shared retained native services.
 use super::*;
-use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+use carrick_core_abi::service::{ServiceCell, ServiceOperation, ServiceTicket};
 use carrick_guest_arch::KernelVa;
 use carrick_sched_core::object_wait::ObjectWaitKey;
+
+pub(in crate::cpl0_boot) struct Cpl0ServicePin {
+    cell: core::ptr::NonNull<ServiceCell>,
+    _ram: Arc<crate::guest_ram::GuestRam>,
+}
+impl core::ops::Deref for Cpl0ServicePin {
+    type Target = ServiceCell;
+    fn deref(&self) -> &ServiceCell {
+        // SAFETY: authenticated control storage remains retained by RAM custody.
+        unsafe { self.cell.as_ref() }
+    }
+}
+
+pub(in crate::cpl0_boot) struct PendingNativeHostFile {
+    pub(in crate::cpl0_boot) ticket: ServiceTicket<Cpl0ServicePin>,
+    execution: GrantExecution,
+    key: ObjectWaitKey,
+    address: KernelVa,
+    pub(in crate::cpl0_boot) record: Vec<u8>,
+}
+pub(in crate::cpl0_boot) enum NativeNoticeStep {
+    Settled,
+    HostFile(Box<PendingNativeHostFile>),
+}
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     /// Authenticate a retained supervisor span against this exact live root.
@@ -60,12 +84,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         Ok(pointer)
     }
 
-    pub(in crate::cpl0_boot) fn service_native_notice<I: CarrierCpuIo>(
+    fn claim_native_notice<I: CarrierCpuIo>(
         &mut self,
         lease: &StoppedCpuLease<'_, I>,
-        file: Option<anonymous_owner::FileSupply>,
-        native_entropy: NativeEntropyService,
-    ) -> Result<(), TrapError> {
+    ) -> Result<(ServiceTicket<Cpl0ServicePin>, GrantExecution, ObjectWaitKey), TrapError> {
         let execution = self.physical_execution(lease)?;
         let selector = self
             .task(lease.cpu)
@@ -122,9 +144,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         // SAFETY: custody retains this exact control; its member is revalidated
         // under the queue. The ring's pending claim retains its admitted MM.
-        let mut ticket = unsafe {
+        let ticket = unsafe {
             ServiceCell::claim_notice(
-                &control.service,
+                Cpl0ServicePin {
+                    cell: core::ptr::NonNull::from(&control.service),
+                    _ram: Arc::clone(&self.ram),
+                },
                 selector,
                 self._vm.identity().nonzero(),
                 member,
@@ -132,8 +157,54 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         .map_err(|_| fail("native service ticket claim"))?;
         drop(queue);
+        Ok((ticket, execution, key))
+    }
+
+    pub(in crate::cpl0_boot) fn service_native_notice<I: CarrierCpuIo>(
+        &mut self,
+        lease: &StoppedCpuLease<'_, I>,
+        file: Option<anonymous_owner::FileSupply>,
+        native_entropy: NativeEntropyService,
+    ) -> Result<NativeNoticeStep, TrapError> {
+        let (mut ticket, execution, key) = self.claim_native_notice(lease)?;
+        let zone_pointer = self
+            .ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("native service zone absent"))?;
+        // SAFETY: boot initializes this fixed aligned region, retained by custody.
+        let zone = unsafe { &*zone_pointer.cast::<X86Cpl0Zone>() };
         let mut owner_wait = None;
         let supplied = match ticket.request().operation {
+            ServiceOperation::HostFile { payload, .. } => {
+                let address = payload.ring_storage();
+                let pointer = self.native_service_pointer(
+                    execution.context,
+                    address,
+                    payload.length().raw() as usize,
+                    1,
+                )?;
+                // SAFETY: the outstanding ticket retains the authenticated staging box.
+                let mut record =
+                    unsafe { std::slice::from_raw_parts(pointer, payload.length().raw() as usize) }
+                        .to_vec();
+                let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record)
+                    .map_err(|_| fail("invalid CPL0 host file record"))?;
+                if view.header().op == carrick_core_abi::host_file::HostFileOp::MapPrivate {
+                    return Err(fail("CPL0 MapPrivate uses HostFileCrossing"));
+                }
+                return Ok(NativeNoticeStep::HostFile(Box::new(
+                    PendingNativeHostFile {
+                        ticket,
+                        execution,
+                        key,
+                        address,
+                        record,
+                    },
+                )));
+            }
             ServiceOperation::Entropy { payload } => {
                 let pointer = self.native_service_pointer(
                     execution.context,
@@ -212,6 +283,77 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // This synchronous doorbell precedes park enrollment. The shared owner
         // probes ACK under the same queue and requeues its exact continuation;
         // no host waiter, readiness pipe or polling path is introduced.
+        Ok(NativeNoticeStep::Settled)
+    }
+
+    pub(in crate::cpl0_boot) fn finish_native_host_file<I: CarrierCpuIo>(
+        &mut self,
+        lease: &StoppedCpuLease<'_, I>,
+        pending: PendingNativeHostFile,
+        served: Result<
+            Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+            carrick_hal::fork_stock::NativeHostFileRefused,
+        >,
+    ) -> Result<(), TrapError> {
+        if self.physical_execution(lease)?.context != pending.execution.context {
+            return Err(fail("native host file completion context changed"));
+        }
+        self.native_service_pointer(
+            pending.execution.context,
+            pending.address,
+            pending.record.len(),
+            1,
+        )?;
+        match &served {
+            Ok(None) => {
+                let physical = kernel_pod_physical(
+                    &self.kernel_pod_storage,
+                    pending.address,
+                    pending.record.len(),
+                    1,
+                )
+                .ok_or_else(|| fail("native host file reply storage"))?;
+                self._vm
+                    .write(physical, &pending.record)
+                    .map_err(|error| fail(error.to_string()))?;
+            }
+            Ok(Some(_)) => return Err(fail("unexpected native host file source")),
+            Err(_) => {
+                let pointer = self.native_service_pointer(
+                    pending.execution.context,
+                    KernelVa::new(self.binding(lease.cpu).counters_address),
+                    size_of::<carrick_el1_abi::Counters>(),
+                    align_of::<carrick_el1_abi::Counters>(),
+                )?;
+                // SAFETY: exact stopped binding authenticates the retained counter region.
+                let counters = unsafe { &*pointer.cast::<carrick_el1_abi::Counters>() };
+                let request = pending.ticket.request();
+                let ServiceOperation::HostFile { payload, .. } = request.operation else {
+                    return Err(fail("native host file ticket changed"));
+                };
+                counters.record_refusal(
+                    payload.ordinal(),
+                    request.identity.birth.origin,
+                    carrick_el1_abi::RefusalVenue::Carrier,
+                );
+            }
+        }
+        let pointer = self
+            .ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("native service zone absent"))?;
+        // SAFETY: fixed aligned zone is retained by custody and the ticket.
+        let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
+        let _queue = zone
+            .object_wait(pending.key, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| fail("native host file acknowledgment queue"))?;
+        pending
+            .ticket
+            .complete(served.is_ok())
+            .map_err(|_| fail("native host file acknowledgment"))?;
         Ok(())
     }
 }
