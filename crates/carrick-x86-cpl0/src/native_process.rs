@@ -550,7 +550,26 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         mm: &Mm,
         request: carrick_core::mm::transaction::CopyoutRequest,
     ) -> Result<(), NativeProcessError> {
-        self.access_user_target(mm, request.address, request.len, None)
+        self.access_user_target(
+            mm,
+            request.address,
+            request.len,
+            None,
+            carrick_guest_arch::Access::Write,
+        )
+    }
+    fn prepare_owned_read(
+        &mut self,
+        mm: &Mm,
+        request: carrick_core::user_copy::GuestCopyRequest,
+    ) -> Result<(), NativeProcessError> {
+        self.access_user_target(
+            mm,
+            request.address,
+            request.len,
+            None,
+            carrick_guest_arch::Access::Read,
+        )
     }
     fn service_mm_handle(
         &self,

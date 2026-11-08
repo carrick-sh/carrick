@@ -188,10 +188,7 @@ impl<
         });
         let mut outcome = venue.wait_guest_copy(request);
         if matches!(outcome, LifecycleOutcome::Redispatch) {
-            let frame = self.frame.arm_frame().unwrap_or_else(|| {
-                super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
-            });
-            frame.elr = frame.elr.wrapping_sub(4);
+            self.frame.restart_syscall();
         }
         self.run_ready_after_native_transfer(&mut outcome);
         outcome

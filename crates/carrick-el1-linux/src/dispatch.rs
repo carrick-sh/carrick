@@ -93,6 +93,13 @@ pub trait GuestDispatchFrame: SyscallFrame {
     ) -> bool {
         false
     }
+    /// Re-enter this ISA's syscall instruction after argument preparation.
+    fn restart_syscall(&mut self) {
+        let frame = self
+            .arm_frame()
+            .unwrap_or_else(|| invalid_completion(NativeInvariant::EntryBinding));
+        frame.elr = frame.elr.wrapping_sub(4);
+    }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
     fn arm_frame_ref(&self) -> Option<&TrapFrame>;
     fn arm_scheduler(&self) -> bool;
@@ -2682,14 +2689,8 @@ impl<
                 -1
             } else {
                 let mut ts = [0u8; 16];
-                let mut user = file::ValidatedCopy {
-                    task,
-                    validator: &file::HardwareValidator,
-                };
-                if !user.copy_in(&mut ts, tmo_ptr) {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    );
+                if let Err(completion) = self.copy_argument(&mut ts, tmo_ptr) {
+                    return completion;
                 }
                 let mut seconds = [0u8; 8];
                 let mut nanoseconds = [0u8; 8];
@@ -2715,14 +2716,8 @@ impl<
                         carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
                     );
                 }
-                let mut user = file::ValidatedCopy {
-                    task,
-                    validator: &file::HardwareValidator,
-                };
-                if !user.copy_in(&mut bits, mask_ptr) {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    );
+                if let Err(completion) = self.copy_argument(&mut bits, mask_ptr) {
+                    return completion;
                 }
                 PollSignalMask::Replace(
                     carrick_signal_core::SignalSet::from_bits(u64::from_le_bytes(bits))
@@ -2770,15 +2765,8 @@ impl<
                 nfds * core::mem::size_of::<super::file_table::PollFd>(),
             )
         };
-        let copied = {
-            let mut user = file::ValidatedCopy {
-                task,
-                validator: &file::HardwareValidator,
-            };
-            user.copy_in(bytes, fds_ptr)
-        };
-        if !copied {
-            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
+        if let Err(completion) = self.copy_argument(bytes, fds_ptr) {
+            return completion;
         }
         let host_entries = super::file_table::host_readiness_entries(
             self.fd_map,
@@ -4344,7 +4332,31 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         }
     }
 
-    fn ipc_transfer(&mut self) -> FamilyCompletion {
+    /// No syscall effect has occurred: retain an input refusal through the
+    /// same exact-MM preparation used by lifecycle and futex argument reads.
+    fn copy_argument(&mut self, dst: &mut [u8], address: u64) -> Result<(), FamilyCompletion>
+    where
+        F: Fn(u32) -> *mut u8,
+    {
+        use carrick_core::user_copy::{CopyOutcome, UserCopy};
+        match UserCopy::copy_in(self, dst, carrick_guest_arch::UserVa::new(address)) {
+            CopyOutcome::Done => Ok(()),
+            CopyOutcome::Fault => Err(FamilyCompletion::Complete(
+                carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+            )),
+            CopyOutcome::NotYet(request) => {
+                let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+                Err(carrick_personality_linux::lifecycle::lifecycle_effect(
+                    &outcome,
+                ))
+            }
+        }
+    }
+
+    fn ipc_transfer(&mut self) -> FamilyCompletion
+    where
+        F: Fn(u32) -> *mut u8,
+    {
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
@@ -4370,6 +4382,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 },
                 owner: self.process.as_deref_mut(),
                 wait: None,
+                input_wait: None,
             };
             let (disposition, sigpipe_owed) = ipc::serve_ipc_with_signals(
                 &mut sched,
@@ -4379,6 +4392,18 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 native_signals,
                 &mut || false,
             );
+            // Admission (eventfd value / iovec headers) has no effects when
+            // it leaves for an input fault. Keep the refusal in the same
+            // native owner instead of sending an in-zone object to the host.
+            if (disposition == ipc::IpcServed::Forward
+                || (disposition == ipc::IpcServed::Returned { switched: false }
+                    && frame.x[0] as i64 == carrick_syscall_abi::LINUX_EFAULT.guest_retval()))
+                && let Some(request) = user.input_wait.take()
+            {
+                frame.x[0] = orig_x0;
+                let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+                return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+            }
             let result = frame.x[0] as i64;
             if sigpipe_owed {
                 raise_native_sigpipe(self.process.as_deref_mut());
@@ -4394,7 +4419,10 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         FamilyCompletion::Forward
     }
 
-    fn ipc_poll_transfer(&mut self) -> FamilyCompletion {
+    fn ipc_poll_transfer(&mut self) -> FamilyCompletion
+    where
+        F: Fn(u32) -> *mut u8,
+    {
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
@@ -4418,10 +4446,15 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 },
                 owner: self.process.as_deref_mut(),
                 wait: None,
+                input_wait: None,
             };
             let mut output = None;
             let disposition =
                 ipc::serve_single_zone_ppoll(&mut sched, frame, venue, &mut user, &mut output);
+            if let Some(request) = user.input_wait.take() {
+                let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+                return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+            }
             if let Some(output) = output {
                 let bytes = unsafe {
                     core::slice::from_raw_parts(
