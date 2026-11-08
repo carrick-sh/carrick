@@ -87,6 +87,7 @@ embed = [
 # applied per retained lifecycle page; this does not complete guest waits.
 vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::native_root_stock_claim_rollback_and_nproc_limit",
+  "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::{native_clear_tid_stopped_join_driver_aarch64,native_clear_tid_stopped_join_driver_x86} (registered native raw exit, stopped eligible join driver, no host custody and exactly one join completion)",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_root_stock_busy_claim_parks_then_release_retries_same_clone",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_cancels_retained_ipc_before_retirement",
