@@ -546,6 +546,302 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
     )
 }
 
+/// Serve the blocking, one-description zone subset of AArch64 `ppoll`.
+///
+/// The shared dispatcher handles immediate, host and mixed sets. This owner
+/// exists for the case the host cannot observe: an inherited zone object that
+/// is not ready yet. It retains the exact pollfd bytes, description pin and
+/// absolute deadline in the same operation arena as pipe and epoll waits.
+pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut TrapFrame,
+    venue: &IpcVenue<'_>,
+    user: &mut M,
+) -> IpcServed {
+    use crate::file_table::{LINUX_POLLERR, LINUX_POLLHUP, PollFd};
+    use carrick_el1_abi::ipc::epoll::EpollMember;
+
+    const POLLFD_BYTES: usize = core::mem::size_of::<PollFd>();
+    const SYS_PPOLL: u64 = 73;
+
+    if frame.x[8] != SYS_PPOLL || frame.x[1] != 1 || frame.x[3] != 0 {
+        return IpcServed::Forward;
+    }
+
+    let region = &venue.region;
+    let resumed = match sched.take_object_operation() {
+        Err(_) => return IpcServed::Forward,
+        Ok(Some(operation)) => {
+            let Some(token) = from_sched_token(operation) else {
+                return IpcServed::Forward;
+            };
+            let Ok(op) = region.operation(&token) else {
+                return IpcServed::Forward;
+            };
+            if op.kind != IpcOpKind::PollWait
+                || op.task != task_key(sched.task)
+                || op.mm != mm_key(sched.task)
+                || op.nr != SYS_PPOLL as u32
+            {
+                retain_native_operation(sched, token);
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+            }
+            let raw = op.value.0.to_ne_bytes();
+            let pollfd = PollFd {
+                fd: i32::from_ne_bytes(raw[..4].try_into().unwrap_or_default()),
+                events: i16::from_ne_bytes(raw[4..6].try_into().unwrap_or_default()),
+                revents: i16::from_ne_bytes(raw[6..].try_into().unwrap_or_default()),
+            };
+            let reason = sched
+                .zone
+                .slot(sched.slot)
+                .current()
+                .and_then(|id| sched.zone.record(id).handback());
+            if reason == Some(carrick_sched_core::Handback::Signal) && user.interrupt_pending_wait()
+            {
+                finish(sched, token, region);
+                frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+                return IpcServed::Returned { switched: false };
+            }
+            Some((pollfd, op.deadline, token, op))
+        }
+        Ok(None) => None,
+    };
+
+    let (mut pollfd, deadline, mut retained) = if let Some((pollfd, deadline, token, op)) = resumed
+    {
+        (pollfd, deadline, Some((token, op)))
+    } else {
+        let mut pollfd = PollFd::default();
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
+        };
+        if !user.copy_in(bytes, frame.x[0]) {
+            return IpcServed::Forward;
+        }
+        let deadline = if frame.x[2] == 0 {
+            carrick_el1_abi::ipc::IpcCounterDeadline::NONE
+        } else {
+            let mut timeout = [0u8; 16];
+            if !user.copy_in(&mut timeout, frame.x[2]) {
+                return IpcServed::Forward;
+            }
+            let seconds = i64::from_ne_bytes(timeout[..8].try_into().unwrap_or_default());
+            let nanos = i64::from_ne_bytes(timeout[8..].try_into().unwrap_or_default());
+            if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+                frame.x[0] = carrick_syscall_abi::LINUX_EINVAL.guest_retval() as u64;
+                return IpcServed::Returned { switched: false };
+            }
+            let duration = u64::try_from(seconds)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(nanos as u64);
+            if duration == 0 {
+                carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.cpu.now())
+            } else {
+                carrick_el1_abi::ipc::IpcCounterDeadline::at(
+                    sched
+                        .cpu
+                        .now()
+                        .saturating_add(sched.ticks(duration))
+                        .saturating_add(1),
+                )
+            }
+        };
+        (pollfd, deadline, None)
+    };
+
+    let Some(raw_table) = venue.tables.table_of(sched.task) else {
+        return IpcServed::Forward;
+    };
+    let table = TableId::from_raw(raw_table);
+    let fd = Fd(pollfd.fd);
+    let authority = region.fd(EL1_WAIT);
+
+    loop {
+        let active = retained.take();
+        let (mut active, fresh_pin, description) = if let Some((token, mut op)) = active {
+            let pin = OfdPin::from_raw(op.pin);
+            let description = match authority.pinned(&pin) {
+                Ok(description) => description,
+                Err(_) => {
+                    let _ = pin.into_raw();
+                    retain_native_operation(sched, token);
+                    crate::dispatch::invalid_completion(
+                        crate::dispatch::NativeInvariant::EntryBinding,
+                    );
+                }
+            };
+            op.pin = pin.into_raw();
+            (Some((token, op)), None, description)
+        } else {
+            match authority.pin(table, fd) {
+                Ok((pin, description)) => (None, Some(pin), description),
+                Err(FdError::BadFd) => {
+                    pollfd.revents = crate::file_table::LINUX_POLLNVAL;
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts((&raw const pollfd).cast::<u8>(), POLLFD_BYTES)
+                    };
+                    if !user.copy_out(frame.x[0], bytes) {
+                        return IpcServed::Forward;
+                    }
+                    frame.x[0] = 1;
+                    return IpcServed::Returned { switched: false };
+                }
+                Err(FdError::PinRaced(raw)) => {
+                    let op = IpcOperation {
+                        pin: raw,
+                        task: task_key(sched.task),
+                        mm: mm_key(sched.task),
+                        ..IpcOperation::EMPTY
+                    };
+                    let Ok(token) = region.begin_operation(op) else {
+                        return IpcServed::Forward;
+                    };
+                    finish_native(sched, token, region);
+                    return IpcServed::Forward;
+                }
+                Err(_) => return IpcServed::Forward,
+            }
+        };
+        let Some((object, member)) =
+            IpcBacking::decode(description.backing).and_then(EpollMember::of_backing)
+        else {
+            if let Some((token, _)) = active.take() {
+                finish(sched, token, region);
+            } else if let Some(pin) = fresh_pin {
+                release_pin(sched, pin, region);
+            }
+            return IpcServed::Forward;
+        };
+        let lane = if pollfd.events & crate::file_table::LINUX_POLLIN != 0 {
+            WaitFor::Readable
+        } else if pollfd.events & crate::file_table::LINUX_POLLOUT != 0 {
+            WaitFor::Writable
+        } else {
+            if let Some((token, _)) = active.take() {
+                finish(sched, token, region);
+            } else if let Some(pin) = fresh_pin {
+                release_pin(sched, pin, region);
+            }
+            return IpcServed::Forward;
+        };
+        let mut guard = match region.lock(object, &EL1_WAIT) {
+            Ok(guard) => guard,
+            Err(_) => {
+                if let Some((token, _)) = active.take() {
+                    retain_native_operation(sched, token);
+                    crate::dispatch::invalid_completion(
+                        crate::dispatch::NativeInvariant::EntryBinding,
+                    );
+                } else if let Some(pin) = fresh_pin {
+                    release_pin(sched, pin, region);
+                }
+                return IpcServed::Forward;
+            }
+        };
+        let Ok(level) = guard.member_level(member) else {
+            drop(guard);
+            if let Some((token, _)) = active.take() {
+                retain_native_operation(sched, token);
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+            } else if let Some(pin) = fresh_pin {
+                release_pin(sched, pin, region);
+            }
+            return IpcServed::Forward;
+        };
+        pollfd.revents = level as i16 & (pollfd.events | LINUX_POLLERR | LINUX_POLLHUP);
+        if pollfd.revents != 0 || deadline.get().is_some_and(|end| sched.cpu.now() >= end) {
+            drop(guard);
+            let bytes = unsafe {
+                core::slice::from_raw_parts((&raw const pollfd).cast::<u8>(), POLLFD_BYTES)
+            };
+            if !user.copy_out(frame.x[0], bytes) {
+                if let Some((token, _)) = active.take() {
+                    finish(sched, token, region);
+                    frame.x[0] = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
+                    return IpcServed::Returned { switched: false };
+                }
+                if let Some(pin) = fresh_pin {
+                    release_pin(sched, pin, region);
+                }
+                return IpcServed::Forward;
+            }
+            if let Some((token, _)) = active.take() {
+                finish(sched, token, region);
+            } else if let Some(pin) = fresh_pin {
+                release_pin(sched, pin, region);
+            }
+            frame.x[0] = u64::from(pollfd.revents != 0);
+            return IpcServed::Returned { switched: false };
+        }
+        let Some(snap) = snapshot(sched, object, lane) else {
+            drop(guard);
+            if let Some((token, _)) = active.take() {
+                retain_native_operation(sched, token);
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+            } else if let Some(pin) = fresh_pin {
+                release_pin(sched, pin, region);
+            }
+            return IpcServed::Forward;
+        };
+        drop(guard);
+        let mut raw = [0u8; POLLFD_BYTES];
+        raw[..4].copy_from_slice(&pollfd.fd.to_ne_bytes());
+        raw[4..6].copy_from_slice(&pollfd.events.to_ne_bytes());
+        raw[6..].copy_from_slice(&pollfd.revents.to_ne_bytes());
+        let (token, op) = if let Some((token, mut op)) = active.take() {
+            op.object = object.to_raw();
+            op.value = carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(raw));
+            (token, op)
+        } else {
+            let Some(fresh_pin) = fresh_pin else {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+            };
+            let op = IpcOperation {
+                kind: IpcOpKind::PollWait,
+                pin: fresh_pin.into_raw(),
+                object: object.to_raw(),
+                task: task_key(sched.task),
+                mm: mm_key(sched.task),
+                buf: IpcUserVa(frame.x[0]),
+                value: carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(raw)),
+                orig_x0: frame.x[0],
+                nr: SYS_PPOLL as u32,
+                deadline,
+                ..IpcOperation::EMPTY
+            };
+            let token = match region.begin_operation(op) {
+                Ok(token) => token,
+                Err(_) => {
+                    release_pin(sched, OfdPin::from_raw(op.pin), region);
+                    return IpcServed::Forward;
+                }
+            };
+            (token, op)
+        };
+        match park(
+            sched,
+            frame,
+            region,
+            token,
+            op,
+            object,
+            lane,
+            snap,
+            deadline.get(),
+            &mut || user.interrupt_pending_wait(),
+        ) {
+            Parked::Done(served) => return served,
+            Parked::Retry(token) => retained = Some((token, op)),
+            Parked::Refused(token) => {
+                finish(sched, token, region);
+                return IpcServed::Forward;
+            }
+        }
+    }
+}
+
 fn task_key(task: &CurrentTask) -> IpcTaskKey {
     IpcTaskKey(task.execution.task.load(Ordering::Relaxed))
 }

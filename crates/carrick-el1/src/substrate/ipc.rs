@@ -206,7 +206,9 @@ pub fn transfer_with_input<U: UserCopy>(
             }
         }
         // An epoll wait moves no bytes: it is never transferred.
-        IpcOpKind::None | IpcOpKind::EpollWait => return Err(IpcError::Corrupt),
+        IpcOpKind::None | IpcOpKind::EpollWait | IpcOpKind::PollWait => {
+            return Err(IpcError::Corrupt);
+        }
     };
     Ok((status, wake))
 }
