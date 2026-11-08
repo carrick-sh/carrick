@@ -216,7 +216,11 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
         let preflight: Result<()> = match name.as_str() {
             "carrick-kernel" => kernel_host_facilities(),
             "carrick-xtask" => crate::fixtures::reject_ambient_overrides()
-                .map_err(|e| format!("host configuration unavailable: {e}").into()),
+                .map_err(|e| format!("host configuration unavailable: {e}").into())
+                .and_then(|()| {
+                    if crate::target_prune::lsof_binary().is_some() { Ok(()) }
+                    else { Err("host facility unavailable: lsof is required by carrick-xtask target-prune tests".into()) }
+                }),
             _ => Ok(()),
         };
         if let Err(e) = preflight {

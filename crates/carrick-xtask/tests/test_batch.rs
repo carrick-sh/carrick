@@ -435,4 +435,39 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
         "{text}"
     );
     assert!(!text.contains("must_not_run ... FAILED"), "{text}");
+    // Keep the real capture prerequisites on PATH, but omit lsof. The suite
+    // must name that missing facility before executing its panic witness.
+    let tools = root.join("tools-without-lsof");
+    std::fs::create_dir(&tools).unwrap();
+    let paths = std::env::var_os("PATH").unwrap();
+    for name in ["cargo", "rustc", "git", "just", "python3", "sh", "bash"] {
+        let binary = std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .unwrap();
+        std::os::unix::fs::symlink(binary, tools.join(name)).unwrap();
+    }
+    let missing = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "test-touched",
+            &config_base,
+        ])
+        .env_remove("CARGO_BUILD_JOBS")
+        .env("PATH", tools)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&missing.stdout),
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(!missing.status.success(), "{text}");
+    assert!(
+        text.contains("host facility unavailable: lsof is required"),
+        "{text}"
+    );
+    assert!(!text.contains("must_not_run ... FAILED"), "{text}");
 }
