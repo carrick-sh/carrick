@@ -208,6 +208,51 @@ fn anonymous_release_after_enrollment_reprobes_before_park() {
         control_slot: 0,
     };
     let record = zone.current_or_new(slot, identity).unwrap();
+    let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+        let _ = effects.deliver_handbacks(&mut |_| {});
+    };
+    let mut early_probes = 0;
+    let mut early_enrollments = 0;
+    let early: EditWaitOutcome<()> = coordinate_anonymous_edit_wait(
+        &source,
+        None,
+        || {
+            early_probes += 1;
+            if early_probes == 1 {
+                Some(Some(SpaceWaitCause::Reservations))
+            } else {
+                Some(None)
+            }
+        },
+        |key, snapshot, operation| {
+            early_enrollments += 1;
+            source
+                .reserve(SpaceWaitCause::Reservations)
+                .publish(carrick_sched_core::Waker::Host, &complete);
+            let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, operation, None);
+            match park_object_record_rechecked(
+                &zone,
+                slot,
+                request,
+                &complete,
+                || Ok((record, false)),
+                || panic!("an advanced revision must refuse before enrollment"),
+            ) {
+                Ok(_) => panic!("a release before enrollment cannot leave the caller parked"),
+                Err(error) => {
+                    assert_eq!(
+                        error.0,
+                        carrick_sched_core::object_wait::ObjectWaitError::Changed
+                    );
+                    Err(error)
+                }
+            }
+        },
+    );
+    assert_eq!(early, EditWaitOutcome::NoConflict);
+    assert_eq!((early_probes, early_enrollments), (2, 1));
+    assert!(!zone.record(record).has_object_operation());
+
     let mut probes = 0;
     let mut enrollments = 0;
     let outcome: EditWaitOutcome<()> = coordinate_anonymous_edit_wait(
@@ -215,15 +260,15 @@ fn anonymous_release_after_enrollment_reprobes_before_park() {
         None,
         || {
             probes += 1;
-            (probes == 1).then_some(Some(SpaceWaitCause::Reservations))
+            if probes == 1 {
+                Some(Some(SpaceWaitCause::Reservations))
+            } else {
+                Some(None)
+            }
         },
         |key, snapshot, operation| {
             enrollments += 1;
             let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, operation, None);
-            let complete =
-                |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
-                    let _ = effects.deliver_handbacks(&mut |_| {});
-                };
             match park_object_record_rechecked(
                 &zone,
                 slot,
@@ -239,13 +284,28 @@ fn anonymous_release_after_enrollment_reprobes_before_park() {
                 },
             ) {
                 Ok(_) => panic!("a release after enrollment cannot leave the caller parked"),
-                Err(error) => Err(error),
+                Err(error) => {
+                    assert_eq!(
+                        error.0,
+                        carrick_sched_core::object_wait::ObjectWaitError::Changed
+                    );
+                    Err(error)
+                }
             }
         },
     );
     assert_eq!(outcome, EditWaitOutcome::NoConflict);
     assert_eq!((probes, enrollments), (2, 1));
-    assert!(zone.slot(slot).current().is_some());
+    assert_eq!(
+        zone.object_queue_census(source.key(SpaceWaitCause::Reservations).index())
+            .unwrap()
+            .waiters,
+        0
+    );
+    assert!(!matches!(
+        zone.record(record).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
     assert!(!zone.record(record).has_object_operation());
 }
 
