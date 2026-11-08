@@ -22,7 +22,7 @@
 //!    THAT is what HVF surfaces to the host as an `EXCEPTION` exit from
 //!    `hv_vcpu_run`. (Plain EL0 memory aborts HVF cannot satisfy — a stack
 //!    overflow running SP off the mapped stack — surface directly as an
-//!    `EXCEPTION` exit with `EC=0x21/0x24` instead; see
+//!    `EXCEPTION` exit with `EC=0x20/0x24` instead; see
 //!    `is_aarch64_el0_abort_exception`.) The reason we trampoline through EL1
 //!    rather than letting HVF trap the `svc` directly is that the EL1 stage
 //!    gives us a place to do stage-1 TLB maintenance (`hvc #1`, see
@@ -660,8 +660,8 @@ const GPR_TABLE: [applevisor::vcpu::Reg; 31] = [
     applevisor::vcpu::Reg::X16,
     applevisor::vcpu::Reg::X17,
     applevisor::vcpu::Reg::X18,
+    applevisor::vcpu::Reg::X19,
     applevisor::vcpu::Reg::X20,
-    applevisor::vcpu::Reg::X21,
     applevisor::vcpu::Reg::X21,
     applevisor::vcpu::Reg::X22,
     applevisor::vcpu::Reg::X23,
@@ -673,6 +673,7 @@ const GPR_TABLE: [applevisor::vcpu::Reg; 31] = [
     applevisor::vcpu::Reg::X29,
     applevisor::vcpu::Reg::X30,
 ];
+
 /// GPR_TABLE's array index is the architectural register number: snapshot,
 /// restore and indexed reads all rely on it (#887 round 2 briefly replaced X19
 /// with a duplicate X21 here, silently corrupting X19/X20 across rebinds).
@@ -2242,7 +2243,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
             shared_key_offset: 0,
             owner_generation: mm_slot,
         }),
-        mm_root_slot: Some((mm_slot << 20, 0x21_0000)),
+        mm_root_slot: Some((mm_slot << 20, 0x20_0000)),
         container_root: ContainerRootToken::from_raw(1),
         pending_exec_mm_root_slot: None,
         pending_exec_asid: None,
@@ -8417,7 +8418,7 @@ impl HvfInner {
             let exception = exit.exception;
             // A guest EL0 memory abort HVF couldn't satisfy (e.g. a stack overflow
             // that ran SP off the mapped stack) surfaces DIRECTLY as an EXCEPTION
-            // exit with EC=0x21/0x24, NOT through our EL1 vector's HVC. Surface it
+            // exit with EC=0x20/0x24, NOT through our EL1 vector's HVC. Surface it
             // as a DIRECT EL0Fault so the runtime delivers the right Linux signal
             // (SIGSEGV) instead of fataling. ELR_EL1/FAR_EL1 are STALE here (the
             // guest's EL1 vector never ran), so build the fault from HVF's
@@ -9191,7 +9192,7 @@ mod el1_resume_tests {
                 mm,
                 Layout {
                     heap: ReservationRange::new(heap, heap + 0x10_0000).unwrap(),
-                    arena: ReservationRange::new(0x2100_0000, 0x3000_0000).unwrap(),
+                    arena: ReservationRange::new(0x2000_0000, 0x3000_0000).unwrap(),
                     brk: heap,
                     address_limit: u64::MAX,
                     data_limit: u64::MAX,
@@ -9253,7 +9254,7 @@ mod el1_resume_tests {
         };
 
         // Resumes with PC advancing do not accumulate unbounded consecutive count
-        for pc in (0x1000..0x2100).step_by(4) {
+        for pc in (0x1000..0x2000).step_by(4) {
             simulate_resume(pc, &mut last_pc, &mut consecutive_without_progress);
             assert_eq!(consecutive_without_progress, 1);
         }
@@ -9265,7 +9266,7 @@ mod el1_resume_tests {
         }
 
         // Stepping to a new PC resets the count to 1
-        simulate_resume(0x2100, &mut last_pc, &mut consecutive_without_progress);
+        simulate_resume(0x2000, &mut last_pc, &mut consecutive_without_progress);
         assert_eq!(consecutive_without_progress, 1);
     }
 
