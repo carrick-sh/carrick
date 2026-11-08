@@ -3240,7 +3240,11 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
     use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
     use carrick_sched_core::spaces::notification::SpaceWaitCause;
 
-    for cause in [SpaceWaitCause::Reservations, SpaceWaitCause::Editor] {
+    for cause in [
+        SpaceWaitCause::Reservations,
+        SpaceWaitCause::Editor,
+        SpaceWaitCause::PreparedOverlap,
+    ] {
         for cancel in [false, true] {
             let region = Region::new();
             let zone = region.zone();
@@ -3268,7 +3272,26 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
             task.mm.thread_generation.store(1101, Ordering::Release);
             task.linux.mark_pending_host_work();
             let counters = Counters::default();
-            let tables = Tables::new(ROOT, IPA, 0);
+            let tables = Tables::new(ROOT, IPA, 2);
+            let maintenance = CallerInvalidatesAsid;
+            let prepared = (cause == SpaceWaitCause::PreparedOverlap).then(|| {
+                let transfer = portal
+                    .begin(
+                        portal.admitted_handle(mm, 0).unwrap(),
+                        GuestVa::new(VA),
+                        4096,
+                        TransferIntent::UserWrite,
+                        0,
+                    )
+                    .unwrap();
+                let request = selected(select(&portal, &transfer, &tables))
+                    .request(TransferIntent::UserWrite, retained())
+                    .unwrap();
+                let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+                    .unwrap()
+                    .unwrap();
+                (permit, request)
+            });
             let arenas = [&tables];
             let mut editor = ForkAnonymousEditor {
                 arenas: &arenas,
@@ -3346,6 +3369,9 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
             }
             drop(held_root);
             drop(held_editor);
+            if let Some((permit, request)) = prepared {
+                portal.cancel_prepared(permit, request, 0).unwrap();
+            }
             assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
             if cancel {
                 assert!(zone.switch_in_full(slot).is_none());
@@ -3372,15 +3398,16 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
                 ),
                 DelegatedAnonymous::Served,
             );
-            let leave = if cause == SpaceWaitCause::Reservations {
-                AnonymousLeave::RootBusy
-            } else {
-                AnonymousLeave::EditorBusy
-            };
-            assert_eq!(
-                counters.anonymous_leaves[leave as usize].load(Ordering::Relaxed),
-                0
-            );
+            for leave in [
+                AnonymousLeave::RootBusy,
+                AnonymousLeave::EditorBusy,
+            ] {
+                assert_eq!(
+                    counters.anonymous_leaves[leave as usize].load(Ordering::Relaxed),
+                    0
+                );
+            }
+            assert_eq!(counters.forwarded[215].load(Ordering::Relaxed), 0);
         }
     }
 }
