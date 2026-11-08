@@ -768,10 +768,6 @@ fn native_clear_tid_stopped_join_driver_aarch64() {
 
 use carrick_core_abi::PortalWaitCause;
 
-fn mm_of(handle: carrick_core_abi::El1MmHandle) -> MmGeneration {
-    MmGeneration::new(NonZeroU64::new(handle.mm().raw()).unwrap())
-}
-
 const HELD_SLOT: u32 = 1;
 const PROBE_SLOT: u32 = 2;
 
@@ -799,7 +795,7 @@ fn contention_keeps_owner_notification<
         "the held root must hold the private anonymous mapping under test"
     );
 
-    let wait = match private_anonymous_futex_mapping(portal, mm_of(handle), PROBE_SLOT, address) {
+    let wait = match private_anonymous_futex_mapping(portal, handle, PROBE_SLOT, address) {
         Err(NativeProcessError::OwnerWait(wait)) => wait,
         other => panic!("real root contention must return the owner's wait, got {other:?}"),
     };
@@ -879,14 +875,14 @@ fn contention_keeps_owner_notification<
     // The same authenticated handle now acquires the released root and answers
     // from the real mapping tree.
     assert_eq!(
-        private_anonymous_futex_mapping(portal, mm_of(handle), PROBE_SLOT, address),
+        private_anonymous_futex_mapping(portal, handle, PROBE_SLOT, address),
         Ok(true),
         "the private anonymous mapping is admitted after release"
     );
     assert_eq!(
         private_anonymous_futex_mapping(
             portal,
-            mm_of(handle),
+            handle,
             PROBE_SLOT,
             UserVa::new(address.raw() + 0x0100_0000)
         ),

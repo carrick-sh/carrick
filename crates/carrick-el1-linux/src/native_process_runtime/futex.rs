@@ -7,9 +7,17 @@ use carrick_personality_linux::sched::{
 };
 use core::cell::{Cell, RefCell};
 
+/// Whether `address` is a private anonymous mapping of the admitted MM.
+///
+/// The mapping root is acquired through the existing authenticated portal
+/// protocol: the caller supplies the MM handle it already authenticated, and
+/// the portal observes that handle's `Reservations` source before probing the
+/// root lock. A held root therefore returns the holder's exact
+/// [`carrick_core_abi::PortalOwnerWait`] for the caller to enrol on, never a
+/// bare `Busy` that would send the syscall back through a checkpoint retry.
 pub fn private_anonymous_futex_mapping<P, Policy, Geometry, Venue, B, C>(
     portal: &carrick_core::mm::transaction::MmPortal<'_, P, Policy, Geometry, Venue, B, C>,
-    mm: MmGeneration,
+    handle: carrick_core_abi::El1MmHandle,
     slot: u32,
     address: UserVa,
 ) -> Result<bool, NativeProcessError>
@@ -21,18 +29,11 @@ where
     B: carrick_mmu_core::owner_mmu::OwnerMmu,
     C: ProcessContext,
 {
-    let mut root = portal
-        .root(
-            carrick_el1_abi::ReservationMm::new(mm.raw().get()).ok_or(NativeProcessError::Stale)?,
-            slot,
-        )
-        .map_err(|error| match error {
-            carrick_core::mm::transaction::MmError::Wait(wait) => {
-                NativeProcessError::OwnerWait(wait)
-            }
-            carrick_core::mm::transaction::MmError::Busy => NativeProcessError::Busy,
-            _ => NativeProcessError::Stale,
-        })?;
+    let mut root = portal.root_for(handle, slot).map_err(|error| match error {
+        carrick_core::mm::transaction::MmError::Wait(wait) => NativeProcessError::OwnerWait(wait),
+        carrick_core::mm::transaction::MmError::Busy => NativeProcessError::Busy,
+        _ => NativeProcessError::Stale,
+    })?;
     Ok(root.mapping(address.raw()).is_some_and(|mapping| {
         mapping.anonymous
             && mapping
@@ -360,14 +361,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let result = carrick_personality_linux::sched::serve_futex(call, &mut adapter);
         if let Some(error) = adapter.mapping_refusal {
             return Some(match error {
-                NativeProcessError::OwnerWait(_) | NativeProcessError::Busy => {
+                NativeProcessError::OwnerWait(wait) => {
                     if let Some(retained) = adapter.retained {
                         adapter.entry.retain_relative_futex_wait(retained);
                     }
-                    let wait = match error {
-                        NativeProcessError::OwnerWait(wait) => Some(wait),
-                        _ => None,
-                    };
                     adapter
                         .entry
                         .retry_guest_input(
@@ -375,12 +372,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 entry: OwnerEntry::Syscall,
                             },
                             None,
-                            wait,
+                            Some(wait),
                         )
                         .unwrap_or_else(|error| {
                             adapter.entry.run_failed(error.run_failure_reason())
                         })
                 }
+                // A live portal always observes its Reservations source before
+                // the root probe, so mapping contention cannot reach here as a
+                // bare `Busy`. Treat it as the invariant break it is instead of
+                // adding a waitless checkpoint-retry second path.
                 error => adapter.entry.run_failed(error.run_failure_reason()),
             });
         }
