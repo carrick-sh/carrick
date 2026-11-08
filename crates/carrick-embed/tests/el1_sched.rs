@@ -4077,6 +4077,25 @@ fn prepared_fork_copy_refusals() -> String {
     rows
 }
 
+/// Include rows even when the harness fails before returning guest output.
+/// Unwinding is caught only to enrich the failure, then immediately re-raised.
+fn run_prepared_fork_fixture(carrier: &Carrier, argument: &str) -> Measured {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_fixture(carrier, &[argument], Duration::from_secs(30))
+    }))
+    .unwrap_or_else(|failure| {
+        let reason = failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failure.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        panic!(
+            "{argument} fixture failed: {reason}\n{}",
+            prepared_fork_copy_refusals()
+        );
+    })
+}
+
 /// Actual guest reads and writes with two live processes. VM-free descriptor
 /// checks cannot prove the backend's armed physical COW authority fires.
 #[test]
@@ -4084,7 +4103,7 @@ fn el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
-    let run = run_fixture(&carrier, &["prepared-fork"], Duration::from_secs(30));
+    let run = run_prepared_fork_fixture(&carrier, "prepared-fork");
     assert_eq!(
         run.result
             .stdout_utf8()
@@ -4104,7 +4123,7 @@ fn el1_prepared_fork_poll_arguments_touched_after_fork() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
-    let run = run_fixture(&carrier, &["prepared-fork-touch"], Duration::from_secs(30));
+    let run = run_prepared_fork_fixture(&carrier, "prepared-fork-touch");
     let output = run.result.stdout_utf8();
     assert!(
         output.contains(
