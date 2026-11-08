@@ -305,7 +305,15 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                     ) => return Some(Some(SpaceWaitCause::PendingEdit)),
                     ReservationDisposition::Unavailable(
                         carrick_el1::memory::reservations::Refusal::MetadataRequired,
-                    ) => return None,
+                    ) => {
+                        if root
+                            .provision_metadata(&carrick_el1::alloc::GLOBAL_ALLOCATOR)
+                            .is_err()
+                        {
+                            return None;
+                        }
+                        return Some(None);
+                    }
                     ReservationDisposition::Unavailable(_) => return None,
                     ReservationDisposition::Work(pending) => {
                         if pending.cancel(&mut root).is_err() {
