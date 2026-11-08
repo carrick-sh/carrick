@@ -2194,13 +2194,18 @@ fn run_inner(
             let step_name = "probe-cases";
             let run_id = format!("accept-{timestamp}-probe-cases");
             let log_path = run_dir.join("probe-cases.log");
-            let cmd_str = "./scripts/test-signed.sh carrick-conformance-next case_ --nocapture";
+            let cmd_str = "./scripts/test-signed.sh carrick-conformance-next case_ --include-ignored --nocapture";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
             let (exit_code, duration_s) = run_command_redirect(
                 &gate_lease,
                 "./scripts/test-signed.sh",
-                &["carrick-conformance-next", "case_", "--nocapture"],
+                &[
+                    "carrick-conformance-next",
+                    "case_",
+                    "--include-ignored",
+                    "--nocapture",
+                ],
                 &[("CARRICK_RUN_ID", &run_id)],
                 &root,
                 &log_path,

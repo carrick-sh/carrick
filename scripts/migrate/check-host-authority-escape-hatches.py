@@ -40,6 +40,10 @@ RAW_SYSCALL_BOUNDARIES = frozenset(
         PurePosixPath(
             "crates/carrick-conformance-next/tests/fixtures/directory-copyout/src/main.rs"
         ),
+        # Guest-only static ELF reads its own executable link; no host service.
+        PurePosixPath(
+            "crates/carrick-conformance-next/tests/fixtures/native-exe-lifecycle/src/main.rs"
+        ),
         PurePosixPath("crates/carrick-vmm-bhyve/fixtures/bhyve-asyncsig/src/main.rs"),
         PurePosixPath("crates/carrick-vmm-bhyve/fixtures/bhyve-fork-raw/src/main.rs"),
         PurePosixPath("crates/carrick-vmm-bhyve/fixtures/bhyve-vfork-exec/src/main.rs"),
