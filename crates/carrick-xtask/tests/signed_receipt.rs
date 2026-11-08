@@ -183,6 +183,8 @@ fn write_paired_base(results: &std::path::Path, base: &AcceptReceipt) -> std::pa
         serde_json::to_vec(&base.cleanup_counts).unwrap(),
     )
     .unwrap();
+    // Completed itemized failures: acceptance exits nonzero (#1889 review).
+    std::fs::write(paired.join("accept-exit.json"), r#"{"success":false}"#).unwrap();
     paired
 }
 
