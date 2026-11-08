@@ -219,14 +219,25 @@ fn with_pair(run: impl FnOnce(Pair<'_, '_>)) {
     use carrick_kernel::kernel::ClonePlan;
     let (process, root) = crate::hvpatch::process_context_for_tests(73_703);
     root.thread().set_affinity(carrick_hal::CpuAffinity::all(2));
-    let zone = carrick_test_support::TestEl1Region::zeroed();
     // A separate typed allocation avoids putting ZoneTables on a Rust stack.
-    let zone = unsafe {
+    // It is leaked because the kernel bound below keeps the zone's namespace
+    // table as its identity authority for as long as any claim lives.
+    let zone: &'static carrick_test_support::TestEl1Region =
+        Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let zone: &'static ZoneTables = unsafe {
         &*zone
             .as_ptr()
             .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
             .cast::<ZoneTables>()
     };
+    // Production launch binds the kernel's identity authority to the carrier
+    // zone before native admission (`PreparedRun`), so the root and every
+    // host-issued thread live in the zone's shared namespace table.
+    root.kernel()
+        .bind_initial_birth_source(Arc::new(
+            carrick_hal::birth_serial::test_support::OwnedBirthZone::from_static(zone),
+        ))
+        .unwrap();
     zone.publish_carrier_cpu_count(2);
     let address = Address {
         root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),

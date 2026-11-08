@@ -25,13 +25,19 @@ pub(crate) fn seed_fixture_namespace<C: ProcessContext>(
                 }
             }
             ns.bind_visible_domain(root, domain).unwrap();
-            ns.advance_visible_past(
-                domain,
-                VisibleIdentity::from_existing_member(
-                    NonZeroU32::new(current.visible_pid().unwrap()).unwrap(),
-                ),
-            )
-            .unwrap();
+            // A host kernel bound to this zone may already have bound the root
+            // to the unmapped domain, whose visible ids are the internal claims
+            // themselves: it has no cursor to advance.
+            let mapped = domain != VisibleNamespace::unmapped();
+            if mapped {
+                ns.advance_visible_past(
+                    domain,
+                    VisibleIdentity::from_existing_member(
+                        NonZeroU32::new(current.visible_pid().unwrap()).unwrap(),
+                    ),
+                )
+                .unwrap();
+            }
             for index in 0..page.entry_count() {
                 let Some((generation, state)) = page.state(index) else {
                     continue;
@@ -54,7 +60,7 @@ pub(crate) fn seed_fixture_namespace<C: ProcessContext>(
                         .unwrap();
                 }
                 ns.bind_visible_domain(identity.tid as i32, domain).unwrap();
-                if let Some(visible) = NonZeroU32::new(identity.visible_tid) {
+                if let Some(visible) = NonZeroU32::new(identity.visible_tid).filter(|_| mapped) {
                     ns.advance_visible_past(domain, VisibleIdentity::from_existing_member(visible))
                         .unwrap();
                 }

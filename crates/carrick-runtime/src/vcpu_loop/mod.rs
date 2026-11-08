@@ -4663,6 +4663,14 @@ pub(crate) mod tests {
         use carrick_guest_arch::{
             AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
         };
+        // Production launch binds the kernel's identity authority to the
+        // carrier zone before native admission (`PreparedRun`), so host-issued
+        // tasks and threads live in the zone's shared namespace table.
+        root.kernel()
+            .bind_initial_birth_source(std::sync::Arc::new(
+                carrick_hal::birth_serial::test_support::OwnedBirthZone::from_static(zone),
+            ))
+            .expect("bind fixture kernel to the test zone");
         let region = carrick_el1_abi::get_el1_region_host_ptr();
         assert_ne!(region, 0);
         // SAFETY: this test exclusively owns the fresh aligned ABI region;
