@@ -13960,6 +13960,50 @@ fn admission_fresh_root_pending_custody_reports_identity() {
 }
 
 #[test]
+fn live_root_unregister_does_not_reclassify_own_projection_as_fresh_root() {
+    use carrick_el1_abi::Lifecycle;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let (_, sibling_record) = imported_thread(fixture);
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+
+    // Keep a second live imported member in the same process. The entering
+    // leader's signal projection is nevertheless the exact pending writer
+    // involved in the refusal, rather than a synthetic writer held by this
+    // test.
+    assert_eq!(fixture.page.live(), 2);
+    assert!(fixture.zone.live(sibling_record).is_some());
+
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    registry().attempt_live_root_unregister_for_test(&runtime);
+    let entered = fixture.enter(
+        fixture.control,
+        fixture_ttbr0(fixture),
+        &mut service,
+        |_| (),
+    );
+    assert!(
+        entered.is_ok(),
+        "live root re-entry must keep the existing projection; got {entered:?} (carrier fatal AdmissionFreshRootPendingCustody)"
+    );
+    registry().unregister_root_for_test(&runtime);
+}
+
+#[test]
 fn admission_thread_pending_custody_reports_identity() {
     use crate::native_process_runtime::{NativeAdmissionContention, NativeAdmissionOrigin};
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
