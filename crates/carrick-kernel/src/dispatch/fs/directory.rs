@@ -107,13 +107,13 @@ impl<'a> DirectoryReadCaller<'a> {
     }
 }
 
-struct RenameAtRequest {
-    olddirfd: u64,
-    oldpath: u64,
-    newdirfd: u64,
-    newpath: u64,
-    flags: u64,
-    target_tid: Option<crate::thread::ThreadId>,
+pub(in crate::dispatch) struct RenameAtRequest<'a> {
+    pub olddirfd: u64,
+    pub oldpath: &'a str,
+    pub newdirfd: u64,
+    pub newpath: &'a str,
+    pub flags: u64,
+    pub target_tid: Option<crate::thread::ThreadId>,
 }
 
 impl<'a> FsView<'a> {
@@ -565,11 +565,10 @@ impl<'a> FsView<'a> {
         Some(Ok(()))
     }
 
-    fn do_renameat<M: CurrentMmMemory>(
+    pub(in crate::dispatch) fn rename_paths(
         &self,
-        context: &crate::kernel::KernelContext,
-        request: RenameAtRequest,
-        memory: &M,
+        context: Option<&crate::kernel::KernelContext>,
+        request: RenameAtRequest<'_>,
     ) -> Result<DispatchOutcome, DispatchError> {
         const RENAME_NOREPLACE: u64 = 1;
         const RENAME_EXCHANGE: u64 = 2;
@@ -581,16 +580,22 @@ impl<'a> FsView<'a> {
             flags,
             target_tid,
         } = request;
-        let old = read_guest_c_string(memory, oldpath)?;
-        let new_path = read_guest_c_string(memory, newpath)?;
+        let old = oldpath;
+        let new_path = newpath;
         if old.is_empty() || new_path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
         let resolved_old = self.resolve_at_path(olddirfd, &old)?;
         let resolved_new = self.resolve_at_path(newdirfd, &new_path)?;
-        if self.is_synthetic_virtual_path(context, &resolved_old)
-            || self.is_synthetic_virtual_path(context, &resolved_new)
+        if self.mutation_path_needs_task(context, &resolved_old)
+            || self.mutation_path_needs_task(context, &resolved_new)
         {
+            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+        }
+        if context.is_some_and(|context| {
+            self.is_synthetic_virtual_path(context, &resolved_old)
+                || self.is_synthetic_virtual_path(context, &resolved_new)
+        }) {
             return Ok(DispatchOutcome::errno(LINUX_EROFS));
         }
         // RENAME_EXCHANGE: atomically swap two EXISTING entries. Both must
@@ -608,6 +613,12 @@ impl<'a> FsView<'a> {
             let new_exists = self.layered_metadata(&resolved_new).is_ok();
             if !old_exists || !new_exists {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+            }
+            if context.is_none()
+                && (!self.native_rename_source_supported(&resolved_old)
+                    || !self.native_rename_source_supported(&resolved_new))
+            {
+                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
             }
             return match self.fs.rootfs_vfs.exchange_with_flags_and_publish(
                 &resolved_old,
@@ -664,12 +675,14 @@ impl<'a> FsView<'a> {
                         self.inotify_move(&resolved_old, &resolved_new, old_is_dir);
                         self.inotify_move(&resolved_new, &resolved_old, new_is_dir);
                     }
-                    self.dnotify_child_for_tid(
-                        context,
-                        &resolved_old,
-                        LinuxDnotifyMask::RENAME,
-                        target_tid,
-                    );
+                    if let Some(context) = context {
+                        self.dnotify_child_for_tid(
+                            context,
+                            &resolved_old,
+                            LinuxDnotifyMask::RENAME,
+                            target_tid,
+                        );
+                    }
                     Ok(DispatchOutcome::Returned { value: 0 })
                 },
             ) {
@@ -678,6 +691,13 @@ impl<'a> FsView<'a> {
             };
         }
         let no_replace = flags & RENAME_NOREPLACE != 0;
+        if context.is_none()
+            && self.fs.vfs_mounts.resolve(&resolved_old).is_none()
+            && self.layered_lstat(&resolved_old).is_ok()
+            && !self.native_rename_source_supported(&resolved_old)
+        {
+            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+        }
         // Renaming OVER an OVERRIDABLE single-file injection (/etc/services,
         // /etc/resolv.conf) DETACHES it: the read-only synthetic mount would
         // EROFS on the rename target. Record the override so the new path falls
@@ -697,6 +717,9 @@ impl<'a> FsView<'a> {
                 }
                 if no_replace && mnew.vfs.lookup(&mnew.full_path).is_ok() {
                     return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+                }
+                if context.is_none() {
+                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
                 }
                 // Mounted VFS renames use that mount's own namespace
                 // authority. RootFs snapshots are captured only after its
@@ -786,24 +809,26 @@ impl<'a> FsView<'a> {
                             .inotify_registry
                             .rename_path(&resolved_old, &resolved_new);
                     }
-                    if moved_is_dir {
-                        self.dnotify_child_for_tid(
-                            context,
-                            &resolved_old,
-                            LinuxDnotifyMask::RENAME,
-                            target_tid,
-                        );
+                    if let Some(context) = context {
+                        if moved_is_dir {
+                            self.dnotify_child_for_tid(
+                                context,
+                                &resolved_old,
+                                LinuxDnotifyMask::RENAME,
+                                target_tid,
+                            );
+                        }
+                        let cwd = self.cwd();
+                        if cwd == resolved_old {
+                            self.set_cwd(&resolved_new);
+                        } else if cwd.starts_with(&resolved_old)
+                            && cwd.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                        {
+                            let rest = &cwd[resolved_old.len() + 1..];
+                            self.set_cwd(&format!("{resolved_new}/{rest}"));
+                        }
+                        self.rename_open_paths(&resolved_old, &resolved_new);
                     }
-                    let cwd = self.cwd();
-                    if cwd == resolved_old {
-                        self.set_cwd(&resolved_new);
-                    } else if cwd.starts_with(&resolved_old)
-                        && cwd.as_bytes().get(resolved_old.len()) == Some(&b'/')
-                    {
-                        let rest = &cwd[resolved_old.len() + 1..];
-                        self.set_cwd(&format!("{resolved_new}/{rest}"));
-                    }
-                    self.rename_open_paths(&resolved_old, &resolved_new);
                     crate::el1_inotify::invalidate_name_cache_all();
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -812,6 +837,23 @@ impl<'a> FsView<'a> {
             Ok(outcome) => outcome,
             Err(errno) => Ok(DispatchOutcome::errno(errno)),
         }
+    }
+
+    fn native_rename_source_supported(&self, path: &str) -> bool {
+        // Native callers have no indexed host FileTable or mutable TaskFs
+        // row here. Only physical non-directory rootfs names need neither.
+        self.fs.rootfs_vfs.overlay.serves_dentry_cache()
+            && self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .real_stat(path, true)
+                .is_some_and(|metadata| {
+                    matches!(
+                        metadata.kind,
+                        RootFsEntryKind::File | RootFsEntryKind::Symlink
+                    )
+                })
     }
 
     pub(in crate::dispatch) fn mkdir_path(
@@ -1594,17 +1636,18 @@ impl<'a> FsView<'a> {
 
     define_syscall! {
         fn renameat(this, cx, olddirfd: u64, oldpath: GuestPtr, newdirfd: u64, newpath: GuestPtr) {
-            this.do_renameat(
-                cx.kernel,
+            let old = read_guest_c_string(&*cx.memory, oldpath.0)?;
+            let new = read_guest_c_string(&*cx.memory, newpath.0)?;
+            this.rename_paths(
+                Some(cx.kernel),
                 RenameAtRequest {
                     olddirfd,
-                    oldpath: oldpath.0,
+                    oldpath: &old,
                     newdirfd,
-                    newpath: newpath.0,
+                    newpath: &new,
                     flags: 0,
                     target_tid: Some(cx.tid()),
                 },
-                &*cx.memory,
             )
         }
 
@@ -1621,17 +1664,18 @@ impl<'a> FsView<'a> {
             if rf.contains(LinuxRenameat2Flags::WHITEOUT) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            this.do_renameat(
-                cx.kernel,
+            let old = read_guest_c_string(&*cx.memory, oldpath.0)?;
+            let new = read_guest_c_string(&*cx.memory, newpath.0)?;
+            this.rename_paths(
+                Some(cx.kernel),
                 RenameAtRequest {
                     olddirfd,
-                    oldpath: oldpath.0,
+                    oldpath: &old,
                     newdirfd,
-                    newpath: newpath.0,
+                    newpath: &new,
                     flags,
                     target_tid: Some(cx.tid()),
                 },
-                &*cx.memory,
             )
         }
 
