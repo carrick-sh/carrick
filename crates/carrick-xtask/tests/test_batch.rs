@@ -449,18 +449,29 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
             .unwrap();
         std::os::unix::fs::symlink(binary, tools.join(name)).unwrap();
     }
-    let missing = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+    let mut missing = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+    missing
         .args([
             "--root",
             root.to_str().unwrap(),
             "test-touched",
             &config_base,
         ])
-        .env_remove("CARGO_BUILD_JOBS")
+        .env_clear()
         .env("PATH", tools)
-        .env("CARGO_TARGET_DIR", root.join("target"))
-        .output()
-        .unwrap();
+        .env("CARGO_TARGET_DIR", root.join("target"));
+    for name in [
+        "HOME",
+        "RUSTUP_HOME",
+        "CARGO_HOME",
+        "RUSTUP_TOOLCHAIN",
+        "TMPDIR",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            missing.env(name, value);
+        }
+    }
+    let missing = missing.output().unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&missing.stdout),
