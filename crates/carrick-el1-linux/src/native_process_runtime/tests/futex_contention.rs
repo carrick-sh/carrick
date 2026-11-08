@@ -141,6 +141,7 @@ impl<C: ProcessContext> Drop for Fixture<C> {
 struct Copy {
     refuse_word: bool,
     loads: usize,
+    word: u32,
 }
 impl UserCopy for Copy {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
@@ -161,7 +162,7 @@ impl UserCopy for Copy {
                 access: Access::Read,
             })
         } else {
-            *out = 0;
+            *out = self.word;
             CopyOutcome::Done
         }
     }
@@ -234,6 +235,7 @@ fn episode<C: ProcessContext + 'static, B: carrick_mmu_core::owner_mmu::OwnerFor
     let mut copy = Copy {
         refuse_word: !mapping,
         loads: 0,
+        word: 0,
     };
     let call = FutexCall {
         args: [0x1000, 0, 0, if timed { 0x2000 } else { 0 }, 0, 0],
@@ -349,7 +351,7 @@ fn native_futex_word_deadline_starts_at_first_attempt_aarch64() {
 
 /// A native frame routes exit through the common lifecycle dispatcher on
 /// either context type, without selecting the separate ARM scheduler adapter.
-struct ExitFrame;
+struct ExitFrame(carrick_personality_linux::crossing::HostCrossingSet);
 impl carrick_personality_linux::dispatch::SyscallFrame for ExitFrame {
     fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
         carrick_syscall_abi::CanonicalNr::new(carrick_personality_linux::lifecycle::SYS_EXIT as u64)
@@ -373,10 +375,13 @@ impl carrick_personality_linux::dispatch::SyscallFrame for ExitFrame {
 }
 impl crate::dispatch::GuestDispatchFrame for ExitFrame {
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
-        carrick_guest_arch::NativeOrdinal::new(60)
+        carrick_guest_arch::NativeOrdinal::new(match self.0 {
+            carrick_personality_linux::crossing::HostCrossingSet::X86 => 60,
+            carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => 93,
+        })
     }
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
-        carrick_personality_linux::crossing::HostCrossingSet::X86
+        self.0
     }
     fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> {
         None
@@ -392,8 +397,10 @@ impl crate::dispatch::GuestDispatchFrame for ExitFrame {
     }
 }
 
-fn clear_tid_stopped_join_driver<C, B>(make: impl Fn(AddressContext<RootGpa>) -> C)
-where
+fn clear_tid_stopped_join_driver<C, B>(
+    make: impl Fn(AddressContext<RootGpa>) -> C,
+    isa: carrick_personality_linux::crossing::HostCrossingSet,
+) where
     C: ProcessContext + crate::dispatch::DispatchContext + 'static,
     B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
 {
@@ -522,6 +529,7 @@ where
     let mut copy = Copy {
         refuse_word: false,
         loads: 0,
+        word: 42,
     };
     {
         let mut entry = fixture
@@ -541,7 +549,7 @@ where
         assert!(matches!(
             entry.native_futex(
                 FutexCall {
-                    args: [0x1000, 0, 0, 0x2000, 0, 0],
+                    args: [0x1000, 0, 42, 0x2000, 0, 0],
                 },
                 &mut copy
             ),
@@ -626,7 +634,7 @@ where
         > = crate::dispatch::El1PendingFamilies {
             handoff: None,
             lifecycle_user: None,
-            frame: &mut ExitFrame,
+            frame: &mut ExitFrame(isa),
             counters: &counters,
             current_tasks: core::slice::from_ref(task),
             fd_map: &[],
@@ -655,13 +663,16 @@ where
             "raw nonfinal exit must never forward to host custody"
         );
         drop(pending);
-        assert!(entry.take_handoff_receipt().is_some());
+        // The dispatcher consumed and authenticated the terminal receipt.
+        assert!(entry.take_handoff_receipt().is_none());
         assert!(entry.take_run_failure().is_none());
     }
     assert!(
         task.service_notice.take().unwrap().is_none(),
         "no host service forward"
     );
+    assert!(!control.host_exit_requested(), "no host terminal custody");
+    assert!(zone.slot(child_slot).current().is_none());
     assert_eq!(fixture.page.live(), 1);
     assert_eq!(control.clear_child_tid(), 0);
     assert_eq!(service.tid_writes, [(1, 0x1000, 0)]);
@@ -669,7 +680,6 @@ where
         zone.record(fixture.record.id).claim(),
         Claim::Queued { .. }
     ));
-    assert_eq!(zone.timer_node_count(), 0);
     // Fixed scheduler steps only: no polling or host blocking waits. The guest
     // wait above is timed, and returning the driver consumes one completion.
     zone.step_back(fixture.slot, 1);
@@ -678,6 +688,16 @@ where
     let selected = zone.switch_in_full(fixture.slot).unwrap();
     assert_eq!(selected.record, fixture.record.id);
     assert_eq!(selected.result, Some(0));
+    assert_eq!(
+        zone.expire_timer(
+            fixture.slot,
+            2000,
+            carrick_personality_linux::sched::ETIMEDOUT_RESULT
+        ),
+        Ok(false),
+        "the old timed wait must not complete a second time",
+    );
+    assert_eq!(zone.timer_node_count(), 0);
     let mut entry = fixture
         .runtime
         .enter_registered(
@@ -712,6 +732,7 @@ where
 fn native_clear_tid_stopped_join_driver_x86() {
     clear_tid_stopped_join_driver::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
         words,
+        carrick_personality_linux::crossing::HostCrossingSet::X86,
     );
 }
 #[test]
@@ -719,5 +740,8 @@ fn native_clear_tid_stopped_join_driver_aarch64() {
     clear_tid_stopped_join_driver::<
         carrick_sched_core::Aarch64ParkedContext,
         carrick_mmu_core::owner_mmu::Aarch64Mmu,
-    >(arm_words);
+    >(
+        arm_words,
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+    );
 }

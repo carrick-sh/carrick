@@ -8089,27 +8089,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             // when clear_child_tid itself is unaligned.
             return true;
         };
-        let zone = self.source.zone;
-        let guard = zone.short_lock(
-            ZoneTables::<C>::bucket_of_with_context(mm.raw(), key.scheduler_address()),
-            &carrick_sched_core::ShortLockSpin,
-        );
-        let mut effects = WakeEffects::default();
-        let result = zone.wake_placed(
-            &guard,
-            mm.raw(),
-            key.scheduler_address(),
+        let Some(mm) = carrick_core_abi::ReservationMm::new(mm.raw()) else {
+            return false;
+        };
+        self.wake_native_futex(
+            mm,
+            key,
             carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
             carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
-            carrick_sched_core::Waker::El1 {
-                slot: self.source.slot,
-            },
-            &mut [],
-            &mut effects,
-        );
-        drop(guard);
-        self.service.wake_effects(effects);
-        result.is_ok()
+        )
+        .is_ok()
     }
     fn retire_thread_current(
         &mut self,
