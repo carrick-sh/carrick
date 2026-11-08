@@ -1085,6 +1085,76 @@ mod tests {
     }
 
     #[test]
+    fn native_child_write_serves_parent_redirected_stdout_after_host_close() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let mut fixture = writable_fixture(upper);
+            let opened = root_openat(&mut fixture.dispatcher, b"/tmp/redirected\0", CREATE);
+            assert!(opened >= 0, "{upper:?}: host open returned {opened}");
+            let context = fixture.dispatcher.capture_one_task_context().unwrap();
+            let original = Arc::downgrade(
+                &context
+                    .resources()
+                    .files()
+                    .slot(FileSlotNumber::for_open_fd(opened as i32).unwrap())
+                    .unwrap()
+                    .description(),
+            );
+            let region = fixture.owner.region();
+            let ring = region.fd(crate::el1_zone::HostLockWait);
+            ring.dup2(fixture.ring_fd(), fd::Fd(opened as i32), fd::Fd(1))
+                .unwrap();
+            let mut storage = region
+                .provision_descriptors(64, &crate::el1_zone::HostLockWait)
+                .unwrap();
+            let child = ring.fork(fixture.ring_fd(), &mut storage).unwrap();
+            let raw = child.to_raw();
+            let child_table = [raw.authority, raw.index, raw.generation];
+            let mut memory = super::super::outcome::LinearMemory::new(0x4000, vec![0; 4096]);
+            let closed = fixture
+                .dispatcher
+                .dispatch(
+                    &context,
+                    super::super::SyscallRequest::new(
+                        57,
+                        crate::compat::SyscallArgs::from([opened as u64, 0, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &crate::compat::CompatReporter::default(),
+                )
+                .unwrap();
+            assert!(matches!(closed, DispatchOutcome::Returned { value: 0 }));
+            assert!(original.upgrade().is_none(), "no publication-owner cycle");
+            let mut bytes = record(
+                child_table,
+                HostFileOp::Write,
+                1,
+                [UNLIMITED, 0, 0, 0],
+                b"child\n",
+                0,
+            );
+            let result = match fixture
+                .dispatcher
+                .serve_native_host_file_in(&fixture.owner, &mut bytes)
+            {
+                Ok(_) => host_file::reply(&bytes).unwrap().result,
+                Err(NativeHostFileRefusal) => -38,
+            };
+            assert_eq!(
+                result, 6,
+                "{upper:?}: native redirected write returned {result}"
+            );
+            assert_eq!(
+                fixture.venue_contents(&authority_of(&fixture.dispatcher), b"/tmp/redirected"),
+                b"child\n",
+            );
+            assert!(fixture.dispatcher.stdout().is_empty());
+            ring.retire_table(child, |_| false, |_| unreachable!())
+                .unwrap();
+            fixture.owner.drain_retired_tables().unwrap();
+        }
+    }
+
+    #[test]
     fn native_stdio_fstat_is_the_dispatchers_implicit_stdio_record() {
         let fixture = fixture();
         let bytes = record(
