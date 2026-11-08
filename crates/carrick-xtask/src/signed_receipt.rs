@@ -213,26 +213,6 @@ pub fn comparable(base: &AcceptReceipt, candidate: &AcceptReceipt) -> Result<(),
     Ok(())
 }
 
-/// Prefer the newest comparable exact-SHA receipt (callers supply newest first).
-pub fn select_base<'a>(
-    bases: &'a [AcceptReceipt],
-    candidate: &AcceptReceipt,
-) -> Result<&'a AcceptReceipt, ReceiptError> {
-    for base in bases {
-        if comparable(base, candidate).is_ok() {
-            return Ok(base);
-        }
-    }
-    let diagnostic = bases
-        .first()
-        .and_then(|base| comparable(base, candidate).err())
-        .map_or_else(|| "no receipts available".into(), |error| error.to_string());
-    Err(ReceiptError::IncomparableBase(format!(
-        "no exact-SHA baseline matches candidate host and fixture bundle ({} available receipts): {diagnostic}",
-        bases.len()
-    )))
-}
-
 /// Compare typed receipt fields only. Counts and binary completion are checked even
 /// when every test in a baseline binary failed. Human `failures` strings are never keys.
 pub fn compare(
