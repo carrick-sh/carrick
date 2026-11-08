@@ -68,4 +68,7 @@ pub use mmu::{
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use mmu::{portal_descriptor_words, portal_invalidate_root};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub use transport::{complete_native_run_failure, fatal_entry_binding, yield_host_effect};
+pub use transport::{
+    complete_native_run_failure, fatal_entry_binding, fatal_entry_binding_with_identity,
+    yield_host_effect,
+};

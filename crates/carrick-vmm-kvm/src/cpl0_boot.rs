@@ -3488,6 +3488,42 @@ impl Cpl0Carrier {
                 let payload = self.cpus[index].get_gpr(X86Reg::Rax)?;
                 let fault = self.user_fault_state(index)?;
                 let mut detail = format!("CPL0 fatal exit: payload {payload:#x}, fault {fault:?}");
+                let tag = self.cpus[index].get_gpr(X86Reg::Rdi)?;
+                if carrick_el1_abi::is_entry_binding_fatal(payload, tag) {
+                    let reason = self.cpus[index].get_gpr(X86Reg::Rsi)?;
+                    let location = self.cpus[index].get_gpr(X86Reg::Rcx)?;
+                    let address = self.cpus[index].get_gpr(X86Reg::R8)?;
+                    let decoded =
+                        carrick_el1_abi::EntryBindingFatalDetail::decode(reason, location);
+                    detail.push_str(&format!(
+                        " entry_binding={decoded:?} reason={reason} location={location:#x}"
+                    ));
+                    // Only the stopped CPU's own retained supervisor stack
+                    // licenses this payload, never an arbitrary guest address.
+                    let words = checked_stack_end(self.binding(index).kernel_stack)
+                        .and_then(|end| {
+                            checked_private_stack_frame_gpa(
+                                end,
+                                address,
+                                size_of::<[[u64; 8]; 2]>(),
+                            )
+                        })
+                        .and_then(|gpa| {
+                            self.custody.ram().host_ptr(gpa, size_of::<[[u64; 8]; 2]>())
+                        })
+                        .map(|ptr| {
+                            // SAFETY: checked bounds cover the entire payload
+                            // in this exclusively stopped CPU's private stack.
+                            unsafe { ptr.cast::<[[u64; 8]; 2]>().read_unaligned() }
+                        });
+                    if let Some([identity, lookup]) = words {
+                        detail.push_str(&format!(
+                            " admission_identity={identity:?} admission_lookup={lookup:?}"
+                        ));
+                    } else {
+                        detail.push_str(" admission_payload=outside_private_stack");
+                    }
+                }
                 self.cpus[index].append_debug_state(&mut detail);
                 return Err(fail(detail));
             }

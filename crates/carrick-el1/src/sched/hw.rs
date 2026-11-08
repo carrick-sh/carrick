@@ -664,6 +664,5 @@ pub fn fatal_entry_binding_with_identity(
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[track_caller]
 pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
-    let _ = reason;
-    crate::isa::x86::fatal_entry_binding()
+    crate::isa::x86::fatal_entry_binding_with_identity(reason, [0; 8], [0; 8])
 }

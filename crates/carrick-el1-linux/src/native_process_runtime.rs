@@ -2679,6 +2679,41 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime.task_binding(process).map(|binding| binding.address)
     }
 
+    /// Refresh the executor's namespace cache only from its exact retained
+    /// execution member and generation-owned process row. A renewed record
+    /// need not have a record-index entry yet. An unknown execution has no
+    /// native identity authority; first host admission authenticates it.
+    pub fn refresh_entry_identity(
+        &self,
+        zone: &ZoneTables<C>,
+        current: &CurrentTask,
+        address: AddressContext<RootGpa>,
+    ) -> Result<Option<u32>, NativeProcessError> {
+        let key = NativeExecutionKey::new(
+            zone,
+            super::common_entry::execution_binding(current),
+            address,
+        )?;
+        let state = self.state.lock();
+        let Some(member) = state.members.get(&key) else {
+            return Ok(None);
+        };
+        if member.address != address || !current.owns_control_slot(member.control.control()) {
+            return Err(NativeProcessError::Stale);
+        }
+        let graph = member.runtime.graph.lock();
+        let row = graph
+            .owner
+            .task(member.process)
+            .map_err(|_| NativeProcessError::Stale)?;
+        if !current.owns_lifecycle_page(row.native().resources().page) {
+            return Err(NativeProcessError::Stale);
+        }
+        let pid = row.metadata().namespace_pid;
+        current.publish_visible_pid(pid);
+        Ok(Some(pid))
+    }
+
     /// Reuse an already-admitted group before a caller may construct a fresh
     /// root. Exact entry custody wins immediately; a renewed execution record
     /// is rehomed through the group's existing signal projection.
@@ -2699,7 +2734,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .or_else(|| source.zone.slot(source.slot).host_record())
             .map(|record| source.zone.record_ref(record))
             .ok_or(NativeProcessError::Stale)?;
-        let visible_pid = current.visible_pid().ok_or(NativeProcessError::Stale)?;
+        let visible_pid = self
+            .refresh_entry_identity(source.zone, current, address)?
+            .or_else(|| current.visible_pid())
+            .ok_or(NativeProcessError::Stale)?;
         let group_key = Self::group_key(source.zone, address, page, visible_pid);
         // Preserve receipt folding before classification (for_entry's side effect).
         if let Ok(runtime) = self.for_entry(source, current, address) {

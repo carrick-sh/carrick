@@ -951,3 +951,22 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
 fn fatal() -> ! {
     carrick_x86_carrier::entry::fatal_boot()
 }
+
+/// Preserve typed admission contention at the CPL0 terminal boundary, just
+/// as ARM does. This is diagnostic policy, not an errno or invariant lowering.
+#[track_caller]
+pub(super) fn fatal_admission(
+    error: carrick_el1_linux::native_process_runtime::NativeAdmissionError,
+) -> ! {
+    match error {
+        carrick_el1_linux::native_process_runtime::NativeAdmissionError::Contended(contention) => {
+            let (identity, lookup) = contention.diagnostic_payload();
+            carrick_el1::isa::x86::fatal_entry_binding_with_identity(
+                contention.fatal_reason(),
+                identity,
+                lookup,
+            )
+        }
+        carrick_el1_linux::native_process_runtime::NativeAdmissionError::Failure(_) => fatal(),
+    }
+}

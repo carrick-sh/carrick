@@ -21,3 +21,25 @@ process-row lookup; record renewal retains the existing rehome protocol
 and its fixed lifecycle bounds. Existing dispatch and backend-call budgets
 remain authoritative. The director owns signed inherited-descriptor
 population evidence and physical-artifact acceptance.
+
+The cause is the executor cache, not shared fork lifecycle backing.
+The scheduler's publish_identity replaces task, thread generation, MM and
+lifecycle references but has no namespace-PID authority. Registered
+resume_selected refreshes PID from its owner; resume_unregistered previously
+returned NoPending for a renewed record while retaining the child's PID.
+admit_existing_group then used that cache to choose between a retained
+group and fresh-root admission.
+
+The shared registry now resolves namespace PID by NativeExecutionKey and
+the retained member's exact TaskKey, authenticating address incarnation,
+control custody and lifecycle ownership. Both ISA admission adapters use
+this classifier. ARM unregistered resume uses the same resolver before
+returning to userspace, without admitting or replaying a process operation.
+Unknown host entries retain their existing first-admission authentication.
+
+CPL0's existing fatal port carries the same reason, caller coordinates and
+two eight-word diagnostic arrays as ARM. The host accepts the payload only
+from the stopped CPU's private supervisor stack. The live KVM binding
+shared_kernel_transport_retains_admission_identity checks both arrays,
+reason and caller coordinates. This adds diagnostic payload, not a new
+process-service route or guest-visible errno.
