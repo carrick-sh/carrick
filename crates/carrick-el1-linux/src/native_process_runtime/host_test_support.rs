@@ -6703,3 +6703,673 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
     ));
     assert!(take_signal_copies().is_empty());
 }
+
+#[cfg(test)]
+struct LazyRangeValidator {
+    lazy_read_at: std::cell::Cell<Option<u64>>,
+    lazy_write_at: std::cell::Cell<Option<u64>>,
+}
+
+#[cfg(test)]
+impl crate::file::MemoryValidator for LazyRangeValidator {
+    fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
+        let ready = crate::file::HardwareValidator.writable_bytes(user_va, len);
+        if ready == 0 {
+            return 0;
+        }
+        if let Some(at) = self.lazy_write_at.get() {
+            let end = user_va.saturating_add(ready as u64);
+            if user_va <= at && at < end {
+                return (at - user_va) as usize;
+            }
+        }
+        ready
+    }
+
+    fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+        let ready = crate::file::HardwareValidator.readable_bytes(user_va, len);
+        if ready == 0 {
+            return 0;
+        }
+        if let Some(at) = self.lazy_read_at.get() {
+            let end = user_va.saturating_add(ready as u64);
+            if user_va <= at && at < end {
+                return (at - user_va) as usize;
+            }
+        }
+        ready
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn native_host_file_rw_rwv_retains_pin_and_progress_across_lazy_copy_wait() {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_el1_abi::ipc::fd::Fd;
+    use carrick_personality_linux::native_host_file::HostFileStage;
+
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner = Box::leak(Box::new(context.kernel().ipc().unwrap()));
+    let host_table =
+        carrick_kernel::el1_ipc::HostTable::create(std::sync::Arc::clone(owner), 64, 8).unwrap();
+    let table_id = host_table.id();
+    let stdio_desc = owner
+        .admit_description(carrick_el1_abi::ipc::fd::Description::new(
+            carrick_el1_abi::ipc::IpcBacking::EventFd {
+                object: owner
+                    .create_eventfd(0, carrick_el1_abi::ipc::EventMode::Counter)
+                    .unwrap(),
+            }
+            .encode(),
+            carrick_el1_abi::ipc::fd::AccessMode::ReadWrite,
+            carrick_el1_abi::ipc::fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    for fd in 0..3 {
+        stdio_desc.install(table_id, Fd(fd), false).unwrap();
+    }
+    drop(stdio_desc);
+    let raw_table = table_id.to_raw();
+    let table_words = [raw_table.authority, raw_table.index, raw_table.generation];
+
+    struct SingleTable(carrick_el1_abi::ipc::RawTableId);
+    impl crate::ipc::IpcTables for SingleTable {
+        fn table_for_file_table(&self, _: u64) -> Option<carrick_el1_abi::ipc::RawTableId> {
+            Some(self.0)
+        }
+        fn owned_table_of(&self, _: &CurrentTask) -> Option<carrick_el1_abi::ipc::RawTableId> {
+            Some(self.0)
+        }
+    }
+    let single_table = SingleTable(raw_table);
+
+    let mut service = fixture.service();
+    service.native_ipc = Some(owner.region());
+    let handle = service.service_mm_handle(&fixture.address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.defer_handbacks();
+            },
+        )
+        .unwrap();
+    let notifications = space.notifications(handle.incarnation()).unwrap();
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    let ipc_venue = crate::ipc::IpcVenue {
+        region: owner.region(),
+        tables: &single_table,
+    };
+
+    // Helper: stage and run one synchronous native host-file call to completion.
+    let run_sync_call = |service: &mut Physical<'static>,
+                         validator: &LazyRangeValidator,
+                         nr: u64,
+                         args: [u64; 6]|
+     -> i64 {
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            ..Default::default()
+        };
+        frame.x[8] = nr;
+        frame.x[..6].copy_from_slice(&args);
+        let stage = crate::dispatch::native_host_file_stage(
+            &frame,
+            fixture.task,
+            validator,
+            table_words,
+            |fd| crate::ipc::native_descriptor(&ipc_venue, table_words, fd),
+            &mut |_| 0,
+        )
+        .expect("syscall must stage through native_host_file");
+        match stage {
+            HostFileStage::Returned(res) => res.raw(),
+            HostFileStage::Request {
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+                ..
+            } => {
+                {
+                    let mut entry = fixture
+                        .runtime
+                        .enter_registered(
+                            fixture.registry,
+                            source,
+                            fixture.task,
+                            fixture.address,
+                            &words(fixture.address),
+                            service,
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        entry.begin_host_file_service(
+                            record,
+                            output,
+                            resolves_path,
+                            map,
+                            chdir,
+                            NativeServiceCall::new(
+                                carrick_guest_arch::NativeOrdinal::new(nr),
+                                counters,
+                            ),
+                        ),
+                        Ok(NativeResume::Left(None))
+                    ));
+                    assert!(entry.take_handoff_receipt().is_some());
+                }
+                let notice = fixture.task.service_notice.take().unwrap().unwrap();
+                let queue = fixture
+                    .zone
+                    .object_wait(
+                        carrick_sched_core::object_wait::ObjectWaitKey::native_service(
+                            fixture.record,
+                        )
+                        .unwrap(),
+                        &carrick_sched_core::ShortLockSpin,
+                    )
+                    .unwrap();
+                let ticket = unsafe {
+                    ServiceCell::claim_notice(
+                        &fixture.control.service,
+                        notice,
+                        NonZeroU64::MIN,
+                        fixture.zone.record(fixture.record.id).identity(),
+                    )
+                }
+                .unwrap();
+                let ServiceOperation::HostFile { payload, .. } = ticket.request().operation else {
+                    panic!("expected HostFile operation");
+                };
+                let record_bytes = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        payload.address().raw() as *mut u8,
+                        payload.length().raw() as usize,
+                    )
+                };
+                dispatcher.serve_native_host_file(record_bytes).unwrap();
+                assert!(ticket.complete(true).is_ok());
+                queue
+                    .notify_object(fixture.slot, &mut WakeEffects::default())
+                    .unwrap();
+                drop(queue);
+                assert_eq!(
+                    fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+                    fixture.record.id
+                );
+                let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+                    .unwrap()
+                    .words;
+                let mut entry = fixture
+                    .runtime
+                    .enter_registered(
+                        fixture.registry,
+                        source,
+                        fixture.task,
+                        fixture.address,
+                        &saved,
+                        service,
+                    )
+                    .unwrap();
+                match entry.resume_checkpoint(|_| Ok(None)).unwrap() {
+                    NativeResume::Returned(res) => res.raw(),
+                    _ => panic!("expected Returned"),
+                }
+            }
+            other => panic!("unexpected synchronous stage: {other:?}"),
+        }
+    };
+
+    let validator = LazyRangeValidator {
+        lazy_read_at: std::cell::Cell::new(None),
+        lazy_write_at: std::cell::Cell::new(None),
+    };
+
+    let replace_fd3_with_fd4_while_pinned = || {
+        let region = owner.region();
+        let authority = region.fd(carrick_sched_core::ShortLockSpin);
+        let closed_while_parked = authority.close(table_id, Fd(3)).unwrap();
+        assert!(
+            closed_while_parked.is_none(),
+            "closing numeric fd 3 during an owner wait must not release a pinned description"
+        );
+        let (pin4, _) = authority.pin(table_id, Fd(4)).unwrap();
+        let res3 = authority.reserve_exact(table_id, Fd(3)).unwrap();
+        assert!(
+            authority
+                .commit_reservation(res3, &pin4, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(authority.unpin(pin4).unwrap().is_none());
+        assert!(authority.close(table_id, Fd(4)).unwrap().is_none());
+    };
+
+    let create_flags = (carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_RDWR) as u64;
+
+    // 1. writev(3, iov, 2) with iov[0] resident ("alpha-") and iov[1] lazy ("omega!").
+    let orig_path = carrick_test_support::GuestUserBuffer::from_bytes(b"/orig_writev\0");
+    let repl_path = carrick_test_support::GuestUserBuffer::from_bytes(b"/repl_writev\0");
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            56,
+            [(-100i64) as u64, orig_path.arg(), create_flags, 0o600, 0, 0],
+        ),
+        3
+    );
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            56,
+            [(-100i64) as u64, repl_path.arg(), create_flags, 0o600, 0, 0],
+        ),
+        4
+    );
+
+    let mut seg0 = carrick_test_support::GuestUserBuffer::from_bytes(b"alpha-");
+    let seg1 = carrick_test_support::GuestUserBuffer::from_bytes(b"omega!");
+    let mut iov_bytes = [0u8; 32];
+    iov_bytes[..8].copy_from_slice(&seg0.arg().to_le_bytes());
+    iov_bytes[8..16].copy_from_slice(&6u64.to_le_bytes());
+    iov_bytes[16..24].copy_from_slice(&seg1.arg().to_le_bytes());
+    iov_bytes[24..32].copy_from_slice(&6u64.to_le_bytes());
+    let mut iov = carrick_test_support::GuestUserBuffer::from_bytes(&iov_bytes);
+
+    validator.lazy_read_at.set(Some(seg1.arg()));
+    let observed =
+        notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    access.raise(space.index());
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    service.prepare_copy_error = Some(NativeProcessError::OwnerWait(wait));
+
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        ..Default::default()
+    };
+    frame.x[8] = 66; // writev
+    frame.x[0] = 3;
+    frame.x[1] = iov.arg();
+    frame.x[2] = 2;
+
+    let stage1 = crate::dispatch::native_host_file_stage(
+        &frame,
+        fixture.task,
+        &validator,
+        table_words,
+        |fd| crate::ipc::native_descriptor(&ipc_venue, table_words, fd),
+        &mut |_| 0,
+    )
+    .unwrap();
+    let HostFileStage::Fault {
+        address,
+        access: fault_access,
+        ..
+    } = stage1
+    else {
+        panic!("expected HostFileStage::Fault on lazy second iovec, got {stage1:?}");
+    };
+    assert_eq!(address, seg1.arg());
+    assert_eq!(fault_access, carrick_guest_arch::Access::Read);
+
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.wait_guest_copy(carrick_core::user_copy::GuestCopyRequest {
+                address: UserVa::new(address),
+                len: carrick_guest_arch::GuestLen::new(1),
+                access: fault_access,
+            }),
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+
+    seg0.as_mut_bytes().copy_from_slice(b"POISON");
+    iov.as_mut_bytes().fill(0);
+    replace_fd3_with_fd4_while_pinned();
+
+    validator.lazy_read_at.set(None);
+    service.prepare_copy_error = None;
+    access.lower(space.index());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::RetrySyscall
+        ));
+    }
+    assert_eq!(
+        run_sync_call(&mut service, &validator, 66, [3, iov.arg(), 2, 0, 0, 0]),
+        12
+    );
+    assert_eq!(run_sync_call(&mut service, &validator, 62, [3, 0, 2, 0, 0, 0]), 0);
+    let last = owner
+        .region()
+        .fd(carrick_sched_core::ShortLockSpin)
+        .close(table_id, Fd(3))
+        .unwrap();
+    if let Some(last) = last {
+        owner.release(last.backing).unwrap();
+    }
+    owner.drain_retired_ofds().unwrap();
+    assert_eq!(owner.retained_host_resources(), 0);
+
+    // 2. write(3, buf, 8192) with page 0 resident ('A') and page 1 lazy ('B').
+    let orig_write_path = carrick_test_support::GuestUserBuffer::from_bytes(b"/orig_write\0");
+    let repl_write_path = carrick_test_support::GuestUserBuffer::from_bytes(b"/repl_write\0");
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            56,
+            [
+                (-100i64) as u64,
+                orig_write_path.arg(),
+                create_flags,
+                0o600,
+                0,
+                0
+            ],
+        ),
+        3
+    );
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            56,
+            [
+                (-100i64) as u64,
+                repl_write_path.arg(),
+                create_flags,
+                0o600,
+                0,
+                0
+            ],
+        ),
+        4
+    );
+
+    let mut write_buf_bytes = vec![b'A'; 4096];
+    write_buf_bytes.extend_from_slice(&[b'B'; 4096]);
+    let mut write_buf = carrick_test_support::GuestUserBuffer::from_bytes(&write_buf_bytes);
+    validator.lazy_read_at.set(Some(write_buf.arg_at(4096)));
+    let observed =
+        notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    access.raise(space.index());
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    service.prepare_copy_error = Some(NativeProcessError::OwnerWait(wait));
+
+    frame.x[8] = 64; // write
+    frame.x[0] = 3;
+    frame.x[1] = write_buf.arg();
+    frame.x[2] = 8192;
+
+    let stage1 = crate::dispatch::native_host_file_stage(
+        &frame,
+        fixture.task,
+        &validator,
+        table_words,
+        |fd| crate::ipc::native_descriptor(&ipc_venue, table_words, fd),
+        &mut |_| 0,
+    )
+    .unwrap();
+    let HostFileStage::Fault {
+        address,
+        access: fault_access,
+        ..
+    } = stage1
+    else {
+        panic!("expected HostFileStage::Fault on lazy second page of write, got {stage1:?}");
+    };
+    assert_eq!(address, write_buf.arg_at(4096));
+    assert_eq!(fault_access, carrick_guest_arch::Access::Read);
+
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.wait_guest_copy(carrick_core::user_copy::GuestCopyRequest {
+                address: UserVa::new(address),
+                len: carrick_guest_arch::GuestLen::new(1),
+                access: fault_access,
+            }),
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+
+    // Poison page 0 in user memory and replace numeric fd 3 with "/repl_write" while parked.
+    write_buf.as_mut_bytes()[..4096].fill(b'X');
+    replace_fd3_with_fd4_while_pinned();
+
+    validator.lazy_read_at.set(None);
+    service.prepare_copy_error = None;
+    access.lower(space.index());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::RetrySyscall
+        ));
+    }
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            64,
+            [3, write_buf.arg(), 8192, 0, 0, 0]
+        ),
+        8192
+    );
+    // Replacement at fd 3 must be untouched (size 0).
+    assert_eq!(run_sync_call(&mut service, &validator, 62, [3, 0, 2, 0, 0, 0]), 0);
+    let last = owner
+        .region()
+        .fd(carrick_sched_core::ShortLockSpin)
+        .close(table_id, Fd(3))
+        .unwrap();
+    if let Some(last) = last {
+        owner.release(last.backing).unwrap();
+    }
+    owner.drain_retired_ofds().unwrap();
+    assert_eq!(owner.retained_host_resources(), 0);
+
+    // 3. read(3, dst, 12) and 4. readv(3, iov, 2) with lazy destination, plus 5. EFAULT.
+    let orig_read_path = carrick_test_support::GuestUserBuffer::from_bytes(b"/orig_read\0");
+    let repl_read_path = carrick_test_support::GuestUserBuffer::from_bytes(b"/repl_read\0");
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            56,
+            [
+                (-100i64) as u64,
+                orig_read_path.arg(),
+                create_flags,
+                0o600,
+                0,
+                0
+            ],
+        ),
+        3
+    );
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            56,
+            [
+                (-100i64) as u64,
+                repl_read_path.arg(),
+                create_flags,
+                0o600,
+                0,
+                0
+            ],
+        ),
+        4
+    );
+    let hello_buf = carrick_test_support::GuestUserBuffer::from_bytes(b"hello-world!");
+    let wrong_buf = carrick_test_support::GuestUserBuffer::from_bytes(b"WRONG-BYTES!");
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            64,
+            [3, hello_buf.arg(), 12, 0, 0, 0]
+        ),
+        12
+    );
+    assert_eq!(run_sync_call(&mut service, &validator, 62, [3, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            64,
+            [4, wrong_buf.arg(), 12, 0, 0, 0]
+        ),
+        12
+    );
+    assert_eq!(run_sync_call(&mut service, &validator, 62, [4, 0, 0, 0, 0, 0]), 0);
+
+    let dst0 = carrick_test_support::GuestUserBuffer::zeroed(6);
+    let dst1 = carrick_test_support::GuestUserBuffer::zeroed(6);
+    let mut read_iov_bytes = [0u8; 32];
+    read_iov_bytes[..8].copy_from_slice(&dst0.arg().to_le_bytes());
+    read_iov_bytes[8..16].copy_from_slice(&6u64.to_le_bytes());
+    read_iov_bytes[16..24].copy_from_slice(&dst1.arg().to_le_bytes());
+    read_iov_bytes[24..32].copy_from_slice(&6u64.to_le_bytes());
+    let read_iov = carrick_test_support::GuestUserBuffer::from_bytes(&read_iov_bytes);
+
+    validator.lazy_write_at.set(Some(dst1.arg()));
+    frame.x[8] = 65; // readv
+    frame.x[0] = 3;
+    frame.x[1] = read_iov.arg();
+    frame.x[2] = 2;
+    let readv_stage = crate::dispatch::native_host_file_stage(
+        &frame,
+        fixture.task,
+        &validator,
+        table_words,
+        |fd| crate::ipc::native_descriptor(&ipc_venue, table_words, fd),
+        &mut |_| 0,
+    );
+    assert!(
+        matches!(
+            readv_stage,
+            Some(HostFileStage::Fault {
+                address,
+                access: carrick_guest_arch::Access::Write,
+                ..
+            }) if address == dst1.arg()
+        ),
+        "readv must stage through native_host_file and fault on lazy second iovec, got {readv_stage:?}"
+    );
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            64,
+            [3, carrick_guest_arch::USER_CEILING, 4, 0, 0, 0],
+        ),
+        carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+    );
+    assert_eq!(
+        run_sync_call(
+            &mut service,
+            &validator,
+            63,
+            [3, carrick_guest_arch::USER_CEILING, 4, 0, 0, 0],
+        ),
+        carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+    );
+}
