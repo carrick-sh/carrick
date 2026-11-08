@@ -1886,11 +1886,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
                     .store(Handback::GroupStop as u32, Ordering::Release);
             }
             match claim {
-                Claim::Transferring {
-                    seq,
-                    cancelled: true,
-                    ..
-                } if seq == self.seq => {
+                Claim::Transferring { seq, cancelled, .. }
+                    if seq == self.seq && (cancelled || rec.is_cancelled()) =>
+                {
                     rec.retire_cancelled_metadata_operation();
                     if rec.has_object_operation() {
                         // Cancellation must reach the adapter while its exact

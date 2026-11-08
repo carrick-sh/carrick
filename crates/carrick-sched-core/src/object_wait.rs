@@ -1804,6 +1804,28 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         );
     }
 
+    /// Retire an anonymous-edit replay token while its exact queue identity is
+    /// still published.  Unlike adapter operations it owns no external pin;
+    /// terminal cancellation must not retain the record merely to hand that
+    /// scheduler-only token to a nonexistent adapter.
+    fn retire_cancelled_anonymous_operation(&self) {
+        if !self.is_cancelled() {
+            return;
+        }
+        let Some(census) = self.object_wait_census() else {
+            return;
+        };
+        if !census.is_anonymous_edit() {
+            return;
+        }
+        let _ = self.object.operation.compare_exchange(
+            census.operation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     /// Consume a resumed metadata operation receipt under the execution
     /// owner's exclusive `OnCpu` custody without disturbing adapter-owned
     /// tokens (`index != u64::MAX`).
@@ -2512,6 +2534,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 continue;
             };
             if rec.object.queue.load(Ordering::Acquire) == index {
+                rec.retire_cancelled_anonymous_operation();
                 guard.unlink(record);
             }
             return;
