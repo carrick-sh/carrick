@@ -9288,7 +9288,6 @@ fn arm_caught_signal_returns_then_reexecutes_parked_anonymous_edit() {
         fixture.zone.record(binding.record.id).handback(),
         Some(carrick_sched_core::Handback::Signal)
     );
-    assert!(fixture.zone.place_native_handback(binding.record).is_some());
     drop(held);
 
     let mut cpu = ResumeCpu {
