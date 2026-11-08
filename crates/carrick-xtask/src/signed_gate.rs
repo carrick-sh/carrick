@@ -759,11 +759,58 @@ pub fn verify_fixture_artifact(
     Ok(())
 }
 
+/// The acceptance exit status `execute_one` recorded beside a receipt.
+fn accept_exit(dir: &Path) -> Result<bool, ReceiptError> {
+    read_json(&dir.join(ACCEPT_EXIT))?["success"]
+        .as_bool()
+        .ok_or_else(|| fail(format!("{ACCEPT_EXIT} lacks a boolean success")))
+}
+
+/// A paired base is a baseline only when it ran to completion. Completed
+/// tests with known failures stay comparable: the gate is differential. A
+/// step that did not run (a killed or unfinished binary, a build failure,
+/// zero tests selected), tests skipped after a budget expired, or a failing
+/// acceptance exit that no completed failure explains is refused before any
+/// comparison, so a missing base result can never read as FIXED.
+pub fn admit_paired_base(receipt: &AcceptReceipt, accepted: bool) -> Result<(), ReceiptError> {
+    let refuse =
+        |why: String| ReceiptError::IncomparableBase(format!("paired base incomplete: {why}"));
+    let mut completed_failure = !receipt.probe_diffs.is_empty();
+    for step in &receipt.steps {
+        match step.execution_outcome() {
+            crate::accept::StepOutcome::NotRun { reason } => {
+                return Err(refuse(format!(
+                    "step {} did not run to completion: {reason}",
+                    step.name
+                )));
+            }
+            crate::accept::StepOutcome::Failed { .. } => completed_failure = true,
+            crate::accept::StepOutcome::Passed => {}
+        }
+        if !step.not_run_tests.is_empty() {
+            return Err(refuse(format!(
+                "step {} was interrupted before {} test(s) ran",
+                step.name,
+                step.not_run_tests.len()
+            )));
+        }
+    }
+    if !accepted && !completed_failure {
+        return Err(refuse(
+            "acceptance exited nonzero with no completed failure to explain it (infrastructure failure)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Receipt file names inside one execution's output directory.
 const CANDIDATE_RECEIPT: &str = "candidate.json";
 const BASE_RECEIPT: &str = "base.json";
 /// The paired base's evidence lives beside the candidate's, in this subdirectory.
 const BASE_DIR: &str = "base";
+/// Acceptance exit status recorded by the trusted executor for each run.
+const ACCEPT_EXIT: &str = "accept-exit.json";
 
 /// One side of a paired execution, as the pairing hands it to the runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -838,10 +885,14 @@ pub fn execute_pair(
             run(&PairedRun {
                 commit: request.base.clone(),
                 fixture_publisher: request.sha.clone(),
-                output: base_dir,
+                output: base_dir.clone(),
                 receipt_name: BASE_RECEIPT,
             })
             .map_err(|error| fail(format!("paired base {}: {error}", request.base)))?;
+            // An incomplete base cannot serve as a baseline; refuse before
+            // spending a candidate run on a comparison that cannot pass.
+            let receipt = load(&base_dir.join(BASE_RECEIPT))?;
+            admit_paired_base(&receipt, accept_exit(&base_dir)?)?;
         }
         run(&PairedRun {
             commit: request.sha.clone(),
@@ -931,7 +982,7 @@ fn execute_one(
         ]);
         let accepted = logged(&mut accept, lease, &output.join("accept.log"))?;
         write(
-            &output.join("accept-exit.json"),
+            &output.join(ACCEPT_EXIT),
             json!({"success": accepted}).to_string(),
         )?;
         // accept rebuilds once under the same lease before testing. Its receipt
@@ -1056,6 +1107,7 @@ fn publish(
         } else {
             let dir = results.join(BASE_DIR);
             let base = load(&dir.join(BASE_RECEIPT))?;
+            admit_paired_base(&base, accept_exit(&dir)?)?;
             let evidence = admit_evidence(&dir, &base).map(|_| ());
             (base, evidence)
         };
@@ -1145,7 +1197,7 @@ fn publish(
     }
     // Status is written even if comment publication fails.
     let description = if incomparable {
-        "Incomparable base: host or fixture evidence; blocked"
+        "Incomparable base: host, fixture or incomplete base run; blocked"
     } else if passed {
         "No new failures; populations and completion preserved"
     } else {
