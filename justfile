@@ -1063,7 +1063,7 @@ conformance-probes: build
         env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-generic-signed-artifacts.jsonl
-        env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
+        env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next case_ --include-ignored --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-dedicated-signed-artifacts.jsonl
         {{_admit}} {{_cargo}} test -p carrick-cli --test conformance_cli_contract \
