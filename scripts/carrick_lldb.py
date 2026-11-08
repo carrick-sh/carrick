@@ -1077,7 +1077,11 @@ def _c_global_load_addr(target, name: str) -> Optional[int]:
 # ----- the top-level `carrick` multiplex command --------------------------
 
 def _mmap_record_capacity(records_type, record_type):
-    return records_type.GetNumberOfElements()
+    stride = record_type.GetByteSize()
+    total = records_type.GetByteSize()
+    if stride <= 0 or total % stride != 0:
+        raise ValueError("invalid mmap failure array extent in DWARF")
+    return total // stride
 
 
 def _format_mmap_failure(words):
@@ -1165,7 +1169,11 @@ def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
     records_type = fields["records"].GetType()
     record_type = records_type.GetArrayElementType()
     stride = record_type.GetByteSize()
-    capacity = _mmap_record_capacity(records_type, record_type)
+    try:
+        capacity = _mmap_record_capacity(records_type, record_type)
+    except ValueError as error:
+        result.SetError(str(error))
+        return
     record_fields = {record_type.GetFieldAtIndex(i).GetName(): record_type.GetFieldAtIndex(i)
                      for i in range(record_type.GetNumberOfFields())}
     if (capacity != 16 or set(record_fields) != {"ready", "words"}
