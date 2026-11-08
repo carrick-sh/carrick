@@ -8432,8 +8432,39 @@ fn invalid_copy_ranges_are_efault_before_owner_preparation() {
         assert!(matches!(output, LifecycleOutcome::Returned { result, .. } if result.raw() == -14));
     }
     assert!(entry.take_handoff_receipt().is_none());
+    assert!(entry.take_run_failure().is_none());
     assert!(
         service.copies.is_empty(),
         "bad addresses cannot publish bytes"
     );
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[test]
+fn owner_copyout_invariant_is_a_run_failure() {
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    service.child_copy_error = Some(NativeProcessError::Invalid);
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let outcome = entry.complete_copyout(UserVa::new(0x10000), vec![0; 8], SyscallResult::new(0));
+    assert!(matches!(outcome, LifecycleOutcome::Transferred { .. }));
+    assert_eq!(
+        entry.take_run_failure(),
+        Some(carrick_core_abi::NativeRunFailureReason::NativeInvalid)
+    );
+    assert!(service.copies.is_empty());
 }
