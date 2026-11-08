@@ -44,6 +44,7 @@ impl<'a> FsView<'a> {
     /// path. `None` entries are UTIME_OMIT (left untouched).
     fn set_fd_times(
         &self,
+        context: &crate::kernel::KernelContext,
         fd: i32,
         atime: Option<(i64, i64)>,
         mtime: Option<(i64, i64)>,
@@ -51,9 +52,27 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
-        let Some(open) = crate::kernel::FileDescription::read_for_io(&open_file.description) else {
+        self.set_description_times(Some(context), &open_file.description, Fd(fd), atime, mtime)
+    }
+
+    pub(in crate::dispatch) fn set_description_times(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        description: &Arc<crate::kernel::FileDescription>,
+        fd: Fd,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> DispatchOutcome {
+        let Some(open) = crate::kernel::FileDescription::read_for_io(description) else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
+        if context.is_none()
+            && open
+                .open_path()
+                .is_some_and(|path| self.mutation_path_needs_task(context, path))
+        {
+            return DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS);
+        }
         match &*open {
             OpenDescription::HostFile {
                 host_fd, metadata, ..
@@ -76,7 +95,7 @@ impl<'a> FsView<'a> {
                     let e = std::io::Error::last_os_error();
                     crate::probes::fs_op(
                         "set_fd_times:futimens_err_besteffort",
-                        &format!("fd={fd} {e}"),
+                        &format!("fd={} {e}", fd.0),
                         e.raw_os_error().unwrap_or(0),
                     );
                 } else {
@@ -602,106 +621,116 @@ impl<'a> FsView<'a> {
                     }
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-                return Ok(this.set_fd_times(dirfd as i32, atime_set, mtime_set));
+                return Ok(this.set_fd_times(cx.kernel, dirfd as i32, atime_set, mtime_set));
             }
 
             let path = read_guest_c_string(memory, pathname)?;
-            if path.is_empty() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+            this.set_path_times(Some(cx.kernel), dirfd, &path, atime_set, mtime_set, flags)
+        }
+    }
+
+    pub(in crate::dispatch) fn set_path_times(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        dirfd: u64,
+        path: &str,
+        atime_set: Option<(i64, i64)>,
+        mtime_set: Option<(i64, i64)>,
+        flags: u64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let this = self;
+        if path.is_empty() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
+        let path = match this.resolve_at_path(dirfd, &path) {
+            Ok(path) => path,
+            Err(errno) => {
+                crate::probes::fs_op("utimensat:resolve_err", &path, errno.get());
+                return Ok(DispatchOutcome::errno(errno));
             }
-            let path = match this.resolve_at_path(dirfd, &path) {
-                Ok(path) => path,
+        };
+        // Without AT_SYMLINK_NOFOLLOW, utime()/utimensat FOLLOWS a trailing
+        // symlink to its target and updates THAT file's times: a dangling
+        // target is ENOENT and a symlink cycle is ELOOP (utime07). Only when
+        // the final component is genuinely a symlink — plain paths and
+        // synthetic /proc entries are left untouched for the checks below,
+        // and resolve_at_path already leaves the final component unfollowed.
+        let path = if flags & LINUX_AT_SYMLINK_NOFOLLOW == 0
+            && matches!(
+                this.layered_lstat(&path),
+                Ok(md) if md.kind == RootFsEntryKind::Symlink
+            ) {
+            match this.canonicalize_following(&path) {
+                Ok(resolved) => resolved,
                 Err(errno) => {
-                    crate::probes::fs_op("utimensat:resolve_err", &path, errno.get());
-                    return Ok(DispatchOutcome::errno(errno));
-                }
-            };
-            // Without AT_SYMLINK_NOFOLLOW, utime()/utimensat FOLLOWS a trailing
-            // symlink to its target and updates THAT file's times: a dangling
-            // target is ENOENT and a symlink cycle is ELOOP (utime07). Only when
-            // the final component is genuinely a symlink — plain paths and
-            // synthetic /proc entries are left untouched for the checks below,
-            // and resolve_at_path already leaves the final component unfollowed.
-            let path = if flags & LINUX_AT_SYMLINK_NOFOLLOW == 0
-                && matches!(
-                    this.layered_lstat(&path),
-                    Ok(md) if md.kind == RootFsEntryKind::Symlink
-                ) {
-                match this.canonicalize_following(&path) {
-                    Ok(resolved) => resolved,
-                    Err(errno) => {
-                        crate::probes::fs_op("utimensat:follow_err", &path, errno.get());
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                }
-            } else {
-                path
-            };
-            let exists = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
-                this.layered_lstat(&path).map(|_| ())
-            } else {
-                this.layered_metadata(&path).map(|_| ())
-            };
-            match exists {
-                Ok(_) => {}
-                Err(errno) => {
-                    if this.is_synthetic_virtual_path(cx.kernel, &path) {
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    crate::probes::fs_op("utimensat:meta_err", &path, errno.get());
+                    crate::probes::fs_op("utimensat:follow_err", &path, errno.get());
                     return Ok(DispatchOutcome::errno(errno));
                 }
             }
-            if atime_set.is_none() && mtime_set.is_none() {
-                // Both UTIME_OMIT: nothing to persist.
-                return Ok(DispatchOutcome::Returned { value: 0 });
+        } else {
+            path
+        };
+        if this.mutation_path_needs_task(context, &path) {
+            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
+        }
+        let exists = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+            this.layered_lstat(&path).map(|_| ())
+        } else {
+            this.layered_metadata(&path).map(|_| ())
+        };
+        match exists {
+            Ok(_) => {}
+            Err(errno) => {
+                if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &path)) {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                crate::probes::fs_op("utimensat:meta_err", &path, errno.get());
+                return Ok(DispatchOutcome::errno(errno));
             }
-            if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
-                return match m.vfs.set_times(
-                    &m.full_path,
-                    atime_set,
-                    mtime_set,
-                    flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
-                ) {
-                    Ok(()) => {
-                        this.fs.rootfs_vfs.notify_inode_changed(&path, None);
-                        Ok(DispatchOutcome::Returned { value: 0 })
-                    }
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                };
-            }
-            // Persist atime/mtime to the materialised host file (disk-backed
-            // overlay). A subsequent stat reads real disk metadata via
-            // real_stat and will report the set mtime. MemoryBackend returns
-            // Unsupported; accept as a no-op so in-memory guests don't fail.
-            match this
-                .fs
-                .rootfs_vfs
-                .set_times(
-                    &path,
-                    atime_set,
-                    mtime_set,
-                    flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
-                )
-            {
+        }
+        if atime_set.is_none() && mtime_set.is_none() {
+            // Both UTIME_OMIT: nothing to persist.
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+            return match m.vfs.set_times(
+                &m.full_path,
+                atime_set,
+                mtime_set,
+                flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
+            ) {
                 Ok(()) => {
+                    this.fs.rootfs_vfs.notify_inode_changed(&path, None);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
-                Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                // Best-effort timestamps: a successful set above persists real
-                // mtime (apt's pkgcache x-ref relies on that), but a FAILURE to
-                // set times must NOT abort the caller. Linux tools like dpkg treat
-                // utimensat failure on a file they just wrote as fatal ("error
-                // setting timestamps … Read-only file system"); returning EROFS
-                // there breaks `dpkg --unpack` of any package with shared libs.
-                // The file content is already correct; timestamps are cosmetic.
-                Err(e) => {
-                    crate::probes::fs_op("utimensat:set_times_err_besteffort", &path, 0);
-                    let _ = e;
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            };
+        }
+        // Persist atime/mtime to the materialised host file (disk-backed
+        // overlay). A subsequent stat reads real disk metadata via
+        // real_stat and will report the set mtime. MemoryBackend returns
+        // Unsupported; accept as a no-op so in-memory guests don't fail.
+        match this.fs.rootfs_vfs.set_times(
+            &path,
+            atime_set,
+            mtime_set,
+            flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
+        ) {
+            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            // Best-effort timestamps: a successful set above persists real
+            // mtime (apt's pkgcache x-ref relies on that), but a FAILURE to
+            // set times must NOT abort the caller. Linux tools like dpkg treat
+            // utimensat failure on a file they just wrote as fatal ("error
+            // setting timestamps … Read-only file system"); returning EROFS
+            // there breaks `dpkg --unpack` of any package with shared libs.
+            // The file content is already correct; timestamps are cosmetic.
+            Err(e) => {
+                crate::probes::fs_op("utimensat:set_times_err_besteffort", &path, 0);
+                let _ = e;
+                Ok(DispatchOutcome::Returned { value: 0 })
             }
         }
     }

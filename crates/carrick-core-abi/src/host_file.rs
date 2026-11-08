@@ -69,10 +69,17 @@ pub enum HostFileOp {
     /// `linkat`: input is the source path, NUL, then the target path;
     /// `flags` carries the Linux `AT_*` flags.
     Linkat = 16,
+    /// `utimensat` of the staged path; four scalar words are the two
+    /// Linux timespecs, retaining `UTIME_NOW` and `UTIME_OMIT`.
+    Utimensat = 17,
+    /// `utimensat(fd, NULL, ...)` with the same timespec words.
+    SetFdTimes = 18,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
 pub const POLLFD_BYTES: usize = 8;
+/// Timestamp request flag distinguishing NULL times from two explicit NOWs.
+pub const UTIMENS_NULL_TIMES: u32 = 1 << 31;
 /// [`HostFileOp::Poll`] `args[0]`: whether the caller would wait.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -188,6 +195,8 @@ impl HostFileOp {
             14 => Self::Unlinkat,
             15 => Self::Symlinkat,
             16 => Self::Linkat,
+            17 => Self::Utimensat,
+            18 => Self::SetFdTimes,
             _ => return None,
         })
     }
@@ -206,6 +215,7 @@ impl HostFileOp {
                 | Self::Unlinkat
                 | Self::Symlinkat
                 | Self::Linkat
+                | Self::Utimensat
         )
     }
 }

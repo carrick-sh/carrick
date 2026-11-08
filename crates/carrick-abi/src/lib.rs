@@ -2920,8 +2920,8 @@ pub fn errno_name(e: LinuxErrno) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 pub use carrick_syscall_abi::LINUX_AT_FDCWD;
-pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 pub use carrick_syscall_abi::LINUX_AT_SYMLINK_FOLLOW;
+pub use carrick_syscall_abi::LINUX_AT_SYMLINK_NOFOLLOW;
 /// Request an identity-only file handle that need not be decodable by
 /// `open_by_handle_at(2)`.
 pub const LINUX_AT_HANDLE_FID: u64 = 0x200;
@@ -3058,8 +3058,7 @@ impl FsconfigCmd {
         })
     }
 }
-pub const LINUX_UTIME_NOW: i64 = (1 << 30) - 1;
-pub const LINUX_UTIME_OMIT: i64 = (1 << 30) - 2;
+pub use carrick_syscall_abi::{LINUX_UTIME_NOW, LINUX_UTIME_OMIT};
 pub const LINUX_F_OK: u64 = 0;
 pub const LINUX_R_OK: u64 = 4;
 pub const LINUX_W_OK: u64 = 2;
