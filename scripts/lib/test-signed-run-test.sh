@@ -91,7 +91,13 @@ run_case hangs one two
 [ "$(status_of hangs)" = deadline ]
 [ "$(status_of one)" = not-run ]
 [ "$(status_of two)" = not-run ]
-grep -Fxq 'test one ... FAILED' "$root/log"
+for name in one two; do
+    grep -Fq "test-signed: NOT-RUN $fake $name (" "$root/log"
+    if grep -Fxq "test $name ... FAILED" "$root/log"; then
+        echo "unrun test $name was reported FAILED" >&2
+        exit 1
+    fi
+done
 
 # 4. All passing: no failure.
 test_deadline_secs=5 binary_deadline_secs=0
