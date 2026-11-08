@@ -479,7 +479,8 @@ else:
         String::from_utf8_lossy(&prepared.stderr)
     );
     assert_eq!(
-        std::fs::read(request_dir.join("base.json")).unwrap(),
+        std::fs::read(request_dir.join("base-00000000000000000100-00000000000000000002.json"))
+            .unwrap(),
         std::fs::read(&baseline_path).unwrap()
     );
     let missing = child()
