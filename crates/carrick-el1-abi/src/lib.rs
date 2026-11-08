@@ -2943,7 +2943,13 @@ impl AnonymousLeave {
 }
 
 /// Provenance only: permission faults do not establish COW ownership.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum CopyRefusalReason {
     ForbiddenRange,
     Validator,
