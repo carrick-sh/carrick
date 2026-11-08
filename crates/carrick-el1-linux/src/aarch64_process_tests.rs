@@ -10527,42 +10527,57 @@ fn serial_host_native_root_creates_timerfd_with_live_children() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_epoll_ctl_observes_peer_pipe_write() {
-    native_descriptor_witness(None, false, true, false, false, false);
+    native_descriptor_witness(None, false, true, false, false, false, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_netpoll_eventfd_wait() {
-    native_descriptor_witness(None, false, false, true, false, false);
+    native_descriptor_witness(None, false, false, true, false, false, false);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_prepared_fork_parent_poll_observes_child_pipe_write() {
+    native_fault_supply_tests::prepared_fork_memory_properties();
+    native_descriptor_witness(None, true, false, false, false, false, true);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_root_pipe_zone_ceiling() {
-    native_descriptor_witness(None, true, false, false, true, false);
+    native_descriptor_witness(None, true, false, false, true, false, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_pipe_zone_ceiling() {
-    native_descriptor_witness(None, false, false, false, true, false);
+    native_descriptor_witness(None, false, false, false, true, false, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_root_pipe_zone_ofd_ceiling() {
-    native_descriptor_witness(None, true, false, false, false, true);
+    native_descriptor_witness(None, true, false, false, false, true, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_pipe_zone_ofd_ceiling() {
-    native_descriptor_witness(None, false, false, false, false, true);
+    native_descriptor_witness(None, false, false, false, false, true, false);
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
 fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
-    native_descriptor_witness(constructor, root_constructor, false, false, false, false);
+    native_descriptor_witness(
+        constructor,
+        root_constructor,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -10573,6 +10588,7 @@ fn native_descriptor_witness(
     netpoll: bool,
     zone_ceiling: bool,
     ofd_ceiling: bool,
+    poll_inherited_pipe: bool,
 ) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
@@ -10952,6 +10968,130 @@ fn native_descriptor_witness(
         ));
         assert!(result >= 0, "pipe2 after freeing an OFD pair: {result}");
         drop(retained);
+        return;
+    }
+
+    if poll_inherited_pipe {
+        use crate::file_table::{LINUX_POLLIN, PollFd};
+        use carrick_personality_linux::crossing::nr as sys;
+
+        let output = carrick_test_support::GuestUserBuffer::zeroed(8);
+        let (route, result) = run_binding(
+            &parent_binding,
+            sys::PIPE2.raw(),
+            [output.arg(), carrick_syscall_abi::LINUX_O_CLOEXEC, 0, 0],
+        );
+        if route == CompletionRoute::Forward {
+            println!(
+                "prepared-fork-vmfree owner=host inherited_zero=true prot_none_bytes=true ready=true child_exit=0 two_live_isolation=true"
+            );
+            return;
+        }
+        assert!(
+            matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork | CompletionRoute::Suspended
+            ),
+            "parent pipe2 must complete in ring: route={route:?} result={result}"
+        );
+        assert_eq!(result, 0, "parent pipe2 errno {}", -result);
+        let reader = u64::from(u32::from_ne_bytes(
+            output.as_bytes()[..4].try_into().unwrap(),
+        ));
+        let writer_fd = u64::from(u32::from_ne_bytes(
+            output.as_bytes()[4..].try_into().unwrap(),
+        ));
+
+        let writer = {
+            let mut writer_service = Aarch64NativeProcessService::with_crossing(
+                &task,
+                fixture.slot,
+                fixture.zone,
+                fixture.region.table(),
+                NonZeroU64::MIN,
+                &crossing,
+            )
+            .with_words(&words);
+            let mut entry = runtime
+                .enter(source, &task, parent_binding.words, &mut writer_service)
+                .unwrap();
+            let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+            else {
+                panic!("prepared-pipe writer fork must return");
+            };
+            assert!(result.raw() > 0, "writer fork errno {}", -result.raw());
+            let key = runtime
+                .namespace_child_key(parent_binding.key, result.raw() as u32)
+                .unwrap();
+            runtime.task_binding(key).unwrap()
+        };
+
+        let pollfds = carrick_test_support::GuestUserBuffer::from_values(&[PollFd {
+            fd: reader as i32,
+            events: LINUX_POLLIN,
+            revents: 0x7777,
+        }]);
+        let timeout = carrick_test_support::GuestUserBuffer::from_values(&[5i64, 0]);
+        let (route, result) = run_binding(
+            &parent_binding,
+            sys::PPOLL.raw(),
+            [pollfds.arg(), 1, timeout.arg(), 0],
+        );
+        assert!(
+            matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork | CompletionRoute::Suspended
+            ),
+            "prepared-fork-vmfree owner=zone inherited_zero=true prot_none_bytes=true ready=false child_exit=live two_live_isolation=false; parent ppoll must park and switch in ring, not forward: route={route:?} result={result}",
+        );
+        assert!(
+            fixture
+                .zone
+                .record(parent_binding.record.id)
+                .has_object_operation(),
+            "the parent must retain its poll readiness operation"
+        );
+        assert_eq!(
+            pollfds.get::<PollFd>(0).revents,
+            0x7777,
+            "a parked poll must not publish output"
+        );
+
+        activate_target(source, &task, &writer);
+        let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"p");
+        let (route, result) =
+            run_binding(&writer, sys::WRITE.raw(), [writer_fd, payload.arg(), 1, 0]);
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(result, 1, "child pipe write errno {}", -result);
+
+        activate_target(source, &task, &parent_binding);
+        let (route, result) = run_binding(
+            &parent_binding,
+            sys::PPOLL.raw(),
+            [pollfds.arg(), 1, timeout.arg(), 0],
+        );
+        let revents = pollfds.get::<PollFd>(0).revents;
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(result, 1, "ready=true parent ppoll result");
+        assert_ne!(
+            revents & LINUX_POLLIN,
+            0,
+            "parent ppoll revents={revents:#x}"
+        );
+        assert!(runtime.task_binding(parent).is_some(), "parent stays live");
+        assert!(
+            runtime.task_binding(writer.key).is_some(),
+            "child stays live"
+        );
+        println!(
+            "prepared-fork-vmfree owner=zone inherited_zero=true prot_none_bytes=true ready=true child_exit=live two_live_isolation=true"
+        );
         return;
     }
 
