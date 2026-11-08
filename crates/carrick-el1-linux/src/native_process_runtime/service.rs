@@ -398,9 +398,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     ) -> Result<(), NativeProcessError> {
         let member = self.zone.record(record.id);
         if let Some(census) = member.object_wait_census()
-            && census.queue as usize >= carrick_sched_core::object_wait::ADDRESS_SPACE_WAIT_BASE
-            && census.operation == u64::from(census.queue)
-            && census.operation_generation == census.generation
+            && census.is_anonymous_edit()
         {
             let terminal = {
                 let graph = self.graph.lock();

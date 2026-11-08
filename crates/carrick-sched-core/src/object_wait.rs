@@ -313,6 +313,8 @@ pub struct OperationToken {
     generation: u64,
 }
 
+const ANONYMOUS_EDIT_OPERATION_TAG: u64 = 1 << 63;
+
 /// Authentication of an operation held by a scheduler record; not ownership.
 #[derive(
     ::core::clone::Clone,
@@ -335,11 +337,34 @@ impl OperationToken {
     }
 
     pub const fn new(index: u64, generation: u64) -> Option<Self> {
-        if index == 0 || index == u64::MAX || generation == 0 {
+        if index == 0
+            || index == u64::MAX
+            || index & ANONYMOUS_EDIT_OPERATION_TAG != 0
+            || generation == 0
+        {
             None
         } else {
             Some(Self { index, generation })
         }
+    }
+
+    /// An anonymous reservation edit replay, distinct from prepared portal
+    /// waits that share the same address-space notification queue.
+    pub const fn anonymous_edit(key: ObjectWaitKey) -> Option<Self> {
+        let index = ANONYMOUS_EDIT_OPERATION_TAG | key.index as u64;
+        if key.generation == 0 {
+            None
+        } else {
+            Some(Self {
+                index,
+                generation: key.generation,
+            })
+        }
+    }
+
+    pub const fn is_anonymous_edit_for(&self, key: ObjectWaitKey) -> bool {
+        self.index == ANONYMOUS_EDIT_OPERATION_TAG | key.index as u64
+            && self.generation == key.generation
     }
 
     /// An owned metadata request wait; no IPC operation arena owns this token.
@@ -1579,6 +1604,16 @@ pub struct ObjectWaitCensus {
     /// The owned operation token's index and generation (0: none).
     pub operation: u64,
     pub operation_generation: u64,
+}
+
+impl ObjectWaitCensus {
+    /// Whether this census names an anonymous reservation edit on its exact
+    /// address-space notification incarnation.
+    pub const fn is_anonymous_edit(&self) -> bool {
+        self.queue as usize >= ADDRESS_SPACE_WAIT_BASE
+            && self.operation == ANONYMOUS_EDIT_OPERATION_TAG | self.queue as u64
+            && self.operation_generation == self.generation
+    }
 }
 
 /// Read-only view of one object wait queue (census only).
