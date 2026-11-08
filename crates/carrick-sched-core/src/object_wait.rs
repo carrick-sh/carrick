@@ -1061,7 +1061,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
         if ObjectWaitKey::native_service(record) != Some(self.key) {
             return None;
         }
-        let member = self.zone.live(record)?;
+        let member = self.zone.live(record).or_else(|| {
+            let home = self.zone.record(record.id);
+            // An admitted root can still run on its host executor with a Free
+            // native home. Only its exact published owner continuation admits
+            // intake before park; the service cell still authenticates the MM.
+            (home.incarnation() == record.incarnation
+                && home.is_native_owned()
+                && matches!(
+                    home.resume_disposition(),
+                    ResumeDisposition::OwnerContinuation(_)
+                ))
+            .then_some(home)
+        })?;
         // The retained service may expose its notice before park enrollment
         // installs the operation token. Its cell authenticates the request;
         // this observation never grants MM or execution ownership.

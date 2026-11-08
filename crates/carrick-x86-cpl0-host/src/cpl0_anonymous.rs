@@ -2,6 +2,7 @@
 //! selection or live descriptor store occurs at this boundary.
 use super::*;
 use carrick_el1_abi::{MmPortalSlots, PortalGrantWindow};
+use carrick_guest_arch::KernelVa;
 use carrick_hal::fork_stock::{
     ForkStockServiceError, GrantExecution, LifecycleWindow, NoTableLedger, SlotAbsence,
     lifecycle_slots,
@@ -31,13 +32,14 @@ fn decode_fork_custody(bytes: &[u8]) -> Option<carrick_el1_abi::PortalForkCustod
 /// absent: only the legacy no-FP-getter x86 engine in a bhyve VM decodes
 /// it (`run_fp_stub`), never a hardware CPL0 VM, so its number is shared with
 /// [`carrick_core_abi::X86_INITIAL_BOOT_PORT`] without aliasing.
-pub const CPL0_CARRIER_PORTS: [u16; 19] = [
+pub const CPL0_CARRIER_PORTS: [u16; 20] = [
     FAULT_DOORBELL_PORT,
     FORWARD_PORT,
     CONTROL_PORT,
     ENTRY_KICK_PORT,
     RETURN_KICK_PORT,
     WORK_PORT,
+    NATIVE_SERVICE_PORT,
     FATAL_PORT,
     YIELD_PORT,
     OWNER_GRANT_PORT,
@@ -225,6 +227,23 @@ pub(super) struct PendingPrepare {
     tables: PrepareTableLoan,
 }
 
+impl PendingPrepare {
+    pub(super) fn authenticates_native_reply(
+        &self,
+        execution: GrantExecution,
+        owner: carrick_el1_abi::El1MmHandle,
+        generation: NonZeroU64,
+    ) -> bool {
+        execution.context == self.execution.context
+            && execution.binding.task == self.execution.binding.task
+            && execution.binding.thread_generation == self.execution.binding.thread_generation
+            && owner.carrier() == self.window.operation.carrier
+            && owner.mm() == self.window.operation.mm
+            && owner.incarnation() == self.window.operation.incarnation
+            && generation == self.txn.id.generation
+    }
+}
+
 pub(super) struct PendingCow {
     window: PortalGrantWindow,
     inventory: InitialInventory,
@@ -344,12 +363,22 @@ impl<'a> CowPause<'a> {
         access: SpaceAccess<'a, carrick_sched_core::ParkedContextWords>,
         mm: u64,
     ) -> Result<Self, TrapError> {
-        let spaces = access.table();
-        let index = spaces.find(mm).ok_or_else(|| fail("owner COW space"))?;
-        let exclusion = access
-            .try_exclude_editor(index, mm)
-            .map_err(|reason| fail(format!("owner COW editor exclusion refused: {reason:?}")))?;
-        Ok(Self { exclusion })
+        let mm = carrick_el1_abi::ReservationMm::new(mm).ok_or_else(|| fail("owner COW MM"))?;
+        Self::try_new(access, mm)
+            .map_err(|reason| fail(format!("owner COW editor exclusion refused: {reason:?}")))
+    }
+    fn try_new(
+        access: SpaceAccess<'a, carrick_sched_core::ParkedContextWords>,
+        mm: carrick_el1_abi::ReservationMm,
+    ) -> Result<Self, carrick_sched_core::spaces::notification::ExclusionRefusal> {
+        use carrick_sched_core::spaces::notification::ExclusionRefusal;
+        let index = access
+            .table()
+            .find(mm.raw())
+            .ok_or(ExclusionRefusal::Stale)?;
+        Ok(Self {
+            exclusion: access.try_exclude_editor(index, mm.raw())?,
+        })
     }
     fn proof(&self) -> &carrick_el1_abi::ExcludedEditor<'_> {
         self.exclusion.proof()
@@ -976,61 +1005,74 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 address,
             )
         }?;
-        let accepted = (|| -> Option<()> {
-            let (owner, generation, reply_address) = settlement.request()?;
-            if execution.binding.mm.raw() != owner.mm().raw()
-                || self.fork_stock.child_owner(owner.mm()) != Some(owner)
-                || self.fork_stock.child_root(owner.mm()) != Some(execution.context.root)
-            {
-                return None;
-            }
-            let txn = self.fork_stock.pending_native_descriptor_transaction(
-                owner,
-                execution.context.root,
-                generation,
-            )?;
-            let reply_physical = kernel_pod_physical(
-                &self.kernel_pod_storage,
-                reply_address,
-                size_of::<PortalGrantSlot>(),
-                align_of::<PortalGrantSlot>(),
-            )?;
-            // SAFETY: declared writable kernel storage retains the complete
-            // aligned atomic-only reply slot for this synchronous crossing.
-            let reply =
-                unsafe { self._vm.retained_record::<PortalGrantSlot>(reply_physical) }.ok()?;
-            let window = reply.window()?;
-            if window.operation.carrier != owner.carrier()
-                || window.operation.mm != owner.mm()
-                || window.operation.incarnation != owner.incarnation()
-                || window.operation.sequence != generation
-            {
-                return None;
-            }
-            if let Some(receipt) = reply.take_receipt(window, &txn) {
-                self.fork_stock
-                    .settle_native_descriptor_tables(
-                        &mut NoTableLedger,
-                        owner,
-                        execution.context.root,
-                        &receipt,
-                    )
-                    .ok()?;
-            } else if reply.withdraw(window, &txn) {
-                self.fork_stock
-                    .cancel_submitted_native_descriptor_tables(
-                        &mut NoTableLedger,
-                        owner,
-                        execution.context.root,
-                        generation,
-                    )
-                    .ok()?;
-            } else {
-                return None;
-            }
-            Some(())
-        })()
-        .is_some();
+        let native_reply = settlement
+            .request()
+            .filter(|(_, _, address)| self.native_backing_pending.contains_key(address));
+        let accepted = if let Some((owner, generation, reply_address)) = native_reply {
+            self.settle_native_backing_reply(execution, owner, generation, reply_address)?
+        } else {
+            (|| -> Option<()> {
+                let (owner, generation, reply_address) = settlement.request()?;
+                if execution.binding.mm.raw() != owner.mm().raw()
+                    || self.fork_stock.child_owner(owner.mm()) != Some(owner)
+                    || self.fork_stock.child_root(owner.mm()) != Some(execution.context.root)
+                {
+                    return None;
+                }
+                let txn = self.fork_stock.pending_native_descriptor_transaction(
+                    owner,
+                    execution.context.root,
+                    generation,
+                )?;
+                let reply_physical = kernel_pod_physical(
+                    &self.kernel_pod_storage,
+                    reply_address,
+                    size_of::<PortalGrantSlot>(),
+                    align_of::<PortalGrantSlot>(),
+                )?;
+                // SAFETY: declared writable kernel storage retains the complete
+                // aligned atomic-only reply slot for this synchronous crossing.
+                let reply =
+                    unsafe { self._vm.retained_record::<PortalGrantSlot>(reply_physical) }.ok()?;
+                let window = reply.window()?;
+                if window.operation.carrier != owner.carrier()
+                    || window.operation.mm != owner.mm()
+                    || window.operation.incarnation != owner.incarnation()
+                    || window.operation.sequence != generation
+                {
+                    return None;
+                }
+                if let Some(receipt) = reply.take_receipt(window, &txn) {
+                    self.fork_stock
+                        .settle_native_descriptor_tables(
+                            &mut NoTableLedger,
+                            owner,
+                            execution.context.root,
+                            &receipt,
+                        )
+                        .ok()?;
+                } else if reply.withdraw(window, &txn) {
+                    self.fork_stock
+                        .cancel_submitted_native_descriptor_tables(
+                            &mut NoTableLedger,
+                            owner,
+                            execution.context.root,
+                            generation,
+                        )
+                        .ok()?;
+                } else {
+                    return None;
+                }
+                Some(())
+            })()
+            .is_some()
+        };
+        if !accepted && native_reply.is_none() {
+            // Only a retained native reply's editor contention uses REFUSED.
+            // Unknown or stale descriptors are invariants, never owner waits
+            // with no release source.
+            return Err(fail("native descriptor settlement owner changed"));
+        }
         if accepted {
             settlement.accept();
         } else {
@@ -1735,7 +1777,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         wake.finish()
     }
 
-    fn grant_portal(&self) -> Result<&MmPortalSlots, TrapError> {
+    pub(super) fn grant_portal(&self) -> Result<&MmPortalSlots, TrapError> {
         // SAFETY: the boot owner zero-initializes this atomic-only record in
         // the retained supervisor kernel region before either vCPU runs.
         unsafe {
@@ -1757,18 +1799,29 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     fn file_supply_request<I: CarrierCpuIo>(
         &mut self,
         lease: &StoppedCpuLease<'_, I>,
+        native_service: bool,
     ) -> Result<Option<FileSupplyRequest>, TrapError> {
         let execution = self.physical_execution(lease)?;
         let index = lease.cpu.raw() as usize;
         if self.anonymous_pending[index].is_some() {
             return Ok(None);
         }
-        let far = lease.io.get_gpr(X86Reg::Rdi)?;
-        let Some((_, window)) = self
+        let slot = self
             .grant_portal()?
             .grant(index)
-            .and_then(|slot| slot.pending_fault_selection(execution.context.mm.raw().get(), far))
-        else {
+            .ok_or_else(|| fail("file supply grant slot"))?;
+        let selected = if native_service {
+            slot.pending_fault_selection_for_mm(
+                carrick_el1_abi::ReservationMm::new(execution.context.mm.raw().get())
+                    .ok_or_else(|| fail("file supply native MM"))?,
+            )
+        } else {
+            slot.pending_fault_selection(
+                execution.context.mm.raw().get(),
+                lease.io.get_gpr(X86Reg::Rdi)?,
+            )
+        };
+        let Some((_, window)) = selected else {
             return Ok(None);
         };
         let Some(identity) = window.host_backing else {
@@ -1826,59 +1879,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if matches!(self.anonymous_pending[index], Some(PendingGrant::Cow(_))) {
             return self.settle_cow_grant(index, execution);
         }
-        if let Some(PendingGrant::Prepare(mut pending)) = self.anonymous_pending[index].take() {
-            let receipt = self
+        if let Some(PendingGrant::Prepare(pending)) = self.anonymous_pending[index].take() {
+            let reply = self
                 .grant_portal()?
                 .grant(index)
                 .ok_or_else(|| fail("owner grant slot"))?
-                .take_receipt(pending.window, &pending.txn)
-                .ok_or_else(|| fail("owner grant receipt absent"))?;
-            let publication = GuestMmuPublication::from_x86_owner_grant(&pending.txn, &receipt)
-                .ok_or_else(|| {
-                    let linked = match receipt.outcome {
-                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(applied) => Some(applied.tables_linked),
-                        _ => None,
-                    };
-                    fail(format!("owner grant refused: {:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} offered_tables={} receipt_tables_linked={linked:?}", receipt.outcome, execution.cpu.raw(), execution.context.mm.raw(), execution.context.root.address().raw(), pending.window.range.start(), pending.window.range.len(), pending.txn.tables.len()))
-                })?;
-            X86Mmu::project_grant(pending.txn.root.raw(), &pending.txn, |native| {
-                self._vm
-                    .publish(native, publication, &mut pending.inventory)
-            })
-            .map_err(|error| fail(format!("owner grant projection: {error:?}")))?
-            .map_err(|error| fail(error.to_string()))?;
-            pending.inventory.finish()?;
-            // File grants settle through the same publisher, but are outside
-            // the anonymous-leaf evidence population.
-            if pending.window.host_backing.is_none() {
-                self.private_anonymous_witness.record_settled(
-                    crate::cpl0_private_witness::SettledPrivateGrant {
-                        memory: &self._vm,
-                        inventory: &*self.frame_inventory,
-                        binding: pending.execution.binding,
-                        cpu: pending.execution.cpu,
-                        context: pending.execution.context,
-                        window: pending.window,
-                        txn: &pending.txn,
-                        publication,
-                        peer: pending.peer.combine(
-                            crate::cpl0_private_witness::PeerActivity::observe(
-                                &self.actual_run[1 - index],
-                            ),
-                        ),
-                    },
-                )?;
+                as *const carrick_el1_abi::PortalGrantSlot;
+            // SAFETY: the carrier retains this initialized physical reply.
+            if !self.settle_backing_grant(pending, unsafe { &*reply }, None)? {
+                return Err(fail("owner grant refused"));
             }
-            let used = publication.tables_linked as usize;
-            if pending.txn.tables.len() != pending.tables.len() || used > pending.tables.len() {
-                return Err(fail("owner grant table receipt"));
-            }
-            self.prepare_table_stock
-                .as_mut()
-                .ok_or_else(|| fail("Prepare table stock absent at settlement"))?
-                .return_unused(pending.tables, used)?;
-            // Retained stage-2 custody now belongs to the live guest graph.
-            let _retained = pending.handle;
             return Ok(());
         }
         // Hardware faults and kernel-owned user copies share this crossing.
@@ -1898,6 +1908,243 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .ok_or_else(|| fail("owner grant slot"))?
             .pending_fault_selection(mm.get(), far)
             .ok_or_else(|| fail("owner fault selection absent"))?;
+        let reply = self
+            .grant_portal()?
+            .grant(index)
+            .ok_or_else(|| fail("owner grant slot"))?
+            as *const carrick_el1_abi::PortalGrantSlot;
+        // SAFETY: the carrier retains this initialized slot across staging.
+        let pending = self.prepare_backing_grant(execution, window, file, unsafe { &*reply })?;
+        self.anonymous_pending[index] = pending.map(PendingGrant::Prepare);
+        Ok(())
+    }
+
+    pub(super) fn settle_native_backing_reply(
+        &mut self,
+        execution: carrick_hal::fork_stock::GrantExecution,
+        owner: carrick_el1_abi::El1MmHandle,
+        generation: core::num::NonZeroU64,
+        address: KernelVa,
+    ) -> Result<bool, TrapError> {
+        if !self
+            .native_backing_pending
+            .get(&address)
+            .is_some_and(|pending| pending.authenticates_native_reply(execution, owner, generation))
+        {
+            return Err(fail("native backing reply owner changed"));
+        }
+        let pointer = self.native_service_pointer(
+            execution.context,
+            address,
+            size_of::<carrick_el1_abi::PortalGrantSlot>(),
+            align_of::<carrick_el1_abi::PortalGrantSlot>(),
+        )?;
+        // SAFETY: exact stopped task/MM and retained reply authenticate the complete
+        // slot. The ring owns it until this receipt or withdrawal is settled.
+        let reply = unsafe { &*pointer.cast::<carrick_el1_abi::PortalGrantSlot>() };
+        let ram = Arc::clone(&self.ram);
+        let zone = retained_cow_zone(&ram)?;
+        let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
+        let delivery = |zone: &X86Cpl0Zone,
+                        waker: Waker,
+                        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| wake.deliver(zone, waker, owned);
+        let access = SpaceAccess::notified(SpaceReleaseVenue {
+            zone,
+            waker: Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                &delivery,
+            ),
+        });
+        let pause = match CowPause::try_new(access, owner.mm()) {
+            Ok(pause) => pause,
+            Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
+                // Refusal leaves the exact reply and physical journals owned.
+                // The caller observed Editor before this crossing, and parks
+                // there rather than lowering this refusal to a Linux errno.
+                wake.finish()?;
+                return Ok(false);
+            }
+            Err(_) => return Err(fail("native backing settlement MM changed")),
+        };
+        let pending = self
+            .native_backing_pending
+            .remove(&address)
+            .ok_or_else(|| fail("native fault retained reply absent"))?;
+        self.settle_backing_grant(pending, reply, Some(&pause))?;
+        drop(pause);
+        wake.finish()?;
+        Ok(true)
+    }
+    fn settle_backing_grant(
+        &mut self,
+        mut pending: PendingPrepare,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+        exclusion: Option<&CowPause<'_>>,
+    ) -> Result<bool, TrapError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+        let index = pending.execution.cpu.raw() as usize;
+        let receipt = reply.take_receipt(pending.window, &pending.txn);
+        if let Some(receipt) = &receipt
+            && (receipt.id != pending.txn.id || receipt.digest != pending.txn.digest())
+        {
+            return Err(fail("owner grant receipt identity"));
+        }
+        let undo = match receipt.as_ref().map(|receipt| &receipt.outcome) {
+            Some(DescriptorOutcome::Applied(_)) => false,
+            Some(DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_)) => true,
+            Some(DescriptorOutcome::Indeterminate(_)) => {
+                return Err(fail("owner grant indeterminate receipt"));
+            }
+            None if reply.withdraw(pending.window, &pending.txn) => true,
+            None => return Err(fail("owner grant receipt absent")),
+        };
+        if undo {
+            let _proof = exclusion
+                .ok_or_else(|| fail("owner grant refused"))?
+                .proof();
+            // The exact withdrawn or rolled-back receipt proves that none of
+            // these fresh bytes are named by a guest descriptor.
+            pending.inventory.guest_exposed = false;
+            unsafe {
+                self._vm
+                    .cancel_prepared(&[pending.handle], &mut pending.inventory)
+            }
+            .map_err(|error| fail(error.to_string()))?;
+            self.prepare_table_stock
+                .as_mut()
+                .ok_or_else(|| fail("Prepare stock absent on cancellation"))?
+                .return_unused(pending.tables, 0)?;
+            return Ok(false);
+        }
+        let receipt = receipt.ok_or_else(|| fail("owner grant applied receipt absent"))?;
+        let publication = GuestMmuPublication::from_x86_owner_grant(&pending.txn, &receipt)
+            .ok_or_else(|| {
+                let linked = match receipt.outcome {
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(applied) => Some(applied.tables_linked),
+                    _ => None,
+                };
+                fail(format!("owner grant refused: {:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} offered_tables={} receipt_tables_linked={linked:?}", receipt.outcome, pending.execution.cpu.raw(), pending.execution.context.mm.raw(), pending.execution.context.root.address().raw(), pending.window.range.start(), pending.window.range.len(), pending.txn.tables.len()))
+            })?;
+        X86Mmu::project_grant(pending.txn.root.raw(), &pending.txn, |native| {
+            self._vm
+                .publish(native, publication, &mut pending.inventory)
+        })
+        .map_err(|error| fail(format!("owner grant projection: {error:?}")))?
+        .map_err(|error| fail(error.to_string()))?;
+        pending.inventory.finish()?;
+        // File grants settle through the same publisher, but are outside
+        // the anonymous-leaf evidence population.
+        if pending.window.host_backing.is_none() {
+            self.private_anonymous_witness.record_settled(
+                crate::cpl0_private_witness::SettledPrivateGrant {
+                    memory: &self._vm,
+                    inventory: &*self.frame_inventory,
+                    binding: pending.execution.binding,
+                    cpu: pending.execution.cpu,
+                    context: pending.execution.context,
+                    window: pending.window,
+                    txn: &pending.txn,
+                    publication,
+                    peer: pending
+                        .peer
+                        .combine(crate::cpl0_private_witness::PeerActivity::observe(
+                            &self.actual_run[1 - index],
+                        )),
+                },
+            )?;
+        }
+        let used = publication.tables_linked as usize;
+        if pending.txn.tables.len() != pending.tables.len() || used > pending.tables.len() {
+            return Err(fail("owner grant table receipt"));
+        }
+        self.prepare_table_stock
+            .as_mut()
+            .ok_or_else(|| fail("Prepare table stock absent at settlement"))?
+            .return_unused(pending.tables, used)?;
+        // Retained stage-2 custody now belongs to the live guest graph.
+        let _retained = pending.handle;
+        Ok(true)
+    }
+
+    pub(super) fn prepare_native_backing_grant(
+        &mut self,
+        execution: GrantExecution,
+        window: PortalGrantWindow,
+        file: Option<FileSupply>,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+    ) -> Result<Result<Option<PendingPrepare>, carrick_core_abi::PortalOwnerWait>, TrapError> {
+        let ram = Arc::clone(&self.ram);
+        let zone = retained_cow_zone(&ram)?;
+        let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
+        let delivery = |zone: &X86Cpl0Zone,
+                        waker: Waker,
+                        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| wake.deliver(zone, waker, owned);
+        let access = SpaceAccess::notified(SpaceReleaseVenue {
+            zone,
+            waker: Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                &delivery,
+            ),
+        });
+        let source = zone
+            .space_entry(
+                NonZeroU64::new(window.operation.mm.raw())
+                    .ok_or_else(|| fail("native preparation MM"))?,
+            )
+            .ok_or_else(|| fail("native preparation space"))?;
+        let observed = source
+            .notifications(window.operation.incarnation)
+            .map_err(|_| fail("native preparation source"))?
+            .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor);
+        let pause = match CowPause::try_new(access, window.operation.mm) {
+            Ok(pause) => pause,
+            Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
+                let handle = unsafe {
+                    // SAFETY: the ticket retains this exact admitted window;
+                    // the source above authenticates its MM incarnation.
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        window.operation.carrier,
+                        window.operation.mm,
+                        window.operation.incarnation,
+                    )
+                };
+                let wait = unsafe {
+                    // SAFETY: this Editor observation preceded the failed probe.
+                    carrick_core_abi::PortalOwnerWait::from_owner(
+                        handle,
+                        carrick_core_abi::PortalWaitCause::Editor,
+                        observed.revision(),
+                    )
+                };
+                wake.finish()?;
+                return Ok(Err(wait));
+            }
+            Err(_) => return Err(fail("native preparation MM changed")),
+        };
+        // Keep this exclusion through allocation and the read-only table plan:
+        // a contended native call waits before creating any physical journal.
+        let pending = self.prepare_backing_grant(execution, window, file, reply)?;
+        drop(pause);
+        wake.finish()?;
+        Ok(Ok(pending))
+    }
+
+    pub(super) fn prepare_backing_grant(
+        &mut self,
+        execution: GrantExecution,
+        window: PortalGrantWindow,
+        file: Option<FileSupply>,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+    ) -> Result<Option<PendingPrepare>, TrapError> {
+        let index = execution.cpu.raw() as usize;
+        let context = execution.context;
+        let mm = context.mm.raw();
         if self.grant_portal()?.carrier() != Some(window.operation.carrier)
             || window.range.len() > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
         {
@@ -1933,7 +2180,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             // Leave the authenticated selection pending. The guest observes
             // no backing reply, cancels this exact selection and delivers its
             // normal backing-fault signal; EOF is not a carrier invariant.
-            return Ok(());
+            return Ok(None);
         }
         let root = context.root;
         let gpa = self.anonymous_next_gpa;
@@ -2070,13 +2317,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let admission = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
             self._vm.admit_guest_edit(native)
         });
-        if !matches!(admission, Ok(Ok(())))
-            || !self
-                .grant_portal()?
-                .grant(index)
-                .ok_or_else(|| fail("owner grant slot"))?
-                .submit(window, &txn)
-        {
+        if !matches!(admission, Ok(Ok(()))) || !reply.submit(window, &txn) {
             // SAFETY: the vCPU is stopped, and no descriptor submission was
             // admitted. The fresh extent has never been guest-visible.
             unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
@@ -2092,7 +2333,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // if the carrier never receives a verifiable completion. Keep physical
         // custody through carrier teardown rather than rolling inventory back.
         inventory.guest_exposed = true;
-        self.anonymous_pending[index] = Some(PendingGrant::Prepare(PendingPrepare {
+        Ok(Some(PendingPrepare {
             peer: crate::cpl0_private_witness::PeerActivity::observe(&self.actual_run[1 - index]),
             window,
             txn,
@@ -2100,8 +2341,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             handle,
             execution,
             tables: owned_tables,
-        }));
-        Ok(())
+        }))
     }
 }
 
@@ -2203,6 +2443,7 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ProductionCpuLease<I, M> {
     pub(super) fn read_owner_file(
         &mut self,
         task: Option<carrick_guest_arch::TaskIdentity>,
+        native_service: bool,
     ) -> Result<Option<FileSupply>, TrapError> {
         let request = {
             let mut custody = self
@@ -2214,14 +2455,17 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ProductionCpuLease<I, M> {
                     .physical_slot()
                     .ok_or_else(|| fail("file supply CPU slot"))?;
                 self.cpu.with_stopped_io(task, |io| {
-                    custody.file_supply_request(&StoppedCpuLease { cpu, io })
+                    custody.file_supply_request(&StoppedCpuLease { cpu, io }, native_service)
                 })?
             } else {
                 self.cpu.with_idle_peer_io(|io| {
-                    custody.file_supply_request(&StoppedCpuLease {
-                        cpu: carrick_guest_arch::CpuId::new(1),
-                        io,
-                    })
+                    custody.file_supply_request(
+                        &StoppedCpuLease {
+                            cpu: carrick_guest_arch::CpuId::new(1),
+                            io,
+                        },
+                        native_service,
+                    )
                 })?
             }
         };
@@ -2238,6 +2482,35 @@ mod custody_tests {
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_mmu_core::x86::descriptor_txn::Permissions;
+    #[test]
+    fn native_backing_editor_exclusion_busy_once_then_success() {
+        let layout = std::alloc::Layout::new::<X86Cpl0Zone>();
+        // SAFETY: the atomic-only zone has a valid zero state and typed alignment.
+        let zone = unsafe {
+            let pointer = std::alloc::alloc_zeroed(layout).cast::<X86Cpl0Zone>();
+            assert!(!pointer.is_null());
+            Box::from_raw(pointer)
+        };
+        let index = zone.spaces.publish_closed(77, 0x1000, 0).unwrap();
+        let access = SpaceAccess::source_free_with_context(&zone.spaces);
+        access.open(index);
+        let editor = access.try_begin_edit(index, 77, NonZeroU64::MIN).unwrap();
+        assert!(matches!(
+            CowPause::try_new(access, carrick_el1_abi::ReservationMm::new(77).unwrap()),
+            Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy)
+        ));
+        assert_eq!(
+            zone.spaces.gate(index),
+            0,
+            "refusal must not close the editor's gate"
+        );
+        drop(editor);
+        let pause =
+            CowPause::try_new(access, carrick_el1_abi::ReservationMm::new(77).unwrap()).unwrap();
+        drop(pause);
+        assert_eq!(zone.spaces.gate(index), 0);
+    }
+
     fn execution() -> GrantExecution {
         GrantExecution {
             cpu: carrick_guest_arch::CpuId::new(1),
@@ -2903,3 +3176,6 @@ mod custody_tests {
         assert!(residency.publish(added).is_some());
     }
 }
+
+#[path = "cpl0_native_service.rs"]
+mod native_service;

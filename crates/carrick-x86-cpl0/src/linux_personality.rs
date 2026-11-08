@@ -1029,6 +1029,25 @@ impl Personality for LinuxPersonality {
                 anonymous.as_mut().map(|venue| venue as &mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue),
                 cache_lookup,
             );
+            if route == CompletionRoute::NativeService
+                && call.canonical.raw() == carrick_personality_linux::crossing::nr::GETRANDOM.raw()
+            {
+                use carrick_el1_linux::native_process_runtime::{
+                    NativeEntropyArgs, NativeEntropyFlags, NativeResume,
+                };
+                route = match process.begin_entropy_call(NativeEntropyArgs {
+                    address: carrick_guest_arch::UserVa::new(call.args[0]),
+                    length: carrick_guest_arch::GuestLen::new(call.args[1]),
+                    flags: NativeEntropyFlags::from_bits_retain(call.args[2] as u32),
+                }) {
+                    Ok(NativeResume::Left(None)) => CompletionRoute::Suspended,
+                    Ok(NativeResume::Returned(result)) => {
+                        frame.rax = result.raw() as u64;
+                        CompletionRoute::Served
+                    }
+                    _ => fatal_boot(),
+                };
+            }
             if let Some(reason) = process.take_run_failure() {
                 complete_run_failure(task, reason);
             }
@@ -1063,8 +1082,8 @@ impl Personality for LinuxPersonality {
             CompletionRoute::InvalidCompletion => {
                 fatal_error(frame);
             }
-            // The x86 router never selects the ARM native-exec service; fail
-            // closed with a counted-unrouted errno rather than forwarding.
+            // Entropy has been staged above. Any other unwired native service
+            // fails closed with a counted refusal.
             CompletionRoute::NativeService => {
                 let child = source.zone.slot(slot).current().is_some_and(|record| {
                     native_process::registry()

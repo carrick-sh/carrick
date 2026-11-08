@@ -4093,3 +4093,48 @@ fn host_owned_syscall_memory_wait_requires_ring_resume() {
         assert!(zone.record(record).take_object_operation().is_none());
     }
 }
+
+/// An admitted root still uses its host executor while its home record is
+/// Free. Its published service continuation must be claimable before park.
+#[test]
+fn native_service_intake_authenticates_free_root_home_before_park() {
+    use crate::object_wait::{ObjectWaitKey, OwnerEntry};
+    let zone = zone();
+    let home = zone.alloc_record(identity(101)).unwrap();
+    let peer = zone.alloc_record(identity(102)).unwrap();
+    let reference = zone.record_ref(home);
+    let peer_reference = zone.record_ref(peer);
+    let key = ObjectWaitKey::native_service(reference).unwrap();
+    let peer_key = ObjectWaitKey::native_service(peer_reference).unwrap();
+    zone.bind_object_wait(key, &HostWait).unwrap();
+    zone.bind_object_wait(peer_key, &HostWait).unwrap();
+    assert_eq!(zone.record(home).claim(), Claim::Free);
+    assert!(zone.mark_native_owned(home));
+    let queue = zone.object_wait(key, &HostWait).unwrap();
+    assert!(queue.native_service_member(reference).is_none());
+    // SAFETY: this fixture owns both unpublished home records and models the
+    // production owner publishing its retained request before the notice.
+    unsafe {
+        zone.record(home)
+            .publish_owner_continuation(OwnerEntry::Syscall);
+        zone.record(peer)
+            .publish_owner_continuation(OwnerEntry::Syscall);
+    }
+    assert_eq!(
+        queue.native_service_member(reference),
+        Some(zone.record(home).identity())
+    );
+    assert!(queue.native_service_member(peer_reference).is_none());
+    let peer_queue = zone.object_wait(peer_key, &HostWait).unwrap();
+    assert!(peer_queue.native_service_member(peer_reference).is_none());
+    // A recycled incarnation and a consumed continuation confer no custody.
+    let stale = RecordRef {
+        id: home,
+        incarnation: reference.incarnation + 1,
+    };
+    assert!(queue.native_service_member(stale).is_none());
+    unsafe {
+        zone.record(home).consume_owner_continuation();
+    }
+    assert!(queue.native_service_member(reference).is_none());
+}

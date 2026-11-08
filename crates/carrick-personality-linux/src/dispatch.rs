@@ -56,9 +56,9 @@ pub enum Family {
     Identity(IdentityCall),
     Sysinfo(SysinfoCall),
     Ipc(IpcCall),
-    /// AArch64 image replacement is completed by the carrier's native-exec
-    /// service after the shared entry owner authenticates this handoff.
-    NativeExec,
+    /// Typed native service (entropy on both ISAs, image replacement on ARM)
+    /// after the shared entry owner authenticates the handoff.
+    NativeService,
     Unported,
 }
 
@@ -573,7 +573,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Identity(_) => FamilyCompletion::Forward,
         Family::Sysinfo(_) => FamilyCompletion::Forward,
         Family::Ipc(_) => FamilyCompletion::Forward,
-        Family::NativeExec => FamilyCompletion::NativeService,
+        Family::NativeService => FamilyCompletion::NativeService,
         Family::Signal(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
@@ -642,13 +642,14 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
         134 => Family::Signal(crate::signal::SignalCall::RtSigaction),
         139 => Family::Signal(crate::signal::SignalCall::RtSigreturn),
-        221 | 281 => Family::NativeExec,
+        221 | 281 => Family::NativeService,
         _ => route_shared(ordinal, allocator_control),
     }
 }
 
 const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
     match ordinal {
+        nr if nr == crate::crossing::nr::GETRANDOM.raw() => Family::NativeService,
         214 => Family::Anonymous(AnonymousCall::Brk),
         215 => Family::Anonymous(AnonymousCall::Munmap),
         216 => Family::Anonymous(AnonymousCall::Mremap),
@@ -972,7 +973,7 @@ pub const fn service_owner(ordinal: CanonicalNr, allocator_control: u64) -> Serv
         | Family::Identity(_)
         | Family::Sysinfo(_)
         | Family::Ipc(_)
-        | Family::NativeExec => ServiceOwner::Ring(family),
+        | Family::NativeService => ServiceOwner::Ring(family),
         Family::Unported => {
             match crate::crossing::AllowedHostCrossing::from_canonical_aarch64(ordinal) {
                 Some(crossing) => match crossing.kind() {
@@ -1449,7 +1450,7 @@ mod ring_first_tests {
     #[test]
     fn native_exec_routes_to_the_arm_carrier_service_only() {
         for ordinal in [221, 281] {
-            assert_eq!(route_aarch64(ordinal, u64::MAX), Family::NativeExec);
+            assert_eq!(route_aarch64(ordinal, u64::MAX), Family::NativeService);
             assert_eq!(route_x86(ordinal, u64::MAX), Family::Unported);
         }
     }
@@ -1460,6 +1461,39 @@ mod ring_first_tests {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
                 set: HostCrossingSet::Aarch64,
+                mutate_forward: false,
+                strict: true,
+                state: crate::abi::entry::LinuxTaskState::new(),
+                native: carrick_syscall_abi::NativeNr(native),
+                admitted: true,
+                result: 42,
+                work: false,
+                handback: false,
+                signal_restore_calls: 0,
+                refused: &refused,
+                forwarded: [const { AtomicU64::new(0) }; 512],
+            };
+
+            assert_eq!(
+                dispatch(ordinal, 42, &mut pending),
+                CompletionRoute::NativeService
+            );
+            assert_eq!(pending.result, 42);
+            assert_eq!(
+                pending.forwarded[ordinal as usize].load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn native_entropy_handoff_bypasses_host_crossing_refusal_on_both_isas() {
+        for (set, native) in [(HostCrossingSet::X86, 318), (HostCrossingSet::Aarch64, 278)] {
+            let ordinal = 278;
+            let refused = [const { AtomicU64::new(0) }; 513];
+            let mut pending = CarrierOwned {
+                set,
                 mutate_forward: false,
                 strict: true,
                 state: crate::abi::entry::LinuxTaskState::new(),

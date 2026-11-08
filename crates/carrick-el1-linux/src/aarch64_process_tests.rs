@@ -3956,9 +3956,8 @@ fn native_fork_child_getrandom(flags: u64) {
         None,
         |_| core::ptr::null_mut(),
     );
-    assert_eq!(route, CompletionRoute::Forward);
-    let (address, capacity, flags, requested) =
-        crate::dispatch::native_entropy_stage(&frame, &crate::file::HardwareValidator);
+    assert_eq!(route, CompletionRoute::NativeService);
+    let (address, capacity, flags, requested) = crate::dispatch::native_entropy_stage(&frame);
     assert!(matches!(
         entry
             .begin_entropy_service(address, capacity, flags, requested)
@@ -4043,7 +4042,7 @@ fn native_fork_child_getrandom(flags: u64) {
     let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
     assert!(
         matches!(resumed, crate::native_process_runtime::NativeResume::Returned(result) if result.raw() == 8),
-        "native child getrandom(flags={flags}) must return eight only after completion and resume"
+        "native child getrandom(flags={flags:?}) must return eight only after completion and resume"
     );
     assert_eq!(counters.refused_child[278].load(Ordering::Acquire), 0);
 }
