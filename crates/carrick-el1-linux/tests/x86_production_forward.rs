@@ -598,10 +598,13 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         };
         result.raw() as u32
     };
-    let retained = registry
-        .admit_existing_group(source, &task, address, &page, &control)
-        .unwrap()
-        .expect("x86 entry with a live child must reuse its signal projection");
+    let carrick_el1_linux::native_process_runtime::NativeGroupAdmission::Existing(retained) =
+        registry
+            .admit_existing_group(source, &task, address, &page, &control)
+            .unwrap()
+    else {
+        panic!("x86 entry with a live child must reuse its signal projection")
+    };
     assert!(
         Arc::ptr_eq(&retained, &runtime),
         "x86 admission cannot construct a second root around its own pending writer"

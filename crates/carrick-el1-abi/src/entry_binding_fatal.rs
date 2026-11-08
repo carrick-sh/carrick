@@ -208,6 +208,10 @@ pub struct ArmEntryFatalRegisters {
     pub source_location: Option<u64>,
     /// x4..x11, populated only for typed admission contention reasons.
     pub admission_identity: [Option<u64>; 8],
+    /// x12..x17, x20..x21: four (flags/task, generation) pairs, in order
+    /// members, records, groups, by_process -> groups. Bit 0 = present,
+    /// bit 1 = downstream present, bit 2 = same Arc as members[execution].
+    pub admission_lookup: [Option<u64>; 8],
     pub pc: Option<u64>,
     pub lr: Option<u64>,
     pub fp: Option<u64>,
@@ -407,10 +411,11 @@ impl fmt::Display for ArmEntryBindingFatal {
             // the larger saved-register snapshot below.
             return write!(
                 f,
-                "entry_binding cpu={} {}admission_identity={:x?} pc={} lr={} sp_el1={} loaded_task={} loaded_generation={} loaded_thread={} loaded_mm={}",
+                "entry_binding cpu={} {}admission_identity={:x?} lookup_members_records_groups_by_process={:x?} pc={} lr={} sp_el1={} loaded_task={} loaded_generation={} loaded_thread={} loaded_mm={}",
                 self.slot.raw(),
                 FatalDetail(r.reason, r.source_location),
                 r.admission_identity,
+                r.admission_lookup,
                 Register(r.pc),
                 Register(r.lr),
                 Register(r.sp_el1),
@@ -716,6 +721,7 @@ mod tests {
             reason: Some(EntryBindingFatalReason::AdmissionRecordKeyCollision as u64),
             source_location: Some(u64::MAX),
             admission_identity: [Some(u64::MAX); 8],
+            admission_lookup: [Some(u64::MAX); 8],
             pc: Some(u64::MAX),
             lr: Some(u64::MAX),
             sp_el1: Some(u64::MAX),
@@ -767,6 +773,7 @@ mod tests {
             reason: Some(u64::MAX),
             source_location: Some(u64::MAX),
             admission_identity: [None; 8],
+            admission_lookup: [None; 8],
             pc: Some(u64::MAX),
             lr: Some(u64::MAX),
             fp: Some(u64::MAX),

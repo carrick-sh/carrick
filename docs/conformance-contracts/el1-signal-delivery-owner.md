@@ -74,3 +74,23 @@ scheduler load and resume_production path for a rehomed host-owned root, with
 no work, a parked carrier reply and an inline carrier acknowledgment. A
 shared-policy refusal observed before a concurrent work drain remains owned
 until its exact checkpoint; clearing the doorbell cannot erase that obligation.
+
+For #887, a fresh-root refusal retains the classification snapshot alongside
+its original contention identity. Both ISA adapters use the shared classifier.
+The four pairs printed as `lookup_members_records_groups_by_process` describe
+`members[execution]`, `records[record]`, `groups[group]`, and the group reached
+through `by_process[process]`, in that order. Each first word contains a task
+ID in its low 32 bits and flags above bit 31: 1 means index present, 2 means
+its downstream lookup succeeded, and 4 means the runtime Arc agrees with the
+execution member. The second word is the execution generation for members and
+records, or the neutral process serial for groups. Zero identity means absent.
+For records the downstream lookup is its member; for groups it is task binding;
+for by_process it is the indexed group. Missing flags distinguish absence from
+Arc disagreement. The snapshot and classification use the same registry guard;
+receipt folding still precedes them. There are no retries or registry scans.
+
+The original x4–x11 identity words remain intact. The snapshot uses x12–x17
+and x20–x21 at the existing terminal HVC, leaving platform-reserved x18 alone.
+The formatted terminal record remains 1024 bytes; the maximum-width rendering
+witness includes all sixteen words. This is attribution only, not a lifecycle
+fix, a cross-holder wait, or permission to wait for a self-held projection.
