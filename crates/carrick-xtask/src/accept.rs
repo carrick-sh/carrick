@@ -275,8 +275,43 @@ pub struct FixtureBundleReceipt {
     pub archive_sha256: String,
 }
 
+/// Execution environment recorded by the receipt writer, never by the publisher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedHostIdentity {
+    pub runner_name: String,
+    pub hardware_model: String,
+    pub product_build: String,
+}
+
+impl SignedHostIdentity {
+    pub fn capture() -> Option<Self> {
+        let runner_name = std::env::var("RUNNER_NAME").ok()?;
+        let read = |program: &str, args: &[&str]| {
+            let output = Command::new(program).args(args).output().ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        };
+        let identity = Self {
+            runner_name,
+            hardware_model: read("sysctl", &["-n", "hw.model"])?,
+            product_build: read("sw_vers", &["-buildVersion"])?,
+        };
+        identity.is_complete().then_some(identity)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        [&self.runner_name, &self.hardware_model, &self.product_build]
+            .iter()
+            .all(|value| !value.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AcceptReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_identity: Option<SignedHostIdentity>,
     pub schema_version: u32,
     pub timestamp: String,
     pub head: String,
@@ -1586,6 +1621,7 @@ pub fn publish_refusal(
         el1: None,
         probe_diffs: Vec::new(),
         cleanup_counts: Vec::new(),
+        host_identity: SignedHostIdentity::capture(),
         fixture_bundle: None,
         host_load: Default::default(),
         failures: vec![format!("{ACCEPT_REFUSAL_PREFIX}{error}")],
@@ -2511,6 +2547,7 @@ fn run_inner(
         el1: el1_summary,
         probe_diffs,
         cleanup_counts,
+        host_identity: SignedHostIdentity::capture(),
         fixture_bundle: None,
         host_load,
         failures: failures.clone(),
@@ -3108,6 +3145,7 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
             el1: None,
             probe_diffs: vec![],
             cleanup_counts: vec![],
+            host_identity: SignedHostIdentity::capture(),
             fixture_bundle: None,
             host_load: crate::host_load::HostLoadReport::default(),
             failures: vec![],

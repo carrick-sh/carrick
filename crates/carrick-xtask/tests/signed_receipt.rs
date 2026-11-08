@@ -395,7 +395,7 @@ if args[:2] == ['run', 'watch']:
     assert args[2] == '100'
     pathlib.Path(os.environ['TEST_POSTS']+'.waited').touch()
 elif args[:2] == ['run', 'download']:
-    assert args[2] == '100' and args[args.index('--name')+1] == 'signed-baseline-'+base+'-2'
+    assert args[2] == '100' and args[args.index('--name')+1] in ['signed-baseline-'+base+'-1', 'signed-baseline-'+base+'-2']
     shutil.copyfile(os.environ['TEST_BASE'], pathlib.Path(args[args.index('--dir')+1])/'candidate.json')
 elif '--method' in args and args[args.index('--method')+1] == 'POST':
     endpoint = args[args.index('POST')+1]
@@ -835,6 +835,31 @@ else:
         assert!(body.contains("Pull requests: #123, #124"), "{body}");
         assert!(body.contains("new_queue_failure"), "{body}");
     }
+    std::fs::write(&candidate_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+
+    let mut foreign = candidate.clone();
+    foreign.host_identity.as_mut().unwrap().runner_name = "foreign-mac".into();
+    foreign.steps[2]
+        .failed_tests
+        .push("host_dependent_failure".into());
+    std::fs::write(&candidate_path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+    let refused = publish("success");
+    assert!(!refused.status.success());
+    let body = std::fs::read_to_string(results.join("comment.md")).unwrap();
+    assert!(body.contains("INCOMPARABLE BASE — BLOCKED"), "{body}");
+    assert!(!body.contains("NEW="), "{body}");
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&posts)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows[rows.len() - 2]["body"]["state"], "failure");
+    assert!(
+        rows[rows.len() - 2]["body"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Incomparable base")
+    );
     std::fs::write(&candidate_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
 
     // A valid receipt cannot hide a failed execution job, nor can an unrelated
@@ -1931,4 +1956,71 @@ fn different_hosts_refuse_false_new_at_production_comparison() {
             .to_string()
             .contains("incomparable base")
     );
+}
+
+#[test]
+fn legacy_or_incomplete_identity_and_different_bundles_are_incomparable() {
+    use carrick_xtask::ci_receipt::ReceiptError;
+    let candidate = base();
+    let mut legacy = serde_json::to_value(&candidate).unwrap();
+    legacy.as_object_mut().unwrap().remove("host_identity");
+    let legacy = serde_json::from_value(legacy).unwrap();
+    let err = compare(&legacy, &candidate).unwrap_err();
+    assert!(matches!(err, ReceiptError::IncomparableBase(_)));
+    assert!(
+        err.to_string()
+            .contains("base receipt missing complete host identity")
+    );
+    for field in ["runner_name", "hardware_model", "product_build"] {
+        let mut old = serde_json::to_value(&candidate).unwrap();
+        old["host_identity"][field] = json!("different");
+        assert!(matches!(
+            compare(&serde_json::from_value(old).unwrap(), &candidate),
+            Err(ReceiptError::IncomparableBase(_))
+        ));
+    }
+    let mut old = candidate.clone();
+    old.host_identity.as_mut().unwrap().runner_name.clear();
+    assert!(
+        compare(&old, &candidate)
+            .unwrap_err()
+            .to_string()
+            .contains("missing complete host identity")
+    );
+    old = candidate.clone();
+    old.fixture_validation = None;
+    assert!(
+        compare(&old, &candidate)
+            .unwrap_err()
+            .to_string()
+            .contains("missing fixture bundle identity")
+    );
+    let mut old = serde_json::to_value(&candidate).unwrap();
+    old["fixture_validation"]["manifest_sha256"] = json!("9".repeat(64));
+    assert!(
+        compare(&serde_json::from_value(old).unwrap(), &candidate)
+            .unwrap_err()
+            .to_string()
+            .contains("fixture bundle identity differs")
+    );
+}
+
+#[test]
+fn base_selection_prefers_matching_host_and_bundle_over_newest() {
+    use carrick_xtask::signed_receipt::select_base;
+    let candidate = base();
+    let mut other = candidate.clone();
+    other.host_identity.as_mut().unwrap().runner_name = "other-mac".into();
+    let bases = [other, candidate.clone()];
+    assert!(std::ptr::eq(
+        select_base(&bases, &candidate).unwrap(),
+        &bases[1]
+    ));
+    assert!(
+        select_base(&bases[..1], &candidate)
+            .unwrap_err()
+            .to_string()
+            .contains("incomparable base")
+    );
+    assert!(select_base(&[], &candidate).is_err());
 }

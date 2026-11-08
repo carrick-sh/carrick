@@ -169,6 +169,62 @@ fn structured_failures(receipt: &AcceptReceipt) -> BTreeSet<String> {
     keys
 }
 
+/// Require complete evidence before inspecting any failure populations.
+pub fn comparable(base: &AcceptReceipt, candidate: &AcceptReceipt) -> Result<(), ReceiptError> {
+    let refuse = |reason: &str| ReceiptError::IncomparableBase(reason.into());
+    let old = base
+        .host_identity
+        .as_ref()
+        .filter(|h| h.is_complete())
+        .ok_or_else(|| refuse("base receipt missing complete host identity"))?;
+    let next = candidate
+        .host_identity
+        .as_ref()
+        .filter(|h| h.is_complete())
+        .ok_or_else(|| refuse("candidate receipt missing complete host identity"))?;
+    if old != next {
+        return Err(ReceiptError::IncomparableBase(format!(
+            "host identity differs: base {old:?}, candidate {next:?}"
+        )));
+    }
+    let old = base
+        .fixture_validation
+        .as_ref()
+        .ok_or_else(|| refuse("base receipt missing fixture bundle identity"))?;
+    let next = candidate
+        .fixture_validation
+        .as_ref()
+        .ok_or_else(|| refuse("candidate receipt missing fixture bundle identity"))?;
+    // The manifest binds actual executable hashes and build inputs. Archive paths,
+    // checkout SHAs and compression bytes do not identify the executed fixtures.
+    if old.manifest_sha256 != next.manifest_sha256 || old.inputs_sha256 != next.inputs_sha256 {
+        return Err(refuse(
+            "fixture bundle identity differs (manifest or inputs SHA-256)",
+        ));
+    }
+    Ok(())
+}
+
+/// Prefer the newest comparable exact-SHA receipt (callers supply newest first).
+pub fn select_base<'a>(
+    bases: &'a [AcceptReceipt],
+    candidate: &AcceptReceipt,
+) -> Result<&'a AcceptReceipt, ReceiptError> {
+    for base in bases {
+        if comparable(base, candidate).is_ok() {
+            return Ok(base);
+        }
+    }
+    let diagnostic = bases
+        .first()
+        .and_then(|base| comparable(base, candidate).err())
+        .map_or_else(|| "no receipts available".into(), |error| error.to_string());
+    Err(ReceiptError::IncomparableBase(format!(
+        "no exact-SHA baseline matches candidate host and fixture bundle ({} available receipts): {diagnostic}",
+        bases.len()
+    )))
+}
+
 /// Compare typed receipt fields only. Counts and binary completion are checked even
 /// when every test in a baseline binary failed. Human `failures` strings are never keys.
 pub fn compare(
@@ -176,6 +232,7 @@ pub fn compare(
     candidate: &AcceptReceipt,
 ) -> Result<SignedDiff, ReceiptError> {
     let base_steps = steps(base)?;
+    comparable(base, candidate)?;
     let candidate_steps = steps(candidate)?;
     let mut result = SignedDiff {
         passed: false,
