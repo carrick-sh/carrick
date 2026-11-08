@@ -2210,13 +2210,27 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     /// Venue must unshare a CLONE_FILES table before exec; otherwise siblings
     /// would observe this sweep. Releases are delivered exactly once, under
     /// the table's lock.
-    pub fn exec(&self, table: TableId, mut release: impl FnMut(Description)) -> Result<(), Error> {
+    pub fn exec(&self, table: TableId, release: impl FnMut(Description)) -> Result<(), Error> {
+        self.exec_filtered(table, true, release)
+    }
+    /// Ring exec cutover after the venue's consuming adoption. Physical
+    /// obligations use the same retired-OFD owner as close/dup/exit.
+    pub fn exec_deferred(&self, table: TableId) -> Result<(), Error> {
+        self.exec_filtered(table, false, |_| {})
+    }
+    fn exec_filtered(
+        &self,
+        table: TableId,
+        release_here: bool,
+        mut release: impl FnMut(Description),
+    ) -> Result<(), Error> {
         let (_guard, t) = self.lock(table)?;
         for fd in 0..t.storage.capacity() {
-            if t.storage.get(fd).is_some_and(|e| e.cloexec)
-                && let Some(d) = self.close_locked(&t, Fd(fd as i32))?
+            if t.storage.get(fd).is_some_and(|entry| entry.cloexec)
+                && let DeferredRelease::Now(description) =
+                    self.close_locked_filtered(&t, Fd(fd as i32), |_| release_here)?
             {
-                release(d);
+                release(description);
             }
         }
         Ok(())

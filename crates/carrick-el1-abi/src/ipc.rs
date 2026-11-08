@@ -1168,6 +1168,70 @@ impl<'a> IpcRegion<'a> {
         }
     }
 
+    /// Resize with one provision/recheck/reclaim transaction for both venues.
+    /// Wake delivery occurs only after releasing the object guard.
+    pub fn resize_pipe(
+        &self,
+        object: IpcObjectHandle,
+        requested: usize,
+        limit: usize,
+        wait: &impl LockWait,
+        mut deliver: impl FnMut(IpcWake),
+    ) -> Result<usize, IpcError> {
+        let region = self;
+        loop {
+            let (current, backed) = {
+                let mut guard = region.lock(object, wait)?;
+                let pipe = guard.pipe()?;
+                (pipe.capacity(), pipe.is_backed())
+            };
+            let rounded = pipe::Pipe::rounded_capacity(IPC_PIPE_PAGE_SIZE, requested)
+                .map_err(IpcError::Object)?;
+            if rounded > current && rounded > limit {
+                return Err(IpcError::Object(pipe::Error::Permission));
+            }
+            // An unbacked pipe only records its capacity; its first write
+            // sizes the ring.
+            let mut replacement = if rounded > current && backed {
+                Some(region.provision_pipe_storage(
+                    rounded as u64,
+                    (rounded / IPC_PIPE_PAGE_SIZE) as u64,
+                    wait,
+                )?)
+            } else {
+                None
+            };
+            let mut changed = false;
+            let result = (|| {
+                let mut guard = region.lock(object, wait)?;
+                // A concurrent resize owns its own allocation. Do not install
+                // a replacement sized for the sampled predecessor capacity.
+                if guard.pipe()?.capacity() != current {
+                    changed = true;
+                    return Err(IpcError::Object(pipe::Error::Storage));
+                }
+                if let Some(storage) = &mut replacement {
+                    guard.replace_pipe_storage(storage)?;
+                }
+                let step = guard.pipe()?.set_capacity(requested, limit);
+                let wake = guard.publish(step.wake);
+                drop(guard);
+                deliver(wake);
+                step.result.map_err(IpcError::Object)
+            })();
+            let without_ring = replacement.is_none();
+            if let Some(mut storage) = replacement {
+                region.reclaim_pipe_storage(&mut storage, wait)?;
+            }
+            match result {
+                // A first write gave the pipe its ring (for the old capacity)
+                // between the sample and the lock: size it again.
+                Err(IpcError::Object(pipe::Error::Storage)) if without_ring || changed => continue,
+                result => return result,
+            }
+        }
+    }
+
     /// Allocate one pipe extent through the shared buddy owner in either venue.
     pub fn provision_pipe_storage(
         &self,

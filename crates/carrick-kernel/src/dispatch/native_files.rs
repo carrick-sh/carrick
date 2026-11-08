@@ -1650,11 +1650,12 @@ mod tests {
     fn in_zone_pipe_stat_matches_the_dispatchers_pipe_record() {
         let dispatcher = SyscallDispatcher::new();
         let pipe = super::super::fd_table::InMemoryPipeTestFixture::new(1, 4096);
-        let fields = carrick_abi::LinuxStatFields::CARRICK_PIPE;
-        assert_eq!(
-            fields.ino,
-            super::super::inode_for_path(std::path::Path::new("pipe:[carrick]")),
-        );
+        let object = match &*pipe.read {
+            super::super::fd_table::OpenDescription::PipeReader { pipe, .. } => pipe.ipc_object(),
+            _ => unreachable!(),
+        };
+        let fields =
+            carrick_abi::LinuxPipeIdentity::new(object.index(), object.generation()).stat_fields();
         for end in [&pipe.read, &pipe.write] {
             let record = dispatcher
                 .fs_view()

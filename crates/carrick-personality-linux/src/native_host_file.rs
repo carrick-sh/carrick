@@ -57,7 +57,7 @@ impl DescriptionAccess {
 /// The in-zone object kinds the ring owns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InZoneKind {
-    Pipe,
+    Pipe(carrick_syscall_abi::LinuxPipeIdentity),
     EventFd,
     Epoll,
 }
@@ -359,7 +359,7 @@ pub enum HostFileStage {
 /// shared [`carrick_syscall_abi::LinuxStatFields`].
 fn in_zone_stat(op: HostFileOp, kind: InZoneKind, output: HostFileOutput) -> HostFileStage {
     let fields = match kind {
-        InZoneKind::Pipe => carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE,
+        InZoneKind::Pipe(identity) => identity.stat_fields(),
         InZoneKind::EventFd => carrick_syscall_abi::LinuxStatFields::CARRICK_EVENTFD,
         InZoneKind::Epoll => carrick_syscall_abi::LinuxStatFields::CARRICK_EPOLL,
     };
@@ -790,7 +790,7 @@ fn stage_call(
             )
         }
         HostFileCall::Read { fd, buf, count } => match staging.descriptor(fd)? {
-            NativeDescriptor::InZone(InZoneKind::Pipe | InZoneKind::EventFd) => {
+            NativeDescriptor::InZone(InZoneKind::Pipe(_) | InZoneKind::EventFd) => {
                 let len = chunk(count);
                 let writable = user.writable(buf, len);
                 if writable < len {
@@ -825,7 +825,9 @@ fn stage_call(
             count,
             offset,
         } => match staging.descriptor(fd)? {
-            NativeDescriptor::InZone(InZoneKind::Pipe) => errno(carrick_syscall_abi::LINUX_ESPIPE),
+            NativeDescriptor::InZone(InZoneKind::Pipe(_)) => {
+                errno(carrick_syscall_abi::LINUX_ESPIPE)
+            }
             NativeDescriptor::InZone(_) => HostFileStage::InRing,
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { access } if !access.readable() => {
@@ -847,7 +849,9 @@ fn stage_call(
             ),
         },
         HostFileCall::Lseek { fd, offset, whence } => match staging.descriptor(fd)? {
-            NativeDescriptor::InZone(InZoneKind::Pipe) => errno(carrick_syscall_abi::LINUX_ESPIPE),
+            NativeDescriptor::InZone(InZoneKind::Pipe(_)) => {
+                errno(carrick_syscall_abi::LINUX_ESPIPE)
+            }
             NativeDescriptor::InZone(_) => HostFileStage::InRing,
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { .. } => {
@@ -870,7 +874,7 @@ fn stage_call(
             ),
         },
         HostFileCall::Ioctl { fd, request } => match staging.descriptor(fd)? {
-            NativeDescriptor::InZone(InZoneKind::Pipe | InZoneKind::EventFd)
+            NativeDescriptor::InZone(InZoneKind::Pipe(_) | InZoneKind::EventFd)
                 if is_terminal_request(request) =>
             {
                 errno(carrick_syscall_abi::LINUX_ENOTTY)

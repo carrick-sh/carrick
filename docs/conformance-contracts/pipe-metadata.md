@@ -26,50 +26,44 @@ metadata pattern probes both a freshly created pipe and inherited fd 3.
 Contention and x86 execution still need witnesses. No signed or end-to-end
 CPython result is claimed by these VM-free tests.
 
-## Required shared interface review before implementation
+## Shared implementation and ownership
 
-The complete acceptance requires more than adding descriptor match arms.
-`IpcObjectGuard::drop` only clears its lock, and the fd core's `Locked::drop`
-only clears the table lock. Neither publishes a release notification.
-`NativeFdWait` always returns true, so using it for the new object operations
-would indefinitely spin on a host-held lock. Existing readiness notifications
-are not lock-release notifications: a holder can unlock without changing
-readability or writability. Waiting on readiness would lose that wakeup.
+The director's decision on #1901 assigns lock-release notification to #1845.
+Metadata therefore acquires the existing fd authority and `IpcObjectGuard`
+through the same wait path as current pipe operations. It adds no lock-release
+protocol. The bounded Busy-once production-dispatch witness holds the real
+object lock, observes the existing wait path, releases it and requires the
+original query to complete.
 
-This is the same architectural prerequisite tracked by #1845 (queue-lock
-release and constructor custody), alongside the typed-refusal work in #1879.
-The implementation must share that protocol instead of adding a second lock
-wait mechanism to this metadata family. The relevant proposed interface is:
+Pipe stat, empty-path stat, capacity, FIONREAD, FIONBIO, close-on-exec ioctl,
+terminal refusal and seek refusal use the shared descriptor family. Scalar
+input is imported before operation admission through typed guest copy; refused
+input uses the existing owner preparation. Completed stat/count output releases
+the description pin before the existing `ProcessNative::complete_copyout`
+owner retains its bytes across memory waits. Duplication, close and fcntl flags
+continue through fd-core's existing owner. A missing entry in an authoritative
+root table returns EBADF(9), including a repeated close.
 
-- A failed table/object admission returns an owned typed release ticket,
-  retaining the holder identity and revision sampled before the probe.
-  Reuse `carrick_sched_core::refusal::{Refusal, ReleaseTicket}`.
-- The guard that releases that authority publishes its release revision and
-  notification. Delivery occurs after dropping all table/object guards.
-  An unlock with no readiness change must still wake a metadata waiter.
-- The existing per-thread continuation owner retains the metadata operation,
-  its exact description pin, imported scalar operands and any completed output.
-  A release race returns that same operation for one immediate reprobe;
-  otherwise parking releases execution capacity. Numeric fd reuse must never
-  redirect a resumed request to another description.
-- Output uses the existing `ProcessNative::complete_copyout` owner, which
-  retains bytes through owner-memory waits. Input uses the typed guest-copy
-  result and owner preparation; a refused raw copy is not proof of EFAULT.
-- Capacity resizing moves the host algorithm into the shared object owner.
-  Preserve its provision/recheck/reclaim transaction, pipe-core rounding and
-  EBUSY shrink test, and deliver the shared wake result in each venue.
-- Both stat encoders consume one pipe-identity record. The existing
-  `LinuxStatFields::CARRICK_PIPE` uses a constant inode and cannot distinguish
-  separate pipes. Move the host x86 stat encoder into the shared ABI rather
-  than copying its layout into the ring.
+The host provision/recheck/reclaim resize transaction now lives in `IpcRegion`.
+Both venues use it, with pipe-core rounding and EBUSY(16) for a shrink below
+buffered bytes. A concurrent resize reclaims the unused allocation and resamples
+the current capacity before replacing storage. Wake publication remains under
+the object lock and delivery follows unlock in each venue.
 
-Lock-release publication and lifetime retention change the shared protocol
-and cross-crate lock order. AGENTS.md requires a separate design pass reviewed
-before code for those changes. The director must coordinate the shared
-interface with #1845/#1879; this proposal is not an approved ABI layout.
+`LinuxPipeIdentity`, exported by `carrick-abi` from its syscall ABI leaf, derives
+one inode from the IPC object's index and generation. Both pipe ends and all
+aliases share that identity; separate live pipes differ. The host and ring use
+this record and the ABI's shared ARM and x86 stat encoders.
 
-The full x86 I/O reproduction also intersects #1756, whose tracked work wires
-CPL0 to the shared ring IPC execution venue. In this base, `ipc_transfer`
-still requires `arm_frame()`. Metadata routing must remain ISA-neutral, but
-an x86 bytes-moving acceptance claim cannot be inferred from ARM-frame tests
-on an x86 host. No unrelated x86 IPC implementation is copied into this PR.
+Native exec previously swept only delegated slots. The existing fd-core exec
+selection now also supports deferred physical release. After consuming successful
+exec adoption, the native owner sweeps its private ring table, outside all
+delegated-map guards, and settles releases at the existing host boundary. Failed
+exec before adoption leaves the table unchanged. Parent tables stay live.
+
+The CPL0 production witness runs real metadata syscalls and checks both pipe
+ends' inode, a distinct second live pipe, x86 stat layouts, flags, capacity,
+ioctl, duplication, close and errno numbers. The full x86 I/O reproduction
+still waits on #1756: `ipc_transfer` requires an ARM frame. No per-ISA IPC
+implementation is introduced. Signed/HVF execution and CPython subprocess
+remain director-owned verification; VM-free ARM-frame tests are not that proof.
