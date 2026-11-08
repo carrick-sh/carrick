@@ -12,12 +12,38 @@ std::thread_local! {
 
 use super::{AtomicU32, AtomicU64, Ordering};
 
+/// Hardware slots and the carrier deadline server are distinct serving owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Serving {
+    SlotTimer(SlotId),
+    CarrierDeadline,
+}
+impl Serving {
+    fn index(self) -> usize {
+        match self {
+            Self::SlotTimer(slot) => slot.raw() as usize,
+            Self::CarrierDeadline => ZONE_SLOTS,
+        }
+    }
+    fn plus_one(self) -> u32 {
+        self.index() as u32 + 1
+    }
+    fn from_plus_one(raw: u32) -> Option<Self> {
+        if raw == ZONE_SLOTS as u32 + 1 {
+            Some(Self::CarrierDeadline)
+        } else {
+            SlotId::from_plus_one(raw).map(Self::SlotTimer)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Ticket {
-    pub slot: SlotId,
+    pub slot: Serving,
     pub record: RecordRef,
     pub seq: u32,
     pub deadline: u64,
+    pub result: u64,
 }
 #[repr(C)]
 #[cfg_attr(all(test, feature = "loom"), derive(Default))]
@@ -29,6 +55,7 @@ struct Node {
     incarnation: AtomicU64,
     seq: AtomicU32,
     deadline: AtomicU64,
+    result: AtomicU64,
 }
 #[repr(C)]
 #[cfg_attr(all(test, feature = "loom"), derive(Default))]
@@ -47,14 +74,14 @@ struct Lease {
 #[repr(C)]
 #[cfg_attr(all(test, feature = "loom"), derive(Default))]
 pub(super) struct Index {
-    trees: [Tree; ZONE_SLOTS],
+    trees: [Tree; ZONE_SLOTS + 1],
     nodes: [Node; ZONE_RECORDS],
     leases: [Lease; ZONE_RECORDS],
     map: [AtomicU64; ZONE_RECORDS.div_ceil(64)],
 }
 struct Guard<'a> {
     index: &'a Index,
-    slot: SlotId,
+    slot: Serving,
 }
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
@@ -69,13 +96,13 @@ impl Index {
             .map(|word| word.load(Ordering::Acquire).count_ones() as usize)
             .sum()
     }
-    fn tree(&self, slot: SlotId) -> &Tree {
-        &self.trees[slot.raw() as usize]
+    fn tree(&self, slot: Serving) -> &Tree {
+        &self.trees[slot.index()]
     }
     fn node(&self, index: u32) -> &Node {
         &self.nodes[index as usize]
     }
-    fn lock(&self, slot: SlotId) -> Guard<'_> {
+    fn lock(&self, slot: Serving) -> Guard<'_> {
         // No timer-index lock holder acquires a bucket or run-queue lock.
         // Timer peeks release this lock before authenticating a wake CAS.
         while self
@@ -88,7 +115,7 @@ impl Index {
         }
         Guard { index: self, slot }
     }
-    fn key(&self, slot: SlotId, node: u32) -> Ticket {
+    fn key(&self, slot: Serving, node: u32) -> Ticket {
         let n = self.node(node);
         Ticket {
             slot,
@@ -99,6 +126,7 @@ impl Index {
             },
             seq: n.seq.load(Ordering::Relaxed),
             deadline: n.deadline.load(Ordering::Relaxed),
+            result: n.result.load(Ordering::Relaxed),
         }
     }
     fn write_key(&self, node: u32, key: Ticket) {
@@ -108,22 +136,23 @@ impl Index {
             .store(key.record.incarnation, Ordering::Relaxed);
         n.seq.store(key.seq, Ordering::Relaxed);
         n.deadline.store(key.deadline, Ordering::Relaxed);
+        n.result.store(key.result, Ordering::Relaxed);
         let lease = &self.leases[key.record.id.raw() as usize];
         lease.node.store(node, Ordering::Relaxed);
         lease.slot.store(key.slot.plus_one(), Ordering::Release);
     }
-    fn swap(&self, slot: SlotId, a: u32, b: u32) {
+    fn swap(&self, slot: Serving, a: u32, b: u32) {
         let ka = self.key(slot, a);
         let kb = self.key(slot, b);
         self.write_key(a, kb);
         self.write_key(b, ka);
     }
-    fn less(&self, slot: SlotId, a: u32, b: u32) -> bool {
+    fn less(&self, slot: Serving, a: u32, b: u32) -> bool {
         let ka = self.key(slot, a);
         let kb = self.key(slot, b);
         (ka.deadline, ka.record, ka.seq) < (kb.deadline, kb.record, kb.seq)
     }
-    fn at(&self, slot: SlotId, position: u32) -> u32 {
+    fn at(&self, slot: Serving, position: u32) -> u32 {
         let mut node = self.tree(slot).root.load(Ordering::Relaxed);
         let mut bit = (1_u32 << (31 - position.leading_zeros())) >> 1;
         while bit != 0 {
@@ -136,7 +165,7 @@ impl Index {
         }
         node
     }
-    fn up(&self, slot: SlotId, mut node: u32) {
+    fn up(&self, slot: Serving, mut node: u32) {
         loop {
             let parent = self.node(node).parent.load(Ordering::Relaxed);
             if parent == 0 || !self.less(slot, node, parent) {
@@ -146,7 +175,7 @@ impl Index {
             node = parent;
         }
     }
-    fn down(&self, slot: SlotId, mut node: u32) {
+    fn down(&self, slot: Serving, mut node: u32) {
         loop {
             let left = self.node(node).left.load(Ordering::Relaxed);
             if left == 0 {
@@ -166,14 +195,19 @@ impl Index {
         }
     }
     fn remove_locked(&self, guard: &Guard<'_>, node: u32) -> Ticket {
+        let (key, last) = self.detach_locked(guard, node);
+        let lease = &self.leases[key.record.id.raw() as usize];
+        lease.node.store(0, Ordering::Relaxed);
+        lease.slot.store(0, Ordering::Release);
+        ZoneTables::<ThreadCtx>::free_bit(&self.map, last);
+        key
+    }
+    fn detach_locked(&self, guard: &Guard<'_>, node: u32) -> (Ticket, u32) {
         let slot = guard.slot;
         let tree = self.tree(slot);
         let key = self.key(slot, node);
         let len = tree.len.load(Ordering::Relaxed);
         let last = self.at(slot, len);
-        let lease = &self.leases[key.record.id.raw() as usize];
-        lease.node.store(0, Ordering::Relaxed);
-        lease.slot.store(0, Ordering::Release);
         if node != last {
             self.write_key(node, self.key(slot, last));
         }
@@ -186,7 +220,6 @@ impl Index {
             self.node(parent).right.store(0, Ordering::Relaxed);
         }
         tree.len.store(len - 1, Ordering::Relaxed);
-        ZoneTables::<ThreadCtx>::free_bit(&self.map, last);
         if node != last {
             let parent = self.node(node).parent.load(Ordering::Relaxed);
             if parent != 0 && self.less(slot, node, parent) {
@@ -195,7 +228,7 @@ impl Index {
                 self.down(slot, node);
             }
         }
-        key
+        (key, last)
     }
     pub(super) fn cancel_record(&self, record: RecordId) {
         #[cfg(test)]
@@ -205,7 +238,7 @@ impl Index {
         let lease = &self.leases[record.raw() as usize];
         loop {
             let slot_raw = lease.slot.load(Ordering::Acquire);
-            let Some(slot) = SlotId::from_plus_one(slot_raw) else {
+            let Some(slot) = Serving::from_plus_one(slot_raw) else {
                 return;
             };
             let guard = self.lock(slot);
@@ -227,7 +260,7 @@ impl Index {
     }
     pub(super) fn cancel_admission(&self, record: RecordRef) {
         let lease = &self.leases[record.id.raw() as usize];
-        let Some(slot) = SlotId::from_plus_one(lease.slot.load(Ordering::Acquire)) else {
+        let Some(slot) = Serving::from_plus_one(lease.slot.load(Ordering::Acquire)) else {
             return;
         };
         let _guard = self.lock(slot);
@@ -271,6 +304,10 @@ impl Index {
             return;
         }
         lease.active.store(1, Ordering::Relaxed);
+        self.insert_locked(node, ticket);
+        drop(guard);
+    }
+    fn insert_locked(&self, node: u32, ticket: Ticket) {
         let tree = self.tree(ticket.slot);
         let position = tree.len.load(Ordering::Relaxed) + 1;
         let parent = if position == 1 {
@@ -291,11 +328,11 @@ impl Index {
             self.node(parent).right.store(node, Ordering::Relaxed);
         }
         tree.len.store(position, Ordering::Relaxed);
-        self.up(guard.slot, node);
+        self.up(ticket.slot, node);
     }
     pub(super) fn admission(&self, record: RecordRef, seq: u32, deadline: u64) -> Option<Ticket> {
         let lease = &self.leases[record.id.raw() as usize];
-        let slot = SlotId::from_plus_one(lease.slot.load(Ordering::Acquire))?;
+        let slot = Serving::from_plus_one(lease.slot.load(Ordering::Acquire))?;
         let _guard = self.lock(slot);
         if lease.slot.load(Ordering::Acquire) != slot.plus_one() {
             return None;
@@ -310,11 +347,12 @@ impl Index {
                 record,
                 seq,
                 deadline,
+                result: reserved.result,
             })
     }
     pub(super) fn owned(&self, record: RecordRef) -> Option<Ticket> {
         let lease = &self.leases[record.id.raw() as usize];
-        let slot = SlotId::from_plus_one(lease.slot.load(Ordering::Acquire))?;
+        let slot = Serving::from_plus_one(lease.slot.load(Ordering::Acquire))?;
         let _guard = self.lock(slot);
         if lease.slot.load(Ordering::Acquire) != slot.plus_one()
             || lease.active.load(Ordering::Relaxed) == 0
@@ -324,7 +362,7 @@ impl Index {
         let ticket = self.key(slot, lease.node.load(Ordering::Relaxed));
         (ticket.record == record).then_some(ticket)
     }
-    pub(super) fn minimum(&self, slot: SlotId, live: impl Fn(Ticket) -> bool) -> Option<Ticket> {
+    pub(super) fn minimum(&self, slot: Serving, live: impl Fn(Ticket) -> bool) -> Option<Ticket> {
         let guard = self.lock(slot);
         loop {
             let node = self.tree(slot).root.load(Ordering::Relaxed);
@@ -353,10 +391,11 @@ impl Index {
     }
     pub(super) fn take_foreign(
         &self,
-        slot: SlotId,
+        slot: Serving,
         home: Option<RecordId>,
         live: impl Fn(Ticket) -> bool,
-    ) -> Option<Ticket> {
+        native: impl Fn(Ticket) -> bool,
+    ) -> Option<(Ticket, bool)> {
         let guard = self.lock(slot);
         loop {
             let root = self.tree(slot).root.load(Ordering::Relaxed);
@@ -364,7 +403,7 @@ impl Index {
                 return None;
             }
             let root_key = self.key(slot, root);
-            let node = if !live(root_key) || Some(root_key.record.id) != home {
+            let node = if !live(root_key) || native(root_key) || Some(root_key.record.id) != home {
                 root
             } else {
                 let left = self.node(root).left.load(Ordering::Relaxed);
@@ -378,9 +417,23 @@ impl Index {
                     left
                 }
             };
-            let key = self.remove_locked(&guard, node);
+            let key = self.key(slot, node);
+            if live(key) && native(key) {
+                // All slot owners precede CarrierDeadline in the lock order.
+                let _destination = self.lock(Serving::CarrierDeadline);
+                let (_, detached) = self.detach_locked(&guard, node);
+                self.insert_locked(
+                    detached,
+                    Ticket {
+                        slot: Serving::CarrierDeadline,
+                        ..key
+                    },
+                );
+                return Some((key, true));
+            }
+            self.remove_locked(&guard, node);
             if live(key) {
-                return Some(key);
+                return Some((key, false));
             }
         }
     }
@@ -404,13 +457,14 @@ mod tests {
     }
     fn ticket(index: u32, incarnation: u64, slot: SlotId, deadline: u64) -> Ticket {
         Ticket {
-            slot,
+            slot: Serving::SlotTimer(slot),
             record: RecordRef {
                 id: RecordId::from_raw(index).unwrap(),
                 incarnation,
             },
             seq: 1,
             deadline,
+            result: 0,
         }
     }
     #[test]
@@ -430,7 +484,7 @@ mod tests {
         let mut previous = 0;
         for _ in 1..ZONE_RECORDS {
             NODE_READS.with(|reads| reads.set(0));
-            let key = index.minimum(slot, |_| true).unwrap();
+            let key = index.minimum(Serving::SlotTimer(slot), |_| true).unwrap();
             assert!(key.deadline >= previous);
             previous = key.deadline;
             assert!(index.remove(key));
@@ -439,7 +493,7 @@ mod tests {
                 "removal exceeds logarithmic index budget"
             );
         }
-        assert_eq!(index.minimum(slot, |_| true), None);
+        assert_eq!(index.minimum(Serving::SlotTimer(slot), |_| true), None);
     }
     #[test]
     fn reused_record_and_migration_cannot_consume_new_deadline() {
@@ -477,9 +531,15 @@ mod tests {
             deadline: 0,
             ..second
         }));
-        assert_eq!(index.minimum(slot, |_| true), Some(first));
+        assert_eq!(
+            index.minimum(Serving::SlotTimer(slot), |_| true),
+            Some(first)
+        );
         index.cancel_record(second.record.id);
         index.activate(second);
-        assert_eq!(index.minimum(slot, |_| true), Some(first));
+        assert_eq!(
+            index.minimum(Serving::SlotTimer(slot), |_| true),
+            Some(first)
+        );
     }
 }

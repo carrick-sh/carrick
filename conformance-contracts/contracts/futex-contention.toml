@@ -30,6 +30,14 @@ rationale = "Blocking futex operations must park without redispatch and wake wit
 # budgets, and waiter enrollment invariants remain intact.
 vm_free = [
   "carrick-kernel-example::futex_contention_contract",
+  "carrick-sched-core::tests::native_deadline_transfer_survives_all_slots_departing_and_record_reuse",
+  "carrick-sched-core::tests::unhoming_a_native_root_cannot_cancel_carrier_deadline_custody",
+  "carrick-sched-core::tests::native_deadline_wake_transfer_and_expiry_resolve_once",
+  "carrick-sched-core::tests::native_deadline_contended_cleanup_keeps_owned_resolution_until_release",
+  "carrick-sched-core::object_wait::host_tests::native_epoll_departure_preserves_timer_until_notification",
+  "carrick-sched-core::object_wait::host_tests::native_epoll_departure_timeout_drains_enrollment_and_retains_operation",
+  "carrick-runtime::deadline_driver::tests::driver_delivers_native_park_with_no_slots_and_joins_before_zone_drop",
+  "carrick-runtime::deadline_driver::tests::shutdown_joins_an_admitted_callback_before_releasing_target",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_timed_futex",
   "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::native_futex_mapping_deadline_starts_at_first_attempt_aarch64",
   "carrick-el1-linux::native_process_runtime::host_test_support::futex_contention::native_futex_mapping_deadline_starts_at_first_attempt_x86",

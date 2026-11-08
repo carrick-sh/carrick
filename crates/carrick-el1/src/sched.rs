@@ -471,7 +471,16 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         );
         let seq = zone.next_seq(record);
         // Reserve one exact record lease before publishing its timed park.
-        if deadline.is_some() && zone.arm_timer(slot, record, seq).is_err() {
+        if deadline.is_some()
+            && zone
+                .arm_timer_result(
+                    slot,
+                    record,
+                    seq,
+                    carrick_guest_arch::NativeReturnWord(timeout_result),
+                )
+                .is_err()
+        {
             drop(guard);
             if fresh {
                 zone.discard_unpublished(slot, record);

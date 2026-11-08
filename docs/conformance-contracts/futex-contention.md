@@ -364,3 +364,19 @@ win before the original deadline, deliver zero through native selection,
 and leave no timer node for the later timeout. These are acceptance criteria,
 not green evidence. The proposed surviving owner and last-executor delivery
 obligation are in [native timed parks](../design/native-timed-park-owner.md).
+
+Native timed parks retain their exact record, park sequence, original counter
+deadline and personality-supplied timeout result through executor departure.
+The timer index transfers serving custody from the slot heap to the carrier
+heap without dropping the wait enrollment or allocated node. A wake and the
+deadline driver compete on the same Parked CAS; the winner cancels the timer,
+unlinks the enrollment and publishes native readiness. Native epoll uses the
+same transfer with its retained operation and expired marker. One node per
+admitted record and indexed O(log n) transfer/cancellation bound the work;
+expiry does not scan records. The four native fork/exec/clone departure
+bindings cover timeout and wake winners, slot reset and the original tick.
+Neutral schedules cover transfer/wake/expiry races, cancellation/reuse and
+contended cleanup. The shared runtime driver binding checks real delivery
+with no live slot and shutdown joining an admitted callback. See
+[the owner design](../design/native-timed-park-owner.md) for clock binding,
+remaining KVM runtime seams and the intentionally separate nanosleep owner.
