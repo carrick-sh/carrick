@@ -54,7 +54,7 @@ private-source note does not identify an active dependency; that issue is
 closed and concerns bounded image table stock. The initial shared root
 constructor currently retains host filesystem authority (`initial.fs = None`);
 registering its execution as native does not supply native pathname authority.
-That authority must be transferred explicitly, not replaced with a guessed
+That authority must be selected explicitly, not replaced with a guessed
 `/` or root credentials. X86 `fstat` and `newfstatat` also require their Linux
 ABI layouts at the shared personality boundary.
 
@@ -87,3 +87,27 @@ host root's child. It neither transfers the root's authority nor supplies its
 credential and resource-limit state, so repurposing it silently would not
 implement the second choice. A synchronous bridge cannot substitute for that
 decision or for the retained native-service consumer.
+
+## Selected correction: separate host-root resource custody
+
+The director selected option A for this slice; option B is separate work in
+#1861. Native execution registration must not imply ownership of the root's
+filesystem, credentials, supplementary groups, umask or resource limits.
+The host retains those resources. Open must install into the ring descriptor
+namespace that close already owns, using the shared native host-file service.
+Stat layouts and the remaining loader calls are later slices.
+
+The red witness was rerun after rebasing onto current main. The native
+control passed; KVM again returned 16 after four guest entries, with two host
+opens and zero guest refusals. No implementation correction or green result
+is established by that rebase.
+
+The general retained service consumer also needs a CPL0 binding:
+`NativeProcessEntry::begin_host_file_service` publishes an authenticated
+service notice and retains its request, while the current carrier intake
+and completion implementation lives in the HVF adapter's `native_service`
+module. CPL0's `capture_host_file` deliberately accepts only synchronous
+MapPrivate records. Widening that transport to open would not satisfy the
+required retained-service binding. The shared intake must preserve exact
+member/MM authentication, metadata retention, cancellation exclusion,
+completion publication and waiter notification, outside physical custody.
