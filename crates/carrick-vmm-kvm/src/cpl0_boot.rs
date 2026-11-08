@@ -963,6 +963,7 @@ impl Cpl0Carrier {
             let request = X86InitialBootRequest {
                 magic: X86_INITIAL_BOOT_MAGIC,
                 version: X86_INITIAL_BOOT_VERSION,
+                layout_hash: carrick_el1_abi::EL1_ABI_LAYOUT_HASH,
                 region_count: image.regions.len() as u32,
                 executable_region_count: image.executable_region_count as u32,
                 executable_entry: image.executable_entry,
@@ -1036,6 +1037,7 @@ impl Cpl0Carrier {
             {
                 return Err(fail("production image boot header invalid"));
             }
+            carrick_x86_cpl0_host::cpl0_boot::validate_layout_hash(header.layout_hash)?;
             self.custody
                 .set_peer_entry(carrick_guest_arch::KernelVa::new(header.peer_entry_va));
             let kernel_stack = self.binding(0).kernel_stack;
@@ -1747,6 +1749,26 @@ impl Cpl0Carrier {
                 write: segment.perms.write,
                 exec: segment.perms.execute,
             });
+        }
+        if initial_extent_bytes.is_some() {
+            let bytes = ram
+                .read(
+                    X86_INITIAL_BOOT_HEADER_GPA,
+                    size_of::<X86InitialBootHeader>(),
+                )
+                .map_err(|error| fail(error.to_string()))?;
+            // SAFETY: read returned a complete header; byte storage may be unaligned.
+            let header = unsafe {
+                bytes
+                    .as_ptr()
+                    .cast::<X86InitialBootHeader>()
+                    .read_unaligned()
+            };
+            if header.magic != X86_INITIAL_BOOT_MAGIC || header.version != X86_INITIAL_BOOT_VERSION
+            {
+                return Err(fail("production image boot header invalid"));
+            }
+            carrick_x86_cpl0_host::cpl0_boot::validate_layout_hash(header.layout_hash)?;
         }
         // Existing x86 descriptor/TSS/IDT machinery, including private stacks
         // and exception stubs, remains the hardware authority.
@@ -4017,6 +4039,40 @@ impl Cpl0Carrier {
 mod cpl0_layout_tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn production_boot_refuses_stale_layout_before_entry() {
+        let mut bytes = include_bytes!(concat!(env!("OUT_DIR"), "/carrick-x86-cpl0")).to_vec();
+        let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62).expect("production ELF");
+        let hash_va = IMAGE_VA + X86_INITIAL_BOOT_HEADER_GPA - IMAGE_GPA
+            + core::mem::offset_of!(X86InitialBootHeader, layout_hash) as u64;
+        let segment = plan
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.virtual_address <= hash_va
+                    && hash_va + 8 <= segment.virtual_address + segment.file_size
+            })
+            .expect("embedded boot fingerprint");
+        let at = (segment.file_offset + hash_va - segment.virtual_address) as usize;
+        let expected = carrick_el1_abi::EL1_ABI_LAYOUT_HASH;
+        let found = expected ^ 1;
+        bytes[at..at + 8].copy_from_slice(&found.to_le_bytes());
+        let inventory = Arc::new(FrameInventoryAuthority::new())
+            .physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let result = Cpl0Carrier::boot_bytes_inner(
+            inventory,
+            &bytes,
+            [&[], &[]],
+            false,
+            Some(0x20_000),
+            false,
+            None,
+        );
+        assert!(matches!(result, Err(TrapError::ImageAbiMismatch {
+            expected: e, found: f,
+        }) if e == expected && f == found));
+    }
 
     fn admission_fixture() -> Cpl0Carrier {
         let inventory = Arc::new(FrameInventoryAuthority::new())
