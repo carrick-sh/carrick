@@ -1097,6 +1097,25 @@ def _copy_refusal_lines(raw):
     return lines
 
 
+def _syscall_frame_lines(raw):
+    """Decode the bounded frame prefix, including host replay write masks."""
+    import struct
+    if len(raw) != 32 * 16 * 8:
+        raise ValueError("invalid syscall frame extent")
+    sources = {1: "fresh-trap", 2: "decoded-dispatch", 3: "owner-input-redispatch",
+               4: "scheduler-saved-return", 5: "scheduler-object-replay",
+               6: "scheduler-owner-replay", 7: "scheduler-saved-replay", 8: "host-ipc-replay"}
+    lines = []
+    for sample in range(32):
+        committed, source, nr, pc, slot, mm, generation, task, thread, *rest = struct.unpack_from("<16Q", raw, sample * 128)
+        if committed != 1:
+            continue
+        args, detail = rest[:6], rest[6]
+        label = "argument-write-mask" if source == 8 else "esr"
+        lines.append(f"syscall-frame sample={sample} source={sources.get(source, 'unknown')} nr={nr} pc={pc:#x} slot={slot} binding[mm={mm},generation={generation},task={task},thread={thread}] args=[{','.join(hex(arg) for arg in args)}] {label}={detail:#x}")
+    return lines
+
+
 def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
     """Read the mapped ARM counters, using this artifact's DWARF layout."""
     import struct
@@ -1160,6 +1179,20 @@ def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
             return
         lines.extend(_copy_refusal_lines(raw))
         lines.append("# copy-refusal retains first 16 records; owner=0 means absent; bindings show authentication; COW/Busy are not inferred from permission faults")
+    for index in range(layout.GetNumberOfFields()):
+        field = layout.GetFieldAtIndex(index)
+        if field.GetName() != "syscall_frames":
+            continue
+        size = field.GetType().GetByteSize()
+        if size != 32 * 16 * 8:
+            result.SetError("invalid syscall frame extent in DWARF")
+            return
+        raw = process.ReadMemory(pointer + field.GetOffsetInBytes(), size, error)
+        if error.Fail() or len(raw) != size:
+            result.SetError("syscall frames unreadable: " + str(error))
+            return
+        lines.extend(_syscall_frame_lines(raw))
+        lines.append("# syscall frames retain first 32 samples; not a census")
     result.AppendMessage("\n".join(lines))
 
 

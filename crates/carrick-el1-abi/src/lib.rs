@@ -2993,6 +2993,7 @@ pub enum SyscallFrameSource {
     SchedulerObjectReplay = 5,
     SchedulerOwnerReplay = 6,
     SchedulerSavedReplay = 7,
+    HostIpcReplay = 8,
 }
 impl SyscallFrameSource {
     pub const fn label(self) -> &'static str {
@@ -3004,6 +3005,7 @@ impl SyscallFrameSource {
             Self::SchedulerObjectReplay => "scheduler-object-replay",
             Self::SchedulerOwnerReplay => "scheduler-owner-replay",
             Self::SchedulerSavedReplay => "scheduler-saved-replay",
+            Self::HostIpcReplay => "host-ipc-replay",
         }
     }
     fn from_code(code: u64) -> Option<Self> {
@@ -3015,6 +3017,7 @@ impl SyscallFrameSource {
             5 => Self::SchedulerObjectReplay,
             6 => Self::SchedulerOwnerReplay,
             7 => Self::SchedulerSavedReplay,
+            8 => Self::HostIpcReplay,
             _ => return None,
         })
     }
@@ -3346,7 +3349,7 @@ impl Counters {
             let source = SyscallFrameSource::from_code(word(1)).map_or("unknown", |s| s.label());
             writeln!(
                 output,
-                "syscall-frame sample={sample} source={source} nr={} pc={:#x} slot={} binding[mm={},generation={},task={},thread={}] args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] esr={:#x}",
+                "syscall-frame sample={sample} source={source} nr={} pc={:#x} slot={} binding[mm={},generation={},task={},thread={}] args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] {}={:#x}",
                 word(2),
                 word(3),
                 word(4),
@@ -3360,6 +3363,11 @@ impl Counters {
                 word(12),
                 word(13),
                 word(14),
+                if word(1) == SyscallFrameSource::HostIpcReplay as u64 {
+                    "argument-write-mask"
+                } else {
+                    "esr"
+                },
                 word(15)
             )?;
         }
@@ -3739,6 +3747,52 @@ pub fn ipc_window_guest() -> Option<IpcWindow> {
             EL1_IPC_POOL_SPAN as usize,
         )
     }
+}
+
+/// Sample the host replay boundary in the existing bounded frame store.
+/// The last word is an argument-register write mask for this source, rather
+/// than an ESR. This is observational; it grants no execution authority.
+pub fn record_host_ipc_replay(
+    slot: Option<usize>,
+    ordinal: carrick_syscall_abi::CanonicalNr,
+    pc: u64,
+    arguments: [u64; 6],
+    argument_write_mask: u64,
+) {
+    let ptr = get_el1_region_host_ptr();
+    let Some(slot) = slot.filter(|slot| *slot < EL1_STACK_SLOTS as usize) else {
+        return;
+    };
+    if ptr == 0 || !matches!(ordinal.raw(), 22 | 73) {
+        return;
+    }
+    // SAFETY: the published aperture outlives this carrier boundary. Only
+    // atomics in the current-task snapshot and diagnostic store are accessed.
+    let (counters, task) = unsafe {
+        (
+            &*((ptr + EL1_COUNTERS_OFFSET as usize) as *const Counters),
+            &*((ptr
+                + EL1_CURRENT_TASKS_OFFSET as usize
+                + slot * core::mem::size_of::<CurrentTask>()) as *const CurrentTask),
+        )
+    };
+    counters.publish_syscall_frame([
+        SyscallFrameSource::HostIpcReplay as u64,
+        ordinal.raw(),
+        pc,
+        slot as u64,
+        task.mm.key.load(Ordering::Acquire),
+        task.execution.generation.load(Ordering::Acquire).raw(),
+        task.execution.task.load(Ordering::Acquire),
+        task.mm.thread_generation.load(Ordering::Acquire),
+        arguments[0],
+        arguments[1],
+        arguments[2],
+        arguments[3],
+        arguments[4],
+        arguments[5],
+        argument_write_mask,
+    ]);
 }
 
 /// The IPC table map in the EL1 region, as the host maps it.
@@ -5127,6 +5181,7 @@ mod tests {
             SyscallFrameSource::SchedulerObjectReplay,
             SyscallFrameSource::SchedulerOwnerReplay,
             SyscallFrameSource::SchedulerSavedReplay,
+            SyscallFrameSource::HostIpcReplay,
         ] {
             counters.record_syscall_frame(source, &frame, binding);
         }
@@ -5136,17 +5191,17 @@ mod tests {
             .write_syscall_frames(&mut output)
             .unwrap();
         assert!(output.starts_with("syscall-frame sample=0 source=fresh-trap nr=73 pc=0x1234 slot=2 binding[mm=11,generation=12,task=13,thread=14] args=[0x1000,0x1,0x2000,0x1387,0x8,0x0] esr=0x54000000\n"));
-        for source in 1..=7 {
+        for source in 1..=8 {
             assert!(output.contains(SyscallFrameSource::from_code(source).unwrap().label()));
         }
         // An interrupted writer's incomplete row is not copied or rendered.
-        counters.syscall_frames[7][1].store(99, Ordering::Relaxed);
+        counters.syscall_frames[8][1].store(99, Ordering::Relaxed);
         let mut incomplete = std::string::String::new();
         counters
             .copy_snapshot()
             .write_syscall_frames(&mut incomplete)
             .unwrap();
-        assert!(!incomplete.contains("sample=7"));
+        assert!(!incomplete.contains("sample=8"));
         for _ in 0..40 {
             counters.record_syscall_frame(SyscallFrameSource::FreshTrap, &frame, binding);
         }
