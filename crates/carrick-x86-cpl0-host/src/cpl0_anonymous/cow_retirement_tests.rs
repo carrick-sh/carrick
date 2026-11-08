@@ -1,7 +1,5 @@
 use super::*;
-use crate::carrier_memory::{
-    BackingExtent, CarrierMemoryIo, CarrierMemoryRegion, PreparedBacking,
-};
+use crate::carrier_memory::{BackingExtent, CarrierMemoryIo, CarrierMemoryRegion, PreparedBacking};
 use carrick_mmu_core::x86::descriptor_txn::BackingIdentity;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -54,9 +52,7 @@ fn retired_fork_children_release_cow_pool_grants_across_pool_capacity() {
     let root_arena_gpa = 0x4000_0000u64;
     memory
         .install(&[PreparedBacking {
-            extent: Arc::new(
-                BackingExtent::private(FrameGpa::new(root_arena_gpa), 4096).unwrap(),
-            ),
+            extent: Arc::new(BackingExtent::private(FrameGpa::new(root_arena_gpa), 4096).unwrap()),
             identity: BackingIdentity {
                 frame_id: nz(2),
                 mapping_id: nz(2),
