@@ -8,8 +8,9 @@
 //! resource through the same code the dispatcher uses for that resource, and
 //! writes the reply in place. Nothing here owns a descriptor number.
 //!
-//! Slice 1 serves the run's implicit stdio streams (write and fstat); other
-//! host resources are refused exactly (counted ENOSYS in the ring).
+//! Writes also serve inherited host-file descriptions through their pinned
+//! physical backing, including a parent's redirected stdout after host close.
+//! Resources outside the venue's operation set remain counted ENOSYS.
 use std::sync::Arc;
 
 use carrick_abi::{LINUX_AT_FDCWD, LinuxOpenFlags};
@@ -536,12 +537,19 @@ impl SyscallDispatcher {
         if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
             return self.serve_native_open_file(header, &file.description, input, capacity);
         }
-        if header.op == HostFileOp::MapPrivate
-            && let Some(file) = resource.downcast_ref::<crate::kernel::objects::IpcPhysicalHold>()
-        {
-            return match file.retain_mapping() {
-                Some(reference) => self.native_map_reference(reference),
-                None => Served::Refused,
+        if let Some(file) = resource.downcast_ref::<crate::kernel::objects::IpcPhysicalHold>() {
+            return match header.op {
+                HostFileOp::MapPrivate => match file.retain_mapping() {
+                    Some(reference) => self.native_map_reference(reference),
+                    None => Served::Refused,
+                },
+                HostFileOp::Write => match file.retain_io() {
+                    Some(lease) => {
+                        self.serve_native_open_file(header, lease.description(), input, capacity)
+                    }
+                    None => Served::Refused,
+                },
+                _ => Served::Refused,
             };
         }
         Served::Refused
@@ -1148,6 +1156,32 @@ mod tests {
                 b"child\n",
             );
             assert!(fixture.dispatcher.stdout().is_empty());
+            let next = record(
+                child_table,
+                HostFileOp::Write,
+                1,
+                [UNLIMITED, 0, 0, 0],
+                b"next\n",
+                0,
+            );
+            assert_eq!(fixture.result(None, next).0, 5);
+            assert_eq!(
+                fixture.venue_contents(&authority_of(&fixture.dispatcher), b"/tmp/redirected"),
+                b"child\nnext\n",
+                "the inherited description retains its cursor",
+            );
+            if let Some(released) = ring.close(child, fd::Fd(1)).unwrap() {
+                fixture.owner.release(released.backing).unwrap();
+            }
+            let closed = record(
+                child_table,
+                HostFileOp::Write,
+                1,
+                [UNLIMITED, 0, 0, 0],
+                b"must not land",
+                0,
+            );
+            assert_eq!(fixture.result(None, closed).0, -9);
             ring.retire_table(child, |_| false, |_| unreachable!())
                 .unwrap();
             fixture.owner.drain_retired_tables().unwrap();
