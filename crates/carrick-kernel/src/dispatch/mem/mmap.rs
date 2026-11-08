@@ -1469,13 +1469,6 @@ impl<'a> MemView<'a> {
             let layout = this.mem().lock().layout;
             let in_arena = range_within(address, length, layout.mmap_base, layout.mmap_size);
             let address_uses_alias_layout = mmap_address_uses_alias(address, length, layout, user_ceiling);
-            // The backing query is only needed for a fixed, non-alias address
-            // outside the semantic arena. An admitted owner serves reads via
-            // EL1, and this syscall still holds the MM mutation gate.
-            let has_identity_backing = !address_uses_alias_layout
-                && map_flags.contains(LinuxMmapFlags::FIXED)
-                && !in_arena
-                && memory.read_bytes_raw(address, 1).is_ok();
             // Attributed anonymous mappings and shared file snapshots remain
             // host-served in an admitted root. Their sparse arena VA is not
             // physical backing: use the existing alias transaction to install
@@ -1488,10 +1481,23 @@ impl<'a> MemView<'a> {
                     || (map_sharing == MmapSharing::Shared
                         && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)));
             let owner_proposal = this.mem().lock().has_owner_proposal();
+            let lazy_fixed_external_owner = memory.supports_lazy_anonymous_mmap()
+                && !owner_host_snapshot
+                && this.linux_page_size() == 4096
+                && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
+                && !super::anonymous::in_heap(address, address.saturating_add(length), layout);
             let external_owner_reservation = owner_proposal
                 && root_eligible
-                && !map_flags.contains(LinuxMmapFlags::FIXED)
-                && !in_arena;
+                && !in_arena
+                && (!map_flags.contains(LinuxMmapFlags::FIXED) || lazy_fixed_external_owner);
+            // The backing query is only needed for a fixed, non-alias address
+            // outside the semantic arena. An admitted owner serves reads via
+            // EL1, and this syscall still holds the MM mutation gate.
+            let has_identity_backing = !external_owner_reservation
+                && !address_uses_alias_layout
+                && map_flags.contains(LinuxMmapFlags::FIXED)
+                && !in_arena
+                && memory.read_bytes_raw(address, 1).is_ok();
             let address_uses_alias = !external_owner_reservation && (owner_host_snapshot || mmap_request_uses_alias(
                 map_flags.contains(LinuxMmapFlags::FIXED),
                 address_uses_alias_layout,
@@ -1593,10 +1599,11 @@ impl<'a> MemView<'a> {
                 && this.linux_page_size() == 4096
                 && map_flags.contains(LinuxMmapFlags::PRIVATE)
                 && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
-                // A fixed replacement inside the sparse arena is eligible once
-                // its exact predecessor has been retired below. Fixed holes
-                // outside that arena retain the alias path.
-                && (!fixed_anonymous || in_arena);
+                // A fixed replacement inside the sparse arena or an owner-held
+                // outside-layout reservation is eligible once its exact
+                // predecessor has been retired below. Fixed holes outside
+                // those owner reservations retain the alias path.
+                && (!fixed_anonymous || in_arena || external_owner_reservation);
 
             let prot_none = prot_flags.is_empty();
             if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {

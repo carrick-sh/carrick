@@ -129,3 +129,24 @@ overallocate/trim shape. Its native-pages companion checks actual stores
 and generated x86 code execution. These VM-free checks do not prove VMM
 publication or Node startup. The director's exact-head signed Node check
 is still required.
+
+## Outside-layout fixed sub-mappings and demotion (#1848)
+
+Go's runtime reserves a 64 MiB `PROT_NONE` arena at an outside-layout hint
+(`sysReserveOS`, e.g. `0x01400000000` on arm64 or `0x00c000000000` on amd64)
+and commits sub-ranges with `mmap(MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)`
+(`sysMapOS`), later calling `madvise(MADV_DONTNEED)`, `mprotect`, and `munmap`
+on sub-ranges. A fixed private anonymous `Prepare` wholly covered by
+`PLACED_OUTSIDE_LAYOUT` owner nodes stays on the MM owner, retains
+`PLACED_OUTSIDE_LAYOUT` on the split sub-mapping, and uses lazy owner
+publication rather than host alias installation. Fixed replacements over
+imported ELF `IMAGE` spans still forward (`ForeignMapping`).
+
+When a host-served operation (`MAP_FIXED` file, shared, or straddling mapping)
+demotes or completes an opaque obstacle over a `PLACED_OUTSIDE_LAYOUT` or
+`IMAGE` row, root-only outside-layout provenance is stripped from the opaque
+obstacle while unclipped neighbour slices retain owner authority. Admitted
+`insert_opaque` continues to reject `PLACED_OUTSIDE_LAYOUT` and `IMAGE` with
+`Refusal::Invalid`. VM-free witnesses prove the shared reservation model and
+production host/ISA dispatch; signed Go test rows still require a signed HVF
+run on macOS.

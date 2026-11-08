@@ -1946,16 +1946,18 @@ impl<
             .iter()
             .any(|r| r.start() <= range.start() && range.end() <= r.end())
     }
-    /// Whether every byte belongs to an imported image or a host-validated
-    /// external placement. Ordinary editable imported rows do not confer
-    /// authority outside the allocation layout.
-    fn image_cover(&mut self, range: ReservationRange) -> bool {
+    /// Whether every byte is covered by root-editable nodes carrying at least
+    /// one of the `allowed` outside-layout authority flags. Ordinary editable
+    /// imported rows do not confer authority outside the allocation layout.
+    fn outside_authority_cover(
+        &mut self,
+        range: ReservationRange,
+        allowed: ReservationNodeFlags,
+    ) -> bool {
         let mut cursor = range.start();
         while let Some(n) = self.next(cursor) {
             if n.start > cursor
-                || !Policy::flags(&n).intersects(
-                    ReservationNodeFlags::IMAGE.union(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT),
-                )
+                || !Policy::flags(&n).intersects(allowed)
                 || !Policy::root_editable(&n)
             {
                 return false;
@@ -1966,6 +1968,12 @@ impl<
             }
         }
         false
+    }
+    fn image_cover(&mut self, range: ReservationRange) -> bool {
+        self.outside_authority_cover(
+            range,
+            ReservationNodeFlags::IMAGE.union(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT),
+        )
     }
     /// Whether one node straddles `address` (so an edit boundary there splits it).
     fn straddles(&mut self, address: u64) -> bool {
@@ -2010,15 +2018,22 @@ impl<
             return Err(Refusal::Invalid);
         }
         // The layout bounds placement. Outside it the root edits only the
-        // image its import adopted or a host-validated external placement.
-        // Ordinary editable imported nodes confer no outside-layout authority.
+        // image its import adopted or a host-validated external placement,
+        // including fixed anonymous replacement within an external placement.
+        // Ordinary editable imported nodes confer no outside-layout authority,
+        // and fixed replacements over imported ELF image segments forward to
+        // the host's private-repoint path.
+        let external_prepare = operation == ReservationOperation::Prepare
+            && source.is_none()
+            && flags == ReservationNodeFlags::ANONYMOUS_PRIVATE
+            && self.outside_authority_cover(range, ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT);
         let image_edit = matches!(
             operation,
             ReservationOperation::Protect
                 | ReservationOperation::Retire
                 | ReservationOperation::Decommit
         ) && self.image_cover(range);
-        if !external_placement && !image_edit && !self.in_layout(range) {
+        if !external_placement && !image_edit && !external_prepare && !self.in_layout(range) {
             return Err(Refusal::ForeignMapping);
         }
         // A retired resident extent's frames are unreusable until the
@@ -2119,12 +2134,17 @@ impl<
             operation,
             source,
         };
+        let pending_flags = if !external_placement && !self.in_layout(range) && external_prepare {
+            flags.union(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT)
+        } else {
+            flags
+        };
         self.state_mut().sequence = sequence;
         self.state_mut().pending = Some(Pending {
             request,
             result,
             policy_value,
-            flags: flags.bits(),
+            flags: pending_flags.bits(),
             nodes,
         });
         Ok(Decision::Work(request))
@@ -2668,7 +2688,11 @@ impl<
         let mut created_flags =
             ReservationNodeFlags::from_bits(pending.flags).ok_or(Refusal::Stale)?;
         if host_owned {
-            created_flags = created_flags.difference(ReservationNodeFlags::ANONYMOUS);
+            created_flags = created_flags.difference(
+                ReservationNodeFlags::ANONYMOUS
+                    .union(ReservationNodeFlags::IMAGE)
+                    .union(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT),
+            );
         }
         let creates = pending.request.operation != ReservationOperation::Retire;
         let created_backing = if created_flags.contains(ReservationNodeFlags::FILE)
@@ -6601,6 +6625,127 @@ mod tests {
 
         assert!(g.is_reserved(reserve_span));
         assert!(!g.is_committed(commit_span));
+    }
+
+    #[test]
+    fn outside_layout_fixed_prepare_retains_owner_provenance_and_admitted_opaque_rejects_it() {
+        let table = table();
+        let mut g = admitted(&table, 0, 89);
+
+        // Admitted opaque inserts still refuse outside-layout root provenance.
+        for bad_flag in [
+            ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT,
+            ReservationNodeFlags::IMAGE,
+        ] {
+            assert_eq!(
+                g.insert_opaque(
+                    range(0x7000_0000, 0x7000_1000),
+                    ReservationProtection::READ,
+                    ReservationNodeFlags::PRIVATE.union(bad_flag),
+                ),
+                Err(Refusal::Invalid)
+            );
+        }
+
+        // Go `sysReserveOS` outside layout, then `sysMapOS` `MAP_FIXED` within it.
+        let arena = range(0xc0_0000_0000, 0xc0_0400_0000);
+        g.begin_host_proposal().unwrap();
+        let reserve = g
+            .prepare_external_anonymous(arena, ReservationProtection::NONE)
+            .unwrap();
+        complete(&mut g, reserve);
+
+        let sub = range(0xc0_0001_0000, 0xc0_0003_0000);
+        let commit = g
+            .mmap(
+                Placement::Fixed(sub.start()),
+                sub.len(),
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap();
+        complete(&mut g, commit);
+        let mapped = g.mapping(sub.start()).unwrap();
+        assert!(mapped.anonymous);
+        assert_eq!(mapped.protection, ReservationProtection::READ_WRITE);
+        assert!(
+            mapped
+                .flags
+                .contains(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT)
+        );
+
+        // Straddling past the owned reservation still forwards (`ForeignMapping`).
+        assert_eq!(
+            g.mmap(
+                Placement::Fixed(arena.end() - 0x1000),
+                0x2000,
+                ReservationProtection::READ_WRITE,
+            ),
+            Err(Refusal::ForeignMapping)
+        );
+
+        // Cross-boundary protection and decommit still recognize the whole span.
+        let protect = g
+            .mprotect(
+                range(0xc0_0000_f000, 0xc0_0003_1000),
+                ReservationProtection::READ,
+            )
+            .unwrap();
+        complete(&mut g, protect);
+        let decommit = g.decommit_range(sub).unwrap();
+        complete(&mut g, decommit);
+
+        // A host-owned completion on an outside-layout prepare strips root-only flags.
+        let host_sub = range(0xc0_0010_0000, 0xc0_0010_2000);
+        let Decision::Work(request) = g
+            .mmap(
+                Placement::Fixed(host_sub.start()),
+                host_sub.len(),
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap()
+        else {
+            panic!("expected work");
+        };
+        // SAFETY: test fixture models completed host-alias descriptor installation.
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        g.complete_host_owned(completion).unwrap();
+        let opaque = g.mapping(host_sub.start()).unwrap();
+        assert!(!opaque.anonymous);
+        assert!(!opaque.flags.intersects(
+            ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT.union(ReservationNodeFlags::IMAGE)
+        ));
+
+        // Fixed anonymous replacements over an imported ELF `IMAGE` span still
+        // forward (`ForeignMapping`) rather than masquerading as external hints.
+        let mm2 = ReservationMm::new(90).unwrap();
+        table.publish(1, mm2, layout()).unwrap();
+        let mut g2 = table.lock(1, mm2).unwrap();
+        let image = range(0x2000_0000, 0x2000_2000);
+        g2.import_with(
+            image,
+            ReservationProtection::READ_WRITE,
+            ReservationNodeFlags::ANONYMOUS_PRIVATE.union(ReservationNodeFlags::IMAGE),
+        )
+        .unwrap();
+        g2.finish_import().unwrap();
+        assert_eq!(
+            g2.mmap(
+                Placement::Fixed(image.start()),
+                0x1000,
+                ReservationProtection::READ_WRITE,
+            ),
+            Err(Refusal::ForeignMapping)
+        );
     }
 }
 
