@@ -1430,16 +1430,15 @@ impl NativeOwnerSignalFixture {
         );
         let record = self.root_control.zone_record().unwrap();
         // Change readiness after completion. Output must not be re-polled.
-        assert_eq!(
-            host.region()
-                .lock(object, &HostLockWait)
-                .unwrap()
-                .eventfd()
-                .unwrap()
-                .try_read()
-                .result,
-            Ok(1)
-        );
+        let drained = host
+            .region()
+            .lock(object, &HostLockWait)
+            .unwrap()
+            .eventfd()
+            .unwrap()
+            .try_read()
+            .result;
+        assert_eq!(drained, Ok(1));
         self.runtime
             .cancel_service(record, slot, &mut physical)
             .unwrap();
