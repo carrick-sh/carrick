@@ -697,6 +697,10 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
     };
     let (runtime, address) =
         admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
+    #[cfg(test)]
+    if INJECT_SIGNAL_ENTRY_BUSY_ONCE.swap(false, Ordering::AcqRel) {
+        return Err(NativeProcessError::Busy);
+    }
     task.publish_root_generation(address.generation);
     let (result, root_exit) = {
         let mut process = {
@@ -734,6 +738,15 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+static INJECT_SIGNAL_ENTRY_BUSY_ONCE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn inject_signal_entry_busy_once() {
+    INJECT_SIGNAL_ENTRY_BUSY_ONCE.store(true, Ordering::Release);
 }
 
 /// Deliver a synchronous fault through the admitted `SignalOwner`: the host
