@@ -258,22 +258,58 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 /// `carrick volume` subcommands, not this per-run path.
 pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
     // Cached once per process; the scratch root cannot change while we run.
-    static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    Ok(CACHE.get_or_init(resolve_scratch_root).clone())
+    static CACHE: ScratchRootCache = ScratchRootCache::new();
+    Ok(CACHE.get_or_resolve(resolve_scratch_root))
+}
+
+/// The one per-process scratch-root cache. Production owns exactly one
+/// (`preferred_scratch_root`'s static); tests construct their own so a
+/// resolution, including a cached rejection, is observed in isolation.
+struct ScratchRootCache {
+    root: std::sync::OnceLock<PathBuf>,
+}
+
+impl ScratchRootCache {
+    const fn new() -> Self {
+        Self {
+            root: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The cached root, resolving it on first use only. A rejected
+    /// conventional mount is cached as its fallback root, so later callers
+    /// never classify or probe that candidate again.
+    fn get_or_resolve(&self, resolve: impl FnOnce() -> PathBuf) -> PathBuf {
+        self.root.get_or_init(resolve).clone()
+    }
 }
 
 fn resolve_scratch_root() -> PathBuf {
-    // Fast path: the conventional mount point of the carrick volume. Verify
-    // it's actually case-sensitive (a Linux ABI requirement) so a coincidental
-    // dir at that path on a case-insensitive boot volume can't be mistaken for
-    // our volume.
+    // Fast path: the conventional mount point of the carrick volume.
     let conventional = Path::new("/Volumes").join(DEFAULT_VOLUME_NAME);
-    resolve_scratch_root_from(
+    resolve_scratch_root_at(
         &conventional,
-        conventional_mount_usable(&conventional),
-        |path| path.is_dir() && probe_case_sensitive(path),
         std::env::var_os("CARRICK_HOME"),
         std::env::var_os("HOME"),
+    )
+}
+
+/// Resolve the scratch root for one conventional candidate with the real
+/// host classifier and case probe. The candidate is case-probed only after
+/// the classifier admits it; then verify it's actually case-sensitive (a
+/// Linux ABI requirement) so a coincidental dir at that path on a
+/// case-insensitive boot volume can't be mistaken for our volume.
+fn resolve_scratch_root_at(
+    conventional: &Path,
+    carrick_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    resolve_scratch_root_from(
+        conventional,
+        conventional_mount_usable(conventional),
+        |path| path.is_dir() && probe_case_sensitive(path),
+        carrick_home,
+        home,
     )
 }
 
@@ -602,6 +638,100 @@ mod tests {
         completion.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
+    /// Plant a file where `probe_case_sensitive` writes its sentinel. The
+    /// probe truncates and then unlinks that name, so the planted file
+    /// survives exactly when no case probe touched `dir`.
+    fn plant_probe_witness(dir: &Path) -> PathBuf {
+        let witness = dir.join(".carrick-case-probe");
+        std::fs::write(&witness, b"untouched").unwrap();
+        witness
+    }
+
+    fn assert_never_probed(witness: &Path) {
+        assert_eq!(
+            std::fs::read(witness).ok().as_deref(),
+            Some(&b"untouched"[..]),
+            "rejected candidate {} was case-probed",
+            witness.display()
+        );
+    }
+
+    /// Resolve `candidate` through the production cache type twice, the
+    /// second time with a different `CARRICK_HOME`: a live cache returns the
+    /// first fallback and never runs the second resolution.
+    fn assert_cached_rejection(candidate: &Path) {
+        let cache = ScratchRootCache::new();
+        let resolutions = std::cell::Cell::new(0);
+        let resolve = |home: &str| {
+            resolutions.set(resolutions.get() + 1);
+            resolve_scratch_root_at(candidate, Some(home.into()), None)
+        };
+        let first = cache.get_or_resolve(|| resolve("/internal/first"));
+        let second = cache.get_or_resolve(|| resolve("/internal/second"));
+        assert_eq!(first, PathBuf::from("/internal/first/scratch"));
+        assert_eq!(second, first);
+        assert_eq!(resolutions.get(), 1);
+    }
+
+    #[test]
+    fn probe_witness_detects_a_case_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let witness = plant_probe_witness(dir.path());
+        let _ = probe_case_sensitive(dir.path());
+        assert!(!witness.exists(), "case probe must consume the witness");
+    }
+
+    #[test]
+    fn resolution_rejects_unmounted_candidate_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().canonicalize().unwrap();
+        let witness = plant_probe_witness(&candidate);
+        let root = resolve_scratch_root_at(
+            &candidate,
+            Some("/internal/carrick-home".into()),
+            Some("/Users/u".into()),
+        );
+        assert_eq!(root, PathBuf::from("/internal/carrick-home/scratch"));
+        let root = resolve_scratch_root_at(&candidate, None, Some("/Users/u".into()));
+        assert_eq!(root, PathBuf::from("/Users/u/.carrick/scratch"));
+        assert_cached_rejection(&candidate);
+        assert_never_probed(&witness);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_classifier_admits_internal_local_volumes() {
+        // The boot volume and its data volume are internal, fixed and
+        // local on every Mac; both have exact mount records.
+        for mount in ["/", "/System/Volumes/Data"] {
+            let mount = Path::new(mount);
+            assert!(classify_conventional_mount(mount).unwrap(), "{mount:?}");
+            assert!(conventional_mount_usable(mount), "{mount:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_classifier_rejects_paths_without_exact_mount_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let unmounted = dir.path().canonicalize().unwrap();
+        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for path in [
+            unmounted.as_path(),
+            checkout.as_path(),
+            // Prefix, trailing-slash and doubled-slash aliases of real mounts.
+            Path::new("/System/Volumes/Dat"),
+            Path::new("/System/Volumes/Data/"),
+            Path::new("//"),
+            // A directory nested inside a mount is not that mount.
+            Path::new("/System/Volumes/Data/private"),
+            Path::new("/Volumes/definitely-not-mounted-xyz"),
+        ] {
+            assert!(!classify_conventional_mount(path).unwrap(), "{path:?}");
+            assert!(!conventional_mount_usable(path), "{path:?}");
+        }
+    }
+
     #[test]
     fn parse_apfs_list_finds_named_case_sensitive_volume() {
         let sample = "\
@@ -666,5 +796,117 @@ APFS Containers (1 found)
         let (n, s) = split_at_last_paren("just-a-name");
         assert_eq!(n, "just-a-name");
         assert_eq!(s, "");
+    }
+
+    /// Host-mutating witnesses: they spawn `hdiutil` and mount a disk image.
+    #[cfg(target_os = "macos")]
+    mod serial_host {
+        use super::*;
+        use std::process::Command;
+        use std::time::Duration;
+
+        /// Run a bounded host command; a hang fails the test instead of
+        /// wedging the lane.
+        fn run(command: &mut Command) {
+            let rendered = format!("{command:?}");
+            let child = command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let pid = child.id();
+            std::thread::spawn(move || {
+                let _ = sender.send(child.wait_with_output());
+            });
+            let output = match receiver.recv_timeout(Duration::from_secs(60)) {
+                Ok(output) => output.unwrap(),
+                Err(error) => {
+                    // SAFETY: plain kill(2) of the child this test spawned.
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    panic!("{rendered} did not finish: {error}");
+                }
+            };
+            assert!(
+                output.status.success(),
+                "{rendered} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// A case-sensitive APFS disk image attached at a private mount
+        /// point. `diskutil info` reports attached images as "Device
+        /// Location: External", "Removable Media: Removable". It stands in
+        /// for non-internal media; it is not the fixed external USB disk
+        /// that wedged cloudmac. Detached on drop.
+        struct AttachedImage {
+            mountpoint: PathBuf,
+            _dir: tempfile::TempDir,
+        }
+
+        impl AttachedImage {
+            fn attach() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let image = dir.path().join("carricktestext.dmg");
+                let mountpoint = dir.path().join("mnt");
+                std::fs::create_dir(&mountpoint).unwrap();
+                run(Command::new("hdiutil")
+                    .args(["create", "-quiet", "-size", "20m", "-fs"])
+                    .arg("Case-sensitive APFS")
+                    .args(["-volname", "carricktestext"])
+                    .arg(&image));
+                run(Command::new("hdiutil")
+                    .args(["attach", "-quiet", "-nobrowse", "-noautoopen"])
+                    .arg("-mountpoint")
+                    .arg(&mountpoint)
+                    .arg(&image));
+                // getfsstat records the resolved mount path (/private/var/...).
+                let mountpoint = mountpoint.canonicalize().unwrap();
+                Self {
+                    mountpoint,
+                    _dir: dir,
+                }
+            }
+        }
+
+        impl Drop for AttachedImage {
+            fn drop(&mut self) {
+                let _ = Command::new("hdiutil")
+                    .args(["detach", "-quiet", "-force"])
+                    .arg(&self.mountpoint)
+                    .status();
+            }
+        }
+
+        #[test]
+        fn external_disk_image_is_rejected_without_probing() {
+            let image = AttachedImage::attach();
+            let mount = image.mountpoint.as_path();
+            // Control: the image is a mounted, writable, case-sensitive
+            // volume, so the case probe alone would admit it.
+            assert!(probe_case_sensitive(mount));
+            // CoreFoundation reports an attached image as removable and
+            // gives it no internal-bus value at all (`volumeIsInternal` is
+            // nil, checked with Foundation on macOS 27); the classifier must
+            // refuse it either way, never admit it.
+            let verdict = classify_conventional_mount(mount);
+            assert!(!matches!(verdict, Ok(true)), "{verdict:?}");
+            assert!(!conventional_mount_usable(mount));
+            let nested = mount.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            assert!(!classify_conventional_mount(&nested).unwrap());
+
+            let witness = plant_probe_witness(mount);
+            let root = resolve_scratch_root_at(
+                mount,
+                Some("/internal/carrick-home".into()),
+                Some("/Users/u".into()),
+            );
+            assert_eq!(root, PathBuf::from("/internal/carrick-home/scratch"));
+            let root = resolve_scratch_root_at(mount, None, Some("/Users/u".into()));
+            assert_eq!(root, PathBuf::from("/Users/u/.carrick/scratch"));
+            assert_cached_rejection(mount);
+            assert_never_probed(&witness);
+        }
     }
 }
