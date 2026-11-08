@@ -3858,10 +3858,10 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         use crate::ipc;
         use carrick_abi::{
             CARRICK_PRIVATE_X86_FSTAT, CARRICK_PRIVATE_X86_NEWFSTATAT, LINUX_AT_EMPTY_PATH,
-            LINUX_AT_NO_AUTOMOUNT, LINUX_AT_SYMLINK_NOFOLLOW, LINUX_EBUSY, LINUX_EFAULT,
-            LINUX_EINVAL, LINUX_ENOTTY, LINUX_EPERM, LINUX_ESPIPE, LINUX_F_SETPIPE_SZ,
-            LINUX_FIOCLEX, LINUX_FIONBIO, LINUX_FIONCLEX, LINUX_FIONREAD, LinuxPipeIdentity,
-            LinuxStat, LinuxX8664Stat,
+            LINUX_AT_FDCWD, LINUX_AT_NO_AUTOMOUNT, LINUX_AT_SYMLINK_NOFOLLOW, LINUX_EBUSY,
+            LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOTTY, LINUX_EPERM, LINUX_ESPIPE,
+            LINUX_F_SETPIPE_SZ, LINUX_FIOCLEX, LINUX_FIONBIO, LINUX_FIONCLEX, LINUX_FIONREAD,
+            LinuxPipeIdentity, LinuxStat, LinuxX8664Stat,
         };
         use carrick_el1_abi::ipc::{
             IpcBacking,
@@ -3890,26 +3890,34 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         let ordinal = self.frame.canonical_ordinal();
         let arg = self.frame.argument(1).unwrap_or(0);
         let value = self.frame.argument(2).unwrap_or(0);
+        let at = ordinal == nr::NEWFSTATAT || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT;
+        // AT_EMPTY_PATH permits an empty pathname; it does not require one.
+        // Cwd queries belong to the path owner even when the path is empty.
+        if at && fd.0 == LINUX_AT_FDCWD as i32 {
+            return FamilyCompletion::Forward;
+        }
         // Import scalar input before admitting an owned metadata operation.
         // A refused page uses the existing exact-MM copy wait and redispatch;
         // no description, object guard or output has been retained yet.
         let input = if ordinal == nr::IOCTL && arg == LINUX_FIONBIO {
             Some((value, 4))
-        } else if ordinal == nr::NEWFSTATAT || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT {
+        } else if at {
             Some((arg, 1))
         } else {
             None
         };
         let mut imported = [0u8; 4];
         if let Some((address, len)) = input {
-            match authority.get(table, fd) {
-                Ok(description)
-                    if matches!(
-                        IpcBacking::decode(description.backing),
-                        Some(IpcBacking::Pipe { .. })
-                    ) => {}
-                Ok(_) => return FamilyCompletion::Forward,
-                Err(error) => return map_fd_error(error),
+            if !at {
+                match authority.get(table, fd) {
+                    Ok(description)
+                        if matches!(
+                            IpcBacking::decode(description.backing),
+                            Some(IpcBacking::Pipe { .. })
+                        ) => {}
+                    Ok(_) => return FamilyCompletion::Forward,
+                    Err(error) => return map_fd_error(error),
+                }
             }
             let mut copy = file::ValidatedCopy {
                 task,
@@ -3932,6 +3940,11 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     return lifecycle::lifecycle_effect(&outcome);
                 }
             }
+        }
+        // Classify the pathname before validating dirfd: absolute paths ignore
+        // it, and all nonempty paths must go through the existing path owner.
+        if at && imported[0] != 0 {
+            return FamilyCompletion::Forward;
         }
         let (pin, description) = match authority.pin(table, fd) {
             Ok(value) => value,
@@ -3987,8 +4000,6 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 || ordinal == nr::NEWFSTATAT
                 || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT
             {
-                let at =
-                    ordinal == nr::NEWFSTATAT || ordinal.raw() == CARRICK_PRIVATE_X86_NEWFSTATAT;
                 if at {
                     let flags = self.frame.argument(3).unwrap_or(0);
                     if flags
@@ -3998,9 +4009,6 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                         return FamilyCompletion::Complete(LINUX_EINVAL.guest_retval());
                     }
                     if flags & LINUX_AT_EMPTY_PATH == 0 {
-                        return FamilyCompletion::Forward;
-                    }
-                    if imported[0] != 0 {
                         return FamilyCompletion::Forward;
                     }
                 }
