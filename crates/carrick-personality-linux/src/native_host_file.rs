@@ -700,7 +700,7 @@ fn stage_call(
                 &path,
                 Some(HostFileOutput {
                     address: buf.raw(),
-                    len: (size as usize).min(LINUX_PATH_MAX),
+                    len: (size as usize).min(HOST_FILE_CHUNK_BYTES),
                 }),
             )
         }
