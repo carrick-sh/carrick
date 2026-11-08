@@ -3106,10 +3106,17 @@ mod host_tests {
     fn anonymous_cancel_after_wake_has_no_ipc_handback() {
         let zone = fixture(true);
         let key = ObjectWaitKey::address_space(0, 17).unwrap();
-        zone.bind_object_wait(key, &SpinForever).unwrap();
+        zone.bind_object_wait(key, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
         let record = allocate(&zone, 101);
         let reference = zone.record_ref(record);
-        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
         queue
             .park(
                 queue.snapshot(),
@@ -3125,7 +3132,15 @@ mod host_tests {
         // and executing, so its current slot owns terminal settlement.
         assert_eq!(zone.switch_in(SLOT), Some(record));
         assert_eq!(
-            zone.claim_for_host(reference, None, Handback::Cancelled, &SpinForever),
+            zone.claim_for_host(
+                reference,
+                None,
+                Handback::Cancelled,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                }
+            ),
             HostClaim::El1Held { slot: SLOT }
         );
         assert_eq!(
@@ -3199,15 +3214,30 @@ mod host_tests {
         }
         for (kind, key, operation, anonymous) in cases {
             let zone = fixture(false);
-            zone.bind_object_wait(key, &SpinForever).unwrap();
+            zone.bind_object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
             let id = allocate(&zone, 1);
             let reference = zone.record_ref(id);
             let identity = operation.identity();
-            let guard = zone.object_wait(key, &SpinForever).unwrap();
+            let guard = zone
+                .object_wait(key, &SpinForever, &|owned| {
+                    let _ = owned.into_parts();
+                })
+                .unwrap();
             guard.park(guard.snapshot(), id, operation).unwrap();
             drop(guard);
             assert_eq!(
-                zone.claim_for_host(reference, None, Handback::Cancelled, &SpinForever),
+                zone.claim_for_host(
+                    reference,
+                    None,
+                    Handback::Cancelled,
+                    &SpinForever,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    }
+                ),
                 if anonymous {
                     HostClaim::Stale
                 } else {
@@ -3230,7 +3260,15 @@ mod host_tests {
         let id = allocate(&zone, 1);
         let reference = zone.record_ref(id);
         assert_eq!(
-            zone.claim_for_host(reference, None, Handback::Cancelled, &SpinForever),
+            zone.claim_for_host(
+                reference,
+                None,
+                Handback::Cancelled,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                }
+            ),
             HostClaim::Stale
         );
         assert!(zone.live(reference).is_none());
