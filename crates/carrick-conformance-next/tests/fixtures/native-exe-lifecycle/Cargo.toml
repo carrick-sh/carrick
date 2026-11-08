@@ -8,3 +8,6 @@ publish = false
 libc = "0.2"
 
 [workspace]
+
+[profile.release]
+debug = true
