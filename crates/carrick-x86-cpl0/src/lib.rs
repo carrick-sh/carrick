@@ -22,6 +22,7 @@ mod test_support {
     pub const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
     pub const INJECT_PREPARED_CONFLICT_ONCE: u64 = 0xffff_ffff_ffff_fe12;
     pub const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+    pub const INJECT_METADATA_REQUIRED_ONCE: u64 = 0xffff_ffff_ffff_fe14;
 
     pub fn dispatch(
         native: u64,
@@ -36,6 +37,9 @@ mod test_support {
             }
             INJECT_PREPARED_CONFLICT_ONCE => {
                 carrick_core::mm::reservation::inject_prepared_conflict_once().then_some(0)
+            }
+            INJECT_METADATA_REQUIRED_ONCE => {
+                carrick_core::mm::reservation::inject_metadata_required_once().then_some(0)
             }
             INJECT_WAIT_PARK_CENSUS => {
                 let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(

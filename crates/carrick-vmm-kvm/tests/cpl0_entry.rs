@@ -754,6 +754,64 @@ fn production_anonymous_prepared_conflict_once_parks_and_completes() {
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
 
+/// Metadata capacity is provisioned synchronously inside the shared
+/// anonymous owner. It is never converted into a per-MM parked wait.
+#[test]
+fn production_anonymous_metadata_required_provisions_without_park() {
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+    const INJECT_METADATA_REQUIRED_ONCE: u64 = 0xffff_ffff_ffff_fe14;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_METADATA_REQUIRED_ONCE);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[
+        0x0f, 0x05, // mmap
+        0x48, 0x85, 0xc0, // test rax,rax
+        0x0f, 0x88, // js failure
+    ]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(222))
+            .unwrap(),
+        0
+    );
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
 /// Production Linux entry, including first touch and partial-range retirement.
 /// No fixture syscall or host mmap-family fallback can satisfy this witness.
 #[test]
