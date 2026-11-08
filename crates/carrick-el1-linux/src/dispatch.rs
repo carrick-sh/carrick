@@ -1945,6 +1945,7 @@ fn fatal_admission(error: super::native_process_runtime::NativeAdmissionError) -
             carrick_el1::substrate::sched::hw::fatal_entry_binding_with_identity(
                 contention.fatal_reason(),
                 contention.diagnostic_words(),
+                contention.group_lookup.map_or([0; 8], |lookup| lookup.0),
             );
             #[cfg(not(target_os = "none"))]
             carrick_fatal::carrick_fatal!(

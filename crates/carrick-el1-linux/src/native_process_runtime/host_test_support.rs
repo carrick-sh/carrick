@@ -8023,6 +8023,7 @@ fn admission_root_registration_collision_reports_identity() {
         error,
         crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
             NativeAdmissionContention {
+                group_lookup: None,
                 origin: NativeAdmissionOrigin::RootRegistrationCollision,
                 binding,
                 old_record: Some(fixture.record),
@@ -8066,6 +8067,7 @@ fn admission_old_record_retained_reports_identity() {
         error,
         crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
             NativeAdmissionContention {
+                group_lookup: None,
                 origin: NativeAdmissionOrigin::OldRecordRetained,
                 binding,
                 old_record: Some(fixture.record),
@@ -8144,6 +8146,7 @@ fn admission_rehome_collision(record_collision: bool) {
         error,
         crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
             NativeAdmissionContention {
+                group_lookup: None,
                 origin: if record_collision {
                     NativeAdmissionOrigin::RecordKeyCollision
                 } else {
@@ -8232,6 +8235,7 @@ fn admission_thread_registration_collision_reports_identity() {
         error,
         crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
             NativeAdmissionContention {
+                group_lookup: None,
                 origin: NativeAdmissionOrigin::ThreadRegistrationCollision,
                 binding: super::super::common_entry::execution_binding(&task),
                 old_record: Some(fixture.record),
@@ -8240,4 +8244,69 @@ fn admission_thread_registration_collision_reports_identity() {
             }
         ))
     );
+}
+
+// Diagnostic schema test only: deletion is deliberate corruption, not a
+// reproduction of #887 through production lifecycle operations.
+#[cfg(test)]
+#[test]
+fn admission_group_lookup_distinguishes_missing_indexes() {
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let binding = super::super::common_entry::execution_binding(fixture.task);
+    let key = NativeExecutionKey::new(fixture.zone, binding, fixture.address).unwrap();
+    {
+        let mut state = fixture.registry.state.lock();
+        let process = state.members.get(&key).unwrap().process;
+        let group = state.by_process.get(&(key.carrier, process)).unwrap().0;
+        state.records.remove(&NativeProcessRegistry::<
+            AddressContext<RootGpa>,
+            ParkedContextWords,
+        >::record_key(fixture.zone, fixture.record));
+        state.groups.remove(&group);
+    }
+    let NativeGroupAdmission::FreshRoot(lookup) = fixture
+        .registry
+        .admit_existing_group(
+            source,
+            fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .unwrap()
+    else {
+        panic!("expected diagnostic miss")
+    };
+    assert_eq!(
+        lookup.0,
+        [
+            7 << 32 | binding.task.raw(),
+            binding.generation.raw(),
+            0,
+            0,
+            0,
+            0,
+            1 << 32,
+            0
+        ]
+    );
+    fixture.registry.state.lock().members.remove(&key);
+    let NativeGroupAdmission::FreshRoot(lookup) = fixture
+        .registry
+        .admit_existing_group(
+            source,
+            fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .unwrap()
+    else {
+        panic!("expected diagnostic miss")
+    };
+    assert_eq!(lookup.0, [0, 0, 0, 0, 0, 0, 1 << 32, 0]);
 }

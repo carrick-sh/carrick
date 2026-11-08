@@ -607,18 +607,24 @@ fn admit_entry_runtime(
     } else {
         observed
     };
-    if let Some(runtime) = REGISTRY.admit_existing_group(source, task, address, page, control)? {
-        return Ok((runtime, address));
-    }
+    let lookup = match REGISTRY.admit_existing_group(source, task, address, page, control)? {
+        super::native_process_runtime::NativeGroupAdmission::Existing(runtime) => {
+            return Ok((runtime, address));
+        }
+        super::native_process_runtime::NativeGroupAdmission::FreshRoot(lookup) => lookup,
+    };
     let words = Aarch64ParkedContext::from_register(
         *native,
         ttbr0,
         address.mm.raw().get(),
         address.generation.raw().get(),
     );
-    let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source, task, page, control, address, address, words,
-    )?);
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source, task, page, control, address, address, words,
+        )
+        .map_err(|error| error.with_group_lookup(*lookup))?,
+    );
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
     Ok((runtime, address))
 }
