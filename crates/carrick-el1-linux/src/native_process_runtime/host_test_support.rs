@@ -8089,6 +8089,7 @@ fn admission_record_key_collision_reports_identity() {
 /// Hold a destination registry reservation made from a real registered member.
 /// A steady-state successful registration cannot create duplicate keys; this
 /// schedule exercises the refusing production seam with the destination held.
+#[cfg(test)]
 fn admission_rehome_collision(record_collision: bool) {
     let fixture = native_exec_fixture();
     let old_binding = super::super::common_entry::execution_binding(fixture.task);
