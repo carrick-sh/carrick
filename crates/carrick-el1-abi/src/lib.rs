@@ -2979,8 +2979,51 @@ impl CopyRefusalReason {
     }
 }
 
+/// The code boundary that produced a frame sample. A fresh trap can itself
+/// be an SVC replay: correlate its PC/binding with the preceding replay row.
+/// These observations never change execution or claim to be a full census.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum SyscallFrameSource {
+    FreshTrap = 1,
+    DecodedDispatch = 2,
+    OwnerInputRedispatch = 3,
+    SchedulerSavedReturn = 4,
+    SchedulerObjectReplay = 5,
+    SchedulerOwnerReplay = 6,
+    SchedulerSavedReplay = 7,
+}
+impl SyscallFrameSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FreshTrap => "fresh-trap",
+            Self::DecodedDispatch => "decoded-dispatch",
+            Self::OwnerInputRedispatch => "owner-input-redispatch",
+            Self::SchedulerSavedReturn => "scheduler-saved-return",
+            Self::SchedulerObjectReplay => "scheduler-object-replay",
+            Self::SchedulerOwnerReplay => "scheduler-owner-replay",
+            Self::SchedulerSavedReplay => "scheduler-saved-replay",
+        }
+    }
+    fn from_code(code: u64) -> Option<Self> {
+        Some(match code {
+            1 => Self::FreshTrap,
+            2 => Self::DecodedDispatch,
+            3 => Self::OwnerInputRedispatch,
+            4 => Self::SchedulerSavedReturn,
+            5 => Self::SchedulerObjectReplay,
+            6 => Self::SchedulerOwnerReplay,
+            7 => Self::SchedulerSavedReplay,
+            _ => return None,
+        })
+    }
+}
+
 /// One diagnostic sample. It is observational and grants no copy authority.
 pub struct CopyRefusal {
+    /// The argument words actually decoded at the copy site (zero-based).
+    pub arguments: [u64; 6],
+    pub pc: u64,
     pub ordinal: carrick_syscall_abi::CanonicalNr,
     pub address: carrick_guest_arch::UserVa,
     pub len: carrick_guest_arch::GuestLen,
@@ -3026,9 +3069,14 @@ pub struct Counters {
     /// word 0 (1 = committed): ordinal, VA, length, argument (6 = derived),
     /// direction (0 = in, 1 = out), reason, owner-present, then the presented
     /// and expected binding (MM, execution generation, task, thread generation).
+    /// Then PC and the six raw decoded argument words (indices 0 through 5).
     /// Zero binding words denote an absent identity, never a matching owner.
-    pub copy_refusals: [[AtomicU64; 16]; 16],
+    pub copy_refusals: [[AtomicU64; 23]; 16],
     pub copy_refusal_slots: AtomicU64,
+    /// First 32 ppoll frame-source samples, not a complete execution census.
+    /// commit, source, ordinal, PC, slot, binding[4], arguments[6], syndrome.
+    pub syscall_frames: [[AtomicU64; 16]; 32],
+    pub syscall_frame_slots: AtomicU64,
 }
 
 /// The authority that declined to serve the operation.
@@ -3059,8 +3107,10 @@ impl Counters {
             refused_child: [const { AtomicU64::new(0) }; 513],
             venue_refused: [const { AtomicU64::new(0) }; 513],
             venue_refused_child: [const { AtomicU64::new(0) }; 513],
-            copy_refusals: [const { [const { AtomicU64::new(0) }; 16] }; 16],
+            copy_refusals: [const { [const { AtomicU64::new(0) }; 23] }; 16],
             copy_refusal_slots: AtomicU64::new(0),
+            syscall_frames: [const { [const { AtomicU64::new(0) }; 16] }; 32],
+            syscall_frame_slots: AtomicU64::new(0),
         }
     }
 
@@ -3125,6 +3175,13 @@ impl Counters {
                 }));
             }
         }
+        for row in &self.syscall_frames {
+            if row[0].load(Ordering::Acquire) == 1 {
+                snapshot.publish_syscall_frame(core::array::from_fn(|i| {
+                    row[i + 1].load(Ordering::Relaxed)
+                }));
+            }
+        }
         snapshot
     }
 
@@ -3146,10 +3203,17 @@ impl Counters {
             refusal.expected.map_or(0, |b| b.generation.raw()),
             refusal.expected.map_or(0, |b| b.task.raw()),
             refusal.expected.map_or(0, |b| b.thread_generation.raw()),
+            refusal.pc,
+            refusal.arguments[0],
+            refusal.arguments[1],
+            refusal.arguments[2],
+            refusal.arguments[3],
+            refusal.arguments[4],
+            refusal.arguments[5],
         ]);
     }
 
-    fn publish_copy_refusal(&self, words: [u64; 15]) {
+    fn publish_copy_refusal(&self, words: [u64; 22]) {
         let Ok(slot) =
             self.copy_refusal_slots
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -3201,7 +3265,92 @@ impl Counters {
             }
             writeln!(
                 output,
-                " owner={} presented[mm={},generation={},task={},thread={}] expected[mm={},generation={},task={},thread={}]",
+                " owner={} presented[mm={},generation={},task={},thread={}] expected[mm={},generation={},task={},thread={}] source=decoded-dispatch pc={:#x} args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                word(7),
+                word(8),
+                word(9),
+                word(10),
+                word(11),
+                word(12),
+                word(13),
+                word(14),
+                word(15),
+                word(16),
+                word(17),
+                word(18),
+                word(19),
+                word(20),
+                word(21),
+                word(22)
+            )?;
+        }
+        if !found {
+            writeln!(output, "copy-refusal: no committed rows")?;
+        }
+        Ok(())
+    }
+
+    /// Sample the real ppoll frame at a named execution boundary. Limit the
+    /// store to ppoll so unrelated startup calls cannot evict the failing call.
+    pub fn record_syscall_frame(
+        &self,
+        source: SyscallFrameSource,
+        frame: &TrapFrame,
+        binding: ExecutionBinding,
+    ) {
+        if frame.x[8] != carrick_syscall_abi::nr::PPOLL.raw() {
+            return;
+        }
+        self.publish_syscall_frame([
+            source as u64,
+            frame.x[8],
+            frame.elr,
+            frame.slot,
+            binding.mm.raw(),
+            binding.generation.raw(),
+            binding.task.raw(),
+            binding.thread_generation.raw(),
+            frame.x[0],
+            frame.x[1],
+            frame.x[2],
+            frame.x[3],
+            frame.x[4],
+            frame.x[5],
+            frame.esr,
+        ]);
+    }
+
+    fn publish_syscall_frame(&self, words: [u64; 15]) {
+        let Ok(slot) =
+            self.syscall_frame_slots
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    (n < 32).then_some(n + 1)
+                })
+        else {
+            return;
+        };
+        let row = &self.syscall_frames[slot as usize];
+        for (target, value) in row[1..].iter().zip(words) {
+            target.store(value, Ordering::Relaxed);
+        }
+        row[0].store(1, Ordering::Release);
+    }
+
+    pub fn write_syscall_frames(&self, output: &mut impl core::fmt::Write) -> core::fmt::Result {
+        for (sample, row) in self.syscall_frames.iter().enumerate() {
+            if row[0].load(Ordering::Acquire) != 1 {
+                continue;
+            }
+            let word = |i: usize| row[i].load(Ordering::Relaxed);
+            let source = SyscallFrameSource::from_code(word(1)).map_or("unknown", |s| s.label());
+            writeln!(
+                output,
+                "syscall-frame sample={sample} source={source} nr={} pc={:#x} slot={} binding[mm={},generation={},task={},thread={}] args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] esr={:#x}",
+                word(2),
+                word(3),
+                word(4),
+                word(5),
+                word(6),
                 word(7),
                 word(8),
                 word(9),
@@ -3213,10 +3362,11 @@ impl Counters {
                 word(15)
             )?;
         }
-        if !found {
-            writeln!(output, "copy-refusal: no committed rows")?;
-        }
-        Ok(())
+        writeln!(
+            output,
+            "syscall-frame samples={}/32 (bounded prefix; not a census)",
+            self.syscall_frame_slots.load(Ordering::Relaxed)
+        )
     }
 
     pub fn record_refusal(
@@ -4916,7 +5066,9 @@ mod tests {
     fn copy_refusals_keep_first_records_and_snapshot_committed_rows() {
         let counters = Counters::new();
         for n in 0..20 {
-            counters.publish_copy_refusal([73, n, 16, 2, 0, 3, 0, 11, 12, 13, 14, 21, 22, 23, 24]);
+            counters.publish_copy_refusal([
+                73, n, 16, 2, 0, 3, 0, 11, 12, 13, 14, 21, 22, 23, 24, 0, 0, 0, 0, 0, 0, 0,
+            ]);
         }
         assert_eq!(counters.copy_refusal_slots.load(Ordering::Relaxed), 16);
         let snapshot = counters.copy_snapshot();
@@ -4932,7 +5084,9 @@ mod tests {
     fn copy_refusal_format_includes_both_owner_identities() {
         extern crate std;
         let counters = Counters::new();
-        counters.publish_copy_refusal([73, 0x4000, 16, 2, 0, 6, 1, 11, 12, 13, 14, 21, 22, 23, 24]);
+        counters.publish_copy_refusal([
+            73, 0x4000, 16, 2, 0, 6, 1, 11, 12, 13, 14, 21, 22, 23, 24, 0, 0, 0, 0, 0, 0, 0,
+        ]);
         // An unpublished row must not be printed.
         counters.copy_refusals[1][1].store(99, Ordering::Relaxed);
         let mut output = std::string::String::new();
@@ -4941,6 +5095,69 @@ mod tests {
             output,
             "copy-refusal nr=73 va=0x4000 len=16 argument=2 direction=in reason=owner-mismatch owner=1 presented[mm=11,generation=12,task=13,thread=14] expected[mm=21,generation=22,task=23,thread=24] source=decoded-dispatch pc=0x0 args=[0x0,0x0,0x0,0x0,0x0,0x0]\n"
         );
+    }
+
+    #[test]
+    fn syscall_frame_samples_preserve_sources_arguments_and_committed_prefix() {
+        extern crate std;
+        let counters = Counters::new();
+        let mut frame = TrapFrame {
+            elr: 0x1234,
+            slot: 2,
+            esr: 0x54000000,
+            ..TrapFrame::default()
+        };
+        frame.x[..6].copy_from_slice(&[0x1000, 1, 0x2000, 4999, 8, 0]);
+        let binding = ExecutionBinding {
+            mm: carrick_core_abi::EntryMmKey::from_raw(11),
+            generation: carrick_core_abi::SnapshotGeneration::from_raw(12),
+            task: carrick_core_abi::EntryTaskKey::from_raw(13),
+            thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(14),
+        };
+        // Other ordinals cannot consume the bounded ppoll diagnostic.
+        counters.record_syscall_frame(SyscallFrameSource::FreshTrap, &frame, binding);
+        assert_eq!(counters.syscall_frame_slots.load(Ordering::Relaxed), 0);
+        frame.x[8] = 73;
+        for source in [
+            SyscallFrameSource::FreshTrap,
+            SyscallFrameSource::DecodedDispatch,
+            SyscallFrameSource::OwnerInputRedispatch,
+            SyscallFrameSource::SchedulerSavedReturn,
+            SyscallFrameSource::SchedulerObjectReplay,
+            SyscallFrameSource::SchedulerOwnerReplay,
+            SyscallFrameSource::SchedulerSavedReplay,
+        ] {
+            counters.record_syscall_frame(source, &frame, binding);
+        }
+        let mut output = std::string::String::new();
+        counters
+            .copy_snapshot()
+            .write_syscall_frames(&mut output)
+            .unwrap();
+        assert!(output.starts_with("syscall-frame sample=0 source=fresh-trap nr=73 pc=0x1234 slot=2 binding[mm=11,generation=12,task=13,thread=14] args=[0x1000,0x1,0x2000,0x1387,0x8,0x0] esr=0x54000000\n"));
+        for source in 1..=7 {
+            assert!(output.contains(SyscallFrameSource::from_code(source).unwrap().label()));
+        }
+        // An interrupted writer's incomplete row is not copied or rendered.
+        counters.syscall_frames[7][1].store(99, Ordering::Relaxed);
+        let mut incomplete = std::string::String::new();
+        counters
+            .copy_snapshot()
+            .write_syscall_frames(&mut incomplete)
+            .unwrap();
+        assert!(!incomplete.contains("sample=7"));
+        for _ in 0..40 {
+            counters.record_syscall_frame(SyscallFrameSource::FreshTrap, &frame, binding);
+        }
+        assert_eq!(counters.syscall_frame_slots.load(Ordering::Relaxed), 32);
+        assert_eq!(counters.syscall_frames[0][12].load(Ordering::Relaxed), 4999);
+        let mut output = std::string::String::new();
+        counters
+            .copy_snapshot()
+            .write_syscall_frames(&mut output)
+            .unwrap();
+        assert_eq!(output.lines().count(), 33);
+        assert!(output.ends_with("samples=32/32 (bounded prefix; not a census)\n"));
     }
 
     #[test]
@@ -4955,7 +5172,9 @@ mod tests {
                 + LifecycleDecline::COUNT
                 + AnonymousLeave::COUNT
                 + 4 * 513
-                + 16 * 16
+                + 16 * 23
+                + 1
+                + 32 * 16
                 + 1)
                 * 8
         );

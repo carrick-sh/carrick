@@ -249,6 +249,13 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     {
         let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
             unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
+        if let Some(task) = current_tasks.get(frame.slot as usize) {
+            counters.record_syscall_frame(
+                carrick_el1_abi::SyscallFrameSource::FreshTrap,
+                frame,
+                crate::common_entry::execution_binding(task),
+            );
+        }
         let fd_map = unsafe { &*(EL1_FD_MAP_BASE as *const [FdMapSlot; FD_MAP_CAPACITY]) };
         let object_table =
             unsafe { &*(EL1_OBJECT_TABLE_BASE as *const [DelegatedFile; MAX_DELEGATED_FILES]) };
@@ -2237,6 +2244,14 @@ where
     Context: DispatchContext + 'a,
 {
     let ordinal = frame.canonical_ordinal().raw();
+    if let (Some(arm), Some(task)) = (frame.arm_frame_ref(), current_tasks.get(frame.task_index()))
+    {
+        counters.record_syscall_frame(
+            carrick_el1_abi::SyscallFrameSource::DecodedDispatch,
+            arm,
+            crate::common_entry::execution_binding(task),
+        );
+    }
     let mut pending = El1PendingFamilies {
         handoff: None,
         #[cfg(test)]
@@ -2463,7 +2478,7 @@ fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
     address: carrick_guest_arch::UserVa,
     bytes: &[u8],
     result: SyscallResult,
-    diagnostic: (&Counters, carrick_syscall_abi::CanonicalNr),
+    diagnostic: (&Counters, carrick_syscall_abi::CanonicalNr, [u64; 6], u64),
 ) -> FamilyCompletion {
     if let Some(process) = process {
         let outcome = process.complete_copyout(address, bytes.to_vec(), result);
@@ -2473,6 +2488,8 @@ fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
                 .0
                 .record_copy_refusal(carrick_el1_abi::CopyRefusal {
                     ordinal: diagnostic.1,
+                    arguments: diagnostic.2,
+                    pc: diagnostic.3,
                     address,
                     len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
                     argument: Some(0),
@@ -2508,7 +2525,12 @@ fn host_owned_poll_copyout_refusal_keeps_the_host_fallback() {
             carrick_guest_arch::UserVa::new(carrick_guest_arch::USER_CEILING),
             &[0; 8],
             SyscallResult::new(1),
-            (&Counters::new(), carrick_syscall_abi::CanonicalNr::new(73)),
+            (
+                &Counters::new(),
+                carrick_syscall_abi::CanonicalNr::new(73),
+                [0; 6],
+                0
+            ),
         ),
         FamilyCompletion::Forward
     ));
@@ -2916,7 +2938,12 @@ impl<
                     carrick_guest_arch::UserVa::new(fds_ptr),
                     out_bytes,
                     SyscallResult::new(ready as i64),
-                    (self.counters, self.frame.canonical_ordinal()),
+                    (
+                        self.counters,
+                        self.frame.canonical_ordinal(),
+                        core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
+                        self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
+                    ),
                 );
             }
         }
@@ -2950,7 +2977,12 @@ impl<
                 carrick_guest_arch::UserVa::new(fds_ptr),
                 out_bytes,
                 SyscallResult::new(ready as i64),
-                (self.counters, self.frame.canonical_ordinal()),
+                (
+                    self.counters,
+                    self.frame.canonical_ordinal(),
+                    core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
+                    self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
+                ),
             )
         } else {
             // This venue has no retained readiness wait. Leave the call
@@ -4758,6 +4790,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                         counters,
                         ordinal: carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
                         arguments: core::array::from_fn(|i| frame.x[i]),
+                        pc: frame.elr,
                         presented: self.process.as_deref().map(|owner| owner.binding()),
                         expected: Some(crate::common_entry::execution_binding(task)),
                     },
@@ -4835,6 +4868,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                         counters,
                         ordinal: carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
                         arguments: core::array::from_fn(|i| frame.x[i]),
+                        pc: frame.elr,
                         presented: self.process.as_deref().map(|owner| owner.binding()),
                         expected: Some(crate::common_entry::execution_binding(task)),
                     },
@@ -4866,6 +4900,10 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     (
                         self.counters,
                         carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
+                        [
+                            orig_x0, frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+                        ],
+                        frame.elr,
                     ),
                 );
             }
