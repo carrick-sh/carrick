@@ -1579,190 +1579,205 @@ impl<'a> FsView<'a> {
         }
 
         fn unlinkat(this, cx, dirfd: u64, pathname: GuestPtr, flags: u64) {
-            let pathname = pathname.0;
             let Some(at_flags) = carrick_abi::LinuxAtFlags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             if at_flags.bits() & !LINUX_AT_REMOVEDIR != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let path = read_guest_c_string(&*cx.memory, pathname)?;
-            if path.is_empty() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-            }
-            let remove_dir = at_flags.contains(carrick_abi::LinuxAtFlags::REMOVEDIR);
-            let ends_with_dot = path == "."
-                || path.ends_with("/.")
-                || path.trim_end_matches('/').ends_with("/.")
-                || path.trim_end_matches('/') == "."
-                || path == ".."
-                || path.ends_with("/..")
-                || path.trim_end_matches('/').ends_with("/..")
-                || path.trim_end_matches('/') == "..";
-            let had_trailing_slash = path.len() > 1 && path.ends_with('/');
-            let resolved = this.resolve_at_path(dirfd, &path)?;
-            if ends_with_dot {
-                let followed = this
-                    .canonicalize_following(&resolved)
-                    .unwrap_or_else(|_| resolved.clone());
-                match this.layered_metadata(&followed) {
-                    Ok(md) => {
-                        if md.kind != RootFsEntryKind::Directory {
-                            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                        } else if remove_dir {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                        } else {
-                            return Ok(DispatchOutcome::errno(LINUX_EISDIR));
-                        }
-                    }
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
-                }
-            }
-            if had_trailing_slash {
-                if let Ok(lmd) = this.layered_lstat(&resolved) {
-                    if lmd.kind == RootFsEntryKind::Symlink {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                    }
-                }
-                if let Ok(md) = this.layered_metadata(&resolved) {
+            let path = read_guest_c_string(&*cx.memory, pathname.0)?;
+            this.unlink_path(
+                Some(cx.kernel), dirfd, &path,
+                at_flags.contains(carrick_abi::LinuxAtFlags::REMOVEDIR),
+            )
+        }
+    }
+
+    pub(in crate::dispatch) fn unlink_path(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        dirfd: u64,
+        path: &str,
+        remove_dir: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let this = self;
+        if path.is_empty() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
+        let ends_with_dot = path == "."
+            || path.ends_with("/.")
+            || path.trim_end_matches('/').ends_with("/.")
+            || path.trim_end_matches('/') == "."
+            || path == ".."
+            || path.ends_with("/..")
+            || path.trim_end_matches('/').ends_with("/..")
+            || path.trim_end_matches('/') == "..";
+        let had_trailing_slash = path.len() > 1 && path.ends_with('/');
+        let resolved = this.resolve_at_path(dirfd, path)?;
+        if this.mutation_path_needs_task(context, &resolved) {
+            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+        }
+        if ends_with_dot {
+            let followed = this
+                .canonicalize_following(&resolved)
+                .unwrap_or_else(|_| resolved.clone());
+            match this.layered_metadata(&followed) {
+                Ok(md) => {
                     if md.kind != RootFsEntryKind::Directory {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                    } else if !remove_dir {
+                    } else if remove_dir {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    } else {
                         return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                     }
                 }
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
             }
-            // Synthetic /proc /sys paths can't be unlinked.
-            if this.is_synthetic_virtual_path(cx.kernel, &resolved) {
-                return Ok(DispatchOutcome::errno(LINUX_EROFS));
-            }
-            use carrick_vfs::Vfs as _;
-            // DAC: removing an entry needs write+search on the parent dir
-            // (unlink08: 0555 lacks write, 0666 lacks search — both → EACCES).
-            // A sticky parent (S_ISVTX) additionally requires owning the entry
-            // or the dir (rmdir03 case 2 → EPERM). Only when the target exists
-            // (a missing one is ENOENT) and on the rootfs path (not the
-            // carrick-internal bind-mount IPC paths).
-            if !this.guest_dac_root_bypass()
-                && this.fs.vfs_mounts.resolve(&resolved).is_none()
-                && this.layered_metadata(&resolved).is_ok()
-                && let Some(parent) = Path::new(&resolved).parent()
-            {
-                let parent_str = display_rootfs_path(parent);
-                if !this.guest_can_modify_dir(&parent_str) {
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
-                if !this.guest_sticky_delete_ok(&parent_str, &resolved) {
-                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
+        }
+        if had_trailing_slash {
+            if let Ok(lmd) = this.layered_lstat(&resolved) {
+                if lmd.kind == RootFsEntryKind::Symlink {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
                 }
             }
-            // Route through bind mounts (e.g. /dev/shm → host-tmp) so a file
-            // CREATED via the openat mount path can also be unlinkat'd. The
-            // open path resolves mounts first then falls through to rootfs;
-            // unlinkat must mirror that or LTP's SAFE_UNLINK(shm_path) — which
-            // creates the IPC region then immediately unlinks it (the mapping
-            // outlives the name) — fails ENOENT and TBROKs setup_ipc.
-            // An OVERRIDABLE single-file injection (/etc/services, /etc/resolv.conf)
-            // is just a default the guest may replace: unlinking it must DETACH
-            // the injection rather than EROFS from the read-only synthetic mount
-            // (kaniko's image-unpack unlinks /etc/services to lay down the base
-            // image's copy). Record the override so the path falls through to the
-            // overlay everywhere thereafter; the injection isn't a real overlay
-            // file, so "unlink" just means stop injecting. If the overlay DOES
-            // happen to carry the path, also run the normal overlay delete.
-            // Learn the target's inode identity BEFORE it goes away so the
-            // removal also drops the inode record every other hard link of it
-            // shares (`legacyfs`: unlink of the second name must lower the
-            // first name's nlink). One `fstatat` on a cache miss.
-            let _ = this.fs.rootfs_vfs.dentry_stat(&resolved, false);
-            let unlinked_executable = this.executable_object_id_for_unlink(&resolved);
-            if let Some(m) = this.fs.vfs_mounts.resolve(&resolved)
-                && m.vfs.overridable()
-            {
-                this.fs.vfs_mounts.override_path(&resolved);
-                let overlay_result = if remove_dir {
-                    this.fs.rootfs_vfs.rmdir(&resolved)
-                } else {
-                    this.fs.rootfs_vfs.unlink(&resolved)
-                };
-                // A missing overlay file is expected (the injection had no real
-                // backing) — that's still a successful detach. Only a non-ENOENT
-                // error from a real overlay file should surface.
-                return match overlay_result {
-                    Ok(()) | Err(LINUX_ENOENT) => {
-                        if let Some(object_id) = unlinked_executable {
-                            this.notify_executable_unlink(object_id, &resolved);
-                        }
-                        Ok(DispatchOutcome::Returned { value: 0 })
-                    }
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                };
+            if let Ok(md) = this.layered_metadata(&resolved) {
+                if md.kind != RootFsEntryKind::Directory {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                } else if !remove_dir {
+                    return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+                }
             }
-            // Capture the target kind and (for a file) its pre-delete link count
-            // BEFORE the delete, only when something is watching (the lookups are
-            // otherwise wasted work). The link count distinguishes "a link was
-            // removed but the inode survives" (IN_ATTRIB only) from "the last link
-            // is gone, the file is removed" (IN_ATTRIB → IN_DELETE_SELF →
-            // IN_IGNORED) — see inotify04 and inotify(7).
-            let watching = !this.fs.inotify_registry.is_empty();
-            let unlinked_is_dir = if watching {
-                this.inotify_path_kind(&resolved).unwrap_or(remove_dir)
-            } else {
-                false
-            };
-            // nlink only matters for the file (non-dir) self-watch sequence.
-            let nlink_before = if watching && !unlinked_is_dir {
-                this.path_stat_record(cx.kernel, dirfd, &path, 0)
-                    .map(|r| r.nlink)
-                    .unwrap_or(1)
-            } else {
-                0
-            };
-            let result = if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
-                if remove_dir { m.vfs.rmdir(&m.full_path) } else { m.vfs.unlink(&m.full_path) }
-            } else if remove_dir {
+        }
+        // Synthetic /proc /sys paths can't be unlinked.
+        if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &resolved)) {
+            return Ok(DispatchOutcome::errno(LINUX_EROFS));
+        }
+        use carrick_vfs::Vfs as _;
+        // DAC: removing an entry needs write+search on the parent dir
+        // (unlink08: 0555 lacks write, 0666 lacks search — both → EACCES).
+        // A sticky parent (S_ISVTX) additionally requires owning the entry
+        // or the dir (rmdir03 case 2 → EPERM). Only when the target exists
+        // (a missing one is ENOENT) and on the rootfs path (not the
+        // carrick-internal bind-mount IPC paths).
+        if !this.guest_dac_root_bypass()
+            && this.fs.vfs_mounts.resolve(&resolved).is_none()
+            && this.layered_metadata(&resolved).is_ok()
+            && let Some(parent) = Path::new(&resolved).parent()
+        {
+            let parent_str = display_rootfs_path(parent);
+            if !this.guest_can_modify_dir(&parent_str) {
+                return Ok(DispatchOutcome::errno(LINUX_EACCES));
+            }
+            if !this.guest_sticky_delete_ok(&parent_str, &resolved) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+        }
+        // Route through bind mounts (e.g. /dev/shm → host-tmp) so a file
+        // CREATED via the openat mount path can also be unlinkat'd. The
+        // open path resolves mounts first then falls through to rootfs;
+        // unlinkat must mirror that or LTP's SAFE_UNLINK(shm_path) — which
+        // creates the IPC region then immediately unlinks it (the mapping
+        // outlives the name) — fails ENOENT and TBROKs setup_ipc.
+        // An OVERRIDABLE single-file injection (/etc/services, /etc/resolv.conf)
+        // is just a default the guest may replace: unlinking it must DETACH
+        // the injection rather than EROFS from the read-only synthetic mount
+        // (kaniko's image-unpack unlinks /etc/services to lay down the base
+        // image's copy). Record the override so the path falls through to the
+        // overlay everywhere thereafter; the injection isn't a real overlay
+        // file, so "unlink" just means stop injecting. If the overlay DOES
+        // happen to carry the path, also run the normal overlay delete.
+        // Learn the target's inode identity BEFORE it goes away so the
+        // removal also drops the inode record every other hard link of it
+        // shares (`legacyfs`: unlink of the second name must lower the
+        // first name's nlink). One `fstatat` on a cache miss.
+        let _ = this.fs.rootfs_vfs.dentry_stat(&resolved, false);
+        let unlinked_executable = this.executable_object_id_for_unlink(&resolved);
+        if let Some(m) = this.fs.vfs_mounts.resolve(&resolved)
+            && m.vfs.overridable()
+        {
+            this.fs.vfs_mounts.override_path(&resolved);
+            let overlay_result = if remove_dir {
                 this.fs.rootfs_vfs.rmdir(&resolved)
             } else {
                 this.fs.rootfs_vfs.unlink(&resolved)
             };
-            match result {
-                Ok(()) => {
+            // A missing overlay file is expected (the injection had no real
+            // backing) — that's still a successful detach. Only a non-ENOENT
+            // error from a real overlay file should surface.
+            return match overlay_result {
+                Ok(()) | Err(LINUX_ENOENT) => {
                     if let Some(object_id) = unlinked_executable {
                         this.notify_executable_unlink(object_id, &resolved);
                     }
-                    // inotify: IN_DELETE (name) to a watch on the parent dir.
-                    this.inotify_child(
-                        &resolved,
-                        carrick_abi::LINUX_IN_DELETE,
-                        unlinked_is_dir,
-                    );
-                    this.dnotify_child(cx.kernel, &resolved, LinuxDnotifyMask::DELETE);
-                    // To a watch ON the entry itself:
-                    // - A directory (rmdir) has no link-count subtlety:
-                    //   IN_DELETE_SELF → IN_IGNORED.
-                    // - A file whose link count just dropped to 0 (the last link):
-                    //   IN_ATTRIB (link count changed) → IN_DELETE_SELF → IN_IGNORED.
-                    // - A file with surviving hardlinks (link count was > 1): the
-                    //   inode lives on, so only IN_ATTRIB — no self-delete/ignore.
-                    if unlinked_is_dir {
-                        this.inotify_self(&resolved, carrick_abi::LINUX_IN_DELETE_SELF);
-                        this.inotify_self(&resolved, carrick_abi::LINUX_IN_IGNORED);
-                        this.fs.inotify_registry.unregister_path(&resolved);
-                    } else {
-                        // The unlinked name changes the inode's link count → IN_ATTRIB.
-                        this.inotify_self(&resolved, carrick_abi::LINUX_IN_ATTRIB);
-                        if nlink_before <= 1 {
-                            // Last link gone: the watched object is destroyed.
-                            this.inotify_self(&resolved, carrick_abi::LINUX_IN_DELETE_SELF);
-                            this.inotify_self(&resolved, carrick_abi::LINUX_IN_IGNORED);
-                            this.fs.inotify_registry.unregister_path(&resolved);
-                        }
-                    }
-                    crate::el1_inotify::invalidate_name_cache_all();
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            };
+        }
+        // Capture the target kind and (for a file) its pre-delete link count
+        // BEFORE the delete, only when something is watching (the lookups are
+        // otherwise wasted work). The link count distinguishes "a link was
+        // removed but the inode survives" (IN_ATTRIB only) from "the last link
+        // is gone, the file is removed" (IN_ATTRIB → IN_DELETE_SELF →
+        // IN_IGNORED) — see inotify04 and inotify(7).
+        let watching = !this.fs.inotify_registry.is_empty();
+        let unlinked_is_dir = if watching {
+            this.inotify_path_kind(&resolved).unwrap_or(remove_dir)
+        } else {
+            false
+        };
+        // nlink only matters for the file (non-dir) self-watch sequence.
+        let nlink_before = if watching && !unlinked_is_dir {
+            this.path_stat_record_for(context, dirfd, path, 0)
+                .map(|r| r.nlink)
+                .unwrap_or(1)
+        } else {
+            0
+        };
+        let result = if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
+            if remove_dir {
+                m.vfs.rmdir(&m.full_path)
+            } else {
+                m.vfs.unlink(&m.full_path)
             }
+        } else if remove_dir {
+            this.fs.rootfs_vfs.rmdir(&resolved)
+        } else {
+            this.fs.rootfs_vfs.unlink(&resolved)
+        };
+        match result {
+            Ok(()) => {
+                if let Some(object_id) = unlinked_executable {
+                    this.notify_executable_unlink(object_id, &resolved);
+                }
+                // inotify: IN_DELETE (name) to a watch on the parent dir.
+                this.inotify_child(&resolved, carrick_abi::LINUX_IN_DELETE, unlinked_is_dir);
+                this.mutation_dnotify_child(context, &resolved, LinuxDnotifyMask::DELETE);
+                // To a watch ON the entry itself:
+                // - A directory (rmdir) has no link-count subtlety:
+                //   IN_DELETE_SELF → IN_IGNORED.
+                // - A file whose link count just dropped to 0 (the last link):
+                //   IN_ATTRIB (link count changed) → IN_DELETE_SELF → IN_IGNORED.
+                // - A file with surviving hardlinks (link count was > 1): the
+                //   inode lives on, so only IN_ATTRIB — no self-delete/ignore.
+                if unlinked_is_dir {
+                    this.inotify_self(&resolved, carrick_abi::LINUX_IN_DELETE_SELF);
+                    this.inotify_self(&resolved, carrick_abi::LINUX_IN_IGNORED);
+                    this.fs.inotify_registry.unregister_path(&resolved);
+                } else {
+                    // The unlinked name changes the inode's link count → IN_ATTRIB.
+                    this.inotify_self(&resolved, carrick_abi::LINUX_IN_ATTRIB);
+                    if nlink_before <= 1 {
+                        // Last link gone: the watched object is destroyed.
+                        this.inotify_self(&resolved, carrick_abi::LINUX_IN_DELETE_SELF);
+                        this.inotify_self(&resolved, carrick_abi::LINUX_IN_IGNORED);
+                        this.fs.inotify_registry.unregister_path(&resolved);
+                    }
+                }
+                crate::el1_inotify::invalidate_name_cache_all();
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            Err(errno) => Ok(DispatchOutcome::errno(errno)),
         }
     }
 }

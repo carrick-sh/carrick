@@ -617,6 +617,7 @@ impl SyscallDispatcher {
             | HostFileOp::Faccessat
             | HostFileOp::Newfstatat
             | HostFileOp::Mkdirat
+            | HostFileOp::Unlinkat
             | HostFileOp::Poll => Served::Refused,
         }
     }
@@ -631,6 +632,21 @@ impl SyscallDispatcher {
     ) -> Served {
         let fs = self.fs_view();
         match header.op {
+            HostFileOp::Unlinkat => {
+                if u64::from(header.flags) & !carrick_abi::LINUX_AT_REMOVEDIR != 0 {
+                    return Served::errno(carrick_abi::LINUX_EINVAL);
+                }
+                match fs.unlink_path(
+                    None,
+                    LINUX_AT_FDCWD,
+                    path,
+                    u64::from(header.flags) & carrick_abi::LINUX_AT_REMOVEDIR != 0,
+                ) {
+                    Ok(outcome) => served_mutation(outcome),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::Mkdirat => {
                 match fs.mkdir_path(None, LINUX_AT_FDCWD, path, header.args[0]) {
                     Ok(outcome) => served_mutation(outcome),
