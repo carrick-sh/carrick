@@ -1,7 +1,7 @@
 //! Native Linux futex service over the existing typed scheduler and MM owners.
 use super::*;
-use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest, UserCopy};
-use carrick_guest_arch::{Access, CounterTick, GuestLen};
+use carrick_core::user_copy::{CopyOutcome, UserCopy};
+use carrick_guest_arch::CounterTick;
 use carrick_personality_linux::sched::{
     FutexCall, FutexFrequency, FutexVenue, FutexWait, MmFutexKey, RelativeFutexWait,
 };
@@ -297,12 +297,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 Ok(true) => call = candidate,
                 Ok(false) => return None,
-                Err(NativeProcessError::OwnerWait(_) | NativeProcessError::Busy) => {
-                    return Some(self.wait_guest_copy(GuestCopyRequest {
-                        address: UserVa::new(call.args[0]),
-                        len: GuestLen::new(4),
-                        access: Access::Read,
-                    }));
+                Err(error @ (NativeProcessError::OwnerWait(_) | NativeProcessError::Busy)) => {
+                    let wait = match error {
+                        NativeProcessError::OwnerWait(wait) => Some(wait),
+                        _ => None,
+                    };
+                    return Some(
+                        self.retry_guest_input(
+                            carrick_core_abi::service::ServiceOperation::CarrierWork {
+                                entry: OwnerEntry::Syscall,
+                            },
+                            None,
+                            wait,
+                        )
+                        .unwrap_or_else(|error| self.run_failed(error.run_failure_reason())),
+                    );
                 }
                 Err(error) => return Some(self.run_failed(error.run_failure_reason())),
             }

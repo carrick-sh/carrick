@@ -4,6 +4,11 @@ use super::*;
 use carrick_guest_arch::{ContextGeneration, FrameGpa};
 use carrick_sched_core::ParkedContextWords;
 
+#[cfg(test)]
+std::thread_local! {
+    static FUTEX_MAPPING: core::cell::Cell<Option<Result<bool, NativeProcessError>>> = const { core::cell::Cell::new(None) };
+}
+
 std::thread_local! {
     static SIGNAL_COPIES: std::cell::RefCell<Vec<(UserVa, Vec<u8>)>> = const {
         std::cell::RefCell::new(Vec::new())
@@ -412,6 +417,14 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             offset += count;
         }
         Ok(())
+    }
+    #[cfg(test)]
+    fn futex_shared_private(
+        &mut self,
+        _: &Self::Mm,
+        _: UserVa,
+    ) -> Result<bool, NativeProcessError> {
+        FUTEX_MAPPING.with(|slot| slot.get().unwrap_or(Ok(false)))
     }
     fn prepare_owned_read(
         &mut self,
@@ -8419,3 +8432,7 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
         "nonmatching mask must stay asleep"
     );
 }
+
+#[cfg(test)]
+#[path = "tests/futex_contention.rs"]
+mod futex_contention;

@@ -323,3 +323,15 @@ the production adapter with one excluded-mask waiter and two matching waiters.
 It requires exactly one counted completion, retained scheduler custody while
 the driver is away, and one completion on the driver's return. A second wake
 completes the remaining matching waiter and a third returns zero.
+
+Mapping-key authentication preserves the portal's exact owner wait. The
+shared anonymous key is not admitted until the same operation retries after
+owner release. `native_futex_mapping_owner_busy_once_aarch64` and
+`native_futex_mapping_owner_busy_once_x86` run the production adapter and
+service continuation with their actual saved-context types. While the Gate
+notification is closed, there is no queued redispatch and no operand load.
+Release queues that same record; its retry authenticates and enrolls once.
+The physical input-copy venue is Unsupported during mapping refusal, proving
+that it cannot substitute for the returned mapping notification. These
+VM-free witnesses replace physical mapping admission only, not scheduler or
+continuation logic; they do not prove signed HVF execution.

@@ -888,6 +888,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             Err(error) => return Err(error),
         };
+        self.retry_guest_input(operation, sequence, wait)
+    }
+
+    // Mapping authentication and physical operand supply share the same
+    // exact-member syscall retry custody. A returned portal wait already
+    // identifies the owner; do not ask a different copy venue to recreate it.
+    pub(super) fn retry_guest_input(
+        &mut self,
+        operation: ServiceOperation,
+        sequence: Option<NonZeroU64>,
+        wait: Option<carrick_core_abi::PortalOwnerWait>,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
         let result = self.begin_service_inner(
             operation,
             sequence,
