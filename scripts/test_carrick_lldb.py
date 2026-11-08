@@ -28,15 +28,15 @@ PLUGIN = _load_plugin()
 class CarrickLldbHelperTests(unittest.TestCase):
     def test_copy_refusals_decode_committed_rows_only(self):
         import struct
-        rows = bytearray(16 * 128)
-        struct.pack_into("<16Q", rows, 0, 1, 73, 0x4000, 16, 2, 0, 0x105, 0, 0, 0, 0, 0, 21, 22, 23, 24)
-        struct.pack_into("<16Q", rows, 128, 0, 73, 0x8000, 8, 0, 1, 3, 1, 11, 12, 13, 14, 21, 22, 23, 24)
-        struct.pack_into("<16Q", rows, 256, 1, 73, 0x9000, 8, 0, 0, 6, 1, 11, 12, 13, 14, 21, 22, 23, 24)
-        struct.pack_into("<16Q", rows, 384, 1, 73, 0xa000, 8, 0, 0, 7, 1, 11, 12, 13, 14, 11, 12, 13, 14)
+        rows = bytearray(16 * 23 * 8)
+        struct.pack_into("<23Q", rows, 0, 1, 73, 0x4000, 16, 2, 0, 0x105, 0, 0, 0, 0, 0, 21, 22, 23, 24, 0x1234, 1, 2, 3, 4999, 8, 0)
+        struct.pack_into("<23Q", rows, 184, 0, 73, 0x8000, 8, 0, 1, 3, 1, 11, 12, 13, 14, 21, 22, 23, 24, 0x1234, 1, 2, 3, 4999, 8, 0)
+        struct.pack_into("<23Q", rows, 368, 1, 73, 0x9000, 8, 0, 0, 6, 1, 11, 12, 13, 14, 21, 22, 23, 24, 0x1234, 1, 2, 3, 4999, 8, 0)
+        struct.pack_into("<23Q", rows, 552, 1, 73, 0xa000, 8, 0, 0, 7, 1, 11, 12, 13, 14, 11, 12, 13, 14, 0x1234, 1, 2, 3, 4999, 8, 0)
         self.assertEqual(PLUGIN._copy_refusal_lines(rows), [
-            "copy-refusal nr=73 va=0x4000 len=16 argument=2 direction=in reason=unmapped(PAR.FST=0x5) owner=0 presented[mm=0,generation=0,task=0,thread=0] expected[mm=21,generation=22,task=23,thread=24]",
-            "copy-refusal nr=73 va=0x9000 len=8 argument=0 direction=in reason=owner-mismatch owner=1 presented[mm=11,generation=12,task=13,thread=14] expected[mm=21,generation=22,task=23,thread=24]",
-            "copy-refusal nr=73 va=0xa000 len=8 argument=0 direction=in reason=owner-busy owner=1 presented[mm=11,generation=12,task=13,thread=14] expected[mm=11,generation=12,task=13,thread=14]",
+            "copy-refusal nr=73 va=0x4000 len=16 argument=2 direction=in reason=unmapped(PAR.FST=0x5) owner=0 presented[mm=0,generation=0,task=0,thread=0] expected[mm=21,generation=22,task=23,thread=24] source=decoded-dispatch pc=0x1234 args=[0x1,0x2,0x3,0x1387,0x8,0x0]",
+            "copy-refusal nr=73 va=0x9000 len=8 argument=0 direction=in reason=owner-mismatch owner=1 presented[mm=11,generation=12,task=13,thread=14] expected[mm=21,generation=22,task=23,thread=24] source=decoded-dispatch pc=0x1234 args=[0x1,0x2,0x3,0x1387,0x8,0x0]",
+            "copy-refusal nr=73 va=0xa000 len=8 argument=0 direction=in reason=owner-busy owner=1 presented[mm=11,generation=12,task=13,thread=14] expected[mm=11,generation=12,task=13,thread=14] source=decoded-dispatch pc=0x1234 args=[0x1,0x2,0x3,0x1387,0x8,0x0]",
         ])
 
     def test_clone_refusal_producer_decodes_the_actual_error_stage(self):
