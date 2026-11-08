@@ -259,8 +259,7 @@ pub enum IpcCause {
     /// group-exit drain) or one Linux does not count as an interruption (a
     /// quiesce, an ignored signal).
     Control,
-    /// The park's deadline passed while the host kept it (only an
-    /// [`IpcOpKind::EpollWait`] parks with one).
+    /// The park's absolute counter deadline passed while the host kept it.
     Timeout,
 }
 
@@ -269,16 +268,8 @@ pub enum IpcCause {
 pub enum IpcHostOutcome {
     /// Return `result` after the SVC; `sigpipe` requests SIGPIPE too.
     Complete { result: i64, sigpipe: bool },
-    /// No effect was taken: resume at the SVC with the original `x0` and
-    /// syscall number (the call runs again). `timeout_ms`: a timed epoll
-    /// wait re-runs with what is left of its deadline as its timeout
-    /// argument (`x3`), never the full original timeout; 0 once it passed
-    /// (one more harvest, then 0 events).
-    Restart {
-        x0: u64,
-        nr: u32,
-        timeout_ms: Option<i32>,
-    },
+    /// Re-enter a syscall under its own register convention.
+    Restart(IpcRestart),
     /// The output was refused before consuming anything. Keep the operation
     /// and its endpoint pin while the existing owner-memory machinery waits.
     OwnerMemory {
@@ -291,9 +282,33 @@ pub enum IpcHostOutcome {
         token: IpcOpToken,
         object: IpcObjectHandle,
         lane: WaitFor,
+        deadline: Option<u64>,
         x0: u64,
         nr: u32,
     },
+}
+
+/// Register conventions for zero-progress syscall re-entry. A timed
+/// pointer argument cannot be paired with epoll's millisecond rewrite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpcRestart {
+    Original { x0: u64, nr: u32 },
+    EpollPwait { x0: u64, timeout_ms: i32 },
+}
+
+impl IpcHostOutcome {
+    /// The only argument rewrite a host completion authorizes. The syscall
+    /// ordinal travels with the convention, never with an arbitrary caller.
+    pub fn replay_argument(&self) -> Option<(carrick_abi::CanonicalNr, usize, u64)> {
+        match self {
+            Self::Restart(IpcRestart::EpollPwait { timeout_ms, .. }) => Some((
+                carrick_abi::syscall::nr::EPOLL_PWAIT,
+                3,
+                *timeout_ms as u32 as u64,
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// An operation retained across an owner-memory wait. Cancellation releases
@@ -364,20 +379,23 @@ pub fn take_handback(
 
 /// Re-run a parked epoll wait with what is left of its wait.
 fn epoll_rerun(op: &IpcOperation, clock: CounterClock) -> IpcHostOutcome {
-    IpcHostOutcome::Restart {
+    IpcHostOutcome::Restart(IpcRestart::EpollPwait {
         x0: op.orig_x0,
-        nr: op.nr,
         timeout_ms: op
             .deadline
             .get()
-            .map(|deadline| clock.remaining_ms(deadline)),
-    }
+            .map_or(-1, |deadline| clock.remaining_ms(deadline)),
+    })
 }
 
 /// The outcome of stopping `op` for `cause` at counter reading `clock`
 /// (pure policy).
-pub fn interrupted(op: &IpcOperation, cause: IpcCause, clock: CounterClock) -> IpcHostOutcome {
-    if matches!(op.kind, IpcOpKind::EpollWait | IpcOpKind::PollWait) {
+pub(crate) fn interrupted(
+    op: &IpcOperation,
+    cause: IpcCause,
+    clock: CounterClock,
+) -> IpcHostOutcome {
+    if op.kind == IpcOpKind::EpollWait {
         // epoll_wait(2) is never restarted after a handler, SA_RESTART or
         // not, and a stop followed by SIGCONT interrupts it too, with no
         // handler (man 7 signal, the Linux-specific list). Other control
@@ -416,11 +434,10 @@ pub fn interrupted(op: &IpcOperation, cause: IpcCause, clock: CounterClock) -> I
             result: LINUX_EINTR.guest_retval(),
             sigpipe: false,
         },
-        _ => IpcHostOutcome::Restart {
+        _ => IpcHostOutcome::Restart(IpcRestart::Original {
             x0: op.orig_x0,
             nr: op.nr,
-            timeout_ms: None,
-        },
+        }),
     }
 }
 
@@ -451,14 +468,131 @@ pub fn finish(
 }
 
 /// Stop a parked or handed-back operation for `cause` and finish it.
-pub fn interrupt(
+pub fn interrupt<M: carrick_guest_mem::CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
     region: &IpcRegion<'_>,
     token: IpcOpToken,
+    mm: IpcMmKey,
+    memory: &mut M,
     cause: IpcCause,
     wake: &impl IpcHostServices,
 ) -> Result<IpcHostOutcome, IpcError> {
+    wake.validate_region(region)?;
+    let op = region.operation(&token)?;
+    if op.mm != mm {
+        return Err(IpcError::Stale);
+    }
+    if op.kind == IpcOpKind::PollWait {
+        return complete_poll(context, region, token, op, memory, Some(cause), wake);
+    }
     let op = finish(region, token, wake)?;
     Ok(interrupted(&op, cause, wake.counter()))
+}
+
+/// Complete the admitted single-description poll. Readiness uses the shared
+/// IPC member-level primitive, never a numeric-fd lookup or a new relative
+/// timeout. Once decided, the answer and byte cursor stay in the same arena
+/// record through owner-copyout refusals.
+fn complete_poll<M: carrick_guest_mem::CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
+    region: &IpcRegion<'_>,
+    token: IpcOpToken,
+    mut op: IpcOperation,
+    memory: &mut M,
+    cause: Option<IpcCause>,
+    wake: &impl IpcHostServices,
+) -> Result<IpcHostOutcome, IpcError> {
+    use crate::dispatch::copyout::{self, UserSlot};
+    use carrick_el1_abi::ipc::{IpcBacking, WriteProgress, epoll::EpollMember};
+    let complete = |result| IpcHostOutcome::Complete {
+        result,
+        sigpipe: false,
+    };
+    if op.progress.len == 0 {
+        if matches!(cause, Some(IpcCause::Signal { .. } | IpcCause::Stop)) {
+            finish(region, token, wake)?;
+            return Ok(complete(LINUX_EINTR.guest_retval()));
+        }
+        let pin = OfdPin::from_raw(op.pin);
+        let description = region.fd(HostIpcWait).pinned(&pin);
+        op.pin = pin.into_raw();
+        let (object, member) = description.map_err(IpcError::Fd).and_then(|d| {
+            IpcBacking::decode(d.backing)
+                .and_then(EpollMember::of_backing)
+                .ok_or(IpcError::Corrupt)
+        })?;
+        if object.to_raw() != op.object {
+            return Err(IpcError::Corrupt);
+        }
+        let mut bytes = op.value.0.to_ne_bytes();
+        let events = i16::from_ne_bytes([bytes[4], bytes[5]]);
+        let mut guard = region.lock(object, &HostIpcWait)?;
+        let level = guard.member_level(member)?;
+        drop(guard);
+        let revents =
+            level as i16 & (events | carrick_abi::LINUX_POLLERR | carrick_abi::LINUX_POLLHUP);
+        if revents == 0
+            && !op
+                .deadline
+                .get()
+                .is_some_and(|end| wake.counter().now >= end)
+        {
+            let lane = match member {
+                EpollMember::PipeWriter => WaitFor::Writable,
+                EpollMember::EventFd
+                    if events as u16 as u32 & carrick_el1_abi::ipc::epoll::events::WRITE_SIDE
+                        != 0 =>
+                {
+                    WaitFor::Writable
+                }
+                _ => WaitFor::Readable,
+            };
+            return Ok(IpcHostOutcome::Blocked {
+                token,
+                object,
+                lane,
+                deadline: op.deadline.get(),
+                x0: op.orig_x0,
+                nr: op.nr,
+            });
+        }
+        bytes[6..].copy_from_slice(&revents.to_ne_bytes());
+        op.value = carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(bytes));
+        op.result = i64::from(revents != 0);
+        op.progress = WriteProgress::new(8);
+        region.update_operation(&token, op)?;
+    }
+    let bytes = op.value.0.to_ne_bytes();
+    while !op.progress.is_complete() {
+        let offset = op.progress.written as usize;
+        let address = op
+            .buf
+            .0
+            .checked_add(op.progress.written)
+            .ok_or(IpcError::Corrupt)?;
+        let length = (8 - offset).min(
+            (carrick_el1::substrate::ipc::USER_COPY_GRANULE
+                - address % carrick_el1::substrate::ipc::USER_COPY_GRANULE) as usize,
+        );
+        let output = match copyout::prepare(context, memory, [Some(UserSlot::new(address, length))])
+        {
+            Ok(output) => output,
+            Err(refusal) => {
+                return Ok(IpcHostOutcome::OwnerMemory {
+                    token,
+                    outcome: Box::new(refusal.into_outcome()),
+                });
+            }
+        };
+        if output.commit([&bytes[offset..offset + length]]).is_err() {
+            finish(region, token, wake)?;
+            return Ok(complete(LINUX_EFAULT.guest_retval()));
+        }
+        op.progress.written += length as u64;
+        region.update_operation(&token, op)?;
+    }
+    finish(region, token, wake)?;
+    Ok(complete(op.result))
 }
 
 /// Most bytes one host step can move (the largest pipe capacity).
@@ -609,13 +743,13 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
                 sigpipe: true,
             });
         }
+        IpcHandback::Restart if op.kind == IpcOpKind::PollWait => {}
         IpcHandback::Restart => {
             let op = finish(region, token, wake)?;
-            return Ok(IpcHostOutcome::Restart {
+            return Ok(IpcHostOutcome::Restart(IpcRestart::Original {
                 x0: op.orig_x0,
                 nr: op.nr,
-                timeout_ms: None,
-            });
+            }));
         }
         IpcHandback::Continue => {}
         IpcHandback::None => return Err(IpcError::Corrupt),
@@ -625,9 +759,12 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
         return Err(IpcError::Stale);
     }
     if let Some(cause) = signal {
-        return interrupt(region, token, cause, wake);
+        return interrupt(context, region, token, mm, memory, cause, wake);
     }
-    if matches!(op.kind, IpcOpKind::EpollWait | IpcOpKind::PollWait) {
+    if op.kind == IpcOpKind::PollWait {
+        return complete_poll(context, region, token, op, memory, None, wake);
+    }
+    if op.kind == IpcOpKind::EpollWait {
         // A parked zone epoll wait owns no progress: the host runs the
         // original call (its harvest covers both halves) with what is left
         // of its deadline, so a wake that found nothing never extends it.
@@ -760,6 +897,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
                 token,
                 object,
                 lane,
+                deadline: op.deadline.get(),
                 x0: op.orig_x0,
                 nr: op.nr,
             });
