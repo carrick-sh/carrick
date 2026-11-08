@@ -11498,6 +11498,19 @@ fn native_descriptor_argument_witness(
                 CompletionRoute::Served | CompletionRoute::WithWork
             ));
             assert_eq!(result, 8, "eventfd input uses the same owner preparation");
+            let (route, result) = run_binding(
+                &parent_binding,
+                sys::WRITE.raw(),
+                [eventfd, carrick_guest_arch::USER_CEILING, 8, 0],
+            );
+            assert_eq!(
+                result, -14,
+                "bad eventfd input must complete with EFAULT: {route:?}"
+            );
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
             let value = carrick_test_support::GuestUserBuffer::zeroed(8);
             let (_, result) = run_binding(
                 &parent_binding,
