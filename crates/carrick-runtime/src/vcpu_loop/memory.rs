@@ -895,6 +895,7 @@ mod tests {
             registers: carrick_el1_abi::ArmEntryFatalRegisters {
                 reason: Some(carrick_el1_abi::EntryBindingFatalReason::EntryBinding as u64),
                 source_location: Some((1646 << 32) | 9),
+                admission_identity: [None; 8],
                 pc: Some(0x1010),
                 lr: Some(0x2020),
                 fp: Some(0x3030),
