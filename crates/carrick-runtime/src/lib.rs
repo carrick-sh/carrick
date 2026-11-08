@@ -521,3 +521,5 @@ mod test_hooks;
 #[path = "../../carrick-vmm-hvf/src/syscall_mailbox.rs"]
 #[allow(dead_code)]
 mod hvf_mailbox_tests;
+
+mod deadline_driver;
