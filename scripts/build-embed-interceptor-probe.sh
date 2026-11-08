@@ -17,6 +17,7 @@
 # loader would make the fixture depend on the guest image's libc.
 set -eu
 cd "$(dirname "$0")/.."
+. scripts/lib/cargo-target-dir.sh
 
 target="aarch64-unknown-linux-musl"
 crate_dir="$PWD/fixtures/embed-interceptor-probe"
@@ -35,7 +36,7 @@ if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
 fi
 
 (cd "$crate_dir" && cargo build --locked --release --target "$target")
-cp -f "$crate_dir/target/$target/release/interceptor-probe" "$output_path"
+cp -f "$(cargo_target_dir "$crate_dir")/$target/release/interceptor-probe" "$output_path"
 chmod 0755 "$output_path"
 
 # Prove the two properties the guest depends on, so a toolchain change cannot
