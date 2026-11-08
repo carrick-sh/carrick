@@ -1,3 +1,13 @@
+# #887 round 2A, policy reversal: the remaining dispatch.rs change only
+# retains the refusal reason at five existing fatal boundaries. Admission,
+# completion, signal delivery, service settlement and successful dispatch
+# are unchanged from main; existing semantic and work bindings stay intact.
+# Diagnostic mapping evidence: carrick-el1-linux::dispatch::tests::
+# native_service_refusals_keep_the_error_in_the_fatal_transport and
+# stale_service_diagnostic_distinguishes_owners_without_reclassifying_busy
+# (just test-el1-native). These prove reason selection, not producer identity
+# or signal progress under contention. Typed attribution and its seven real
+# authority witnesses remain outstanding; signed evidence is director-owned.
 # #1394: additional ABI bookkeeping witness only; existing semantic and
 # work-budget bindings remain authoritative. Census publication reads counters
 # after executor join and does not alter this contract's guest operation.
