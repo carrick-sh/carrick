@@ -3682,3 +3682,18 @@ fn empty_step_and_zero_executed_lane_receipts_fail_without_candidate_tree() {
     );
     assert!(refusal_key.contains("4242 yes") && refusal_key.contains("4243 stress-ng"));
 }
+
+// Reduced from run 42427607136, el1-gate/7cd7369/el1-embed.log.
+#[test]
+fn spent_binary_budget_does_not_fail_tests_never_run() {
+    let log = "test-signed: running /w/el1_sched-d12e72e26c1d1655 el1_ --nocapture\n\
+test el1_thread_lifecycle_tgkill_right_after_clone ... FAILED\n\
+test-signed: DEADLINE /w/el1_sched-d12e72e26c1d1655 el1_thread_lifecycle_tgkill_right_after_clone (9s, CARRICK_RUN_ID=accept-20261108-015521-el1-b3-t51)\n\
+test el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation ... FAILED\n\
+test-signed: NOT-RUN /w/el1_sched-d12e72e26c1d1655 el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation (binary budget of 600s spent)\n";
+    let parsed = parse_test_log(log);
+    assert!(!parsed.failed_tests.iter().any(|t| t.contains("el1_tlb_")));
+    let keys = failure_keys(&receipt_from_el1_log(false, log));
+    assert!(keys.contains("not-run:el1-embed:el1_sched::el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation"));
+    assert!(keys.contains("test:el1-embed:deadline:el1_sched::el1_thread_lifecycle_tgkill_right_after_clone"));
+}
