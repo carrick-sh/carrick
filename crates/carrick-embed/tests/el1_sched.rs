@@ -3847,8 +3847,8 @@ fn el1_metadata_allocator_concurrent_growth() {
     assert_eq!(stats.bytes_granted, stats.bytes_returned, "{stats:?}");
     let counters = read_el1_counters().expect("EL1 counters after guest");
     assert!(
-        counters.forwarded[160].load(std::sync::atomic::Ordering::Relaxed) >= 1024,
-        "uname must execute through host service, not just a guest fast path"
+        counters.served[160].load(std::sync::atomic::Ordering::Relaxed) >= 1024,
+        "uname must execute through ring service, not host forward"
     );
 }
 

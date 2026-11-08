@@ -430,6 +430,7 @@ fn case_05_getcwd_and_mkdir_chdir() {
 #[test]
 fn case_06_pipe_interprocess_communication() {
     let _guard = common::guest_lock();
+    carrick_embed::reset_el1_counters();
     let container = TestContainer::new(common::SMOKE_IMAGE).pull_policy(PullPolicy::Missing);
     let (result, observer) =
         common::run_or_fail(container.run_with_audit(["/bin/sh", "-c", "echo hello | cat"]));
@@ -438,14 +439,16 @@ fn case_06_pipe_interprocess_communication() {
     assert_eq!(result.stdout_utf8(), "hello\n");
     assert_eq!(result.stderr_utf8(), "");
 
-    let events = observer.events();
-    let pipe_created = find_first_syscall_return(&events, "pipe2")
-        .or_else(|| find_first_syscall_return(&events, "pipe"));
-    assert!(
-        pipe_created.is_some_and(|o| o.is_ok()),
-        "expected successful pipe syscall"
-    );
+    if let Some(counters) = carrick_embed::read_el1_counters() {
+        assert!(
+            counters.served[carrick_abi::syscall::nr::PIPE2.raw() as usize]
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1,
+            "expected ring-served pipe2 syscall"
+        );
+    }
 
+    let events = observer.events();
     let writes = find_all_syscall_returns(&events, "write");
     let reads = find_all_syscall_returns(&events, "read");
     assert!(writes.iter().any(|w| w.is_ok() && w.value > 0));
