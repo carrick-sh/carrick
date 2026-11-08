@@ -7690,3 +7690,104 @@ fn entropy_fault_completion(cancel_wait: bool) {
     }
     assert_eq!(fixture.page.claimed_count(), 0);
 }
+
+#[cfg(test)]
+#[test]
+fn host_root_open_publishes_unstamped_record_through_service_notice() {
+    let fixture = NativeSignalFixture::admit_host_root(
+        ExecutionBinding {
+            task: carrick_core_abi::EntryTaskKey::from_raw(7001),
+            generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+            mm: carrick_core_abi::EntryMmKey::from_raw(1),
+            thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+        },
+        carrick_core_abi::EntryTaskKey::from_raw(7001),
+        carrick_core_abi::BirthSerial::of_task(TaskSerial::from_registry_allocation(
+            NonZeroU64::MIN,
+        )),
+    );
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    let mut service = fixture.service();
+    let mut root = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let path = b"/lib/libc.so.6";
+    let mut open =
+        alloc::vec![0u8; carrick_core_abi::host_file::record_len(path.len(), 0).unwrap()];
+    carrick_core_abi::host_file::encode(
+        &mut open,
+        carrick_core_abi::host_file::HostFileHeader {
+            op: carrick_core_abi::host_file::HostFileOp::Openat,
+            table: [1, 1, 1],
+            fd: -100,
+            flags: 0,
+            args: [0; 4],
+        },
+        path,
+        0,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        root.begin_host_file_call(
+            open.into_boxed_slice(),
+            None,
+            true,
+            None,
+            false,
+            NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(257), counters)
+        ),
+        Ok(NativeResume::Left(None))
+    ));
+    drop(root);
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    // SAFETY: fixture retains the control and exact member under its queue.
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(fixture.record.id).identity(),
+        )
+    }
+    .unwrap();
+    assert_eq!(
+        ticket.request().identity.birth.origin,
+        carrick_core_abi::service::ServiceOrigin::Initial
+    );
+    let carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } =
+        ticket.request().operation
+    else {
+        panic!("host file notice expected")
+    };
+    // SAFETY: ticket retains the request box; no ring execution can mutate it.
+    let record = unsafe {
+        core::slice::from_raw_parts_mut(
+            payload.ring_storage().raw() as *mut u8,
+            payload.length().raw() as usize,
+        )
+    };
+    let view = carrick_core_abi::host_file::HostFileRequestView::parse(record).unwrap();
+    assert_eq!(view.input(), path);
+    assert_eq!(counters.refused[257].load(Ordering::Relaxed), 0);
+    assert!(ticket.complete(false).is_ok());
+    drop(queue);
+}
