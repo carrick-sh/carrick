@@ -18,7 +18,7 @@ mod environment;
 mod inputs;
 pub mod linker;
 use environment::BuildEnvironment;
-pub use environment::{BuildPolicy, is_ambient_override, scrub_ambient_overrides};
+pub use environment::{BuildPolicy, scrub_ambient_overrides};
 pub use inputs::{
     check_leaf_closures, current_build_code, fetch_dependencies, fetch_plan, source_hashes,
 };

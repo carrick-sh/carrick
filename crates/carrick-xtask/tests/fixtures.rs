@@ -1,4 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod support;
+
+/// Each case here drives the publisher's library in-process, so it runs in a
+/// child whose Cargo environment the production policy prepared; see
+/// `support::compliant_ambient_case` for why, and for what it does not change.
+fn compliant_ambient_case() -> bool {
+    support::compliant_ambient_case(carrick_xtask::fixtures::scrub_ambient_overrides)
+}
+
 use carrick_xtask::fixtures::{
     self, CommitSha, ContentHash, Executable, GuestTarget, Manifest, Toolchain,
 };
@@ -91,6 +101,9 @@ fn restore_command(f: &Fixture, lock: &Path) -> Command {
 
 #[test]
 fn standalone_restore_waits_for_gate_before_publishing() {
+    if !compliant_ambient_case() {
+        return;
+    }
     use carrick_xtask::host_lease::{HostLease, HostLeaseMode};
     use std::io::BufRead;
     let f = Fixture::new();
@@ -143,6 +156,9 @@ fn standalone_restore_waits_for_gate_before_publishing() {
 
 #[test]
 fn restore_reuses_inherited_gate_and_rejects_shared_upgrade() {
+    if !compliant_ambient_case() {
+        return;
+    }
     use carrick_xtask::host_lease::{HostLease, HostLeaseMode};
     let f = Fixture::new();
     let lock = f.store.path().join("host.lock");
@@ -502,6 +518,9 @@ impl Fixture {
 }
 #[test]
 fn roundtrip_restores_exact_paths_and_verifies_installed_bytes() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::verify_bundle(f.repo.path(), &f.path, None).unwrap();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
@@ -533,6 +552,9 @@ fn roundtrip_restores_exact_paths_and_verifies_installed_bytes() {
 
 #[test]
 fn restore_durability_flush_budget_does_not_scale_with_executable_count() {
+    if !compliant_ambient_case() {
+        return;
+    }
     for probes in [1, 32] {
         let f = Fixture::with_probe_count(probes);
         let work = fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
@@ -546,18 +568,27 @@ fn restore_durability_flush_budget_does_not_scale_with_executable_count() {
 }
 #[test]
 fn tampered_object_is_rejected_before_any_install() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fs::write(f.object(), b"tampered").unwrap();
     f.rejected("hash mismatch");
 }
 #[test]
 fn missing_object_is_rejected_before_any_install() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fs::remove_file(f.object()).unwrap();
     f.rejected("No such file");
 }
 #[test]
 fn bundle_source_head_is_provenance_not_an_admission_key() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let mut f = Fixture::new();
     f.manifest.source_head = "a".repeat(40).try_into().unwrap();
     f.republish();
@@ -571,6 +602,9 @@ fn bundle_source_head_is_provenance_not_an_admission_key() {
 }
 #[test]
 fn expected_sha_must_match_checkout() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let error = fixtures::restore(
         f.repo.path(),
@@ -583,12 +617,18 @@ fn expected_sha_must_match_checkout() {
 }
 #[test]
 fn manifest_tamper_is_rejected() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fs::write(&f.path, b"{}").unwrap();
     f.rejected("content address mismatch");
 }
 #[test]
 fn source_tamper_and_untracked_input_are_rejected() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     write(
         f.repo.path(),
@@ -610,6 +650,9 @@ fn source_tamper_and_untracked_input_are_rejected() {
 
 #[test]
 fn local_workspace_dependency_sources_are_verified() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     write(
@@ -626,6 +669,9 @@ fn local_workspace_dependency_sources_are_verified() {
 }
 #[test]
 fn clean_restore_then_unrelated_edit_preserves_fixtures() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let mut f = Fixture::new();
     // Use the publisher's inventory for this behavioral witness. The other
     // tests retain their independent expected inventory to check scope.
@@ -645,6 +691,9 @@ fn clean_restore_then_unrelated_edit_preserves_fixtures() {
 
 #[test]
 fn acceptance_rejects_untracked_host_test_even_with_valid_fixtures() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
@@ -678,6 +727,9 @@ fn acceptance_rejects_untracked_host_test_even_with_valid_fixtures() {
 
 #[test]
 fn fixture_verification_rejects_ambient_profile_override() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     for (name, value) in [
@@ -704,6 +756,9 @@ fn fixture_verification_rejects_ambient_profile_override() {
 
 #[test]
 fn fixture_policy_identity_rejects_changed_policy() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let mut f = Fixture::new();
     f.manifest
         .build_policy
@@ -715,6 +770,9 @@ fn fixture_policy_identity_rejects_changed_policy() {
 
 #[test]
 fn cargo_home_and_parent_config_are_isolated() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let outside = CanonicalTempDir::new();
     let checkout = outside.path().join("checkout");
@@ -768,6 +826,9 @@ fn cargo_home_and_parent_config_are_isolated() {
 
 #[test]
 fn unrelated_workspace_edits_preserve_fixture_identity() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     write(
@@ -841,6 +902,9 @@ fn unrelated_workspace_edits_preserve_fixture_identity() {
 
 #[test]
 fn unresolved_fixture_closure_fails_closed() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     write(
@@ -869,6 +933,9 @@ fn unresolved_fixture_closure_fails_closed() {
 
 #[test]
 fn transitive_fixture_dependency_edits_are_rejected() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     write(
@@ -924,6 +991,9 @@ fn assert_identity_refusal(f: &Fixture, case: &str) {
 
 #[test]
 fn committed_unrelated_edit_keeps_bundle_admissible_by_input_identity() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let root = f.repo.path();
     let built_at = git(root, &["rev-parse", "HEAD"]);
@@ -950,6 +1020,9 @@ fn committed_unrelated_edit_keeps_bundle_admissible_by_input_identity() {
 
 #[test]
 fn workspace_lockfile_is_not_a_fixture_input() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // Fixture workspaces carry their own Cargo.lock; the host workspace lock
     // cannot change fixture bytes and churns with every host dependency.
     let f = Fixture::new();
@@ -969,6 +1042,9 @@ fn workspace_lockfile_is_not_a_fixture_input() {
 
 #[test]
 fn committed_fixture_input_edits_refuse_by_input_identity() {
+    if !compliant_ambient_case() {
+        return;
+    }
     for path in [
         // Fixture source.
         "conformance-probes/src/bin/hello.rs",
@@ -991,6 +1067,9 @@ fn committed_fixture_input_edits_refuse_by_input_identity() {
 
 #[test]
 fn fixture_lockfile_change_refuses_by_input_identity() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let root = f.repo.path();
     fixtures::restore(root, &f.path, None, &private_gate().lease).unwrap();
@@ -1005,6 +1084,9 @@ fn fixture_lockfile_change_refuses_by_input_identity() {
 
 #[test]
 fn toolchain_pin_change_refuses() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let root = f.repo.path();
     fixtures::restore(root, &f.path, None, &private_gate().lease).unwrap();
@@ -1032,6 +1114,9 @@ fn toolchain_pin_change_refuses() {
 
 #[test]
 fn compiler_input_outside_package_directories_refuses() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // `conformance-probes/src/lib.rs` include_str!s `shared/banner.txt`.
     let f = Fixture::new();
     let root = f.repo.path();
@@ -1047,6 +1132,9 @@ fn compiler_input_outside_package_directories_refuses() {
 
 #[test]
 fn symlink_with_identical_link_text_refuses() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // Regular `alias.txt` holds the bytes `actual.txt`; replacing it with a
     // symlink to `actual.txt` must not keep the same identity.
     let f = Fixture::new();
@@ -1063,6 +1151,9 @@ fn symlink_with_identical_link_text_refuses() {
 
 #[test]
 fn target_cfg_build_dependency_is_a_fixture_input() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // `embed-el1-sched` has an x86_64-only build-dependency: a publisher on
     // x86_64 compiles it, so it is an input whatever the verifier's host.
     let f = Fixture::new();
@@ -1090,6 +1181,9 @@ fn copy_bundle(from: &Path, to: &Path) {
 
 #[test]
 fn bundle_selection_follows_fixture_input_identity_across_commits() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let root = f.repo.path();
     let built_at = git(root, &["rev-parse", "HEAD"]);
@@ -1123,6 +1217,9 @@ fn bundle_selection_follows_fixture_input_identity_across_commits() {
 
 #[test]
 fn missing_source_hash_and_missing_executable_row_are_rejected() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let mut f = Fixture::new();
     f.manifest.sources.remove("rust-toolchain.toml");
     f.republish();
@@ -1134,6 +1231,9 @@ fn missing_source_hash_and_missing_executable_row_are_rejected() {
 }
 #[test]
 fn duplicate_or_traversing_destination_is_rejected() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let mut f = Fixture::new();
     f.manifest
         .executables
@@ -1147,6 +1247,9 @@ fn duplicate_or_traversing_destination_is_rejected() {
 }
 #[test]
 fn wrong_target_and_toolchain_are_rejected() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let mut f = Fixture::new();
     f.manifest.executables[0].target = GuestTarget::Musl;
     f.republish();
@@ -1158,6 +1261,9 @@ fn wrong_target_and_toolchain_are_rejected() {
 }
 #[test]
 fn non_executable_and_symlink_object_are_rejected() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fs::set_permissions(f.object(), fs::Permissions::from_mode(0o644)).unwrap();
     f.rejected("not executable");
@@ -1170,6 +1276,9 @@ fn non_executable_and_symlink_object_are_rejected() {
 }
 #[test]
 fn destination_symlink_is_rejected_without_touching_external_directory() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let external = CanonicalTempDir::new();
     std::os::unix::fs::symlink(external.path(), f.repo.path().join("target")).unwrap();
@@ -1178,6 +1287,9 @@ fn destination_symlink_is_rejected_without_touching_external_directory() {
 }
 #[test]
 fn installed_manifest_and_missing_installed_file_fail_closed() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     assert!(fixtures::verify_installed(f.repo.path()).is_err());
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
@@ -1189,6 +1301,9 @@ fn installed_manifest_and_missing_installed_file_fail_closed() {
 
 #[test]
 fn signed_preflight_rejects_existing_directories_without_manifest() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     for target in ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"] {
         fs::create_dir_all(
@@ -1205,6 +1320,9 @@ fn signed_preflight_rejects_existing_directories_without_manifest() {
 
 #[test]
 fn signed_preflight_rehashes_restored_executables() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
@@ -1217,6 +1335,9 @@ fn signed_preflight_rehashes_restored_executables() {
 }
 #[test]
 fn identities_reject_abbreviations_and_non_hex_values() {
+    if !compliant_ambient_case() {
+        return;
+    }
     assert!(CommitSha::try_from("HEAD".to_owned()).is_err());
     assert!(ContentHash::try_from("g".repeat(64)).is_err());
 }
@@ -1409,6 +1530,9 @@ fi
 
 #[test]
 fn remote_preparation_restores_empty_checkout_before_signed_preflight() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -1419,6 +1543,9 @@ fn remote_preparation_restores_empty_checkout_before_signed_preflight() {
 
 #[test]
 fn remote_preparation_restores_empty_checkout_with_remote_bundle() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -1432,6 +1559,9 @@ fn remote_preparation_restores_empty_checkout_with_remote_bundle() {
 
 #[test]
 fn remote_preparation_restores_raw_fixtures_after_same_sha_cleanup() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -1446,6 +1576,9 @@ fn remote_preparation_restores_raw_fixtures_after_same_sha_cleanup() {
 
 #[test]
 fn remote_preparation_admits_new_commit_with_same_fixture_inputs() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     let built_at = git(f.repo.path(), &["rev-parse", "HEAD"]);
@@ -1469,6 +1602,9 @@ fn remote_preparation_admits_new_commit_with_same_fixture_inputs() {
 
 #[test]
 fn remote_preparation_rejects_changed_fixture_inputs_before_acceptance() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     commit(
@@ -1490,6 +1626,9 @@ fn remote_preparation_rejects_changed_fixture_inputs_before_acceptance() {
 
 #[test]
 fn actions_restore_entrypoint_preserves_modes_and_passes_fixture_preflight() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -1510,6 +1649,9 @@ fn actions_restore_entrypoint_preserves_modes_and_passes_fixture_preflight() {
 
 #[test]
 fn cache_selection_preserves_ambient_wrapper_rejection_at_fixture_entrypoint() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -1541,6 +1683,9 @@ fn cache_selection_preserves_ambient_wrapper_rejection_at_fixture_entrypoint() {
 
 #[test]
 fn cache_selection_preserves_ambient_wrapper_rejection_at_fixture_publish() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -1591,6 +1736,9 @@ fn cache_selection_preserves_ambient_wrapper_rejection_at_fixture_publish() {
 
 #[test]
 fn signed_build_environment_preserves_ambient_wrapper_when_cache_disabled() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/build-env.sh");
     for (cache, wrapper) in [
         ("0", "/ambient/compiler-wrapper"),
@@ -1619,6 +1767,9 @@ fn signed_build_environment_preserves_ambient_wrapper_when_cache_disabled() {
 
 #[test]
 fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution() {
+    if !compliant_ambient_case() {
+        return;
+    }
     use yaml_rust2::{Yaml, YamlLoader};
     let workflow = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/kernel-runtime.yml"),
@@ -1862,6 +2013,9 @@ esac
 
 #[test]
 fn fixture_preparation_lease_preserves_shell_argument_boundaries() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -1889,16 +2043,25 @@ fn fixture_preparation_lease_preserves_shell_argument_boundaries() {
 
 #[test]
 fn remote_accept_cli_transfers_the_bundle_and_prepares_a_fresh_checkout() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_remote_accept_cli(false, false);
 }
 
 #[test]
 fn remote_accept_cli_attach_recovers_remote_bundle_provenance() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_remote_accept_cli(true, false);
 }
 
 #[test]
 fn remote_accept_cli_propagates_receipt_annotation_failure() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_remote_accept_cli(false, true);
 }
 
@@ -2107,6 +2270,9 @@ exec "$FIXTURE_TEST_RSYNC" "$@"
 
 #[test]
 fn fixture_artifact_is_immutable_and_retains_executable_modes() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let output = CanonicalTempDir::new();
     let artifact = fixtures::archive::pack(&f.path, output.path()).unwrap();
@@ -2124,6 +2290,9 @@ fn fixture_artifact_is_immutable_and_retains_executable_modes() {
 
 #[test]
 fn archived_missing_tampered_or_linked_objects_fail_before_publication() {
+    if !compliant_ambient_case() {
+        return;
+    }
     for case in ["missing", "tampered", "symlink", "mode"] {
         let f = Fixture::new();
         match case {
@@ -2155,6 +2324,9 @@ fn archived_missing_tampered_or_linked_objects_fail_before_publication() {
 
 #[test]
 fn remote_bundle_selection_rejects_missing_ambiguous_and_wrong_sha_inputs() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
     assert!(fixtures::resolve_bundle(f.repo.path(), &sha, None).is_err());
@@ -2189,6 +2361,9 @@ fn remote_bundle_selection_rejects_missing_ambiguous_and_wrong_sha_inputs() {
 
 #[test]
 fn signed_preparation_requires_a_bundle_and_checkout_admission() {
+    if !compliant_ambient_case() {
+        return;
+    }
     for phase in [
         carrick_xtask::accept::AcceptPhase::Signed,
         carrick_xtask::accept::AcceptPhase::All,
@@ -2221,6 +2396,9 @@ fn signed_preparation_requires_a_bundle_and_checkout_admission() {
 
 #[test]
 fn remote_preparation_rejects_unpublished_or_linked_archives() {
+    if !compliant_ambient_case() {
+        return;
+    }
     for case in ["symlink", "parent-symlink", "partial", "directory"] {
         let f = Fixture::new();
         let p = Preparation::new(&f);
@@ -2327,23 +2505,38 @@ fn check_gzip_transport(case: &str) {
 
 #[test]
 fn fixture_verification_rejects_truncated_trailer() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_gzip_transport("trailer");
 }
 #[test]
 fn fixture_verification_rejects_corrupted_crc() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_gzip_transport("crc");
 }
 #[test]
 fn fixture_verification_rejects_corrupted_length() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_gzip_transport("length");
 }
 #[test]
 fn fixture_verification_rejects_trailing_garbage() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_gzip_transport("garbage");
 }
 
 #[test]
 fn remote_preparation_persists_verified_provenance_for_both_sources() {
+    if !compliant_ambient_case() {
+        return;
+    }
     for remote in [false, true] {
         let f = Fixture::new();
         let p = Preparation::new(&f);
@@ -2374,6 +2567,9 @@ fn remote_preparation_persists_verified_provenance_for_both_sources() {
 
 #[test]
 fn replacing_shared_archive_after_verification_restores_captured_bytes() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let mut f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -2429,6 +2625,9 @@ fn replacing_shared_archive_after_verification_restores_captured_bytes() {
 
 #[test]
 fn remote_preparation_provenance_write_failure_stops_acceptance() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -2499,21 +2698,33 @@ fn check_archive_input_identity(case: &str, expected: &str) {
 
 #[test]
 fn archive_verification_rejects_changed_build_policy_before_provenance() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_archive_input_identity("policy", "build policy mismatch");
 }
 
 #[test]
 fn archive_verification_rejects_changed_scoped_inputs_before_provenance() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_archive_input_identity("source", "dirty fixture source inputs");
 }
 
 #[test]
 fn archive_verification_rejects_ambient_override_before_provenance() {
+    if !compliant_ambient_case() {
+        return;
+    }
     check_archive_input_identity("ambient", "build policy forbids ambient");
 }
 
 #[test]
 fn archive_verification_records_scoped_evidence_atomically() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
@@ -2557,6 +2768,9 @@ fn archive_verification_records_scoped_evidence_atomically() {
 
 #[test]
 fn cargo_dep_info_records_out_of_package_compiler_inputs() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // A real Cargo build reports `#[path]` modules, `include_str!` targets
     // outside the package and build-script `rerun-if-changed` files.
     let snapshot = CanonicalTempDir::new();
@@ -2586,6 +2800,11 @@ fn cargo_dep_info_records_out_of_package_compiler_inputs() {
     );
     let output = carrick_xtask::command::offline_cargo()
         .current_dir(root.join("fixtures/probe"))
+        // The dep-info is classified by its path under this snapshot, so the
+        // build's target directory is part of the assertion. Pin it instead of
+        // letting an ambient CARGO_TARGET_DIR move the artifacts elsewhere
+        // (#1888); this is the same spelling cargo picks with no target dir set.
+        .env("CARGO_TARGET_DIR", root.join("fixtures/probe/target"))
         .args(["build", "--offline", "--quiet"])
         .output()
         .unwrap();
@@ -2615,6 +2834,9 @@ fn cargo_dep_info_records_out_of_package_compiler_inputs() {
 
 #[test]
 fn dep_info_classification_fails_closed() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let snapshot = CanonicalTempDir::new();
     let root = snapshot.path();
     let elsewhere = CanonicalTempDir::new();
@@ -2665,6 +2887,9 @@ fn dep_info_classification_fails_closed() {
 
 #[test]
 fn every_executable_has_a_declared_dep_info_location() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let embed = [
         ("embed-interceptor-probe", "interceptor-probe"),
@@ -2694,6 +2919,9 @@ fn every_executable_has_a_declared_dep_info_location() {
 
 #[test]
 fn recorded_compiler_inputs_must_be_tracked_sources() {
+    if !compliant_ambient_case() {
+        return;
+    }
     for (inputs, expected) in [
         (vec!["target/generated.rs".to_owned()], "under target/"),
         (vec!["shared/missing.txt".to_owned()], "not a tracked file"),
@@ -2725,6 +2953,9 @@ fn recorded_compiler_inputs_must_be_tracked_sources() {
 
 #[test]
 fn source_entries_hash_with_type_and_length_framing() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let root = f.repo.path();
     assert_eq!(
@@ -2748,6 +2979,9 @@ fn source_entries_hash_with_type_and_length_framing() {
 
 #[test]
 fn unfiltered_graph_includes_host_only_build_dependencies() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let sources = fixtures::source_hashes(f.repo.path(), &[]).unwrap();
     assert!(sources.contains_key("crates/fixture-host-helper/src/lib.rs"));
@@ -2759,6 +2993,9 @@ fn unfiltered_graph_includes_host_only_build_dependencies() {
 
 #[test]
 fn dep_info_refuses_compiler_inputs_reached_through_symlinks() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // `shared/current.txt -> a.txt`: recording only the canonical `a.txt`
     // would let a retarget to `b.txt` keep the identity.
     let snapshot = CanonicalTempDir::new();
@@ -2791,6 +3028,9 @@ fn dep_info_refuses_compiler_inputs_reached_through_symlinks() {
 
 #[test]
 fn checkout_build_script_refuses_publish_and_admission() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // A build script can read any file without telling dep-info. Checkout
     // build code is forbidden outright; no review can admit it.
     let f = Fixture::new();
@@ -2812,6 +3052,9 @@ fn checkout_build_script_refuses_publish_and_admission() {
 
 #[test]
 fn reviewed_registry_build_code_list_is_exact() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // A stale entry (registry build code no longer in the graph) refuses, and
     // the list is part of the inventory.
     let f = Fixture::new();
@@ -2842,6 +3085,9 @@ fn reviewed_registry_build_code_list_is_exact() {
 
 #[test]
 fn lockfile_checksums_key_registry_build_code() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let lock = "version = 4\n\n[[package]]\nname = \"libc\"\nversion = \"0.2.189\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"abc\"\n\n[[package]]\nname = \"local\"\nversion = \"0.0.0\"\n";
     let checksums = fixtures::build_code::lock_checksums(lock);
     assert_eq!(checksums.len(), 1);
@@ -2857,6 +3103,9 @@ fn lockfile_checksums_key_registry_build_code() {
 
 #[test]
 fn unreviewed_proc_macro_refuses() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let root = f.repo.path();
     write(
@@ -2891,6 +3140,9 @@ fn unreviewed_proc_macro_refuses() {
 
 #[test]
 fn every_linker_input_reference_refuses() {
+    if !compliant_ambient_case() {
+        return;
+    }
     for (origin, text) in [
         (
             "conformance-probes/.cargo/config.toml",
@@ -2937,6 +3189,9 @@ fn every_linker_input_reference_refuses() {
 
 #[test]
 fn linker_script_reference_must_be_an_inventoried_input() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // A repo-root linker script named by tracked Cargo configuration is read
     // by the linker, which dep-info does not report.
     let f = Fixture::new();
@@ -2963,6 +3218,9 @@ fn linker_script_reference_must_be_an_inventoried_input() {
 
 #[test]
 fn build_script_link_arg_outputs_follow_the_linker_rule() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let snapshot = CanonicalTempDir::new();
     let root = snapshot.path();
     let output = "fixtures/embed-x/target/aarch64-unknown-linux-musl/release/build/x-0123/output";
@@ -2987,6 +3245,9 @@ fn build_script_link_arg_outputs_follow_the_linker_rule() {
 
 #[test]
 fn checkout_build_script_module_change_refuses() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // An approved build.rs that `mod helper;`s: approval of the entry file
     // alone would let helper.rs change behaviour.
     let f = Fixture::new();
@@ -3017,6 +3278,9 @@ fn checkout_build_script_module_change_refuses() {
 
 #[test]
 fn decoy_package_linker_script_refuses() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // An inventoried package-local link.ld must not authorize a reference the
     // linker may resolve elsewhere (e.g. the repo root).
     let f = Fixture::new();
@@ -3041,6 +3305,9 @@ fn decoy_package_linker_script_refuses() {
 
 #[test]
 fn response_file_pulling_external_linker_script_refuses() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let root = f.repo.path();
     write(root, "conformance-probes/link.rsp", b"-T ../external.ld\n");
@@ -3063,6 +3330,9 @@ fn response_file_pulling_external_linker_script_refuses() {
 
 #[test]
 fn performance_probes_are_included_in_executable_inventory() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let root = f.repo.path();
     write(
@@ -3092,6 +3362,9 @@ fn performance_probes_are_included_in_executable_inventory() {
 
 #[test]
 fn real_repo_inventory_includes_perf_probes() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -3120,6 +3393,9 @@ fn real_repo_inventory_includes_perf_probes() {
 
 #[test]
 fn verification_stamp_reuses_unchanged_files_and_refuses_restored_mtime_tamper() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     fixtures::verify_installed(f.repo.path()).unwrap();
@@ -3147,6 +3423,9 @@ fn verification_stamp_reuses_unchanged_files_and_refuses_restored_mtime_tamper()
 
 #[test]
 fn installed_receipts_distinguish_recomputed_hashes_from_stamp_reuse() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     // An installed historical receipt lacks work metadata; revalidation must
@@ -3189,6 +3468,9 @@ fn installed_receipts_distinguish_recomputed_hashes_from_stamp_reuse() {
 
 #[test]
 fn concurrent_installed_verification_tolerates_missing_stamps() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
     fs::remove_file(f.repo.path().join("target/fixtures/verified-stat-v1.json")).unwrap();
@@ -3212,6 +3494,9 @@ fn concurrent_installed_verification_tolerates_missing_stamps() {
 
 #[test]
 fn restore_never_waits_on_the_ambient_host_lease() {
+    if !compliant_ambient_case() {
+        return;
+    }
     // A real gate holds the lock the environment names; the restore under
     // test must finish on its own private gate instead of queueing (#1180).
     let held = tempfile::NamedTempFile::new().unwrap();
@@ -3256,6 +3541,9 @@ fn restore_under_a_held_ambient_lease_child() {
 
 #[test]
 fn restore_refuses_a_shared_lease() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let f = Fixture::new();
     let lock = tempfile::NamedTempFile::new().unwrap();
     let shared = carrick_xtask::host_lease::HostLease::acquire_path(
@@ -3274,6 +3562,9 @@ fn restore_refuses_a_shared_lease() {
 
 #[test]
 fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
+    if !compliant_ambient_case() {
+        return;
+    }
     let mut f = Fixture::new();
     let output = CanonicalTempDir::new();
     let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
