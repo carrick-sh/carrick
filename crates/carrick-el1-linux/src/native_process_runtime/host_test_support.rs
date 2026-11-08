@@ -2179,6 +2179,14 @@ fn prepare_signal_sibling(fixture: &NativeSignalFixture, host_issued: bool) -> E
         mm: carrick_core_abi::EntryMmKey::from_raw(1),
         thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(102),
     };
+    // The host issues the sibling's tid in the shared namespace table before
+    // registration claims it, as a production host-born thread does.
+    fixture
+        .zone
+        .namespace()
+        .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            ns.reserve_exact(42, ClaimKind::Thread).unwrap();
+        });
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
     if host_issued {
         control
@@ -2500,12 +2508,6 @@ fn add_signal_sibling(
         record,
         ..
     } = prepare_signal_sibling(fixture, host_issued);
-    fixture
-        .zone
-        .namespace()
-        .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
-            ns.reserve_exact(42, ClaimKind::Thread).unwrap();
-        });
     fixture
         .registry
         .register_thread(
