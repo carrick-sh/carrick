@@ -2726,6 +2726,36 @@ mod anonymous_wait_cancellation_tests {
     }
 
     #[test]
+    fn anonymous_host_handback_preserves_replay_domain() {
+        let fixture = native_exec_fixture();
+        let sibling = add_signal_sibling(&fixture, None, false);
+        let key = park_anonymous_sibling(&fixture, &sibling);
+        assert_eq!(
+            fixture.zone.claim_for_host(
+                sibling.record,
+                None,
+                carrick_sched_core::Handback::Control,
+                &carrick_sched_core::ShortLockSpin,
+            ),
+            carrick_sched_core::HostClaim::Claimed,
+        );
+        let record = fixture.zone.live(sibling.record).unwrap();
+        assert_eq!(
+            fixture
+                .zone
+                .object_queue_census(key.index())
+                .unwrap()
+                .waiters,
+            0
+        );
+        assert!(record.has_object_operation());
+        assert!(
+            !record.has_adapter_operation(),
+            "anonymous replay must not enter IPC cancellation or host IPC resume"
+        );
+    }
+
+    #[test]
     fn exit_group_entry_cancels_parked_anonymous_edit_without_effects() {
         let fixture = native_exec_fixture();
         let sibling = add_signal_sibling(&fixture, None, false);
