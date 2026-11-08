@@ -27,9 +27,10 @@
  *   REFUSE  `hvpatch-native-crossing-refused`, `el1-grant-refusal`,
  *           `el1-native-diagnostic`, `el1-zone-capture-missing`,
  *           `el1-task-record-stale`
- * and an END census. Faults EL1 serves in the ring (native owners) do not
- * surface here; a SIGSEGV exit with no FAULT/DELIVER line was decided in the
- * ring, which is itself the answer to "where".
+ * and an END census. #1857 adds failure-only signal frame/terminal context
+ * to el1-native-diagnostic. In-ring faults still need not surface as FAULT
+ * or DELIVER; correlate DIAGNOSTIC with the terminal and guest-core state.
+ * The renamed provider has not yet been live-qualified on this worker.
  *
  * (b) PROVIDER ABI (from `carrick-observability` probe declarations)
  * ------------------------------------------------------------------
@@ -209,7 +210,7 @@ carrick*:::el1-native-diagnostic
 /strstr(execname, "el1_sched") != NULL/
 {
 	last = timestamp;
-	printf("REFUSE|fork|ns=%d|reason=%u|a=0x%x|b=0x%x|detail=%s\n",
+	printf("DIAGNOSTIC|ns=%d|cpu=%u|mm=0x%x|root=0x%x|detail=%s\n",
 	    timestamp, (uint32_t)arg0, arg1, arg2, copyinstr(arg3));
 }
 

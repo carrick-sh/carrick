@@ -28,7 +28,13 @@ failure, not signed proof of its cause.
 
 The fixture's ACKS are not hardware shootdown acknowledgements. Page edits
 use the shared MM owner and descriptor publication; architectural invalidation
-is performed by the ARM venue. Expected permission faults run through
+is performed by the ARM venue. The in-ring mprotect entry is
+`dispatch.rs`'s `permission` adapter -> `memory::try_serve_mprotect` with
+`HardwareAnonymousPermissionEditor`; native descriptor transactions use
+`CurrentMmMaintenance`, whose `HardwareCpu::invalidate_asid` executes
+`DSB ISHST; TLBI ASIDE1IS; DSB ISH; ISB` (architectural broadcast, not a
+fixture ACKS increment). Host-served edits retain the HVF maintenance path.
+Expected permission faults run through
 `dispatch_fault_with_prepared` and the declined/native signal owner; a
 host-classified fault can re-enter via `arm_deliver_declined_fault_signal_with`.
 Its terminal default disposition returns to the existing host core/exit path.
@@ -54,6 +60,9 @@ recent PRs without a signed bisect.
 One suspect: the ARM `access_user_target` disallows backing supply for a direct
 signal copy, and `copy_signal_frame` collapses OwnerWait to Fault. An untouched
 stack page or an owner dependency may therefore prevent handler installation.
+The x86 `native_process::Service::copy_signal_bytes` similarly converts
+OwnerWait to Busy before the shared boolean frame-copy result; that venue
+also needs a retained-signal-copy investigation if contention is observed.
 No such failure has been observed on HVF in this round. Do not fix it by
 pretouching stacks, serializing the probes, or changing deadlines.
 
