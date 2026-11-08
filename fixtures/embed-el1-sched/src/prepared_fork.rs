@@ -9,6 +9,27 @@ fn errno_if_failed(rc: i64) -> i64 {
     }
 }
 
+/// The readiness word precedes the diagnostic record even when ppoll failed.
+/// `consumed` includes any partial readiness read; never decode its remainder
+/// as child fields. The caller has reaped the child, so EOF bounds every read.
+fn read_diagnostics(fd: libc::c_int, consumed: usize, payload: &mut [u8; 96]) -> isize {
+    let mut remainder = [0u8; 8];
+    let mut skipped = consumed;
+    while skipped < remainder.len() {
+        let rc = unsafe { libc::read(fd, remainder.as_mut_ptr().cast(), remainder.len() - skipped) };
+        if rc <= 0 { return rc; }
+        skipped += rc as usize;
+    }
+    let mut have = 0;
+    while have < payload.len() {
+        let rc = unsafe { libc::read(fd, payload[have..].as_mut_ptr().cast(), payload.len() - have) };
+        if rc < 0 { return rc; }
+        if rc == 0 { break; }
+        have += rc as usize;
+    }
+    have as isize
+}
+
 /// Keep both processes alive while publishing inherited prepared backing,
 /// restoring PROT_NONE data and writing both inherited pages independently.
 pub(crate) fn run() -> i32 {
@@ -227,13 +248,7 @@ pub(crate) fn run() -> i32 {
     let mut child = [-999i64; 12];
     let mut payload = [0u8; 96];
     // Child has exited (or alarm will terminate this fixture); EOF cannot hang.
-    let diagnostic_read = unsafe {
-        libc::read(
-            c2p_read.as_raw_fd(),
-            payload.as_mut_ptr().cast(),
-            payload.len(),
-        )
-    };
+    let diagnostic_read = read_diagnostics(c2p_read.as_raw_fd(), have, &mut payload);
     let diagnostic_errno = errno_if_failed(diagnostic_read as i64);
     if diagnostic_read == payload.len() as isize {
         for (value, bytes) in child.iter_mut().zip(payload.chunks_exact(8)) {
@@ -271,4 +286,28 @@ pub(crate) fn run() -> i32 {
         pfd.revents
     );
     if ok { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn diagnostic_record_stays_aligned_after_failed_or_partial_poll_read() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let expected = [0i64, 0, 34, 0, 0, 0, 8, 0, 0, 17, 51, 68];
+        for consumed in [0, 3, 8] {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            let mut stream = 1u64.to_le_bytes().to_vec();
+            for field in expected { stream.extend(field.to_le_bytes()); }
+            // Simulate exactly the bytes already consumed by the readiness path.
+            let remaining = &stream[consumed..];
+            assert_eq!(unsafe { libc::write(writer.as_raw_fd(), remaining.as_ptr().cast(), remaining.len()) }, remaining.len() as isize);
+            drop(writer);
+            let mut payload = [0; 96];
+            assert_eq!(super::read_diagnostics(reader.as_raw_fd(), consumed, &mut payload), 96);
+            let actual: Vec<_> = payload.chunks_exact(8).map(|word| i64::from_le_bytes(word.try_into().unwrap())).collect();
+            assert_eq!(actual, expected, "readiness bytes consumed: {consumed}");
+        }
+    }
 }
