@@ -9,6 +9,7 @@
 # through carrick's VFS seam and must not depend on the image's libc.
 set -eu
 cd "$(dirname "$0")/.."
+. scripts/lib/cargo-target-dir.sh
 
 target="aarch64-unknown-linux-musl"
 crate_dir="$PWD/fixtures/embed-zone-readers"
@@ -23,7 +24,7 @@ if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
 fi
 
 (cd "$crate_dir" && cargo build --locked --release --target "$target")
-cp -f "$crate_dir/target/$target/release/zone-readers" "$output_path"
+cp -f "$(cargo_target_dir "$crate_dir")/$target/release/zone-readers" "$output_path"
 chmod 0755 "$output_path"
 
 if ! file "$output_path" | grep -Eq 'ELF 64-bit.*ARM aarch64.*statically linked'; then
