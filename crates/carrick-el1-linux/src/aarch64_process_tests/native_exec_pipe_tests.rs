@@ -306,8 +306,7 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
             &mut service,
             parent,
             child,
-            operation,
-            bitset,
+            (operation, bitset),
         );
         registry.unregister_root_for_test(&runtime);
         return;
@@ -873,9 +872,9 @@ fn child_futex<'a>(
     service: &mut Physical<'a, Aarch64ParkedContext>,
     parent: TaskKey,
     child: TaskKey,
-    operation: u64,
-    bitset: u64,
+    futex: (u64, u64),
 ) {
+    let (operation, bitset) = futex;
     let counters = &carrick_el1_abi::Counters::new();
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
     use carrick_guest_arch::{Access, GuestLen};
@@ -1001,6 +1000,9 @@ fn child_futex<'a>(
             None,
             |_| core::ptr::null_mut(),
         );
+        if operation == (128 | 256 | 9) && bitset == 0 {
+            assert_eq!(frame.x[0] as i64, -22, "native child receives EINVAL");
+        }
         if route == CompletionRoute::Forward {
             // Complete the same unclaimed-syscall capture as the ARM vector.
             // Derive lineage from this real exec successor, not a fabricated
@@ -1039,7 +1041,7 @@ fn child_futex<'a>(
             );
         }
         let expected_route = if operation == (128 | 256 | 9) && bitset == 0 {
-            CompletionRoute::Forward
+            CompletionRoute::Served
         } else {
             CompletionRoute::Suspended
         };
@@ -1053,7 +1055,7 @@ fn child_futex<'a>(
         assert!(entry.take_run_failure().is_none());
     }
     if operation == (128 | 256 | 9) && bitset == 0 {
-        registry.unregister_root_for_test(&runtime);
+        registry.unregister_root_for_test(runtime);
         return;
     }
     assert_eq!(word.reads.get(), 1, "one refusal transfers to the owner");

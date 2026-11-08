@@ -130,6 +130,13 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
     fn retained_deadline(&self) -> Option<CounterTick> {
         self.operation.as_ref().map(|op| op.deadline)
     }
+    fn invalid(
+        &mut self,
+        result: carrick_personality_linux::entry::SyscallResult,
+    ) -> Option<Served> {
+        self.frame.x[0] = result.raw() as u64;
+        Some(Served::Returned { switched: false })
+    }
     fn wake(
         &mut self,
         mm: ReservationMm,
