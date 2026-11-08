@@ -2761,26 +2761,7 @@ fn archive_verification_records_scoped_evidence_atomically() {
 
 #[test]
 fn cargo_dep_info_is_independent_of_hostile_ambient_cargo_settings() {
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "cargo_dep_info_records_out_of_package_compiler_inputs",
-            "--nocapture",
-        ])
-        .env("CARGO_TARGET_DIR", "/nonexistent/hostile")
-        .env("CARGO_BUILD_TARGET_DIR", "/nonexistent/hostile-build")
-        .env("CARGO_BUILD_JOBS", "0")
-        .env("RUSTC_WRAPPER", "/nonexistent/wrapper")
-        .env("RUSTC_WORKSPACE_WRAPPER", "/nonexistent/workspace-wrapper")
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && stdout.contains("test result: ok. 1 passed;"),
-        "hostile-environment child failed: {}\n{stdout}\n{stderr}",
-        output.status
-    );
+    cargo_env::assert_hostile_cargo_test("cargo_dep_info_records_out_of_package_compiler_inputs");
 }
 
 #[test]
