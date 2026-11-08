@@ -101,6 +101,18 @@ esac
 
 /// Capture the existing recipe as structured argv, without compiling its tests.
 pub fn records(root: &Path, recipe: &str, args: &[String]) -> Result<Vec<Vec<String>>> {
+    Ok(records_with_units(root, recipe, args)?
+        .into_iter()
+        .map(|r| r[1..].to_vec())
+        .collect())
+}
+
+/// Structured records prefixed by the test-batch compilation unit (empty for direct Cargo).
+pub(crate) fn records_with_units(
+    root: &Path,
+    recipe: &str,
+    args: &[String],
+) -> Result<Vec<Vec<String>>> {
     let temp = tempfile::tempdir()?;
     let stub = temp.path().join("cargo");
     std::fs::write(&stub, CAPTURE)?;
@@ -122,13 +134,14 @@ pub fn records(root: &Path, recipe: &str, args: &[String]) -> Result<Vec<Vec<Str
         .env("PATH", capture_path)
         .env("CARRICK_REAL_CARGO", real_cargo)
         .env("CARRICK_TEST_CAPTURE", temp.path().join("commands"))
-        .env("CARRICK_TEST_RECORDS", &log)
+        .env("CARRICK_TEST_BATCH_RECORDS", &log)
+        .env_remove("CARRICK_TEST_BATCH_UNIT")
         .env("CARRICK_TEST_XTASK", snapshot_xtask(temp.path())?)
         .status()?;
     if !status.success() {
         return Err(format!("capture {recipe} failed").into());
     }
-    parse_null_delimited_records(&std::fs::read(log)?, 3)
+    parse_null_delimited_records(&std::fs::read(log)?, 4)
 }
 
 fn parse_null_delimited_records(data: &[u8], min_fields: usize) -> Result<Vec<Vec<String>>> {
