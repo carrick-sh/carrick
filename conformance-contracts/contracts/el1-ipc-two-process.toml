@@ -36,6 +36,7 @@ rationale = "Request/response IPC between forked processes (`pairs` concurrent p
 [bindings]
 vm_free = [
   "carrick-el1-abi::ipc::tests::el1_ipc_too_small_retained_ring_stays_owned_until_replacement (#1506: retained extent identity, no stock consumption on refusal, exactly one replacement transfer; constructor syscall remains unserved)",
+  "carrick-el1-abi::ipc::tests::lock_release (shared object and descriptor guard entry points; exact per-slot release revisions; ReleaseTicket release-before-enrollment and two-live-thread release-after-park for ARM and x86 contexts; no executor-capacity or constructor-continuation claim)",
   "carrick-el1-linux::native_process_runtime::host_test_support::portal_wait_terminal_cancellation_resumes_exact_native_service_waiter (portal service cancellation component: caught-signal interruption retains committed CarrierWork; typed terminal cancellation detaches its exact enrolled portal queue, resumes the waiter and preserves completed result 65; outside the scalar IPC fence)",
   "carrick-sched-core::spaces::notification::tests::actual_gate_refusal_during_final_release_cannot_park_after_it (#1773: shared notification publication preserves exact operation custody and prevents a stranded scheduler record after final release; no change to queue delivery, IPC semantics or handback identity)",
   "carrick-kernel::dispatch::fs::tests::serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations (production pipe2/close at an 8193-fd limit, two fill/drain rounds with a live metadata queue)",

@@ -1226,7 +1226,9 @@ pub(crate) struct Locked<'a> {
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
         self.record.lock.store(0, Ordering::Release);
-
+        if let Some((release, index)) = self.release {
+            release.released(index);
+        }
     }
 }
 
