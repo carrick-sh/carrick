@@ -9,6 +9,14 @@ structural_budgets = []
 rationale = "One bounded pathname read and one retained owner copyout; no host-task fallback and no retries or polling. The native harness asserts zero forwarded calls."
 
 [bindings]
+embed = [
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_two_live_relative_and_symlink_exec",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_real_fork_inheritance",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_real_vfork_shared_mm",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_two_live_threads",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_failed_exec_preserves_running_caller",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_root_rename_unlink_live_holders",
+]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_readlink_exe",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_readlink_copyout_busy_once_then_success",
@@ -25,5 +33,5 @@ vm_free = [
 [bindings.unresolved]
 embed_structural = "Director: exact signed artifact must demonstrate one retained readlink service and no host syscall replay."
 observation = "The VM-free dispatch witness asserts zero forwarded calls; no WorkObservation schema exists for executable custody."
-embed = "Director: signed real go-build row on this exact head; this worker has no HVF"
+ecosystem = "Director: signed real go-build row on this exact head; this worker has no HVF"
 docker = "Director: native arm64 go-build differential"

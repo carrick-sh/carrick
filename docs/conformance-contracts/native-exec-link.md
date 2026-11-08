@@ -82,3 +82,23 @@ scheduler activation are the corrected head fixture, and it reaches errno
 **38**, not Declined or a non-runnable record. Restore the routing arm after
 this mutation; no production mutation is committed. Durable worker log:
 `/var/lib/carrick-conductor/evidence/1862-r3/semantic-red.log`.
+
+## Production lifecycle bindings (round 3)
+
+The six `carrick-conformance-next::native_exe_lifecycle` cases replace the
+supplied-object controls as the production population witnesses. The
+fixture forks two children and actually execs distinct copies, one by a
+relative pathname and one via a final symlink. Each child reads its own
+link before acknowledging startup. They remain live while separate cases
+exercise real fork inheritance, vfork/shared-MM, two live threads, failed
+exec, and root rename/unlink. No host test binds executable custody.
+The fixture README names the precise preparation-binding mutation and
+signed commands.
+
+Native Linux x86_64 ran all six fixture scenarios successfully and the
+AArch64 musl fixture compiled. These qualify the choreography, not the
+Carrick lifecycle. The production capability and physical adopt path are
+macOS/AArch64-gated; this worker cannot execute the new guest cases or the
+binding-removal experiment. Their signed green and mutation red results
+remain **unverified**, as does the native arm64 Docker bless. Do not count
+Linux fixture controls or a cross-check as either result.
