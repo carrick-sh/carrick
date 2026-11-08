@@ -47,6 +47,12 @@ fn serial_host_native_fork_exec_child_timed_futex() {
     );
 }
 
+/// RED: the exec successor has no retained executable-object capability yet.
+#[test]
+fn serial_host_native_fork_exec_child_readlink_exe() {
+    fork_exec_probe_with_departure(None, u32::MAX as u64, false, None, None, true);
+}
+
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
     fork_exec_probe(futex, bitset, false, None);
 }
@@ -61,7 +67,7 @@ fn fork_exec_probe(
     timed: bool,
     metadata: Option<super::pipe_metadata_tests::Case>,
 ) {
-    fork_exec_probe_with_departure(futex, bitset, timed, metadata, None);
+    fork_exec_probe_with_departure(futex, bitset, timed, metadata, None, false);
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +86,7 @@ fn serial_host_native_child_timed_futex_carrier_exit() {
         true,
         None,
         Some(TimerDeparture::CarrierExit),
+        false,
     );
 }
 
@@ -91,6 +98,7 @@ fn serial_host_native_child_timed_futex_slot_reset() {
         true,
         None,
         Some(TimerDeparture::SlotReset),
+        false,
     );
 }
 
@@ -102,6 +110,7 @@ fn serial_host_native_child_timed_futex_carrier_exit_wake() {
         true,
         None,
         Some(TimerDeparture::CarrierExitWake),
+        false,
     );
 }
 
@@ -113,6 +122,7 @@ fn serial_host_native_child_timed_futex_slot_reset_wake() {
         true,
         None,
         Some(TimerDeparture::SlotResetWake),
+        false,
     );
 }
 
@@ -122,6 +132,7 @@ fn fork_exec_probe_with_departure(
     timed: bool,
     metadata: Option<super::pipe_metadata_tests::Case>,
     departure: Option<TimerDeparture>,
+    readlink: bool,
 ) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let metadata_scope = MetadataScope::new(fixture);
@@ -412,6 +423,12 @@ fn fork_exec_probe_with_departure(
     {
         memory.as_mut_bytes()[index * 8..index * 8 + 8].copy_from_slice(&word.to_ne_bytes());
     }
+    if readlink {
+        if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+            work.settled();
+        }
+        memory.as_mut_bytes()[..15].copy_from_slice(b"/proc/self/exe\0");
+    }
     let mut cpu = crate::sched::FakeCpu::default();
     assert_eq!(fixture.slot.raw(), 0);
     // SAFETY: zero is the valid empty name-cache state; retained by fixture.
@@ -499,6 +516,29 @@ fn fork_exec_probe_with_departure(
             None,
             |_| core::ptr::null_mut(),
         );
+        if route == carrick_personality_linux::dispatch::CompletionRoute::Forward {
+            let (page, _) = fixture.task.lifecycle_refs().unwrap();
+            let owner = registry.thread_group_owner(
+                fixture.zone,
+                page,
+                fixture.task.visible_pid().unwrap(),
+            );
+            assert_eq!(
+                crate::dispatch::native_unstaged_exit(
+                    &mut frame,
+                    &fixture.task.linux,
+                    carrick_el1_abi::Action::Forward,
+                    || owner,
+                    &counters,
+                ),
+                crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served)
+            );
+            assert_eq!(
+                frame.x[0] as i64, -38,
+                "unclaimed native child receives errno 38"
+            );
+            assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
+            assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 1);
         drop(entry);
         if metadata.is_some() {
             assert_eq!(
@@ -541,6 +581,16 @@ fn fork_exec_probe_with_departure(
         );
         frame.x[0]
     };
+    if readlink {
+        assert_eq!(
+            call_full(78, (-100i64) as u64, memory.arg(), memory.arg() + 512, 128),
+            16
+        );
+        assert_eq!(&memory.as_mut_bytes()[512..528], b"/bin/pipe-writer");
+        assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
+        registry.unregister_root_for_test(&runtime);
+        return;
+    }
     if let Some(case) = metadata {
         use carrick_personality_linux::crossing::nr as sys;
         for fd in [3, 4] {
