@@ -1076,6 +1076,10 @@ def _c_global_load_addr(target, name: str) -> Optional[int]:
 
 # ----- the top-level `carrick` multiplex command --------------------------
 
+def _mmap_record_capacity(records_type, record_type):
+    return records_type.GetNumberOfElements()
+
+
 def _format_mmap_failure(words):
     if len(words) != 15:
         raise ValueError("mmap failure record must have 15 words")
@@ -1161,7 +1165,7 @@ def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
     records_type = fields["records"].GetType()
     record_type = records_type.GetArrayElementType()
     stride = record_type.GetByteSize()
-    capacity = records_type.GetNumberOfElements()
+    capacity = _mmap_record_capacity(records_type, record_type)
     record_fields = {record_type.GetFieldAtIndex(i).GetName(): record_type.GetFieldAtIndex(i)
                      for i in range(record_type.GetNumberOfFields())}
     if (capacity != 16 or set(record_fields) != {"ready", "words"}

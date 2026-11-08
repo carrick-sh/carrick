@@ -26,6 +26,19 @@ PLUGIN = _load_plugin()
 
 
 class CarrickLldbHelperTests(unittest.TestCase):
+    def test_mmap_array_extent_uses_supported_sbtype_size_api(self):
+        class SizedType:
+            def __init__(self, size):
+                self.size = size
+
+            def GetByteSize(self):
+                return self.size
+
+        self.assertEqual(PLUGIN._mmap_record_capacity(SizedType(2048), SizedType(128)), 16)
+        for total, stride in [(2048, 0), (2049, 128)]:
+            with self.assertRaises(ValueError):
+                PLUGIN._mmap_record_capacity(SizedType(total), SizedType(stride))
+
     def test_mmap_failure_formats_native_known_answer_and_rejects_missing_words(self):
         words = [1, 42, 0, 262144, 3, 0x22, 1, 0x6000000000, 0x6800000000,
                  (1 << 64) - 1, 0, 0, 0, 192 << 30, 512 << 20]
