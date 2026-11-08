@@ -97,7 +97,16 @@ const _: () = {
     assert!(STRIDE.is_multiple_of(align_of::<ThreadControlSlot>() as u64));
     assert!(BINDING_OFFSET + 2 * STRIDE <= TASK_OFFSET);
     assert!(TASK_OFFSET + 2 * STRIDE <= CONTROL_OFFSET);
-    assert!(CONTROL_OFFSET + 2 * STRIDE <= 0xb000);
+    assert!(CONTROL_OFFSET + 2 * STRIDE <= carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET);
+    assert!(
+        (carrick_el1_abi::THREAD_POOL_ENTRIES + 1) * size_of::<ThreadControlSlot>()
+            <= carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_SIZE as usize
+    );
+    assert!(
+        carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET
+            + carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_SIZE
+            <= ROUTES_OFFSET
+    );
     assert!(ROUTES_OFFSET >= 0xc000 + 9 * size_of::<ThreadControlSlot>() as u64);
     assert!(ROUTES_OFFSET + size_of::<PublishedApicIds>() as u64 <= SHOOTDOWN_OFFSET);
     assert!(SHOOTDOWN_OFFSET + size_of::<ShootdownTable>() as u64 <= COUNTERS_OFFSET);
@@ -1581,7 +1590,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     work_flags = Some(take_production_work_boundary(custody.task(lease.cpu))?);
                     Ok((None, None, None))
                 }
-                _ => Err(fail("unexpected idle peer physical doorbell")),
+                _ => {
+                    let detail = format!(
+                        "unexpected idle peer physical doorbell {port:#x}: rax={:#x} rip={:#x} rsp={:#x} cr3={:#x}",
+                        lease.io.get_gpr(X86Reg::Rax)?, lease.io.get_gpr(X86Reg::Rip)?,
+                        lease.io.get_gpr(X86Reg::Rsp)?, lease.io.get_gpr(X86Reg::Cr3)?,
+                    );
+                    Err(fail(detail))
+                }
             }
         })?;
         if let Some(child_binding) = register_child {

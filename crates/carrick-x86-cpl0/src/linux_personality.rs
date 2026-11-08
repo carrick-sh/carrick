@@ -103,6 +103,26 @@ impl SyscallFrame for NativeDispatch<'_> {
 }
 
 impl GuestDispatchFrame for NativeDispatch<'_> {
+    fn can_capture_thread_child(&self, stack: UserVa, tls: Option<UserVa>) -> bool {
+        stack.raw() != 0 && stack.raw() < (1 << 47) && tls.is_none_or(|tls| tls.raw() < (1 << 47))
+    }
+    fn capture_x86_thread_child(
+        &self,
+        child: &mut carrick_sched_core::ParkedContextWords,
+        context: &carrick_personality_linux::lifecycle::ChildContext,
+    ) -> bool {
+        if !self.can_capture_thread_child(context.stack, context.tls) {
+            return false;
+        }
+        *child = capture(self.frame, self.fpstate);
+        use carrick_guest_arch::ProcessContext;
+        child.set_user_stack(context.stack.raw());
+        child.set_syscall_return(context.result.raw() as u64);
+        if let Some(tls) = context.tls {
+            child.set_thread_pointer(carrick_guest_arch::ThreadPointerRegister::FS, tls.raw());
+        }
+        true
+    }
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
         self.call.native
     }

@@ -2,7 +2,9 @@
 //! Root admission adopts the existing execution incarnation as a local process
 //! incarnation; it does not import a host TaskSerial or launcher credentials.
 extern crate alloc;
+mod futex;
 mod service;
+pub use futex::private_anonymous_futex_mapping;
 pub(crate) mod thread_stock;
 use super::{
     native_fork_refusal::{NativeForkStage, at_busy_site, busy},
@@ -543,6 +545,31 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
             Ok(())
         } else {
             Err(carrick_core::mm::transaction::MmError::Core)
+        }
+    }
+    /// Authenticate a shared futex on private anonymous storage. Shared file or
+    /// shared anonymous backing needs an object key and remains unrouted here.
+    fn futex_shared_private(
+        &mut self,
+        _mm: &Self::Mm,
+        _address: UserVa,
+    ) -> Result<bool, NativeProcessError> {
+        Ok(false)
+    }
+    fn counter_frequency(
+        &self,
+    ) -> Result<carrick_personality_linux::sched::FutexFrequency, NativeProcessError> {
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            carrick_el1::isa::signal_clock()
+                .frequency()
+                .map(|hz| carrick_personality_linux::sched::FutexFrequency::from_hz(hz.raw().get()))
+                .map_err(|_| NativeProcessError::Unsupported)
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            Err(NativeProcessError::Unsupported)
         }
     }
     fn wake_effects(&mut self, effects: WakeEffects);
@@ -1648,6 +1675,18 @@ impl NativeExecutionKey {
     }
 }
 
+struct NativeThreadRegistration<'a, C: ProcessContext> {
+    source: BornInZoneSource<'a, C>,
+    address: AddressContext<RootGpa>,
+    page: &'a ThreadLifecyclePage,
+    control: &'a ThreadControlSlot,
+    record: carrick_sched_core::RecordId,
+    key: NativeExecutionKey,
+    visible_pid: u32,
+    visible_tid: u32,
+    host_issued: Option<IssuedHostThread>,
+}
+
 type NativeRecordKey = (usize, u32, u64);
 type NativeGroupKey = (usize, u64, u64, usize, u32);
 
@@ -2660,6 +2699,38 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             )?;
             (issued.visible_tid, Some(issued))
         };
+        let (runtime, closing) = self.register_thread_member(NativeThreadRegistration {
+            source,
+            address,
+            page,
+            control,
+            record,
+            key,
+            visible_pid,
+            visible_tid,
+            host_issued,
+        })?;
+        if closing {
+            current.linux.mark_pending_host_work();
+        }
+        Ok(runtime)
+    }
+
+    fn register_thread_member(
+        &self,
+        registration: NativeThreadRegistration<'a, C>,
+    ) -> Result<(Arc<NativeProcessRuntime<'a, M, C>>, bool), NativeProcessError> {
+        let NativeThreadRegistration {
+            source,
+            address,
+            page,
+            control,
+            record,
+            key,
+            visible_pid,
+            visible_tid,
+            host_issued,
+        } = registration;
         // Births were issued by this carrier before publication. Admission
         // authenticates the exact member; it does not reconstruct issuance
         // from a lifecycle-page snapshot.
@@ -2842,15 +2913,94 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         state.records.insert(record_key, key);
         registry_control.commit_native_signal_owner();
         drop(state);
-        if closing {
-            if binding.issued() {
-                control.request_host_exit();
-            }
-            // This member is still live and owes a host receipt. Preserve its
-            // record for the host control wake rather than retiring it here.
-            current.linux.mark_pending_host_work();
+        if closing && key.binding().issued() {
+            control.request_host_exit();
         }
-        Ok(runtime)
+        Ok((runtime, closing))
+    }
+
+    /// Retain a Born thread before it can be selected by any CPU. This consumes
+    /// its real issued scheduler identity, never a synthetic CurrentTask/frame.
+    fn register_native_birth(
+        &self,
+        runtime: &NativeProcessRuntime<'a, M, C>,
+        process: TaskKey,
+        source: BornInZoneSource<'a, C>,
+        reference: RecordRef,
+    ) -> Result<bool, NativeProcessError> {
+        let retained = source.zone.record(reference.id);
+        if !core::ptr::eq(runtime.zone, source.zone)
+            || retained.incarnation() != reference.incarnation
+            || retained.claim() != carrick_sched_core::Claim::Free
+            || !retained.has_native_execution_owner()
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let identity = retained.identity();
+        let (address, page, control, visible_pid, visible_tid) = {
+            let graph = runtime.graph.lock();
+            let row = graph
+                .owner
+                .task(process)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let resources = row.native().resources();
+            let control = resources
+                .owned_control(identity.control_slot)
+                .ok_or(NativeProcessError::Stale)?;
+            let entry = control.entry().ok_or(NativeProcessError::Stale)?;
+            let pool = resources
+                .page
+                .identity(entry)
+                .ok_or(NativeProcessError::Stale)?;
+            let born = resources
+                .page
+                .born_record(entry)
+                .ok_or(NativeProcessError::Stale)?;
+            if pool.tid as u64 != identity.tid
+                || pool.thread_serial != identity.serial
+                || identity.mm != resources.address.mm.raw().get()
+                || identity.lifecycle_page != resources.page as *const _ as u64
+                || control.zone_record() != Some(reference)
+                || born.clone_flags & carrick_abi::LINUX_CLONE_THREAD == 0
+                || !row.has_thread(pool.visible_tid)
+            {
+                return Err(NativeProcessError::Stale);
+            }
+            (
+                resources.address,
+                resources.page,
+                control,
+                row.metadata().namespace_pid,
+                pool.visible_tid,
+            )
+        };
+        let key = NativeExecutionKey::new(
+            source.zone,
+            ExecutionBinding {
+                task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
+                generation: carrick_core_abi::SnapshotGeneration::from_raw(identity.generation),
+                mm: carrick_core_abi::EntryMmKey::from_raw(identity.mm),
+                thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(
+                    identity.serial,
+                ),
+            },
+            address,
+        )?;
+        let (registered, closing) = self.register_thread_member(NativeThreadRegistration {
+            source,
+            address,
+            page,
+            control,
+            record: reference.id,
+            key,
+            visible_pid,
+            visible_tid,
+            host_issued: None,
+        })?;
+        if !core::ptr::eq(Arc::as_ptr(&registered), runtime) {
+            return Err(NativeProcessError::Stale);
+        }
+        Ok(closing)
     }
 
     fn unregister_member(
@@ -3378,6 +3528,41 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             && thread.control_slot == control as *const _ as u64)
             .then(|| resources.signals().clone())
     }
+    /// Admit carrier-retained control storage for a fresh native root. No
+    /// identity is preseeded: the shared stock owner issues and reclaims it at
+    /// clone admission, under the same limits as native fork children.
+    pub fn admit_thread_stock(
+        &self,
+        lifecycle: NativeLifecycleResources<'a>,
+    ) -> Result<(), NativeProcessError> {
+        let mut graph = self.graph.lock();
+        let key = graph.root_key;
+        let resources = graph
+            .owner
+            .task_mut(key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native_mut()
+            .resources_mut();
+        if !core::ptr::eq(lifecycle.page, resources.page)
+            || lifecycle.controls.len() != carrick_el1_abi::THREAD_POOL_ENTRIES + 1
+            || resources.thread_stock.is_some()
+            || (0..lifecycle.page.entry_count()).any(|index| {
+                lifecycle
+                    .page
+                    .state(index)
+                    .is_none_or(|(_, state)| state != carrick_el1_abi::EntryState::Vacant)
+            })
+        {
+            return Err(NativeProcessError::Invalid);
+        }
+        resources.thread_stock = Some(thread_stock::NativeThreadStock::new(
+            lifecycle.controls,
+            self.zone,
+            resources.record,
+        )?);
+        Ok(())
+    }
+
     /// Import only retained, published thread records. The lifecycle census
     /// must account for exactly these members plus the leader; admission never
     /// edits the count or supplies missing host tasks.
@@ -7956,6 +8141,92 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             None => {}
         }
         take
+    }
+    fn native_futex(
+        &mut self,
+        call: carrick_personality_linux::sched::FutexCall,
+        copy: &mut dyn carrick_core::user_copy::UserCopy,
+    ) -> Option<LifecycleOutcome> {
+        self.serve_native_futex(call, copy)
+    }
+    fn enqueue_thread(
+        &mut self,
+        record: RecordRef,
+    ) -> carrick_personality_linux::lifecycle::BornEnqueue {
+        use carrick_personality_linux::lifecycle::BornEnqueue;
+        let retained = self.source.zone.record(record.id);
+        if retained.incarnation() != record.incarnation
+            || retained.claim() != carrick_sched_core::Claim::Free
+        {
+            return BornEnqueue::Refused;
+        }
+        if !retained.has_native_execution_owner() || retained.identity().mm != self.binding.mm.raw()
+        {
+            return BornEnqueue::Refused;
+        }
+        let Some(registry) = *self.runtime.registry.lock() else {
+            return BornEnqueue::Refused;
+        };
+        match registry.register_native_birth(self.runtime, self.key, self.source, record) {
+            Ok(closing) => {
+                if closing {
+                    self.current.linux.mark_pending_host_work();
+                }
+            }
+            Err(_) => return BornEnqueue::Refused,
+        }
+        let queued = self
+            .source
+            .zone
+            .requeue_preempted(self.source.slot, record.id);
+        if queued.is_queued() {
+            let mut effects = WakeEffects::default();
+            effects.queued_own = true;
+            self.service.wake_effects(effects);
+        }
+        queued.into()
+    }
+    fn wake_thread_join(&mut self, mm: carrick_core_abi::EntryMmKey, address: UserVa) -> bool {
+        if mm != self.binding.mm {
+            return false;
+        }
+        let zone = self.source.zone;
+        let guard = zone.short_lock(
+            ZoneTables::<C>::bucket_of_with_context(mm.raw(), futex::shared_private_key(address)),
+            &carrick_sched_core::ShortLockSpin,
+        );
+        let mut effects = WakeEffects::default();
+        let result = zone.wake_placed(
+            &guard,
+            mm.raw(),
+            futex::shared_private_key(address),
+            carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
+            carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
+            carrick_sched_core::Waker::El1 {
+                slot: self.source.slot,
+            },
+            &mut [],
+            &mut effects,
+        );
+        drop(guard);
+        self.service.wake_effects(effects);
+        result.is_ok()
+    }
+    fn retire_thread_current(
+        &mut self,
+        record: RecordRef,
+        retirement: carrick_core::terminal::ZoneRetirement<'_, '_>,
+    ) -> bool {
+        if record != self.record
+            || self.source.zone.live(record).is_none()
+            || self.handoff.is_some()
+        {
+            return false;
+        }
+        self.handoff = retirement
+            .retire_current(self.binding, self.source, record.id)
+            .ok();
+        self.handoff.is_some()
     }
     fn binding(&self) -> ExecutionBinding {
         self.binding

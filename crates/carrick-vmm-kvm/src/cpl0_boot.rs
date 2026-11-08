@@ -2094,6 +2094,18 @@ impl Cpl0Carrier {
                 .ok_or_else(|| fail("lifecycle page backing"))?
                 .cast::<ThreadLifecyclePage>();
             page.write(ThreadLifecyclePage::new());
+            // Retained empty control storage, shared by real native births.
+            // Identity issuance and all live/runnable publication stay in ring.
+            let controls = ram
+                .host_ptr(
+                    META_GPA + carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET,
+                    carrick_core_abi::X86_CPL0_ROOT_THREAD_CONTROLS_SIZE as usize,
+                )
+                .ok_or_else(|| fail("native root thread control backing"))?
+                .cast::<ThreadControlSlot>();
+            for index in 0..=carrick_el1_abi::THREAD_POOL_ENTRIES {
+                controls.add(index).write(ThreadControlSlot::new());
+            }
             (*page)
                 .thread_born()
                 .ok_or_else(|| fail("second live task admission"))?;

@@ -1,4 +1,4 @@
-//! ARM native context and mapping hooks for the shared Linux lifecycle owner.
+//! Native context and scheduler hooks for the shared Linux lifecycle owner.
 extern crate alloc;
 use super::dispatch::{El1PendingFamilies, GuestDispatchFrame, native_scheduler};
 use super::sched::{ThreadCpu, UserWord};
@@ -462,10 +462,15 @@ impl<
         self.counters.record_lifecycle_decline(reason);
     }
     fn has_scheduler(&self) -> bool {
-        self.frame.arm_scheduler() && self.zone.is_some() && self.frame.slot().is_some()
+        (self.frame.arm_scheduler() && self.zone.is_some() && self.frame.slot().is_some())
+            || (self.source.is_some()
+                && self
+                    .process
+                    .as_deref()
+                    .is_some_and(|venue| Some(venue.binding()) == LifecycleNative::binding(self)))
     }
-    fn can_prepare_child(&self, _: UserVa, _: Option<UserVa>) -> bool {
-        if self.frame.arm_frame_ref().is_some() {
+    fn can_prepare_child(&self, stack: UserVa, tls: Option<UserVa>) -> bool {
+        if self.frame.arm_frame_ref().is_some() || self.frame.can_capture_thread_child(stack, tls) {
             true
         } else {
             self.frame.record_isa_unsupported_forward();
@@ -492,6 +497,14 @@ impl<
         &mut self,
         identity: ThreadIdentity,
     ) -> Result<RecordRef, carrick_sched_core::Exhausted> {
+        if !self.frame.arm_scheduler()
+            && let Some(source) = self.source
+        {
+            return source
+                .zone
+                .alloc_record(identity)
+                .map(|id| source.zone.record_ref(id));
+        }
         let zone = self
             .zone
             .as_ref()
@@ -511,12 +524,37 @@ impl<
         // The native process runtime is this birth's only issuer: it commits
         // the record issued and native-owned before it is published, so its
         // first entry is an ordinary issued admission (#1100).
+        if !self.frame.arm_scheduler()
+            && let Some(source) = self.source
+        {
+            return source.zone.record(record.id).incarnation() == record.incarnation
+                && source.zone.issue_native_birth(record.id);
+        }
         self.zone.as_ref().is_some_and(|zone| {
             zone.tables.record(record.id).incarnation() == record.incarnation
                 && zone.tables.issue_native_birth(record.id)
         })
     }
     fn release_native_birth(&mut self, record: RecordRef, control: &ThreadControlSlot) -> bool {
+        if !self.frame.arm_scheduler()
+            && let Some(source) = self.source
+        {
+            let Some(key) = carrick_sched_core::object_wait::ObjectWaitKey::native_service(record)
+            else {
+                return false;
+            };
+            return source.zone.record(record.id).incarnation() == record.incarnation
+                && control.zone_record() == Some(record)
+                && control
+                    .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+                    .is_ok()
+                && source
+                    .zone
+                    .unbind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
+                    .is_ok();
+        }
         let Some(zone) = &self.zone else {
             return false;
         };
@@ -542,6 +580,14 @@ impl<
                 .is_ok()
     }
     fn free_record(&mut self, record: RecordRef) {
+        if !self.frame.arm_scheduler()
+            && let Some(source) = self.source
+        {
+            if source.zone.record(record.id).incarnation() == record.incarnation {
+                source.zone.free_record(record.id);
+            }
+            return;
+        }
         if let Some(zone) = &self.zone
             && zone.tables.record(record.id).incarnation() == record.incarnation
         {
@@ -549,6 +595,24 @@ impl<
         }
     }
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext) {
+        if !self.frame.arm_scheduler()
+            && let Some(source) = self.source
+        {
+            let retained = source.zone.record(record.id);
+            if retained.incarnation() != record.incarnation || retained.claim() != Claim::Free {
+                self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
+            }
+            let record = retained;
+            // SAFETY: the birth owner exclusively owns this unpublished record.
+            if !Context::capture_thread_child(
+                self.frame,
+                unsafe { &mut *record.ctx_mut() },
+                &context,
+            ) {
+                self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
+            }
+            return;
+        }
         let Some(zone) = &mut self.zone else {
             return;
         };
@@ -595,6 +659,11 @@ impl<
             aarch64_child_vdso_identity(ctx.native.tpidrro_el0, context.visible_tid);
     }
     fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue {
+        if !self.frame.arm_scheduler() {
+            return self
+                .process_venue()
+                .map_or(BornEnqueue::Refused, |venue| venue.enqueue_thread(record));
+        }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return BornEnqueue::Refused;
         };
@@ -612,6 +681,22 @@ impl<
             .into()
     }
     fn exit_record(&self) -> Option<ExitRecord> {
+        if !self.frame.arm_scheduler()
+            && let Some(source) = self.source
+        {
+            let id = source.zone.slot(source.slot).current()?;
+            let record = source.zone.record(id);
+            return Some(ExitRecord {
+                reference: source.zone.record_ref(id),
+                identity: record.identity(),
+                home: source.zone.slot(source.slot).host_record() == Some(id),
+                unadopted: record.is_unadopted_birth() || record.has_native_execution_owner(),
+                on_cpu: matches!(record.claim(), Claim::OnCpu { slot, .. } if slot == source.slot),
+                needs_host: record.needs_host(),
+                cancelled: record.is_cancelled(),
+                object_operation: record.has_object_operation(),
+            });
+        }
         let zone = self.zone.as_ref()?.tables;
         let slot = self.frame.slot()?;
         let id = zone.slot(slot).current()?;
@@ -629,6 +714,11 @@ impl<
         })
     }
     fn wake_child_tid(&mut self, mm: EntryMmKey, address: UserVa) -> bool {
+        if !self.frame.arm_scheduler() {
+            return self
+                .process_venue()
+                .is_some_and(|venue| venue.wake_thread_join(mm, address));
+        }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
@@ -656,6 +746,11 @@ impl<
         record: RecordRef,
         retirement: carrick_core::terminal::ZoneRetirement<'_, '_>,
     ) -> bool {
+        if !self.frame.arm_scheduler() {
+            return self
+                .process_venue()
+                .is_some_and(|venue| venue.retire_thread_current(record, retirement));
+        }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
@@ -698,6 +793,9 @@ impl<
         self.handoff.is_some()
     }
     fn run_next(&mut self, timeout_result: SyscallResult) -> (carrick_core::Served, SyscallResult) {
+        if !self.frame.arm_scheduler() {
+            return (carrick_core::Served::Idle, SyscallResult::new(0));
+        }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return (
                 carrick_core::Served::Idle,
