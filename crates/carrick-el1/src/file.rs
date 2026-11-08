@@ -198,6 +198,23 @@ pub trait MemoryValidator {
 
     /// Return the number of contiguous bytes from `user_va` that EL0 can read.
     fn readable_bytes(&self, user_va: u64, len: usize) -> usize;
+
+    /// Preserve the validator's original refusal before a boolean caller loses it.
+    fn check_range(&self, address: u64, len: usize, write: bool) -> Result<(), CopyRefusalReason> {
+        if !valid_lower_half_range(address, len) {
+            return Err(CopyRefusalReason::ForbiddenRange);
+        }
+        let checked = if write {
+            self.writable_bytes(address, len)
+        } else {
+            self.readable_bytes(address, len)
+        };
+        if checked == len {
+            Ok(())
+        } else {
+            Err(CopyRefusalReason::Validator)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -256,61 +273,53 @@ impl MemoryValidator for HardwareValidator {
 pub struct HardwareValidator;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl HardwareValidator {
+    fn checked_bytes(
+        &self,
+        user_va: u64,
+        len: usize,
+        write: bool,
+    ) -> (usize, Option<CopyRefusalReason>) {
+        if !valid_lower_half_range(user_va, len) {
+            return (0, Some(CopyRefusalReason::ForbiddenRange));
+        }
+        let mut checked = 0;
+        while checked < len {
+            let cur_va = user_va + checked as u64;
+            let par: u64;
+            unsafe {
+                if write {
+                    core::arch::asm!("at s1e0w, {va}", va = in(reg) cur_va, options(nostack));
+                } else {
+                    core::arch::asm!("at s1e0r, {va}", va = in(reg) cur_va, options(nostack));
+                }
+                core::arch::asm!("isb", "mrs {par}, par_el1", par = out(reg) par, options(nostack));
+            }
+            if par & 1 != 0 {
+                // Keep this exact AT result. A second AT can see different tables.
+                return (
+                    checked,
+                    Some(CopyRefusalReason::ArmTranslation(((par >> 1) & 0x3f) as u8)),
+                );
+            }
+            checked += core::cmp::min(len - checked, 4096 - (cur_va as usize & 4095));
+        }
+        (checked, None)
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl MemoryValidator for HardwareValidator {
     fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
-        if len == 0 || !valid_lower_half_range(user_va, len) {
-            return 0;
-        }
-        let mut checked = 0;
-        while checked < len {
-            let cur_va = user_va + checked as u64; // range checked above
-            let mut par: u64;
-            unsafe {
-                core::arch::asm!(
-                    "at s1e0w, {va}",
-                    "isb",
-                    "mrs {par}, par_el1",
-                    va = in(reg) cur_va,
-                    par = out(reg) par,
-                    options(nostack)
-                );
-            }
-            if (par & 1) != 0 {
-                // Translation fault or permission failure
-                break;
-            }
-            let page_remaining = 4096 - (cur_va as usize & 4095);
-            checked += core::cmp::min(len - checked, page_remaining);
-        }
-        checked
+        self.checked_bytes(user_va, len, true).0
     }
-
     fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
-        if len == 0 || !valid_lower_half_range(user_va, len) {
-            return 0;
-        }
-        let mut checked = 0;
-        while checked < len {
-            let cur_va = user_va + checked as u64; // range checked above
-            let mut par: u64;
-            unsafe {
-                core::arch::asm!(
-                    "at s1e0r, {va}",
-                    "isb",
-                    "mrs {par}, par_el1",
-                    va = in(reg) cur_va,
-                    par = out(reg) par,
-                    options(nostack)
-                );
-            }
-            if (par & 1) != 0 {
-                // Translation fault or permission failure
-                break;
-            }
-            let page_remaining = 4096 - (cur_va as usize & 4095);
-            checked += core::cmp::min(len - checked, page_remaining);
-        }
-        checked
+        self.checked_bytes(user_va, len, false).0
+    }
+    fn check_range(&self, address: u64, len: usize, write: bool) -> Result<(), CopyRefusalReason> {
+        self.checked_bytes(address, len, write)
+            .1
+            .map_or(Ok(()), Err)
     }
 }
 
@@ -406,14 +415,7 @@ pub struct ValidatedCopy<'a, V: MemoryValidator> {
 impl<V: MemoryValidator> ValidatedCopy<'_, V> {
     /// Copyout counterpart of `copy_in_diagnosed` with the same reason codes.
     pub fn copy_out_diagnosed(&mut self, dst: u64, src: &[u8]) -> Result<(), CopyRefusalReason> {
-        let checked = self.validator.writable_bytes(dst, src.len());
-        if checked < src.len() {
-            return Err(if valid_lower_half_range(dst, src.len()) {
-                copy_validation_reason(dst + checked as u64, true)
-            } else {
-                CopyRefusalReason::ForbiddenRange
-            });
-        }
+        self.validator.check_range(dst, src.len(), true)?;
         // SAFETY: user faults are intercepted by the fixup.
         if unsafe { copy_to_user_guarded(self.task, dst as *mut u8, src.as_ptr(), src.len()) } {
             Ok(())
@@ -426,14 +428,7 @@ impl<V: MemoryValidator> ValidatedCopy<'_, V> {
     /// 1 = forbidden range, 2 = validator refusal, 3 = guarded instruction
     /// fault. On ARM, 0x100 | PAR.FST identifies the failed translation.
     pub fn copy_in_diagnosed(&mut self, dst: &mut [u8], src: u64) -> Result<(), CopyRefusalReason> {
-        let checked = self.validator.readable_bytes(src, dst.len());
-        if checked < dst.len() {
-            return Err(if valid_lower_half_range(src, dst.len()) {
-                copy_validation_reason(src + checked as u64, false)
-            } else {
-                CopyRefusalReason::ForbiddenRange
-            });
-        }
+        self.validator.check_range(src, dst.len(), false)?;
         if unsafe {
             copy_from_user_guarded(self.task, dst.as_mut_ptr(), src as *const u8, dst.len())
         } {
@@ -442,26 +437,6 @@ impl<V: MemoryValidator> ValidatedCopy<'_, V> {
             Err(CopyRefusalReason::GuardedFault)
         }
     }
-}
-
-fn copy_validation_reason(address: u64, write: bool) -> CopyRefusalReason {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    {
-        let par: u64;
-        unsafe {
-            if write {
-                core::arch::asm!("at s1e0w, {va}", va = in(reg) address, options(nostack));
-            } else {
-                core::arch::asm!("at s1e0r, {va}", va = in(reg) address, options(nostack));
-            }
-            core::arch::asm!("isb", "mrs {par}, par_el1", par = out(reg) par, options(nostack));
-        }
-        if par & 1 != 0 {
-            return CopyRefusalReason::ArmTranslation(((par >> 1) & 0x3f) as u8);
-        }
-    }
-    let _ = (address, write);
-    CopyRefusalReason::Validator
 }
 
 impl<V: MemoryValidator> UserCopy for ValidatedCopy<'_, V> {

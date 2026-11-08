@@ -8072,7 +8072,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         &mut self,
         request: carrick_core::user_copy::GuestCopyRequest,
     ) -> LifecycleOutcome {
-        self.prepare_guest_input(request)
+        self.wait_guest_copy_observed(request, &mut |_| {})
+    }
+    fn wait_guest_copy_observed(
+        &mut self,
+        request: carrick_core::user_copy::GuestCopyRequest,
+        observe: &mut dyn FnMut(carrick_personality_linux::lifecycle::InputPreparationRefusal),
+    ) -> LifecycleOutcome {
+        self.prepare_guest_input(request, observe)
             .unwrap_or_else(|error| self.run_failed(error.run_failure_reason()))
     }
     fn copy_out_owned(
