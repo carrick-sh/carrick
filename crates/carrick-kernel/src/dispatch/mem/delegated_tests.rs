@@ -8050,7 +8050,7 @@ fn delegated_go_persistentalloc_after_hinted_arena() {
             other => panic!("Go {name} returned {other:?}"),
         }
     }
-    const HINT: u64 = 0x0140_0000_0000;
+    const HINT: u64 = 0x00c0_0000_0000;
     const ARENA: u64 = 64 * 1024 * 1024;
     const CHUNK: u64 = 256 * 1024;
     let mut dispatcher = SyscallDispatcher::new();
@@ -8147,6 +8147,54 @@ fn delegated_go_persistentalloc_after_hinted_arena() {
         ),
         0
     );
+}
+
+/// Two live address spaces on one carrier must each be able to reserve Go's
+/// 64 MiB heap arena and map the 256 KiB persistentalloc chunk. Fork admission
+/// uses the production MM publication path, then the calls use dispatch.
+#[test]
+fn delegated_go_startup_maps_in_two_live_mms() {
+    const HINT: u64 = 0x00c0_0000_0000;
+    const ARENA: u64 = 64 * 1024 * 1024;
+    const CHUNK: u64 = 256 * 1024;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
+    let rw = LINUX_PROT_READ | LINUX_PROT_WRITE;
+    let mut parent = SyscallDispatcher::new();
+    let root = Root::admit(&parent);
+    let mut child = fork_child(&parent);
+    let child_root = root.publish_child(&child);
+    assert_eq!(fork_commit(&parent, &child), Ok(El1Admission::Delegated));
+
+    let mut parent_memory = CountingMmapMemory::new(HINT + 16 * PAGE, (32 * PAGE) as usize);
+    let mut child_memory = CountingMmapMemory::new(HINT + 16 * PAGE, (32 * PAGE) as usize);
+    for (dispatcher, memory, owner) in [
+        (&mut parent, &mut parent_memory, &root),
+        (&mut child, &mut child_memory, &child_root),
+    ] {
+        memory.defer_anon = true;
+        memory.discard_anon = true;
+        assert_eq!(
+            returned(host_mmap(dispatcher, memory, HINT, ARENA, 0, flags, -1)) as u64,
+            HINT
+        );
+        assert_eq!(
+            returned(host_mmap(
+                dispatcher,
+                memory,
+                HINT + 16 * PAGE,
+                32 * PAGE,
+                rw,
+                flags | LINUX_MAP_FIXED,
+                -1,
+            )) as u64,
+            HINT + 16 * PAGE
+        );
+        let chunk = returned(host_mmap(dispatcher, memory, 0, CHUNK, rw, flags, -1)) as u64;
+        assert_eq!(chunk, LINUX_MMAP_BASE);
+        assert!(owner.lock().mapping(chunk).is_some());
+    }
+    assert!(root.lock().mapping(HINT).is_some());
+    assert!(child_root.lock().mapping(HINT).is_some());
 }
 
 /// When a genuinely host-served edit (such as `mprotect(PROT_GROWSDOWN)` or
