@@ -5,6 +5,10 @@ use core::fmt;
 
 /// Discriminator in x1 of the existing PANIC_SENTINEL / HVC #3 transport.
 /// Rust panic source lines cannot collide with this full-width tag.
+/// Last lookup word selects the key-attribution view of the same sixteen
+/// admission words. This does not extend the terminal register transport.
+pub const ADMISSION_GROUP_KEYS_TAG: u64 = 0x4752_4f55_504b_4559;
+
 pub const ENTRY_BINDING_FATAL_TAG: u64 = 0x454e_5452_5942_494e;
 
 pub const fn is_entry_binding_fatal(sentinel: u64, tag: u64) -> bool {
@@ -207,10 +211,14 @@ pub struct ArmEntryFatalRegisters {
     pub reason: Option<u64>,
     pub source_location: Option<u64>,
     /// x4..x11, populated only for typed admission contention reasons.
+    /// With ADMISSION_GROUP_KEYS_TAG: observed group tuple (five words),
+    /// registered record ID/incarnation, then observed record ID.
     pub admission_identity: [Option<u64>; 8],
     /// x12..x17, x20..x21: four (flags/task, generation) pairs, in order
     /// members, records, groups, by_process -> groups. Bit 0 = present,
     /// bit 1 = downstream present, bit 2 = same Arc as members[execution].
+    /// With ADMISSION_GROUP_KEYS_TAG in the final word: stored group tuple
+    /// (five words), observed incarnation, packed lookup flags, then the tag.
     pub admission_lookup: [Option<u64>; 8],
     pub pc: Option<u64>,
     pub lr: Option<u64>,
@@ -409,6 +417,26 @@ impl fmt::Display for ArmEntryBindingFatal {
             // Admission evidence must fit the fixed terminal record even at
             // maximum width. Use its retained identities instead of repeating
             // the larger saved-register snapshot below.
+            if r.admission_lookup[7] == Some(ADMISSION_GROUP_KEYS_TAG) {
+                return write!(
+                    f,
+                    "entry_binding cpu={} {}group_observed_carrier_mm_root_page_pid={:x?} group_stored_carrier_mm_root_page_pid={:x?} registered_record_id_inc={:x?} observed_record_id_inc={:x?} lookup_flags={:x?} pc={} lr={} sp_el1={} loaded_task={} loaded_generation={} loaded_thread={} loaded_mm={}",
+                    self.slot.raw(),
+                    FatalDetail(r.reason, r.source_location),
+                    &r.admission_identity[..5],
+                    &r.admission_lookup[..5],
+                    &r.admission_identity[5..7],
+                    [r.admission_identity[7], r.admission_lookup[5]],
+                    r.admission_lookup[6],
+                    Register(r.pc),
+                    Register(r.lr),
+                    Register(r.sp_el1),
+                    self.loaded.task.raw(),
+                    self.loaded.generation.raw(),
+                    self.loaded.thread_generation.raw(),
+                    self.loaded.mm.raw(),
+                );
+            }
             return write!(
                 f,
                 "entry_binding cpu={} {}admission_identity={:x?} lookup_members_records_groups_by_process={:x?} pc={} lr={} sp_el1={} loaded_task={} loaded_generation={} loaded_thread={} loaded_mm={}",
@@ -744,6 +772,40 @@ mod tests {
         assert!(rendered.contains("reason=AdmissionRecordKeyCollision"));
         assert!(rendered.contains("admission_identity=[Some(ffffffffffffffff)"));
         assert!(rendered.contains("loaded_mm=18446744073709551615"));
+    }
+
+    #[test]
+    fn admission_group_keys_fit_the_terminal_record() {
+        let mut registers = ArmEntryFatalRegisters {
+            reason: Some(EntryBindingFatalReason::AdmissionFreshRootPendingCustody as u64),
+            source_location: Some(u64::MAX),
+            admission_identity: [Some(u64::MAX); 8],
+            admission_lookup: [Some(u64::MAX); 8],
+            pc: Some(u64::MAX),
+            lr: Some(u64::MAX),
+            sp_el1: Some(u64::MAX),
+            ..Default::default()
+        };
+        registers.admission_lookup[7] = Some(ADMISSION_GROUP_KEYS_TAG);
+        let capture = ArmEntryBindingFatal::capture(
+            registers,
+            &crate::TrapFrame::default(),
+            crate::ExecutionBinding {
+                task: crate::EntryTaskKey::from_raw(u64::MAX),
+                generation: crate::SnapshotGeneration::from_raw(u64::MAX),
+                mm: crate::EntryMmKey::from_raw(u64::MAX),
+                thread_generation: crate::EntryThreadGeneration::from_raw(u64::MAX),
+            },
+            &zone(),
+            crate::SlotId::new(255),
+        );
+        let rendered = format!("{capture}");
+        assert!(rendered.len() <= 1024, "{} bytes", rendered.len());
+        assert!(rendered.contains("group_observed_carrier_mm_root_page_pid="));
+        assert!(rendered.contains("group_stored_carrier_mm_root_page_pid="));
+        assert!(rendered.contains("registered_record_id_inc="));
+        assert!(rendered.contains("observed_record_id_inc="));
+        assert!(rendered.ends_with("loaded_mm=18446744073709551615"));
     }
 
     #[test]

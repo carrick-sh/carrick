@@ -13947,7 +13947,9 @@ fn admission_fresh_root_pending_custody_reports_identity() {
         Err(
             crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
-                    group_lookup: Some(crate::native_process_runtime::NativeGroupLookup([0; 8])),
+                    group_lookup: Some(crate::native_process_runtime::NativeGroupLookup(
+                        [0; 8], None
+                    )),
                     origin: NativeAdmissionOrigin::FreshRootPendingCustody,
                     binding,
                     old_record: Some(record),
