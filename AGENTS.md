@@ -559,6 +559,27 @@ verification, the signed evidence and landing.
 - **Grep diffs for out-of-fence changes** — a page-table worker flipped
   `pwrite64` on a pipe read end ESPIPE→EBADF, broke main for a day, and a later
   worker "fixed" the test to match. Out-of-fence changes need an oracle line.
+- **A diff touching macOS-only code is tested on a Mac before its review
+  counts.** Linux gates can't compile or run `cfg(target_os = "macos")` code:
+  a worker's accidental global substitution in `carrick-vmm-hvf/src/trap.rs`
+  replaced X19 with X21 in the production `GPR_TABLE`, so vCPU snapshot and
+  restore lost a callee-saved register, and every Linux gate passed (#887,
+  #1560). The director runs that crate's tests on a Mac; reviewers grep such
+  diffs for unrelated edits.
+- **One owner per syscall family and mechanism; check before starting a
+  lane.** Duplicated lanes come from starting work on fresh evidence without
+  seeing an open draft that already owns it (PR #1836's ARM `nanosleep` port
+  was nearly rebuilt by a timer lane, 2026-11-08). Before briefing a worker,
+  search open PRs (title, body and the functions their diffs touch) and
+  issues for the syscalls, functions and paths involved, and read the
+  ring-coverage registry (pinned issue #1906, one owning issue per family). A
+  hit means the brief names that PR or issue and builds on it, or the lane
+  doesn't start; new evidence for an owned family goes to its owner. Two open
+  PRs changing the same production function is overlap: reuse, stack or close
+  one. A draft idle for more than 24 hours is finished or closed with the
+  reason on its issue. Every worker brief and review includes an
+  existing-mechanism inventory: the nearest existing type, owner, queue or
+  publisher, with file:line, and why it is reused or can't be.
 - **Commit after each step (red witness, fix, signed proof), and require it in
   worker briefs.** Long turns hit time limits — two hit the three-hour cap in
   one day, one stranding 1,749 uncommitted lines (#1560).
