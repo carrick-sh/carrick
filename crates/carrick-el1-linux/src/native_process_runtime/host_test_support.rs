@@ -8004,6 +8004,7 @@ fn host_root_open_publishes_unstamped_record_through_service_notice() {
     drop(queue);
 }
 
+#[cfg(test)]
 #[test]
 fn admission_root_registration_collision_reports_identity() {
     let fixture = native_exec_fixture();
@@ -8034,6 +8035,7 @@ fn admission_root_registration_collision_reports_identity() {
     );
 }
 
+#[cfg(test)]
 #[test]
 fn admission_old_record_retained_reports_identity() {
     let fixture = native_exec_fixture();
@@ -8076,11 +8078,13 @@ fn admission_old_record_retained_reports_identity() {
     );
 }
 
+#[cfg(test)]
 #[test]
 fn admission_execution_key_collision_reports_identity() {
     admission_rehome_collision(false);
 }
 
+#[cfg(test)]
 #[test]
 fn admission_record_key_collision_reports_identity() {
     admission_rehome_collision(true);
@@ -8160,6 +8164,7 @@ fn admission_rehome_collision(record_collision: bool) {
     );
 }
 
+#[cfg(test)]
 #[test]
 fn admission_thread_registration_collision_reports_identity() {
     let fixture = native_exec_fixture();
