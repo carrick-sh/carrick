@@ -1,8 +1,10 @@
-# Prepared-fork argument-copy diagnostic (#1877, rounds 10 and 12)
+# Prepared-fork argument-copy diagnostic and ppoll replay (#1877)
 
-Contract: `kernel.memory.owner-wait`. This diagnostic changes no owner
-preparation, syscall result, wait policy or work budget. It adds no signed
-correctness claim. The default `prepared-fork` sequence remains the control;
+Contract: `kernel.memory.owner-wait`. Rounds 10–13 added diagnostics without
+changing owner preparation, syscall results, wait policy or work budgets.
+Round 14 fixes host ppoll continuation as described below; signed cause
+verification remains pending. The default `prepared-fork` sequence remains
+the control;
 `prepared-fork-touch` performs volatile stores to every pollfd and timespec
 field immediately before the parent's ppoll and reports
 `pollfd_touched=true timespec_touched=true` on `prepared-fork-steps`.
@@ -92,9 +94,10 @@ syscall arguments. Only trap/decoded samples describe actual SVC arguments;
 never attribute a syscall corruption from a saved-return row alone.
 These bounded prefixes are observations, never a complete
 population or an authority to resume. Saturated or missing samples do not
-exclude an unsampled path. Only ppoll consumes sibling slots, so unrelated
-startup syscalls cannot displace the target. Publication is bounded and
-allocation-free; syscall and scheduling policies and budgets are unchanged.
+exclude an unsampled path. Guest-side sources sample only ppoll; the host
+replay source also samples epoll to expose its timeout-register convention.
+Either can saturate the shared prefix. Publication is bounded and
+allocation-free; diagnostic recording does not change scheduling budgets.
 
 The production native-dispatch prepared-pollfd and prepared-timeout witnesses
 check the recorded raw words and dispatch source. The ABI test drives the
