@@ -369,6 +369,12 @@ pub trait UserCopy {
     /// call, or a park that did not happen). A no-op when nothing is armed.
     fn disarm_wait_sigmask(&mut self) {}
 
+    /// A pre-effect argument read can retain its exact owner-preparation
+    /// request rather than turn a preparable refusal into an address errno.
+    fn has_copyin_refusal(&self) -> bool {
+        false
+    }
+
     /// Copy `src` to the user buffer at `dst_va`.
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool;
     /// Fill `dst` from the user buffer at `src_va`.
