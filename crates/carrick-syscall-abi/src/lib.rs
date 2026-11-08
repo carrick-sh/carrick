@@ -472,17 +472,27 @@ impl LinuxWaitOptions {
 /// Linux 64-bit rusage contains two timevals and fourteen signed counters.
 pub const LINUX_RUSAGE_BYTES: usize = 144;
 
-// Linux memory advice ordinals, shared by host and ring policy.
 pub const LINUX_MADV_NORMAL: u64 = 0;
 pub const LINUX_MADV_RANDOM: u64 = 1;
 pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
 pub const LINUX_MADV_WILLNEED: u64 = 3;
 pub const LINUX_MADV_DONTNEED: u64 = 4;
 pub const LINUX_MADV_FREE: u64 = 8;
+// Fork-inheritance hints and policy controls.
 pub const LINUX_MADV_DONTFORK: u64 = 10;
 pub const LINUX_MADV_DOFORK: u64 = 11;
 pub const LINUX_MADV_WIPEONFORK: u64 = 18;
 pub const LINUX_MADV_KEEPONFORK: u64 = 19;
+
+// Transparent-huge-page advisory hints. carrick presents 4 KiB guest pages and
+// cannot promote a range to a huge page, but these advices are purely advisory:
+// real Linux returns 0 for them whenever THP is built in (the common
+// `always`/`madvise` modes), so accepting them as a success no-op matches the
+// kernel and keeps allocators (Go runtime, jemalloc, glibc) from treating a
+// spurious EINVAL as a hard error.
+// Core-dump inclusion hints. Unlike the THP hints below these are NOT no-ops:
+// `MADV_DONTDUMP` must actually keep the range's contents out of a core dump,
+// which carrick honours through `VmaDumpPolicy`.
 pub const LINUX_MADV_DONTDUMP: u64 = 16;
 pub const LINUX_MADV_DODUMP: u64 = 17;
 pub const LINUX_MADV_HUGEPAGE: u64 = 14;

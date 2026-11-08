@@ -3,24 +3,19 @@
 //! `membarrier`, `userfaultfd`, `io_uring_*`).
 
 use super::*;
+#[cfg(test)]
+use carrick_abi::LINUX_MADV_DONTNEED;
 use carrick_abi::{
-    LINUX_MADV_COLLAPSE, LINUX_MADV_DODUMP, LINUX_MADV_DOFORK, LINUX_MADV_DONTDUMP,
-    LINUX_MADV_DONTFORK, LINUX_MADV_DONTNEED, LINUX_MADV_FREE, LINUX_MADV_HUGEPAGE,
-    LINUX_MADV_KEEPONFORK, LINUX_MADV_NOHUGEPAGE, LINUX_MADV_NORMAL, LINUX_MADV_RANDOM,
-    LINUX_MADV_SEQUENTIAL, LINUX_MADV_WILLNEED, LINUX_MADV_WIPEONFORK, LINUX_MEMBARRIER_CMD_QUERY,
-    LINUX_MS_ASYNC, LINUX_MS_INVALIDATE, LINUX_MS_SYNC, LinuxMlock2Flags, LinuxMlockallFlags,
+    LINUX_MEMBARRIER_CMD_QUERY, LINUX_MS_ASYNC, LINUX_MS_INVALIDATE, LINUX_MS_SYNC,
+    LinuxMlock2Flags, LinuxMlockallFlags,
+};
+use carrick_core_abi::GuestLen;
+use carrick_personality_linux::mm::madvise::{
+    self as policy, Action, Advice, Class, Coverage, Range, Segment, Snapshot,
 };
 
-/// Describes the VMA coverage and attributes of a requested address range for `madvise`.
-pub struct MadviseRangeMeta {
-    pub(crate) fully_mapped: bool,
-    pub(crate) covered: Vec<MadviseCoveredSegment>,
-    pub(crate) shared: bool,
-    pub(crate) all_private_anon: bool,
-    pub(crate) any_special: bool,
-    pub(crate) any_droppable: bool,
-    pub(crate) locked: bool,
-}
+/// Observed coverage retained for the shared Linux policy and host effects.
+pub type MadviseRangeMeta = Snapshot<MadviseCoveredSegment>;
 
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub struct MadviseCoveredSegment {
@@ -28,30 +23,44 @@ pub struct MadviseCoveredSegment {
     pub(crate) end: u64,
     pub(crate) prot: LinuxProtFlags,
     pub(crate) provenance: VmaBackingProvenance,
+    droppable: bool,
 }
 
-fn linux_madvise_advice_is_supported(advice: u64) -> bool {
-    matches!(
-        advice,
-        LINUX_MADV_NORMAL
-            | LINUX_MADV_RANDOM
-            | LINUX_MADV_SEQUENTIAL
-            | LINUX_MADV_WILLNEED
-            | LINUX_MADV_DONTNEED
-            | LINUX_MADV_FREE
-            | LINUX_MADV_DONTFORK
-            | LINUX_MADV_DOFORK
-            | LINUX_MADV_WIPEONFORK
-            | LINUX_MADV_KEEPONFORK
-            | LINUX_MADV_DONTDUMP
-            | LINUX_MADV_DODUMP
-            // THP hints: advisory, accepted as a success no-op (see the abi
-            // constants). carrick can't promote to huge pages, but neither must
-            // it reject the hint — real Linux with THP built in returns 0.
-            | LINUX_MADV_HUGEPAGE
-            | LINUX_MADV_NOHUGEPAGE
-            | LINUX_MADV_COLLAPSE
-    )
+impl Segment for MadviseCoveredSegment {
+    fn range(&self) -> Range {
+        Range {
+            start: GuestVa::new(self.start),
+            end: GuestVa::new(self.end),
+        }
+    }
+    fn class(&self) -> Class {
+        match self.provenance {
+            VmaBackingProvenance::PrivateAnonymous => Class::PrivateAnonymous,
+            VmaBackingProvenance::PrivateFile => Class::PrivateFile,
+            VmaBackingProvenance::SharedAnonymous | VmaBackingProvenance::SharedFile => {
+                Class::Shared
+            }
+            VmaBackingProvenance::SpecialKernelSynthetic => Class::Special,
+        }
+    }
+    fn droppable(&self) -> bool {
+        self.droppable
+    }
+}
+
+impl Coverage for MemView<'_> {
+    type Segment = MadviseCoveredSegment;
+
+    fn check_range(&self, range: Range) -> Result<(), LinuxErrno> {
+        if super::overlaps_el0_clock_stub(range.start.raw(), range.len().raw()) {
+            Err(LINUX_EPERM)
+        } else {
+            Ok(())
+        }
+    }
+    fn snapshot(&self, range: Range) -> MadviseRangeMeta {
+        self.madvise_range_meta(range.start.raw(), range.end.raw())
+    }
 }
 
 fn validate_mlock_range(
@@ -93,17 +102,11 @@ impl<'a> MemView<'a> {
         let mem = mem_authority_2.lock();
         let mut covered_to = start;
         let mut covered: Vec<MadviseCoveredSegment> = Vec::new();
-        let mut fully_mapped = true;
-        let mut shared = false;
-        let mut all_private_anon = true;
-        let mut any_special = false;
-        let mut any_droppable = false;
 
         for vma in &mem.observed_vmas_within(start, end) {
             if vma.start > covered_to {
                 // Gap before this interval → unmapped hole. Keep walking:
                 // the VMAs past the hole still decide the per-VMA verdict.
-                fully_mapped = false;
                 covered_to = vma.start;
             }
             if vma.end > covered_to {
@@ -120,28 +123,15 @@ impl<'a> MemView<'a> {
                             && last.provenance == vma.provenance =>
                     {
                         last.end = segment_end;
+                        last.droppable |= vma.droppable;
                     }
                     _ => covered.push(MadviseCoveredSegment {
                         start: covered_to,
                         end: segment_end,
                         prot,
                         provenance: vma.provenance,
+                        droppable: vma.droppable,
                     }),
-                }
-                if matches!(
-                    vma.provenance,
-                    VmaBackingProvenance::SharedAnonymous | VmaBackingProvenance::SharedFile
-                ) {
-                    shared = true;
-                }
-                if !vma.provenance.allows_wipe_on_fork() {
-                    all_private_anon = false;
-                }
-                if matches!(vma.provenance, VmaBackingProvenance::SpecialKernelSynthetic) {
-                    any_special = true;
-                }
-                if vma.droppable {
-                    any_droppable = true;
                 }
                 covered_to = vma.end;
             }
@@ -149,19 +139,15 @@ impl<'a> MemView<'a> {
                 break;
             }
         }
-        if covered_to < end {
-            fully_mapped = false;
-        }
         let locked = mem.locked_bytes_within(start, end) != 0;
-        MadviseRangeMeta {
-            fully_mapped,
+        Snapshot::new(
+            Range {
+                start: GuestVa::new(start),
+                end: GuestVa::new(end),
+            },
             covered,
-            shared,
-            all_private_anon,
-            any_special,
-            any_droppable,
             locked,
-        }
+        )
     }
 
     fn membarrier(&self, command: u64, flags: u64) -> DispatchOutcome {
@@ -647,75 +633,44 @@ impl<'a> MemView<'a> {
         mm_mutation fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
-            let page_size = this.linux_page_size();
-            if !address.0.is_multiple_of(page_size) || !linux_madvise_advice_is_supported(advice) {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            if length == 0 {
+            let plan = match policy::plan(
+                this,
+                GuestVa::new(address.0),
+                GuestLen::new(length),
+                Advice::from_guest_arg(advice),
+                GuestLen::new(this.linux_page_size()),
+            ) {
+                Ok(plan) => plan,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            if plan.range.is_empty() {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-
-            let Ok(length) = usize::try_from(length) else {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            let end = plan.range.end.raw();
+            let hole_verdict = match plan.result {
+                Ok(()) => DispatchOutcome::Returned { value: 0 },
+                Err(errno) => DispatchOutcome::errno(errno),
             };
-            // Validity is derived from carrick's VMA metadata, NEVER by touching
-            // a page: a physical probe SIGBUSes the runtime on a read-only /
-            // past-EOF file page (madvise02 MADV_DONTNEED on a locked read-only
-            // MAP_SHARED file) and false-ENOMEMs a mapped-but-PROT_NONE range
-            // (madvise05 MADV_WILLNEED on an mprotect(PROT_NONE) anon region).
-            // An unmapped hole anywhere in [address, address+length) → ENOMEM,
-            // but only once every visited VMA has accepted the advice: a
-            // per-VMA rejection (EINVAL) is reported first, and an advice that
-            // acts on pages acts on the mapped segments before the hole is
-            // reported (madvise02 expects EINVAL, not ENOMEM, for
-            // MADV_WIPEONFORK over one shared page plus 15 unmapped ones).
-            let Some(raw_end) = address.0.checked_add(length as u64) else {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            };
-            let Some(end) = align_up_u64(raw_end, page_size) else {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            };
-            if super::overlaps_el0_clock_stub(address.0, end - address.0) {
-                return Ok(DispatchOutcome::errno(LINUX_EPERM));
-            }
-            let meta = this.madvise_range_meta(address.0, end);
-            if meta.covered.is_empty() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            }
-            let hole_verdict = if meta.fully_mapped {
-                DispatchOutcome::Returned { value: 0 }
-            } else {
-                DispatchOutcome::errno(LINUX_ENOMEM)
-            };
-            match advice {
-                LINUX_MADV_DONTFORK | LINUX_MADV_DOFORK | LINUX_MADV_WIPEONFORK | LINUX_MADV_KEEPONFORK => {
-                    if advice == LINUX_MADV_DOFORK && meta.any_special {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
-                    if advice == LINUX_MADV_WIPEONFORK && !meta.all_private_anon {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
-                    if advice == LINUX_MADV_KEEPONFORK && meta.any_droppable {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
-                    let (copy_update, child_update) = match advice {
-                        LINUX_MADV_DONTFORK => (Some(carrick_abi::VmaForkCopyPolicy::Omit), None),
-                        LINUX_MADV_DOFORK => (Some(carrick_abi::VmaForkCopyPolicy::Inherit), None),
-                        LINUX_MADV_WIPEONFORK => (None, Some(carrick_abi::VmaForkChildPolicy::ZeroInChild)),
-                        LINUX_MADV_KEEPONFORK => (None, Some(carrick_abi::VmaForkChildPolicy::Preserve)),
+            match plan.advice {
+                Advice::DontFork | Advice::DoFork | Advice::WipeOnFork | Advice::KeepOnFork => {
+                    let (copy_update, child_update) = match plan.advice {
+                        Advice::DontFork => (Some(carrick_abi::VmaForkCopyPolicy::Omit), None),
+                        Advice::DoFork => (Some(carrick_abi::VmaForkCopyPolicy::Inherit), None),
+                        Advice::WipeOnFork => (None, Some(carrick_abi::VmaForkChildPolicy::ZeroInChild)),
+                        Advice::KeepOnFork => (None, Some(carrick_abi::VmaForkChildPolicy::Preserve)),
                         _ => unreachable!(),
                     };
                     this.update_madvise_vma_policy(address.0, end - address.0, copy_update, child_update, None);
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(hole_verdict);
                 }
-                LINUX_MADV_DONTDUMP | LINUX_MADV_DODUMP => {
+                Advice::DontDump | Advice::DoDump => {
                     // Not an advisory no-op: Linux keeps a DONTDUMP VMA in the
                     // core's program headers but writes no contents for it, so
                     // the policy has to reach the dump. carrick rejected both
                     // with EINVAL, which is what `memflagmatrix`'s
                     // `madvise_hints_matrix_ok` caught -- the oracle returns 0.
-                    let dump_update = if advice == LINUX_MADV_DONTDUMP {
+                    let dump_update = if plan.advice == Advice::DontDump {
                         carrick_abi::VmaDumpPolicy::Omit
                     } else {
                         carrick_abi::VmaDumpPolicy::Include
@@ -730,13 +685,7 @@ impl<'a> MemView<'a> {
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(hole_verdict);
                 }
-                LINUX_MADV_DONTNEED => {
-                    // Linux can_madv_lru_vma rejects VM_LOCKED (also VM_HUGETLB /
-                    // VM_PFNMAP, which carrick does not model) with EINVAL before
-                    // dropping any page — derived from the locked-range table.
-                    if meta.locked {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
+                Advice::DontNeed => {
                     // Private anonymous contents are discarded regardless of guest
                     // write permission. Backing maintenance bypasses that permission
                     // while retaining COW/owner authentication. Classify each segment:
@@ -744,18 +693,19 @@ impl<'a> MemView<'a> {
                     // Shared backing is never zeroed; private files restore their
                     // own source below. Covered segments on both sides of a hole
                     // are processed before reporting the hole verdict.
-                    for segment in &meta.covered {
+                    for step in &plan.steps {
+                        let segment = &step.segment;
                         let Ok(segment_len) = usize::try_from(segment.end - segment.start) else {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                         };
-                        if segment.provenance == VmaBackingProvenance::PrivateFile {
+                        if step.action == Action::RestorePrivateFile {
                             this.mark_vma_dispatch(&mut host_alias_dispatch);
                             if let Err(errno) = this.discard_private_file_segment(cx.memory, segment) {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
                             continue;
                         }
-                        if segment.provenance.is_private_anonymous() {
+                        if step.action == Action::DiscardPrivateAnonymous {
                             let discarded = match cx.memory.discard_private_anonymous(segment.start, segment_len) {
                                 Ok(discarded) => discarded,
                                 Err(carrick_guest_mem::RepointPrivateError::Clean(_)) => {
@@ -771,7 +721,7 @@ impl<'a> MemView<'a> {
                                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                             }
                         }
-                        if segment.provenance.is_private_anonymous() {
+                        if step.action == Action::DiscardPrivateAnonymous {
                             this.mark_range_nonresident(segment.start, segment_len as u64);
                             // Discarding the pages puts them back where a fresh
                             // anonymous mapping starts: not resident, and resident
@@ -808,11 +758,6 @@ impl<'a> MemView<'a> {
                         }
                     }
                     return Ok(hole_verdict);
-                }
-                // MADV_FREE only applies to private anonymous mappings; a shared
-                // mapping (file- or anon-backed) → EINVAL.
-                LINUX_MADV_FREE if meta.shared => {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 _ => {}
             }
