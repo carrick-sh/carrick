@@ -11469,8 +11469,8 @@ fn native_descriptor_argument_witness(
                 }));
             });
             carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move |address, _, write| {
-                    if address != target {
+                *hook.borrow_mut() = Some(Box::new(move |address, _, access| {
+                    if address.raw() != target {
                         return true;
                     }
                     if matches!(
@@ -11480,7 +11480,9 @@ fn native_descriptor_argument_witness(
                         return false;
                     }
                     let descriptor = fixture.tables.words[1536].load(Ordering::Acquire);
-                    descriptor & 1 != 0 && (!write || descriptor & (1 << 7) == 0)
+                    descriptor & 1 != 0
+                        && (access != carrick_guest_arch::Access::Write
+                            || descriptor & (1 << 7) == 0)
                 }));
             });
         }
