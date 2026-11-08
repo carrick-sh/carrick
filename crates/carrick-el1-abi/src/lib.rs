@@ -1037,10 +1037,6 @@ pub fn check_image_abi(image: &[u8]) -> Result<ImageHeader, ImageAbiError> {
 pub const EL1_ABI_LAYOUT_HASH: u64 = {
     let facts: &[u64] = &[
         carrick_core_abi::X86_INITIAL_BOOT_VERSION as u64,
-        core::mem::size_of::<carrick_core_abi::X86InitialBootHeader>() as u64,
-        core::mem::size_of::<carrick_core_abi::X86InitialBootRequest>() as u64,
-        core::mem::offset_of!(carrick_core_abi::X86InitialBootHeader, layout_hash) as u64,
-        core::mem::offset_of!(carrick_core_abi::X86InitialBootRequest, layout_hash) as u64,
         EL1_REGION_BASE,
         EL1_REGION_SIZE,
         EL1_IMAGE_SIZE.raw(),
