@@ -4441,3 +4441,215 @@ fn native_service_intake_authenticates_free_root_home_before_park() {
     }
     assert!(queue.native_service_member(reference).is_none());
 }
+
+/// A native scalar park has no host task, and need not have a home slot.
+fn native_timer_park(zone: &ZoneTables, tid: u64, deadline: u64) -> RecordRef {
+    let record = zone.alloc_record(identity(tid)).unwrap();
+    publish_native_timer_park(zone, record, deadline)
+}
+fn publish_native_timer_park(zone: &ZoneTables, record: RecordId, deadline: u64) -> RecordRef {
+    assert!(zone.mark_native_owned(record));
+    let seq = zone.next_seq(record);
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x4400), &HostWait)
+        .unwrap();
+    zone.arm_timer_result(
+        SLOT,
+        record,
+        seq,
+        carrick_guest_arch::NativeReturnWord(0xfeed),
+    )
+    .unwrap();
+    zone.enqueue(&guard, record, seq, MM, 0x4400, u32::MAX, 0)
+        .unwrap();
+    zone.set_deadline(record, deadline);
+    zone.publish_park(record, seq);
+    zone.record_ref(record)
+}
+
+#[test]
+fn native_deadline_transfer_survives_all_slots_departing_and_record_reuse() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 1);
+    let exact = native_timer_park(&zone, 51, 100);
+    zone.leave_guest(SLOT, &HostWait);
+    let taken = zone.take_foreign_timer(SLOT).unwrap();
+    assert!(taken.native);
+    assert_eq!(taken.record, exact);
+    assert!(zone.reset_slot(SLOT));
+    assert_eq!(zone.timer_node_count(), 1);
+    assert_eq!(zone.native_timed_park().unwrap().deadline.raw(), 100);
+    assert_eq!(
+        zone.expire_native_timer(
+            carrick_guest_arch::CounterTick::new(99),
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            }
+        ),
+        None
+    );
+    assert_eq!(
+        zone.expire_native_timer(
+            carrick_guest_arch::CounterTick::new(100),
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            }
+        ),
+        Some(exact)
+    );
+    assert_eq!(zone.record(exact.id).result(), 0xfeed);
+    assert!(zone.record(exact.id).needs_native_handback());
+    assert_eq!(zone.record(exact.id).entry_count(), 0);
+    assert_eq!(zone.timer_node_count(), 0);
+    zone.free_record(exact.id);
+    let next = native_timer_park(&zone, 52, 200);
+    assert_eq!(next.id, exact.id);
+    assert_ne!(next.incarnation, exact.incarnation);
+    assert!(zone.take_foreign_timer(SLOT).unwrap().native);
+    assert_eq!(
+        zone.expire_native_timer(
+            carrick_guest_arch::CounterTick::new(100),
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            }
+        ),
+        None
+    );
+    assert_eq!(
+        zone.claim_for_host(next, None, Handback::Cancelled, &HostWait, &|owned| {
+            let _ = owned.into_parts();
+        }),
+        HostClaim::Claimed
+    );
+    zone.free_record(next.id);
+    assert_eq!(zone.timer_node_count(), 0);
+    assert_eq!(zone.native_timed_park(), None);
+    assert_eq!(zone.live(next).map(|_| ()), None);
+}
+
+#[test]
+fn native_deadline_wake_transfer_and_expiry_resolve_once() {
+    for _ in 0..32 {
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, Some(0), 1);
+        let exact = native_timer_park(&zone, 51, 100);
+        zone.leave_guest(SLOT, &HostWait);
+        let (woke, expired) = std::thread::scope(|scope| {
+            let waker = scope.spawn(|| {
+                let guard = zone
+                    .lock(ZoneTables::bucket_of(MM, 0x4400), &HostWait)
+                    .unwrap();
+                let mut woken = [WakeRecord::Empty];
+                let count = zone
+                    .wake(&guard, MM, 0x4400, u32::MAX, 1, Waker::Host, &mut woken)
+                    .unwrap();
+                drop(guard);
+                if count == 1 {
+                    assert_eq!(
+                        woken[0].take_ready(&HostWait, &|owned| {
+                            let _ = owned.into_parts();
+                        }),
+                        Some(exact)
+                    );
+                }
+                count
+            });
+            zone.take_foreign_timer(SLOT);
+            let expired = zone
+                .expire_native_timer(
+                    carrick_guest_arch::CounterTick::new(100),
+                    &HostWait,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    },
+                )
+                .is_some();
+            (waker.join().unwrap(), expired)
+        });
+        assert_eq!(woke + u32::from(expired), 1);
+        assert_eq!(
+            zone.record(exact.id).result(),
+            if expired { 0xfeed } else { 0 }
+        );
+        assert_eq!(zone.timer_node_count(), 0);
+        assert_eq!(zone.record(exact.id).entry_count(), 0);
+        assert_eq!(
+            zone.expire_native_timer(
+                carrick_guest_arch::CounterTick::new(200),
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                }
+            ),
+            None
+        );
+    }
+}
+
+#[test]
+fn native_deadline_contended_cleanup_keeps_owned_resolution_until_release() {
+    let zone = zone();
+    let exact = native_timer_park(&zone, 51, 100);
+    assert!(zone.take_foreign_timer(SLOT).unwrap().native);
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x4400), &HostWait)
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    struct WaitForRelease(std::sync::mpsc::SyncSender<()>);
+    impl LockWait for WaitForRelease {
+        fn wait(&self, attempt: u32) -> bool {
+            if attempt == 1 {
+                self.0.send(()).unwrap();
+            }
+            std::thread::yield_now();
+            true
+        }
+    }
+    std::thread::scope(|scope| {
+        let expiry = scope.spawn(|| {
+            zone.expire_native_timer(
+                carrick_guest_arch::CounterTick::new(100),
+                &WaitForRelease(tx),
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+            )
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            zone.record(exact.id).claim(),
+            Claim::Transferring { .. }
+        ));
+        assert_eq!(zone.record(exact.id).entry_count(), 1);
+        drop(guard);
+        assert_eq!(expiry.join().unwrap(), Some(exact));
+    });
+    assert_eq!(zone.record(exact.id).result(), 0xfeed);
+    assert_eq!(zone.record(exact.id).entry_count(), 0);
+    assert_eq!(zone.timer_node_count(), 0);
+}
+
+#[test]
+fn unhoming_a_native_root_cannot_cancel_carrier_deadline_custody() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 1);
+    let record = zone.current_or_new(SLOT, identity(51)).unwrap();
+    let exact = publish_native_timer_park(&zone, record, 100);
+    zone.clear_current(SLOT);
+    zone.leave_guest(SLOT, &HostWait);
+    assert!(zone.take_foreign_timer(SLOT).unwrap().native);
+    assert_eq!(zone.unhome(SLOT, record, 1), None);
+    assert_eq!(zone.timer_node_count(), 1);
+    assert_eq!(zone.native_timed_park().unwrap().record, exact);
+    assert!(zone.reset_slot(SLOT));
+    assert_eq!(
+        zone.expire_native_timer(CounterTick::new(100), &HostWait, &|owned| {
+            let _ = owned.into_parts();
+        }),
+        Some(exact)
+    );
+    assert_eq!(zone.timer_node_count(), 0);
+}

@@ -336,19 +336,40 @@ pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
     outcome
 }
 
-/// The executor of `slot` is leaving EL1: a timed park of another
-/// executor's thread on this slot's timer would go unserved until the vCPU
-/// returns. Claim it for the host (a control handback): its thread re-runs
-/// the call with what is left of its deadline. A wake that won the record
-/// first leaves nothing to claim.
+/// Deliver all due exact native parks. HostLockWait is the existing short
+/// authority acquisition policy: no fallible refusal discards a timer receipt.
+pub fn expire_native_timers(zone: &ZoneTables, now: carrick_sched_core::CounterTick) {
+    while zone
+        .native_timed_park()
+        .is_some_and(|park| park.deadline.raw() <= now.raw())
+    {
+        if let Some(record) = zone.expire_native_timer(now, &HostLockWait, &|owned| {
+            crate::el1_zone::complete_object_wake(owned.zone(), owned)
+        }) {
+            route_native_handback_in_zone(zone, record);
+        }
+    }
+}
+
+/// Move native deadline serving custody before the departing slot is reused.
+/// The Parked claim, enrollment, saved result and original tick stay intact.
+/// Host-owned waits retain their existing control-handback continuation.
 pub fn hand_back_foreign_timer(slot: SlotId) {
     let Some(zone) = zone() else {
         return;
     };
+    let mut transferred = false;
     while let Some(foreign) = zone.take_foreign_timer(slot) {
+        if foreign.native {
+            transferred = true;
+            continue;
+        }
         if let HostClaim::Claimed = claim(foreign.record, Some(foreign.seq), Handback::Control) {
             hand_back(&[foreign.record]);
         }
+    }
+    if transferred {
+        deliver_handback_event(HandbackEvent::NativeDeadlineChanged);
     }
 }
 
@@ -1041,6 +1062,8 @@ pub enum HandbackEvent<'a> {
     /// A native queue retained work without a live driver. Wake execution
     /// capacity through the scheduler control epoch, without a host task row.
     NativeQueued,
+    /// Deadline serving custody moved to the carrier's lifetime driver.
+    NativeDeadlineChanged,
 }
 
 pub type HandbackPublisher = Arc<dyn Fn(HandbackEvent<'_>) + Send + Sync>;
@@ -2365,7 +2388,7 @@ mod tests {
                 HandbackEvent::NativeQueued => {
                     seen_capacity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                HandbackEvent::DeferredCaptured(_) => {}
+                HandbackEvent::DeferredCaptured(_) | HandbackEvent::NativeDeadlineChanged => {}
             }));
             // The guest venue (`deliver_completion`): defer what could not be
             // placed, then ring the venue slot's pending-host-work doorbell.

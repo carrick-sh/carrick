@@ -1590,6 +1590,13 @@ fn child_futex<'a>(
             carrick_sched_core::Claim::Parked { .. }
         ));
         assert!(deadline > crate::sched::ThreadCpu::now(&cpu));
+        // Settle gettid's completed return boundary before rebinding the
+        // task, just as the carrier does. Otherwise CurrentTask::set turns
+        // that unconsumed boundary into pending work and defers FUTEX_WAKE.
+        assert_eq!(
+            fixture.task.linux.take_served_boundary(),
+            Some(carrick_personality_linux::abi::entry::ServedBoundary::Completed),
+        );
         // The sibling has executed gettid while the exec leader is parked.
         // Model the stopped carrier boundary using the same public entry
         // points as reconcile_zone_exit and executor slot reuse.
@@ -1627,35 +1634,63 @@ fn child_futex<'a>(
         if wake_after_departure {
             // Resume the already-live sibling through native custody, then
             // use the production FUTEX_WAKE below before the original tick.
+            fixture.zone.enter_guest(fixture.slot);
             activate_target(source, &fixture.task, &worker);
+            // activate_target's process binding names the leader. This is a
+            // non-leader: project its exact execution identity as Sched does.
+            let identity = fixture.zone.record(worker.record.id).identity();
+            fixture.task.set(
+                El1TaskId::from_linux_tid(identity.tid as i32),
+                carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+                identity.file_table,
+            );
         } else {
             // No timeout before the original deadline, then exactly one timeout.
             assert!(
-                !fixture
+                fixture
                     .zone
-                    .expire_timer(fixture.slot, deadline - 1, (-110_i64) as u64, &|owned| {
-                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                    })
-                    .unwrap()
+                    .expire_native_timer(
+                        carrick_guest_arch::CounterTick::new(deadline - 1),
+                        &ShortLockSpin,
+                        &|owned| crate::sched::object_wait::deliver_host_completion(
+                            owned.zone(),
+                            owned
+                        )
+                    )
+                    .is_none()
             );
             assert!(
                 fixture
                     .zone
-                    .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
-                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                    })
-                    .unwrap()
+                    .expire_native_timer(
+                        carrick_guest_arch::CounterTick::new(deadline),
+                        &ShortLockSpin,
+                        &|owned| crate::sched::object_wait::deliver_host_completion(
+                            owned.zone(),
+                            owned
+                        )
+                    )
+                    .is_some()
             );
             assert!(
-                !fixture
+                fixture
                     .zone
-                    .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
-                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                    })
-                    .unwrap()
+                    .expire_native_timer(
+                        carrick_guest_arch::CounterTick::new(deadline),
+                        &ShortLockSpin,
+                        &|owned| crate::sched::object_wait::deliver_host_completion(
+                            owned.zone(),
+                            owned
+                        )
+                    )
+                    .is_none()
             );
             assert_eq!(fixture.zone.timer_node_count(), 0);
             assert_eq!(waiter.result() as i64, -110);
+            assert_eq!(waiter.entry_count(), 0);
+            carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+                carrick_kernel::el1_zone::hand_back(&[binding.record]);
+            });
             assert!(!matches!(
                 waiter.claim(),
                 carrick_sched_core::Claim::Parked { .. }
@@ -1706,15 +1741,21 @@ fn child_futex<'a>(
     drop(entry);
     if wake_after_departure {
         let deadline = original_deadline.expect("timed native park");
+        assert_eq!(fixture.zone.record(binding.record.id).entry_count(), 0);
         assert!(crate::sched::ThreadCpu::now(&cpu) < deadline);
         assert_eq!(fixture.zone.timer_node_count(), 0);
         assert!(
-            !fixture
+            fixture
                 .zone
-                .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
-                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                })
-                .unwrap(),
+                .expire_native_timer(
+                    carrick_guest_arch::CounterTick::new(deadline),
+                    &ShortLockSpin,
+                    &|owned| crate::sched::object_wait::deliver_host_completion(
+                        owned.zone(),
+                        owned
+                    )
+                )
+                .is_none(),
             "the later timeout must not resolve the wake winner again"
         );
         assert!(
