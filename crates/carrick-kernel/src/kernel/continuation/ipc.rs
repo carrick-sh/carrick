@@ -461,7 +461,8 @@ pub fn finish(
     Ok(op)
 }
 
-/// Stop a parked or handed-back operation for `cause` and finish it.
+/// Settle a parked or handed-back operation for `cause`. Control actions
+/// retain PollWait's admission; handler interruptions finish it with EINTR.
 pub fn interrupt<M: carrick_guest_mem::CurrentMmMemory>(
     context: &crate::kernel::KernelContext,
     region: &IpcRegion<'_>,
@@ -472,11 +473,16 @@ pub fn interrupt<M: carrick_guest_mem::CurrentMmMemory>(
     wake: &impl IpcHostServices,
 ) -> Result<IpcHostOutcome, IpcError> {
     wake.validate_region(region)?;
-    let op = region.operation(&token)?;
+    let mut op = region.operation(&token)?;
     if op.mm != mm {
         return Err(IpcError::Stale);
     }
     if op.kind == IpcOpKind::PollWait {
+        // A directly claimed ring park may still have handback=None. Once
+        // the host owns completion, a copyout refusal must be resumable by
+        // complete_handback without losing its decided answer or token.
+        op.handback = IpcHandback::Continue;
+        region.update_operation(&token, op)?;
         return complete_poll(context, region, token, op, memory, Some(cause), wake);
     }
     let op = finish(region, token, wake)?;
