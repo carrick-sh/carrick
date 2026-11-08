@@ -42,7 +42,7 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
         "scripts/migrate/check-serial-host-tests.py",
         "# fixture authority\n",
     );
-    let recipe = "test:\n    cargo --locked --offline test --workspace --lib --features carrick-kernel/test-support -- --skip serial_host\n    env RUST_TEST_THREADS=1 cargo --locked --offline test --workspace --lib --features carrick-kernel/test-support serial_host\n";
+    let recipe = "test:\n    cargo --locked --offline run -p carrick-xtask -- test-batch lanes\nlanes:\n    cargo --locked --offline test --workspace --lib -- --skip serial_host\n    env RUST_TEST_THREADS=1 cargo --locked --offline test --workspace --lib --features carrick-kernel/test-support serial_host\n";
     write("justfile", recipe);
     let git = |args: &[&str]| {
         let out = Command::new("git")
@@ -129,6 +129,12 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
         "{text}"
     );
     assert!(!text.contains("must_not_run ... FAILED"), "{text}");
+    if !text.contains("host facility unavailable") {
+        assert!(
+            text.contains("test-touched: carrick-kernel: PASS"),
+            "{text}"
+        );
+    }
     // Editing the authority changes the touched plan immediately; no second table.
     write(
         "justfile",
