@@ -3739,6 +3739,30 @@ fn deadline_preserves_prior_failure_and_skips_do_not_fix_baseline_failures() {
 }
 
 #[test]
+fn not_run_cannot_fix_a_baseline_deadline() {
+    let base = receipt_from_el1_log(
+        false,
+        "test-signed: running /w/suite-abcdef\ntest earlier ... FAILED\ntest-signed: DEADLINE /w/suite-abcdef earlier (9s)\ntest x ... FAILED\ntest-signed: DEADLINE /w/suite-abcdef x (9s)\ntest result: FAILED.\n",
+    );
+    let candidate = receipt_from_el1_log(
+        false,
+        "test-signed: running /w/suite-abcdef\ntest earlier ... FAILED\ntest-signed: DEADLINE /w/suite-abcdef earlier (9s)\ntest-signed: NOT-RUN /w/suite-abcdef x (binary budget of 600s spent)\ntest result: FAILED.\n",
+    );
+    assert_eq!(
+        base.steps[0].failed_tests,
+        ["deadline:suite::earlier", "deadline:suite::x"]
+    );
+    assert_eq!(candidate.steps[0].failed_tests, ["deadline:suite::earlier"]);
+    assert_eq!(candidate.steps[0].not_run_tests, ["suite::x"]);
+    let key = "test:el1-embed:deadline:suite::x".to_string();
+    let delta = diff(&base, &candidate).unwrap();
+    assert!(!delta.fixed.contains(&key), "{delta:?}");
+    assert!(!delta.new.contains(&key), "{delta:?}");
+    // An executed deadline remains a new failure in the reverse comparison.
+    assert!(diff(&candidate, &base).unwrap().new.contains(&key));
+}
+
+#[test]
 fn not_run_cannot_fix_a_baseline_failure() {
     for deadline in [false, true] {
         let mut base_step = step("el1-embed", false, &["suite::x"]);
