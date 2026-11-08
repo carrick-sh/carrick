@@ -134,6 +134,7 @@ vm_free = [
   "carrick-el1-linux::mm_portal::tests::copyin_mapping_change_retains_selected_owner_retry_and_redispatches_once (#1677: a real reservation change between selection and revalidation retains the selected wait observation; one queue-release handback and one redispatch, no local retry)",
   "carrick-aarch64::engine::transfer_service_tests::serial_host_withdrawn_file_fault_parks_authenticated_owner_wait (#1692: the production owner file-fault service submits and withdraws an unclaimed physical grant, decodes EL1's authenticated editor wait, releases physical custody, and returns PendingOwner instead of a terminal refusal)",
   "carrick-runtime::vcpu_loop::tests::serial_host_file_fault_owner_wait_parks_then_reruns_fetch (#1692: owner file-fault resolution releases the exact frame mailbox, production binding parks on the authenticated owner notification, wake resumes through ResumeFaultOwner, and the faulting fetch reruns without replaying host service)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_zone_poll_output_owner_wait_preserves_ready_answer",
 ]
 
 embed = [
