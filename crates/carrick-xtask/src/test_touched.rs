@@ -39,8 +39,15 @@ fn selection(root: &Path, meta: &Value, paths: &[PathBuf]) -> Result<BTreeSet<St
             .max_by_key(|(dir, _)| dir.components().count());
         if let Some((_, p)) = owner {
             selected.insert(p["name"].as_str().ok_or("missing name")?.to_owned());
-        } else {
-            // Shared inputs (Cargo.lock, recipes, scripts, etc.) have no single owner.
+        } else if matches!(
+            path.to_str(),
+            Some("Cargo.toml" | "Cargo.lock" | "justfile" | "rust-toolchain.toml")
+        ) || [".cargo", "scripts", "crates", ".github"]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+        {
+            // Shared build/test inputs have no single owner. Documentation and
+            // other non-build files outside packages do not touch a crate.
             selected.extend(
                 packages
                     .iter()
@@ -263,6 +270,11 @@ mod tests {
                 "kernel".into(),
                 "runtime".into()
             ])
+        );
+        assert!(
+            selection(Path::new("/repo"), &meta, &[PathBuf::from("AGENTS.md")])
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(
             selection(Path::new("/repo"), &meta, &[PathBuf::from("Cargo.lock")])
