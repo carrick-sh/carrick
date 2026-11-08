@@ -312,6 +312,42 @@ pub struct NativeAdmissionContention {
     pub conflicting_owner: Option<ExecutionBinding>,
 }
 
+impl NativeAdmissionContention {
+    pub fn fatal_reason(self) -> carrick_el1_abi::EntryBindingFatalReason {
+        use carrick_el1_abi::EntryBindingFatalReason as R;
+        match self.origin {
+            NativeAdmissionOrigin::OldRecordRetained => R::AdmissionOldRecordRetained,
+            NativeAdmissionOrigin::ExecutionKeyCollision => R::AdmissionExecutionKeyCollision,
+            NativeAdmissionOrigin::RecordKeyCollision => R::AdmissionRecordKeyCollision,
+            NativeAdmissionOrigin::ThreadRegistrationCollision => {
+                R::AdmissionThreadRegistrationCollision
+            }
+            NativeAdmissionOrigin::ThreadPendingCustody => R::AdmissionThreadPendingCustody,
+            NativeAdmissionOrigin::FreshRootPendingCustody => R::AdmissionFreshRootPendingCustody,
+            NativeAdmissionOrigin::RootRegistrationCollision => {
+                R::AdmissionRootRegistrationCollision
+            }
+        }
+    }
+
+    /// Lossless compact identities: record ids, incarnations, task ids,
+    /// snapshot generations and thread generations. Zero id means absent.
+    pub fn diagnostic_words(self) -> [u64; 8] {
+        let owner = self.conflicting_owner;
+        [
+            u64::from(self.new_record.id.raw()) << 32
+                | self.old_record.map_or(0, |r| u64::from(r.id.raw())),
+            self.old_record.map_or(0, |r| r.incarnation),
+            self.new_record.incarnation,
+            self.binding.task.raw() << 32 | owner.map_or(0, |b| b.task.raw()),
+            self.binding.generation.raw(),
+            owner.map_or(0, |b| b.generation.raw()),
+            self.binding.thread_generation.raw(),
+            owner.map_or(0, |b| b.thread_generation.raw()),
+        ]
+    }
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
