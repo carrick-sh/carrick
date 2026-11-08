@@ -616,6 +616,20 @@ impl NativeSignalFixture {
         Self::with_identity(true, |_| (binding, process, process_birth))
     }
 
+    /// Admit the identities established by production bootstrap without seeding
+    /// a fixture namespace domain or issuing any fixture identity claims.
+    pub fn from_bootstrap(
+        identity: impl FnOnce(
+            &'static ZoneTables<ParkedContextWords>,
+        ) -> (
+            ExecutionBinding,
+            carrick_core_abi::EntryTaskKey,
+            carrick_core_abi::BirthSerial,
+        ),
+    ) -> Self {
+        Self::with_identity(false, identity)
+    }
+
     fn with_identity(
         seed: bool,
         identity: impl FnOnce(
@@ -8028,12 +8042,13 @@ fn host_root_open_publishes_unstamped_record_through_service_notice() {
     drop(queue);
 }
 
-
+#[cfg(test)]
 #[test]
 fn production_unmapped_root_early_bind_admits_and_forks() {
     production_unmapped_root_admits_and_forks(false);
 }
 
+#[cfg(test)]
 #[test]
 fn production_unmapped_root_late_bind_admits_and_forks() {
     production_unmapped_root_admits_and_forks(true);
@@ -8045,7 +8060,7 @@ fn production_unmapped_root_admits_and_forks(late_bind: bool) {
     use carrick_kernel::kernel::{Container, Kernel, LaunchContext, RootBootstrap, RunId};
     {
         let mut retained = None;
-        let fixture = NativeSignalFixture::with_identity(false, |zone| {
+        let fixture = NativeSignalFixture::from_bootstrap(|zone| {
             let source = Arc::new(OwnedBirthZone::from_static(zone));
             let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
                 "unmapped",

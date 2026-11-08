@@ -2156,6 +2156,12 @@ fn production_root_domains_retire_after_cancel() {
 fn production_root_domains_retire(retire_bootstrap: bool) {
     use super::{Container, LaunchContext, RunId};
     use crate::namespace::pid::NsSharedRegion;
+    use carrick_core_abi::{
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
+    };
+    use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
+    use carrick_hal::birth_serial::test_support::OwnedBirthZone;
     use carrick_kernel_arena::arena::KernelArena;
     let arena = Box::leak(Box::new(KernelArena::create().unwrap()));
     let region = NsSharedRegion::allocate(arena).unwrap();
@@ -2171,9 +2177,30 @@ fn production_root_domains_retire(retire_bootstrap: bool) {
         Arc::new(carrick_hal::NullHostSignalBridge::default()),
     )
     .unwrap();
-    let (kernel, _root) = Kernel::bootstrap_root(bootstrap).unwrap();
+    let mut bootstrapped = None;
+    let native = NativeSignalFixture::from_bootstrap(|zone| {
+        let source = Arc::new(OwnedBirthZone::from_static(zone));
+        let (kernel, root) = Kernel::bootstrap_root(bootstrap.with_birth_source(source)).unwrap();
+        let task = root.task().key();
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(task.id.raw() as u64),
+            generation: SnapshotGeneration::INITIAL,
+            mm: EntryMmKey::from_raw(root.shared().mm().id().raw()),
+            thread_generation: EntryThreadGeneration::from_raw(root.thread().key().serial.raw()),
+        };
+        let visible = crate::namespace::pid::ns_self_pid_for(&root, task.id.raw() as u32);
+        assert_eq!(visible, 1);
+        bootstrapped = Some((kernel, root));
+        (
+            binding,
+            EntryTaskKey::from_raw(u64::from(visible)),
+            BirthSerial::of_task(task.serial),
+        )
+    });
+    let (kernel, _root) = bootstrapped.unwrap();
     assert_eq!(kernel.ids().visible_namespace_count(), 1);
     if retire_bootstrap {
+        drop(native);
         assert!(region.retire());
         assert_eq!(
             kernel.ids().visible_namespace_count(),

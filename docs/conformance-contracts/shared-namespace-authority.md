@@ -35,7 +35,8 @@ The review regressions in #1841 are covered at production root admission:
 or after bootstrap, and calls native admission without fixture namespace
 seeding. Host reservations remain live across native fork. The child PID and
 leader TID must equal the internal claim and avoid those reservations.
-`production_root_domains_retire_after_{bootstrap,cancel}` checks initial
+`production_root_domains_retire_after_{bootstrap,cancel}` admits the
+production namespaced root into the native runtime before checking initial
 root retirement and four cancelled `prepare_container_root` operations. Each
 namespace retirement must return the cursor count to baseline, and each
 cancelled preparation must return all number claims to baseline.
