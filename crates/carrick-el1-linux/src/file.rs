@@ -210,6 +210,9 @@ impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, 
         }
         done
     }
+    fn has_copyin_refusal(&self) -> bool {
+        self.input_wait.is_some()
+    }
     fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
         if self.inner.copy_out(address, bytes) {
             return true;
