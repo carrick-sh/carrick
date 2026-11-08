@@ -36,7 +36,7 @@ pub(crate) struct Lane {
     pub(crate) targets: BTreeSet<(String, String)>,
     features: BTreeSet<String>,
     harness: Vec<String>,
-    doc: bool,
+    pub(crate) doc: bool,
     implicit_doc: bool,
     no_run: bool,
     no_default: bool,
@@ -258,7 +258,7 @@ pub(crate) fn selected_records(
         .filter(|(id, _)| ids.contains(id))
         .cloned()
         .collect();
-    if execution_targets.is_empty() {
+    if execution_targets.is_empty() && !lanes.iter().any(|lane| lane.doc) {
         return Ok(());
     }
     let args = TestBatchArgs {
@@ -361,6 +361,10 @@ fn execute_selected(
             binaries.insert((binary.package, binary.target), path);
         }
         binaries
+    } else if packages.is_empty() {
+        // Explicit doctest-only units are built by rustdoc below. An empty
+        // Cargo package selection here would compile workspace defaults.
+        BTreeMap::new()
     } else {
         let (binaries, files) = compile(
             root, &lanes, &meta, &packages, &features, &targets, args.jobs,
@@ -430,6 +434,9 @@ fn execute_selected(
             let mut doc = crate::command::offline_cargo();
             doc.current_dir(&lane.record[2])
                 .args(crate::command::cargo_replay_args(&lane.record[3..]));
+            if let Some(jobs) = args.jobs {
+                doc.args(["--jobs", &jobs.to_string()]);
+            }
             if !doc.status()?.success() {
                 red.push("doctest".to_owned());
             }
