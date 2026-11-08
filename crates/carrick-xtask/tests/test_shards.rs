@@ -1,6 +1,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/cargo_env.rs"]
+mod cargo_env;
+
+use std::ffi::OsStr;
 use std::process::Command;
+
+fn clean_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    cargo_env::clean_cargo_env(&mut command);
+    command
+}
 
 fn check(shards: &str) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
@@ -11,7 +21,7 @@ fn check(shards: &str) -> std::process::Output {
         ),
     )
     .unwrap();
-    Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+    clean_command(env!("CARGO_BIN_EXE_carrick-xtask"))
         .args(["--root", dir.path().to_str().unwrap(), "check-test-shards"])
         .output()
         .unwrap()
@@ -224,7 +234,7 @@ test-shard-a:
 "#,
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+    let output = clean_command(env!("CARGO_BIN_EXE_carrick-xtask"))
         .args(["--root", dir.path().to_str().unwrap(), "check-test-shards"])
         .output()
         .unwrap();
@@ -248,7 +258,7 @@ fn capture_owns_its_helper_when_a_build_replaces_the_running_binary() {
     let executable = dir.path().join("xtask");
     std::fs::hard_link(binary, &executable).unwrap();
     std::fs::write(dir.path().join("justfile"), "test:\n    rm -f \"$CARRICK_TEST_EXECUTABLE\"\n    cargo --locked --offline test -p one --lib\nlanes:\n    cargo --locked --offline test -p one --lib\ntest-shard-a:\n    cargo --locked --offline run -p carrick-xtask -- test-batch lanes\n").unwrap();
-    let output = Command::new(&executable)
+    let output = clean_command(&executable)
         .current_dir(dir.path())
         .args(["check-test-shards"])
         .env("CARRICK_TEST_EXECUTABLE", &executable)
@@ -300,7 +310,7 @@ test-shard-a:
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+    let output = clean_command(env!("CARGO_BIN_EXE_carrick-xtask"))
         .args(["--root", dir.path().to_str().unwrap(), "check-test-shards"])
         .output()
         .unwrap();
@@ -317,9 +327,16 @@ test-shard-a:
 }
 
 #[test]
+fn workspace_shard_capture_is_independent_of_hostile_cargo_settings() {
+    cargo_env::assert_hostile_cargo_test(
+        "workspace_test_and_shards_agree_including_unconditional_kernel_control",
+    );
+}
+
+#[test]
 fn workspace_test_and_shards_agree_including_unconditional_kernel_control() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+    let output = clean_command(env!("CARGO_BIN_EXE_carrick-xtask"))
         .args(["--root", root.to_str().unwrap(), "check-test-shards"])
         .output()
         .unwrap();
@@ -336,7 +353,7 @@ fn workspace_capture_with_artifact_and_no_cargo_environment() {
     let directory = tempfile::tempdir().unwrap();
     let artifact = directory.path().join("xtask artifact");
     std::fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &artifact).unwrap();
-    let output = Command::new(&artifact)
+    let output = clean_command(&artifact)
         .args(["--root", root.to_str().unwrap(), "check-test-shards"])
         .env("CARRICK_XTASK_BIN", &artifact)
         .env_remove("CARGO")
@@ -363,7 +380,7 @@ fn capture_refuses_unlocked_or_online_cargo_before_execution() {
             format!("test:\n    {invocation}\ntest-shard-a:\n    {invocation}\n"),
         )
         .unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        let output = clean_command(env!("CARGO_BIN_EXE_carrick-xtask"))
             .args(["--root", dir.path().to_str().unwrap(), "check-test-shards"])
             .output()
             .unwrap();
@@ -407,7 +424,7 @@ fn cache_preparation_failure_is_infrastructure_and_offline_gate_never_fetches() 
     )
     .unwrap();
     let run = |prepare: bool| {
-        let mut command = Command::new("bash");
+        let mut command = clean_command("bash");
         command.arg(&script);
         if prepare {
             command.arg("--prepare");
@@ -454,7 +471,7 @@ fn fixture_lockfile_gate_rejects_missing_nested_lock_before_cargo() {
     let fixture = dir.path().join("crates/backend/fixtures/probe");
     std::fs::create_dir_all(&fixture).unwrap();
     std::fs::write(fixture.join("Cargo.toml"), "[workspace]\n").unwrap();
-    let output = Command::new("bash")
+    let output = clean_command("bash")
         .arg(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../scripts/check-fixture-lockfiles.sh"),
