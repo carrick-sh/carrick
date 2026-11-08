@@ -247,6 +247,23 @@ impl IpcTableMap {
     /// child can run and remains immutable until that same process retires it,
     /// so an unstable target entry means that custody is already changing.
     pub fn lookup_owned(&self, file_table: u64) -> Option<RawTableId> {
+        self.lookup_retained(file_table, Some(RetirementOwner::Directory))
+    }
+
+    /// Resolve a namespace whose binding the running caller retains. The
+    /// caller must exclude replacement/withdrawal of its own entry throughout
+    /// the read (a retained host FileTable or the native process lifetime).
+    /// Unrelated publishers may be preempted: skip their unstable entries in
+    /// the same bounded scan used for directory-owned namespaces.
+    pub fn lookup_retained_binding(&self, file_table: u64) -> Option<RawTableId> {
+        self.lookup_retained(file_table, None)
+    }
+
+    fn lookup_retained(
+        &self,
+        file_table: u64,
+        owner: Option<RetirementOwner>,
+    ) -> Option<RawTableId> {
         if file_table == EMPTY || file_table == TOMBSTONE {
             return None;
         }
@@ -268,7 +285,9 @@ impl IpcTableMap {
                 continue;
             }
             if key == file_table {
-                return (retirement == RetirementOwner::Directory as u32).then_some(table);
+                return owner
+                    .is_none_or(|owner| retirement == owner as u32)
+                    .then_some(table);
             }
             if key == EMPTY {
                 return None;
