@@ -34,6 +34,7 @@ rationale = "Owner waits are killable-only: handled signals and stops never comp
 [bindings]
 vm_free = [
   "carrick-sched-core::spaces::notification::tests::{actual_editor_refusal_during_final_release_cannot_park_after_it,actual_resource_refusal_during_final_release_cannot_park_after_it} (production editor destruction and resource release; observe/refuse immediately before final unlock, then host enrollment must return Changed with the owned operation, zero stranded registrations; all six resource causes)",
+  "carrick-el1-linux::aarch64_process_tests::{serial_host_native_prepared_fork_parent_ppoll_prepared_pollfd,serial_host_native_prepared_fork_parent_ppoll_prepared_timeout,serial_host_native_prepared_fork_parent_ppoll_unmapped_argument,serial_host_native_prepared_fork_parent_ppoll_forbidden_argument,serial_host_native_prepared_fork_parent_ppoll_shared_eventfd_input} (production dispatch, real native fork descriptors, parent input preparation; one backing supply and no copyout before preparation)",
   "carrick-sched-core::spaces::notification::tests::actual_gate_refusal_during_final_release_cannot_park_after_it",
   "carrick-runtime::vcpu_loop::binding::tests::serial_host_unkeyed_thread_exit_retry_parks_on_exact_memory_owner (retained terminal wait binds captured MM before ordinary zone refresh; real Gate wait parks and producer release resumes exact child-TID clear)",
   "carrick-core::terminal::terminal_memory_wait_tests::terminal_memory_wait_keeps_exact_mm_and_owner_incarnation",
