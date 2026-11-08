@@ -318,8 +318,19 @@ fn run_to_marker(
     expected: u8,
     factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
 ) {
+    run_to_marker_with_work(cpu, task, expected, factory, 0);
+}
+
+fn run_to_marker_with_work(
+    cpu: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
+    task: carrick_guest_arch::TaskIdentity,
+    expected: u8,
+    factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
+    expected_work: usize,
+) {
     use carrick_guest_mem::GuestMemory;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    let mut completed_work = 0;
     for _ in 0..128 {
         let exit = cpu
             .fixture_run_loaded(task)
@@ -348,14 +359,27 @@ fn run_to_marker(
                     [expected],
                     "guest assertions must reach the next marker"
                 );
+                assert_eq!(
+                    completed_work, expected_work,
+                    "completed boundaries before marker {expected}"
+                );
                 cpu.complete_forward(task, token, 1)
                     .expect("write completion");
                 return;
             }
             CarrierRunExit::PhysicalDoorbell { .. } => {
                 let outcome = cpu
-                    .service_physical_doorbell(task, &exit, |_, _| {
-                        panic!("unexpected completed host work before marker")
+                    .service_physical_doorbell(task, &exit, |served, pending| {
+                        assert!(served, "only completed work may precede a marker");
+                        let work = pending.expect("completed boundary owes ordinary host work");
+                        assert!(!work.native_signal_wake());
+                        assert!(work.native_terminal_slot().is_none());
+                        work.settled();
+                        completed_work += 1;
+                        assert!(
+                            completed_work <= expected_work,
+                            "unexpected completed host work before marker {expected}"
+                        );
                     })
                     .expect("physical service");
                 assert!(
@@ -1406,7 +1430,7 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
             (stdout, incarnation)
         })
         .expect("pre-fork open lifetime");
-    run_to_marker(&mut parent, task, 1, &factory);
+    run_to_marker_with_work(&mut parent, task, 1, &factory, 1);
     factory
         .fixture_pin_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
         .expect("child on independent physical lane");
