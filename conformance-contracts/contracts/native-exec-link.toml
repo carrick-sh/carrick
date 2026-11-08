@@ -1,0 +1,18 @@
+schema_version = 1
+id = "process.exec.native-exe-link"
+title = "Native exec successors read their own executable link"
+guest_surfaces = ["syscall:execve", "syscall:readlinkat", "proc:self/exe"]
+semantic_authority = ["proc_pid_exe(5): /proc/pid/exe names the executed program", "readlinkat(2): truncate without a terminating NUL"]
+fixture = "Real native fork and exec service adoption, then production readlinkat dispatch while the parent remains live"
+scale_points = [1]
+structural_budgets = []
+rationale = "One bounded pathname read and one retained owner copyout; no host-task fallback and no retries or polling. The native harness asserts zero forwarded calls."
+
+[bindings]
+vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_readlink_exe",
+]
+
+[bindings.unresolved]
+embed = "Director: signed real go-build row on this exact head; this worker has no HVF"
+docker = "Director: native arm64 go-build differential"
