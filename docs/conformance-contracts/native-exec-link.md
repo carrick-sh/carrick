@@ -25,13 +25,13 @@ Canonical syscall 78 stages a path record with the caller's access context.
 The carrier receives the executable from the authenticated caller MM, and
 uses the shared readlink target lookup under `NativeFsAuthority`. The ring
 copies only the completed reply bytes. The output allocation is bounded by
-PATH_MAX and the caller's positive signed buffer size. There is no polling,
+the existing 64 KiB record budget and the caller's positive signed buffer size. There is no polling,
 new wait, host-task syscall fallback, or crossing allowlist change.
 
 Non-`/` roots and foreign or other proc/fd magic links remain counted
 refusals. Ordinary symlinks use the same VFS implementation. The x86 decoder
 already desugars `readlink` to `readlinkat`; the x86 carrier has no native exec
-custody yet and supplies no executable identity. That remains a seam.
+custody yet and supplies no executable identity. That remains seam #1903.
 
 ## Evidence
 
