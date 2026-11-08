@@ -57,6 +57,8 @@ vm_free = [
   "carrick-core-abi::executable_publication::{tests::publication_is_bounded_and_acknowledges_cancellation_before_reuse,layout_manifest::portal_executable_publication,layout_manifest::portal_executable_slot}",
   "carrick-el1-abi::mm_portal::layout_manifest::mm_portal_slots (neutral executable-publication ownership move only: retained wire sizes, offsets, bounded single-flight acknowledgment and cancellation/reuse; existing semantic and work bindings above remain required, no broader or signed acceptance claim)",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
+  "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
+  "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
 ]
 
 [bindings.unresolved]
