@@ -1308,7 +1308,10 @@ impl MemState {
                                 piece_start,
                                 piece_end,
                                 prot,
-                                mapping.flags,
+                                mapping.flags.difference(
+                                    ReservationNodeFlags::IMAGE
+                                        .union(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT),
+                                ),
                                 Some(
                                     source
                                         .advance(piece_start - mapping.range.start())
@@ -1386,11 +1389,17 @@ impl MemState {
                 )?;
                 mapping.range = clipped;
                 model.retire_opaque(clipped)?;
-                // The lock moves to the host lock table below.
+                // The lock moves to the host lock table below; root-only
+                // outside-layout provenance belongs to root-editable spans,
+                // never to a host-owned opaque obstacle.
                 model.insert_opaque(
                     clipped,
                     mapping.protection,
-                    mapping.flags.difference(ReservationNodeFlags::LOCKED),
+                    mapping.flags.difference(
+                        ReservationNodeFlags::LOCKED
+                            .union(ReservationNodeFlags::IMAGE)
+                            .union(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT),
+                    ),
                 )?;
             }
             Ok(())
