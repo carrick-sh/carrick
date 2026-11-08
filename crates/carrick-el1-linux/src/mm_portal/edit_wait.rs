@@ -9,10 +9,52 @@ use carrick_el1::memory::reservations::SharedReservations;
 use carrick_el1::substrate::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1_abi::{ReservationMm, ReservationRange, TrapFrame};
 use carrick_personality_linux::dispatch::AnonymousCall;
+use carrick_sched_core::object_wait::ObjectWaitError;
 use carrick_sched_core::spaces::notification::SpaceWaitCause;
 use carrick_syscall_abi::CanonicalNr;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
+
+/// Consume the scheduler-owned token after a resumed anonymous edit commits.
+///
+/// A caught signal unlinks the wait but deliberately leaves its operation on
+/// the record while the handler borrows execution.  A successful replay is
+/// the terminal owner of that token.  Match it against this MM's typed space
+/// notification keys before taking it so an unrelated adapter operation can
+/// never be consumed by the anonymous path.
+pub fn complete_anonymous_edit_replay(
+    zone: &carrick_sched_core::ZoneTables<carrick_sched_core::Aarch64ParkedContext>,
+    slot: carrick_el1_abi::SlotId,
+    task: &carrick_el1_abi::CurrentTask,
+) -> Result<bool, ObjectWaitError> {
+    let Some(record) = zone
+        .slot(slot)
+        .current()
+        .or_else(|| zone.slot(slot).host_record())
+    else {
+        return Ok(false);
+    };
+    let retained = zone.record(record);
+    let Some(census) = retained.object_wait_census() else {
+        return Ok(false);
+    };
+    let mm = NonZeroU64::new(task.mm.key.load(Ordering::Acquire))
+        .and_then(|mm| zone.space_entry(mm))
+        .and_then(|entry| entry.live_notifications().ok());
+    let Some(notifications) = mm else {
+        return Ok(false);
+    };
+    let anonymous = SpaceWaitCause::ALL.into_iter().any(|cause| {
+        let key = notifications.key(cause);
+        census.operation == key.index() as u64 && census.operation_generation == key.generation()
+    });
+    if !anonymous {
+        return Ok(false);
+    }
+    carrick_core::wait::take_object_operation(zone, slot, retained.identity())?
+        .map(|_| true)
+        .ok_or(ObjectWaitError::Stale)
+}
 
 /// No result means the existing syscall venue continues. A result means its
 /// original context is parked/queued, with execution capacity released.

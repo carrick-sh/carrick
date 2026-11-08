@@ -3372,6 +3372,11 @@ impl<
             memory::DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
             memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
             memory::DelegatedAnonymous::Served => {
+                if super::mm_portal::complete_anonymous_edit_replay(zone.tables, slot, task)
+                    .is_err()
+                {
+                    invalid_completion(NativeInvariant::EntryBinding);
+                }
                 DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
             // A private file mapping whose retained source the root still
