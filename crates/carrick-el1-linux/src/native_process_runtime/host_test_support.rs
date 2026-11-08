@@ -1347,6 +1347,205 @@ impl NativeOwnerSignalFixture {
             on_signal_clock: None,
         }
     }
+    /// Complete a production zone readiness decision, refuse its second output
+    /// piece on the exact MM gate, drain the source, then deliver the retained
+    /// answer. Only the physical memory service is substituted.
+    #[cfg(test)]
+    pub fn poll_output_owner_wait(&self) {
+        use crate::file_table::{LINUX_POLLIN, PollFd};
+        use carrick_el1_abi::ipc::{EventMode, IpcBacking, fd};
+        use carrick_kernel::el1_ipc::{HostIpc, HostTable};
+        use carrick_kernel::el1_zone::HostLockWait;
+        use carrick_test_support::GuestUserBuffer;
+        let host: &'static Arc<HostIpc> =
+            Box::leak(Box::new(Arc::new(HostIpc::new(1 << 20).unwrap())));
+        let table = HostTable::create(host.clone(), 64, 8).unwrap();
+        let object = host
+            .region()
+            .create_eventfd(1, EventMode::Counter, &HostLockWait)
+            .unwrap();
+        let description = host
+            .admit_description(fd::Description::new(
+                IpcBacking::EventFd { object }.encode(),
+                fd::AccessMode::ReadWrite,
+                fd::StatusFlags::default(),
+            ))
+            .unwrap();
+        description.install(table.id(), fd::Fd(0), false).unwrap();
+        let map = Box::leak(Box::new(unsafe {
+            core::mem::zeroed::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+        }));
+        map.publish(5, table.id().to_raw()).unwrap();
+        let tables = Box::leak(Box::new(crate::ipc::MapTables(map)));
+        let venue = crate::ipc::IpcVenue {
+            region: host.region(),
+            tables,
+        };
+        let pages = GuestUserBuffer::zeroed(8192);
+        let address = pages.arg() + 4092;
+        let pollfd = PollFd {
+            fd: 0,
+            events: LINUX_POLLIN,
+            revents: 0x7777,
+        };
+        // SAFETY: this guest allocation covers the exact eight-byte record.
+        unsafe {
+            (address as *mut PollFd).write_unaligned(pollfd);
+        }
+        let mut physical = self.physical();
+        for at in [address, address + 4] {
+            physical
+                .tid_words
+                .insert((self.address.mm.raw().get(), at), 0);
+        }
+        let take_output =
+            |physical: &mut Physical<'_, carrick_sched_core::Aarch64ParkedContext>| {
+                core::mem::take(&mut physical.tid_writes)
+                    .into_iter()
+                    .map(|(_, at, value)| (UserVa::new(at), value.to_ne_bytes().to_vec()))
+                    .collect::<Vec<_>>()
+            };
+        let handle = physical.service_mm_handle(&self.address).unwrap();
+        let space = self
+            .zone
+            .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+            .unwrap();
+        space
+            .admit_notifications(
+                handle.incarnation(),
+                &carrick_sched_core::BoundedSpin(0),
+                &|effects| {
+                    let _ = effects.defer_handbacks();
+                },
+            )
+            .unwrap();
+        let observed = space
+            .notifications(handle.incarnation())
+            .unwrap()
+            .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+        let slot = SlotId::new(0);
+        let access = crate::sched::object_wait::space_access(self.zone, slot);
+        physical.on_copy_complete = Some(Box::new(move |at| {
+            if at.raw() == address {
+                access.raise(space.index());
+            }
+        }));
+        // SAFETY: this fixture owns the exact-MM gate until output completes.
+        let wait = unsafe {
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                handle,
+                carrick_core_abi::PortalWaitCause::Gate,
+                observed.revision(),
+            )
+        };
+        physical.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
+        physical.child_copy_error_at = Some(address + 4);
+        take_signal_copies();
+        let source = BornInZoneSource {
+            zone: self.zone,
+            slot,
+        };
+        {
+            let mut entry = self
+                .runtime
+                .enter_registered(
+                    self.registry,
+                    source,
+                    self.root,
+                    self.address,
+                    &self.words,
+                    &mut physical,
+                )
+                .unwrap();
+            let mut frame = carrick_el1_abi::TrapFrame {
+                elr: 0x4004,
+                ..Default::default()
+            };
+            frame.x[8] = 73;
+            frame.x[0] = address;
+            frame.x[1] = 1;
+            let mut cpu = crate::sched::FakeCpu::default();
+            let route = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &carrick_el1_abi::Counters::new(),
+                core::slice::from_ref(self.root),
+                &[],
+                &[],
+                &[],
+                &[],
+                &carrick_el1_abi::InotifyNameCache::new(),
+                Some(crate::dispatch::Zone {
+                    tables: self.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                None,
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            assert_eq!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+                "completed zone readiness must enter exact-MM preparation, result={}",
+                frame.x[0] as i64
+            );
+        }
+        assert_eq!(
+            take_output(&mut physical),
+            [(UserVa::new(address), 0i32.to_ne_bytes().to_vec())]
+        );
+        let record = self.root_control.zone_record().unwrap();
+        // Change readiness after completion. Output must not be re-polled.
+        assert_eq!(
+            host.region()
+                .lock(object, &HostLockWait)
+                .unwrap()
+                .eventfd()
+                .unwrap()
+                .try_read()
+                .result,
+            Ok(1)
+        );
+        self.runtime
+            .cancel_service(record, slot, &mut physical)
+            .unwrap();
+        physical.child_copy_error = None;
+        // The fake executor returns its vCPU before the release, so the real
+        // queue may place this exact parked record instead of a host handback.
+        self.zone.drive(slot, 1);
+        self.zone.enter_guest(slot);
+        access.lower(space.index());
+        assert_eq!(self.zone.switch_in_full(slot).unwrap().record, record.id);
+        let saved = unsafe { self.runtime.record_binding(record) }
+            .unwrap()
+            .words;
+        let mut entry = self
+            .runtime
+            .enter_registered(
+                self.registry,
+                source,
+                self.root,
+                self.address,
+                &saved,
+                &mut physical,
+            )
+            .unwrap();
+        assert!(
+            matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), NativeResume::Returned(result) if result.raw() == 1)
+        );
+        drop(entry);
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&LINUX_POLLIN.to_ne_bytes());
+        tail.extend_from_slice(&LINUX_POLLIN.to_ne_bytes());
+        assert_eq!(
+            take_output(&mut physical),
+            [(UserVa::new(address + 4), tail)]
+        );
+    }
+
     pub fn kill_from_sibling(&self) -> Option<carrick_el1_abi::HostWorkDoorbell> {
         self.signal_from_sibling(false)
     }
