@@ -891,7 +891,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
             }
             Err(NativeProcessError::OwnerWait(wait)) => {
-                observe(InputPreparationRefusal::OwnerWait);
+                observe(InputPreparationRefusal::OwnerDependency);
                 (
                     ServiceOperation::CarrierWork {
                         entry: OwnerEntry::Syscall,
@@ -901,7 +901,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )
             }
             Err(NativeProcessError::Busy) => {
-                observe(InputPreparationRefusal::Busy);
+                observe(InputPreparationRefusal::OwnerBusy);
                 (
                     ServiceOperation::CarrierWork {
                         entry: OwnerEntry::Syscall,

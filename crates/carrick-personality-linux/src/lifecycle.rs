@@ -238,8 +238,8 @@ pub struct MapSourceTake {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputPreparationRefusal {
     Fault,
-    Busy,
-    OwnerWait,
+    OwnerBusy,
+    OwnerDependency,
 }
 
 /// A bounded owner write either faults or retains its exact producer receipt.
