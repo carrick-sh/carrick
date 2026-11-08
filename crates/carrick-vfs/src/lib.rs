@@ -15,7 +15,7 @@
 //! kernel-view filesystems (procfs, sysfs, devpts, /dev) live in
 //! carrick-kernel (`carrick_kernel::vfs`) because they render kernel state.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod apfs;
 /// Linux/non-macOS `apfs` shim. The real `apfs` module (macOS-only, above)
 /// drives APFS volume management via `diskutil`; that does not apply on Linux.
@@ -25,7 +25,7 @@ pub mod apfs;
 /// functions are genuinely macOS-only — the `carrick volume` subcommand is
 /// gated off on Linux. Gated as the exact complement of the real module's
 /// `target_os = "macos"` so the two can never both exist.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
 pub mod apfs {
     pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
         carrick_spec::FsBackendKind::Host
