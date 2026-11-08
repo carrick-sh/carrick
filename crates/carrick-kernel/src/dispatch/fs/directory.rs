@@ -814,6 +814,135 @@ impl<'a> FsView<'a> {
         }
     }
 
+    pub(in crate::dispatch) fn mkdir_path(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        dirfd: u64,
+        path: &str,
+        mode: u64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if path.is_empty() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
+        let ends_with_dot = path == "."
+            || path.ends_with("/.")
+            || path.trim_end_matches('/').ends_with("/.")
+            || path.trim_end_matches('/') == "."
+            || path == ".."
+            || path.ends_with("/..")
+            || path.trim_end_matches('/').ends_with("/..")
+            || path.trim_end_matches('/') == "..";
+        let had_trailing_slash = path.len() > 1 && path.ends_with('/');
+        let resolved = self.resolve_at_path(dirfd, path)?;
+        if self.mutation_path_needs_task(context, &resolved) {
+            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+        }
+        if ends_with_dot || had_trailing_slash {
+            let followed = self
+                .canonicalize_following(&resolved)
+                .unwrap_or_else(|_| resolved.clone());
+            match self.layered_metadata(&followed) {
+                Ok(md) => {
+                    if md.kind == RootFsEntryKind::Directory {
+                        if ends_with_dot {
+                            return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+                        }
+                    } else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                    }
+                }
+                Err(_) if ends_with_dot => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                _ => {}
+            }
+        }
+        if context.is_some_and(|context| self.is_synthetic_virtual_path(context, &resolved)) {
+            return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+        }
+        if let Some(m) = self.fs.vfs_mounts.resolve(&resolved) {
+            let creds = self.cred_snapshot();
+            let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
+            return match m.vfs.mkdir(&m.full_path, create_mode) {
+                Ok(()) => {
+                    let _ = m
+                        .vfs
+                        .chown(&m.full_path, Some(creds.euid), Some(creds.egid), false);
+                    self.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
+                    self.mutation_dnotify_child(context, &resolved, LinuxDnotifyMask::CREATE);
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            };
+        }
+        if !self.guest_dac_root_bypass()
+            && self.layered_metadata(&resolved).is_err()
+            && let Some(parent) = Path::new(&resolved).parent()
+            && !self.guest_can_modify_dir(&display_rootfs_path(parent))
+        {
+            return Ok(DispatchOutcome::errno(LINUX_EACCES));
+        }
+        let creds = self.cred_snapshot();
+        let mut create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
+        let mut owner_gid = creds.egid;
+        const S_ISGID: u32 = 0o2000;
+        match self
+            .fs
+            .rootfs_vfs
+            .with_mkdir_transaction(&resolved, |permit| {
+                let mut inherited_gid = false;
+                let parent_info = permit.parent(&resolved).ok_or(LINUX_EINVAL)?;
+                if let Some(ref pfd) = parent_info.parent_fd {
+                    use std::os::fd::AsRawFd;
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    if unsafe { libc::fstat(pfd.as_raw_fd(), &mut st) } == 0 {
+                        let (xattr_mode, _, xattr_gid, _) =
+                            carrick_vfs::fs_backend::host::fd_carrick_meta(pfd.as_raw_fd());
+                        let pmode = xattr_mode.unwrap_or(st.st_mode as u32);
+                        if pmode & S_ISGID != 0 {
+                            create_mode |= S_ISGID;
+                            owner_gid = xattr_gid.unwrap_or(carrick_abi::NsGid::new(st.st_gid));
+                            inherited_gid = true;
+                        }
+                    }
+                } else if let Some(parent) = Path::new(&resolved).parent() {
+                    let parent_str = display_rootfs_path(parent);
+                    if let Ok(pmd) = self.layered_metadata(&parent_str)
+                        && pmd.mode & S_ISGID != 0
+                    {
+                        create_mode |= S_ISGID;
+                        if let Some((_, pgid)) = self.fs.rootfs_vfs.overlay.get_owner(&parent_str) {
+                            owner_gid = pgid;
+                            inherited_gid = true;
+                        }
+                    }
+                }
+                match self
+                    .fs
+                    .rootfs_vfs
+                    .mkdir_admitted(permit, &resolved, create_mode)
+                {
+                    Ok(()) => {
+                        if create_mode & 0o700 != 0o700 {
+                            let _ = self.fs.rootfs_vfs.set_mode(&resolved, create_mode);
+                        }
+                        if !creds.euid.is_root() || !owner_gid.is_root() || inherited_gid {
+                            let _ = self.fs.rootfs_vfs.set_owner(
+                                &resolved,
+                                Some(creds.euid),
+                                Some(owner_gid),
+                            );
+                        }
+                        self.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
+                        self.mutation_dnotify_child(context, &resolved, LinuxDnotifyMask::CREATE);
+                        Ok(DispatchOutcome::Returned { value: 0 })
+                    }
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                }
+            }) {
+            Ok(outcome) => outcome,
+            Err(errno) => Ok(DispatchOutcome::errno(errno)),
+        }
+    }
+
     define_syscall! {
         fn getdents64(this, cx, fd: Fd, dirp: GuestPtr, count: u64) {
             let length = usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -1151,143 +1280,8 @@ impl<'a> FsView<'a> {
         }
 
         fn mkdirat(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64) {
-            let pathname = pathname.0;
-            let path = read_guest_c_string(&*cx.memory, pathname)?;
-            if path.is_empty() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-            }
-            let ends_with_dot = path == "."
-                || path.ends_with("/.")
-                || path.trim_end_matches('/').ends_with("/.")
-                || path.trim_end_matches('/') == "."
-                || path == ".."
-                || path.ends_with("/..")
-                || path.trim_end_matches('/').ends_with("/..")
-                || path.trim_end_matches('/') == "..";
-            let had_trailing_slash = path.len() > 1 && path.ends_with('/');
-            let resolved = this.resolve_at_path(dirfd, &path)?;
-            if ends_with_dot || had_trailing_slash {
-                let followed = this
-                    .canonicalize_following(&resolved)
-                    .unwrap_or_else(|_| resolved.clone());
-                match this.layered_metadata(&followed) {
-                    Ok(md) => {
-                        if md.kind == RootFsEntryKind::Directory {
-                            if ends_with_dot {
-                                return Ok(DispatchOutcome::errno(LINUX_EEXIST));
-                            }
-                        } else {
-                            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                        }
-                    }
-                    Err(_) if ends_with_dot => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
-                    _ => {}
-                }
-            }
-            if this.is_synthetic_virtual_path(cx.kernel, &resolved) {
-                return Ok(DispatchOutcome::errno(LINUX_EEXIST));
-            }
-            if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
-                let creds = this.cred_snapshot();
-                let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
-                return match m.vfs.mkdir(&m.full_path, create_mode) {
-                    Ok(()) => {
-                        let _ = m.vfs.chown(
-                            &m.full_path,
-                            Some(creds.euid),
-                            Some(creds.egid),
-                            false,
-                        );
-                        // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
-                        this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
-                        this.dnotify_child(cx.kernel, &resolved, LinuxDnotifyMask::CREATE);
-                        Ok(DispatchOutcome::Returned { value: 0 })
-                    }
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                };
-            }
-            // DAC: creating a new entry needs write+search on the parent dir
-            // (mkdir04). Only when the target doesn't already exist — an
-            // existing target is EEXIST (returned by mkdir below), which the
-            // kernel reports before the permission error.
-            if !this.guest_dac_root_bypass()
-                && this.layered_metadata(&resolved).is_err()
-                && let Some(parent) = Path::new(&resolved).parent()
-                && !this.guest_can_modify_dir(&display_rootfs_path(parent))
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EACCES));
-            }
-            // Apply the requested mode (umask-masked, like the kernel) and
-            // stamp the creating process's owner — mkdir previously dropped
-            // both, so DAC checks against the new dir were wrong.
-            let creds = this.cred_snapshot();
-            let mut create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
-            let mut owner_gid = creds.egid;
-            // setgid-directory inheritance (LTP mkdir02/04): a new dir in
-            // a parent with S_ISGID inherits the parent's GID *and* gets
-            // S_ISGID itself (so a shared-group subtree propagates).
-            // Otherwise the new dir's group is the creator's egid.
-            const S_ISGID: u32 = 0o2000;
-            match this.fs.rootfs_vfs.with_mkdir_transaction(&resolved, |permit| {
-            let mut inherited_gid = false;
-            let parent_info = permit.parent(&resolved).ok_or(LINUX_EINVAL)?;
-            if let Some(ref pfd) = parent_info.parent_fd {
-                use std::os::fd::AsRawFd;
-                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                if unsafe { libc::fstat(pfd.as_raw_fd(), &mut st) } == 0 {
-                    let (xattr_mode, _, xattr_gid, _) =
-                        carrick_vfs::fs_backend::host::fd_carrick_meta(pfd.as_raw_fd());
-                    let pmode = xattr_mode.unwrap_or(st.st_mode as u32);
-                    if pmode & S_ISGID != 0 {
-                        create_mode |= S_ISGID;
-                        owner_gid = xattr_gid.unwrap_or(carrick_abi::NsGid::new(st.st_gid));
-                        inherited_gid = true;
-                    }
-                }
-            } else if let Some(parent) = Path::new(&resolved).parent() {
-                let parent_str = display_rootfs_path(parent);
-                if let Ok(pmd) = this.layered_metadata(&parent_str)
-                    && pmd.mode & S_ISGID != 0
-                {
-                    create_mode |= S_ISGID;
-                    if let Some((_, pgid)) =
-                        this.fs.rootfs_vfs.overlay.get_owner(&parent_str)
-                    {
-                        owner_gid = pgid;
-                        inherited_gid = true;
-                    }
-                }
-            }
-            // Layered existence + parent-exists checks live inside
-            // RootFsVfs::mkdir_admitted; the dispatcher only handles
-            // synthetic path shadowing.
-            match this.fs.rootfs_vfs.mkdir_admitted(permit, &resolved, create_mode) {
-                Ok(()) => {
-                    // Only invoke set_mode if the mode requires xattr storage
-                    // (e.g. owner permissions lack read/write/execute).
-                    if create_mode & 0o700 != 0o700 {
-                        let _ = this.fs.rootfs_vfs.set_mode(&resolved, create_mode);
-                    }
-                    // Stamp the owner when it's non-root OR the gid was inherited
-                    // from a setgid parent (so a root-created dir still records the
-                    // inherited group).
-                    if !creds.euid.is_root() || !owner_gid.is_root() || inherited_gid {
-                        let _ = this
-                            .fs
-                            .rootfs_vfs
-                            .set_owner(&resolved, Some(creds.euid), Some(owner_gid));
-                    }
-                    // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
-                    this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
-                    this.dnotify_child(cx.kernel, &resolved, LinuxDnotifyMask::CREATE);
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
-            }) {
-                Ok(outcome) => outcome,
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
+            let path = read_guest_c_string(&*cx.memory, pathname.0)?;
+            this.mkdir_path(Some(cx.kernel), dirfd, &path, mode)
         }
 
         fn linkat(this, cx, olddirfd: u64, oldpath: GuestPtr, newdirfd: u64, newpath: GuestPtr, flags: u64) {

@@ -616,6 +616,7 @@ impl SyscallDispatcher {
             HostFileOp::Openat
             | HostFileOp::Faccessat
             | HostFileOp::Newfstatat
+            | HostFileOp::Mkdirat
             | HostFileOp::Poll => Served::Refused,
         }
     }
@@ -630,6 +631,13 @@ impl SyscallDispatcher {
     ) -> Served {
         let fs = self.fs_view();
         match header.op {
+            HostFileOp::Mkdirat => {
+                match fs.mkdir_path(None, LINUX_AT_FDCWD, path, header.args[0]) {
+                    Ok(outcome) => served_mutation(outcome),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::Faccessat => {
                 let (mode, flags) = (header.args[0], u64::from(header.flags));
                 if carrick_abi::LinuxAccessMode::from_bits(mode).is_none()
@@ -842,6 +850,13 @@ fn served_outcome(outcome: DispatchOutcome, mut bytes: Vec<u8>) -> Served {
         }
         DispatchOutcome::Errno { errno } => Served::errno(errno),
         _ => Served::Refused,
+    }
+}
+
+fn served_mutation(outcome: DispatchOutcome) -> Served {
+    match outcome {
+        DispatchOutcome::Errno { errno } if errno == carrick_abi::LINUX_ENOSYS => Served::Refused,
+        outcome => served_outcome(outcome, Vec::new()),
     }
 }
 
