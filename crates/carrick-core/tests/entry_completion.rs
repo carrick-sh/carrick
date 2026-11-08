@@ -123,14 +123,20 @@ fn exercise_anonymous_wait_event(event: AnonymousWaitEvent) {
     } else {
         carrick_sched_core::Handback::Signal
     };
+    let reference = zone.record_ref(record);
+    let claim = zone.claim_for_host(
+        reference,
+        None,
+        handback,
+        &carrick_sched_core::ShortLockSpin,
+    );
     assert_eq!(
-        zone.claim_for_host(
-            zone.record_ref(record),
-            None,
-            handback,
-            &carrick_sched_core::ShortLockSpin,
-        ),
-        carrick_sched_core::HostClaim::Claimed
+        claim,
+        if matches!(event, AnonymousWaitEvent::Signal) {
+            carrick_sched_core::HostClaim::Claimed
+        } else {
+            carrick_sched_core::HostClaim::Stale
+        }
     );
     assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
     assert!(!zone.object_queue_census(key.index()).unwrap().locked);
@@ -140,14 +146,14 @@ fn exercise_anonymous_wait_event(event: AnonymousWaitEvent) {
         reservation_revision,
         "cancellation cannot publish an anonymous-edit effect"
     );
-    // SAFETY: the concrete event just transferred this exact record to the
-    // host claimant and unlinked every queue entry before returning Claimed.
-    let Some(operation) = (unsafe { zone.record(record).take_object_operation() }) else {
-        panic!("the event must own the exact parked operation");
-    };
-    // SAFETY: the same host claim remains exclusive until this test frees it.
-    assert!(unsafe { zone.record(record).take_object_operation() }.is_none());
     if matches!(event, AnonymousWaitEvent::Signal) {
+        // SAFETY: the signal transferred this exact record to the host claimant
+        // and unlinked every queue entry before returning Claimed.
+        let Some(operation) = (unsafe { zone.record(record).take_object_operation() }) else {
+            panic!("the signal must own the exact parked operation");
+        };
+        // SAFETY: the same host claim remains exclusive until this test frees it.
+        assert!(unsafe { zone.record(record).take_object_operation() }.is_none());
         let replay: EditWaitOutcome<()> = coordinate_anonymous_edit_wait(
             &source,
             Some(operation),
@@ -159,15 +165,18 @@ fn exercise_anonymous_wait_event(event: AnonymousWaitEvent) {
         );
         assert_eq!(replay, EditWaitOutcome::NoConflict);
         assert_eq!(probes, 2);
+        assert!(!zone.record(record).has_object_operation());
+        zone.free_record(record);
     } else {
-        drop(operation);
         assert_eq!(probes, 1, "terminal events must not re-execute the call");
+        assert!(
+            zone.live(reference).is_none(),
+            "terminal cancellation must retire scheduler-only custody"
+        );
     }
-    assert!(!zone.record(record).has_object_operation());
     if let Some(cancellation) = cancellation {
         assert!(cancellation.cancellation().is_some());
     }
-    zone.free_record(record);
 }
 
 #[test]
