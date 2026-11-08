@@ -2073,3 +2073,34 @@ fn identical_fixture_content_from_different_commits_is_comparable() {
     );
     assert!(compare(&old, &receipt(&republished)).unwrap().passed);
 }
+
+#[test]
+fn cli_refusal_removes_previous_passing_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_path = dir.path().join("base.json");
+    let candidate_path = dir.path().join("candidate.json");
+    let diff_path = dir.path().join("diff.json");
+    let receipt = base();
+    std::fs::write(&base_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    std::fs::write(&candidate_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["ci-receipt", "signed-diff", "--base"])
+            .arg(&base_path)
+            .arg("--candidate")
+            .arg(&candidate_path)
+            .arg("--json")
+            .arg(&diff_path)
+            .output()
+            .unwrap()
+    };
+    assert!(run().status.success());
+    let passed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&diff_path).unwrap()).unwrap();
+    assert_eq!(passed["passed"], true);
+    let mut refused = receipt;
+    refused.host_identity.as_mut().unwrap().runner_name = "different-runner".into();
+    std::fs::write(&candidate_path, serde_json::to_vec(&refused).unwrap()).unwrap();
+    assert!(!run().status.success());
+    assert!(!diff_path.exists(), "refusal left stale passing diff.json");
+}
