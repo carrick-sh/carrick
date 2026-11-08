@@ -920,7 +920,7 @@ const ADMISSION_POSTED: u32 = 1 << 30;
 const ADMISSION_RELEASED: u32 = 1 << 29;
 const ADMISSION_LOCK_RELEASE: u32 = 1 << 28;
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum AdmissionKind {
     Notification,
     LockRelease,
