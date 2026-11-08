@@ -592,8 +592,7 @@ impl Drop for NativeSignalFixture {
     fn drop(&mut self) {
         // The registry's member and group rows retain the signal owner even
         // after the fixture's runtime handle is dropped.
-        let process = self.runtime.graph.lock().root_key;
-        self.registry.unregister_process(&self.runtime, process);
+        self.registry.unregister_root_for_test(&self.runtime);
     }
 }
 
@@ -1106,8 +1105,7 @@ pub struct NativeOwnerSignalFixture {
 }
 impl Drop for NativeOwnerSignalFixture {
     fn drop(&mut self) {
-        let process = self.runtime.graph.lock().root_key;
-        self.registry.unregister_process(&self.runtime, process);
+        self.registry.unregister_root_for_test(&self.runtime);
     }
 }
 impl NativeOwnerSignalFixture {

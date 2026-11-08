@@ -598,6 +598,14 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         };
         result.raw() as u32
     };
+    let retained = registry
+        .admit_existing_group(source, &task, address, &page, &control)
+        .unwrap()
+        .expect("x86 entry with a live child must reuse its signal projection");
+    assert!(
+        Arc::ptr_eq(&retained, &runtime),
+        "x86 admission cannot construct a second root around its own pending writer"
+    );
     // The unported x86 affinity venue has no published carrier topology.
     // Fork inherits the parent's unpublished control mask, not the fixture's
     // numeric scheduler mask (3). A live alias must not turn that zero into
