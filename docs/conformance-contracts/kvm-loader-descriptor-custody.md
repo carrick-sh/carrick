@@ -48,8 +48,10 @@ The current synchronous `HostFileCrossing` transport admits **MapPrivate
 only**. It is a retained byte-source transport, not the general native file
 service consumer. General service admission must preserve the exact request,
 caller filesystem/credential authority, and completed output while an owner
-wait releases execution capacity. It must join the same supply consumer
-used for guest faults and host copyouts (#1728). The initial shared root
+wait releases execution capacity. It must join one supply consumer
+for guest faults and host copyouts. The historical #1728 reference in the
+private-source note does not identify an active dependency; that issue is
+closed and concerns bounded image table stock. The initial shared root
 constructor currently retains host filesystem authority (`initial.fs = None`);
 registering its execution as native does not supply native pathname authority.
 That authority must be transferred explicitly, not replaced with a guessed
@@ -59,3 +61,29 @@ ABI layouts at the shared personality boundary.
 This binding is red-first evidence, not a loader fix. Private-source tests
 alone do not prove any of these service, contention or loader obligations.
 No runtime ratio or ecosystem scoreboard improvement is established.
+
+## Root authority decision before the first implementation slice
+
+`root_exec_access_refusal_is_counted_before_service_publication` now starts
+with the production root constructor and `register_root`, without assigning
+a fixture cwd. Calling `begin_host_file_service` for an open returns errno
+38 with no service notice or handoff. The production guard is correct: this
+row has no pathname authority. Simply wiring the loader into this entry does
+not solve open/close/reopen.
+
+Two ownership choices need review before changing that contract:
+
+- Preserve host-root resource custody independently of native execution
+  custody, and consistently use the shared ARM host-root mutation owner.
+  Descriptor cleanup must authenticate the exact slot/description; deleting
+  whichever host slot occupies a reused number is not valid.
+- Transfer the root's exact filesystem context, credentials, groups, umask
+  and resource limits to the ring owner at admission, then bind its retained
+  host-file service as for native children. This fits the desired native
+  route, but requires an explicit authority-transfer interface before code.
+
+The existing `RootForkSeed` is intentionally a live cwd/root snapshot for a
+host root's child. It neither transfers the root's authority nor supplies its
+credential and resource-limit state, so repurposing it silently would not
+implement the second choice. A synchronous bridge cannot substitute for that
+decision or for the retained native-service consumer.

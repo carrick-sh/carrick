@@ -292,6 +292,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.native.entropy" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.native.namespace-mutation" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.vcpu.shutdown-entry" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "process.native.arm-admission" },
