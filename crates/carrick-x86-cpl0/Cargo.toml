@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-support = ["carrick-core/test-support"]
+
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-core-abi = { path = "../carrick-core-abi" }

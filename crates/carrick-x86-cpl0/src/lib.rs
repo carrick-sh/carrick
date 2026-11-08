@@ -14,6 +14,46 @@ pub mod native_process;
 
 use carrick_el1_abi::Action;
 
+#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
+mod test_support {
+    use core::sync::atomic::Ordering;
+
+    pub const INJECT_ROOT_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe10;
+    pub const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
+    pub const INJECT_PREPARED_CONFLICT_ONCE: u64 = 0xffff_ffff_ffff_fe12;
+    pub const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+
+    pub fn dispatch(
+        native: u64,
+        binding: &carrick_el1::isa::x86::context::native::CpuBinding,
+    ) -> Option<u64> {
+        match native {
+            INJECT_ROOT_BUSY_ONCE => {
+                carrick_core::mm::reservation::inject_root_busy_once().then_some(0)
+            }
+            INJECT_EDITOR_BUSY_ONCE => {
+                carrick_sched_core::spaces::inject_editor_busy_once().then_some(0)
+            }
+            INJECT_PREPARED_CONFLICT_ONCE => {
+                carrick_core::mm::reservation::inject_prepared_conflict_once().then_some(0)
+            }
+            INJECT_WAIT_PARK_CENSUS => {
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                Some(
+                    carrick_x86_carrier::native_execution::source(slot)
+                        .zone
+                        .counters
+                        .el1_parks
+                        .load(Ordering::Acquire),
+                )
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The production CPL0 transport owed by a completed shared dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProductionBoundary {

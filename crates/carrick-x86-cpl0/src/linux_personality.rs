@@ -895,6 +895,12 @@ impl Personality for LinuxPersonality {
         let frame = &mut *cx.frame;
         let early_xstate = &mut *cx.xsave;
 
+        #[cfg(feature = "test-support")]
+        if let Some(result) = crate::test_support::dispatch(call.native.raw(), binding) {
+            frame.rax = result;
+            return ControlFlow::Return(());
+        }
+
         if call.native.raw() == carrick_syscall_abi::syscall_x86_64::ARCH_PRCTL_NR {
             struct Cpl0ArchPrctl<'a> {
                 task: &'a CurrentTask,
