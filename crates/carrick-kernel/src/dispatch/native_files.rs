@@ -643,7 +643,8 @@ impl SyscallDispatcher {
         let fs = self.fs_view();
         match header.op {
             HostFileOp::Readlinkat => {
-                if let Err(errno) = fs.readlink_trailing_slash(fd::Fd(LINUX_AT_FDCWD as i32), path) {
+                if let Err(errno) = fs.readlink_trailing_slash(fd::Fd(LINUX_AT_FDCWD as i32), path)
+                {
                     return Served::errno(errno);
                 }
                 let resolved = match fs.resolve_at_path(LINUX_AT_FDCWD, path) {
@@ -3025,6 +3026,20 @@ mod tests {
                 Err(NativeHostFileRefusal)
             );
         }
+        let mut confined = authority.clone();
+        confined.root = Some("/usr".into());
+        let mut bytes = record(
+            fixture.table,
+            HostFileOp::Readlinkat,
+            FDCWD,
+            [0; 4],
+            b"/lib",
+            128,
+        );
+        assert_eq!(
+            fixture.serve(Some(&confined), &mut bytes),
+            Err(NativeHostFileRefusal)
+        );
     }
 
     fn dirent_names(records: &[u8]) -> Vec<String> {

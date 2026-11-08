@@ -487,18 +487,21 @@ impl NativeService {
         let Ok(service) = self.custody.native_exec_services.resolve(capability) else {
             return self.refuse_host_file();
         };
-        let executable = self
-            .with_native_sources(|sources| sources.executable())
-            .flatten();
         let Some(record) = self.exec_payload.as_mut() else {
             return Err(stale());
         };
-        let is_mapping =
+        let operation =
             match carrick_core_abi::host_file::HostFileRequestView::parse(record.bytes_mut()) {
-                Ok(view) => view.header().op == carrick_core_abi::host_file::HostFileOp::MapPrivate,
+                Ok(view) => view.header().op,
                 Err(_) => return self.refuse_host_file(),
             };
-        if is_mapping {
+        let executable = if operation == carrick_core_abi::host_file::HostFileOp::Readlinkat {
+            self.with_native_sources(|sources| sources.executable())
+                .flatten()
+        } else {
+            None
+        };
+        if operation == carrick_core_abi::host_file::HostFileOp::MapPrivate {
             // The shared source owner handles retirements and writes ENOMEM at
             // the bound before either ISA invokes the host file service.
             let mut record = self.exec_payload.take().ok_or_else(stale)?;
