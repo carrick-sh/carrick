@@ -441,6 +441,7 @@ pub(crate) fn prepare_native_exec_successor(
         mut plan,
         lazy_regions,
         sources,
+        executable,
     } = parts;
     // The successor's ring owner supplies its ELF pages from `sources`; the
     // carrier builds no leaf and no frame for them.
@@ -488,6 +489,7 @@ pub(crate) fn prepare_native_exec_successor(
         TrapError::Hypervisor("native exec successor has no initial stack".to_owned())
     })?;
     let mut physical = install_native_exec_physical(backing, root_slot)?;
+    physical.sources.bind_executable(executable);
     for source in sources {
         physical.sources.inherit(source);
     }

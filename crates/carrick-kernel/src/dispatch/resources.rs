@@ -159,6 +159,7 @@ thread_local! {
 /// reaches for a host fd table inside this scope escapes it and fails closed.
 #[derive(Clone)]
 pub struct NativeFsAuthority {
+    pub(super) executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     pub(super) credentials: Arc<crate::kernel::Credentials>,
     pub(super) fs_context: Arc<crate::kernel::FsContext>,
 }
@@ -179,6 +180,7 @@ impl NativeFsAuthority {
         Self {
             credentials,
             fs_context,
+            executable: None,
         }
     }
 }
@@ -263,7 +265,6 @@ pub(super) fn with_native_fs_scope<R>(
 /// scope has no host file table or MM, so reaching for one is an escape.
 /// Production fails closed on the absent table; test builds, whose
 /// dispatcher helpers fall back to a test task, ask this first.
-#[cfg(test)]
 pub(super) fn in_native_fs_scope() -> bool {
     CAPTURED_RESOURCES.with(|stack| {
         let stack = stack.borrow();
@@ -565,6 +566,16 @@ pub(crate) fn rlimits() -> Option<crate::kernel::RlimitSet> {
 
 pub(super) fn task() -> Option<crate::kernel::TaskRef> {
     CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::task))
+}
+
+pub(super) fn native_executable() -> Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>> {
+    CAPTURED_RESOURCES.with(|stack| {
+        stack
+            .borrow()
+            .native_fs
+            .as_ref()
+            .and_then(|authority| authority.executable.clone())
+    })
 }
 
 pub(super) fn credentials() -> Option<Arc<crate::kernel::Credentials>> {

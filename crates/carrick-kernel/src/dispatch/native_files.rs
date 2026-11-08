@@ -267,11 +267,12 @@ impl SyscallDispatcher {
     pub fn serve_native_host_file(
         &self,
         record: &mut [u8],
+        executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let Some(owner) = self.kernel_binding.read().kernel().existing_ipc() else {
             return Err(NativeHostFileRefusal);
         };
-        self.serve_native_host_file_in(&owner, record)
+        self.serve_native_host_file_in(&owner, record, executable)
     }
 
     /// Serve a request whose authenticated member retains host-root resources.
@@ -288,7 +289,12 @@ impl SyscallDispatcher {
             .existing_ipc()
             .ok_or(NativeHostFileRefusal)?;
         let resources = resources.snapshot().map_err(|_| NativeHostFileRefusal)?;
-        self.serve_native_host_file_with_authority(&owner, record, Some(resources.filesystem()))
+        self.serve_native_host_file_with_authority(
+            &owner,
+            record,
+            Some(resources.filesystem()),
+            None,
+        )
     }
 
     /// The transient filesystem authority of one path crossing, built from
@@ -335,8 +341,9 @@ impl SyscallDispatcher {
         &self,
         owner: &Arc<HostIpc>,
         record: &mut [u8],
+        executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
-        self.serve_native_host_file_with_authority(owner, record, None)
+        self.serve_native_host_file_with_authority(owner, record, None, executable)
     }
 
     fn serve_native_host_file_with_authority(
@@ -344,6 +351,7 @@ impl SyscallDispatcher {
         owner: &Arc<HostIpc>,
         record: &mut [u8],
         host_root: Option<&NativeFsAuthority>,
+        executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal)?;
         let header = view.header();
@@ -354,17 +362,25 @@ impl SyscallDispatcher {
         });
         let served = if header.op.resolves_path() {
             // Every path record leads with its caller's access context.
-            let (authority, path) = if let Some(authority) = host_root {
+            let (mut authority, path) = if let Some(authority) = host_root {
                 (authority.clone(), view.input())
             } else {
                 let (context, path) =
                     AccessContext::decode(view.input()).ok_or(NativeHostFileRefusal)?;
+                if header.op == HostFileOp::Readlinkat
+                    && context.root.is_some_and(|root| root != b"/")
+                {
+                    return Err(NativeHostFileRefusal);
+                }
                 (
                     self.native_access_authority(&context)
                         .ok_or(NativeHostFileRefusal)?,
                     path,
                 )
             };
+            if header.op == HostFileOp::Readlinkat {
+                authority.executable = executable;
+            }
             // Carrick's VFS names paths as UTF-8; any other byte string is
             // not served rather than altered.
             let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal)?;
@@ -419,6 +435,9 @@ impl SyscallDispatcher {
         capacity: usize,
     ) -> Served {
         let flags = u64::from(header.flags);
+        if header.op == HostFileOp::Readlinkat && header.fd == LINUX_AT_FDCWD as i32 {
+            return Served::errno(carrick_abi::LINUX_ENOENT);
+        }
         if header.op != HostFileOp::Statx
             || flags & carrick_abi::LINUX_AT_EMPTY_PATH == 0
             || header.fd < 0
@@ -608,7 +627,8 @@ impl SyscallDispatcher {
             HostFileOp::Openat
             | HostFileOp::Faccessat
             | HostFileOp::Newfstatat
-            | HostFileOp::Poll => Served::Refused,
+            | HostFileOp::Poll
+            | HostFileOp::Readlinkat => Served::Refused,
         }
     }
 
@@ -622,6 +642,24 @@ impl SyscallDispatcher {
     ) -> Served {
         let fs = self.fs_view();
         match header.op {
+            HostFileOp::Readlinkat => {
+                if let Err(errno) = fs.readlink_trailing_slash(LINUX_AT_FDCWD, path) {
+                    return Served::errno(errno);
+                }
+                let resolved = match fs.resolve_at_path(LINUX_AT_FDCWD, path) {
+                    Ok(path) => path,
+                    Err(errno) => return Served::errno(errno),
+                };
+                match fs.readlink_path_target(&resolved) {
+                    Ok(target) => {
+                        let mut bytes = carrick_vfs::pathcodec::decode_to_bytes(&target);
+                        bytes.truncate(capacity);
+                        Served::Reply(bytes.len() as i64, bytes)
+                    }
+                    Err(errno) if errno == carrick_abi::LINUX_ENOSYS => Served::Refused,
+                    Err(errno) => Served::errno(errno),
+                }
+            }
             HostFileOp::Faccessat => {
                 let (mode, flags) = (header.args[0], u64::from(header.flags));
                 if carrick_abi::LinuxAccessMode::from_bits(mode).is_none()
@@ -1059,7 +1097,7 @@ mod tests {
                 authority.stamp(bytes);
             }
             self.dispatcher
-                .serve_native_host_file_in(&self.owner, bytes)
+                .serve_native_host_file_in(&self.owner, bytes, None)
                 .map(|_| ())
         }
         fn result(&self, authority: Option<&CallerAccess>, mut bytes: Vec<u8>) -> (i64, Vec<u8>) {
@@ -2380,7 +2418,8 @@ mod tests {
             0,
         );
         authority.stamp(&mut open);
-        root.serve_native_host_file_in(&owner, &mut open).unwrap();
+        root.serve_native_host_file_in(&owner, &mut open, None)
+            .unwrap();
         let native = host_file::reply(&open).unwrap().result as i32;
         assert_eq!(native, 3, "the child's lowest free ring descriptor");
         let region = owner.region();
@@ -2631,7 +2670,7 @@ mod tests {
         );
         let source = fixture
             .dispatcher
-            .serve_native_host_file_in(&fixture.owner, &mut map)
+            .serve_native_host_file_in(&fixture.owner, &mut map, None)
             .unwrap()
             .retained_source
             .expect("published physical source");
@@ -2731,7 +2770,7 @@ mod tests {
         );
         let served = fixture
             .dispatcher
-            .serve_native_host_file_in(&fixture.owner, &mut map)
+            .serve_native_host_file_in(&fixture.owner, &mut map, None)
             .unwrap();
         let source = served
             .retained_source
@@ -2764,7 +2803,7 @@ mod tests {
         );
         let second = fixture
             .dispatcher
-            .serve_native_host_file_in(&fixture.owner, &mut again)
+            .serve_native_host_file_in(&fixture.owner, &mut again, None)
             .unwrap()
             .retained_source
             .expect("a second mapping retains a source");
@@ -2809,6 +2848,182 @@ mod tests {
             fixture.serve(None, &mut map_stdio),
             Err(NativeHostFileRefusal)
         );
+    }
+
+    #[test]
+    fn native_readlink_uses_live_mm_executable_custody() {
+        use carrick_hal::fork_stock::ForkHostBackingCustody;
+        use carrick_vfs::fs_backend::{FsBackend as _, MemoryBackend};
+        let backend = MemoryBackend::new();
+        for path in ["/first", "/second"] {
+            backend.set_file_contents(path, b"image".to_vec()).unwrap();
+            backend.set_mode(path, 0o755).unwrap();
+        }
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut fixture = fixture_with(dispatcher, None);
+        let context = fixture.dispatcher.capture_one_task_context().unwrap();
+        let acquire = |path| {
+            fixture.dispatcher.retain_native_executable(
+                fixture
+                    .dispatcher
+                    .acquire_exec_source(&context, path)
+                    .unwrap(),
+            )
+        };
+        let mut first = ForkHostBackingCustody::default();
+        first.bind_executable(acquire("/first"));
+        let fork = first.clone();
+        let shared_mm = &first;
+        let mut successor = ForkHostBackingCustody::default();
+        successor.bind_executable(acquire("/second"));
+        let readlink =
+            |fixture: &Fixture, custody: &ForkHostBackingCustody, path: &[u8], capacity| {
+                let mut bytes = record(
+                    fixture.table,
+                    HostFileOp::Readlinkat,
+                    FDCWD,
+                    [0; 4],
+                    path,
+                    capacity,
+                );
+                authority_of(&fixture.dispatcher).stamp(&mut bytes);
+                fixture
+                    .dispatcher
+                    .serve_native_host_file_in(&fixture.owner, &mut bytes, custody.executable())
+                    .unwrap();
+                let reply = host_file::reply(&bytes).unwrap();
+                (reply.result, reply.output.to_vec())
+            };
+        assert_eq!(
+            readlink(&fixture, shared_mm, b"/proc/self/exe", 128),
+            (6, b"/first".to_vec())
+        );
+        assert_eq!(
+            readlink(&fixture, &fork, b"/proc/self/exe", 128),
+            (6, b"/first".to_vec())
+        );
+        assert_eq!(
+            readlink(&fixture, &successor, b"/proc/self/exe", 128),
+            (7, b"/second".to_vec())
+        );
+        assert_eq!(
+            readlink(&fixture, &successor, b"/proc/self/exe", 3),
+            (3, b"/se".to_vec())
+        );
+        assert!(
+            fixture
+                .dispatcher
+                .acquire_exec_source(&context, "/missing")
+                .is_err()
+        );
+        assert_eq!(
+            readlink(&fixture, &first, b"/proc/self/exe", 128).1,
+            b"/first"
+        );
+
+        // Root mutations traverse production dispatch and notify the same registry.
+        let mutate = |fixture: &mut Fixture, nr, paths: &[u8], args| {
+            let mut memory = super::super::outcome::LinearMemory::new(0x4000, paths.to_vec());
+            let result = fixture
+                .dispatcher
+                .dispatch(
+                    &context,
+                    super::super::SyscallRequest::new(nr, crate::compat::SyscallArgs::from(args)),
+                    &mut memory,
+                    &crate::compat::CompatReporter::default(),
+                )
+                .unwrap();
+            assert!(
+                matches!(result, DispatchOutcome::Returned { value: 0 }),
+                "{result:?}"
+            );
+        };
+        mutate(
+            &mut fixture,
+            38,
+            b"/first\0/moved\0",
+            [FDCWD as u64, 0x4000, FDCWD as u64, 0x4007, 0, 0],
+        );
+        for custody in [&first, &fork] {
+            assert_eq!(
+                readlink(&fixture, custody, b"/proc/self/exe", 128).1,
+                b"/moved"
+            );
+        }
+        mutate(
+            &mut fixture,
+            35,
+            b"/moved\0",
+            [FDCWD as u64, 0x4000, 0, 0, 0, 0],
+        );
+        for custody in [&first, &fork] {
+            assert_eq!(
+                readlink(&fixture, custody, b"/proc/self/exe", 128).1,
+                b"/moved (deleted)"
+            );
+        }
+        assert_eq!(
+            readlink(&fixture, &successor, b"/proc/self/exe", 128).1,
+            b"/second"
+        );
+        let held = first.executable().unwrap();
+        let weak = Arc::downgrade(&held);
+        drop(held);
+        drop(first);
+        assert!(weak.upgrade().is_some());
+        drop(fork);
+        assert!(
+            weak.upgrade().is_none(),
+            "MM retirement releases its executable"
+        );
+        let held = successor.executable().unwrap();
+        let weak = Arc::downgrade(&held);
+        drop(held);
+        drop(successor);
+        assert!(
+            weak.upgrade().is_none(),
+            "cancel drops unadopted successor custody"
+        );
+    }
+
+    #[test]
+    fn native_readlink_serves_ordinary_links_and_refuses_foreign_magic() {
+        let fixture = rootfs_fixture();
+        let authority = authority_of(&fixture.dispatcher);
+        assert_eq!(
+            fixture.result(
+                Some(&authority),
+                record(
+                    fixture.table,
+                    HostFileOp::Readlinkat,
+                    FDCWD,
+                    [0; 4],
+                    b"/lib",
+                    128
+                )
+            ),
+            (7, b"usr/lib".to_vec())
+        );
+        for path in [
+            b"/proc/7/exe".as_slice(),
+            b"/proc/self/cwd",
+            b"/dev/fd/1",
+            b"/proc/self/exe",
+        ] {
+            let mut bytes = record(
+                fixture.table,
+                HostFileOp::Readlinkat,
+                FDCWD,
+                [0; 4],
+                path,
+                128,
+            );
+            assert_eq!(
+                fixture.serve(Some(&authority), &mut bytes),
+                Err(NativeHostFileRefusal)
+            );
+        }
     }
 
     fn dirent_names(records: &[u8]) -> Vec<String> {

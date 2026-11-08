@@ -939,3 +939,38 @@ fn ppoll_arrays_need_readable_input_and_writable_output_before_crossing() {
         })
     );
 }
+
+#[test]
+fn readlink_decodes_and_bounds_the_output_without_a_nul() {
+    let decode = |size| {
+        HostFileCall::decode(
+            crate::crossing::nr::READLINKAT,
+            &[(-100i64) as u64, BASE, BASE + 512, size, 0, 0],
+        )
+        .unwrap()
+    };
+    let mut user = memory(b"/proc/self/exe\0");
+    for size in [0, u64::MAX, 0x80000000] {
+        assert_eq!(
+            run(decode(size), &mut user),
+            returned(carrick_syscall_abi::LINUX_EINVAL)
+        );
+    }
+    let (mut record, output, path) = request(run(decode(3), &mut user));
+    assert!(path);
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Readlinkat);
+    assert_eq!(view.output_capacity(), 3);
+    view.reply(3, b"/bi").unwrap();
+    let mut copied = Vec::new();
+    assert_eq!(
+        complete(&record, output, &mut |address, bytes| {
+            assert_eq!(address, BASE + 512);
+            copied.extend_from_slice(bytes);
+            true
+        })
+        .raw(),
+        3
+    );
+    assert_eq!(copied, b"/bi");
+}

@@ -249,6 +249,33 @@ pub struct CurrentExecutable {
     display: Arc<parking_lot::RwLock<ExecutableDisplay>>,
 }
 
+impl carrick_hal::fork_stock::ExecutableIdentity for CurrentExecutable {
+    fn display_path(&self) -> String {
+        CurrentExecutable::display_path(self)
+    }
+}
+
+impl super::SyscallDispatcher {
+    /// Preserve the loaded object's live namespace identity in successor custody.
+    pub fn retain_native_executable(
+        &self,
+        source: ExecSource,
+    ) -> Arc<dyn carrick_hal::fork_stock::ExecutableIdentity> {
+        Arc::new(source.into_current(&self.fs.executable_authorities))
+    }
+
+    /// RootOnly fork seed: removed with the host-served root's ProcState.
+    pub fn root_executable_seed(
+        &self,
+    ) -> Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>> {
+        self.proc
+            .lock()
+            .current_executable
+            .clone()
+            .map(|current| Arc::new(current) as _)
+    }
+}
+
 impl ExecSource {
     /// The guest path this object was selected at: what `/proc/self/exe`
     /// names for an image loaded from it.
