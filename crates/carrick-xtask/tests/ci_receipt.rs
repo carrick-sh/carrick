@@ -74,6 +74,7 @@ fn receipt(steps: Vec<StepResult>) -> AcceptReceipt {
         el1: None,
         probe_diffs: vec![],
         cleanup_counts: vec![],
+        host_identity: None,
         fixture_bundle: None,
         host_load: Default::default(),
         failures: vec![],
