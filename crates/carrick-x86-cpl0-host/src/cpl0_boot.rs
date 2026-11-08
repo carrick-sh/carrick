@@ -443,6 +443,15 @@ pub fn backing_identity(ids: &dyn PhysicalFrameInventory) -> Result<BackingIdent
     })
 }
 
+/// Refuse stale shared layouts before entering or publishing a guest image.
+pub fn validate_layout_hash(found: u64) -> Result<(), TrapError> {
+    let expected = carrick_el1_abi::EL1_ABI_LAYOUT_HASH;
+    if found != expected {
+        return Err(TrapError::ImageAbiMismatch { expected, found });
+    }
+    Ok(())
+}
+
 /// Authenticate the guest's mutable completion against the retained host
 /// request before any reply field sizes a read, indexes a grant, or subtracts
 /// a stack bound. The stopped carrier still owns all unpublished grants on
@@ -454,6 +463,7 @@ pub fn validate_initial_reply(
     root_gpa: u64,
     initial_break: u64,
 ) -> Result<(), TrapError> {
+    validate_layout_hash(reply.layout_hash)?;
     let host_grants = (request.table_grant_count as usize)
         .checked_add(request.data_grant_count as usize)
         .ok_or_else(|| fail("initial MM host grant count overflow"))?;
@@ -3401,6 +3411,7 @@ mod initial_reply_tests {
         let request = X86InitialBootRequest {
             magic: X86_INITIAL_BOOT_MAGIC,
             version: X86_INITIAL_BOOT_VERSION,
+            layout_hash: carrick_el1_abi::EL1_ABI_LAYOUT_HASH,
             table_grant_count: 5,
             data_grant_count: 2,
             publication_capacity: 2,
@@ -3424,6 +3435,14 @@ mod initial_reply_tests {
         assert!(
             validate_initial_reply(&request, &valid, 7, valid.result_root_gpa, 0x401000).is_ok()
         );
+        let stale = X86InitialBootRequest {
+            layout_hash: valid.layout_hash ^ 1,
+            ..valid
+        };
+        assert!(matches!(
+            validate_initial_reply(&request, &stale, 7, valid.result_root_gpa, 0x401000),
+            Err(TrapError::ImageAbiMismatch { .. })
+        ));
         for corrupted in [
             X86InitialBootRequest {
                 table_grant_count: u32::MAX,

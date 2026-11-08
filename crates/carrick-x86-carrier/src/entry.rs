@@ -34,6 +34,8 @@ core::arch::global_asm!(
     ".long 0",
     ".quad carrick_x86_initial_boot",
     ".quad carrick_x86_peer_boot",
+    ".quad {layout_hash}",
+    layout_hash = const carrick_el1_abi::EL1_ABI_LAYOUT_HASH,
     version = const carrick_core_abi::X86_INITIAL_BOOT_VERSION,
 );
 

@@ -154,6 +154,7 @@ impl InitialFrameSource for GrantedFrames<'_> {
 fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     if request.magic != X86_INITIAL_BOOT_MAGIC
         || request.version != X86_INITIAL_BOOT_VERSION
+        || request.layout_hash != carrick_el1_abi::EL1_ABI_LAYOUT_HASH
         || request.region_count == 0
         || request.executable_region_count == 0
         || request.executable_region_count > request.region_count
