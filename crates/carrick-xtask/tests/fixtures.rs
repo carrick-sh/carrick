@@ -510,6 +510,54 @@ impl Fixture {
     }
 }
 #[test]
+fn compare_bundles_accepts_identical_and_rejects_changed_executables() {
+    let mut f = Fixture::new();
+    let first = f.path.clone();
+    let run = |second: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .current_dir(f.repo.path())
+            .args(["fixtures", "compare", "--first"])
+            .arg(&first)
+            .arg("--second")
+            .arg(second)
+            .output()
+            .unwrap()
+    };
+    let equal = run(&first);
+    assert!(
+        equal.status.success(),
+        "{}",
+        String::from_utf8_lossy(&equal.stderr)
+    );
+
+    let executable = &mut f.manifest.executables[0];
+    let changed = elf(executable.target, 200);
+    executable.sha256 = hash(&changed);
+    let digest: String = executable.sha256.clone().into();
+    let path = executable.path.clone();
+    write(f.store.path(), &format!("objects/{digest}"), &changed);
+    fs::set_permissions(
+        f.store.path().join("objects").join(digest),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    f.republish();
+    let unequal = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(f.repo.path())
+        .args(["fixtures", "compare", "--first"])
+        .arg(&first)
+        .arg("--second")
+        .arg(&f.path)
+        .output()
+        .unwrap();
+    assert!(!unequal.status.success());
+    assert!(
+        String::from_utf8_lossy(&unequal.stderr).contains(&path),
+        "{}",
+        String::from_utf8_lossy(&unequal.stderr)
+    );
+}
+#[test]
 fn roundtrip_restores_exact_paths_and_verifies_installed_bytes() {
     if !cargo_env::in_clean_cargo_test() {
         return;
