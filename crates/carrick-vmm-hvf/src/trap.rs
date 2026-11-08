@@ -673,6 +673,19 @@ const GPR_TABLE: [applevisor::vcpu::Reg; 31] = [
     applevisor::vcpu::Reg::X29,
     applevisor::vcpu::Reg::X30,
 ];
+/// GPR_TABLE's array index is the architectural register number: snapshot,
+/// restore and indexed reads all rely on it (#887 round 2 briefly replaced X19
+/// with a duplicate X21 here, silently corrupting X19/X20 across rebinds).
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod gpr_table_tests {
+    #[test]
+    fn gpr_table_index_is_the_architectural_register_number() {
+        for (i, reg) in super::GPR_TABLE.iter().enumerate() {
+            assert_eq!(format!("{reg:?}"), format!("X{i}"), "GPR_TABLE[{i}]");
+        }
+    }
+}
 
 /// Process-wide handoff for multithreaded fork: the forking thread (parent),
 /// after rebuilding its VM, publishes a clone here so quiesced sibling threads
