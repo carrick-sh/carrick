@@ -68,6 +68,26 @@ impl<'a> FsView<'a> {
             .any(|entry| self.dnotify_path_matches(&entry.path, &parent))
     }
 
+    pub(super) fn mutation_path_needs_task(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        path: &str,
+    ) -> bool {
+        context.is_none()
+            && (crate::vfs::may_be_synthetic_virtual_path(path) || self.watches_cover(path))
+    }
+
+    pub(super) fn mutation_dnotify_child(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        path: &str,
+        mask: LinuxDnotifyMask,
+    ) {
+        if let Some(context) = context {
+            self.dnotify_child(context, path, mask);
+        }
+    }
+
     /// Notify a host-file write while borrowing its stable open-description
     /// path. The retained `OpenFile` keeps the description alive after the
     /// host call, avoiding one heap clone per write on watched files.
