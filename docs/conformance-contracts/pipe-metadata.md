@@ -85,3 +85,20 @@ ISA also has a pipe control requiring an in-ring completion and FIFO mode in
 its native stat layout. These are routing and staging witnesses, not a claim
 of signed path-service execution. The native amd64 Linux syscall oracle
 returns 0 for the same three forms and the pipe control.
+
+## newfstatat edge precedence (#1927)
+
+`stat(2)` specifies EINVAL(22) for invalid flags, EBADF(9) for relative
+paths with an invalid dirfd, and ENOTDIR(20) for relative paths whose dirfd
+is not a directory. The `at_empty_path_{arm,x86}_bad_flags_bad_fd`
+witnesses require invalid flags to be rejected before the descriptor pin,
+with untouched stat output. The relative-path witnesses drive production
+dispatch and its existing `Newfstatat` stager, resolving the real fixture
+descriptor table once and returning the specified errno without a host
+request. These four relative-path witnesses already pass on #1905's head;
+they add coverage, not evidence of a repaired defect.
+
+The nearest existing owners are `serve_pipe_metadata` for empty-path pipe
+queries and `native_host_file::path_base` for relative paths. This change
+adds no production type, lock, queue, or owner and preserves the one-byte
+pathname classification and zero host descriptor operations.
