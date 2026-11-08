@@ -47,7 +47,8 @@ fn serial_host_native_fork_exec_child_timed_futex() {
     );
 }
 
-/// The exec successor resolves its live MM's executable through native service.
+/// Dispatch/copyout control: the physical adapter supplies executable custody.
+/// Production prepare/adopt and population coverage lives in native_exe_lifecycle.
 #[test]
 fn serial_host_native_fork_exec_child_readlink_exe() {
     fork_exec_probe_with_departure(None, u32::MAX as u64, false, None, None, true);
@@ -740,6 +741,10 @@ fn fork_exec_probe_copy(
             );
             assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
             assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 1);
+            if readlink {
+                return frame.x[0];
+            }
+        }
         drop(entry);
         if metadata.is_some() {
             assert_eq!(
@@ -789,7 +794,8 @@ fn fork_exec_probe_copy(
                 -14
             } else {
                 16
-            }
+            },
+            "native child readlinkat(/proc/self/exe): expected executable bytes; negative result is Linux errno"
         );
         assert_eq!(
             crate::native_process_runtime::host_test_support::take_signal_copies(),

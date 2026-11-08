@@ -2853,6 +2853,7 @@ mod tests {
     }
 
     #[test]
+    /// Venue control only: supplied custody clones/references are not process births.
     fn native_readlink_uses_live_mm_executable_custody() {
         use carrick_hal::fork_stock::ForkHostBackingCustody;
         use carrick_vfs::fs_backend::{FsBackend as _, MemoryBackend};
