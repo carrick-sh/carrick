@@ -35,21 +35,39 @@ impl Default for BuildPolicy {
     }
 }
 
+/// True when an ambient variable could change what a fixture build compiles.
+/// One rule, two consumers: the publisher refuses it in `reject_ambient_overrides`
+/// and the test harness scrubs the same names from a child, so the two can never
+/// disagree about what a policy-compliant host means (#1888).
+pub fn is_ambient_override(name: &str) -> bool {
+    name.starts_with("CARGO_PROFILE_")
+        || name.starts_with("CARGO_BUILD_")
+        || (name.starts_with("CARGO_TARGET_")
+            && (name.ends_with("_RUSTFLAGS") || name.ends_with("_LINKER")))
+        || matches!(
+            name,
+            "RUSTFLAGS" | "CARGO_ENCODED_RUSTFLAGS" | "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER"
+        )
+}
+
+/// Drop every ambient override the policy refuses from a child command.
+/// A caller that needs a compliant host (a fixture case, never the publisher)
+/// states its own environment instead of inheriting whichever shell invoked it.
+/// This relaxes nothing: the child still must meet `reject_ambient_overrides`,
+/// and the publisher keeps refusing an override in its own process.
+pub fn scrub_ambient_overrides(command: &mut Command) -> &mut Command {
+    for (name, _) in std::env::vars_os() {
+        if is_ambient_override(&name.to_string_lossy()) {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 pub(super) fn reject_ambient_overrides() -> Result<()> {
     for (name, _) in std::env::vars_os() {
         let name = name.to_string_lossy();
-        if name.starts_with("CARGO_PROFILE_")
-            || name.starts_with("CARGO_BUILD_")
-            || (name.starts_with("CARGO_TARGET_")
-                && (name.ends_with("_RUSTFLAGS") || name.ends_with("_LINKER")))
-            || matches!(
-                name.as_ref(),
-                "RUSTFLAGS"
-                    | "CARGO_ENCODED_RUSTFLAGS"
-                    | "RUSTC_WRAPPER"
-                    | "RUSTC_WORKSPACE_WRAPPER"
-            )
-        {
+        if is_ambient_override(&name) {
             return Err(fail(format!(
                 "fixture build policy forbids ambient {name}; use tracked Cargo configuration"
             )));
@@ -248,8 +266,48 @@ impl BuildEnvironment {
 mod tests {
     use super::*;
 
+    /// The publisher refuses an ambient Cargo override, and a worker VM exports
+    /// `CARGO_BUILD_JOBS` plus an empty `RUSTC_WORKSPACE_WRAPPER` (#1888). The
+    /// declared-environment property is about the *controlled* build, not about
+    /// whichever shell ran `cargo test`, so this case states its own compliant
+    /// ambient environment in a fresh process. The refusal itself stays
+    /// witnessed through the production CLI entry by
+    /// `cache_selection_preserves_ambient_wrapper_rejection_at_fixture_entrypoint`.
     #[test]
     fn build_environment_contains_only_declared_variables() {
+        const CHILD: &str = "CARRICK_XTASK_BUILD_ENVIRONMENT_CHILD";
+        // A name the policy must reject, planted before the scrub so a clean
+        // host still proves the scrub did the work instead of passing vacuously.
+        const PROBE: &str = "RUSTC_WORKSPACE_WRAPPER";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            assert!(
+                is_ambient_override(PROBE),
+                "ambient probe {PROBE} is no longer refused by the build policy"
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "fixtures::environment::tests::build_environment_contains_only_declared_variables",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(PROBE, "/carrick/ambient-probe-wrapper");
+            scrub_ambient_overrides(&mut command);
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "controlled-environment fixture failed: {}\n{stdout}\n{stderr}",
+                output.status
+            );
+            return;
+        }
+        assert!(
+            std::env::var_os(PROBE).is_none(),
+            "controlled environment inherited an unscrubbed Cargo override"
+        );
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let environment = BuildEnvironment::new(&root).unwrap();
         let mut command = Command::new("/usr/bin/env");
