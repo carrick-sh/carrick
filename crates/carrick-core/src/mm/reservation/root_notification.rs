@@ -6,6 +6,35 @@ use carrick_sched_core::spaces::notification::{
     SpaceWaitCause,
 };
 use core::num::NonZeroU64;
+
+#[cfg(feature = "test-support")]
+static INJECT_ROOT_BUSY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Hold the next EL1 reservation-root acquisition until its waiter enrolls.
+/// This symbol does not exist in an ordinary Carrick guest image.
+#[cfg(feature = "test-support")]
+pub fn inject_root_busy_once() -> bool {
+    INJECT_ROOT_BUSY
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[cfg(feature = "test-support")]
+fn injected_root_busy() -> bool {
+    match INJECT_ROOT_BUSY.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(2) => true,
+        Err(_) => false,
+    }
+}
+
+/// Release the injected root holder after the real wait record is published.
+#[cfg(feature = "test-support")]
+pub fn release_injected_root_busy() -> bool {
+    INJECT_ROOT_BUSY
+        .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 pub(super) enum RootAuthority<
     'a,
     Policy: ReservationPolicy,
@@ -56,6 +85,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         mm: ReservationMm,
         slot: u32,
     ) -> Result<Reservations<'a, Policy, Geometry, C>, Refusal> {
+        #[cfg(feature = "test-support")]
+        if injected_root_busy() {
+            return Err(Refusal::Busy);
+        }
         if let Some(venue) = spaces.venue() {
             return RootReleaseVenue::new(self, venue)?.lock_el1(index, mm, slot);
         }

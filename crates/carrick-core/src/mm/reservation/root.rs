@@ -88,6 +88,36 @@ use carrick_sched_core::spaces::notification::{
 };
 use notification::RootAuthority;
 pub use notification::RootReleaseVenue;
+#[cfg(feature = "test-support")]
+pub use notification::{inject_root_busy_once, release_injected_root_busy};
+
+#[cfg(feature = "test-support")]
+static INJECT_PREPARED_CONFLICT: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Hold the next proposal at the shared prepared-conflict check.
+#[cfg(feature = "test-support")]
+pub fn inject_prepared_conflict_once() -> bool {
+    INJECT_PREPARED_CONFLICT
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[cfg(feature = "test-support")]
+fn injected_prepared_conflict() -> bool {
+    match INJECT_PREPARED_CONFLICT.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) | Err(2) => true,
+        Err(_) => false,
+    }
+}
+
+/// Release the injected prepared conflict after the waiter is published.
+#[cfg(feature = "test-support")]
+pub fn release_injected_prepared_conflict() -> bool {
+    INJECT_PREPARED_CONFLICT
+        .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 
 const ROOTS: usize = carrick_sched_core::spaces::ADDRESS_SPACES;
 const NODES: usize = 1024;
@@ -2007,7 +2037,16 @@ impl<
         if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
-        if self.prepared_overlaps(range)
+        if {
+            #[cfg(feature = "test-support")]
+            {
+                injected_prepared_conflict()
+            }
+            #[cfg(not(feature = "test-support"))]
+            {
+                false
+            }
+        } || self.prepared_overlaps(range)
             || source.is_some_and(|range| self.prepared_overlaps(range))
         {
             return Err(Refusal::PreparedConflict);

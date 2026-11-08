@@ -21,6 +21,8 @@ use crate::native_process;
 pub fn schedule(slot: SlotId) -> ! {
     let source = carrick_x86_carrier::native_execution::source(slot);
     let current = task();
+    #[cfg(feature = "test-support")]
+    crate::anonymous::release_injected_edit_wait(source, current);
     settle_current_work(current);
     loop {
         expire_signal_timer(slot);

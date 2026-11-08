@@ -39,6 +39,33 @@ use notification::{NotificationSource, SpaceNotificationLease, SpaceReleaseVenue
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "test-support")]
+static INJECT_EDITOR_BUSY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Hold the next shared editor acquisition until its waiter enrolls.
+#[cfg(feature = "test-support")]
+pub fn inject_editor_busy_once() -> bool {
+    INJECT_EDITOR_BUSY
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[cfg(feature = "test-support")]
+fn injected_editor_busy() -> bool {
+    match INJECT_EDITOR_BUSY.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) | Err(2) => true,
+        Err(_) => false,
+    }
+}
+
+/// Release the injected editor holder after the real wait record is published.
+#[cfg(feature = "test-support")]
+pub fn release_injected_editor_busy() -> bool {
+    INJECT_EDITOR_BUSY
+        .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 /// Entries in the table: the address spaces the host has published at once.
 /// A full table leaves an MM unpublished, so its threads reach a vCPU
 /// through their executors, as before this step.
@@ -740,6 +767,10 @@ impl AddressSpaces {
         owner: NonZeroU64,
         venue: Option<SpaceReleaseVenue<'a, C>>,
     ) -> Result<SpaceEditor<'a, C>, EditAdmissionRefusal> {
+        #[cfg(feature = "test-support")]
+        if injected_editor_busy() {
+            return Err(EditAdmissionRefusal::Editor);
+        }
         self.try_begin_edit_mode(index, key, owner, venue, false)
     }
 
