@@ -1067,6 +1067,12 @@ fn publish(
     let request: Request =
         serde_json::from_value(read_json(request_path)?).map_err(|e| fail(e.to_string()))?;
     let comparison = (|| {
+        // A refused rerun must not upload a prior run's NEW/FIXED artifact.
+        match fs::remove_file(results.join("diff.json")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(fail(format!("cannot clear stale comparison: {error}"))),
+        }
         let candidate = load(&results.join("candidate.json"))?;
         let base = if request.kind == RequestKind::Main {
             candidate.clone()
@@ -1156,7 +1162,10 @@ fn publish(
         Ok((passed, body)) => (passed, body, false),
         Err(error @ ReceiptError::IncomparableBase(_)) => (
             false,
-            format!("Signed gate: **INCOMPARABLE BASE — BLOCKED**\n\n{error}\n"),
+            format!(
+                "Signed gate: **INCOMPARABLE BASE — BLOCKED**\n\nCandidate `{}`; base `{}`\n\n{error}\n",
+                request.sha, request.base
+            ),
             true,
         ),
         Err(error) => (
