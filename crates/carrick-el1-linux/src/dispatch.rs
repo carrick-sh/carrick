@@ -4395,9 +4395,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             // Admission (eventfd value / iovec headers) has no effects when
             // it leaves for an input fault. Keep the refusal in the same
             // native owner instead of sending an in-zone object to the host.
-            if (disposition == ipc::IpcServed::Forward
-                || (disposition == ipc::IpcServed::Returned { switched: false }
-                    && frame.x[0] as i64 == carrick_syscall_abi::LINUX_EFAULT.guest_retval()))
+            if disposition == ipc::IpcServed::Forward
                 && let Some(request) = user.input_wait.take()
             {
                 frame.x[0] = orig_x0;

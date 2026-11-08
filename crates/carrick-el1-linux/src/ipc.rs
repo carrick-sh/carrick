@@ -517,6 +517,12 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
             Admission::Forward => return (IpcServed::Forward, false),
             Admission::CopyInFault => {
+                if user.has_copyin_refusal() {
+                    // The native adapter retains this pre-effect argument
+                    // request through its exact-MM owner. Do not apply this
+                    // redispatch to an admitted transfer or delivered prefix.
+                    return (IpcServed::Forward, false);
+                }
                 if native_signals {
                     frame.x[0] = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
                     return (IpcServed::Returned { switched: false }, false);
