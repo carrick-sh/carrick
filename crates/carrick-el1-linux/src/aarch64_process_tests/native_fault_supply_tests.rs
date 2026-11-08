@@ -1305,23 +1305,6 @@ fn native_inherited_prepared_writes_stay_private_to_each_live_process() {
     );
 }
 
-pub(super) fn prepared_fork_memory_properties() {
-    composed_native_supply_with_prepared(
-        false,
-        None,
-        false,
-        SupplyEnd::Resume,
-        PreparedScenario::UntouchedGrantWrites,
-    );
-    composed_native_supply_with_prepared(
-        false,
-        None,
-        false,
-        SupplyEnd::Resume,
-        PreparedScenario::ProtNoneAcrossForkWritable,
-    );
-}
-
 #[test]
 fn native_child_mprotect_rw_after_prot_none_fork_cannot_write_parent_frame() {
     composed_native_supply_with_prepared(

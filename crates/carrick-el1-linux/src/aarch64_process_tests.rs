@@ -10738,8 +10738,57 @@ fn serial_host_native_fork_netpoll_eventfd_wait() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_prepared_fork_parent_poll_observes_child_pipe_write() {
-    native_fault_supply_tests::prepared_fork_memory_properties();
     native_descriptor_witness(None, true, false, false, false, false, false, true);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_zone_poll_output_owner_wait_preserves_ready_answer() {
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    // SAFETY: aligned, zero-valid ABI storage owned for the complete test.
+    let zone = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<ZoneTables<Aarch64ParkedContext>>()
+    };
+    zone.spaces.set_idle_ttbr(0x30000);
+    let space = zone.spaces.publish_closed(1, 0x10000, 0x10000).unwrap();
+    zone.spaces.open(space);
+    let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let binding = carrick_el1_abi::ExecutionBinding {
+        task: carrick_core_abi::EntryTaskKey::from_raw(41),
+        generation: carrick_core_abi::SnapshotGeneration::from_raw(11),
+        mm: carrick_core_abi::EntryMmKey::from_raw(1),
+        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(101),
+    };
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            binding.task,
+            carrick_core_abi::entry::BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap()),
+            binding.thread_generation,
+        )
+        .unwrap(),
+    );
+    assert!(control.publish_visible_tid(41));
+    control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[1]));
+    let address = AddressContext {
+        root: RootGpa::page_aligned(FrameGpa::new(0x10000)).unwrap(),
+        mm: MmGeneration::new(NonZeroU64::MIN),
+        generation: ContextGeneration::new(NonZeroU64::MIN),
+    };
+    let owner = crate::native_process_runtime::host_test_support::NativeOwnerSignalFixture::new::<
+        Aarch64Mmu,
+    >(
+        zone,
+        binding,
+        page,
+        control,
+        5,
+        Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, address),
+    );
+    owner.poll_output_owner_wait();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -11189,6 +11238,23 @@ fn native_descriptor_witness(
         use crate::file_table::{LINUX_POLLIN, PollFd};
         use carrick_personality_linux::crossing::nr as sys;
 
+        let activate = |binding: &super::native_process_runtime::NativeRecordBinding<
+            AddressContext<RootGpa>,
+            Aarch64ParkedContext,
+        >| {
+            if fixture.zone.slot(fixture.slot).current() == Some(binding.record.id) {
+                return;
+            }
+            if let Some(current) = fixture.zone.slot(fixture.slot).current() {
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(fixture.slot, current)
+                        .is_queued()
+                );
+            }
+            activate_target(source, &task, binding);
+        };
         let output = carrick_test_support::GuestUserBuffer::zeroed(8);
         let (route, result) = run_binding(
             &parent_binding,
@@ -11209,6 +11275,20 @@ fn native_descriptor_witness(
         let writer_fd = u64::from(u32::from_ne_bytes(
             output.as_bytes()[4..].try_into().unwrap(),
         ));
+
+        let ack_output = carrick_test_support::GuestUserBuffer::zeroed(8);
+        let (route, result) = run_binding(
+            &parent_binding,
+            sys::PIPE2.raw(),
+            [ack_output.arg(), carrick_syscall_abi::LINUX_O_CLOEXEC, 0, 0],
+        );
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(result, 0);
+        let ack_reader = u32::from_ne_bytes(ack_output.as_bytes()[..4].try_into().unwrap()) as u64;
+        let ack_writer = u32::from_ne_bytes(ack_output.as_bytes()[4..].try_into().unwrap()) as u64;
 
         let writer = {
             let mut writer_service = Aarch64NativeProcessService::with_crossing(
@@ -11234,6 +11314,14 @@ fn native_descriptor_witness(
             runtime.task_binding(key).unwrap()
         };
 
+        for fd in [writer_fd, ack_reader] {
+            let (route, result) = run_binding(&parent_binding, sys::CLOSE.raw(), [fd, 0, 0, 0]);
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
+            assert_eq!(result, 0);
+        }
         let pollfds = carrick_test_support::GuestUserBuffer::from_values(&[PollFd {
             fd: reader as i32,
             events: LINUX_POLLIN,
@@ -11250,7 +11338,7 @@ fn native_descriptor_witness(
                 route,
                 CompletionRoute::Served | CompletionRoute::WithWork | CompletionRoute::Suspended
             ),
-            "prepared-fork-vmfree owner=zone inherited_zero=true prot_none_bytes=true ready=false child_exit=live two_live_isolation=false; parent ppoll must park and switch in ring, not forward: route={route:?} result={result}",
+            "parent ppoll must park and switch in ring: route={route:?} result={result}",
         );
         assert!(
             fixture
@@ -11265,17 +11353,25 @@ fn native_descriptor_witness(
             "a parked poll must not publish output"
         );
 
-        activate_target(source, &task, &writer);
-        let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"p");
+        activate(&writer);
+        for fd in [reader, ack_writer] {
+            let (route, result) = run_binding(&writer, sys::CLOSE.raw(), [fd, 0, 0, 0]);
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
+            assert_eq!(result, 0);
+        }
+        let payload = carrick_test_support::GuestUserBuffer::from_value(1u64);
         let (route, result) =
-            run_binding(&writer, sys::WRITE.raw(), [writer_fd, payload.arg(), 1, 0]);
+            run_binding(&writer, sys::WRITE.raw(), [writer_fd, payload.arg(), 8, 0]);
         assert!(matches!(
             route,
             CompletionRoute::Served | CompletionRoute::WithWork
         ));
-        assert_eq!(result, 1, "child pipe write errno {}", -result);
+        assert_eq!(result, 8, "child pipe write errno {}", -result);
 
-        activate_target(source, &task, &parent_binding);
+        activate(&parent_binding);
         let (route, result) = run_binding(
             &parent_binding,
             sys::PPOLL.raw(),
@@ -11297,8 +11393,90 @@ fn native_descriptor_witness(
             runtime.task_binding(writer.key).is_some(),
             "child stays live"
         );
-        println!(
-            "prepared-fork-vmfree owner=zone inherited_zero=true prot_none_bytes=true ready=true child_exit=live two_live_isolation=true"
+        let received = carrick_test_support::GuestUserBuffer::zeroed(8);
+        let (route, result) = run_binding(
+            &parent_binding,
+            sys::READ.raw(),
+            [reader, received.arg(), 8, 0],
+        );
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(result, 8);
+        assert_eq!(
+            received.get::<u64>(0),
+            1,
+            "ready includes the 8-byte read, not just ppoll"
+        );
+
+        activate(&writer);
+        let ack = carrick_test_support::GuestUserBuffer::from_value(0xa5a5_a5a5_a5a5_a5a5u64);
+        let (route, _) = run_binding(&writer, sys::READ.raw(), [ack_reader, ack.arg(), 8, 0]);
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork | CompletionRoute::Suspended
+        ));
+        assert!(
+            fixture.zone.record(writer.record.id).has_object_operation(),
+            "child blocks until parent acknowledgement"
+        );
+        activate(&parent_binding);
+        let (route, result) = run_binding(
+            &parent_binding,
+            sys::WRITE.raw(),
+            [ack_writer, payload.arg(), 8, 0],
+        );
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(result, 8);
+        activate(&writer);
+        let (route, result) = run_binding(&writer, sys::READ.raw(), [ack_reader, ack.arg(), 8, 0]);
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(result, 8);
+        assert_eq!(ack.get::<u64>(0), 1);
+        let (route, _) = run_binding(&writer, sys::EXIT_GROUP.raw(), [0, 0, 0, 0]);
+        assert!(
+            matches!(
+                route,
+                CompletionRoute::Served
+                    | CompletionRoute::WithWork
+                    | CompletionRoute::Suspended
+                    | CompletionRoute::HostCustody
+            ),
+            "child exit route: {route:?}"
+        );
+        activate(&parent_binding);
+        let status = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+        let (route, result) = run_binding(
+            &parent_binding,
+            carrick_syscall_abi::nr::WAIT4.raw(),
+            [u64::from(writer.visible_pid), status.arg(), 0, 0],
+        );
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(result, i64::from(writer.visible_pid));
+        assert_eq!(status.get::<i32>(0), 0, "waitpid must observe child exit 0");
+        // This is an IPC schedule. Memory-fault and signed execution evidence
+        // belongs to its own fixtures; no memory/isolation tuple is invented.
+        println!("prepared-fork-ipc owner=zone ready=true notified=true child_ack=1 child_exit=0");
+        let (route, _) = run_binding(&parent_binding, sys::EXIT_GROUP.raw(), [0, 0, 0, 0]);
+        assert!(
+            matches!(
+                route,
+                CompletionRoute::Served
+                    | CompletionRoute::WithWork
+                    | CompletionRoute::Suspended
+                    | CompletionRoute::HostCustody
+            ),
+            "parent exit route: {route:?}"
         );
         return;
     }
