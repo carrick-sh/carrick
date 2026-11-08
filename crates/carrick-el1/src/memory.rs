@@ -2977,7 +2977,7 @@ mod tests {
         }
 
         #[test]
-        fn delegated_busy_root_or_unservable_step_forwards_with_the_root_unchanged() {
+        fn delegated_busy_root_replays_and_unservable_steps_leave_the_root_unchanged() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
             let task = mm(&spaces, &table, 17, true);
             let mut editor = Editor::over(RangeBacking::Empty);
@@ -2990,9 +2990,11 @@ mod tests {
                 SYS_MMAP,
                 mmap_fixed(ARENA, 0x2000),
             );
-            // The host venue holds the root: forward, the host runs it.
+            editor.calls.clear();
+            // A held root retains the in-ring replay without forwarding.
             {
-                let _host = root(&spaces, &table, &task);
+                let held = root(&spaces, &table, &task);
+                let generation = held.generation();
                 let (route, _) = syscall(
                     &task,
                     &spaces,
@@ -3002,7 +3004,20 @@ mod tests {
                     SYS_MUNMAP,
                     [ARENA, 0x2000, 0, 0, 0, 0],
                 );
-                assert_eq!(route, DelegatedAnonymous::Forward);
+                assert_eq!(
+                    route,
+                    DelegatedAnonymous::Contended(SpaceWaitCause::Reservations)
+                );
+                assert_eq!(held.generation(), generation);
+                assert_eq!(
+                    held.mapping(ARENA).unwrap().range,
+                    ReservationRange::new(ARENA, ARENA + 0x2000).unwrap()
+                );
+                assert!(editor.calls.is_empty());
+                assert_eq!(
+                    counters.forwarded[SYS_MUNMAP as usize].load(Ordering::Relaxed),
+                    0
+                );
             }
             // A step EL1 cannot take refuses the proposal, then forwards.
             let mut widening = Editor::over(RangeBacking::Private);
@@ -3049,7 +3064,7 @@ mod tests {
             }
             assert_eq!(
                 counters.forwarded[SYS_MUNMAP as usize].load(Ordering::Relaxed),
-                2
+                1
             );
             assert_eq!(
                 counters.forwarded[SYS_MPROTECT as usize].load(Ordering::Relaxed),
@@ -3059,9 +3074,21 @@ mod tests {
                 counters.forwarded[SYS_MMAP as usize].load(Ordering::Relaxed),
                 1
             );
+            // Once the owner releases the root, the original operation completes.
+            let (route, _) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MUNMAP,
+                [ARENA, 0x2000, 0, 0, 0, 0],
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            assert!(root(&spaces, &table, &task).mapping(ARENA).is_none());
             assert_eq!(
                 counters.served[SYS_MUNMAP as usize].load(Ordering::Relaxed),
-                0
+                1
             );
         }
 
