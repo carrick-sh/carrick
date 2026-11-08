@@ -5032,6 +5032,7 @@ fn completed_poll_output_preparation_busy_yields_then_delivers_the_answer() {
     completed_output_busy_yields(true);
 }
 
+#[cfg(test)]
 #[test]
 fn poll_revents_crossing_a_page_retains_partial_copy_and_fault() {
     let fixture = native_exec_fixture();

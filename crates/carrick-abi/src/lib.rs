@@ -839,7 +839,7 @@ pub struct LinuxPollFd {
 }
 
 /// One poll result field; the input fields remain owned by the caller.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct PollReventsOutput {
     record: carrick_guest_arch::GuestVa,
     bytes: [u8; 2],
