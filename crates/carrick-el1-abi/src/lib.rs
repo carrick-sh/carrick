@@ -4939,7 +4939,7 @@ mod tests {
         counters.write_copy_refusals(&mut output).unwrap();
         assert_eq!(
             output,
-            "copy-refusal nr=73 va=0x4000 len=16 argument=2 direction=in reason=owner-mismatch owner=1 presented[mm=11,generation=12,task=13,thread=14] expected[mm=21,generation=22,task=23,thread=24]\n"
+            "copy-refusal nr=73 va=0x4000 len=16 argument=2 direction=in reason=owner-mismatch owner=1 presented[mm=11,generation=12,task=13,thread=14] expected[mm=21,generation=22,task=23,thread=24] source=decoded-dispatch pc=0x0 args=[0x0,0x0,0x0,0x0,0x0,0x0]\n"
         );
     }
 
