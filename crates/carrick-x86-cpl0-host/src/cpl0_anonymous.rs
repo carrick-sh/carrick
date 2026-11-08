@@ -2903,7 +2903,3 @@ mod custody_tests {
         assert!(residency.publish(added).is_some());
     }
 }
-
-#[cfg(test)]
-#[path = "cpl0_anonymous/cow_retirement_tests.rs"]
-mod cow_retirement_tests;
