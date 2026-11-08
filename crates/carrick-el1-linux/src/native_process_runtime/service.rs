@@ -424,6 +424,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     Handback::Signal
                 },
                 &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_completion(self.zone, slot, owned),
             );
             if matches!(claimed, carrick_sched_core::HostClaim::Claimed)
                 && member.is_native_owned()
