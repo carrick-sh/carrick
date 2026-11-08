@@ -1295,69 +1295,101 @@ impl<'a> FsView<'a> {
             }
             let old = read_guest_c_string(&*cx.memory, oldpath)?;
             let new_path = read_guest_c_string(&*cx.memory, newpath)?;
-            if new_path.is_empty() {
-                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-            }
-            if old.is_empty() && flags & LINUX_AT_EMPTY_PATH == 0 {
-                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-            }
-            // O_TMPFILE / memfd materialization candidate. The source can name an
-            // ANONYMOUS inode (an O_TMPFILE/memfd fd with no directory entry) two
-            // ways:
-            //   - linkat(AT_FDCWD, "/proc/self/fd/<n>", ..., AT_SYMLINK_FOLLOW)
-            //     — the magic symlink FOLLOWED to the unnamed inode (open14,
-            //     openat03). AT_SYMLINK_FOLLOW must be set, else linkat would
-            //     hard-link the symlink itself.
-            //   - linkat(fd, "", ..., AT_EMPTY_PATH) — link the fd's inode
-            //     directly.
-            // Resolved here BEFORE the ordinary source-existence check, because
-            // the anon inode has no namespace path that check would find.
-            let anon_fd_candidate = if old.is_empty() {
-                Some(olddirfd as i32)
-            } else if flags & LINUX_AT_SYMLINK_FOLLOW != 0 {
-                proc_self_fd_number(&old, proc_visible_self(cx.kernel))
-            } else {
-                None
-            };
-            // Ordinary rootfs names are checked under their parent reservation.
-            // Retain those capabilities through DAC, the host link, and cache
-            // publication instead of doing dispatcher preflight path walks.
-            if anon_fd_candidate.is_none() && !old.is_empty() {
-                let source = this.resolve_at_path(olddirfd, &old)?;
-                if let Ok(target) = this.resolve_at_path(newdirfd, &new_path) {
-                    if flags & LINUX_AT_SYMLINK_FOLLOW == 0
-                        && this.fs.vfs_mounts.resolve(&source).is_none()
-                        && this.fs.vfs_mounts.resolve(&target).is_none()
-                        && !this.is_synthetic_virtual_path(cx.kernel, &source)
-                        && !this.is_synthetic_virtual_path(cx.kernel, &target)
-                    {
-                        let result = this.fs.rootfs_vfs.link_with_parent_check(
-                            &source, &target, |parent| this.may_write_admitted_parent(parent),
-                        );
-                        return Ok(match result {
-                            Ok(()) => {
-                                this.dnotify_child(cx.kernel, &target, LinuxDnotifyMask::CREATE);
-                                crate::el1_inotify::invalidate_name_cache_all();
-                                DispatchOutcome::Returned { value: 0 }
-                            }
-                            Err(errno) => DispatchOutcome::errno(errno),
-                        });
-                    }
+            this.link_paths(Some(cx.kernel), olddirfd, &old, newdirfd, &new_path, flags)
+        }
+    }
+
+    pub(in crate::dispatch) fn link_paths(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
+        olddirfd: u64,
+        old: &str,
+        newdirfd: u64,
+        new_path: &str,
+        flags: u64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let this = self;
+        if flags & !(LINUX_AT_SYMLINK_FOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        }
+        if new_path.is_empty() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
+        if old.is_empty() && flags & LINUX_AT_EMPTY_PATH == 0 {
+            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+        }
+        if old.is_empty() && context.is_none() {
+            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+        }
+        // O_TMPFILE / memfd materialization candidate. The source can name an
+        // ANONYMOUS inode (an O_TMPFILE/memfd fd with no directory entry) two
+        // ways:
+        //   - linkat(AT_FDCWD, "/proc/self/fd/<n>", ..., AT_SYMLINK_FOLLOW)
+        //     — the magic symlink FOLLOWED to the unnamed inode (open14,
+        //     openat03). AT_SYMLINK_FOLLOW must be set, else linkat would
+        //     hard-link the symlink itself.
+        //   - linkat(fd, "", ..., AT_EMPTY_PATH) — link the fd's inode
+        //     directly.
+        // Resolved here BEFORE the ordinary source-existence check, because
+        // the anon inode has no namespace path that check would find.
+        let anon_fd_candidate = if old.is_empty() {
+            Some(olddirfd as i32)
+        } else if flags & LINUX_AT_SYMLINK_FOLLOW != 0 {
+            context.and_then(|context| proc_self_fd_number(old, proc_visible_self(context)))
+        } else {
+            None
+        };
+        // Ordinary rootfs names are checked under their parent reservation.
+        // Retain those capabilities through DAC, the host link, and cache
+        // publication instead of doing dispatcher preflight path walks.
+        if anon_fd_candidate.is_none() && !old.is_empty() {
+            let source = this.resolve_at_path(olddirfd, old)?;
+            if let Ok(target) = this.resolve_at_path(newdirfd, new_path) {
+                if this.mutation_path_needs_task(context, &source)
+                    || this.mutation_path_needs_task(context, &target)
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+                }
+                if flags & LINUX_AT_SYMLINK_FOLLOW == 0
+                    && this.fs.vfs_mounts.resolve(&source).is_none()
+                    && this.fs.vfs_mounts.resolve(&target).is_none()
+                    && !context
+                        .is_some_and(|context| this.is_synthetic_virtual_path(context, &source))
+                    && !context
+                        .is_some_and(|context| this.is_synthetic_virtual_path(context, &target))
+                {
+                    let result =
+                        this.fs
+                            .rootfs_vfs
+                            .link_with_parent_check(&source, &target, |parent| {
+                                this.may_write_admitted_parent(parent)
+                            });
+                    return Ok(match result {
+                        Ok(()) => {
+                            this.mutation_dnotify_child(context, &target, LinuxDnotifyMask::CREATE);
+                            crate::el1_inotify::invalidate_name_cache_all();
+                            DispatchOutcome::Returned { value: 0 }
+                        }
+                        Err(errno) => DispatchOutcome::errno(errno),
+                    });
                 }
             }
-            let mut source_kind = None;
-            let resolved_old = if old.is_empty() {
-                if !this.fd_is_valid(olddirfd as i32) {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                None
-            } else {
-                let resolved = this.resolve_at_path(olddirfd, &old)?;
-                carrick_observability::probes::fs_op("path-role", "dispatcher-source", 0);
-                let source_metadata = this.layered_metadata(&resolved).ok();
-                source_kind = source_metadata.as_ref().map(|metadata| metadata.kind);
-                let exists =
-                    this.is_synthetic_virtual_path(cx.kernel, &resolved)
+        }
+        let mut source_kind = None;
+        let resolved_old = if old.is_empty() {
+            if !this.fd_is_valid(olddirfd as i32) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            None
+        } else {
+            let resolved = this.resolve_at_path(olddirfd, old)?;
+            if this.mutation_path_needs_task(context, &resolved) {
+                return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+            }
+            carrick_observability::probes::fs_op("path-role", "dispatcher-source", 0);
+            let source_metadata = this.layered_metadata(&resolved).ok();
+            source_kind = source_metadata.as_ref().map(|metadata| metadata.kind);
+            let exists = context.is_some_and(|context| this.is_synthetic_virtual_path(context, &resolved))
                         || source_metadata.is_some()
                         || this.fs.vfs_mounts.resolve(&resolved).is_some_and(|m| m.vfs.lookup(&m.full_path).is_ok())
                         // An anon fd's magic symlink has no layered metadata; its
@@ -1365,122 +1397,132 @@ impl<'a> FsView<'a> {
                         // materialize branch.
                         || anon_fd_candidate
                             .is_some_and(|n| this.fd_table_contains(n) || is_stdio_fd(n));
-                if !exists {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-                }
-                let resolved = if flags & LINUX_AT_SYMLINK_FOLLOW != 0
-                    && anon_fd_candidate.is_none()
-                {
-                    source_kind = None;
-                    this.canonicalize_following(&resolved)?
-                } else {
-                    resolved
-                };
-                Some(resolved)
+            if !exists {
+                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+            }
+            let resolved = if flags & LINUX_AT_SYMLINK_FOLLOW != 0 && anon_fd_candidate.is_none() {
+                source_kind = None;
+                this.canonicalize_following(&resolved)?
+            } else {
+                resolved
             };
-            let resolved_new = this.resolve_at_path(newdirfd, &new_path)?;
-            carrick_observability::probes::fs_op("path-role", "dispatcher-target", 0);
-            if this.is_synthetic_virtual_path(cx.kernel, &resolved_new)
-                || this.layered_metadata(&resolved_new).is_ok()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EEXIST));
-            }
-            // The new-path's parent directory must exist, be a directory, and be
-            // writable by the caller — creating a hard link writes an entry into
-            // it (link04: a missing parent component -> ENOENT, a non-directory
-            // component -> ENOTDIR, an unwritable parent under a dropped euid ->
-            // EACCES). VFS-mount targets own their own checks below.
-            if this.fs.vfs_mounts.resolve(&resolved_new).is_none() {
-                let new_parent = std::path::Path::new(&resolved_new)
-                    .parent()
-                    .map(|p| {
-                        let s = p.to_string_lossy().into_owned();
-                        if s.is_empty() { "/".to_string() } else { s }
-                    })
-                    .unwrap_or_else(|| "/".to_string());
-                carrick_observability::probes::fs_op("path-role", "permission-parent", 0);
-                match this.layered_metadata(&new_parent) {
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
-                    Ok(md) if md.kind != RootFsEntryKind::Directory => {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                    }
-                    Ok(_) => {}
+            Some(resolved)
+        };
+        let resolved_new = this.resolve_at_path(newdirfd, new_path)?;
+        if this.mutation_path_needs_task(context, &resolved_new)
+            || resolved_old
+                .as_deref()
+                .is_some_and(|old| this.mutation_path_needs_task(context, old))
+        {
+            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+        }
+        carrick_observability::probes::fs_op("path-role", "dispatcher-target", 0);
+        if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &resolved_new))
+            || this.layered_metadata(&resolved_new).is_ok()
+        {
+            return Ok(DispatchOutcome::errno(LINUX_EEXIST));
+        }
+        // The new-path's parent directory must exist, be a directory, and be
+        // writable by the caller — creating a hard link writes an entry into
+        // it (link04: a missing parent component -> ENOENT, a non-directory
+        // component -> ENOTDIR, an unwritable parent under a dropped euid ->
+        // EACCES). VFS-mount targets own their own checks below.
+        if this.fs.vfs_mounts.resolve(&resolved_new).is_none() {
+            let new_parent = std::path::Path::new(&resolved_new)
+                .parent()
+                .map(|p| {
+                    let s = p.to_string_lossy().into_owned();
+                    if s.is_empty() { "/".to_string() } else { s }
+                })
+                .unwrap_or_else(|| "/".to_string());
+            carrick_observability::probes::fs_op("path-role", "permission-parent", 0);
+            match this.layered_metadata(&new_parent) {
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                Ok(md) if md.kind != RootFsEntryKind::Directory => {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
                 }
-                if let Some(errno) = this.may_write(&new_parent) {
-                    return Ok(DispatchOutcome::errno(errno));
-                }
+                Ok(_) => {}
             }
-            // Linux gives the unnamed inode a name in place (same inode); carrick
-            // has no shared-inode primitive for the overlay, so it materializes a
-            // fresh entry from the fd's live bytes + creation mode. The O_TMPFILE
-            // tests only stat size + mode, so a content+mode copy is
-            // observationally exact. `materialize_anon_fd_to` returns None when
-            // the fd is NOT an anon file (a real /proc/self/fd/<n> to a named
-            // file), so the ordinary hard-link path below still handles those.
-            if let Some(n) = anon_fd_candidate
-                && let Some(result) = this.materialize_anon_fd_to(n, &resolved_new)
-            {
-                return Ok(match result {
+            if let Some(errno) = this.may_write(&new_parent) {
+                return Ok(DispatchOutcome::errno(errno));
+            }
+        }
+        // Linux gives the unnamed inode a name in place (same inode); carrick
+        // has no shared-inode primitive for the overlay, so it materializes a
+        // fresh entry from the fd's live bytes + creation mode. The O_TMPFILE
+        // tests only stat size + mode, so a content+mode copy is
+        // observationally exact. `materialize_anon_fd_to` returns None when
+        // the fd is NOT an anon file (a real /proc/self/fd/<n> to a named
+        // file), so the ordinary hard-link path below still handles those.
+        if let Some(n) = anon_fd_candidate
+            && let Some(result) = this.materialize_anon_fd_to(n, &resolved_new)
+        {
+            return Ok(match result {
+                Ok(()) => {
+                    this.mutation_dnotify_child(context, &resolved_new, LinuxDnotifyMask::CREATE);
+                    crate::el1_inotify::invalidate_name_cache_all();
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                Err(errno) => DispatchOutcome::errno(errno),
+            });
+        }
+        // Create a real hard link in the writable backend (cap-std
+        // hard_link). dpkg link()s e.g. /var/lib/dpkg/status -> status-old.
+        // AT_EMPTY_PATH (link by fd) isn't supported. MemoryBackend can't
+        // hard-link an in-memory file, so it falls back to a content copy.
+        let Some(src) = resolved_old else {
+            return Ok(DispatchOutcome::errno(LINUX_EROFS));
+        };
+        // Hard-linking a DIRECTORY is forbidden: Linux's vfs_link returns
+        // EPERM for S_ISDIR (only a privileged FS-specific path could, which
+        // carrick never offers). Check before the overlay hard_link, which
+        // would otherwise surface EROFS (linkat01 case 21 links ".").
+        if matches!(
+            source_kind.or_else(|| this.layered_metadata(&src).ok().map(|md| md.kind)),
+            Some(RootFsEntryKind::Directory)
+        ) {
+            return Ok(DispatchOutcome::errno(LINUX_EPERM));
+        }
+        let msrc = this.fs.vfs_mounts.resolve(&src);
+        let mnew = this.fs.vfs_mounts.resolve(&resolved_new);
+        match (msrc, mnew) {
+            (Some(msrc), Some(mnew)) => {
+                if msrc.point != mnew.point {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
+                }
+                return Ok(match mnew.vfs.link(&msrc.full_path, &mnew.full_path) {
                     Ok(()) => {
-                        this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
+                        this.mutation_dnotify_child(
+                            context,
+                            &resolved_new,
+                            LinuxDnotifyMask::CREATE,
+                        );
                         crate::el1_inotify::invalidate_name_cache_all();
                         DispatchOutcome::Returned { value: 0 }
                     }
                     Err(errno) => DispatchOutcome::errno(errno),
                 });
             }
-            // Create a real hard link in the writable backend (cap-std
-            // hard_link). dpkg link()s e.g. /var/lib/dpkg/status -> status-old.
-            // AT_EMPTY_PATH (link by fd) isn't supported. MemoryBackend can't
-            // hard-link an in-memory file, so it falls back to a content copy.
-            let Some(src) = resolved_old else {
-                return Ok(DispatchOutcome::errno(LINUX_EROFS));
-            };
-            // Hard-linking a DIRECTORY is forbidden: Linux's vfs_link returns
-            // EPERM for S_ISDIR (only a privileged FS-specific path could, which
-            // carrick never offers). Check before the overlay hard_link, which
-            // would otherwise surface EROFS (linkat01 case 21 links ".").
-            if matches!(
-                source_kind.or_else(|| this.layered_metadata(&src).ok().map(|md| md.kind)),
-                Some(RootFsEntryKind::Directory)
-            ) {
-                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            (Some(_), None) | (None, Some(_)) => {
+                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
             }
-            let msrc = this.fs.vfs_mounts.resolve(&src);
-            let mnew = this.fs.vfs_mounts.resolve(&resolved_new);
-            match (msrc, mnew) {
-                (Some(msrc), Some(mnew)) => {
-                    if msrc.point != mnew.point {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
-                    }
-                    return Ok(match mnew.vfs.link(&msrc.full_path, &mnew.full_path) {
-                        Ok(()) => {
-                            this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
-                            crate::el1_inotify::invalidate_name_cache_all();
-                            DispatchOutcome::Returned { value: 0 }
-                        }
-                        Err(errno) => DispatchOutcome::errno(errno),
-                    });
-                }
-                (Some(_), None) | (None, Some(_)) => {
+            (None, None) => {
+                if context.is_some_and(|context| this.is_synthetic_virtual_path(context, &src)) {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
                 }
-                (None, None) => {
-                    if this.is_synthetic_virtual_path(cx.kernel, &src) {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EXDEV));
-                    }
-                }
-            }
-            match this.fs.rootfs_vfs.link(&src, &resolved_new) {
-                Ok(()) => {
-                    this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
-                    crate::el1_inotify::invalidate_name_cache_all();
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
         }
+        match this.fs.rootfs_vfs.link(&src, &resolved_new) {
+            Ok(()) => {
+                this.mutation_dnotify_child(context, &resolved_new, LinuxDnotifyMask::CREATE);
+                crate::el1_inotify::invalidate_name_cache_all();
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            Err(errno) => Ok(DispatchOutcome::errno(errno)),
+        }
+    }
 
+    define_syscall! {
         fn symlinkat(this, cx, target: GuestPtr, newdirfd: u64, linkpath: GuestPtr) {
             let target = target.0;
             let linkpath = linkpath.0;

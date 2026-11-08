@@ -124,6 +124,13 @@ pub enum HostFileCall {
         dirfd: i32,
         path: u64,
     },
+    Linkat {
+        olddirfd: i32,
+        oldpath: u64,
+        newdirfd: i32,
+        newpath: u64,
+        flags: u64,
+    },
     Faccessat {
         dirfd: i32,
         path: u64,
@@ -262,6 +269,13 @@ impl HostFileCall {
                 target: args[0],
                 dirfd: args[1] as i32,
                 path: args[2],
+            },
+            c if c == nr::LINKAT => Self::Linkat {
+                olddirfd: fd,
+                oldpath: args[1],
+                newdirfd: args[2] as i32,
+                newpath: args[3],
+                flags: args[4],
             },
             c if c == nr::FACCESSAT => Self::Faccessat {
                 dirfd: fd,
@@ -766,6 +780,46 @@ fn stage_call(
                 0,
                 [0; 4],
                 &path_pair(&target, &path),
+                None,
+            )
+        }
+        HostFileCall::Linkat {
+            olddirfd,
+            oldpath,
+            newdirfd,
+            newpath,
+            flags,
+        } => {
+            if flags
+                & !(carrick_syscall_abi::LINUX_AT_SYMLINK_FOLLOW | u64::from(LINUX_AT_EMPTY_PATH))
+                != 0
+            {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            let old = match copy_path(user, oldpath) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            let new = match staging.path_input(user, newdirfd, newpath)? {
+                Ok(path) => path,
+                Err(stage) => return Some(stage),
+            };
+            if old.is_empty() {
+                return Some(errno(if flags & u64::from(LINUX_AT_EMPTY_PATH) != 0 {
+                    carrick_syscall_abi::LINUX_ENOSYS
+                } else {
+                    carrick_syscall_abi::LINUX_ENOENT
+                }));
+            }
+            if let Some(answer) = staging.path_base(olddirfd, &old)? {
+                return Some(answer);
+            }
+            staging.request(
+                HostFileOp::Linkat,
+                LINUX_AT_FDCWD,
+                flags as u32,
+                [0; 4],
+                &path_pair(&old, &new),
                 None,
             )
         }
