@@ -402,7 +402,23 @@ impl fmt::Display for ArmEntryBindingFatal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let r = &self.registers;
         if r.reason.is_some_and(|reason| (62..=68).contains(&reason)) {
-            write!(f, "admission_identity={:x?} ", r.admission_identity)?;
+            // Admission evidence must fit the fixed terminal record even at
+            // maximum width. Use its retained identities instead of repeating
+            // the larger saved-register snapshot below.
+            return write!(
+                f,
+                "entry_binding cpu={} {}admission_identity={:x?} pc={} lr={} sp_el1={} loaded_task={} loaded_generation={} loaded_thread={} loaded_mm={}",
+                self.slot.raw(),
+                FatalDetail(r.reason, r.source_location),
+                r.admission_identity,
+                Register(r.pc),
+                Register(r.lr),
+                Register(r.sp_el1),
+                self.loaded.task.raw(),
+                self.loaded.generation.raw(),
+                self.loaded.thread_generation.raw(),
+                self.loaded.mm.raw(),
+            );
         }
         write!(
             f,
@@ -695,6 +711,36 @@ mod tests {
     }
 
     #[test]
+    fn admission_fatal_identity_fits_the_terminal_record() {
+        let registers = ArmEntryFatalRegisters {
+            reason: Some(EntryBindingFatalReason::AdmissionRecordKeyCollision as u64),
+            source_location: Some(u64::MAX),
+            admission_identity: [Some(u64::MAX); 8],
+            pc: Some(u64::MAX),
+            lr: Some(u64::MAX),
+            sp_el1: Some(u64::MAX),
+            ..Default::default()
+        };
+        let capture = ArmEntryBindingFatal::capture(
+            registers,
+            &crate::TrapFrame::default(),
+            crate::ExecutionBinding {
+                task: crate::EntryTaskKey::from_raw(u64::MAX),
+                generation: crate::SnapshotGeneration::from_raw(u64::MAX),
+                mm: crate::EntryMmKey::from_raw(u64::MAX),
+                thread_generation: crate::EntryThreadGeneration::from_raw(u64::MAX),
+            },
+            &zone(),
+            crate::SlotId::new(255),
+        );
+        let rendered = format!("{capture}");
+        assert!(rendered.len() <= 1024, "{} bytes", rendered.len());
+        assert!(rendered.contains("reason=AdmissionRecordKeyCollision"));
+        assert!(rendered.contains("admission_identity=[Some(ffffffffffffffff)"));
+        assert!(rendered.contains("loaded_mm=18446744073709551615"));
+    }
+
+    #[test]
     fn entry_binding_fatal_maximum_width_fits_the_terminal_record() {
         let zone = zone();
         let slot = crate::SlotId::new(255);
@@ -720,6 +766,7 @@ mod tests {
         let registers = ArmEntryFatalRegisters {
             reason: Some(u64::MAX),
             source_location: Some(u64::MAX),
+            admission_identity: [None; 8],
             pc: Some(u64::MAX),
             lr: Some(u64::MAX),
             fp: Some(u64::MAX),
