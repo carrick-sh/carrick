@@ -321,6 +321,8 @@ impl NativeProcessError {
             UserWriteError::Owner(MmError::Wait(wait)) => NativeProcessError::OwnerWait(wait),
             UserWriteError::Owner(MmError::Busy) | UserWriteError::Busy => NativeProcessError::Busy,
             UserWriteError::Owner(MmError::Stale) => NativeProcessError::Stale,
+            UserWriteError::Owner(MmError::Invalid) => NativeProcessError::Invalid,
+            UserWriteError::Owner(MmError::Core) => NativeProcessError::Quarantined,
             UserWriteError::Owner(MmError::UnsupportedExecutableCow)
             | UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
             UserWriteError::Owner(_) | UserWriteError::Fault => NativeProcessError::Fault,
