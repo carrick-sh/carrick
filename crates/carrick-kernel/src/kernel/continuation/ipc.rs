@@ -508,8 +508,10 @@ fn complete_poll<M: carrick_guest_mem::CurrentMmMemory>(
     cause: Option<IpcCause>,
     wake: &impl IpcHostServices,
 ) -> Result<IpcHostOutcome, IpcError> {
+    use super::output::PollReventsOutput;
     use crate::dispatch::copyout::{self, UserSlot};
     use carrick_el1_abi::ipc::{IpcBacking, WriteProgress, epoll::EpollMember};
+    use carrick_guest_mem::GuestVa;
     let complete = |result| IpcHostOutcome::Complete {
         result,
         sigpipe: false,
@@ -560,18 +562,22 @@ fn complete_poll<M: carrick_guest_mem::CurrentMmMemory>(
         bytes[6..].copy_from_slice(&revents.to_ne_bytes());
         op.value = carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(bytes));
         op.result = i64::from(revents != 0);
-        op.progress = WriteProgress::new(8);
+        op.progress = WriteProgress::new(2);
         region.update_operation(&token, op)?;
     }
-    let bytes = op.value.0.to_ne_bytes();
+    let saved = op.value.0.to_ne_bytes();
+    let field = PollReventsOutput::new(
+        GuestVa::new(op.buf.0),
+        i16::from_ne_bytes([saved[6], saved[7]]),
+    );
+    let (base, bytes) = field.unit().map_err(|_| IpcError::Corrupt)?;
     while !op.progress.is_complete() {
         let offset = op.progress.written as usize;
-        let address = op
-            .buf
-            .0
+        let address = base
+            .raw()
             .checked_add(op.progress.written)
             .ok_or(IpcError::Corrupt)?;
-        let length = (8 - offset).min(
+        let length = (bytes.len() - offset).min(
             (carrick_el1::substrate::ipc::USER_COPY_GRANULE
                 - address % carrick_el1::substrate::ipc::USER_COPY_GRANULE) as usize,
         );
