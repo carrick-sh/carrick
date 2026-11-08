@@ -277,6 +277,32 @@ pub(crate) struct FdWaitOutput {
     retained_wait: Option<crate::dispatch::fd_wait::BlockingFdWait>,
 }
 
+/// A poll result can publish only `revents`; fd/events remain caller-owned.
+/// Shared by fd-wait publication and retained IPC handback publication.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PollReventsOutput {
+    record: GuestVa,
+    bytes: [u8; 2],
+}
+
+impl PollReventsOutput {
+    pub(crate) fn new(record: GuestVa, revents: i16) -> Self {
+        Self {
+            record,
+            bytes: revents.to_ne_bytes(),
+        }
+    }
+
+    pub(crate) fn unit(&self) -> Result<(GuestVa, &[u8; 2]), LinuxErrno> {
+        let address = self
+            .record
+            .raw()
+            .checked_add(core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64)
+            .ok_or(LINUX_EFAULT)?;
+        Ok((GuestVa::new(address), &self.bytes))
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum FdWaitWrites {
     Select {
@@ -284,7 +310,7 @@ enum FdWaitWrites {
         offset: usize,
     },
     /// Input record addresses, with only the result field retained for output.
-    Poll(VecDeque<(GuestVa, [u8; 2])>),
+    Poll(VecDeque<PollReventsOutput>),
 }
 
 impl FdWaitWrites {
@@ -304,15 +330,12 @@ impl FdWaitWrites {
                 )))
             }
             Self::Poll(entries) => {
-                let Some((base, bytes)) = entries.front() else {
+                let Some(output) = entries.front() else {
                     return Ok(None);
                 };
-                let address = base
-                    .raw()
-                    .checked_add(core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64)
-                    .ok_or(LINUX_EFAULT)?;
+                let (address, bytes) = output.unit()?;
                 // A field is one complete unit, even when it crosses a page.
-                Ok(Some((GuestVa::new(address), bytes)))
+                Ok(Some((address, bytes)))
             }
         }
     }
@@ -365,7 +388,7 @@ impl FdWaitOutput {
             writes: FdWaitWrites::Poll(
                 entries
                     .into_iter()
-                    .map(|(address, revents)| (address, revents.to_ne_bytes()))
+                    .map(|(address, revents)| PollReventsOutput::new(address, revents))
                     .collect(),
             ),
             retained_wait: Some(retained_wait),
