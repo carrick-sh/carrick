@@ -2286,3 +2286,175 @@ fn incomplete_paired_base_blocks_publication_but_known_failures_compare() {
     let (passed, body) = bench.publish();
     assert!(!passed, "missing base exit status published PASS: {body}");
 }
+
+/// Digest inventory of every file under `dir`, computed independently of the
+/// executor: relative `/`-separated path to lowercase SHA-256.
+fn inventory(dir: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    use sha2::{Digest, Sha256};
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut std::collections::BTreeMap<String, String>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let relative = path.strip_prefix(root).unwrap();
+                let key = relative
+                    .components()
+                    .map(|c| c.as_os_str().to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.insert(
+                    key,
+                    format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap())),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// Evidence one runner side leaves, as `execute_one` would.
+fn write_run_evidence(dir: &std::path::Path, name: &str, receipt: &AcceptReceipt) {
+    std::fs::create_dir_all(dir.join("steps")).unwrap();
+    std::fs::write(dir.join(name), serde_json::to_vec(receipt).unwrap()).unwrap();
+    std::fs::write(
+        dir.join("identity.json"),
+        serde_json::to_vec(&receipt.artifact).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("cleanup.json"),
+        serde_json::to_vec(&receipt.cleanup_counts).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("accept-exit.json"), r#"{"success":false}"#).unwrap();
+    std::fs::write(dir.join("steps/el1-embed.log"), "log").unwrap();
+}
+
+/// Review P1 on #1889: candidate code runs after the base on the same Mac
+/// and could rewrite the base's evidence. The pairing seals a digest
+/// inventory of the base directory in executor memory immediately after the
+/// base run, re-verifies it after the candidate run and its cleanup, and only
+/// then writes the sealed record. Any changed, missing or added file fails.
+#[test]
+fn candidate_phase_mutation_of_paired_base_evidence_is_refused() {
+    use carrick_xtask::signed_gate::{Request, RequestKind, execute_pair};
+    let request = Request {
+        kind: RequestKind::PullRequest,
+        prs: vec![123],
+        sha: "b".repeat(40),
+        base: "a".repeat(40),
+    };
+    type Tamper = fn(&std::path::Path);
+    let tampers: [(&str, Tamper); 4] = [
+        ("changed receipt", |base| {
+            let path = base.join("base.json");
+            let mut receipt: AcceptReceipt =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            receipt.steps[2]
+                .failed_tests
+                .push("candidate_regression".into());
+            std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        }),
+        ("missing file", |base| {
+            std::fs::remove_file(base.join("steps/el1-embed.log")).unwrap()
+        }),
+        ("added file", |base| {
+            std::fs::write(base.join("extra.json"), "{}").unwrap()
+        }),
+        ("replaced seal", |base| {
+            // A candidate cannot pre-plant the sealed record either.
+            std::fs::write(base.parent().unwrap().join("base-seal.json"), "{}").unwrap()
+        }),
+    ];
+    for (label, tamper) in tampers {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path();
+        let result = execute_pair(&request, output, |run| {
+            if run.receipt_name == "base.json" {
+                write_run_evidence(&run.output, run.receipt_name, &admitted(&request.base));
+            } else {
+                write_run_evidence(&run.output, run.receipt_name, &admitted(&request.sha));
+                tamper(&output.join("base"));
+            }
+            Ok(())
+        });
+        if label == "replaced seal" {
+            // The executor overwrites the planted record with its own seal.
+            result.unwrap();
+            let seal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(output.join("base-seal.json")).unwrap())
+                    .unwrap();
+            assert_eq!(seal["base"], request.base);
+            assert_eq!(
+                serde_json::to_value(inventory(&output.join("base"))).unwrap(),
+                seal["files"]
+            );
+            continue;
+        }
+        let error = result.expect_err(label).to_string();
+        assert!(error.contains("base evidence seal"), "{label}: {error}");
+        assert!(
+            !output.join("base-seal.json").exists(),
+            "{label}: sealed a tampered base"
+        );
+        let diagnostic = std::fs::read_to_string(output.join("execution-error.txt")).unwrap();
+        assert!(diagnostic.contains("base evidence seal"), "{label}");
+    }
+}
+
+/// Publication checks the sealed record against the base evidence it loads:
+/// a rewritten base receipt cannot hide a candidate regression.
+#[cfg(unix)]
+#[test]
+fn publish_refuses_base_evidence_that_differs_from_its_seal() {
+    let bench = PublishBench::new();
+    let base = admitted(&bench.base);
+    bench.write_base(&base, false);
+    let mut candidate = admitted(&bench.head);
+    candidate.steps[2]
+        .failed_tests
+        .push("candidate_regression".into());
+    bench.write_candidate(&candidate, false);
+    let seal = |files: std::collections::BTreeMap<String, String>| {
+        std::fs::write(
+            bench.results().join("base-seal.json"),
+            json!({"base": bench.base, "files": files}).to_string(),
+        )
+        .unwrap();
+    };
+    seal(inventory(&bench.results().join("base")));
+    let (passed, body) = bench.publish();
+    assert!(!passed, "regression passed: {body}");
+    assert!(body.contains("candidate_regression"), "{body}");
+
+    // Rewrite the base so the regression looks pre-existing.
+    let mut forged = base.clone();
+    forged.steps[2]
+        .failed_tests
+        .push("candidate_regression".into());
+    bench.write_base(&forged, false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "forged base passed: {body}");
+    assert!(body.contains("base evidence seal"), "{body}");
+
+    // A missing record, or one naming another base, is no seal.
+    bench.write_base(&base, false);
+    std::fs::write(
+        bench.results().join("base-seal.json"),
+        json!({"base": "c".repeat(40), "files": inventory(&bench.results().join("base"))})
+            .to_string(),
+    )
+    .unwrap();
+    let (passed, body) = bench.publish();
+    assert!(!passed && body.contains("base evidence seal"), "{body}");
+    std::fs::remove_file(bench.results().join("base-seal.json")).unwrap();
+    let (passed, body) = bench.publish();
+    assert!(!passed && body.contains("base evidence seal"), "{body}");
+}
