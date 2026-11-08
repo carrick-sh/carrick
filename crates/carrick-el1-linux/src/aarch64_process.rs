@@ -51,6 +51,8 @@ fn native_user_write_preserves_nonfault_refusals() {
     for (error, expected) in [
         (MmError::Busy, NativeProcessError::Busy),
         (MmError::Stale, NativeProcessError::Stale),
+        (MmError::Invalid, NativeProcessError::Invalid),
+        (MmError::Core, NativeProcessError::Quarantined),
         (
             MmError::UnsupportedExecutableCow,
             NativeProcessError::Unsupported,
