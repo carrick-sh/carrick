@@ -4925,6 +4925,7 @@ mod tests {
 
     #[test]
     fn copy_refusal_format_includes_both_owner_identities() {
+        extern crate std;
         let counters = Counters::new();
         counters.publish_copy_refusal([73, 0x4000, 16, 2, 0, 6, 1, 11, 12, 13, 14, 21, 22, 23, 24]);
         // An unpublished row must not be printed.

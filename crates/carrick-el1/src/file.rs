@@ -201,18 +201,17 @@ pub trait MemoryValidator {
 
     /// Preserve the validator's original refusal before a boolean caller loses it.
     fn check_range(&self, address: u64, len: usize, write: bool) -> Result<(), CopyRefusalReason> {
-        if !valid_lower_half_range(address, len) {
-            return Err(CopyRefusalReason::ForbiddenRange);
-        }
         let checked = if write {
             self.writable_bytes(address, len)
         } else {
             self.readable_bytes(address, len)
         };
-        if checked == len {
+        if checked >= len {
             Ok(())
-        } else {
+        } else if valid_lower_half_range(address, len) {
             Err(CopyRefusalReason::Validator)
+        } else {
+            Err(CopyRefusalReason::ForbiddenRange)
         }
     }
 }
@@ -280,6 +279,9 @@ impl HardwareValidator {
         len: usize,
         write: bool,
     ) -> (usize, Option<CopyRefusalReason>) {
+        if len == 0 {
+            return (0, None);
+        }
         if !valid_lower_half_range(user_va, len) {
             return (0, Some(CopyRefusalReason::ForbiddenRange));
         }
@@ -1088,4 +1090,14 @@ fn diagnosed_copy_distinguishes_validation_from_guarded_fault() {
     assert_eq!(result, Err(CopyRefusalReason::GuardedFault));
     assert_eq!(copy.copy_in_diagnosed(&mut dst, address), Ok(()));
     assert_eq!(dst, src);
+}
+
+#[cfg(test)]
+#[test]
+fn diagnosed_empty_copy_preserves_zero_length_validation() {
+    // No address is accessed. Keep the boolean primitive's existing behavior
+    // when adding provenance, including a zero-byte copy above USER_CEILING.
+    let validator = HardwareValidator;
+    assert_eq!(validator.check_range(u64::MAX, 0, false), Ok(()));
+    assert_eq!(validator.check_range(u64::MAX, 0, true), Ok(()));
 }
