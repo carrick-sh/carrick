@@ -3238,6 +3238,11 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
     use carrick_el1::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served, ThreadCpu};
     use carrick_el1_abi::{AnonymousLeave, Counters, CurrentTask, El1TaskId, SlotId, TrapFrame};
     use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
+        execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
     use carrick_sched_core::spaces::notification::SpaceWaitCause;
 
     for cause in [
@@ -3272,9 +3277,36 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
             task.mm.thread_generation.store(1101, Ordering::Release);
             task.linux.mark_pending_host_work();
             let counters = Counters::default();
-            let tables = Tables::new(ROOT, IPA, 2);
+            let tables = Tables::new(ROOT, IPA, 0);
             let maintenance = CallerInvalidatesAsid;
             let prepared = (cause == SpaceWaitCause::PreparedOverlap).then(|| {
+                let nz = |value| NonZeroU64::new(value).unwrap();
+                let published = execute_descriptor_op(
+                    &tables.live(&maintenance),
+                    SubstrateGpa(ROOT),
+                    DescriptorOp::Prepare {
+                        publication: GuestLeafPublication {
+                            va: VA,
+                            ipa: IPA,
+                            len: 4096,
+                            writable: true,
+                            executable: false,
+                        },
+                        resident: PageSpan::new(VA, 4096),
+                        backing: BackingIdentity {
+                            frame_id: nz(1),
+                            mapping_id: nz(2),
+                            owner_generation: nz(3),
+                            inventory_revision: nz(4),
+                        },
+                    },
+                    &TableGrants::NONE,
+                    &mut InlineJournal::new(),
+                );
+                assert!(
+                    matches!(published, DescriptorOutcome::Applied(_)),
+                    "{published:?}"
+                );
                 let transfer = portal
                     .begin(
                         portal.admitted_handle(mm, 0).unwrap(),
@@ -3397,11 +3429,13 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
                     None
                 ),
                 DelegatedAnonymous::Served,
+                "cause={cause:?}, leaves={:?}",
+                counters
+                    .anonymous_leaves
+                    .each_ref()
+                    .map(|counter| counter.load(Ordering::Relaxed)),
             );
-            for leave in [
-                AnonymousLeave::RootBusy,
-                AnonymousLeave::EditorBusy,
-            ] {
+            for leave in [AnonymousLeave::RootBusy, AnonymousLeave::EditorBusy] {
                 assert_eq!(
                     counters.anonymous_leaves[leave as usize].load(Ordering::Relaxed),
                     0
