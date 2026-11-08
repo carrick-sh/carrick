@@ -607,27 +607,7 @@ fn admit_entry_runtime(
     } else {
         observed
     };
-    if let Ok(runtime) = REGISTRY.for_entry(source, task, address)
-        && REGISTRY
-            .for_record(source.zone, source.zone.record_ref(record))
-            .is_some_and(|retained| Arc::ptr_eq(&retained, &runtime))
-    {
-        return Ok((runtime, address));
-    }
-    if control.entry().is_some()
-        || REGISTRY
-            .group_address(
-                source.zone,
-                address,
-                page,
-                task.visible_pid().ok_or(NativeProcessError::Stale)?,
-            )
-            .is_some()
-    {
-        let runtime = match REGISTRY.rehome_entry(source, task, address, page, control)? {
-            Some(runtime) => runtime,
-            None => REGISTRY.register_thread(source, task, address, page, control)?,
-        };
+    if let Some(runtime) = REGISTRY.admit_existing_group(source, task, address, page, control)? {
         return Ok((runtime, address));
     }
     let words = Aarch64ParkedContext::from_register(
