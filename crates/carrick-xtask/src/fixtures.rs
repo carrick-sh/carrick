@@ -19,6 +19,7 @@ mod inputs;
 pub mod linker;
 use environment::BuildEnvironment;
 pub use environment::BuildPolicy;
+pub(crate) use environment::reject_ambient_overrides;
 pub use inputs::{
     check_leaf_closures, current_build_code, fetch_dependencies, fetch_plan, source_hashes,
 };

@@ -292,7 +292,7 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
     );
     write(
         "unrelated/Cargo.toml",
-        "[package]\nname='unrelated'\nversion='0.1.0'\nedition='2021'\n",
+        "[package]\nname='carrick-xtask'\nversion='0.1.0'\nedition='2021'\n",
     );
     write(
         "unrelated/src/lib.rs",
@@ -369,7 +369,7 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
     let output = String::from_utf8_lossy(&plan.stdout);
     assert!(output.contains("test-touched: carrick-sched-core"));
     assert!(output.contains("test-touched: carrick-kernel"));
-    assert!(!output.contains("test-touched: unrelated"));
+    assert!(!output.contains("test-touched: carrick-xtask"));
     assert!(output.contains("carrick-kernel/test-support"));
     let replay = run(false);
     let text = format!(
@@ -403,4 +403,45 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
     );
     let plan = run(true);
     assert!(String::from_utf8_lossy(&plan.stdout).contains("changed-feature"));
+    // Reuse the fixture policy's real environment authority before running the
+    // xtask suite, rather than reporting dozens of ordinary fixture failures.
+    write("justfile", recipe);
+    let config_base = git(&["rev-parse", "HEAD"]);
+    write(
+        "unrelated/src/lib.rs",
+        "#[test] fn must_not_run() { panic!(\"configuration preflight lost\"); }\n",
+    );
+    git(&["add", "unrelated/src/lib.rs"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "commit",
+        "-qm",
+        "configuration witness",
+    ]);
+    let invalid = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "test-touched",
+            &config_base,
+        ])
+        .env("CARGO_BUILD_JOBS", "2")
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&invalid.stdout),
+        String::from_utf8_lossy(&invalid.stderr)
+    );
+    assert!(!invalid.status.success(), "{text}");
+    assert!(
+        text.contains("host configuration unavailable:")
+            && text.contains("fixture build policy forbids ambient CARGO_BUILD_JOBS"),
+        "{text}"
+    );
+    assert!(!text.contains("must_not_run ... FAILED"), "{text}");
 }
