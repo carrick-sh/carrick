@@ -51,14 +51,14 @@ jobs:
         run: rustup show active-toolchain
 
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
 
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
 
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
@@ -211,9 +211,9 @@ jobs:
         run: scripts/ci/download-fixture-bundle.sh verify
 
       - name: Install just and cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just,cargo-deny
+          tools: just,cargo-deny
 
       # CARGO_HOME is runner-private and may persist across runs on the
       # persistent runner, but nothing below relies on that. Restore verifies fixture
@@ -435,13 +435,13 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
 
       - name: Build and verify frozen closure scope
         run: |
@@ -490,14 +490,14 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
 
       - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: sccache@0.18.0
+          tools: sccache
       - name: Install x86 image and fixture targets
         run: rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
 
@@ -563,9 +563,9 @@ jobs:
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-tools
         with:
-          tool: just
+          tools: just
 
       # `xtask accept --profile el1-native` runs `just test-el1-native` and
       # records every failing `<test-binary>::<test>` in the receipt.
