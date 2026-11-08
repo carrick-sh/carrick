@@ -697,6 +697,23 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             // SVC, whose saved ELR names the following aligned instruction.
             frame.elr = frame.elr.wrapping_sub(4);
         }
+        self.counters.record_syscall_frame(
+            if rec.has_object_operation() {
+                carrick_el1_abi::SyscallFrameSource::SchedulerObjectReplay
+            } else {
+                match resumed {
+                    ResumeAction::RetrySyscall => {
+                        carrick_el1_abi::SyscallFrameSource::SchedulerOwnerReplay
+                    }
+                    ResumeAction::RetrySavedSyscall => {
+                        carrick_el1_abi::SyscallFrameSource::SchedulerSavedReplay
+                    }
+                    _ => carrick_el1_abi::SyscallFrameSource::SchedulerSavedReturn,
+                }
+            },
+            frame,
+            carrick_core::entry::binding(&self.task.execution, &self.task.mm),
+        );
         self.task
             .linux
             .orig_arg0
