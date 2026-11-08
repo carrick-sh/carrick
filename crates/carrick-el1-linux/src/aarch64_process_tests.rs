@@ -11336,10 +11336,22 @@ fn native_descriptor_argument_witness(
             let mut entry = runtime
                 .enter(source, &task, parent_binding.words, &mut writer_service)
                 .unwrap();
+            let before = crate::common_entry::execution_binding(&task);
+            assert_eq!(entry.binding(), before);
             let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
             else {
                 panic!("prepared-pipe writer fork must return");
             };
+            assert_eq!(
+                crate::common_entry::execution_binding(&task),
+                before,
+                "prepared fork must preserve the parent's presented MM and generations"
+            );
+            assert_eq!(
+                entry.binding(),
+                before,
+                "prepared fork must preserve the parent's expected owner binding"
+            );
             assert!(result.raw() > 0, "writer fork errno {}", -result.raw());
             let key = runtime
                 .namespace_child_key(parent_binding.key, result.raw() as u32)
@@ -11547,6 +11559,22 @@ fn native_descriptor_argument_witness(
                 row.is_some(),
                 "ring ppoll must retain the original guarded-copy refusal before owner preparation"
             );
+            let row = row.unwrap();
+            assert_eq!(row[7].load(Ordering::Relaxed), 1, "owner present");
+            for i in 0..4 {
+                assert_eq!(
+                    row[8 + i].load(Ordering::Relaxed),
+                    row[12 + i].load(Ordering::Relaxed),
+                    "post-fork presented/expected binding word {i} differs"
+                );
+            }
+            assert_eq!(
+                row[8].load(Ordering::Relaxed),
+                fixture.address.mm.raw().get()
+            );
+            let mut rows = String::new();
+            counters.write_copy_refusals(&mut rows).unwrap();
+            println!("{rows}");
         }
         let revents = pollfds.get::<PollFd>(0).revents;
         assert!(matches!(
