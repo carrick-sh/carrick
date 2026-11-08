@@ -289,6 +289,33 @@ pub(crate) fn native_entry_owned(
     }
 }
 
+/// Admission refuses either with retained contention or an existing failure.
+/// There is no conversion from contention to NativeProcessError or errno.
+///
+/// ```compile_fail
+/// use carrick_el1_linux::native_process_runtime::{NativeAdmissionContention, NativeProcessError};
+/// fn lower(contention: NativeAdmissionContention) -> NativeProcessError {
+///     contention.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carrick_el1_linux::{dispatch::invalid_completion, native_process_runtime::NativeAdmissionContention};
+/// fn fatal(contention: NativeAdmissionContention) -> ! {
+///     invalid_completion(contention)
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub enum NativeAdmissionError {
+    Contended(Box<NativeAdmissionContention>),
+    Failure(NativeProcessError),
+}
+impl From<NativeProcessError> for NativeAdmissionError {
+    fn from(error: NativeProcessError) -> Self {
+        Self::Failure(error)
+    }
+}
+
 /// Admission contention is evidence, not an invariant error. There is deliberately
 /// no From implementation into an invariant or errno type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,7 +392,6 @@ pub enum NativeProcessError {
     Unsupported,
     GroupExitCustody,
     Busy,
-    AdmissionContended(NativeAdmissionContention),
     Quarantined,
     NoChild,
 }
@@ -379,7 +405,7 @@ impl NativeProcessError {
             Self::Fault => R::NativeFault,
             Self::ForkRefused(refusal) => refusal.error().run_failure_reason(),
             Self::Unsupported => R::NativeUnsupported,
-            Self::Busy | Self::AdmissionContended(_) => R::NativeBusy,
+            Self::Busy => R::NativeBusy,
             Self::OwnerWait(_) => R::NativeFault,
             Self::Quarantined => R::NativeQuarantined,
             Self::NoChild => R::NativeNoChild,
@@ -389,7 +415,7 @@ impl NativeProcessError {
     pub fn errno(self) -> i64 {
         match self {
             Self::Invalid | Self::Stale => -22,
-            Self::Exhausted | Self::Busy | Self::AdmissionContended(_) => -11,
+            Self::Exhausted | Self::Busy => -11,
             Self::Fault | Self::OwnerWait(_) => -14,
             Self::ForkRefused(refusal) => refusal.error().errno(),
             Self::Unsupported | Self::GroupExitCustody => -38,
@@ -927,7 +953,7 @@ fn host_admitted_process(
         .host_birth_identity()
         .ok_or(NativeProcessError::Stale)?;
     if birth.task().raw() != id.raw() as u64 {
-        return Err(NativeProcessError::Stale);
+        return Err(NativeProcessError::Stale.into());
     }
     Ok(TaskKey {
         id,
@@ -1663,7 +1689,7 @@ impl NativeExecutionKey {
     ) -> Result<Self, NativeProcessError> {
         let task = NativeThreadIdentity::from_binding(binding)?;
         if binding.mm.raw() != address.mm.raw().get() {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         Ok(Self {
             carrier: core::ptr::from_ref(zone).addr(),
@@ -1905,9 +1931,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         source: BornInZoneSource<'a, C>,
         current: &CurrentTask,
         address: AddressContext<RootGpa>,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeAdmissionError> {
         if !core::ptr::eq(runtime.zone, source.zone) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let binding = super::common_entry::execution_binding(current);
         let key = NativeExecutionKey::new(source.zone, binding, address)?;
@@ -1926,7 +1952,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .task_binding(process)
             .ok_or(NativeProcessError::Stale)?;
         if owned.address != address {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let (page, visible_pid, control) = {
             let graph = runtime.graph.lock();
@@ -1960,7 +1986,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     })
                 })
                 .unwrap_or(key);
-            return Err(NativeProcessError::AdmissionContended(
+            return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
                     origin: NativeAdmissionOrigin::RootRegistrationCollision,
                     binding,
@@ -1968,13 +1994,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     new_record: owned.record,
                     conflicting_owner: Some(owner.binding()),
                 },
-            ));
+            )));
         }
         let retained = retain_member_control(control)?;
         // Root registration, like child publication, transfers the still-Free
         // home record to the native owner before it can become runnable.
         if !source.zone.mark_native_owned(owned.record.id) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         state.members.insert(
             key,
@@ -2011,7 +2037,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         address: AddressContext<RootGpa>,
         page: &ThreadLifecyclePage,
         control: &ThreadControlSlot,
-    ) -> Result<Option<Arc<NativeProcessRuntime<'a, M, C>>>, NativeProcessError> {
+    ) -> Result<Option<Arc<NativeProcessRuntime<'a, M, C>>>, NativeAdmissionError> {
         let binding = super::common_entry::execution_binding(current);
         let host_identity = member_host_identity(page, control)?;
         let key = NativeExecutionKey::new(source.zone, binding, address)?;
@@ -2045,7 +2071,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             || !current.owns_lifecycle_page(page)
             || !current.owns_control_slot(control)
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let Some(member_index) = resources
             .members
@@ -2055,7 +2081,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             return Ok(None);
         };
         if resources.members[member_index].thread.id() != key.task.id() {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let old_record = resources.members[member_index].record;
         let (_, keys) = state
@@ -2073,10 +2099,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         };
         let old_key = keys[key_index];
         if old_key.thread_generation != key.thread_generation {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         if old_record != reference && signal_record_exists(source.zone, old_record) {
-            return Err(NativeProcessError::AdmissionContended(
+            return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
                     origin: NativeAdmissionOrigin::OldRecordRetained,
                     binding,
@@ -2084,11 +2110,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     new_record: reference,
                     conflicting_owner: Some(old_key.binding()),
                 },
-            ));
+            )));
         }
         let record_key = Self::record_key(source.zone, reference);
         if old_key != key && state.members.contains_key(&key) {
-            return Err(NativeProcessError::AdmissionContended(
+            return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
                     origin: NativeAdmissionOrigin::ExecutionKeyCollision,
                     binding,
@@ -2096,12 +2122,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     new_record: reference,
                     conflicting_owner: Some(key.binding()),
                 },
-            ));
+            )));
         }
         if old_record != reference
             && let Some(owner) = state.records.get(&record_key)
         {
-            return Err(NativeProcessError::AdmissionContended(
+            return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
                     origin: NativeAdmissionOrigin::RecordKeyCollision,
                     binding,
@@ -2109,7 +2135,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     new_record: reference,
                     conflicting_owner: Some(owner.binding()),
                 },
-            ));
+            )));
         }
         let mut member = state
             .members
@@ -2133,7 +2159,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 matches!(receipt, OutstandingExitReceipt::Adopted { birth, control: expected }
                     if core::ptr::eq(expected.control(), control) && *birth != host_identity)
             }) {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
             for receipt in &mut pending.outstanding {
                 if let OutstandingExitReceipt::Pool {
@@ -2623,7 +2649,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .runtime
             .clone();
         if !core::ptr::eq(Arc::as_ptr(&runtime), parent) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let child_key = NativeExecutionKey {
             carrier: core::ptr::from_ref(parent.zone).addr(),
@@ -2691,7 +2717,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         address: AddressContext<RootGpa>,
         page: &'a ThreadLifecyclePage,
         control: &'a ThreadControlSlot,
-    ) -> Result<Arc<NativeProcessRuntime<'a, M, C>>, NativeProcessError> {
+    ) -> Result<Arc<NativeProcessRuntime<'a, M, C>>, NativeAdmissionError> {
         let binding = super::common_entry::execution_binding(current);
         let key = NativeExecutionKey::new(source.zone, binding, address)?;
         let visible_pid = current.visible_pid().ok_or(NativeProcessError::Stale)?;
@@ -2700,7 +2726,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             || current.metadata.control_slot.load(Ordering::Acquire)
                 != core::ptr::from_ref(control).addr() as u64
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let record = source
             .zone
@@ -2711,7 +2737,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         carrick_core::entry::prepare_handoff(binding, source, record)
             .ok_or(NativeProcessError::Stale)?;
         if control.zone_record() != Some(source.zone.record_ref(record)) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let (visible_tid, host_issued) = if let Some(entry) = control.entry() {
             let born = page.born_record(entry).ok_or(NativeProcessError::Stale)?;
@@ -2721,7 +2747,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 || identity.thread_serial != binding.thread_generation.raw()
                 || born.clone_flags & 0x0001_0000 == 0
             {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
             (identity.visible_tid, None)
         } else {
@@ -2741,7 +2767,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let group_key = Self::group_key(source.zone, address, page, visible_pid);
         let mut state = self.state.lock();
         if !page.gate().serves_ring() {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let (runtime, process) = state
             .groups
@@ -2751,7 +2777,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let record_key = Self::record_key(source.zone, source.zone.record_ref(record));
         if state.members.contains_key(&key) || state.records.contains_key(&record_key) {
             let owner = state.records.get(&record_key).copied().unwrap_or(key);
-            return Err(NativeProcessError::AdmissionContended(
+            return Err(NativeAdmissionError::Contended(Box::new(
                 NativeAdmissionContention {
                     origin: NativeAdmissionOrigin::ThreadRegistrationCollision,
                     binding,
@@ -2759,10 +2785,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     new_record: source.zone.record_ref(record),
                     conflicting_owner: Some(owner.binding()),
                 },
-            ));
+            )));
         }
         if !state.by_process.contains_key(&(key.carrier, process)) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let host_identity = member_host_identity(page, control)?;
         let process_members = &mut state
@@ -2781,7 +2807,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             } else {
                 let resources = row.native_mut().resources_mut();
                 if !core::ptr::eq(resources.page, page) {
-                    return Err(NativeProcessError::Stale);
+                    return Err(NativeProcessError::Stale.into());
                 }
                 let imported = resources
                     .members
@@ -2792,7 +2818,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                         || (member.record != source.zone.record_ref(record)
                             && signal_record_exists(source.zone, member.record))
                 }) {
-                    return Err(NativeProcessError::Stale);
+                    return Err(NativeProcessError::Stale.into());
                 }
                 imported.is_some()
             };
@@ -2806,13 +2832,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 let retained = retain_member_control(control)?;
                 let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
                     .map_err(|_| {
-                        NativeProcessError::AdmissionContended(NativeAdmissionContention {
+                        NativeAdmissionError::Contended(Box::new(NativeAdmissionContention {
                             origin: NativeAdmissionOrigin::ThreadPendingCustody,
                             binding,
                             old_record: None,
                             new_record: source.zone.record_ref(record),
                             conflicting_owner: Some(binding),
-                        })
+                        }))
                     })?;
                 Some((retained, pending))
             };
@@ -2852,7 +2878,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             // Commit. No contended or fallible acquisition follows the birth
             // consumption; a refusal above drops all provisional custody.
             if host_issued.is_some() && !page.release_adopted_host_birth(host_identity) {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
             if let Some(thread) = prepared_thread {
                 row.threads.threads.push(thread);
@@ -2992,7 +3018,7 @@ impl IssuedHostThread {
         record: carrick_sched_core::RecordId,
     ) -> Result<Self, NativeProcessError> {
         if !binding.issued() || control.entry().is_some() {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let key = NativeThreadIdentity::from_binding(binding)?
             .issued()
@@ -3008,11 +3034,11 @@ impl IssuedHostThread {
             || !(0..carrick_el1_abi::THREAD_POOL_ENTRIES)
                 .any(|index| page.host_birth_identity(index) == Some(birth))
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let record_ref = source.zone.record_ref(record);
         if control.zone_record() != Some(record_ref) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let identity = source.zone.record(record).identity();
         if identity.tid != binding.task.raw()
@@ -3022,7 +3048,7 @@ impl IssuedHostThread {
             || identity.lifecycle_page != core::ptr::from_ref(page).addr() as u64
             || identity.control_slot != core::ptr::from_ref(control).addr() as u64
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         Ok(Self {
             key,
@@ -3043,7 +3069,7 @@ impl IssuedHostThread {
     ) -> Result<bool, NativeProcessError> {
         let namespace_pid = row.metadata().namespace_pid;
         if self.visible_pid != namespace_pid || self.visible_tid == namespace_pid {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let resources = row.native().resources();
         if !core::ptr::eq(resources.page, page)
@@ -3053,7 +3079,7 @@ impl IssuedHostThread {
             || !resources.page.gate().serves_ring()
             || resources.page.live() <= 1
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         if let Some(existing) = resources
             .members
@@ -3065,7 +3091,7 @@ impl IssuedHostThread {
                 || (existing.record != self.record
                     && signal_record_exists(source.zone, existing.record))
             {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
             return Ok(true);
         }
@@ -3074,7 +3100,7 @@ impl IssuedHostThread {
         }) || resources.members.len() >= resources.page.live() as usize
             || row.credentials_for(self.visible_tid).is_ok()
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         Ok(false)
     }
@@ -3454,7 +3480,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             let control = owned_control(page, leader, address).ok_or(NativeProcessError::Stale)?;
             let record = control.zone_record().ok_or(NativeProcessError::Stale)?;
             if !signal_record_exists(zone, record) {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
             let retained = zone.record(record.id).identity();
             let visible = NonZeroU32::new(identity.visible_tid).ok_or(NativeProcessError::Stale)?;
@@ -3482,7 +3508,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     },
                 )
             {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
             members.push((
                 NativeMember {
@@ -3517,7 +3543,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         mm: M,
         address: AddressContext<RootGpa>,
         words: C,
-    ) -> Result<Self, NativeProcessError> {
+    ) -> Result<Self, NativeAdmissionError> {
         source.zone.mm_issuer().observe_existing(address.mm);
         // These fixtures hand-publish root identities without host issuance.
         // Account for those exact values in setup, never in production admission.
@@ -3563,7 +3589,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         mm: M,
         address: AddressContext<RootGpa>,
         words: C,
-    ) -> Result<Self, NativeProcessError> {
+    ) -> Result<Self, NativeAdmissionError> {
         let binding = super::common_entry::execution_binding(current);
         let record = source
             .zone
@@ -3585,7 +3611,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let key = host_admitted_process(id, control)?;
         let execution = NativeThreadIdentity::from_binding(binding)?;
         if execution.id() != id || execution.issued().is_none() {
-            return Err(NativeProcessError::Invalid);
+            return Err(NativeProcessError::Invalid.into());
         }
         if !words.authenticates(address)
             || address.mm.raw().get() != binding.mm.raw()
@@ -3594,7 +3620,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             || current.metadata.lifecycle_page.load(Ordering::Acquire) != identity.lifecycle_page
             || current.metadata.control_slot.load(Ordering::Acquire) != identity.control_slot
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let index = source
             .zone
@@ -3607,7 +3633,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .grant(index, binding.mm.raw())
             .is_none_or(|grant| B::root(grant.ttbr0).ok() != Some(address.root))
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let imported = Self::imported_members(
             source.zone,
@@ -3693,13 +3719,23 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         for member in &mut members {
             let pending = carrick_el1_abi::NativePendingCustody::try_admit(member.control.clone())
                 .map_err(|_| {
-                    NativeProcessError::AdmissionContended(NativeAdmissionContention {
+                    NativeAdmissionError::Contended(Box::new(NativeAdmissionContention {
                         origin: NativeAdmissionOrigin::FreshRootPendingCustody,
                         binding,
                         old_record: Some(member.record),
                         new_record: source.zone.record_ref(record),
-                        conflicting_owner: Some(binding),
-                    })
+                        conflicting_owner: Some(ExecutionBinding {
+                            task: carrick_core_abi::EntryTaskKey::from_raw(
+                                member.thread.id().raw() as u64,
+                            ),
+                            generation: member.thread.issued().map_or(
+                                carrick_core_abi::SnapshotGeneration::UNISSUED,
+                                |execution| execution.generation,
+                            ),
+                            thread_generation: member.expected_host.thread(),
+                            mm: binding.mm,
+                        }),
+                    }))
                 })?;
             member.signal_projection = Some(signals.project_member(member.record, pending));
         }
@@ -3772,7 +3808,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         #[cfg(not(target_arch = "x86_64"))]
         let uts = carrick_personality_linux::sysinfo::LinuxUtsname::carrick_aarch64();
         if !control.publish_visible_tid(visible.get()) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         for member in &owner
             .task(key)
@@ -3828,7 +3864,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         service: &'r mut S,
     ) -> Result<NativeProcessEntry<'r, 'a, M, C, S>, NativeProcessError> {
         if !core::ptr::eq(source.zone, self.zone) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let binding = super::common_entry::execution_binding(current);
         let record = source
@@ -3857,7 +3893,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .task_mut(key)
             .map_err(|_| NativeProcessError::Stale)?;
         if !words.authenticates(row.native().resources().address) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let control = owned_control(
             row.native().resources().page,
@@ -3874,7 +3910,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             || current.metadata.control_slot.load(Ordering::Acquire)
                 != resources.control as *const _ as u64
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let slot = Some(resources.control);
         let calling_tid = resources
@@ -3992,7 +4028,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: &C,
     ) -> Result<AuthenticatedProcessEntry<'a>, NativeProcessError> {
         if !core::ptr::eq(source.zone, self.zone) {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let binding = super::common_entry::execution_binding(current);
         let member_key = NativeExecutionKey::new(source.zone, binding, address)?;
@@ -4006,7 +4042,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         if !core::ptr::eq(Arc::as_ptr(&member.runtime), self)
             || !words.authenticates(member.address)
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let record = source
             .zone
@@ -4028,7 +4064,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 != core::ptr::from_ref(resources.page).addr() as u64
             || current.visible_pid() != Some(row.metadata().namespace_pid)
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let member_control = resources
             .members
@@ -4039,13 +4075,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         if current.metadata.control_slot.load(Ordering::Acquire)
             != member_control as *const _ as u64
         {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let record_ref = source.zone.record_ref(record);
         member_control.bind_zone_record(record_ref);
         if core::ptr::eq(member_control, resources.control) {
             if resources.record != record_ref {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
             *row.context_mut() = *words;
         }
@@ -5354,7 +5390,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     && core::ptr::eq(member.control.control(), self.control)
             }) || !signal_record_exists(zone, self.record)
             {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
             NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
             resources.interrupted_child_waits.insert(
@@ -5921,7 +5957,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         .begin();
         let Some(entry) = entry else {
             if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
             return Ok(LifecycleOutcome::HostCustody);
         };
@@ -5933,7 +5969,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 | carrick_core::lifecycle::MemberMembershipError::InFlight,
             )) => {
                 if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
-                    return Err(NativeProcessError::Stale);
+                    return Err(NativeProcessError::Stale.into());
                 }
                 return Ok(LifecycleOutcome::HostCustody);
             }
@@ -6692,7 +6728,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             >::admitted(identity)
             .begin();
             if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
-                return Err(NativeProcessError::Stale);
+                return Err(NativeProcessError::Stale.into());
             }
         }
 
@@ -7319,7 +7355,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(task) => task.native().resources(),
                 Err(_) => {
                     graph.owner.rollback_birth(&permit);
-                    return Err(NativeProcessError::Stale);
+                    return Err(NativeProcessError::Stale.into());
                 }
             };
             (
@@ -7405,7 +7441,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if let Err((_, p)) = self.service.abort_mm(prepared) {
                 self.service.quarantine_prepared(p)
             };
-            return Err(NativeProcessError::Stale);
+            return Err(NativeProcessError::Stale.into());
         }
         let lifecycle = self.service.child_lifecycle(&prepared);
         let page = lifecycle.page;
@@ -11490,7 +11526,11 @@ mod tests {
         ));
         assert!(matches!(
             registry.register_thread(source, &thread, address, &page, &leader_control),
-            Err(NativeProcessError::Stale)
+            Err(
+                crate::native_process_runtime::NativeAdmissionError::Failure(
+                    NativeProcessError::Stale
+                )
+            )
         ));
         registry
             .register_thread(source, &thread, address, &page, &thread_control)
@@ -11810,7 +11850,11 @@ mod tests {
         ));
         assert!(matches!(
             registry.register_thread(source, &thread, address, &page, &leader_control),
-            Err(NativeProcessError::Stale)
+            Err(
+                crate::native_process_runtime::NativeAdmissionError::Failure(
+                    NativeProcessError::Stale
+                )
+            )
         ));
         registry
             .register_thread(source, &thread, address, &page, &thread_control)
@@ -11950,7 +11994,14 @@ mod tests {
                 let retained = graph.owner.task(graph.root_key).unwrap().context();
                 assert_eq!(retained.native, native);
             } else {
-                assert!(matches!(admitted, Err(NativeProcessError::Stale)));
+                assert!(matches!(
+                    admitted,
+                    Err(
+                        crate::native_process_runtime::NativeAdmissionError::Failure(
+                            NativeProcessError::Stale
+                        )
+                    )
+                ));
             }
         }
     }
@@ -12030,7 +12081,11 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(NativeProcessError::Invalid)
+            Err(
+                crate::native_process_runtime::NativeAdmissionError::Failure(
+                    NativeProcessError::Invalid
+                )
+            )
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -12380,7 +12435,11 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(NativeProcessError::Invalid)
+            Err(
+                crate::native_process_runtime::NativeAdmissionError::Failure(
+                    NativeProcessError::Invalid
+                )
+            )
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -12500,7 +12559,11 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(NativeProcessError::Invalid)
+            Err(
+                crate::native_process_runtime::NativeAdmissionError::Failure(
+                    NativeProcessError::Invalid
+                )
+            )
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -12649,7 +12712,11 @@ mod tests {
                     address,
                     words(address),
                 ),
-                Err(NativeProcessError::Invalid)
+                Err(
+                    crate::native_process_runtime::NativeAdmissionError::Failure(
+                        NativeProcessError::Invalid
+                    )
+                )
             ));
             assert_eq!(page.live(), 2, "admission must not remove a live member");
             page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -12931,7 +12998,11 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(NativeProcessError::Invalid)
+            Err(
+                crate::native_process_runtime::NativeAdmissionError::Failure(
+                    NativeProcessError::Invalid
+                )
+            )
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -16350,7 +16421,11 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(NativeProcessError::Invalid)
+            Err(
+                crate::native_process_runtime::NativeAdmissionError::Failure(
+                    NativeProcessError::Invalid
+                )
+            )
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census

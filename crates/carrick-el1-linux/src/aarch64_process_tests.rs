@@ -1506,7 +1506,7 @@ impl Fixture {
         dispatch: impl FnOnce(
             &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
         ) -> R,
-    ) -> Result<R, NativeProcessError> {
+    ) -> Result<R, crate::native_process_runtime::NativeAdmissionError> {
         with_process_entry(
             BornInZoneSource {
                 zone: self.zone,
@@ -4919,7 +4919,10 @@ fn arm_call(
     control: &'static ThreadControlSlot,
     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
     frame: &mut carrick_el1_abi::TrapFrame,
-) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {
+) -> Result<
+    carrick_personality_linux::dispatch::CompletionRoute,
+    crate::native_process_runtime::NativeAdmissionError,
+> {
     arm_call_with_cpu(
         fixture,
         control,
@@ -4936,7 +4939,10 @@ fn arm_call_with_cpu<X: ForkStockCrossing>(
     service: &mut Aarch64NativeProcessService<'static, X>,
     frame: &mut carrick_el1_abi::TrapFrame,
     cpu: &mut crate::sched::FakeCpu,
-) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {
+) -> Result<
+    carrick_personality_linux::dispatch::CompletionRoute,
+    crate::native_process_runtime::NativeAdmissionError,
+> {
     carrick_test_support::assert_guest_args(&frame.x[..6]);
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
@@ -7455,7 +7461,11 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
                     ..Default::default()
                 }
             ),
-            Err(NativeProcessError::Stale)
+            Err(
+                crate::native_process_runtime::NativeAdmissionError::Failure(
+                    NativeProcessError::Stale
+                )
+            )
         ),
         "a Born sibling cannot register a group before its root owner exists"
     );
@@ -13907,4 +13917,92 @@ fn futex_owner_wait_episode(
         "one refusal, one mismatch, one enrollment compare"
     );
     registry().unregister_root_for_test(&runtime);
+}
+
+#[test]
+fn admission_fresh_root_pending_custody_reports_identity() {
+    use crate::native_process_runtime::{NativeAdmissionContention, NativeAdmissionOrigin};
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let member = std::sync::Arc::new(
+        carrick_core::lifecycle::MemberControlCustody::retain(fixture.control).unwrap(),
+    );
+    let writer = carrick_el1_abi::NativePendingCustody::try_admit(member).unwrap();
+    let record = fixture.zone.record_ref(
+        fixture
+            .zone
+            .slot(fixture.slot)
+            .current()
+            .or_else(|| fixture.zone.slot(fixture.slot).host_record())
+            .unwrap(),
+    );
+    let binding = crate::common_entry::execution_binding(&fixture.task);
+    let mut service = fixture.process_service();
+    assert_eq!(
+        fixture.enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| ()
+        ),
+        Err(
+            crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+                NativeAdmissionContention {
+                    origin: NativeAdmissionOrigin::FreshRootPendingCustody,
+                    binding,
+                    old_record: Some(record),
+                    new_record: record,
+                    conflicting_owner: Some(binding),
+                }
+            ))
+        ),
+    );
+    drop(writer);
+}
+
+#[test]
+fn admission_thread_pending_custody_reports_identity() {
+    use crate::native_process_runtime::{NativeAdmissionContention, NativeAdmissionOrigin};
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let control = host_born_sibling(fixture, 42);
+    let record = process_record_for_call(
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        },
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        control,
+    )
+    .unwrap();
+    let reference = fixture.zone.record_ref(record);
+    let binding = crate::common_entry::execution_binding(&fixture.task);
+    let member = std::sync::Arc::new(
+        carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap(),
+    );
+    let writer = carrick_el1_abi::NativePendingCustody::try_admit(member).unwrap();
+    assert_eq!(
+        fixture.enter(control, fixture_ttbr0(fixture), &mut service, |_| ()),
+        Err(
+            crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+                NativeAdmissionContention {
+                    origin: NativeAdmissionOrigin::ThreadPendingCustody,
+                    binding,
+                    old_record: None,
+                    new_record: reference,
+                    conflicting_owner: Some(binding),
+                }
+            ))
+        )
+    );
+    drop(writer);
 }

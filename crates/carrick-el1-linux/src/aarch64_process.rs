@@ -3,6 +3,7 @@
 //! Implements [`NativeProcessService`] for [`Aarch64ParkedContext`] over [`carrick_mmu_core::owner_mmu::Aarch64Mmu`].
 extern crate alloc;
 
+use super::native_process_runtime::NativeAdmissionError;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -567,7 +568,7 @@ pub fn admit_entry(
     record: RecordId,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
-) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
+) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeAdmissionError> {
     let (runtime, address) =
         admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
     let words = Aarch64ParkedContext::from_register(
@@ -589,7 +590,7 @@ fn admit_entry_runtime(
     record: RecordId,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
-) -> Result<(Arc<Runtime>, Mm), NativeProcessError> {
+) -> Result<(Arc<Runtime>, Mm), NativeAdmissionError> {
     // SAFETY: the EL1 caller owns the running slot and its record until the
     // process route returns to the vector.
     let observed = unsafe { observed_entry_address(source, task, ttbr0, record)? };
@@ -689,7 +690,7 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
             Aarch64NativeProcessService<'static, X>,
         >,
     ) -> R,
-) -> Result<R, NativeProcessError> {
+) -> Result<R, NativeAdmissionError> {
     let record = process_record_for_call(source, task, native, ttbr0, control)?;
     let _home = AdmissionHome {
         source,
@@ -750,7 +751,7 @@ pub(crate) fn deliver_declined_fault_signal_with<X: ForkStockCrossing, F>(
     service: &mut Aarch64NativeProcessService<'static, X>,
     far: u64,
     deliver: F,
-) -> Result<carrick_el1_abi::Action, NativeProcessError>
+) -> Result<carrick_el1_abi::Action, NativeAdmissionError>
 where
     F: FnOnce(
         &mut super::native_process_runtime::NativeProcessEntry<
@@ -793,7 +794,7 @@ where
                     },
                 )
                 .map_err(|_| NativeProcessError::Fault)?;
-            Ok(deliver(process))
+            Ok::<_, NativeProcessError>(deliver(process))
         },
     )??;
     if control
@@ -809,7 +810,7 @@ where
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => {
             Ok(carrick_el1_abi::Action::Idle)
         }
-        Some(_) => Err(NativeProcessError::Quarantined),
+        Some(_) => Err(NativeProcessError::Quarantined.into()),
     }
 }
 
