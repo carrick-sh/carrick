@@ -828,10 +828,13 @@ fn r2_jobs_start_the_compiler_cache_after_install_and_selection() {
         }) else {
             continue;
         };
+        // Every tool install goes through the pinned composite (#1873), which
+        // takes bare names; versions live once in its table.
         let install = position(&|s| {
-            s["with"]["tool"]
-                .as_str()
-                .is_some_and(|t| t.contains("sccache@"))
+            s["uses"].as_str() == Some("./.github/actions/install-tools")
+                && s["with"]["tools"]
+                    .as_str()
+                    .is_some_and(|t| t.split(',').any(|tool| tool.trim() == "sccache"))
         })
         .unwrap_or_else(|| panic!("{job:?}: no sccache install"));
         let starts: Vec<usize> = (0..steps.len())
