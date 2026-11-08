@@ -137,6 +137,13 @@ pub enum HostFileCall {
         times: u64,
         flags: u64,
     },
+    Renameat {
+        olddirfd: i32,
+        oldpath: u64,
+        newdirfd: i32,
+        newpath: u64,
+        flags: u64,
+    },
     Truncate {
         path: u64,
         length: u64,
@@ -268,6 +275,13 @@ impl HostFileCall {
                 path: args[1],
                 flags: args[2],
                 mode: args[3],
+            },
+            c if c == nr::RENAMEAT || c == nr::RENAMEAT2 => Self::Renameat {
+                olddirfd: fd,
+                oldpath: args[1],
+                newdirfd: args[2] as i32,
+                newpath: args[3],
+                flags: if c == nr::RENAMEAT { 0 } else { args[4] },
             },
             c if c == nr::TRUNCATE => Self::Truncate {
                 path: args[0],
@@ -755,6 +769,49 @@ fn stage_call(
                 len: LINUX_STAT_BYTES,
             },
         )?,
+        HostFileCall::Renameat {
+            olddirfd,
+            oldpath,
+            newdirfd,
+            newpath,
+            flags,
+        } => {
+            if flags
+                & !(carrick_syscall_abi::LINUX_RENAME_NOREPLACE
+                    | carrick_syscall_abi::LINUX_RENAME_EXCHANGE)
+                != 0
+                || flags
+                    == (carrick_syscall_abi::LINUX_RENAME_NOREPLACE
+                        | carrick_syscall_abi::LINUX_RENAME_EXCHANGE)
+            {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            let old = match copy_path(user, oldpath) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            let new = match copy_path(user, newpath) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            if old.is_empty() || new.is_empty() {
+                return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
+            }
+            if let Some(answer) = staging.path_base(olddirfd, &old)? {
+                return Some(answer);
+            }
+            if let Some(answer) = staging.path_base(newdirfd, &new)? {
+                return Some(answer);
+            }
+            staging.request(
+                HostFileOp::Renameat,
+                LINUX_AT_FDCWD,
+                flags as u32,
+                [0; 4],
+                &path_pair(&old, &new),
+                None,
+            )
+        }
         HostFileCall::Truncate { path, length } => {
             if (length as i64) < 0 {
                 return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
