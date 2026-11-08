@@ -543,7 +543,7 @@ impl SyscallDispatcher {
                     Some(reference) => self.native_map_reference(reference),
                     None => Served::Refused,
                 },
-                HostFileOp::Write => match file.retain_io() {
+                HostFileOp::Write | HostFileOp::SetFdTimes => match file.retain_io() {
                     Some(lease) => {
                         self.serve_native_open_file(header, lease.description(), input, capacity)
                     }
@@ -559,6 +559,11 @@ impl SyscallDispatcher {
     /// stdio descriptors run.
     fn serve_native_stdio(&self, header: HostFileHeader, fd: i32, input: &[u8]) -> Served {
         match header.op {
+            HostFileOp::SetFdTimes => match self.native_times(header) {
+                Some([None, None]) => Served::value(0),
+                Some(_) => Served::errno(carrick_abi::LINUX_EBADF),
+                None => Served::errno(carrick_abi::LINUX_EINVAL),
+            },
             HostFileOp::Write => match fd {
                 1 | 2 => Served::value(outcome_result(self.fs_view().write_stdio_sink(fd, input))),
                 // Writing the run's stdin stream is not served yet.
@@ -583,6 +588,21 @@ impl SyscallDispatcher {
         capacity: usize,
     ) -> Served {
         match header.op {
+            HostFileOp::SetFdTimes => {
+                let Some([atime, mtime]) = self.native_times(header) else {
+                    return Served::errno(carrick_abi::LINUX_EINVAL);
+                };
+                if atime.is_none() && mtime.is_none() {
+                    return Served::value(0);
+                }
+                served_mutation(self.fs_view().set_description_times(
+                    None,
+                    description,
+                    super::Fd(header.fd),
+                    atime,
+                    mtime,
+                ))
+            }
             HostFileOp::Fstat | HostFileOp::Statx => {
                 match self.fs_view().description_stat_record(description, None) {
                     Ok(record) => Served::Reply(0, native_stat_bytes(header.op, &record)),
@@ -620,6 +640,7 @@ impl SyscallDispatcher {
             | HostFileOp::Unlinkat
             | HostFileOp::Symlinkat
             | HostFileOp::Linkat
+            | HostFileOp::Utimensat
             | HostFileOp::Poll => Served::Refused,
         }
     }
@@ -634,6 +655,18 @@ impl SyscallDispatcher {
     ) -> Served {
         let fs = self.fs_view();
         match header.op {
+            HostFileOp::Utimensat => {
+                let Some([atime, mtime]) = self.native_times(header) else {
+                    return Served::errno(carrick_abi::LINUX_EINVAL);
+                };
+                let flags = header.flags & !carrick_core_abi::host_file::UTIMENS_NULL_TIMES;
+                match fs.set_path_times(None, LINUX_AT_FDCWD, path, atime, mtime, u64::from(flags))
+                {
+                    Ok(outcome) => served_mutation(outcome),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::Linkat => {
                 let Some((old, new)) = native_path_pair(path) else {
                     return Served::Refused;
@@ -766,6 +799,37 @@ impl SyscallDispatcher {
             }
             _ => Served::Refused,
         }
+    }
+
+    fn native_times(&self, header: HostFileHeader) -> Option<[Option<(i64, i64)>; 2]> {
+        let null_times = header.flags & carrick_core_abi::host_file::UTIMENS_NULL_TIMES != 0;
+        let flags = header.flags & !carrick_core_abi::host_file::UTIMENS_NULL_TIMES;
+        if u64::from(flags) & !carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+            return None;
+        }
+        let clock = self.container();
+        if null_times {
+            let now = super::format_time::now_realtime_timespec(clock.clock());
+            return Some([Some(now); 2]);
+        }
+        let [asec, ansec, msec, mnsec] = header.args;
+        let times = [
+            carrick_abi::LinuxTimespec {
+                tv_sec: asec as i64,
+                tv_nsec: ansec as i64,
+            },
+            carrick_abi::LinuxTimespec {
+                tv_sec: msec as i64,
+                tv_nsec: mnsec as i64,
+            },
+        ];
+        if !times
+            .into_iter()
+            .all(super::format_time::linux_utimensat_timespec_is_valid)
+        {
+            return None;
+        }
+        Some(times.map(|time| super::format_time::resolve_utimensat_timespec(clock.clock(), time)))
     }
 
     /// Retain a carrier-opened regular file as a private-mapping byte source.
