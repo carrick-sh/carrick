@@ -507,7 +507,7 @@ pub unsafe fn read_with(
     cache_base: *const u8,
     buf_va: u64,
     count: usize,
-    user: &mut impl UserCopy,
+    user: &mut impl carrick_core::user_copy::UserCopy,
 ) -> Result<i64, FileError> {
     let (file, open) = (zf.inode, zf.open);
     let flags = open.flags.load(Ordering::Acquire);
@@ -523,8 +523,10 @@ pub unsafe fn read_with(
     if src.is_empty() {
         return Ok(0);
     }
-    if !user.copy_out(buf_va, src) {
-        return Err(FileError::Forward);
+    match user.copy_out(carrick_guest_arch::UserVa::new(buf_va), src) {
+        carrick_core::user_copy::CopyOutcome::Done => {}
+        carrick_core::user_copy::CopyOutcome::NotYet(_)
+        | carrick_core::user_copy::CopyOutcome::Fault => return Err(FileError::Forward),
     }
     open.offset
         .store(cur_off + src.len() as u64, Ordering::Release);
@@ -542,7 +544,7 @@ pub unsafe fn pread64_with(
     buf_va: u64,
     count: usize,
     offset: i64,
-    user: &mut impl UserCopy,
+    user: &mut impl carrick_core::user_copy::UserCopy,
 ) -> Result<i64, FileError> {
     let (file, open) = (zf.inode, zf.open);
     if offset < 0 {
@@ -560,8 +562,10 @@ pub unsafe fn pread64_with(
     if src.is_empty() {
         return Ok(0);
     }
-    if !user.copy_out(buf_va, src) {
-        return Err(FileError::Forward);
+    match user.copy_out(carrick_guest_arch::UserVa::new(buf_va), src) {
+        carrick_core::user_copy::CopyOutcome::Done => {}
+        carrick_core::user_copy::CopyOutcome::NotYet(_)
+        | carrick_core::user_copy::CopyOutcome::Fault => return Err(FileError::Forward),
     }
     Ok(src.len() as i64)
 }
@@ -607,7 +611,7 @@ pub unsafe fn store_with(
     cache_base: *mut u8,
     at: StoreAt,
     count: usize,
-    fill: impl FnOnce(&mut [u8]) -> bool,
+    fill: impl FnOnce(&mut [u8]) -> carrick_core::user_copy::CopyOutcome,
 ) -> Result<u64, FileError> {
     let start = match at {
         StoreAt::Offset(offset) => offset,
@@ -638,12 +642,14 @@ unsafe fn store_at(
     cache_base: *mut u8,
     at: u64,
     count: usize,
-    fill: impl FnOnce(&mut [u8]) -> bool,
+    fill: impl FnOnce(&mut [u8]) -> carrick_core::user_copy::CopyOutcome,
 ) -> Result<u64, FileError> {
     // SAFETY: [at, at + count) lies inside the slot (checked by the caller).
     let dst = unsafe { core::slice::from_raw_parts_mut(cache_base.add(at as usize), count) };
-    if !fill(dst) {
-        return Err(FileError::Forward);
+    match fill(dst) {
+        carrick_core::user_copy::CopyOutcome::Done => {}
+        carrick_core::user_copy::CopyOutcome::NotYet(_)
+        | carrick_core::user_copy::CopyOutcome::Fault => return Err(FileError::Forward),
     }
     let delivered_end = at + count as u64;
     let old_size = file.size.load(Ordering::Acquire);
@@ -675,7 +681,7 @@ pub unsafe fn write_with(
     cache_base: *mut u8,
     buf_va: u64,
     count: usize,
-    user: &mut impl UserCopy,
+    user: &mut impl carrick_core::user_copy::UserCopy,
 ) -> Result<i64, FileError> {
     let (file, open) = (zf.inode, zf.open);
     let flags = open.flags.load(Ordering::Acquire);
@@ -698,7 +704,7 @@ pub unsafe fn write_with(
     // SAFETY: bounds checked above; the caller holds the lock.
     let delivered_end = unsafe {
         store_at(file, cache_base, cur_off, count, |dst| {
-            user.copy_in(dst, buf_va)
+            user.copy_in(dst, carrick_guest_arch::UserVa::new(buf_va))
         })?
     };
     open.offset.store(delivered_end, Ordering::Release);
@@ -716,7 +722,7 @@ pub unsafe fn pwrite64_with(
     buf_va: u64,
     count: usize,
     offset: i64,
-    user: &mut impl UserCopy,
+    user: &mut impl carrick_core::user_copy::UserCopy,
 ) -> Result<i64, FileError> {
     let (file, open) = (zf.inode, zf.open);
     if offset < 0 {
@@ -739,7 +745,7 @@ pub unsafe fn pwrite64_with(
     // SAFETY: bounds checked above; the caller holds the lock.
     unsafe {
         store_at(file, cache_base, off, count, |dst| {
-            user.copy_in(dst, buf_va)
+            user.copy_in(dst, carrick_guest_arch::UserVa::new(buf_va))
         })?
     };
     Ok(count as i64)

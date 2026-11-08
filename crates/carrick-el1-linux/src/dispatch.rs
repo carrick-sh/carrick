@@ -4195,7 +4195,7 @@ pub unsafe fn serve_locked_file_op(
     nr: usize,
     args: [u64; 3],
     cache_ptr: *mut u8,
-    user: &mut impl file::UserCopy,
+    user: &mut impl carrick_core::user_copy::UserCopy,
     locks: &impl InstanceLockPolicy,
 ) -> Result<i64, Action> {
     let event = match nr {

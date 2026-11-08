@@ -51,7 +51,7 @@ pub unsafe fn read_with(
     cache_base: *const u8,
     buf_va: u64,
     count: usize,
-    user: &mut impl UserCopy,
+    user: &mut impl carrick_core::user_copy::UserCopy,
 ) -> Result<i64, Action> {
     // SAFETY: forwarded unchanged from the caller's contract.
     linux_result(unsafe { core_file::read_with(zf, cache_base, buf_va, count, user) })
@@ -66,7 +66,7 @@ pub unsafe fn pread64_with(
     buf_va: u64,
     count: usize,
     offset: i64,
-    user: &mut impl UserCopy,
+    user: &mut impl carrick_core::user_copy::UserCopy,
 ) -> Result<i64, Action> {
     // SAFETY: forwarded unchanged from the caller's contract.
     linux_result(unsafe { core_file::pread64_with(zf, cache_base, buf_va, count, offset, user) })
@@ -80,7 +80,7 @@ pub unsafe fn write_with(
     cache_base: *mut u8,
     buf_va: u64,
     count: usize,
-    user: &mut impl UserCopy,
+    user: &mut impl carrick_core::user_copy::UserCopy,
 ) -> Result<i64, Action> {
     // SAFETY: forwarded unchanged from the caller's contract.
     linux_result(unsafe { core_file::write_with(zf, cache_base, buf_va, count, user) })
@@ -95,7 +95,7 @@ pub unsafe fn pwrite64_with(
     buf_va: u64,
     count: usize,
     offset: i64,
-    user: &mut impl UserCopy,
+    user: &mut impl carrick_core::user_copy::UserCopy,
 ) -> Result<i64, Action> {
     // SAFETY: forwarded unchanged from the caller's contract.
     linux_result(unsafe { core_file::pwrite64_with(zf, cache_base, buf_va, count, offset, user) })

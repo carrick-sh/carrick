@@ -1344,7 +1344,7 @@ impl<'a> FsView<'a> {
         address: u64,
         length: usize,
         nonblocking: bool,
-        task: Option<TaskRead<'_>>,
+        mut task: Option<TaskRead<'_>>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
             return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -1371,6 +1371,25 @@ impl<'a> FsView<'a> {
             iov_base: address,
             iov_len: length as u64,
         }];
+        if matches!(
+            &*open,
+            OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. }
+        ) && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
+        {
+            let Some(ref mut task) = task else {
+                return Err(super::carrier_buffer_is_not_owner_memory());
+            };
+            if let Some(lease) = task.read_lease.take() {
+                drop(open);
+                return super::pipe::OwnedPipeRead::new_description(
+                    task.kernel,
+                    Arc::clone(description),
+                    lease,
+                    destination.to_vec(),
+                )
+                .resume(task.kernel, memory);
+            }
+        }
         if let OpenDescription::File {
             contents, offset, ..
         } = &mut *open
@@ -3060,7 +3079,12 @@ impl<'a> FsView<'a> {
                 )?;
             }
             let _read_lease = if open_file.description.inspect_kind(|open| matches!(
-                open, OpenDescription::PipeReader { .. } | OpenDescription::EventFd { .. }
+                open,
+                OpenDescription::PipeReader { .. }
+                    | OpenDescription::EventFd { .. }
+                    | OpenDescription::File { .. }
+                    | OpenDescription::InMemoryFile { .. }
+                    | OpenDescription::SyntheticFile { .. }
             )) == Some(true) {
                 let Some(lease) = files.retain_slot_lease(slot_authority) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -3337,6 +3361,23 @@ impl<'a> FsView<'a> {
                     return super::pipe::OwnedPipeRead::new(
                         cx.kernel, pipe, read_lease, iovecs, flags, authority,
                     ).resume(cx.kernel, memory);
+                }
+                OpenDescription::File { .. }
+                | OpenDescription::InMemoryFile { .. }
+                | OpenDescription::SyntheticFile { .. }
+                    if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner =>
+                {
+                    drop(open);
+                    let Some(read_lease) = open_file.description.retain_fd_lease() else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    return super::pipe::OwnedPipeRead::new_description(
+                        cx.kernel,
+                        Arc::clone(&open_file.description),
+                        read_lease,
+                        iovecs,
+                    )
+                    .resume(cx.kernel, memory);
                 }
                 _ => {}
             }

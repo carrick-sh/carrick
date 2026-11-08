@@ -1853,40 +1853,106 @@ struct HostUserCopy<'m, M: carrick_guest_mem::CurrentMmMemory> {
 }
 
 impl<M: carrick_guest_mem::CurrentMmMemory> HostUserCopy<'_, M> {
-    /// Land the copies out, with no lock held. False: the guest unmapped or
-    /// protected a destination since it was validated (the operation then
-    /// fails with `EFAULT`, as a concurrent unmap mid-copy does on Linux).
-    fn finish(self) -> bool {
-        let mut landed = true;
+    /// Land the copies out, with no lock held. A destination unmapped or
+    /// write-protected since validation classifies as `Fault` (`EFAULT`).
+    fn finish(self) -> carrick_core::user_copy::CopyOutcome {
+        use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
+        use carrick_core::personality::{Access, GuestLen, UserVa};
+        use carrick_guest_mem::MemoryError;
+        let mut outcome = CopyOutcome::Done;
         for (dst_va, bytes) in self.pending {
-            landed &= self.memory.write_bytes(dst_va, &bytes).is_ok();
+            match self.memory.write_bytes(dst_va, &bytes) {
+                Ok(()) => {}
+                Err(MemoryError::OwnerWait(_))
+                | Err(MemoryError::Physical(_))
+                | Err(MemoryError::Supply(_))
+                | Err(MemoryError::ReadSuspended(_)) => {
+                    if matches!(outcome, CopyOutcome::Done) {
+                        outcome = CopyOutcome::NotYet(GuestCopyRequest {
+                            address: UserVa::new(dst_va),
+                            len: GuestLen::new(bytes.len() as u64),
+                            access: Access::Write,
+                        });
+                    }
+                }
+                Err(MemoryError::OutOfBounds { .. })
+                | Err(MemoryError::HostMap(_))
+                | Err(MemoryError::OwnerRetired(_))
+                | Err(MemoryError::MetadataAllocation)
+                | Err(MemoryError::Unsupported) => {
+                    outcome = CopyOutcome::Fault;
+                }
+            }
         }
-        landed
+        outcome
     }
 }
 
-impl<M: carrick_guest_mem::CurrentMmMemory> carrick_el1::substrate::file::UserCopy
+impl<M: carrick_guest_mem::CurrentMmMemory> carrick_core::user_copy::UserCopy
     for HostUserCopy<'_, M>
 {
-    fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
-        if src.is_empty() {
-            return true;
-        }
-        if !self.memory.guest_range_is_writable(dst_va, src.len()) {
-            return false;
-        }
-        self.pending.push((dst_va, src.to_vec()));
-        true
-    }
-
-    fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool {
-        match self.memory.read_bytes(src_va, dst.len()) {
+    fn copy_in(
+        &mut self,
+        dst: &mut [u8],
+        src: carrick_core::personality::UserVa,
+    ) -> carrick_core::user_copy::CopyOutcome {
+        use carrick_core::personality::{Access, GuestLen};
+        use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
+        use carrick_guest_mem::MemoryError;
+        match self.memory.read_bytes(src.raw(), dst.len()) {
             Ok(bytes) if bytes.len() == dst.len() => {
                 dst.copy_from_slice(&bytes);
-                true
+                CopyOutcome::Done
             }
-            _ => false,
+            Ok(_) => CopyOutcome::Fault,
+            Err(MemoryError::OwnerWait(_))
+            | Err(MemoryError::Physical(_))
+            | Err(MemoryError::Supply(_))
+            | Err(MemoryError::ReadSuspended(_)) => CopyOutcome::NotYet(GuestCopyRequest {
+                address: src,
+                len: GuestLen::new(dst.len() as u64),
+                access: Access::Read,
+            }),
+            Err(MemoryError::OutOfBounds { .. })
+            | Err(MemoryError::HostMap(_))
+            | Err(MemoryError::OwnerRetired(_))
+            | Err(MemoryError::MetadataAllocation)
+            | Err(MemoryError::Unsupported) => CopyOutcome::Fault,
         }
+    }
+
+    fn copy_out(
+        &mut self,
+        dst: carrick_core::personality::UserVa,
+        src: &[u8],
+    ) -> carrick_core::user_copy::CopyOutcome {
+        use carrick_core::user_copy::CopyOutcome;
+        if src.is_empty() {
+            return CopyOutcome::Done;
+        }
+        if !self.memory.guest_range_is_writable(dst.raw(), src.len()) {
+            return CopyOutcome::Fault;
+        }
+        self.pending.push((dst.raw(), src.to_vec()));
+        CopyOutcome::Done
+    }
+
+    fn atomic_load_u32(
+        &mut self,
+        _address: carrick_core::personality::UserVa,
+        _value: &mut u32,
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::Fault
+    }
+
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        _address: carrick_core::personality::UserVa,
+        _expected: u32,
+        _desired: u32,
+        _observed: &mut u32,
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::Fault
     }
 }
 
@@ -1899,18 +1965,52 @@ struct HostPreparedRead {
     pending: Option<Vec<u8>>,
 }
 
-impl carrick_el1::substrate::file::UserCopy for HostPreparedRead {
-    fn copy_out(&mut self, destination: u64, source: &[u8]) -> bool {
-        if destination != self.destination || source.len() > self.capacity || self.pending.is_some()
-        {
-            return false;
-        }
-        self.pending = Some(source.to_vec());
-        true
+impl carrick_core::user_copy::UserCopy for HostPreparedRead {
+    fn copy_in(
+        &mut self,
+        _destination: &mut [u8],
+        _source: carrick_core::personality::UserVa,
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::Fault
     }
 
-    fn copy_in(&mut self, _destination: &mut [u8], _source: u64) -> bool {
-        false
+    fn copy_out(
+        &mut self,
+        destination: carrick_core::personality::UserVa,
+        source: &[u8],
+    ) -> carrick_core::user_copy::CopyOutcome {
+        use carrick_core::personality::{Access, GuestLen};
+        use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
+        if destination.raw() != self.destination
+            || source.len() > self.capacity
+            || self.pending.is_some()
+        {
+            return CopyOutcome::NotYet(GuestCopyRequest {
+                address: destination,
+                len: GuestLen::new(source.len() as u64),
+                access: Access::Write,
+            });
+        }
+        self.pending = Some(source.to_vec());
+        CopyOutcome::Done
+    }
+
+    fn atomic_load_u32(
+        &mut self,
+        _address: carrick_core::personality::UserVa,
+        _value: &mut u32,
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::Fault
+    }
+
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        _address: carrick_core::personality::UserVa,
+        _expected: u32,
+        _desired: u32,
+        _observed: &mut u32,
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::Fault
     }
 }
 
@@ -2216,11 +2316,15 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
     // The host is already at its boundary: deliver what a write owed now.
     crate::el1_inotify::deliver_owed_wakes();
     let value = result.ok()?;
-    if !landed {
-        HOST_SERVED.fetch_add(1, Ordering::Relaxed);
-        return Some(crate::dispatch::DispatchOutcome::errno(
-            carrick_abi::LINUX_EFAULT,
-        ));
+    match landed {
+        carrick_core::user_copy::CopyOutcome::Done => {}
+        carrick_core::user_copy::CopyOutcome::NotYet(_)
+        | carrick_core::user_copy::CopyOutcome::Fault => {
+            HOST_SERVED.fetch_add(1, Ordering::Relaxed);
+            return Some(crate::dispatch::DispatchOutcome::errno(
+                carrick_abi::LINUX_EFAULT,
+            ));
+        }
     }
     HOST_SERVED.fetch_add(1, Ordering::Relaxed);
     Some(match carrick_abi::LinuxErrno::from_guest_retval(value) {

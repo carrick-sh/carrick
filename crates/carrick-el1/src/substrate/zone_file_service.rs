@@ -571,7 +571,7 @@ impl<V: ZoneFileVenue, S: ZonePinStorage + ?Sized> FileService for ZoneFileServi
                 unsafe {
                     file::store_with(zf.inode, cache, at, src.len(), |dst| {
                         dst.copy_from_slice(src);
-                        true
+                        carrick_core::user_copy::CopyOutcome::Done
                     })
                 }
                 .map_err(io_error)?;

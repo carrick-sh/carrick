@@ -51,7 +51,6 @@
   "error-collapse:crates/carrick-kernel/src/dispatch/signal.rs": 5,
   "error-collapse:crates/carrick-kernel/src/dispatch/sysv.rs": 10,
   "error-collapse:crates/carrick-kernel/src/dispatch/time.rs": 3,
-  "error-collapse:crates/carrick-kernel/src/el1_delegation.rs": 2,
   "error-collapse:crates/carrick-kernel/src/kernel/continuation/ipc.rs": 2,
   "error-collapse:crates/carrick-personality-linux/src/arch_prctl.rs": 2,
   "error-collapse:crates/carrick-x86/src/bringup_fns.rs": 6,

@@ -672,10 +672,21 @@ pub(crate) fn read_pipe<M: CurrentMmMemory>(
     DispatchOutcome::returned_len_or_errno(count)
 }
 
+enum OwnedReadSource {
+    Pipe {
+        pipe: PipeRef,
+        flags: u64,
+        authority: super::WaitFdAuthority,
+    },
+    Description {
+        description: Arc<crate::kernel::FileDescription>,
+    },
+}
+
 /// A vector read keeps its exact endpoint and completed iovec cursor while
 /// owner memory is unavailable. No pipe lock or destination permit is parked.
 pub struct OwnedPipeRead {
-    pipe: PipeRef,
+    source: OwnedReadSource,
     _lease: crate::kernel::objects::FileDescriptionFdLease,
     thread: crate::kernel::ThreadKey,
     mm: crate::kernel::MmId,
@@ -683,8 +694,6 @@ pub struct OwnedPipeRead {
     index: usize,
     offset: usize,
     total: i64,
-    flags: u64,
-    authority: super::WaitFdAuthority,
 }
 
 /// Only a refused operation carries a memory dependency. Readiness waits keep
@@ -720,17 +729,110 @@ impl std::fmt::Debug for OwnedPipeRead {
 }
 impl PartialEq for OwnedPipeRead {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.pipe, &other.pipe)
+        let same_source = match (&self.source, &other.source) {
+            (
+                OwnedReadSource::Pipe {
+                    pipe: a, flags: fa, ..
+                },
+                OwnedReadSource::Pipe {
+                    pipe: b, flags: fb, ..
+                },
+            ) => Arc::ptr_eq(a, b) && fa == fb,
+            (
+                OwnedReadSource::Description { description: a },
+                OwnedReadSource::Description { description: b },
+            ) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        same_source
             && self.thread == other.thread
             && self.mm == other.mm
             && self.index == other.index
             && self.offset == other.offset
             && self.total == other.total
             && self.iovecs == other.iovecs
-            && self.flags == other.flags
     }
 }
 impl Eq for OwnedPipeRead {}
+
+fn read_description_chunk(
+    context: &crate::kernel::KernelContext,
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    length: usize,
+    description: &Arc<crate::kernel::FileDescription>,
+) -> DispatchOutcome {
+    if length == 0 {
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    let step = (4096 - (address as usize & 4095)).min(length);
+    let chunk = {
+        let Some(open) = crate::kernel::FileDescription::read_for_io(description) else {
+            return DispatchOutcome::errno(carrick_abi::LINUX_EBADF);
+        };
+        match &*open {
+            crate::dispatch::OpenDescription::File {
+                contents, offset, ..
+            } => {
+                let mut buf = vec![0u8; step];
+                match contents.read_at(*offset as u64, &mut buf) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        buf
+                    }
+                    Err(errno) => return DispatchOutcome::errno(errno),
+                }
+            }
+            crate::dispatch::OpenDescription::InMemoryFile {
+                contents, offset, ..
+            } => {
+                let data = contents.read();
+                data.read_range(*offset, step).to_vec()
+            }
+            crate::dispatch::OpenDescription::SyntheticFile {
+                contents, offset, ..
+            } => {
+                let avail = contents.get(*offset..).unwrap_or(&[]);
+                avail[..avail.len().min(step)].to_vec()
+            }
+            _ => return DispatchOutcome::errno(carrick_abi::LINUX_EBADF),
+        }
+    };
+    if chunk.is_empty() {
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    let out = match crate::dispatch::copyout::prepare_array(
+        context,
+        memory,
+        carrick_guest_mem::GuestVa::new(address),
+        chunk.len(),
+        1,
+    ) {
+        Ok(out) => out,
+        Err(refusal) => return refusal.into_outcome(),
+    };
+    let count = out.records();
+    if count == 0 {
+        return DispatchOutcome::errno(LINUX_EFAULT);
+    }
+    let (result, effect) = out.commit_retaining(&chunk[..count]);
+    if let Err(fault) = result {
+        return fault.outcome();
+    }
+    if let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) {
+        match &mut *open {
+            crate::dispatch::OpenDescription::File { offset, .. }
+            | crate::dispatch::OpenDescription::InMemoryFile { offset, .. }
+            | crate::dispatch::OpenDescription::SyntheticFile { offset, .. } => {
+                *offset += count;
+            }
+            _ => {}
+        }
+    }
+    drop(effect);
+    DispatchOutcome::returned_len_or_errno(count)
+}
+
 impl OwnedPipeRead {
     pub(crate) fn new(
         context: &crate::kernel::KernelContext,
@@ -741,7 +843,11 @@ impl OwnedPipeRead {
         authority: super::WaitFdAuthority,
     ) -> Self {
         Self {
-            pipe,
+            source: OwnedReadSource::Pipe {
+                pipe,
+                flags,
+                authority,
+            },
             _lease: lease,
             thread: context.thread().key(),
             mm: context.shared().mm().id(),
@@ -749,13 +855,33 @@ impl OwnedPipeRead {
             index: 0,
             offset: 0,
             total: 0,
-            flags,
-            authority,
+        }
+    }
+    pub(crate) fn new_description(
+        context: &crate::kernel::KernelContext,
+        description: Arc<crate::kernel::FileDescription>,
+        lease: crate::kernel::objects::FileDescriptionFdLease,
+        iovecs: Vec<carrick_abi::LinuxIovec>,
+    ) -> Self {
+        Self {
+            source: OwnedReadSource::Description { description },
+            _lease: lease,
+            thread: context.thread().key(),
+            mm: context.shared().mm().id(),
+            iovecs,
+            index: 0,
+            offset: 0,
+            total: 0,
         }
     }
     pub(crate) fn source_ready(&self) -> bool {
-        let snapshot = self.pipe.snapshot();
-        snapshot.unread != 0 || snapshot.writers == 0
+        match &self.source {
+            OwnedReadSource::Pipe { pipe, .. } => {
+                let snapshot = pipe.snapshot();
+                snapshot.unread != 0 || snapshot.writers == 0
+            }
+            OwnedReadSource::Description { .. } => true,
+        }
     }
     pub fn resume(
         mut self,
@@ -775,23 +901,42 @@ impl OwnedPipeRead {
                 self.index += 1;
                 continue;
             }
-            if self.total > 0 && self.pipe.snapshot().unread == 0 {
+            if let OwnedReadSource::Pipe { pipe, .. } = &self.source
+                && self.total > 0
+                && pipe.snapshot().unread == 0
+            {
                 break;
             }
             let address = iov
                 .iov_base
                 .checked_add(self.offset as u64)
                 .ok_or(super::DispatchError::Errno(LINUX_EFAULT))?;
-            let requested = (length - self.offset).min(crate::dispatch::copyout::COPYOUT_MAX_BYTES);
-            let outcome = read_pipe(
-                context,
-                memory,
-                address,
-                requested,
-                &self.pipe,
-                self.flags,
-                self.authority.clone(),
-            );
+            let (requested, outcome) = match &self.source {
+                OwnedReadSource::Pipe {
+                    pipe,
+                    flags,
+                    authority,
+                } => {
+                    let requested =
+                        (length - self.offset).min(crate::dispatch::copyout::COPYOUT_MAX_BYTES);
+                    let outcome = read_pipe(
+                        context,
+                        memory,
+                        address,
+                        requested,
+                        pipe,
+                        *flags,
+                        authority.clone(),
+                    );
+                    (requested, outcome)
+                }
+                OwnedReadSource::Description { description } => {
+                    let requested = (length - self.offset).min(4096 - (address as usize & 4095));
+                    let outcome =
+                        read_description_chunk(context, memory, address, requested, description);
+                    (requested, outcome)
+                }
+            };
             let wait = match outcome {
                 DispatchOutcome::Returned { value } => {
                     self.total += value;
