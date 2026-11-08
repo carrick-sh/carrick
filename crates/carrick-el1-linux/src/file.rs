@@ -186,22 +186,18 @@ pub(crate) struct CopyDiagnostic<'a> {
 impl CopyDiagnostic<'_> {
     pub fn record(
         &self,
-        address: u64,
-        len: usize,
-        write: bool,
+        address: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+        access: carrick_guest_arch::Access,
         reason: carrick_el1_abi::CopyRefusalReason,
     ) {
         self.counters
             .record_copy_refusal(carrick_el1_abi::CopyRefusal {
                 ordinal: self.ordinal,
-                address: carrick_guest_arch::UserVa::new(address),
-                len: carrick_guest_arch::GuestLen::new(len as u64),
-                argument: self.arguments.iter().position(|&arg| arg == address),
-                access: if write {
-                    carrick_guest_arch::Access::Write
-                } else {
-                    carrick_guest_arch::Access::Read
-                },
+                address,
+                len,
+                argument: self.arguments.iter().position(|&arg| arg == address.raw()),
+                access,
                 reason,
                 owner_present: self.presented.is_some(),
                 presented: self.presented,
@@ -210,12 +206,12 @@ impl CopyDiagnostic<'_> {
     }
     pub(crate) fn record_copy_failure(
         &self,
-        address: u64,
-        len: usize,
-        write: bool,
+        address: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+        access: carrick_guest_arch::Access,
         reason: carrick_el1_abi::CopyRefusalReason,
     ) {
-        self.record(address, len, write, reason);
+        self.record(address, len, access, reason);
         // Owner authentication is a separate refusal, never a replacement for
         // the validator/guarded-copy result recorded above.
         let reason = if self.presented.is_none() {
@@ -226,7 +222,7 @@ impl CopyDiagnostic<'_> {
             None
         };
         if let Some(reason) = reason {
-            self.record(address, len, write, reason);
+            self.record(address, len, access, reason);
         }
     }
 }
@@ -242,8 +238,12 @@ impl<V: MemoryValidator> UserCopy for DiagnosedCopy<'_, V> {
         match self.inner.copy_in_diagnosed(dst, address) {
             Ok(()) => true,
             Err(reason) => {
-                self.diagnostic
-                    .record_copy_failure(address, dst.len(), false, reason);
+                self.diagnostic.record_copy_failure(
+                    carrick_guest_arch::UserVa::new(address),
+                    carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                    carrick_guest_arch::Access::Read,
+                    reason,
+                );
                 false
             }
         }
@@ -252,8 +252,12 @@ impl<V: MemoryValidator> UserCopy for DiagnosedCopy<'_, V> {
         match self.inner.copy_out_diagnosed(address, bytes) {
             Ok(()) => true,
             Err(reason) => {
-                self.diagnostic
-                    .record_copy_failure(address, bytes.len(), true, reason);
+                self.diagnostic.record_copy_failure(
+                    carrick_guest_arch::UserVa::new(address),
+                    carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                    carrick_guest_arch::Access::Write,
+                    reason,
+                );
                 false
             }
         }
