@@ -249,6 +249,12 @@ impl IpcTables for MapTables<'_> {
     fn table_for_file_table(&self, file_table: u64) -> Option<RawTableId> {
         self.0.lookup(file_table)
     }
+    // Execution retains this task's host binding or native namespace.
+    // Only unrelated map entries can be mid-publication here.
+    fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
+        self.0
+            .lookup_retained_binding(task.linux.file_table.load(Ordering::Acquire))
+    }
     fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
         self.0
             .lookup_owned(task.linux.file_table.load(Ordering::Acquire))
@@ -291,6 +297,9 @@ impl IpcTables for GuestTables {
     fn table_for_file_table(&self, file_table: u64) -> Option<RawTableId> {
         MapTables(carrick_el1_abi::ipc_table_map_guest()).table_for_file_table(file_table)
     }
+    fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
+        MapTables(carrick_el1_abi::ipc_table_map_guest()).table_of(task)
+    }
     fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
         MapTables(carrick_el1_abi::ipc_table_map_guest()).owned_table_of(task)
     }
@@ -300,7 +309,10 @@ const EL1_WAIT: ShortLockSpin = ShortLockSpin;
 
 /// `task`'s complete ring descriptor table, as the fd-core raw table words
 /// the native host-file venue names it by. `None` when no complete namespace
-/// is published.
+/// is published. A host root retains its FileTable binding during execution;
+/// a native process retains its directory-owned namespace until retirement.
+/// Neither can withdraw this caller's entry while it stages a service, so
+/// unrelated in-progress publications must not hide it on either ISA.
 pub fn native_table(venue: &IpcVenue<'_>, task: &CurrentTask) -> Option<[u64; 3]> {
     let raw = venue.tables.table_of(task)?;
     Some([raw.authority, raw.index, raw.generation])
@@ -309,8 +321,8 @@ pub fn native_table(venue: &IpcVenue<'_>, task: &CurrentTask) -> Option<[u64; 3]
 /// The ring descriptor table a native fork child's `execveat` resolves its
 /// descriptor in. A fork child's table is directory-owned and immutable until
 /// that process retires it, so this reads the owned entry, which an unrelated
-/// in-progress table-map update cannot hide (the fail-forward
-/// [`native_table`] would read it as absent and the exec as ENOSYS).
+/// in-progress table-map update cannot hide. Unlike [`native_table`], exec
+/// requires directory ownership rather than a retained host binding.
 pub fn native_exec_table(tables: &dyn IpcTables, task: &CurrentTask) -> Option<[u64; 3]> {
     let raw = tables.owned_table_of(task)?;
     Some([raw.authority, raw.index, raw.generation])

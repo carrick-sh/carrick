@@ -2019,6 +2019,20 @@ fn loader_reopen_with_publication(contended: bool) {
         }
         outcome.expect("production loader runtime")
     });
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let refusals: u64 = counters
+        .refused
+        .iter()
+        .map(|counter| counter.load(std::sync::atomic::Ordering::Acquire))
+        .sum();
+    assert_eq!(
+        refusals, 0,
+        "native syscall refusal counters; run={:?}",
+        outcome.run
+    );
     assert_eq!(
         outcome.run.exit_code, 0,
         "open returns its errno as the exit code; 42=close failure, 43=fd reuse failure: {:?}",
