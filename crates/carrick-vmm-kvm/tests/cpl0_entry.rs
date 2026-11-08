@@ -543,6 +543,137 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
     assert_eq!(outcome.physical.robust_list_head(0).unwrap(), 0x2345);
 }
 
+/// A real guest birth, handshake and nonfinal raw exit. No fixture-image
+/// ordinals, preseeded members or host-answered clone can satisfy this probe.
+fn production_thread_clone_probe() -> Vec<u8> {
+    fn mov(code: &mut Vec<u8>, register: &[u8], value: u64) {
+        code.extend_from_slice(register);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    fn branch(code: &mut Vec<u8>, opcode: u8) -> usize {
+        code.extend_from_slice(&[0x0f, opcode]);
+        let at = code.len();
+        code.extend_from_slice(&0_i32.to_le_bytes());
+        at
+    }
+    fn target(code: &mut [u8], at: usize, destination: usize) {
+        let delta = i32::try_from(destination).unwrap() - i32::try_from(at + 4).unwrap();
+        code[at..at + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+    // One bounded FUTEX_WAIT (shared key for the kernel clear-tid wake). A racing publication may return EAGAIN;
+    // the caller checks the actual word after either completion. No retry loop.
+    fn wait(code: &mut Vec<u8>) {
+        mov(code, &[0x48, 0xbe], 0);
+        code.extend_from_slice(&[0x4d, 0x8d, 0x54, 0x24, 0x20]); // r10 = &timeout
+        mov(code, &[0x48, 0xb8], 202);
+        code.extend_from_slice(&[0x0f, 0x05]);
+    }
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    // mmap(NULL, 3 pages, RW, PRIVATE|ANONYMOUS, -1, 0).
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x3000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0]);
+    failures.push(branch(&mut code, 0x88)); // js failure
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]); // r12 = shared data
+    code.extend_from_slice(&[0x49, 0xc7, 0x44, 0x24, 0x20, 5, 0, 0, 0]); // timeout.tv_sec=5
+    mov(&mut code, &[0x48, 0xb8], 186); // gettid before birth
+    code.extend_from_slice(&[0x0f, 0x05, 0x49, 0x89, 0xc6]); // r14 = parent tid
+    // glibc thread flags plus CHILD_SETTID: one shared parent/child tid word at +0.
+    mov(&mut code, &[0x48, 0xbf], 0x013d_0f00);
+    code.extend_from_slice(&[0x49, 0x8d, 0xb4, 0x24, 0xf0, 0x2f, 0, 0]); // child stack
+    code.extend_from_slice(&[0x4c, 0x89, 0xe2]); // rdx = parent_tid
+    code.extend_from_slice(&[0x4d, 0x89, 0xe2]); // r10 = child_tid (x86 order)
+    code.extend_from_slice(&[0x4d, 0x8d, 0x84, 0x24, 0, 1, 0, 0]); // r8 = TLS
+    mov(&mut code, &[0x48, 0xb8], 56);
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0]);
+    let child = branch(&mut code, 0x84); // jz child
+    let clone_error = branch(&mut code, 0x88); // js report errno
+    code.extend_from_slice(&[0x49, 0x89, 0xc5]); // r13 = returned child tid
+    code.extend_from_slice(&[0x41, 0x3b, 0x04, 0x24]); // cmp eax,[r12] (PARENT_SETTID)
+    failures.push(branch(&mut code, 0x85));
+    code.extend_from_slice(&[0x4c, 0x39, 0xf0]); // cmp rax,r14 (distinct tids)
+    failures.push(branch(&mut code, 0x84));
+    // Parent ran after clone. Release the child's bounded handshake wait.
+    code.extend_from_slice(&[0x41, 0xc7, 0x44, 0x24, 0x0c, 1, 0, 0, 0]);
+    code.extend_from_slice(&[0x49, 0x8d, 0x7c, 0x24, 0x0c]);
+    mov(&mut code, &[0x48, 0xbe], 1); // FUTEX_WAKE
+    mov(&mut code, &[0x48, 0xba], 1);
+    mov(&mut code, &[0x48, 0xb8], 202);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    // Join the child using its CHILD_CLEARTID word and the same deadline.
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7, 0x4c, 0x89, 0xea]);
+    wait(&mut code);
+    code.extend_from_slice(&[0x48, 0x83, 0xf8, 0x92]); // timeout is failure (-110)
+    failures.push(branch(&mut code, 0x84));
+    code.extend_from_slice(&[0x41, 0x83, 0x3c, 0x24, 0]);
+    failures.push(branch(&mut code, 0x85));
+    code.extend_from_slice(&[0x45, 0x39, 0x6c, 0x24, 8]); // child gettid == clone result
+    failures.push(branch(&mut code, 0x85));
+    mov(&mut code, &[0x48, 0xb8], 186); // surviving parent's gettid after child exit
+    code.extend_from_slice(&[0x0f, 0x05, 0x4c, 0x39, 0xf0]);
+    failures.push(branch(&mut code, 0x85));
+    mov(&mut code, &[0x48, 0xbf], 7);
+    mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let child_pc = code.len();
+    target(&mut code, child, child_pc);
+    // Child cannot exit until the parent has run after the birth.
+    code.extend_from_slice(&[0x49, 0x8d, 0x7c, 0x24, 0x0c]);
+    mov(&mut code, &[0x48, 0xba], 0);
+    wait(&mut code);
+    code.extend_from_slice(&[0x48, 0x83, 0xf8, 0x92]); // timeout is failure (-110)
+    failures.push(branch(&mut code, 0x84));
+    code.extend_from_slice(&[0x41, 0x83, 0x7c, 0x24, 0x0c, 1]);
+    failures.push(branch(&mut code, 0x85));
+    mov(&mut code, &[0x48, 0xb8], 186);
+    code.extend_from_slice(&[0x0f, 0x05, 0x41, 0x89, 0x44, 0x24, 8]);
+    mov(&mut code, &[0x48, 0xbf], 0);
+    mov(&mut code, &[0x48, 0xb8], 60); // raw exit: only this thread dies
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let error_pc = code.len();
+    target(&mut code, clone_error, error_pc);
+    code.extend_from_slice(&[0x48, 0xf7, 0xd8, 0x48, 0x89, 0xc7]); // exit_group(-clone_result)
+    mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure_pc = code.len();
+    for at in failures {
+        target(&mut code, at, failure_pc);
+    }
+    mov(&mut code, &[0x48, 0xbf], 9);
+    mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    production_probe_elf(&code)
+}
+
+#[test]
+fn production_clone_thread_runs_and_exits_without_ending_parent() {
+    let outcome = run_pool_fixture(&production_thread_clone_probe(), 32);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "guest clone/lifecycle failed (clone errors are reported as errno numbers)"
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.initial_execution_witness().unwrap().1, 0);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(56))
+            .unwrap(),
+        0,
+        "clone must be served in ring"
+    );
+}
+
 /// Production Linux entry, including first touch and partial-range retirement.
 /// No fixture syscall or host mmap-family fallback can satisfy this witness.
 #[test]
