@@ -1,12 +1,14 @@
 //! Entry-turn ownership joins the existing exact-record wait authority.
 #![allow(clippy::unwrap_used, clippy::panic)]
 use carrick_core::entry::{CompletionError, admit, complete, handoff};
+use carrick_core::wait::{EditWaitOutcome, coordinate_anonymous_edit_wait};
 use carrick_core::wait::{notify_object, park_object_record, take_object_operation};
 use carrick_core_abi::{
     EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, ObjectParkRequest,
     SnapshotGeneration,
 };
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+use carrick_sched_core::spaces::notification::SpaceWaitCause;
 use carrick_sched_core::{ExecutionSlot, SlotId, ThreadIdentity, ZoneTables};
 
 fn zone() -> Box<ZoneTables> {
@@ -18,6 +20,96 @@ fn zone() -> Box<ZoneTables> {
         assert!(!ptr.is_null());
         Box::from_raw(ptr)
     }
+}
+
+#[test]
+fn anonymous_wait_cancellation_drops_queue_and_reexecutes_without_effects() {
+    let zone = zone();
+    let slot = SlotId::new(0);
+    let mm = 77;
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, mm, None, 0);
+    let here = ExecutionSlot::zone(slot);
+    zone.occupancy.vacate_any(here);
+    assert!(zone.occupancy.replace(here, 0, mm));
+    zone.enter_guest(slot);
+    zone.spaces.publish_closed(mm, 0x7000, 0x7000).unwrap();
+    let entry = zone
+        .space_entry(std::num::NonZeroU64::new(mm).unwrap())
+        .unwrap();
+    entry
+        .admit_notifications(
+            std::num::NonZeroU64::MIN,
+            &carrick_sched_core::BoundedSpin(0),
+            &|_| {},
+        )
+        .unwrap();
+    let source = entry.live_notifications().unwrap();
+    let identity = ThreadIdentity {
+        tid: 41,
+        serial: 101,
+        mm,
+        file_table: 5,
+        generation: 1,
+        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+        affinity: 0,
+        lifecycle_page: 0,
+        control_slot: 0,
+    };
+    let record = zone.current_or_new(slot, identity).unwrap();
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(41),
+        generation: SnapshotGeneration::from_raw(1),
+        mm: EntryMmKey::from_raw(mm),
+        thread_generation: EntryThreadGeneration::from_raw(101),
+    };
+    let turn = admit(
+        binding,
+        Some(carrick_core_abi::BornInZoneSource { zone: &zone, slot }),
+    )
+    .unwrap();
+    let mut probes = 0;
+    let outcome = coordinate_anonymous_edit_wait(
+        &source,
+        None,
+        || {
+            probes += 1;
+            Some(Some(SpaceWaitCause::Reservations))
+        },
+        |key, snapshot, token| {
+            let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
+            park_object_record(&zone, slot, request, &|_| {}, || Ok((record, false)))
+        },
+    );
+    let EditWaitOutcome::Parked(mut parked) = outcome else {
+        panic!("retryable anonymous edit must park");
+    };
+    handoff(turn, parked.take_receipt().unwrap()).unwrap();
+    let key = source.key(SpaceWaitCause::Reservations);
+    assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+    assert_eq!(
+        zone.claim_for_host(
+            zone.record_ref(record),
+            None,
+            carrick_sched_core::Handback::Cancelled,
+            &carrick_sched_core::ShortLockSpin,
+        ),
+        carrick_sched_core::HostClaim::Claimed
+    );
+    assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+    assert!(!zone.object_queue_census(key.index()).unwrap().locked);
+    assert!(zone.spaces.active_editor(entry.index()).is_none());
+    let replay: EditWaitOutcome<()> = coordinate_anonymous_edit_wait(
+        &source,
+        None,
+        || {
+            probes += 1;
+            Some(None)
+        },
+        |_, _, _| panic!("released operation must re-execute without parking"),
+    );
+    assert_eq!(replay, EditWaitOutcome::NoConflict);
+    assert_eq!(probes, 2);
 }
 
 #[test]
