@@ -1293,6 +1293,7 @@ surfaces = [
   { path = "crates/carrick-x86-cpl0/src/native_execution.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-x86-cpl0/src/native_execution.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-x86-cpl0/src/native_execution.rs", contract = "kernel.native.entropy" },
+  { path = "crates/carrick-x86-cpl0/src/native_host_file.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.el1.mm-exclusive-owner" },
