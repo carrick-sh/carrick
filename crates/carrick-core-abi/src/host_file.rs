@@ -62,6 +62,8 @@ pub enum HostFileOp {
     Poll = 12,
     /// `mkdirat` of the staged path (`args[0]` mode).
     Mkdirat = 13,
+    /// `unlinkat` of the staged path (`flags` may contain `AT_REMOVEDIR`).
+    Unlinkat = 14,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -178,6 +180,7 @@ impl HostFileOp {
             11 => Self::MapPrivate,
             12 => Self::Poll,
             13 => Self::Mkdirat,
+            14 => Self::Unlinkat,
             _ => return None,
         })
     }
@@ -188,7 +191,12 @@ impl HostFileOp {
     pub const fn resolves_path(self) -> bool {
         matches!(
             self,
-            Self::Openat | Self::Faccessat | Self::Newfstatat | Self::Statx | Self::Mkdirat
+            Self::Openat
+                | Self::Faccessat
+                | Self::Newfstatat
+                | Self::Statx
+                | Self::Mkdirat
+                | Self::Unlinkat
         )
     }
 }
