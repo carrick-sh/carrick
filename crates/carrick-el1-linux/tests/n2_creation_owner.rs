@@ -308,7 +308,20 @@ fn nonadmitted_creation_census(policy: ArmRingFirst) {
             let refused = policy.is_strict()
                 && matches!(
                     nr,
-                    220 | 96 | 178 | 122 | 103 | 134 | 214 | 215 | 222 | 226 | 98 | 260 | 99 | 73
+                    220 | 96
+                        | 178
+                        | 122
+                        | 103
+                        | 134
+                        | 214
+                        | 215
+                        | 222
+                        | 226
+                        | 98
+                        | 260
+                        | 99
+                        | 73
+                        | 59
                 );
             for i in 0..n {
                 let mut frame = TrapFrame {
@@ -366,7 +379,8 @@ fn nonadmitted_creation_census(policy: ArmRingFirst) {
                 .iter()
                 .map(|c| c.load(Ordering::Relaxed))
                 .sum::<u64>(),
-            if policy.is_strict() { 14 * n as u64 } else { 0 }
+            // 15 strict refusals: pipe2 joined the ring-served creation set in #1740.
+            if policy.is_strict() { 15 * n as u64 } else { 0 }
         );
         assert_eq!(
             counters
@@ -374,7 +388,7 @@ fn nonadmitted_creation_census(policy: ArmRingFirst) {
                 .iter()
                 .map(|c| c.load(Ordering::Relaxed))
                 .sum::<u64>(),
-            if policy.is_strict() { 7 } else { 21 } * n as u64
+            if policy.is_strict() { 6 } else { 21 } * n as u64
         );
     }
 }
