@@ -58,6 +58,8 @@ fn fork_exec_probe(futex: Option<u64>, bitset: u64, timed: bool) {
 enum TimerDeparture {
     CarrierExit,
     SlotReset,
+    CarrierExitWake,
+    SlotResetWake,
 }
 
 #[test]
@@ -77,6 +79,26 @@ fn serial_host_native_child_timed_futex_slot_reset() {
         u32::MAX as u64,
         true,
         Some(TimerDeparture::SlotReset),
+    );
+}
+
+#[test]
+fn serial_host_native_child_timed_futex_carrier_exit_wake() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        true,
+        Some(TimerDeparture::CarrierExitWake),
+    );
+}
+
+#[test]
+fn serial_host_native_child_timed_futex_slot_reset_wake() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        true,
+        Some(TimerDeparture::SlotResetWake),
     );
 }
 
@@ -1456,6 +1478,11 @@ fn child_futex<'a>(
     if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
         work.settled();
     }
+    let wake_after_departure = matches!(
+        departure,
+        Some(TimerDeparture::CarrierExitWake | TimerDeparture::SlotResetWake)
+    );
+    let original_deadline = fixture.zone.record(binding.record.id).deadline();
     if let Some(departure) = departure {
         let waiter = fixture.zone.record(binding.record.id);
         let deadline = waiter
@@ -1480,7 +1507,10 @@ fn child_futex<'a>(
         carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
             carrick_kernel::el1_zone::hand_back_foreign_timer(fixture.slot);
         });
-        if matches!(departure, TimerDeparture::SlotReset) {
+        if matches!(
+            departure,
+            TimerDeparture::SlotReset | TimerDeparture::SlotResetWake
+        ) {
             assert!(
                 fixture.zone.reset_slot(fixture.slot),
                 "slot reuse must settle timer custody"
@@ -1498,40 +1528,46 @@ fn child_futex<'a>(
             waiter.handback(),
             fixture.zone.timer_node_count(),
         );
-        // No timeout before the original deadline, then exactly one timeout.
-        assert!(
-            !fixture
-                .zone
-                .expire_timer(fixture.slot, deadline - 1, (-110_i64) as u64, &|owned| {
-                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                })
-                .unwrap()
-        );
-        assert!(
-            fixture
-                .zone
-                .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
-                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                })
-                .unwrap()
-        );
-        assert!(
-            !fixture
-                .zone
-                .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
-                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                })
-                .unwrap()
-        );
-        assert_eq!(fixture.zone.timer_node_count(), 0);
-        assert_eq!(waiter.result() as i64, -110);
-        assert!(!matches!(
-            waiter.claim(),
-            carrick_sched_core::Claim::Parked { .. }
-        ));
-        let selected = activate_target(source, &fixture.task, &binding);
-        assert_eq!(selected.result, Some((-110_i64) as u64));
-        return;
+        if wake_after_departure {
+            // Resume the already-live sibling through native custody, then
+            // use the production FUTEX_WAKE below before the original tick.
+            activate_target(source, &fixture.task, &worker);
+        } else {
+            // No timeout before the original deadline, then exactly one timeout.
+            assert!(
+                !fixture
+                    .zone
+                    .expire_timer(fixture.slot, deadline - 1, (-110_i64) as u64, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
+                    .unwrap()
+            );
+            assert!(
+                fixture
+                    .zone
+                    .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
+                    .unwrap()
+            );
+            assert!(
+                !fixture
+                    .zone
+                    .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    })
+                    .unwrap()
+            );
+            assert_eq!(fixture.zone.timer_node_count(), 0);
+            assert_eq!(waiter.result() as i64, -110);
+            assert!(!matches!(
+                waiter.claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
+            let selected = activate_target(source, &fixture.task, &binding);
+            assert_eq!(selected.result, Some((-110_i64) as u64));
+            return;
+        }
     }
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
     frame.x[..6].copy_from_slice(&[VA, crate::sched::FUTEX_WAKE_PRIVATE, 1, 0, 0, 0]);
@@ -1571,6 +1607,34 @@ fn child_futex<'a>(
         CompletionRoute::Served | CompletionRoute::WithWork
     ));
     assert_eq!(frame.x[0], 1, "one enrolled waiter, exactly one wake");
+    drop(entry);
+    if wake_after_departure {
+        let deadline = original_deadline.expect("timed native park");
+        assert!(crate::sched::ThreadCpu::now(&cpu) < deadline);
+        assert_eq!(fixture.zone.timer_node_count(), 0);
+        assert!(
+            !fixture
+                .zone
+                .expire_timer(fixture.slot, deadline, (-110_i64) as u64, &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                })
+                .unwrap(),
+            "the later timeout must not resolve the wake winner again"
+        );
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, worker.record.id)
+                .is_queued()
+        );
+        let selected = activate_target(source, &fixture.task, &binding);
+        assert_eq!(
+            selected.result,
+            Some(0),
+            "native owner receives FUTEX_WAKE result"
+        );
+        assert_eq!(fixture.zone.timer_node_count(), 0);
+    }
     assert_eq!(counters.forwarded[98].load(Ordering::Relaxed), 0);
     assert!(runtime.task_binding(parent).is_some());
 }
