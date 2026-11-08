@@ -6892,11 +6892,20 @@ fn rehomed_signal_copy_service(input: bool) {
         )
         .unwrap();
     let outcome = if input {
-        entry.wait_guest_copy(carrick_core::user_copy::GuestCopyRequest {
-            address: UserVa::new(0x10000),
-            len: carrick_guest_arch::GuestLen::new(8),
-            access: carrick_guest_arch::Access::Read,
-        })
+        let mut observed = Vec::new();
+        let outcome = entry.wait_guest_copy_observed(
+            carrick_core::user_copy::GuestCopyRequest {
+                address: UserVa::new(0x10000),
+                len: carrick_guest_arch::GuestLen::new(8),
+                access: carrick_guest_arch::Access::Read,
+            },
+            &mut |reason| observed.push(reason),
+        );
+        assert_eq!(
+            observed,
+            vec![carrick_personality_linux::lifecycle::InputPreparationRefusal::Busy]
+        );
+        outcome
     } else {
         entry.complete_copyout(
             UserVa::new(0x10000),
