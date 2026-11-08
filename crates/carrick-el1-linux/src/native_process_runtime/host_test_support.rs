@@ -2748,6 +2748,59 @@ mod anonymous_wait_cancellation_tests {
     }
 
     #[test]
+    fn anonymous_release_resumes_through_syscall_replay() {
+        let fixture = native_exec_fixture();
+        let sibling = add_signal_sibling(&fixture, None, false);
+        let key = park_anonymous_sibling(&fixture, &sibling);
+        fixture
+            .zone
+            .object_wait_with_completion(key, &carrick_sched_core::ShortLockSpin, &|effects| {
+                crate::sched::object_wait::deliver_completion(fixture.zone, sibling.slot, effects)
+            })
+            .unwrap()
+            .notify_object(sibling.slot, &mut Default::default())
+            .unwrap();
+        assert_eq!(
+            fixture.zone.switch_in_full(sibling.slot).unwrap().record,
+            sibling.record.id
+        );
+        let retained = fixture.zone.record(sibling.record.id);
+        assert!(!retained.has_adapter_operation());
+        // SAFETY: the production scheduler selected this exact sibling record.
+        let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+            .unwrap()
+            .words;
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: sibling.slot,
+        };
+        let mut service = fixture.service();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                sibling.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                entry.resume_checkpoint(|_| Ok(None)),
+                Ok(NativeResume::RetrySavedSyscall | NativeResume::RetrySyscall)
+            ),
+            "an anonymous release must replay the call, never return its ordinal as a result"
+        );
+        assert_eq!(
+            entry.resume_context().syscall_return(),
+            saved.syscall_return()
+        );
+        assert!(!retained.has_adapter_operation());
+    }
+
+    #[test]
     fn anonymous_host_handback_preserves_replay_domain() {
         let fixture = native_exec_fixture();
         let sibling = add_signal_sibling(&fixture, None, false);
