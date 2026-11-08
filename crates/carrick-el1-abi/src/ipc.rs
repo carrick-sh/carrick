@@ -134,9 +134,9 @@ pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
 pub const IPC_POOL_ALIGN: u64 = IPC_PIPE_PAGE_SIZE as u64;
 const IPC_DESCRIPTOR_STORAGE_NODES: usize = (crate::EL1_IPC_POOL_SPAN / IPC_POOL_ALIGN) as usize;
-/// Region magic: "CRKIPC" + ABI version 6 (operation-owned vector input
-/// receipts alongside elastic object/description stores and zone epoll).
-pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x06");
+/// Region magic: "CRKIPC" + ABI version 7 (operation-owned poll waits and
+/// vector input receipts alongside elastic object/description stores).
+pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x07");
 const IPC_READY: u64 = 1;
 /// Leaf words of the owed-host-wake index: one bit per object.
 const HOST_WAKE_LEAF_WORDS: usize = IPC_MAX_OBJECTS / 64;
@@ -677,6 +677,10 @@ pub enum IpcOpKind {
     /// original call, and a signal interrupts it with EINTR whatever the
     /// handler's `SA_RESTART` (epoll_wait(2) is never restarted).
     EpollWait = 5,
+    /// A blocking one-description `poll`/`ppoll` wait on a zone object.
+    /// The operation pins the inherited description and retains the original
+    /// pollfd bytes and absolute deadline across the readiness park.
+    PollWait = 6,
 }
 
 /// Exact task key of the operation's owner (venue-defined, generation-bearing).
@@ -725,9 +729,9 @@ pub struct IpcOperation {
     pub handback: IpcHandback,
     /// The completed result for [`IpcHandback::Sigpipe`].
     pub result: i64,
-    /// An [`IpcOpKind::EpollWait`]'s absolute deadline on the guest's
-    /// virtual counter (`CNTVCT_EL0`), kept across wakes so a re-parked wait
-    /// sleeps only its remaining time. Unused by other kinds.
+    /// A readiness wait's absolute deadline on the guest's virtual counter
+    /// (`CNTVCT_EL0`), kept across wakes so a re-parked wait sleeps only its
+    /// remaining time. Unused by transfer operations.
     pub deadline: IpcCounterDeadline,
 }
 
