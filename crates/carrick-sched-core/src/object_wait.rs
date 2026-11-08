@@ -377,7 +377,13 @@ const EDIT_OPERATION_TAGS: u64 = PREPARED_EDIT_OPERATION_TAG | ANONYMOUS_EDIT_OP
 
 /// The operation authority, independent of the queue it currently waits on.
 /// Replay tokens own no adapter pin, even after their queue is unlinked.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum OperationKind {
     Adapter,
     Metadata,
