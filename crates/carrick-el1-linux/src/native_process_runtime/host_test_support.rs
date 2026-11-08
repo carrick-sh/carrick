@@ -8203,6 +8203,7 @@ fn production_unmapped_root_admits_and_forks(late_bind: bool) {
 /// Fresh-root storage uses the same issuer, limits, rollback and release
 /// notification path as fork-child stock; no sibling context is supplied.
 #[test]
+#[cfg(test)]
 fn native_root_stock_claim_rollback_and_nproc_limit() {
     use carrick_personality_linux::identity::ProcessIdentityVenue;
     use carrick_personality_linux::lifecycle::ThreadBirthAdmission;
@@ -8239,6 +8240,13 @@ fn native_root_stock_claim_rollback_and_nproc_limit() {
         ThreadBirthAdmission::Ready
     ));
     let before = thread_stock::claim_counts(&fixture.runtime);
+    fixture.page.close_for_fork().unwrap();
+    assert!(matches!(
+        entry.prepare_thread_birth(),
+        ThreadBirthAdmission::Ready
+    ));
+    fixture.page.reopen_after_fork().unwrap();
+    assert_eq!(thread_stock::claim_counts(&fixture.runtime), before);
     let claim = fixture.page.claim_any().unwrap();
     let identity = fixture.page.identity(claim.entry()).unwrap();
     assert_ne!(identity.tid, 41);
@@ -8270,6 +8278,7 @@ fn native_root_stock_claim_rollback_and_nproc_limit() {
 }
 
 #[test]
+#[cfg(test)]
 fn native_root_stock_busy_claim_parks_then_release_retries_same_clone() {
     use carrick_personality_linux::lifecycle::ThreadBirthAdmission;
     let fixture = native_exec_fixture();
@@ -8371,6 +8380,7 @@ fn native_root_stock_busy_claim_parks_then_release_retries_same_clone() {
 }
 
 #[test]
+#[cfg(test)]
 fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest, UserCopy};
     use carrick_guest_arch::{Access, GuestLen};

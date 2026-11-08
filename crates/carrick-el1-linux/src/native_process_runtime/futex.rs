@@ -68,8 +68,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
         let mut bytes = [0; 8];
         match self.copy.borrow_mut().copy_in(&mut bytes, address) {
             CopyOutcome::Done => Some(u64::from_le_bytes(bytes)),
-            refusal => {
-                self.refusal.set(Some(refusal));
+            CopyOutcome::Fault => {
+                self.refusal.set(Some(CopyOutcome::Fault));
+                None
+            }
+            CopyOutcome::NotYet(request) => {
+                self.refusal.set(Some(CopyOutcome::NotYet(request)));
                 None
             }
         }
@@ -167,7 +171,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
         }
         let sequence = zone.next_seq(record);
         if wait.deadline.is_some() && zone.arm_timer(slot, record, sequence).is_err() {
-            return Some(returned(-11));
+            drop(guard);
+            // Capacity is per record; this refusal means the same execution
+            // already owns a timer, not contention with another task.
+            return Some(
+                self.entry
+                    .run_failed(carrick_core_abi::NativeRunFailureReason::NativeStale),
+            );
         }
         if zone
             .enqueue(
@@ -182,6 +192,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
             .is_err()
         {
             zone.cancel_timer_admission(self.entry.record);
+            drop(guard);
             return Some(
                 self.entry
                     .run_failed(carrick_core_abi::NativeRunFailureReason::NativeStale),

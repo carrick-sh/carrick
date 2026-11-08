@@ -46,6 +46,49 @@ pub enum StockAdmission {
 }
 
 impl<I> StockEntries<I> {
+    /// Root admission may issue stock only on a page with no borrowed pool
+    /// identity. Fork-child pages instead retain their existing leader entry.
+    pub fn for_fresh_root(page: &impl Lifecycle) -> Result<Self, super::TransitionError> {
+        for index in 0..page.entry_count() {
+            let (_, state) = page
+                .state(index)
+                .ok_or(super::TransitionError::NoSuchEntry)?;
+            if state != super::EntryState::Vacant {
+                return Err(super::TransitionError::WrongState(state));
+            }
+        }
+        Ok(Self::default())
+    }
+
+    /// Withdraw only this stock owner's unused identities after terminal
+    /// admission closes. A racing claimant keeps its own live/rollback and
+    /// settlement authority; its later settlement calls this owner again.
+    pub fn drain_closed<T: super::MemberControl>(
+        &mut self,
+        page: &dyn Lifecycle,
+        controls: &[T],
+    ) -> Result<(), super::TransitionError> {
+        use super::{EntryState, TransitionError};
+        if !page.gate().is_terminal() {
+            return Ok(());
+        }
+        for (entry, _) in &self.identities {
+            let (generation, state) = page
+                .state(entry.index())
+                .ok_or(TransitionError::NoSuchEntry)?;
+            if generation != entry.generation() {
+                return Err(TransitionError::StaleGeneration);
+            }
+            if state == EntryState::Reserved {
+                match super::revoke_unborn_control(page, *entry, &controls[entry.index() + 1]) {
+                    Ok(()) | Err(TransitionError::WrongState(EntryState::Claimed)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        self.settle(page, controls)
+    }
+
     pub fn insert(&mut self, entry: super::EntryRef, identity: I) {
         self.identities.push((entry, identity));
     }

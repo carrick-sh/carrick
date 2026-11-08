@@ -3077,6 +3077,7 @@ impl<
                 return FamilyCompletion::Forward;
             };
             let Some(process) = self.process.as_deref_mut() else {
+                self.frame.record_isa_unsupported_forward();
                 return FamilyCompletion::Forward;
             };
             if process.binding() != super::common_entry::execution_binding(task) {

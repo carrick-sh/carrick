@@ -70,8 +70,9 @@ continuation completions. This asserts a result, not elapsed-time performance.
 
 The VM-free fresh-root stock bindings cover claim rollback without new
 identities, NPROC refusal, exhausted in-flight stock parking, notification on
-claim release, retry of the exact returned identity, and terminal withdrawal
-of reserved stock. Existing ARM native stock tests cover retired-control
+claim release, retry of the exact returned identity, preservation across a
+temporary fork close, and terminal withdrawal of reserved stock. Existing ARM
+native stock tests cover retired-control
 pins and repeated reuse. One production birth/retirement requires zero host
 clone/exit implementations and zero counted clone refusals. Existing lifecycle
 scaling budgets are unchanged; a single birth supplies no scaling or runtime
