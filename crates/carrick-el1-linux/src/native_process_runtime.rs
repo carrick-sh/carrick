@@ -2691,12 +2691,22 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     .map_err(|_| NativeProcessError::Busy)?;
                 Some((retained, pending))
             };
-            let prepared_threads = if row.credentials_for(visible_tid).is_err() {
-                let mut threads = row.threads.clone();
-                threads
-                    .spawn_thread(row.metadata().namespace_pid, visible_tid)
-                    .map_err(|_| NativeProcessError::Invalid)?;
-                Some(threads)
+            let prepared_thread = if row.credentials_for(visible_tid).is_err() {
+                // Only the new member inherits credentials. Existing group
+                // payloads remain owned in place, regardless of their size.
+                let mut thread = row
+                    .threads
+                    .threads
+                    .iter()
+                    .find(|thread| thread.tid == row.metadata().namespace_pid)
+                    .cloned()
+                    .ok_or(NativeProcessError::Invalid)?;
+                thread.tid = visible_tid;
+                row.threads
+                    .threads
+                    .try_reserve(1)
+                    .map_err(|_| NativeProcessError::Exhausted)?;
+                Some(thread)
             } else {
                 None
             };
@@ -2719,8 +2729,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             if host_issued.is_some() && !page.release_adopted_host_birth(host_identity) {
                 return Err(NativeProcessError::Stale);
             }
-            if let Some(threads) = prepared_threads {
-                row.threads = threads;
+            if let Some(thread) = prepared_thread {
+                row.threads.threads.push(thread);
             }
             if let Some(index) = member_index {
                 let member = &mut row.native_mut().resources_mut().members[index];
