@@ -674,6 +674,55 @@ fn production_clone_thread_runs_and_exits_without_ending_parent() {
     );
 }
 
+/// A sole native thread must resume a timed futex with Linux ETIMEDOUT;
+/// signal-wait EAGAIN is a different personality completion.
+#[test]
+fn production_native_futex_timeout_returns_etimedout() {
+    fn mov(code: &mut Vec<u8>, register: &[u8], value: u64) {
+        code.extend_from_slice(register);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut code = Vec::new();
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x49, 0x89, 0xc4]); // mmap; r12=data
+    // Zero seconds, one millisecond. The native deadline owner must expire
+    // the real wait; no timing assertion, polling or retry is used.
+    code.extend_from_slice(&[0x49, 0xc7, 0x44, 0x24, 0x28, 0x40, 0x42, 0x0f, 0]);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // rdi=data
+    mov(&mut code, &[0x48, 0xbe], 0); // FUTEX_WAIT on private anonymous storage
+    mov(&mut code, &[0x48, 0xba], 0);
+    code.extend_from_slice(&[0x4d, 0x8d, 0x54, 0x24, 0x20]);
+    mov(&mut code, &[0x48, 0xb8], 202);
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x83, 0xf8, 0x92]); // cmp rax,-110
+    code.extend_from_slice(&[
+        0x75, 0x0e, 0xbf, 7, 0, 0, 0, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b, 0xbf, 9, 0, 0,
+        0, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
+    ]);
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 16);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "native futex timeout must be errno 110"
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(202))
+            .unwrap(),
+        0
+    );
+}
+
 /// Production Linux entry, including first touch and partial-range retirement.
 /// No fixture syscall or host mmap-family fallback can satisfy this witness.
 #[test]
