@@ -174,6 +174,92 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
     unsafe { pwrite64_with(zf, cache_base, buf_va, count, offset, &mut user) }
 }
 
+/// Diagnostic context captured before copy or owner preparation. It grants no
+/// authority and never replaces the original refusal with a later result.
+pub(crate) struct CopyDiagnostic<'a> {
+    pub counters: &'a carrick_el1_abi::Counters,
+    pub ordinal: carrick_syscall_abi::CanonicalNr,
+    pub arguments: [u64; 6],
+    pub presented: Option<carrick_el1_abi::ExecutionBinding>,
+    pub expected: Option<carrick_el1_abi::ExecutionBinding>,
+}
+impl CopyDiagnostic<'_> {
+    pub fn record(
+        &self,
+        address: u64,
+        len: usize,
+        write: bool,
+        reason: carrick_el1_abi::CopyRefusalReason,
+    ) {
+        self.counters
+            .record_copy_refusal(carrick_el1_abi::CopyRefusal {
+                ordinal: self.ordinal,
+                address: carrick_guest_arch::UserVa::new(address),
+                len: carrick_guest_arch::GuestLen::new(len as u64),
+                argument: self.arguments.iter().position(|&arg| arg == address),
+                access: if write {
+                    carrick_guest_arch::Access::Write
+                } else {
+                    carrick_guest_arch::Access::Read
+                },
+                reason,
+                owner_present: self.presented.is_some(),
+                presented: self.presented,
+                expected: self.expected,
+            });
+    }
+    pub(crate) fn record_copy_failure(
+        &self,
+        address: u64,
+        len: usize,
+        write: bool,
+        reason: carrick_el1_abi::CopyRefusalReason,
+    ) {
+        self.record(address, len, write, reason);
+        // Owner authentication is a separate refusal, never a replacement for
+        // the validator/guarded-copy result recorded above.
+        let reason = if self.presented.is_none() {
+            Some(carrick_el1_abi::CopyRefusalReason::OwnerAbsent)
+        } else if self.presented != self.expected {
+            Some(carrick_el1_abi::CopyRefusalReason::OwnerMismatch)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.record(address, len, write, reason);
+        }
+    }
+}
+
+/// Use the diagnosed primitive on the boolean IPC interface, publishing before
+/// OwnerCopy can retain a request and before native preparation/redispatch.
+pub(crate) struct DiagnosedCopy<'a, V: MemoryValidator> {
+    pub inner: ValidatedCopy<'a, V>,
+    pub diagnostic: CopyDiagnostic<'a>,
+}
+impl<V: MemoryValidator> UserCopy for DiagnosedCopy<'_, V> {
+    fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
+        match self.inner.copy_in_diagnosed(dst, address) {
+            Ok(()) => true,
+            Err(reason) => {
+                self.diagnostic
+                    .record_copy_failure(address, dst.len(), false, reason);
+                false
+            }
+        }
+    }
+    fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
+        match self.inner.copy_out_diagnosed(address, bytes) {
+            Ok(()) => true,
+            Err(reason) => {
+                self.diagnostic
+                    .record_copy_failure(address, bytes.len(), true, reason);
+                false
+            }
+        }
+    }
+}
+
 /// Bind ring output to the existing exact-MM native write protocol. Input
 /// refusals retain their access direction; outputs carry producer observations.
 pub(crate) struct OwnerCopy<'a, 'p, 'ipc, U, C: carrick_core_abi::EntryContext> {

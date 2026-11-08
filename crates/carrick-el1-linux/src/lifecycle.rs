@@ -48,25 +48,15 @@ impl<
         len: usize,
         write: bool,
         reason: carrick_el1_abi::CopyRefusalReason,
-        owner: bool,
     ) {
-        let role = (0..6)
-            .find(|&i| self.frame.argument(i) == Some(address.raw()))
-            .unwrap_or(6);
-        self.counters
-            .record_copy_refusal(carrick_el1_abi::CopyRefusal {
-                ordinal: self.frame.canonical_ordinal(),
-                address,
-                len: carrick_guest_arch::GuestLen::new(len as u64),
-                argument: (role < 6).then_some(role),
-                access: if write {
-                    carrick_guest_arch::Access::Write
-                } else {
-                    carrick_guest_arch::Access::Read
-                },
-                reason,
-                owner_present: owner,
-            });
+        let diagnostic = crate::file::CopyDiagnostic {
+            counters: self.counters,
+            ordinal: self.frame.canonical_ordinal(),
+            arguments: core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
+            presented: self.process.as_deref().map(|venue| venue.binding()),
+            expected: LifecycleNative::binding(self),
+        };
+        diagnostic.record_copy_failure(address.raw(), len, write, reason);
     }
 
     fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
@@ -128,7 +118,7 @@ impl<
             Ok(()) => CopyOutcome::Done,
             Err(reason) => {
                 let owner = self.process_venue().is_some();
-                self.record_copy_refusal(src, dst.len(), false, reason, owner);
+                self.record_copy_refusal(src, dst.len(), false, reason);
                 if owner {
                     CopyOutcome::NotYet(GuestCopyRequest {
                         address: src,
@@ -189,7 +179,7 @@ impl<
             Ok(()) => CopyOutcome::Done,
             Err(reason) => {
                 let owner = self.process_venue().is_some();
-                self.record_copy_refusal(dst, src.len(), true, reason, owner);
+                self.record_copy_refusal(dst, src.len(), true, reason);
                 if owner {
                     CopyOutcome::NotYet(GuestCopyRequest {
                         address: dst,
@@ -215,19 +205,33 @@ impl<
 > LifecycleNative<'a> for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
+        let diagnostic = crate::file::CopyDiagnostic {
+            counters: self.counters,
+            ordinal: self.frame.canonical_ordinal(),
+            arguments: core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
+            presented: self.process.as_deref().map(|venue| venue.binding()),
+            expected: LifecycleNative::binding(self),
+        };
         let venue = self.process_venue().unwrap_or_else(|| {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
         });
-        let mut outcome = venue.wait_guest_copy(request);
-        if matches!(&outcome, LifecycleOutcome::Returned { result, .. } if result.raw() == -14) {
-            self.record_copy_refusal(
-                request.address,
+        let mut outcome = venue.wait_guest_copy_observed(request, &mut |refusal| {
+            use carrick_personality_linux::lifecycle::InputPreparationRefusal;
+            diagnostic.record(
+                request.address.raw(),
                 request.len.raw() as usize,
                 request.access == carrick_guest_arch::Access::Write,
-                carrick_el1_abi::CopyRefusalReason::OwnerFault,
-                true,
+                match refusal {
+                    InputPreparationRefusal::Fault => {
+                        carrick_el1_abi::CopyRefusalReason::OwnerFault
+                    }
+                    InputPreparationRefusal::Busy => carrick_el1_abi::CopyRefusalReason::OwnerBusy,
+                    InputPreparationRefusal::OwnerWait => {
+                        carrick_el1_abi::CopyRefusalReason::OwnerWait
+                    }
+                },
             );
-        }
+        });
         if matches!(outcome, LifecycleOutcome::Redispatch) {
             self.frame.restart_syscall();
         }

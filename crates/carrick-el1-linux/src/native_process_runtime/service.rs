@@ -907,10 +907,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub(super) fn prepare_guest_input(
         &mut self,
         request: carrick_core::user_copy::GuestCopyRequest,
+        observe: &mut dyn FnMut(carrick_personality_linux::lifecycle::InputPreparationRefusal),
     ) -> Result<LifecycleOutcome, NativeProcessError> {
+        use carrick_personality_linux::lifecycle::InputPreparationRefusal;
         // Bad user ranges are an ABI fault before they can be confused
         // with an invalid owner operation or overflowing transfer record.
         if !carrick_guest_arch::lower_half_range(request.address.raw(), request.len.raw()) {
+            observe(InputPreparationRefusal::Fault);
             return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
         }
         let mm = self
@@ -927,22 +930,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let (operation, sequence, wait) = match self.service.prepare_owned_read(&mm, request) {
             Ok(()) => return Ok(LifecycleOutcome::Redispatch),
             Err(NativeProcessError::Fault) => {
+                observe(InputPreparationRefusal::Fault);
                 return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
             }
-            Err(NativeProcessError::OwnerWait(wait)) => (
-                ServiceOperation::CarrierWork {
-                    entry: OwnerEntry::Syscall,
-                },
-                None,
-                Some(wait),
-            ),
-            Err(NativeProcessError::Busy) => (
-                ServiceOperation::CarrierWork {
-                    entry: OwnerEntry::Syscall,
-                },
-                None,
-                None,
-            ),
+            Err(NativeProcessError::OwnerWait(wait)) => {
+                observe(InputPreparationRefusal::OwnerWait);
+                (
+                    ServiceOperation::CarrierWork {
+                        entry: OwnerEntry::Syscall,
+                    },
+                    None,
+                    Some(wait),
+                )
+            }
+            Err(NativeProcessError::Busy) => {
+                observe(InputPreparationRefusal::Busy);
+                (
+                    ServiceOperation::CarrierWork {
+                        entry: OwnerEntry::Syscall,
+                    },
+                    None,
+                    None,
+                )
+            }
             Err(NativeProcessError::Unsupported) => {
                 let (mut fault, sequence) = self
                     .service

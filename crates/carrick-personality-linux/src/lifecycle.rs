@@ -234,6 +234,14 @@ pub struct MapSourceTake {
     pub orphans: alloc::vec::Vec<carrick_core_abi::HostBackingIdentity>,
 }
 
+/// Original preparation refusal, observed before service admission or retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputPreparationRefusal {
+    Fault,
+    Busy,
+    OwnerWait,
+}
+
 /// A bounded owner write either faults or retains its exact producer receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnedCopyError {
@@ -307,6 +315,15 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn retain_relative_futex_wait(&mut self, _operation: crate::sched::RelativeFutexWait) {}
     /// Prepare an unavailable input and retain its exact syscall until ready.
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
+    /// Observe preparation without changing continuation ownership or policy.
+    fn wait_guest_copy_observed(
+        &mut self,
+        request: GuestCopyRequest,
+        _observe: &mut dyn FnMut(InputPreparationRefusal),
+    ) -> LifecycleOutcome {
+        self.wait_guest_copy(request)
+    }
+
     /// An admitted process may retain an exact-MM write authority (including COW).
     /// None means this venue does not own user transfers.
     fn copy_out_owned(

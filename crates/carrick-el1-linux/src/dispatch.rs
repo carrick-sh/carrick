@@ -2479,6 +2479,8 @@ fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
                     access: carrick_guest_arch::Access::Write,
                     reason: carrick_el1_abi::CopyRefusalReason::OwnerFault,
                     owner_present: true,
+                    presented: Some(process.binding()),
+                    expected: Some(crate::common_entry::execution_binding(task)),
                 });
         }
         return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
@@ -4747,9 +4749,18 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             let orig_x0 = frame.x[0];
             let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
             let mut user = file::OwnerCopy {
-                inner: file::ValidatedCopy {
-                    task,
-                    validator: &file::HardwareValidator,
+                inner: file::DiagnosedCopy {
+                    inner: file::ValidatedCopy {
+                        task,
+                        validator: &file::HardwareValidator,
+                    },
+                    diagnostic: file::CopyDiagnostic {
+                        counters,
+                        ordinal: carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
+                        arguments: core::array::from_fn(|i| frame.x[i]),
+                        presented: self.process.as_deref().map(|owner| owner.binding()),
+                        expected: Some(crate::common_entry::execution_binding(task)),
+                    },
                 },
                 owner: self.process.as_deref_mut(),
                 wait: None,
@@ -4815,9 +4826,18 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             let orig_x0 = frame.x[0];
             let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
             let mut user = file::OwnerCopy {
-                inner: file::ValidatedCopy {
-                    task,
-                    validator: &file::HardwareValidator,
+                inner: file::DiagnosedCopy {
+                    inner: file::ValidatedCopy {
+                        task,
+                        validator: &file::HardwareValidator,
+                    },
+                    diagnostic: file::CopyDiagnostic {
+                        counters,
+                        ordinal: carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
+                        arguments: core::array::from_fn(|i| frame.x[i]),
+                        presented: self.process.as_deref().map(|owner| owner.binding()),
+                        expected: Some(crate::common_entry::execution_binding(task)),
+                    },
                 },
                 owner: self.process.as_deref_mut(),
                 wait: None,
