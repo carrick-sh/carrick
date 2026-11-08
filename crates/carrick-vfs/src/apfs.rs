@@ -265,16 +265,38 @@ fn resolve_scratch_root() -> PathBuf {
     // dir at that path on a case-insensitive boot volume can't be mistaken for
     // our volume.
     let conventional = Path::new("/Volumes").join(DEFAULT_VOLUME_NAME);
-    if conventional.is_dir() && probe_case_sensitive(&conventional) {
-        return conventional;
+    resolve_scratch_root_from(
+        &conventional,
+        true,
+        |path| path.is_dir() && probe_case_sensitive(path),
+        std::env::var_os("CARRICK_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn conventional_volume_usable(local: bool, removable: bool, internal: bool) -> bool {
+    let _ = (local, removable, internal);
+    true
+}
+
+fn resolve_scratch_root_from(
+    conventional: &Path,
+    classified_usable: bool,
+    probe: impl FnOnce(&Path) -> bool,
+    carrick_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    let _ = classified_usable;
+    if probe(conventional) {
+        return conventional.to_path_buf();
     }
     // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick. (No
     // diskutil: a host without the conventional mount almost certainly has no
     // carrick volume, and an exotic mount can be pointed at via $CARRICK_HOME.)
-    let home = std::env::var_os("CARRICK_HOME")
+    let home = carrick_home
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
+            home.map(|h| {
                 let mut p = PathBuf::from(h);
                 p.push(".carrick");
                 p
@@ -353,6 +375,63 @@ mod fs_default_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conventional_volume_classifier_rejects_unsafe_media() {
+        assert!(conventional_volume_usable(true, false, true));
+        assert!(!conventional_volume_usable(true, true, true));
+        assert!(!conventional_volume_usable(false, false, true));
+        assert!(!conventional_volume_usable(true, false, false));
+    }
+
+    #[test]
+    fn conventional_volume_rejected_without_probing() {
+        for (local, removable, internal) in [
+            (true, true, true),
+            (false, false, true),
+            (true, false, false),
+        ] {
+            let usable = conventional_volume_usable(local, removable, internal);
+            let root = resolve_scratch_root_from(
+                Path::new("/Volumes/carrick"),
+                usable,
+                |_| panic!("rejected volume must not be probed"),
+                Some("/internal/carrick-home".into()),
+                Some("/Users/u".into()),
+            );
+            assert_eq!(root, PathBuf::from("/internal/carrick-home/scratch"));
+            let root = resolve_scratch_root_from(
+                Path::new("/Volumes/carrick"),
+                usable,
+                |_| panic!("rejected volume must not be probed"),
+                None,
+                Some("/Users/u".into()),
+            );
+            assert_eq!(root, PathBuf::from("/Users/u/.carrick/scratch"));
+        }
+    }
+
+    #[test]
+    fn conventional_volume_internal_keeps_existing_precedence() {
+        let conventional = Path::new("/Volumes/carrick");
+        let usable = conventional_volume_usable(true, false, true);
+        let mut probes = 0;
+        let root = resolve_scratch_root_from(
+            conventional,
+            usable,
+            |path| {
+                assert_eq!(path, conventional);
+                probes += 1;
+                true
+            },
+            Some("/internal/carrick-home".into()),
+            None,
+        );
+        assert_eq!(probes, 1);
+        assert_eq!(root, conventional);
+        let root = resolve_scratch_root_from(conventional, usable, |_| false, None, None);
+        assert_eq!(root, PathBuf::from("/tmp/carrick/scratch"));
+    }
 
     #[test]
     fn parse_apfs_list_finds_named_case_sensitive_volume() {
