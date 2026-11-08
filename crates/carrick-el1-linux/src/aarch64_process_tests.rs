@@ -11106,7 +11106,7 @@ fn native_descriptor_metadata_witness(
                         std::time::Instant::now() < deadline,
                         "metadata never encountered Busy"
                     );
-                    std::thread::yield_now();
+                    core::hint::spin_loop();
                 }
                 drop(guard);
             });

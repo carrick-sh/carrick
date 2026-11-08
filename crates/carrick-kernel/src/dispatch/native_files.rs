@@ -1644,13 +1644,13 @@ mod tests {
 
     /// The ring answers `fstat`/`statx` of its in-zone pipes itself; those
     /// bytes are exactly what the dispatcher reports for its own pipe ends,
-    /// because both encode one shared `LinuxStatFields`. The shared inode is
-    /// the one the dispatcher has always derived from the pipe's label.
+    /// because both encode one shared `LinuxStatFields` with the exact
+    /// live pipe incarnation's identity.
     #[test]
     fn in_zone_pipe_stat_matches_the_dispatchers_pipe_record() {
         let dispatcher = SyscallDispatcher::new();
         let pipe = super::super::fd_table::InMemoryPipeTestFixture::new(1, 4096);
-        let object = match &*pipe.read {
+        let object = match &*pipe.read.inspect().expect("reader description") {
             super::super::fd_table::OpenDescription::PipeReader { pipe, .. } => pipe.ipc_object(),
             _ => unreachable!(),
         };
