@@ -5577,3 +5577,180 @@ fn native_owner_code_range(whole: bool) {
         assert_eq!(run(), 42);
     }
 }
+
+/// #1862: production native entry, never SyscallDispatcher::dispatch.
+#[test]
+fn native_go_large_reservations_then_persistentalloc() {
+    use carrick_el1::memory::{AnonymousCall, AnonymousCallView, DelegatedAnonymous};
+    use carrick_el1_abi::{Counters, InotifyNameCache, TrapFrame};
+    use carrick_personality_linux::abi::entry::{LinuxTaskState, SyscallResult};
+    use carrick_personality_linux::dispatch::{CompletionRoute, FamilyCompletion};
+    use carrick_personality_linux::pending_anonymous::{
+        DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
+    };
+
+    // The injected venue is physical test scaffolding. Decoding, admission,
+    // proposal, descriptor edits, completion and accounting remain production.
+    struct Venue<'a> {
+        call: AnonymousCall,
+        fixture: &'static Fixture,
+        counters: &'a Counters,
+        editor: FixtureMapping<'a>,
+    }
+    impl PendingAnonymousVenue for Venue<'_> {
+        fn original_argument0(&self) -> u64 {
+            self.call.arguments()[0]
+        }
+        fn task_state(&self) -> Option<&LinuxTaskState> {
+            Some(&self.fixture.task.linux)
+        }
+        fn delegated(&mut self) -> DelegatedStep {
+            match carrick_el1::memory::serve_delegated_mapping(
+                &mut self.call,
+                self.counters,
+                &self.fixture.task,
+                crate::sched::object_wait::space_access(self.fixture.zone, self.fixture.slot),
+                self.fixture.region.table(),
+                &mut self.editor,
+                None,
+            ) {
+                DelegatedAnonymous::Served => {
+                    DelegatedStep::Served(SyscallResult::new(self.call.result().0 as i64))
+                }
+                other => panic!("owner-admitted native mapping left its owner: {other:?}; leaves={:?}", self.counters.anonymous_leaves),
+            }
+        }
+        fn park_prepared(&mut self) -> Option<FamilyCompletion> {
+            None // No retained prepared edit in this uncontended fixture.
+        }
+        fn permission(&mut self) -> PermissionStep {
+            panic!("legacy protection path")
+        }
+        fn retirement(&mut self) -> RetirementStep {
+            panic!("legacy retirement path")
+        }
+        fn install_result(&mut self, _: SyscallResult) {
+            panic!("delegated result")
+        }
+    }
+
+    const LENGTH: u64 = 1024 * 1024 * 1024 * 1024;
+    let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let fixture = Box::leak(Box::new(Fixture::with_identity_and_arena(
+        0x10000,
+        asid(1),
+        page,
+        control,
+        ThreadIdentity {
+            tid: 41,
+            serial: 101,
+            mm: 1,
+            file_table: 5,
+            generation: 11,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: page as *const _ as u64,
+            control_slot: control as *const _ as u64,
+        },
+        LENGTH + 8192,
+    )));
+    let words = fixture.tables.live(&fixture.maintenance);
+    let residency = carrick_el1::cow::test_support::residency_table();
+    let counters = Box::new(Counters::new());
+    let names = Box::new(InotifyNameCache::new());
+    let mut service = fixture.process_service();
+    let mut invoke = |nr: u64, args: [u64; 6]| {
+        let mut frame = TrapFrame::default();
+        frame.x[8] = nr;
+        frame.x[..6].copy_from_slice(&args);
+        let mut venue = Venue {
+            call: AnonymousCall::new(
+                carrick_core::CallOrdinal::from_raw(nr),
+                args,
+                0,
+                fixture.slot,
+                UserVa::new(0x40004),
+            ),
+            fixture,
+            counters: &counters,
+            editor: FixtureMapping {
+                words: &words,
+                residency: &residency,
+            },
+        };
+        let before = counters.served[nr as usize].load(Ordering::Relaxed);
+        let route = fixture
+            .enter(control, fixture_ttbr0(fixture), &mut service, |process| {
+                assert!(process.is_root_process(), "real native owner is admitted");
+                crate::dispatch::dispatch_syscall_with_native::<
+                    _,
+                    crate::sched::FakeCpu,
+                    crate::sched::HardwareUserWord,
+                    _,
+                    Aarch64ParkedContext,
+                >(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &names,
+                    None,
+                    None,
+                    None,
+                    Some(process),
+                    Some(BornInZoneSource {
+                        zone: fixture.zone,
+                        slot: fixture.slot,
+                    }),
+                    Some(&mut venue),
+                    |_| core::ptr::null_mut(),
+                )
+            })
+            .unwrap();
+        assert!(
+            matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+            "{route:?}"
+        );
+        assert_eq!(
+            counters.served[nr as usize].load(Ordering::Relaxed),
+            before + 1
+        );
+        assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
+        frame.x[0]
+    };
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // Go arena and arena-index reservations, followed by fixed commits and
+    // persistentalloc's nil-hint 256 KiB chunks. The expanded VA layout lets
+    // this control exercise the ring decoder even for the high Go hint;
+    // real production's out-of-layout hints instead require host placement.
+    for hint in [0xc0 << 32, (0xc0 << 32) + 128 * GIB, (0xc0 << 32) + 32 * GIB] {
+        let reserved = invoke(222, [hint, 64 * GIB, 0, 0x22, u64::MAX, 0]);
+        assert!(reserved < i64::MAX as u64, "reserve returned errno {}", reserved as i64);
+        assert_eq!(invoke(222, [reserved + 4096, 32 * 4096, 3, 0x32, u64::MAX, 0]), reserved + 4096);
+    }
+    for index in 0..1024 {
+        let address = invoke(222, [0, 256 * 1024, 3, 0x22, u64::MAX, 0]);
+        assert!(address < i64::MAX as u64, "persistentalloc index={index} returned errno {}", address as i64);
+    }
+    // A known-answer refusal validates the diagnostic against a production
+    // native mmap returning errno 12. This deliberately finite RLIMIT_DATA
+    // is NOT a reproduction of Go's unexplained startup failure on the Mac.
+    let portal = super::super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN, fixture.region.table(), fixture.zone,
+    );
+    portal.root(ReservationMm::new(1).unwrap(), 0).unwrap().set_limits(u64::MAX, 0);
+    assert_eq!(invoke(222, [0, 256 * 1024, 3, 0x22, u64::MAX, 0]) as i64, -12);
+    assert_eq!(counters.mmap_failures.attempted.load(Ordering::Acquire), 1,
+        "ring ENOMEM must publish its refusal, length, protection and flags");
+    let record = &counters.mmap_failures.records[0];
+    assert_eq!(record.ready.load(Ordering::Acquire), 1);
+    assert_eq!(record.words[3].load(Ordering::Relaxed), 256 * 1024);
+    assert_eq!(record.words[4].load(Ordering::Relaxed), 3);
+    assert_eq!(record.words[5].load(Ordering::Relaxed), 0x22);
+    assert_eq!(record.words[6].load(Ordering::Relaxed), 1); // Refusal::Limit
+
+}

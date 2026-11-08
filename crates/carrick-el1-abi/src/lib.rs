@@ -2944,6 +2944,68 @@ impl AnonymousLeave {
     pub const COUNT: usize = 16;
 }
 
+/// Bounded first-failure capture. Slots are claimed once, never reused, so a
+/// stopped-carrier reader cannot mix two invocations. `ready` publishes all
+/// words with release ordering; attempts beyond CAPACITY remain counted.
+#[repr(C)]
+pub struct MmapFailureRecord {
+    pub ready: AtomicU64,
+    /// mm, tid, hint, length, prot, flags, reason (1 = reservation Limit),
+    /// arena start/end, address/data limits, external address/data charges,
+    /// root address/data charges. All are scalar snapshot words, not pointers.
+    pub words: [AtomicU64; 15],
+}
+impl MmapFailureRecord {
+    const fn new() -> Self {
+        Self { ready: AtomicU64::new(0), words: [const { AtomicU64::new(0) }; 15] }
+    }
+}
+
+#[repr(C)]
+pub struct MmapFailures {
+    pub attempted: AtomicU64,
+    pub records: [MmapFailureRecord; Self::CAPACITY],
+}
+impl MmapFailures {
+    pub const CAPACITY: usize = 16;
+    const fn new() -> Self {
+        Self {
+            attempted: AtomicU64::new(0),
+            records: [const { MmapFailureRecord::new() }; Self::CAPACITY],
+        }
+    }
+    /// One fixed-size, allocation-free publication per ENOMEM; no loop and
+    /// no wait on another CPU. Overflow never overwrites earlier evidence.
+    pub fn record_limit(
+        &self,
+        mm: ReservationMm,
+        task: &CurrentTask,
+        args: [u64; 6],
+        layout: Layout,
+        charges: carrick_core_abi::Charges,
+    ) {
+        let index = self.attempted.fetch_add(1, Ordering::Relaxed);
+        let Some(record) = usize::try_from(index).ok().and_then(|i| self.records.get(i)) else { return; };
+        let policy = layout.policy.words();
+        let words = [mm.raw(), task.execution.task.load(Ordering::Relaxed), args[0], args[1], args[2], args[3], 1,
+            layout.arena.start(), layout.arena.end(), policy[1], policy[2],
+            policy[3], policy[4], charges.bytes, charges.data];
+        for (target, value) in record.words.iter().zip(words) { target.store(value, Ordering::Relaxed); }
+        record.ready.store(1, Ordering::Release);
+    }
+    fn copy_to(&self, snapshot: &Self) {
+        snapshot.attempted.store(self.attempted.load(Ordering::Acquire), Ordering::Relaxed);
+        for (source, target) in self.records.iter().zip(&snapshot.records) {
+            if source.ready.load(Ordering::Acquire) == 1 {
+                for (source, target) in source.words.iter().zip(&target.words) {
+                    target.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+                target.ready.store(1, Ordering::Release);
+            }
+        }
+    }
+}
+
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
 #[repr(C)]
 pub struct Counters {
@@ -2974,6 +3036,7 @@ pub struct Counters {
     /// Carrier venue refusals, separate from ring routing refusals.
     pub venue_refused: [AtomicU64; 513],
     pub venue_refused_child: [AtomicU64; 513],
+    pub mmap_failures: MmapFailures,
 }
 
 /// The authority that declined to serve the operation.
@@ -3004,6 +3067,7 @@ impl Counters {
             refused_child: [const { AtomicU64::new(0) }; 513],
             venue_refused: [const { AtomicU64::new(0) }; 513],
             venue_refused_child: [const { AtomicU64::new(0) }; 513],
+            mmap_failures: MmapFailures::new(),
         }
     }
 
@@ -3061,6 +3125,7 @@ impl Counters {
                 Ordering::Relaxed,
             );
         }
+        self.mmap_failures.copy_to(&snapshot.mmap_failures);
         snapshot
     }
 
@@ -4566,7 +4631,7 @@ impl Default for InotifyNameCache {
 
 const _: () = {
     assert!(MAX_NAME_CACHE_PATH_LEN == NAME_CACHE_PATH_WORDS * core::mem::size_of::<u64>());
-    assert!(EL1_ABI_LAYOUT_HASH == 0x213ab60223bf134b);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x4e9f725f2b238b5b);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -4756,7 +4821,7 @@ mod tests {
                 + LifecycleDecline::COUNT
                 + AnonymousLeave::COUNT
                 + 4 * 513)
-                * 8
+                * 8 + core::mem::size_of::<MmapFailures>()
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);

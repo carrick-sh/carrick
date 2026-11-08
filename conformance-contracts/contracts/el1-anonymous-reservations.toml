@@ -23,6 +23,7 @@ rationale = "EL1 increment 2 anonymous reservation checkpoint (TASK 1). Under th
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_go_large_reservations_then_persistentalloc (production native entry; 3 x 64 GiB reservations and fixed commits, 1024 x 256 KiB mappings, deliberate data-limit ENOMEM validates bounded refusal census; no Go failure reproduction)",
   "carrick-kernel::dispatch::mem::delegated_tests::delegated_go_persistentalloc_after_hinted_arena (inferred Go startup reserve, fixed commit, advice, protection, then nil-hint 256 KiB RW mmap; control for #1862, not a red reproduction)",
   "carrick-kernel::dispatch::mem::delegated_tests::delegated_occupied_pie_hint_relocates_to_owner_code_range (both ISA call views forward the occupied PIE hint; host relocation keeps the anonymous owner and subsequent whole-range protection is recognized by both ISAs; zero backing allocation)",
   "carrick-kernel::dispatch::mem::delegated_tests::delegated_outside_hint_keeps_owner_protection (production host dispatch, owner-admitted 256 MiB outside-arena hint and unhinted control; R/RW/RWX protection remains owner-published with zero backing allocation)",

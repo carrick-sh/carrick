@@ -147,6 +147,7 @@ surfaces = [
   { path = "crates/carrick-el1-abi/src/ipc/tests.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-el1-abi/src/ipc/vectors.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-el1-abi/src/kernel_fault_venues.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.fault-entry" },
   { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.gic" },
   { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.guest-run-queue" },
