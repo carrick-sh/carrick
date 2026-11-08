@@ -16,6 +16,7 @@ use super::*;
 // Object waits are outside the first-entry loom model.
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 mod delegated;
+pub mod ipc_release;
 pub use delegated::{
     DELEGATED_FILE_WAIT_QUEUES, DelegatedFileWaitIndex, DelegatedLockRelease, DelegatedReleaseVenue,
 };
@@ -37,7 +38,9 @@ pub const EXTRA_CAUSE_QUEUES: usize = 5 * spaces::ADDRESS_SPACES;
 const DELEGATED_FILE_WAIT_BASE: usize = ORIGINAL_OBJECT_WAIT_QUEUES + EXTRA_CAUSE_QUEUES;
 const NATIVE_SERVICE_WAIT_BASE: usize = DELEGATED_FILE_WAIT_BASE + DELEGATED_FILE_WAIT_QUEUES;
 const MEMBER_RELEASE_WAIT_BASE: usize = NATIVE_SERVICE_WAIT_BASE + ZONE_RECORDS;
-pub const OBJECT_WAIT_QUEUES: usize = MEMBER_RELEASE_WAIT_BASE + ZONE_RECORDS;
+const IPC_LOCK_RELEASE_WAIT_BASE: usize = MEMBER_RELEASE_WAIT_BASE + ZONE_RECORDS;
+pub const OBJECT_WAIT_QUEUES: usize =
+    IPC_LOCK_RELEASE_WAIT_BASE + ipc_release::IPC_LOCK_RELEASE_QUEUES;
 
 // Every producer owns one disjoint index range. Keep this a compile-time gate
 // so adding a queue cannot silently alias another owner or its generation.
@@ -55,7 +58,8 @@ const _: () = {
         (ORIGINAL_OBJECT_WAIT_QUEUES, DELEGATED_FILE_WAIT_BASE),
         (DELEGATED_FILE_WAIT_BASE, NATIVE_SERVICE_WAIT_BASE),
         (NATIVE_SERVICE_WAIT_BASE, MEMBER_RELEASE_WAIT_BASE),
-        (MEMBER_RELEASE_WAIT_BASE, OBJECT_WAIT_QUEUES),
+        (MEMBER_RELEASE_WAIT_BASE, IPC_LOCK_RELEASE_WAIT_BASE),
+        (IPC_LOCK_RELEASE_WAIT_BASE, OBJECT_WAIT_QUEUES),
     ];
     let mut i = 0;
     while i < domains.len() {
@@ -76,7 +80,7 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 16;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 17;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
@@ -107,6 +111,9 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(crate::ZoneTables, native_service_waits) as u64,
         NATIVE_SERVICE_WAIT_BASE as u64,
         MEMBER_RELEASE_WAIT_BASE as u64,
+        IPC_LOCK_RELEASE_WAIT_BASE as u64,
+        ipc_release::IPC_LOCK_RELEASE_QUEUES as u64,
+        core::mem::offset_of!(crate::ZoneTables, ipc_lock_release_waits) as u64,
         core::mem::offset_of!(crate::ZoneTables, member_release_waits) as u64,
         crate::spaces::SPACE_NOTIFICATION_LAYOUT_HASH,
         core::mem::size_of::<ObjectQueue>() as u64,
@@ -1764,8 +1771,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             &self.delegated_file_waits[index - DELEGATED_FILE_WAIT_BASE]
         } else if index < MEMBER_RELEASE_WAIT_BASE {
             &self.native_service_waits[index - NATIVE_SERVICE_WAIT_BASE]
-        } else {
+        } else if index < IPC_LOCK_RELEASE_WAIT_BASE {
             &self.member_release_waits[index - MEMBER_RELEASE_WAIT_BASE]
+        } else {
+            &self.ipc_lock_release_waits[index - IPC_LOCK_RELEASE_WAIT_BASE]
         }
     }
 
@@ -3501,8 +3510,8 @@ mod host_tests {
         );
         assert_eq!(
             core::mem::offset_of!(ZoneTables, object_admission_handbacks),
-            core::mem::offset_of!(ZoneTables, member_release_waits)
-                + core::mem::size_of::<ObjectQueue>() * ZONE_RECORDS
+            core::mem::offset_of!(ZoneTables, ipc_lock_release_waits)
+                + core::mem::size_of::<ObjectQueue>() * ipc_release::IPC_LOCK_RELEASE_QUEUES
         );
         assert_eq!(
             core::mem::offset_of!(ZoneTables, delegated_host_pending)

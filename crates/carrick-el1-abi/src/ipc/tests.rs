@@ -1692,3 +1692,5 @@ fn object_growth_observation_excludes_the_segment_still_being_linked() {
     OBJECT_PUBLICATION_PROBE.set(false);
     assert_eq!(fx.region.grow_objects(seen), Ok(0));
 }
+
+mod lock_release;

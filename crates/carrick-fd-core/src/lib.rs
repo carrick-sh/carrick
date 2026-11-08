@@ -372,6 +372,13 @@ impl Extent {
 /// venue publishes it; a slot can only be installed through the
 /// `Covered` proof that call produces.
 pub trait SlotBacking {
+    /// The carrier's admitted release venue, borrowed by table lock guards.
+    /// Views without a scheduler (including standalone authorities) omit it.
+    fn table_lock_release(
+        &self,
+    ) -> Option<&dyn carrick_sched_core::object_wait::ipc_release::IpcLockRelease> {
+        None
+    }
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])>;
     fn ofd(&self, index: usize) -> Option<&OfdRecord>;
     /// Raise the venue's descriptor ceiling to at least `fd` before `fd`
@@ -1211,10 +1218,15 @@ impl<B: SlotBacking, W: LockWait, const T: usize> SlotTableTransaction<'_, '_, B
 
 pub(crate) struct Locked<'a> {
     pub(crate) record: &'a TableRecord,
+    release: Option<(
+        &'a dyn carrick_sched_core::object_wait::ipc_release::IpcLockRelease,
+        carrick_sched_core::object_wait::ipc_release::IpcLockIndex,
+    )>,
 }
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
         self.record.lock.store(0, Ordering::Release);
+
     }
 }
 
@@ -1252,7 +1264,8 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
     }
 
-    pub(crate) fn acquire(&self, record: &'a TableRecord) -> Result<Locked<'a>, Error> {
+    pub(crate) fn acquire(&self, index: usize) -> Result<Locked<'a>, Error> {
+        let record = self.core.tables.get(index).ok_or(Error::StaleTable)?;
         let mut attempt: u32 = 0;
         loop {
             if record
@@ -1260,7 +1273,15 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
                 .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                return Ok(Locked { record });
+                let release = self.backing.table_lock_release().map(|release| {
+                    let Some(index) =
+                        carrick_sched_core::object_wait::ipc_release::IpcLockIndex::table(index)
+                    else {
+                        unreachable!("IPC table outside its release domain");
+                    };
+                    (release, index)
+                });
+                return Ok(Locked { record, release });
             }
             attempt = attempt.saturating_add(1);
             if !self.wait.wait(attempt) {
@@ -1302,7 +1323,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             return Err(Error::StaleTable);
         }
         let record = self.core.tables.get(id.index).ok_or(Error::StaleTable)?;
-        let guard = self.acquire(record)?;
+        let guard = self.acquire(id.index)?;
         if !states.contains(&record.state.load(Ordering::Acquire))
             || record.generation.load(Ordering::Relaxed) != id.generation
         {
@@ -1624,7 +1645,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
         let view = self.storage(*storage)?;
         let index = self.pop_table()?;
-        let guard = match self.acquire(&self.core.tables[index]) {
+        let guard = match self.acquire(index) {
             Ok(guard) => guard,
             Err(e) => {
                 self.push_table(index);
@@ -2130,7 +2151,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         let child = self.storage(*storage)?;
         let index = self.pop_table()?;
         // The child is unpublished: only stale-ID holders can contend.
-        let guard = match self.acquire(&self.core.tables[index]) {
+        let guard = match self.acquire(index) {
             Ok(guard) => guard,
             Err(e) => {
                 self.push_table(index);
