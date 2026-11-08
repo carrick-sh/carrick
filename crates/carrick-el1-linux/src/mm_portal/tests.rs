@@ -3580,26 +3580,9 @@ fn anonymous_contention_then_metadata_provisions_without_park_serial_host() {
     assert_eq!(frame.elr, 0x1000);
     assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 0);
     assert_eq!(region.table().storage_generation(), generation + 1);
-    // A real SVC re-entry advances the saved instruction address again.
-    frame.elr += 4;
-    let route = serve_delegated_anonymous(
-        &mut frame,
-        &counters,
-        &task,
-        access,
-        region.table(),
-        &mut editor,
-        None,
-    );
-    assert_eq!(
-        route,
-        DelegatedAnonymous::Served,
-        "leaves={:?}",
-        counters
-            .anonymous_leaves
-            .each_ref()
-            .map(|counter| counter.load(Ordering::Relaxed))
-    );
+    // Returned is the ARM scheduler's owned completion: execution resumes at
+    // the original SVC, after the bank publication and without a handback.
+    // The executing x86 binding below also proves the replayed syscall result.
 }
 
 #[test]
