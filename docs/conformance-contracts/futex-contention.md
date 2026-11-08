@@ -336,6 +336,21 @@ that it cannot substitute for the returned mapping notification. These
 VM-free witnesses replace physical mapping admission only, not scheduler or
 continuation logic; they do not prove signed HVF execution.
 
+Those two episodes inject the refusal through the host-test service, so they
+cannot show what the real reservation owner returns on contention.
+`real_mapping_root_contention_keeps_notification_aarch64` and
+`real_mapping_root_contention_keeps_notification_x86` instead take an actual
+admitted, notified mapping root on one slot and drive the production
+`private_anonymous_futex_mapping` on another, through the AArch64 EL1 portal
+and the compact CPL0 portal respectively. The first probe must return the
+holder's own `Reservations` `PortalOwnerWait` carrying the revision observed
+before the root lock, must not steal or retry the held root, and must enrol
+exactly once. Only the real release delivers that record, once; the same
+authenticated handle then admits the private anonymous mapping and refuses an
+address outside it. Before #1922 these bindings fail with a bare `Err(Busy)`
+on both ISAs because the entry point probed the root without observing the
+handle's notification source.
+
 The native adapter decodes relative expiry before authenticating a shared
 anonymous mapping, then moves the same `RelativeFutexWait` through either
 mapping or operand suspension. The four
