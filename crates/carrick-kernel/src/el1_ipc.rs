@@ -20,18 +20,10 @@ use crate::el1_zone::HostLockWait;
 static NEXT_REGION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
-static INJECT_OBJECT_WAIT_BIND_BUSY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
 static INJECT_OBJECT_WAIT_KEY_OUT_OF_RANGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static LAST_OBJECT_WAIT_BIND_OBJECT: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-pub(crate) fn inject_object_wait_bind_busy_once() {
-    INJECT_OBJECT_WAIT_BIND_BUSY.store(true, Ordering::Release);
-}
 
 #[cfg(test)]
 pub(crate) fn inject_object_wait_key_out_of_range_once() {
@@ -53,7 +45,6 @@ pub(crate) fn take_last_object_wait_bind_object() -> Option<carrick_el1_abi::ipc
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
     NoMemory,
-    ObjectWaitBusy,
     ObjectWaitKeyOutOfRange,
     ObjectWaitInvariant(carrick_sched_core::object_wait::ObjectWaitError),
     ObjectRollbackInvariant(IpcError),
@@ -77,8 +68,6 @@ impl From<fd::Error> for AdmissionError {
 pub enum CreateError {
     /// The zone-wide file table is full (ENFILE, `fs.file-max`).
     FileTableFull,
-    /// A queue lock was contended while binding a new object's wait keys.
-    ObjectWaitBusy,
 }
 impl CreateError {
     /// Classify an admission refusal. The zone ceiling is ENFILE; any other
@@ -88,7 +77,6 @@ impl CreateError {
     pub fn from_admission(error: AdmissionError) -> Self {
         match error {
             AdmissionError::Shared(IpcError::ZoneLimit) => Self::FileTableFull,
-            AdmissionError::ObjectWaitBusy => Self::ObjectWaitBusy,
             error @ (AdmissionError::ObjectWaitKeyOutOfRange
             | AdmissionError::NoMemory
             | AdmissionError::ObjectWaitInvariant(_)
@@ -104,7 +92,6 @@ impl CreateError {
     pub fn errno(self) -> carrick_abi::LinuxErrno {
         match self {
             Self::FileTableFull => carrick_abi::LINUX_ENFILE,
-            Self::ObjectWaitBusy => carrick_abi::LINUX_EAGAIN,
         }
     }
 }
@@ -840,13 +827,6 @@ impl HostIpc {
                         "admitted object has no readiness wait key: {object:?}"
                     );
                 };
-                #[cfg(test)]
-                let result = if INJECT_OBJECT_WAIT_BIND_BUSY.swap(false, Ordering::AcqRel) {
-                    Err(carrick_sched_core::object_wait::ObjectWaitError::Busy)
-                } else {
-                    zone.bind_object_wait(key, &HostLockWait)
-                };
-                #[cfg(not(test))]
                 let result = zone.bind_object_wait(key, &HostLockWait);
                 if let Err(error) = result {
                     while bound_count > 0 {
@@ -881,9 +861,6 @@ impl HostIpc {
     }
     fn wait_bind_error(error: carrick_sched_core::object_wait::ObjectWaitError) -> AdmissionError {
         match error {
-            carrick_sched_core::object_wait::ObjectWaitError::Busy => {
-                AdmissionError::ObjectWaitBusy
-            }
             carrick_sched_core::object_wait::ObjectWaitError::Exhausted => {
                 AdmissionError::ObjectWaitKeyOutOfRange
             }
