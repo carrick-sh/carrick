@@ -1,15 +1,15 @@
 # Print the directory cargo builds into when invoked from crate directory $1.
 #
-# cargo honours CARGO_TARGET_DIR (resolved against the invoking directory when
-# relative) and otherwise uses <crate>/target. Worker VMs set CARGO_TARGET_DIR
-# to a shared state directory (carrick-conductor worker_exec), so a fixture
-# script that hard-codes "$crate_dir/target" copies from a directory cargo
-# never wrote (#1888). Sourced by the scripts/build-embed-*.sh fixture builders.
+# Ask cargo rather than re-deriving its rules: CARGO_TARGET_DIR,
+# CARGO_BUILD_TARGET_DIR and `build.target-dir` in any inherited cargo config
+# all move it, and a hand-written subset copied a stale binary without error
+# when one of the others was set (#1913 review). Worker VMs set
+# CARGO_TARGET_DIR to a shared state directory (carrick-conductor
+# worker_exec), so a fixture script that hard-codes "<crate>/target" copies
+# from a directory cargo never wrote. Sourced by the scripts/build-embed-*.sh
+# fixture builders. POSIX sh has no `local`, so only "$1" is used here and the
+# caller's variables are left untouched.
 cargo_target_dir() {
-    crate_dir=$1
-    case "${CARGO_TARGET_DIR:-}" in
-        "") printf '%s\n' "$crate_dir/target" ;;
-        /*) printf '%s\n' "$CARGO_TARGET_DIR" ;;
-        *) printf '%s\n' "$crate_dir/$CARGO_TARGET_DIR" ;;
-    esac
+    (cd "$1" && cargo metadata --format-version 1 --no-deps --locked) |
+        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'
 }
