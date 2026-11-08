@@ -45,10 +45,15 @@ rationale = "Admission creates one native process owner for the retained root an
 # The VM-free witness holds real pending custody, then drops it and directly
 # retries production registration: exactly one member and index are added.
 # Notification-driven retry needs #887 release plumbing and is not claimed.
+# Round 3: five existing threads carry distinct 4096..5124-entry group vectors.
+# Production registration must preserve their backing pointers, capacities and
+# contents, and the pre-reserved table, while copying only the new credentials.
+# This is a deterministic payload-copy budget, not a runtime-ratio claim.
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue",
   "carrick-el1-linux::native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable",
+  "carrick-el1-linux::native_process_runtime::host_test_support::register_thread_preserves_existing_credential_storage",
   "carrick-el1-linux::aarch64_process_tests::native_retirement_tests::two_live_processes_reauthenticate_birth_settlement_after_parent_generation_moves",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
