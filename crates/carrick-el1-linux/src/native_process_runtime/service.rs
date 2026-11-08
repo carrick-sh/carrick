@@ -643,6 +643,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         mut output: OwnedCopyout<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
+        if !output.prefix_on_fault
+            && !carrick_guest_arch::lower_half_range(
+                output.address.raw(),
+                output.bytes.len() as u64,
+            )
+        {
+            return Err(NativeProcessError::Fault);
+        }
         let mut prepared_offset = None;
         while output.offset < output.bytes.len() {
             let previous_prepared_offset = prepared_offset.take();
@@ -900,6 +908,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         request: carrick_core::user_copy::GuestCopyRequest,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
+        // Bad user ranges are an ABI fault before they can be confused
+        // with an invalid owner operation or overflowing transfer record.
+        if !carrick_guest_arch::lower_half_range(request.address.raw(), request.len.raw()) {
+            return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+        }
         let mm = self
             .runtime
             .graph
