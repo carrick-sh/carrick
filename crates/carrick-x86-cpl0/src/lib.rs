@@ -25,6 +25,24 @@ mod test_support {
     pub const INJECT_PREPARED_CONFLICT_ONCE: u64 = 0xffff_ffff_ffff_fe12;
     pub const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
     pub const INJECT_METADATA_REQUIRED_ONCE: u64 = 0xffff_ffff_ffff_fe14;
+    pub const INJECT_WAIT_HANDBACK_CENSUS: u64 = 0xffff_ffff_ffff_fe15;
+    pub const INJECT_METADATA_ON_REPROBE_ONCE: u64 = 0xffff_ffff_ffff_fe16;
+    static ANONYMOUS_WAIT_HANDBACKS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    static METADATA_ON_REPROBE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    pub fn record_anonymous_wait_handback() {
+        ANONYMOUS_WAIT_HANDBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn arm_metadata_for_reprobe() {
+        if METADATA_ON_REPROBE.swap(false, Ordering::AcqRel)
+            && !carrick_core::mm::reservation::inject_metadata_required_once()
+        {
+            carrick_x86_carrier::entry::fatal_boot();
+        }
+    }
 
     pub fn dispatch(
         native: u64,
@@ -55,6 +73,11 @@ mod test_support {
                         .load(Ordering::Acquire),
                 )
             }
+            INJECT_WAIT_HANDBACK_CENSUS => Some(ANONYMOUS_WAIT_HANDBACKS.load(Ordering::Acquire)),
+            INJECT_METADATA_ON_REPROBE_ONCE => METADATA_ON_REPROBE
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
             _ => None,
         }
     }
