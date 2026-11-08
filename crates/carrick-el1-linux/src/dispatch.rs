@@ -3744,7 +3744,13 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
     #[inline(never)]
     fn serve_pipe_metadata(&mut self) -> FamilyCompletion {
         use crate::ipc;
-        use carrick_abi::*;
+        use carrick_abi::{
+            CARRICK_PRIVATE_X86_FSTAT, CARRICK_PRIVATE_X86_NEWFSTATAT, LINUX_AT_EMPTY_PATH,
+            LINUX_AT_NO_AUTOMOUNT, LINUX_AT_SYMLINK_NOFOLLOW, LINUX_EBUSY, LINUX_EFAULT,
+            LINUX_EINVAL, LINUX_ENOTTY, LINUX_EPERM, LINUX_ESPIPE, LINUX_F_SETPIPE_SZ,
+            LINUX_FIOCLEX, LINUX_FIONBIO, LINUX_FIONCLEX, LINUX_FIONREAD, LinuxPipeIdentity,
+            LinuxStat, LinuxX8664Stat,
+        };
         use carrick_el1_abi::ipc::{
             IpcBacking,
             fd::{Fd, TableId},
