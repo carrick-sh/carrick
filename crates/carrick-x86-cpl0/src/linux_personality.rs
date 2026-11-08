@@ -1048,6 +1048,77 @@ impl Personality for LinuxPersonality {
                     _ => fatal_boot(),
                 };
             }
+            if route == CompletionRoute::Forward
+                && let Some(stage) = crate::native_host_file::stage(&call, task, binding.cpu_slot)
+            {
+                use carrick_el1_linux::native_process_runtime::{NativeResume, NativeServiceCall};
+                // SAFETY: the admitted CPU binding retains the initialized counter
+                // region for the entire native service continuation.
+                let counters: &'static Counters =
+                    unsafe { &*(binding.counters_address as *const Counters) };
+                use carrick_personality_linux::native_host_file::HostFileStage;
+                let result = match stage {
+                    HostFileStage::Request {
+                        record,
+                        output,
+                        resolves_path,
+                        map,
+                        chdir,
+                    } => {
+                        match process.begin_host_file_call(
+                            record,
+                            output,
+                            resolves_path,
+                            map,
+                            chdir,
+                            NativeServiceCall::new(
+                                carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                                counters,
+                            ),
+                        ) {
+                            Ok(NativeResume::Left(None)) => None,
+                            Ok(NativeResume::Returned(result)) => Some(result.raw()),
+                            _ => fatal_boot(),
+                        }
+                    }
+                    HostFileStage::Returned(result) => Some(result.raw()),
+                    HostFileStage::InRingReply { output, bytes } => {
+                        let mut copy = carrick_el1_linux::file::ValidatedCopy {
+                            task,
+                            validator: &carrick_el1_linux::file::HardwareValidator,
+                        };
+                        Some(
+                            if carrick_el1_linux::file::UserCopy::copy_out(
+                                &mut copy,
+                                output.address,
+                                &bytes,
+                            ) {
+                                0
+                            } else {
+                                carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+                            },
+                        )
+                    }
+                    HostFileStage::InRing | HostFileStage::Fault { .. } => {
+                        counters.record_refusal(
+                            carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                            if process.is_root_process() {
+                                carrick_core_abi::service::ServiceOrigin::Initial
+                            } else {
+                                carrick_core_abi::service::ServiceOrigin::Descendant
+                            },
+                            carrick_el1_abi::RefusalVenue::Ring,
+                        );
+                        Some(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
+                    }
+                };
+                route = if let Some(result) = result {
+                    frame.rax = result as u64;
+                    CompletionRoute::Served
+                } else {
+                    CompletionRoute::Suspended
+                };
+            }
             if let Some(reason) = process.take_run_failure() {
                 complete_run_failure(task, reason);
             }
