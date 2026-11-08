@@ -115,8 +115,10 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
         ReservationMm::new(self.sched.task.mm.key.load(Ordering::Acquire))
     }
     fn timed_wait_allowed(&self) -> bool {
-        let slot = self.sched.zone.slot(self.sched.slot);
-        slot.current().is_none() || slot.current() == slot.host_record()
+        // Timers are leased to the exact record/park sequence, not to the
+        // vCPU's host record. Native fork/exec descendants use that same
+        // scheduler owner and must not escape to a nonexistent host task.
+        true
     }
     fn read_u64(&self, address: UserVa) -> Option<u64> {
         self.sched.user.read_u64(self.sched.task, address.raw())

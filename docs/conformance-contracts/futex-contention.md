@@ -309,3 +309,14 @@ Shared operation 265 observed at native pthread_join, non-NULL absolute
 WAIT_BITSET timeouts and PI variants remain outside this correction. Signed
 Node startup and GNU/musl forkexecpthread must still run on the director's Mac;
 passing this VM-free binding alone does not close the reported abort.
+
+## Native exec child timed admission (#1862)
+
+`serial_host_native_fork_exec_child_timed_futex` extends the real native
+fork/exec fixture with a relative timeout. The production syscall path must
+retain it across one owner-copy refusal, compare atomically on resumption,
+then park a matching wait and count exactly one sibling wake. Neither wait
+nor wake may forward. The scheduler already leases timers to exact records
+and park sequences; the former host-record-only admission check was stale.
+The switched-in scheduler witness also requires numeric timeout `-110` and
+consumption of its expired timer lease. Signed Go execution remains open.
