@@ -502,8 +502,8 @@ fn complete_poll<M: carrick_guest_mem::CurrentMmMemory>(
     cause: Option<IpcCause>,
     wake: &impl IpcHostServices,
 ) -> Result<IpcHostOutcome, IpcError> {
-    use super::output::PollReventsOutput;
     use crate::dispatch::copyout::{self, UserSlot};
+    use carrick_abi::PollReventsOutput;
     use carrick_el1_abi::ipc::{IpcBacking, WriteProgress, epoll::EpollMember};
     use carrick_guest_mem::GuestVa;
     let complete = |result| IpcHostOutcome::Complete {

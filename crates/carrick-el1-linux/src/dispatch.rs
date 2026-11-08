@@ -2466,6 +2466,69 @@ fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
     }
 }
 
+fn complete_poll_array<'p, C: carrick_core_abi::EntryContext>(
+    process: Option<&mut (dyn lifecycle::ProcessNative<'_, C> + 'p)>,
+    task: &CurrentTask,
+    address: carrick_guest_arch::UserVa,
+    pollfds: &[super::file_table::PollFd],
+    result: SyscallResult,
+    diagnostic: (&Counters, carrick_syscall_abi::CanonicalNr, [u64; 6], u64),
+) -> FamilyCompletion {
+    let mut fields = alloc::vec::Vec::new();
+    if fields.try_reserve_exact(pollfds.len()).is_err() {
+        return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_ENOMEM.guest_retval());
+    }
+    for (index, pollfd) in pollfds.iter().enumerate() {
+        let Some(record) = index
+            .checked_mul(core::mem::size_of::<carrick_abi::LinuxPollFd>())
+            .and_then(|offset| address.raw().checked_add(offset as u64))
+        else {
+            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
+        };
+        fields.push(carrick_abi::PollReventsOutput::new(
+            carrick_guest_arch::GuestVa::new(record),
+            pollfd.revents,
+        ));
+    }
+    if let Some(process) = process {
+        let outcome = process.complete_poll_copyout(fields, result);
+        if matches!(&outcome, lifecycle::LifecycleOutcome::Returned { result, .. } if result.raw() == -14)
+        {
+            diagnostic
+                .0
+                .record_copy_refusal(carrick_el1_abi::CopyRefusal {
+                    ordinal: diagnostic.1,
+                    arguments: diagnostic.2,
+                    pc: diagnostic.3,
+                    address,
+                    len: carrick_guest_arch::GuestLen::new(
+                        (pollfds.len() * core::mem::size_of::<carrick_abi::LinuxPollFd>()) as u64,
+                    ),
+                    argument: Some(0),
+                    access: carrick_guest_arch::Access::Write,
+                    reason: carrick_el1_abi::CopyRefusalReason::OwnerFault,
+                    owner_present: true,
+                    presented: Some(process.binding()),
+                    expected: Some(crate::common_entry::execution_binding(task)),
+                });
+        }
+        return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+    }
+    let mut copy = file::ValidatedCopy {
+        task,
+        validator: &file::HardwareValidator,
+    };
+    for field in &fields {
+        let Ok((address, bytes)) = field.unit() else {
+            return FamilyCompletion::Forward;
+        };
+        if !copy.copy_out(address.raw(), bytes) {
+            return FamilyCompletion::Forward;
+        }
+    }
+    FamilyCompletion::Complete(result.raw())
+}
+
 #[cfg(test)]
 #[test]
 fn host_owned_poll_copyout_refusal_keeps_the_host_fallback() {
@@ -2816,20 +2879,14 @@ impl<
                 let Some(ready) = ready else {
                     return FamilyCompletion::Forward;
                 };
-                let out_bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        pollfds.as_ptr() as *const u8,
-                        nfds * core::mem::size_of::<super::file_table::PollFd>(),
-                    )
-                };
                 let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
                     return FamilyCompletion::Forward;
                 };
-                return complete_poll_copyout(
+                return complete_poll_array(
                     self.process.as_deref_mut(),
                     task,
                     carrick_guest_arch::UserVa::new(fds_ptr),
-                    out_bytes,
+                    &pollfds,
                     SyscallResult::new(ready as i64),
                     (
                         self.counters,
@@ -2857,18 +2914,12 @@ impl<
         let Some(ready) = ready else {
             return FamilyCompletion::Forward;
         };
-        let out_bytes = unsafe {
-            core::slice::from_raw_parts(
-                pollfds.as_ptr() as *const u8,
-                nfds * core::mem::size_of::<super::file_table::PollFd>(),
-            )
-        };
         if ready > 0 || timeout_ms == 0 {
-            complete_poll_copyout(
+            complete_poll_array(
                 self.process.as_deref_mut(),
                 task,
                 carrick_guest_arch::UserVa::new(fds_ptr),
-                out_bytes,
+                &pollfds,
                 SyscallResult::new(ready as i64),
                 (
                     self.counters,

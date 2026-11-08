@@ -5,7 +5,7 @@ guest_surfaces = ["syscall:poll", "syscall:ppoll", "syscall:select", "syscall:ps
 semantic_authority = ["man 2 poll", "man 2 select", "man 7 epoll"]
 fixture = "VM-free scoped two-owner seam; see M2-M5 witness ledger"
 scale_points = [1, 8, 64]
-rationale = "Zone wait enrollment must create zero host readiness proxies at each scale; count only scoped proxy handles, never global fd deltas. Existing epoll record tests prove LT/ET/ONESHOT and detach, not mixed completion incarnation or mask transactions."
+rationale = "Zone wait enrollment must create zero host readiness proxies at each scale; count only scoped proxy handles, never global fd deltas. Poll output publishes exactly one two-byte revents field per entry, without rewriting fd or events; the dispatcher witness counts writes at all scale points. Existing epoll record tests prove LT/ET/ONESHOT and detach, not mixed completion incarnation or mask transactions."
 structural_budgets = []
 
 [bindings]
@@ -15,9 +15,11 @@ vm_free = [
   "carrick-kernel::dispatch::net::epoll_zone::tests::red_until_step3_m3_zone_pipe_waits_create_host_proxies",
   "carrick-kernel::dispatch::net::netlink_readiness_tests::{poll_and_epoll_negative_and_absent_fd_semantics,epoll_ctl_rejects_two_description_cycle_with_eloop,epoll_readiness_tracks_stored_target_identity_after_fd_close_and_reuse}",
   "carrick-el1-linux::ipc::tests::{ppoll_nfds_is_bounded_by_the_tables_soft_rlimit_nofile,ppoll_set_the_ring_cannot_allocate_is_enomem,x86_cpl0_poll_is_served_by_the_shared_body}",
+  "carrick-el1-linux::ipc::tests::{x86_shared_poll_preserves_fields_changed_during_host_wait,arm_immediate_poll_writes_only_the_writable_revents_page,immediate_poll_copyout_scales_as_one_revents_field_per_entry}",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_prepared_fork_parent_poll_observes_child_pipe_write",
   "carrick-el1-linux::ipc::tests::{production_zone_ppoll_ignores_negative_fd,production_zone_ppoll_events_zero_parks_until_writer_close,production_zone_ppoll_full_writer_with_both_interests_wakes_on_drain}",
   "carrick-el1-linux::aarch64_process_tests::serial_host_zone_poll_output_owner_wait_preserves_ready_answer",
+  "carrick-el1-linux::native_process_runtime::host_test_support::{production_trap_frame_ppoll_retains_completed_output_across_owner_wait,poll_revents_crossing_a_page_retains_partial_copy_and_fault}",
 ]
 
 [bindings.unresolved]

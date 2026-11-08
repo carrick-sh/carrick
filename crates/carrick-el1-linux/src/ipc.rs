@@ -5711,6 +5711,56 @@ mod tests {
         assert_eq!(published.revents, 0);
     }
 
+    #[test]
+    fn immediate_poll_copyout_scales_as_one_revents_field_per_entry() {
+        let w = world();
+        let tables = delegated();
+        let timeout = zero_timespec();
+        for count in [1, 8, 64] {
+            for x86 in [false, true] {
+                let fds = GuestUserBuffer::from_values(&vec![
+                    PollFd {
+                        fd: -1,
+                        events: LINUX_POLLIN,
+                        revents: 0x7777,
+                    };
+                    count
+                ]);
+                let writes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let observed = writes.clone();
+                carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |address, len, access| {
+                        if access == carrick_guest_arch::Access::Write {
+                            observed.borrow_mut().push((address.raw(), len.raw()));
+                        }
+                        true
+                    }));
+                });
+                let route = if x86 {
+                    let mut frame = X86PollFrame::new(
+                        carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
+                        [fds.arg(), count as u64, 0, 0, 0],
+                    );
+                    dispatch_poll(&w, &mut frame, None, &tables)
+                } else {
+                    let mut frame = TrapFrame::default();
+                    frame.x[..5].copy_from_slice(&[fds.arg(), count as u64, timeout.arg(), 0, 0]);
+                    frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+                    dispatch_poll(&w, &mut frame, None, &tables)
+                };
+                carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+                    *hook.borrow_mut() = None;
+                });
+                assert_eq!(route, CompletionRoute::Served);
+                let expected: Vec<_> = (0..count)
+                    .map(|index| (fds.arg() + (index * 8 + 6) as u64, 2))
+                    .collect();
+                assert_eq!(*writes.borrow(), expected, "x86={x86}, count={count}");
+                assert!((0..count).all(|index| revents(&fds, index) == 0));
+            }
+        }
+    }
+
     /// ppoll(2)/poll(2): nfds above the caller's soft RLIMIT_NOFILE is
     /// EINVAL; at the limit the set is served. Linux reads the timespec and
     /// then the signal mask before it compares nfds, so their EFAULTs win.

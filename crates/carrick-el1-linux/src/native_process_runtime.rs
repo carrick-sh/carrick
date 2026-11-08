@@ -7827,8 +7827,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         effect: Box<dyn carrick_personality_linux::lifecycle::CopyoutEffect + 'a>,
     ) -> LifecycleOutcome {
         let result = self.finish_copyout(service::OwnedCopyout {
-            address,
-            bytes,
+            data: service::CopyoutData::Bytes { address, bytes },
             offset: 0,
             result: SyscallResult::new(0),
             prefix_on_fault: false,
@@ -7843,8 +7842,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         result: SyscallResult,
     ) -> LifecycleOutcome {
         let result = self.finish_copyout(service::OwnedCopyout {
-            address,
-            bytes,
+            data: service::CopyoutData::Bytes { address, bytes },
+            offset: 0,
+            prefix_on_fault: false,
+            result,
+            effect: None,
+        });
+        self.finish_output_outcome(result)
+    }
+    fn complete_poll_copyout(
+        &mut self,
+        fields: Vec<carrick_abi::PollReventsOutput>,
+        result: SyscallResult,
+    ) -> LifecycleOutcome {
+        let result = self.finish_copyout(service::OwnedCopyout {
+            data: service::CopyoutData::Poll(fields),
             offset: 0,
             prefix_on_fault: false,
             result,

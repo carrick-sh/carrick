@@ -134,12 +134,49 @@ struct PendingHostFile<'a> {
 
 /// Ring-owned input of a typed service, retained until completion ACK.
 pub(super) struct OwnedCopyout<'a> {
-    pub address: UserVa,
-    pub bytes: Vec<u8>,
+    pub data: CopyoutData,
     pub offset: usize,
     pub result: SyscallResult,
     pub prefix_on_fault: bool,
     pub effect: Option<Box<dyn carrick_personality_linux::lifecycle::CopyoutEffect + 'a>>,
+}
+
+pub(super) enum CopyoutData {
+    Bytes { address: UserVa, bytes: Vec<u8> },
+    Poll(Vec<carrick_abi::PollReventsOutput>),
+}
+
+impl CopyoutData {
+    fn len(&self) -> usize {
+        match self {
+            Self::Bytes { bytes, .. } => bytes.len(),
+            Self::Poll(fields) => fields.len() * 2,
+        }
+    }
+
+    fn unit(&self, offset: usize) -> Result<(UserVa, &[u8]), NativeProcessError> {
+        let (address, bytes) = match self {
+            Self::Bytes { address, bytes } => {
+                let address = address
+                    .raw()
+                    .checked_add(offset as u64)
+                    .ok_or(NativeProcessError::Fault)?;
+                (UserVa::new(address), &bytes[offset..])
+            }
+            Self::Poll(fields) => {
+                let (address, bytes) = fields[offset / 2]
+                    .unit()
+                    .map_err(|_| NativeProcessError::Fault)?;
+                let within = offset % 2;
+                let address = address
+                    .checked_add(within as u64)
+                    .ok_or(NativeProcessError::Fault)?;
+                (address.to_descriptor_va(), &bytes[within..])
+            }
+        };
+        let count = (4096 - (address.raw() as usize & 4095)).min(bytes.len());
+        Ok((address, &bytes[..count]))
+    }
 }
 
 /// Physical preparation is enrolled only after the IPC dispatch stack unwinds.
@@ -591,27 +628,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         mut output: OwnedCopyout<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
-        if !output.prefix_on_fault
-            && !carrick_guest_arch::lower_half_range(
-                output.address.raw(),
-                output.bytes.len() as u64,
-            )
-        {
-            return Err(NativeProcessError::Fault);
+        if !output.prefix_on_fault {
+            if let CopyoutData::Bytes { address, bytes } = &output.data {
+                if !carrick_guest_arch::lower_half_range(address.raw(), bytes.len() as u64) {
+                    return Err(NativeProcessError::Fault);
+                }
+            }
         }
         let mut prepared_offset = None;
-        while output.offset < output.bytes.len() {
+        while output.offset < output.data.len() {
             let previous_prepared_offset = prepared_offset.take();
-            let address = output
-                .address
-                .raw()
-                .checked_add(output.offset as u64)
-                .ok_or(NativeProcessError::Fault)?;
-            let count = (4096 - (address as usize & 4095)).min(output.bytes.len() - output.offset);
-            match self.copy_owner_frame(
-                UserVa::new(address),
-                &output.bytes[output.offset..output.offset + count],
-            ) {
+            let (address, bytes) = output.data.unit(output.offset)?;
+            let count = bytes.len();
+            if matches!(output.data, CopyoutData::Poll(_))
+                && !carrick_guest_arch::lower_half_range(address.raw(), count as u64)
+            {
+                return Err(NativeProcessError::Fault);
+            }
+            match self.copy_owner_frame(address, bytes) {
                 Ok(()) => output.offset += count,
                 Err(NativeProcessError::OwnerWait(wait)) => {
                     return self.begin_service_inner(
@@ -641,7 +675,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }
                     let preparation =
                         self.prepare_owner_output(carrick_core::mm::transaction::CopyoutRequest {
-                            address: UserVa::new(address),
+                            address,
                             len: carrick_guest_arch::GuestLen::new(count as u64),
                         });
                     match preparation {
@@ -674,7 +708,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         Err(NativeProcessError::Unsupported) => {
                             let (fault, sequence) = self
                                 .service
-                                .copyout_fault(UserVa::new(address))
+                                .copyout_fault(address)
                                 .ok_or(NativeProcessError::Unsupported)?;
                             return self.begin_service_inner(
                                 ServiceOperation::Fault(fault),
@@ -2993,8 +3027,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             && let Ok((value, bytes)) = carrick_core_abi::service::entropy::reply(record)
         {
             output = Some(Box::new(OwnedCopyout {
-                address: *address,
-                bytes: bytes.to_vec(),
+                data: CopyoutData::Bytes {
+                    address: *address,
+                    bytes: bytes.to_vec(),
+                },
                 offset: 0,
                 result: SyscallResult::new(if value == 0 && *empty_fault {
                     carrick_syscall_abi::LINUX_EFAULT.guest_retval()

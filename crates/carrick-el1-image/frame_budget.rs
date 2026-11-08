@@ -563,7 +563,9 @@ impl Frames {
                     ])
                     + self.maximum("::complete_copyout::")
                     + self.qualified("El1PendingFamilies", "::poll::")
-                    + self.maximum("::complete_poll_copyout::")
+                    + self
+                        .maximum("::complete_poll_copyout::")
+                        .max(self.maximum("::complete_poll_array::"))
                     + write,
             ),
             (

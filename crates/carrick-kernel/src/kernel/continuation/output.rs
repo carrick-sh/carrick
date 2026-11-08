@@ -8,7 +8,7 @@ use crate::dispatch::{
 };
 use crate::kernel::objects::{ThreadExecutionLease, ThreadKey};
 use crate::kernel::{KernelContext, KernelTaskBinding, MmId};
-use carrick_abi::{LINUX_EFAULT, LINUX_EINVAL, LinuxErrno};
+use carrick_abi::{LINUX_EFAULT, LINUX_EINVAL, LinuxErrno, PollReventsOutput};
 use carrick_guest_mem::{GuestVa, MemoryError, MemoryReadWait, OwnedReadContinuation};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -275,32 +275,6 @@ pub(crate) struct FdWaitOutput {
     ready: i64,
     writes: FdWaitWrites,
     retained_wait: Option<crate::dispatch::fd_wait::BlockingFdWait>,
-}
-
-/// A poll result can publish only `revents`; fd/events remain caller-owned.
-/// Shared by fd-wait publication and retained IPC handback publication.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct PollReventsOutput {
-    record: GuestVa,
-    bytes: [u8; 2],
-}
-
-impl PollReventsOutput {
-    pub(crate) fn new(record: GuestVa, revents: i16) -> Self {
-        Self {
-            record,
-            bytes: revents.to_ne_bytes(),
-        }
-    }
-
-    pub(crate) fn unit(&self) -> Result<(GuestVa, &[u8; 2]), LinuxErrno> {
-        let address = self
-            .record
-            .raw()
-            .checked_add(core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64)
-            .ok_or(LINUX_EFAULT)?;
-        Ok((GuestVa::new(address), &self.bytes))
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

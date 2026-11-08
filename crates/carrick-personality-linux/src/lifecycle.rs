@@ -348,6 +348,17 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
             work: false,
         }
     }
+    /// Retain the completed poll result and its individual output fields.
+    fn complete_poll_copyout(
+        &mut self,
+        _fields: alloc::vec::Vec<carrick_abi::PollReventsOutput>,
+        _result: SyscallResult,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::new(carrick_syscall_abi::LINUX_EFAULT.guest_retval()),
+            work: false,
+        }
+    }
     /// The private file byte source the native host-file venue retained for
     /// exactly this thread's retried `mmap` with `key`, consumed once, and
     /// every source this thread was given but will not map (to retire).

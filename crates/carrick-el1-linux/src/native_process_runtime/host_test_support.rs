@@ -4945,8 +4945,10 @@ fn completed_output_busy_yields(in_preparation: bool) {
             .unwrap();
         let result = entry.finish_copyout(service::OwnedCopyout {
             effect: None,
-            address: UserVa::new(0x10000),
-            bytes: bytes.clone(),
+            data: service::CopyoutData::Bytes {
+                address: UserVa::new(0x10000),
+                bytes: bytes.clone(),
+            },
             offset: 0,
             result: SyscallResult::new(37),
             prefix_on_fault: false,
@@ -5028,6 +5030,60 @@ fn completed_poll_output_copy_busy_yields_then_delivers_the_answer() {
 #[test]
 fn completed_poll_output_preparation_busy_yields_then_delivers_the_answer() {
     completed_output_busy_yields(true);
+}
+
+#[test]
+fn poll_revents_crossing_a_page_retains_partial_copy_and_fault() {
+    let fixture = native_exec_fixture();
+    let mut service = fixture.service();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    for fault in [false, true] {
+        service.child_copy_error = fault.then_some(NativeProcessError::Fault);
+        service.child_copy_error_at = Some(0x11000);
+        take_signal_copies();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let output = service::OwnedCopyout {
+            effect: None,
+            data: service::CopyoutData::Poll(vec![carrick_abi::PollReventsOutput::new(
+                carrick_guest_arch::GuestVa::new(0x10ff9),
+                0x1234,
+            )]),
+            offset: 0,
+            result: SyscallResult::new(1),
+            prefix_on_fault: false,
+        };
+        let result = entry.finish_copyout(output);
+        let bytes = 0x1234_i16.to_ne_bytes();
+        if fault {
+            assert!(matches!(result, Err(NativeProcessError::Fault)));
+            assert_eq!(
+                take_signal_copies(),
+                [(UserVa::new(0x10fff), vec![bytes[0]])]
+            );
+        } else {
+            assert!(matches!(result, Ok(NativeResume::Returned(value)) if value.raw() == 1));
+            assert_eq!(
+                take_signal_copies(),
+                [
+                    (UserVa::new(0x10fff), vec![bytes[0]]),
+                    (UserVa::new(0x11000), vec![bytes[1]])
+                ]
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5131,7 +5187,11 @@ fn retained_poll_output_owner_wait(
     let observed =
         notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
-    let output_address = address;
+    let output_address = if production_frame && !constructor {
+        address + 6
+    } else {
+        address
+    };
     service.on_copy_complete = Some(Box::new(move |address| {
         if address.raw() == output_address {
             access.raise(space.index());
@@ -5153,7 +5213,11 @@ fn retained_poll_output_owner_wait(
         )
     };
     service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
-    service.child_copy_error_at = Some(address + piece);
+    service.child_copy_error_at = Some(if production_frame && !constructor {
+        address + 14
+    } else {
+        address + piece
+    });
     let bytes: Vec<u8> = if constructor {
         [0i32, 1i32]
             .into_iter()
@@ -5253,10 +5317,17 @@ fn retained_poll_output_owner_wait(
             assert!(entry.take_handoff_receipt().is_some());
         }
     }
-    assert_eq!(
-        take_output(&mut service),
-        [(UserVa::new(address), bytes[..piece as usize].to_vec())]
-    );
+    if production_frame && !constructor {
+        assert_eq!(
+            take_output(&mut service),
+            [(UserVa::new(address + 6), bytes[6..8].to_vec())]
+        );
+    } else {
+        assert_eq!(
+            take_output(&mut service),
+            [(UserVa::new(address), bytes[..piece as usize].to_vec())]
+        );
+    }
     if let Some(table) = constructor_table.as_ref() {
         for fd in [0, 1] {
             assert_eq!(
@@ -5339,13 +5410,26 @@ fn retained_poll_output_owner_wait(
         assert!(
             matches!(resumed, NativeResume::Returned(result) if result.raw() == expected_result)
         );
-        assert_eq!(
-            take_output(&mut service),
-            [(
-                UserVa::new(address + piece),
-                bytes[piece as usize..].to_vec()
-            )]
-        );
+        if production_frame && !constructor {
+            let expected: Vec<_> = (1..1024)
+                .map(|index| {
+                    let offset = index * 8 + 6;
+                    (
+                        UserVa::new(address + offset as u64),
+                        bytes[offset..offset + 2].to_vec(),
+                    )
+                })
+                .collect();
+            assert_eq!(take_output(&mut service), expected);
+        } else {
+            assert_eq!(
+                take_output(&mut service),
+                [(
+                    UserVa::new(address + piece),
+                    bytes[piece as usize..].to_vec()
+                )]
+            );
+        }
     }
     if let Some(table) = constructor_table.as_ref() {
         let region = constructor_owner.as_ref().unwrap().region();
