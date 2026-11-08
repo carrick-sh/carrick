@@ -318,8 +318,8 @@ enum CensusScope {
     FixtureUser,
 }
 
-fn census_output(path: &Path, directory: bool, scope: CensusScope) -> Option<std::process::Output> {
-    let lsof = std::env::var_os("PATH").and_then(|paths| {
+pub(crate) fn lsof_binary() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|dir| dir.join("lsof"))
             .find(|file| {
@@ -327,7 +327,11 @@ fn census_output(path: &Path, directory: bool, scope: CensusScope) -> Option<std
                     .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
             })
             .and_then(|file| fs::canonicalize(file).ok())
-    })?;
+    })
+}
+
+fn census_output(path: &Path, directory: bool, scope: CensusScope) -> Option<std::process::Output> {
+    let lsof = lsof_binary()?;
     // SAFETY: geteuid has no preconditions and observes the invoking user.
     let privileged = match scope {
         CensusScope::AllUsers => true,
