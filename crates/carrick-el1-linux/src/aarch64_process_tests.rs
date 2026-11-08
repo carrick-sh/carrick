@@ -10847,16 +10847,193 @@ fn native_descriptor_witness(
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_prepared_fork_parent_ppoll_prepared_pollfd() {
-    native_descriptor_argument_witness(None, true, false, false, false, false, true, Some(false));
+    native_descriptor_argument_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        true,
+        Some(PreparedPollArgument::Pollfd),
+    );
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_prepared_fork_parent_ppoll_prepared_timeout() {
-    native_descriptor_argument_witness(None, true, false, false, false, false, true, Some(true));
+    native_descriptor_argument_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        true,
+        Some(PreparedPollArgument::Timeout),
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq)]
+enum PreparedPollArgument {
+    Pollfd,
+    Timeout,
+    Unmapped,
+    Forbidden,
+    EventfdInput,
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_prepared_fork_parent_ppoll_unmapped_argument() {
+    native_descriptor_argument_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        true,
+        Some(PreparedPollArgument::Unmapped),
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_prepared_fork_parent_ppoll_forbidden_argument() {
+    native_descriptor_argument_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        true,
+        Some(PreparedPollArgument::Forbidden),
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_prepared_fork_parent_ppoll_shared_eventfd_input() {
+    native_descriptor_argument_witness(
+        None,
+        true,
+        false,
+        false,
+        false,
+        false,
+        true,
+        Some(PreparedPollArgument::EventfdInput),
+    );
+}
+
+/// Physical supply for the VM-free argument page. The native service selects
+/// the real parent owner before this fixture projects its bytes to host memory.
+#[cfg(not(target_os = "macos"))]
+fn prepare_poll_argument(
+    fixture: &'static Fixture,
+    mm: &Mm,
+    len: carrick_guest_arch::GuestLen,
+    address: UserVa,
+) -> Result<(), NativeProcessError> {
+    use carrick_core::mm::transaction::{
+        SelectionVenues, UserWriteRequest, UserWriteTarget, UserWriteVenue,
+    };
+    use carrick_core::mm::transfer::ValidatedChunk;
+    use carrick_el1::fault::NoopCowResolver;
+    struct Supply {
+        prepared: native_fault_supply_tests::SelectionWords<'static>,
+        cow: NoopCowResolver,
+        residency: Box<carrick_el1_abi::FrameGrantResidencyTable>,
+        fixture: &'static Fixture,
+        mm: ReservationMm,
+        supplied: bool,
+    }
+    impl UserWriteVenue<Aarch64ParkedContext> for Supply {
+        type Prepared = native_fault_supply_tests::SelectionWords<'static>;
+        type Cow = NoopCowResolver;
+        type Error = ();
+        fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
+            SelectionVenues {
+                prepared: &mut self.prepared,
+                cow: &mut self.cow,
+                residency: &self.residency,
+                slot: 0,
+            }
+        }
+        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+            panic!("read preparation has no output")
+        }
+        fn supply_cow(&mut self, _: carrick_el1_abi::PortalGrantWindow) -> Result<(), ()> {
+            panic!("read preparation cannot request write COW")
+        }
+        fn supply_backing(
+            &mut self,
+            window: carrick_el1_abi::PortalGrantWindow,
+        ) -> Option<Result<(), ()>> {
+            assert_eq!(window.operation.mm, self.mm);
+            assert_eq!(window.fault_page, VA);
+            assert!(!self.supplied, "one input page, one backing supply");
+            self.supplied = true;
+            // Model the physical service copying the inherited bytes into a
+            // private frame. Host bytes stay unchanged until syscall copyout.
+            self.fixture.tables.words[1536].store(
+                0x9100_0000 | crate::mm_portal::test_support::RW,
+                Ordering::Release,
+            );
+            Some(Ok(()))
+        }
+        fn copy(&mut self, _: &ValidatedChunk<'_, Aarch64ParkedContext>, _: &[u8]) -> bool {
+            panic!("preparation must not copy user output")
+        }
+    }
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut supply = Supply {
+        prepared: native_fault_supply_tests::SelectionWords(words),
+        cow: NoopCowResolver,
+        residency: carrick_el1::cow::test_support::residency_table(),
+        fixture,
+        mm: ReservationMm::new(mm.mm.raw().get()).unwrap(),
+        supplied: false,
+    };
+    let portal = super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    let result = portal.prepare_user_read(
+        UserWriteTarget {
+            handle: portal.admitted_handle(supply.mm, 0).unwrap(),
+            address,
+            len,
+            slot: fixture.slot,
+        },
+        words,
+        &mut supply,
+    );
+    if matches!(
+        result,
+        Err(carrick_core::mm::transaction::UserWriteError::Fault
+            | carrick_core::mm::transaction::UserWriteError::Owner(
+                carrick_core::mm::transaction::MmError::Fault
+            ))
+    ) {
+        assert!(!supply.supplied, "forbidden input must not allocate");
+        return Err(NativeProcessError::Fault);
+    }
+    assert_eq!(
+        result,
+        Ok(()),
+        "the real parent owner must select and prepare the input"
+    );
+    assert!(supply.supplied);
+    Ok(())
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
 fn native_descriptor_argument_witness(
     constructor: Option<u64>,
     root_constructor: bool,
@@ -10865,7 +11042,7 @@ fn native_descriptor_argument_witness(
     zone_ceiling: bool,
     ofd_ceiling: bool,
     poll_inherited_pipe: bool,
-    prepared_timeout: Option<bool>,
+    prepared_timeout: Option<PreparedPollArgument>,
 ) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
@@ -10883,6 +11060,15 @@ fn native_descriptor_argument_witness(
         let descriptor = fixture.tables.words[1536].load(Ordering::Relaxed);
         fixture.tables.words[1536]
             .store((descriptor & !1) | (1 << 56) | (1 << 57), Ordering::Relaxed);
+    }
+    if prepared_timeout == Some(PreparedPollArgument::Forbidden) {
+        crate::mm_portal::test_support::change_policy(
+            fixture.region,
+            crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+            ReservationMm::new(1).unwrap(),
+            &fixture.tables,
+            Some(carrick_el1_abi::ReservationProtection::NONE),
+        );
     }
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -11086,27 +11272,42 @@ fn native_descriptor_argument_witness(
         frame.x[2] = args[2];
         frame.x[3] = args[3];
         carrick_test_support::assert_guest_args(&args);
-        let route = super::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&task),
-            crossing.fd_map(),
-            &[],
-            crossing.open_table(),
-            &[],
-            &names,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            Some(&venue),
-            Some(fixture),
-            Some(&mut entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        let mut attempts = 0;
+        let route = loop {
+            attempts += 1;
+            assert!(attempts <= 3, "argument preparation must make progress");
+            let route = super::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &names,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                Some(fixture),
+                Some(&mut entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            if frame.elr != 0x4000 {
+                break route;
+            }
+            assert_eq!(frame.x[8], nr);
+            assert_eq!(
+                &frame.x[..4],
+                &args,
+                "preparation preserves original arguments"
+            );
+            frame.elr = 0x4004;
+        };
         (route, frame.x[0] as i64)
     };
 
@@ -11395,9 +11596,22 @@ fn native_descriptor_argument_witness(
         ));
         assert_eq!(result, 8, "child pipe write errno {}", -result);
 
+        activate(&parent_binding);
+        let eventfd = if prepared_timeout == Some(PreparedPollArgument::EventfdInput) {
+            let (route, result) = run_binding(&parent_binding, sys::EVENTFD2.raw(), [0, 0, 0, 0]);
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
+            assert!(result >= 0);
+            Some(result as u64)
+        } else {
+            None
+        };
         struct ResetAccess;
         impl Drop for ResetAccess {
             fn drop(&mut self) {
+                super::aarch64_process::TEST_OWNER_ACCESS.with(|hook| *hook.borrow_mut() = None);
                 carrick_el1::substrate::file::TEST_USER_ACCESS
                     .with(|hook| *hook.borrow_mut() = None);
             }
@@ -11411,15 +11625,54 @@ fn native_descriptor_argument_witness(
                 0,
                 "real fork must share prepared backing as COW"
             );
-            let target = if timeout_page {
+            let target = if matches!(
+                timeout_page,
+                PreparedPollArgument::Timeout | PreparedPollArgument::EventfdInput
+            ) {
                 timeout.arg()
             } else {
                 pollfds.arg()
             };
+            super::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |mm, address, len, bytes, access| {
+                    if address.raw() != target || bytes.is_some() {
+                        return None;
+                    }
+                    assert_eq!(
+                        mm.mm, fixture.address.mm,
+                        "preparation must select the parent MM"
+                    );
+                    assert_eq!(
+                        access,
+                        carrick_guest_arch::Access::Read,
+                        "private supply makes later output writable"
+                    );
+                    assert!(
+                        bytes.is_none(),
+                        "argument preparation has no output effects"
+                    );
+                    Some(prepare_poll_argument(
+                        fixture,
+                        mm,
+                        len,
+                        UserVa::new(if timeout_page == PreparedPollArgument::Unmapped {
+                            VA + 8192
+                        } else {
+                            VA
+                        }),
+                    ))
+                }));
+            });
             carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move |address, _, write| {
                     if address != target {
                         return true;
+                    }
+                    if matches!(
+                        timeout_page,
+                        PreparedPollArgument::Unmapped | PreparedPollArgument::Forbidden
+                    ) {
+                        return false;
                     }
                     let descriptor = fixture.tables.words[1536].load(Ordering::Acquire);
                     descriptor & 1 != 0 && (!write || descriptor & (1 << 7) == 0)
@@ -11427,6 +11680,31 @@ fn native_descriptor_argument_witness(
             });
         }
         activate(&parent_binding);
+        if let Some(eventfd) = eventfd {
+            let (route, result) = run_binding(
+                &parent_binding,
+                sys::WRITE.raw(),
+                [eventfd, timeout.arg(), 8, 0],
+            );
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
+            assert_eq!(result, 8, "eventfd input uses the same owner preparation");
+            let value = carrick_test_support::GuestUserBuffer::zeroed(8);
+            let (_, result) = run_binding(
+                &parent_binding,
+                sys::READ.raw(),
+                [eventfd, value.arg(), 8, 0],
+            );
+            assert_eq!(result, 8);
+            assert_eq!(
+                value.get::<u64>(0),
+                5,
+                "admission must not replay a successful effect"
+            );
+            return;
+        }
         let (route, result) = run_binding(
             &parent_binding,
             sys::PPOLL.raw(),
@@ -11437,6 +11715,20 @@ fn native_descriptor_argument_witness(
             route,
             CompletionRoute::Served | CompletionRoute::WithWork
         ));
+        if matches!(
+            prepared_timeout,
+            Some(PreparedPollArgument::Unmapped | PreparedPollArgument::Forbidden)
+        ) {
+            assert_eq!(result, -14, "genuinely forbidden argument remains EFAULT");
+            assert_eq!(revents, 0x7777, "failed input must not publish readiness");
+            assert!(
+                !fixture
+                    .zone
+                    .record(parent_binding.record.id)
+                    .has_object_operation()
+            );
+            return;
+        }
         assert_eq!(result, 1, "ready=true parent ppoll result");
         assert_ne!(
             revents & LINUX_POLLIN,

@@ -5526,6 +5526,7 @@ fn owner_copyout_never_prepares_under_an_ipc_object_lock() {
         inner: Refuses,
         owner: Some(&mut *entry),
         wait: None,
+        input_wait: None,
     };
     let mut guard = region.lock(object, &wait).unwrap();
     let mut op = IpcOperation {

@@ -106,6 +106,7 @@ impl Service {
             address,
             carrick_guest_arch::GuestLen::new(bytes.len() as u64),
             Some(bytes),
+            carrick_guest_arch::Access::Write,
         )
     }
 
@@ -115,6 +116,7 @@ impl Service {
         address: UserVa,
         len: carrick_guest_arch::GuestLen,
         bytes: Option<&[u8]>,
+        access: carrick_guest_arch::Access,
     ) -> Result<(), NativeProcessError> {
         if carrick_el1::isa::x86::hardware_live_root().map_err(error)? != mm.root {
             return Err(NativeProcessError::Stale);
@@ -124,7 +126,7 @@ impl Service {
         let words = anonymous::live_words(mm_key).ok_or(NativeProcessError::Stale)?;
         let handle = owner
             .admitted_handle(mm_key, self.worker())
-            .map_err(error)?;
+            .map_err(|error| NativeProcessError::from_user_write(UserWriteError::Owner(error)))?;
         let venues = KernelFaultVenues::derive(carrick_el1::isa::x86_kernel_layout())
             .and_then(KernelFaultVenues::require_upper_half)
             .ok_or(NativeProcessError::Stale)?;
@@ -166,6 +168,17 @@ impl Service {
                 &words,
                 &mut venue,
             )
+        } else if access == carrick_guest_arch::Access::Read {
+            owner.prepare_user_read(
+                carrick_core::mm::transaction::UserWriteTarget {
+                    handle,
+                    address,
+                    len,
+                    slot: self.slot,
+                },
+                &words,
+                &mut venue,
+            )
         } else {
             owner.prepare_user_write(
                 carrick_core::mm::transaction::UserWriteTarget {
@@ -178,19 +191,6 @@ impl Service {
                 &mut venue,
             )
         };
-        result.map_err(|failure| match failure {
-            UserWriteError::Owner(carrick_core::mm::transaction::MmError::Wait(wait)) => {
-                NativeProcessError::OwnerWait(wait)
-            }
-            UserWriteError::Owner(carrick_core::mm::transaction::MmError::Busy) => {
-                NativeProcessError::Busy
-            }
-            UserWriteError::Owner(owner) => error(owner),
-            UserWriteError::Mechanics(error) => error,
-            UserWriteError::Busy => NativeProcessError::Busy,
-            UserWriteError::InvalidSource => NativeProcessError::Invalid,
-            UserWriteError::Fault => NativeProcessError::Fault,
-            UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
-        })
+        result.map_err(NativeProcessError::from_user_write)
     }
 }
