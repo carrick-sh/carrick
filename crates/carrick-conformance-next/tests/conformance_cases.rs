@@ -439,14 +439,13 @@ fn case_06_pipe_interprocess_communication() {
     assert_eq!(result.stdout_utf8(), "hello\n");
     assert_eq!(result.stderr_utf8(), "");
 
-    if let Some(counters) = carrick_embed::read_el1_counters() {
-        assert!(
-            counters.served[carrick_abi::syscall::nr::PIPE2.raw() as usize]
-                .load(std::sync::atomic::Ordering::Relaxed)
-                >= 1,
-            "expected ring-served pipe2 syscall"
-        );
-    }
+    let counters = carrick_embed::read_el1_counters().expect("EL1 counters after guest");
+    assert!(
+        counters.served[carrick_abi::syscall::nr::PIPE2.raw() as usize]
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1,
+        "expected ring-served pipe2 syscall"
+    );
 
     let events = observer.events();
     let writes = find_all_syscall_returns(&events, "write");
