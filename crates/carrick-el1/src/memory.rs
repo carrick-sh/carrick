@@ -3158,6 +3158,72 @@ mod tests {
         }
 
         #[test]
+        fn delegated_owed_return_forwards_until_ack_then_completes() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let task = mm(&spaces, &table, 17, true);
+            let mut lazy = Editor::over(RangeBacking::Empty);
+            let mut resident = Editor::over(RangeBacking::Private);
+            assert_eq!(
+                syscall(
+                    &task,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut lazy,
+                    SYS_MMAP,
+                    mmap_fixed(ARENA, 0x2000),
+                )
+                .0,
+                DelegatedAnonymous::Served
+            );
+            assert_eq!(
+                syscall(
+                    &task,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut resident,
+                    SYS_MUNMAP,
+                    [ARENA, 0x2000, 0, 0, 0, 0],
+                )
+                .0,
+                DelegatedAnonymous::Served
+            );
+            let owed = owed_returns(&root(&spaces, &table, &task));
+            assert_eq!(owed.len(), 1);
+
+            let (before_ack, _) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut lazy,
+                SYS_MMAP,
+                mmap_fixed(ARENA + 0x1000, 0x1000),
+            );
+            assert_eq!(before_ack, DelegatedAnonymous::Forward);
+
+            assert_eq!(
+                root(&spaces, &table, &task).acknowledge_deferred_returns(owed[0].sequence),
+                Ok(1)
+            );
+            let mut returned = Editor::over(RangeBacking::Retired);
+            let (after_ack, address) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut returned,
+                SYS_MMAP,
+                mmap_fixed(ARENA + 0x1000, 0x1000),
+            );
+            assert_eq!(
+                (after_ack, address as u64),
+                (DelegatedAnonymous::Served, ARENA + 0x1000)
+            );
+        }
+
+        #[test]
         fn delegated_full_return_journal_forwards_the_next_resident_retirement() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
             let task = mm(&spaces, &table, 17, true);
