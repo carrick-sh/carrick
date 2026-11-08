@@ -86,7 +86,11 @@ actual code boundary, not an inference from register values:
 
 A fresh trap may itself be a replayed SVC. Correlate the preceding replay
 sample's PC (at SVC) with the fresh trap's PC (after SVC), exact binding and
-argument words. These bounded prefixes are observations, never a complete
+argument words. A `scheduler-saved-return` can be an arbitrary interrupted
+EL0 instruction with stale x8=73: its six words are saved GPRs, not necessarily
+syscall arguments. Only trap/decoded samples describe actual SVC arguments;
+never attribute a syscall corruption from a saved-return row alone.
+These bounded prefixes are observations, never a complete
 population or an authority to resume. Saturated or missing samples do not
 exclude an unsampled path. Only ppoll consumes sibling slots, so unrelated
 startup syscalls cannot displace the target. Publication is bounded and
@@ -135,11 +139,13 @@ Rebuild the host and image together, restore/verify the matching signed fixture
 bundle, and run on the exact head:
 
 ```
-just test-embed el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes
-just test-embed el1_prepared_fork_poll_arguments_touched_after_fork
+CARRICK_TEST_TARGET=el1_sched scripts/test-signed.sh carrick-embed prepared_fork
 ```
 
-Both use `scripts/test-signed.sh`; also run `just smoke-signed` before reporting
+This selects exactly `el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes`
+and `el1_prepared_fork_poll_arguments_touched_after_fork` in one signed test
+artifact. The equivalent broad recipe is `just test-embed prepared_fork`.
+Also run `just smoke-signed` before reporting
 signed evidence. Retain artifact identity and scoped cleanup. If the failure
 persists, the copy row identifies the raw words used for the refusal. If x3
 is already 4999 at `fresh-trap`, the source precedes shared dispatch; compare
