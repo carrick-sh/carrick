@@ -29,8 +29,8 @@ rationale = "Blocking futex operations must park without redispatch and wake wit
 # crates/carrick-thread/src/thread.rs confirm contention scaling, continuation
 # budgets, and waiter enrollment invariants remain intact.
 vm_free = [
-  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_timed_futex",
   "carrick-kernel-example::futex_contention_contract",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_timed_futex",
   "carrick-el1-linux::aarch64_process_tests::futex_unbacked_word_waits_for_owner_with_two_live_threads",
   "carrick-el1-linux::aarch64_process_tests::futex_relative_deadline_survives_owner_wait_with_two_live_threads",
   "carrick-el1-linux::aarch64_process_tests::futex_relative_deadline_survives_synchronous_owner_redispatch_with_two_live_threads",
