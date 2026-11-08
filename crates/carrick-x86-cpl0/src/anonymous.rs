@@ -273,8 +273,8 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     }
     fn park_contended(&mut self, _: SpaceWaitCause) -> Option<FamilyCompletion> {
         use carrick_core::wait::{
-            EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait, park_object_record,
-            space_access,
+            EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait,
+            park_object_record_rechecked, space_access,
         };
         use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall};
         use carrick_sched_core::Waker;
@@ -354,7 +354,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             |key, snapshot, token| {
                 let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
                 let mut replaced = None;
-                let result = park_object_record(
+                let result = park_object_record_rechecked(
                     zone,
                     slot,
                     request,
@@ -370,6 +370,11 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                         replaced = Some((record, *context));
                         *context = saved;
                         Ok((record, false))
+                    },
+                    || {
+                        SpaceWaitCause::ALL.into_iter().any(|cause| {
+                            source.key(cause) == key && source.observe(cause) == snapshot.observed()
+                        })
                     },
                 );
                 if result.is_err()
