@@ -1688,6 +1688,51 @@ mod tests {
     }
 
     #[test]
+    fn native_child_truncate_dispatch_preserves_resize_access_and_errno_matrix() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = mutation_child(upper);
+            let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+            let file = fixture.venue_open(&authority, b"size", CREATE, 0o644);
+            assert_eq!(fixture.venue_write(file, b"abcdef"), 6);
+            let resize = |fd: i64, length| {
+                fixture.child_call(&authority, 46, [fd as u64, length, 0, 0, 0, 0], &[])
+            };
+            assert_eq!(resize(file, 3), 0, "{upper:?}");
+            assert_eq!(fixture.venue_contents(&authority, b"size"), b"abc");
+            assert_eq!(resize(file, 8), 0);
+            assert_eq!(
+                fixture.venue_contents(&authority, b"size"),
+                b"abc\0\0\0\0\0"
+            );
+            assert_eq!(resize(999, u64::MAX), -22);
+            assert_eq!(resize(999, 1), -9);
+            let readonly = fixture.venue_open(&authority, b"size", carrick_abi::LINUX_O_RDONLY, 0);
+            assert_eq!(resize(readonly, 1), -22);
+            let directory = fixture.venue_open(&authority, b"/tmp", carrick_abi::LINUX_O_RDONLY, 0);
+            assert_eq!(resize(directory, 1), -21);
+            let path_resize = |path: &[u8], length| {
+                fixture.child_call(&authority, 45, [0, length, 0, 0, 0, 0], &[(0, path)])
+            };
+            assert_eq!(
+                path_resize(b"size", 2),
+                if matches!(upper, Upper::Host) { 0 } else { -30 }
+            );
+            assert_eq!(path_resize(b"missing", 1), -2);
+            assert_eq!(path_resize(b"", 1), -2);
+            assert_eq!(path_resize(b"/tmp", 1), -21);
+            assert_eq!(path_resize(b"/etc/ld.so.cache/x", 1), -20);
+            assert_eq!(path_resize(&[b'x'; 256], 1), -36);
+            assert_eq!(path_resize(b"missing", u64::MAX), -22);
+            let region = fixture.owner.region();
+            let ring = region.fd(crate::el1_zone::HostLockWait);
+            if let Some(released) = ring.close(fixture.ring_fd(), fd::Fd(file as i32)).unwrap() {
+                fixture.owner.release(released.backing).unwrap();
+            }
+            assert_eq!(resize(file, 1), -9);
+        }
+    }
+
+    #[test]
     fn native_child_write_serves_parent_redirected_stdout_after_host_close() {
         for upper in [Upper::Memory, Upper::Host] {
             let mut fixture = writable_fixture(upper);
