@@ -379,6 +379,12 @@ fn fork_exec_successor_with_metadata(
                 .tid_words
                 .insert((binding.address.mm.raw().get(), address), 0);
         }
+        // This schedule's deliberate copy fault means unmapped input, not
+        // first-touch backing. Qualify the physical owner too: it must refuse
+        // preparation, rather than falsely report these bad iovecs readable.
+        service.prepare_copy_error = crate::file::SIMULATE_COPY_FAULT
+            .with(|fault| fault.load(Ordering::Relaxed))
+            .then_some(NativeProcessError::Fault);
         let mut entry = runtime
             .enter_registered(
                 registry,
