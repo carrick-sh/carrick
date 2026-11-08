@@ -10,12 +10,12 @@ pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
 pub const X86_INITIAL_RUNNER_READY_PORT: u16 = 0xd7;
 pub const X86_INITIAL_MAX_REGIONS: usize = 32;
 pub const X86_INITIAL_MAX_STRINGS: usize = 256;
-/// CPL0's retained metadata binds the neutral reservation and zone owners
-/// into one virtual region so root release authenticates the exact zone.
 /// Empty control storage retained by the carrier for the initial native root's
 /// on-demand thread stock. No task identity or runnable record is preseeded.
 pub const X86_CPL0_ROOT_THREAD_CONTROLS_OFFSET: u64 = 0xb000;
 pub const X86_CPL0_ROOT_THREAD_CONTROLS_SIZE: u64 = 0x1000;
+/// CPL0's retained metadata binds the neutral reservation and zone owners
+/// into one virtual region so root release authenticates the exact zone.
 pub const X86_CPL0_RESERVATIONS_OFFSET: u64 = 0x2_0000;
 pub const X86_CPL0_ZONE_OFFSET: u64 = 0x40_0000;
 

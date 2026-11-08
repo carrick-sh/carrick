@@ -24,6 +24,18 @@ impl<C: ProcessContext> carrick_core::lifecycle::MemberControlRelease for Contro
     }
 }
 impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
+    pub(super) fn new_root(
+        page: &ThreadLifecyclePage,
+        controls: &'a [ThreadControlSlot],
+        zone: &'a ZoneTables<C>,
+        record: RecordRef,
+    ) -> Result<Self, NativeProcessError> {
+        let identities =
+            StockEntries::for_fresh_root(page).map_err(|_| NativeProcessError::Invalid)?;
+        let mut stock = Self::new(controls, zone, record)?;
+        stock.identities = identities;
+        Ok(stock)
+    }
     pub(super) fn new(
         controls: &'a [ThreadControlSlot],
         zone: &'a ZoneTables<C>,
@@ -75,30 +87,9 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
         Err(NativeProcessError::Exhausted)
     }
     fn drain_closed(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeProcessError> {
-        if page.gate() == carrick_el1_abi::GateState::Open {
-            return Ok(());
-        }
-        for index in 0..page.entry_count() {
-            let Some((generation, carrick_el1_abi::EntryState::Reserved)) = page.state(index)
-            else {
-                continue;
-            };
-            let entry = EntryRef::new(index as u32, generation);
-            match carrick_core::lifecycle::revoke_unborn_control(
-                page,
-                entry,
-                &self.controls[index + 1],
-            ) {
-                Ok(()) => {}
-                // The claim owns its rollback/live decision and its mandatory
-                // admission-settled callback. Never consume that participant.
-                Err(carrick_core::lifecycle::TransitionError::WrongState(
-                    carrick_el1_abi::EntryState::Claimed,
-                )) => {}
-                Err(_) => return Err(NativeProcessError::Stale),
-            }
-        }
-        self.settle(page)
+        self.identities
+            .drain_closed(page, self.controls)
+            .map_err(|_| NativeProcessError::Stale)
     }
     fn settle(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeProcessError> {
         self.identities
@@ -495,7 +486,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 pub(crate) fn claim_counts<M: Clone, C: ProcessContext>(
     runtime: &NativeProcessRuntime<'_, M, C>,
 ) -> carrick_sched_core::process::identity_allocator::IdRegistryCounts {

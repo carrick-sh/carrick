@@ -3475,16 +3475,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         if !core::ptr::eq(lifecycle.page, resources.page)
             || lifecycle.controls.len() != carrick_el1_abi::THREAD_POOL_ENTRIES + 1
             || resources.thread_stock.is_some()
-            || (0..lifecycle.page.entry_count()).any(|index| {
-                lifecycle
-                    .page
-                    .state(index)
-                    .is_none_or(|(_, state)| state != carrick_el1_abi::EntryState::Vacant)
-            })
         {
             return Err(NativeProcessError::Invalid);
         }
-        resources.thread_stock = Some(thread_stock::NativeThreadStock::new(
+        resources.thread_stock = Some(thread_stock::NativeThreadStock::new_root(
+            lifecycle.page,
             lifecycle.controls,
             self.zone,
             resources.record,
@@ -8077,9 +8072,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .zone
             .requeue_preempted(self.source.slot, record.id);
         if queued.is_queued() {
-            let mut effects = WakeEffects::default();
-            effects.queued_own = true;
-            self.service.wake_effects(effects);
+            self.service.wake_effects(WakeEffects {
+                queued_own: true,
+                ..WakeEffects::default()
+            });
         }
         queued.into()
     }
@@ -8120,10 +8116,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         record: RecordRef,
         retirement: carrick_core::terminal::ZoneRetirement<'_, '_>,
     ) -> bool {
-        if record != self.record
-            || self.source.zone.live(record).is_none()
-            || self.handoff.is_some()
-        {
+        if record != self.record || self.handoff.is_some() {
             return false;
         }
         self.handoff = retirement

@@ -57,8 +57,9 @@ impl FutexCall {
     /// authenticates private anonymous storage. Keep this candidate separate
     /// from admission: shared mappings require their own object authority.
     pub fn shared_private_candidate(mut self) -> Option<Self> {
-        if !matches!(self.args[1], 0 | 1) {
-            return None;
+        match self.args[1] {
+            0 | 1 => {}
+            _ => return None,
         }
         self.args[1] |= 128;
         self.admitted().then_some(self)
