@@ -10882,7 +10882,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_prepared_timeout() {
     );
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 #[derive(Clone, Copy, PartialEq)]
 enum PreparedPollArgument {
     Pollfd,
@@ -10939,7 +10939,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_shared_eventfd_input() {
 
 /// Physical supply for the VM-free argument page. The native service selects
 /// the real parent owner before this fixture projects its bytes to host memory.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 fn prepare_poll_argument(
     fixture: &'static Fixture,
     mm: &Mm,
