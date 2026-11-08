@@ -7,6 +7,8 @@ use carrick_core::wait::{
 use carrick_el1::memory::reservations::SharedReservations;
 use carrick_el1::substrate::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1_abi::{ReservationMm, ReservationRange, TrapFrame};
+use carrick_personality_linux::dispatch::AnonymousCall;
+use carrick_syscall_abi::CanonicalNr;
 use core::sync::atomic::Ordering;
 
 /// No result means the existing syscall venue continues. A result means its
@@ -17,9 +19,7 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
     table: &SharedReservations,
 ) -> Option<Served> {
     let nr = frame.x[8];
-    if !matches!(nr, 214 | 215 | 216 | 222 | 226) {
-        return None;
-    }
+    let call = AnonymousCall::from_canonical(CanonicalNr::new(nr))?;
     let mm = ReservationMm::new(sched.task.mm.key.load(Ordering::Acquire))?;
     let index = sched.zone.spaces.find(mm.raw())?;
     if !table.admitted(index.index(), mm) {
@@ -35,17 +35,21 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
     let space_acc = carrick_el1::substrate::sched::object_wait::space_access(sched.zone, slot);
 
     let check_conflict = |root: &mut carrick_el1::memory::reservations::Reservations<'_>| {
-        let first = match nr {
-            215 | 216 | 226 => rounded(frame.x[0], frame.x[1]),
-            222 if frame.x[3] & (0x10 | 0x100000) != 0 => rounded(frame.x[0], frame.x[1]),
-            214 => {
+        let first = match call {
+            AnonymousCall::Munmap | AnonymousCall::Mremap | AnonymousCall::Mprotect => {
+                rounded(frame.x[0], frame.x[1])
+            }
+            AnonymousCall::Mmap if frame.x[3] & (0x10 | 0x100000) != 0 => {
+                rounded(frame.x[0], frame.x[1])
+            }
+            AnonymousCall::Brk => {
                 let old = root.brk_current().checked_add(4095)? & !4095;
                 let new = frame.x[0].checked_add(4095)? & !4095;
                 ReservationRange::new(old.min(new), old.max(new))
             }
             _ => None,
         };
-        let second = (nr == 216 && frame.x[3] & 2 != 0)
+        let second = (call == AnonymousCall::Mremap && frame.x[3] & 2 != 0)
             .then(|| rounded(frame.x[4], frame.x[2]))
             .flatten();
         Some(
