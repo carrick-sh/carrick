@@ -52,6 +52,18 @@ once through the existing completion chain. Both ARM and x86 parked-context
 layouts run that schedule. All coordination receives have five-second bounds;
 no retry or timing-based correctness assertion is used.
 
+The source-admission regression for #1924 pauses the production binder just
+after publishing the carrier generation, then a second host actor calls the
+same binder, borrows its source and transfers two live records through
+`park_host_rechecked`. Both ARM and CPL0 layouts fail on the unfixed source
+because unlock drains generation-777 admissions with a generation-zero guard.
+Publication now consumes the guard and establishes its generation custody
+before the release store exposes the source. Both counted tickets return to
+the permanent base publisher and each operation token is recovered once.
+Object and descriptor-table release sources both exercise this interleaving.
+The scheduling hook is test-only and thread-local; production admission adds
+no queue, polling, allocation or callback registry.
+
 These are shared-guard and scheduler witnesses, not executor-pool or guest
 instruction witnesses. Production views are not yet attached to the release
 venue. The next operation layer must admit sources during directory

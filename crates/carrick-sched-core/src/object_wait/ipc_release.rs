@@ -2,7 +2,8 @@
 //! One source names a directory slot for the carrier lifetime: freeing an
 //! object or table does not retire the slot's lock or its release authority.
 use super::{
-    BorrowedObjectNotificationSource, ObjectWaitError, ObjectWaitKey, OwnedObjectWakeEffects,
+    BorrowedObjectNotificationSource, ObjectWaitError, ObjectWaitGuard, ObjectWaitKey,
+    OwnedObjectWakeEffects,
 };
 use crate::{LockWait, Waker, ZoneTables};
 use core::num::NonZeroU64;
@@ -71,6 +72,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> IpcLockRelease for IpcLockRele
     }
 }
 
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
+    fn publish_ipc_generation(mut self, carrier: NonZeroU64) {
+        // Borrowers may enqueue as soon as the store is visible; unlock must
+        // already own the generation of those counted admissions.
+        self.key.generation = carrier.get();
+        self.queue()
+            .generation
+            .store(self.key.generation, Ordering::Release);
+        #[cfg(all(test, not(feature = "loom")))]
+        tests::after_publication();
+    }
+}
+
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Admit before exposing the corresponding IPC directory slot. The
     /// carrier owns one permanent base publisher until its zone is destroyed.
@@ -100,9 +114,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         queue.completion_mode.store(1, Ordering::Release);
         queue.epoch.store(1, Ordering::SeqCst);
         queue.publishers.store(1, Ordering::Release);
-        queue.generation.store(key.generation, Ordering::Release);
-        #[cfg(all(test, not(feature = "loom")))]
-        tests::after_publication();
+        guard.publish_ipc_generation(carrier);
         Ok(())
     }
 }
