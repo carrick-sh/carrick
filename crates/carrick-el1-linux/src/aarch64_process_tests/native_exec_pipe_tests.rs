@@ -365,7 +365,7 @@ fn fork_exec_successor_with_metadata(
         // Physical records owner copies rather than writing host memory. Bind
         // this call's live GuestUserBuffer output and apply only the bytes the
         // production owner actually delivered, never a synthesized result.
-        let output = metadata.and_then(|_| match nr {
+        let output = metadata.and(match nr {
             59 => Some((fd, 8usize)),
             80 => Some((address, core::mem::size_of::<carrick_abi::LinuxStat>())),
             79 => Some((count, core::mem::size_of::<carrick_abi::LinuxStat>())),
