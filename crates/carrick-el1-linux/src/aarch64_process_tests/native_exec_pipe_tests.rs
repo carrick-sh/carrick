@@ -534,7 +534,7 @@ fn fork_exec_probe(
             dispatcher
                 .serve_native_host_file(bytes, custody.executable())
                 .unwrap();
-            ticket.complete(true).unwrap();
+            assert!(ticket.complete(true).is_ok());
             fixture
                 .zone
                 .object_wait(
