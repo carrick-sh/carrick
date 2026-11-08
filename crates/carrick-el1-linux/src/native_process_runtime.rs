@@ -2648,18 +2648,19 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             return Err(NativeProcessError::Stale);
         }
         let host_identity = member_host_identity(page, control)?;
-        let closing = {
+        let process_members = &mut state
+            .by_process
+            .get_mut(&(key.carrier, process))
+            .ok_or(NativeProcessError::Stale)?
+            .1;
+        let (closing, registry_control) = {
             let mut graph = runtime.graph.lock();
             let row = graph
                 .owner
                 .task_mut(process)
                 .map_err(|_| NativeProcessError::Stale)?;
             let already_owned = if let Some(issued) = host_issued {
-                let already_owned = issued.authorize_group(source, row, address, page, control)?;
-                if !page.release_adopted_host_birth(host_identity) {
-                    return Err(NativeProcessError::Stale);
-                }
-                already_owned
+                issued.authorize_group(source, row, address, page, control)?
             } else {
                 let resources = row.native_mut().resources_mut();
                 if !core::ptr::eq(resources.page, page) {
@@ -2678,19 +2679,51 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 }
                 imported.is_some()
             };
-            if row.credentials_for(visible_tid).is_err() {
-                let caller_tid = row.metadata().namespace_pid;
-                row.spawn_thread(caller_tid, visible_tid)
+            // Prepare every fallible acquisition under registry -> graph custody.
+            // Existing members already own their pending projection: taking a
+            // second writer would contend with our own retained membership.
+            let registry_control = retain_member_control(control)?;
+            let prepared_member = if already_owned {
+                None
+            } else {
+                let retained = retain_member_control(control)?;
+                let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
+                    .map_err(|_| NativeProcessError::Busy)?;
+                Some((retained, pending))
+            };
+            let prepared_threads = if row.credentials_for(visible_tid).is_err() {
+                let mut threads = row.threads.clone();
+                threads
+                    .spawn_thread(row.metadata().namespace_pid, visible_tid)
                     .map_err(|_| NativeProcessError::Invalid)?;
+                Some(threads)
+            } else {
+                None
+            };
+            // Resolve the existing member before consuming the birth, too.
+            let member_index = if already_owned {
+                Some(
+                    row.native()
+                        .resources()
+                        .members
+                        .iter()
+                        .position(|member| member.thread.id() == key.task.id())
+                        .ok_or(NativeProcessError::Stale)?,
+                )
+            } else {
+                None
+            };
+
+            // Commit. No contended or fallible acquisition follows the birth
+            // consumption; a refusal above drops all provisional custody.
+            if host_issued.is_some() && !page.release_adopted_host_birth(host_identity) {
+                return Err(NativeProcessError::Stale);
             }
-            if already_owned {
-                let member = row
-                    .native_mut()
-                    .resources_mut()
-                    .members
-                    .iter_mut()
-                    .find(|member| member.thread.id() == key.task.id())
-                    .ok_or(NativeProcessError::Stale)?;
+            if let Some(threads) = prepared_threads {
+                row.threads = threads;
+            }
+            if let Some(index) = member_index {
+                let member = &mut row.native_mut().resources_mut().members[index];
                 let old_record = member.record;
                 let replaced =
                     member.thread != key.task || old_record != source.zone.record_ref(record);
@@ -2707,10 +2740,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     resources.interrupted_child_waits.remove(&old_record);
                     resources.map_stash.remove(&old_record);
                 }
-            } else {
-                let retained = retain_member_control(control)?;
-                let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
-                    .map_err(|_| NativeProcessError::Busy)?;
+            } else if let Some((retained, pending)) = prepared_member {
                 retained.commit_registration();
                 let projection = row
                     .native()
@@ -2728,8 +2758,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 });
             }
             row.native().resources().sync_non_interrupting_signals();
-            graph.pending.has_exit(&process)
+            (graph.pending.has_exit(&process), registry_control)
         };
+        process_members.push(key);
         state.members.insert(
             key,
             NativeOwnerMember {
@@ -2737,22 +2768,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process,
                 address,
                 record: source.zone.record_ref(record),
-                control: retain_member_control(control)?,
+                control: registry_control.clone(),
             },
         );
-        state
-            .by_process
-            .get_mut(&(key.carrier, process))
-            .ok_or(NativeProcessError::Stale)?
-            .1
-            .push(key);
         state.records.insert(record_key, key);
-        state
-            .members
-            .get(&key)
-            .ok_or(NativeProcessError::Stale)?
-            .control
-            .commit_native_signal_owner();
+        registry_control.commit_native_signal_owner();
         drop(state);
         if closing {
             if binding.issued() {
