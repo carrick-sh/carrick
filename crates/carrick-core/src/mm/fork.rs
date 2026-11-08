@@ -199,7 +199,7 @@ pub trait ForkParentRoot<C: ForkChildRoot> {
 fn refusal_to_fork_error(e: Refusal) -> ForkError {
     match e {
         Refusal::Stale => ForkError::Stale,
-        Refusal::Busy | Refusal::PreparedConflict => ForkError::Busy,
+        Refusal::Busy | Refusal::DeferredReturn | Refusal::PreparedConflict => ForkError::Busy,
         Refusal::MetadataRequired => ForkError::MetadataRequired,
         Refusal::Invalid => ForkError::OwnerRefusal(ForkOwnerRefusal::Invalid),
         Refusal::Collision => ForkError::OwnerRefusal(ForkOwnerRefusal::Collision),
