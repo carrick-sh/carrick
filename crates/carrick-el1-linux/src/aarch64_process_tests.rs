@@ -12787,6 +12787,7 @@ fn arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path() {
         spsr: 0x3c0,
         ..Default::default()
     };
+    super::native_diagnostic::capture();
     let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     assert_eq!(
         super::dispatch::arm_deliver_declined_fault_signal_with(
@@ -12820,6 +12821,17 @@ fn arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path() {
     assert_eq!(
         fixture.control.synchronous_fault(),
         Some((Signal::SEGV, 2, 0x1234_5000, true))
+    );
+    let diagnostics = super::native_diagnostic::take();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("signal-frame-build")
+                && line.contains("pc=0x400200")
+                && line.contains("far=0x12345000")
+                && line.contains("sp=0x0")
+                && line.contains("error=InvalidFrame")),
+        "missing the production signal-frame refusal: {diagnostics:?}"
     );
 }
 

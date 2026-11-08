@@ -20,6 +20,7 @@ pub mod inotify;
 pub mod ipc;
 pub mod lifecycle;
 pub mod mm_portal;
+mod native_diagnostic;
 pub mod native_fork_refusal;
 pub mod native_process_custody;
 pub mod native_process_entry;
