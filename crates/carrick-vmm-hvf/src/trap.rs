@@ -8554,6 +8554,17 @@ impl HvfInner {
                             carrick_el1_abi::ArmEntryFatalRegisters {
                                 reason: vcpu.get_reg(Reg::X2).ok(),
                                 source_location: vcpu.get_reg(Reg::X3).ok(),
+                                admission_identity: [
+                                    Reg::X4,
+                                    Reg::X5,
+                                    Reg::X6,
+                                    Reg::X7,
+                                    Reg::X8,
+                                    Reg::X9,
+                                    Reg::X10,
+                                    Reg::X11,
+                                ]
+                                .map(|reg| vcpu.get_reg(reg).ok()),
                                 pc: Some(pc),
                                 lr: vcpu.get_reg(Reg::X30).ok(),
                                 fp: vcpu.get_reg(Reg::X29).ok(),
