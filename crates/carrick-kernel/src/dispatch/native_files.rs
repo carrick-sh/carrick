@@ -543,7 +543,9 @@ impl SyscallDispatcher {
                     Some(reference) => self.native_map_reference(reference),
                     None => Served::Refused,
                 },
-                HostFileOp::Write | HostFileOp::SetFdTimes => match file.retain_io() {
+                HostFileOp::Write | HostFileOp::SetFdTimes | HostFileOp::Ftruncate => match file
+                    .retain_io()
+                {
                     Some(lease) => {
                         self.serve_native_open_file(header, lease.description(), input, capacity)
                     }
@@ -559,6 +561,7 @@ impl SyscallDispatcher {
     /// stdio descriptors run.
     fn serve_native_stdio(&self, header: HostFileHeader, fd: i32, input: &[u8]) -> Served {
         match header.op {
+            HostFileOp::Ftruncate => Served::errno(carrick_abi::LINUX_EINVAL),
             HostFileOp::SetFdTimes => match self.native_times(header) {
                 Some([None, None]) => Served::value(0),
                 Some(_) => Served::errno(carrick_abi::LINUX_EBADF),
@@ -588,6 +591,22 @@ impl SyscallDispatcher {
         capacity: usize,
     ) -> Served {
         match header.op {
+            HostFileOp::Ftruncate => {
+                if (header.args[0] as i64) < 0 {
+                    return Served::errno(carrick_abi::LINUX_EINVAL);
+                }
+                if header.args[1] != carrick_abi::LINUX_RLIM_INFINITY {
+                    return Served::Refused;
+                }
+                match self
+                    .fs_view()
+                    .truncate_description(None, description, header.args[0] as i64)
+                {
+                    Ok(outcome) => served_mutation(outcome),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::SetFdTimes => {
                 let Some([atime, mtime]) = self.native_times(header) else {
                     return Served::errno(carrick_abi::LINUX_EINVAL);
@@ -641,6 +660,7 @@ impl SyscallDispatcher {
             | HostFileOp::Symlinkat
             | HostFileOp::Linkat
             | HostFileOp::Utimensat
+            | HostFileOp::Truncate
             | HostFileOp::Poll => Served::Refused,
         }
     }
@@ -655,6 +675,19 @@ impl SyscallDispatcher {
     ) -> Served {
         let fs = self.fs_view();
         match header.op {
+            HostFileOp::Truncate => {
+                if (header.args[0] as i64) < 0 {
+                    return Served::errno(carrick_abi::LINUX_EINVAL);
+                }
+                if header.args[1] != carrick_abi::LINUX_RLIM_INFINITY {
+                    return Served::Refused;
+                }
+                match fs.truncate_path(None, path, header.args[0] as i64) {
+                    Ok(outcome) => served_mutation(outcome),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::Utimensat => {
                 let Some([atime, mtime]) = self.native_times(header) else {
                     return Served::errno(carrick_abi::LINUX_EINVAL);
@@ -1729,6 +1762,77 @@ mod tests {
                 fixture.owner.release(released.backing).unwrap();
             }
             assert_eq!(resize(file, 1), -9);
+        }
+    }
+
+    #[test]
+    fn native_child_ftruncate_retains_the_inherited_physical_file_after_host_close() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let mut fixture = writable_fixture(upper);
+            fixture
+                .dispatcher
+                .kernel_binding
+                .read()
+                .kernel()
+                .install_ipc_for_test(Arc::clone(&fixture.owner));
+            let opened = root_openat(&mut fixture.dispatcher, b"/tmp/inherited-size\0", CREATE);
+            assert!(opened >= 0);
+            let context = fixture.dispatcher.capture_one_task_context().unwrap();
+            let original = Arc::downgrade(
+                &context
+                    .resources()
+                    .files()
+                    .slot(FileSlotNumber::for_open_fd(opened as i32).unwrap())
+                    .unwrap()
+                    .description(),
+            );
+            let region = fixture.owner.region();
+            let ring = region.fd(crate::el1_zone::HostLockWait);
+            let mut storage = region
+                .provision_descriptors(64, &crate::el1_zone::HostLockWait)
+                .unwrap();
+            let child = ring.fork(fixture.ring_fd(), &mut storage).unwrap().to_raw();
+            fixture.table = [child.authority, child.index, child.generation];
+            let mut memory = super::super::outcome::LinearMemory::new(0x4000, vec![0; 4096]);
+            let closed = fixture
+                .dispatcher
+                .dispatch(
+                    &context,
+                    super::super::SyscallRequest::new(
+                        57,
+                        crate::compat::SyscallArgs::from([opened as u64, 0, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &crate::compat::CompatReporter::default(),
+                )
+                .unwrap();
+            assert!(matches!(closed, DispatchOutcome::Returned { value: 0 }));
+            assert!(original.upgrade().is_none(), "no publication-owner cycle");
+            let authority = authority_of(&fixture.dispatcher);
+            assert_eq!(
+                fixture.child_call(&authority, 46, [opened as u64, 5, 0, 0, 0, 0], &[],),
+                0,
+                "{upper:?}"
+            );
+            assert_eq!(
+                fixture.venue_contents(&authority, b"/tmp/inherited-size"),
+                [0; 5]
+            );
+            assert_eq!(
+                fixture.child_call(&authority, 88, [opened as u64, 0, 0, 0, 0, 0], &[],),
+                0,
+                "{upper:?}: inherited futimens"
+            );
+            if let Some(released) = ring
+                .close(fixture.ring_fd(), fd::Fd(opened as i32))
+                .unwrap()
+            {
+                fixture.owner.release(released.backing).unwrap();
+            }
+            assert_eq!(
+                fixture.child_call(&authority, 46, [opened as u64, 5, 0, 0, 0, 0], &[],),
+                -9
+            );
         }
     }
 
