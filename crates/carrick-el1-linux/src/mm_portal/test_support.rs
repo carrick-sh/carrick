@@ -254,6 +254,77 @@ pub fn admit_notified(
         true,
     )
 }
+
+/// The compact CPL0 reservation owner and zone, published in this retained
+/// region at their real ABI offsets. Both records share one base, which is
+/// what `RootReleaseVenue::new` authenticates.
+pub fn x86_roots(region: &Region) -> &carrick_el1::memory::reservations::X86Cpl0Reservations {
+    // SAFETY: the retained region is zeroed and owns both records at their
+    // production CPL0 offsets for its whole lifetime.
+    unsafe {
+        &*region
+            .ptr
+            .as_ptr()
+            .add(carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
+            .cast()
+    }
+}
+pub fn x86_zone(region: &Region) -> &carrick_el1::memory::reservations::X86Cpl0Zone {
+    // SAFETY: as above; the zone record is 64-byte aligned at its offset.
+    unsafe {
+        &*region
+            .ptr
+            .as_ptr()
+            .add(carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize)
+            .cast()
+    }
+}
+pub fn x86_nodes(
+    region: &Region,
+) -> carrick_core::mm::reservation::ResolvedReservationNodes<
+    NoPin,
+    carrick_personality_linux::mm::LinuxReservationPolicy,
+    carrick_el1::memory::reservations::X86Cpl0ReservationGeometry,
+> {
+    let mut nodes = carrick_core::mm::reservation::ResolvedReservationNodes::default();
+    // SAFETY: the pins authenticate this retained region's metadata banks.
+    unsafe { nodes.refresh(x86_roots(region), &NoResolver(region), region.ptr) }.unwrap();
+    nodes
+}
+/// A production-admitted CPL0 root with live `Reservations` notifications.
+pub fn admit_notified_x86(
+    region: &Region,
+    mm: u64,
+    root: u64,
+    pages: usize,
+    unrelated: usize,
+) -> ReservationMm {
+    let zone = x86_zone(region);
+    admit_with(
+        x86_roots(region),
+        || x86_nodes(region),
+        carrick_core::wait::space_access(zone, carrick_sched_core::SlotId::new(0), deliver_x86),
+        Admission {
+            mm,
+            root,
+            pages,
+            unrelated,
+            anonymous: true,
+        },
+    )
+}
+fn deliver_x86(
+    _: &carrick_el1::memory::reservations::X86Cpl0Zone,
+    _: carrick_sched_core::Waker,
+    effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_sched_core::ParkedContextWords,
+    >,
+) {
+    // The carrier boundary owns reschedule delivery; the VM-free fixture only
+    // retains the completed record for `take_completion_handbacks`.
+    let _ = effects.defer_handbacks();
+}
 fn admit_access(
     region: &Region,
     spaces: carrick_sched_core::spaces::notification::SpaceAccess<
@@ -266,9 +337,51 @@ fn admit_access(
     unrelated: usize,
     anonymous: bool,
 ) -> ReservationMm {
+    admit_with(
+        region.table(),
+        || nodes(region),
+        spaces,
+        Admission {
+            mm,
+            root,
+            pages,
+            unrelated,
+            anonymous,
+        },
+    )
+}
+/// One root admission's shape: identity, roots and mapping population.
+struct Admission {
+    mm: u64,
+    root: u64,
+    pages: usize,
+    unrelated: usize,
+    anonymous: bool,
+}
+fn admit_with<
+    'a,
+    Policy: carrick_core::mm::reservation::ReservationPolicy,
+    Geometry: carrick_core::mm::reservation::ReservationGeometry,
+    C: carrick_core_abi::EntryContext,
+>(
+    table: &'a carrick_core::mm::reservation::SharedReservations<Policy, Geometry>,
+    resolve_nodes: impl FnOnce() -> carrick_core::mm::reservation::ResolvedReservationNodes<
+        NoPin,
+        Policy,
+        Geometry,
+    >,
+    spaces: carrick_sched_core::spaces::notification::SpaceAccess<'a, C>,
+    admission: Admission,
+) -> ReservationMm {
+    let Admission {
+        mm,
+        root,
+        pages,
+        unrelated,
+        anonymous,
+    } = admission;
     let index = spaces.publish_closed(mm, root, root).unwrap();
     let mm = ReservationMm::new(mm).unwrap();
-    let table = region.table();
     table
         .publish(
             index.index(),
@@ -284,9 +397,11 @@ fn admit_access(
             },
         )
         .unwrap();
-    let view = nodes(region);
+    // Node banks are resolved only after the table publication above; a
+    // pre-publication view is `Stale`.
+    let view = resolve_nodes();
     let mut owner = if let Some(venue) = spaces.venue() {
-        carrick_el1::memory::reservations::RootReleaseVenue::new(table, venue)
+        carrick_core::mm::reservation::RootReleaseVenue::<Policy, Geometry, C>::new(table, venue)
             .unwrap()
             .lock_el1_resolved(index.index(), mm, &view, 0)
             .unwrap()

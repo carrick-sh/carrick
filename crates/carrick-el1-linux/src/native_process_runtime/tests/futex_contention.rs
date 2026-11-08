@@ -752,3 +752,240 @@ fn native_clear_tid_stopped_join_driver_aarch64() {
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Real mapping-root contention (issue #1922).
+//
+// The episodes above inject the refusal through the host-test service, so they
+// cannot show what the real reservation owner returns. These two witnesses hold
+// an actual admitted, notified mapping root on one slot and drive the
+// production `private_anonymous_futex_mapping` on another. The owner must
+// answer with its own `PortalOwnerWait` on the first probe (enrolled once, no
+// retry while the root is held) and admit the same query after the real
+// release. Both ISA portal paths are covered: the AArch64 EL1 portal over
+// `Aarch64ParkedContext` and the x86 CPL0 portal over `ParkedContextWords`.
+// ---------------------------------------------------------------------------
+
+use carrick_core_abi::PortalWaitCause;
+
+fn mm_of(handle: carrick_core_abi::El1MmHandle) -> MmGeneration {
+    MmGeneration::new(NonZeroU64::new(handle.mm().raw()).unwrap())
+}
+
+const HELD_SLOT: u32 = 1;
+const PROBE_SLOT: u32 = 2;
+
+/// A different slot owns the real root; the probe must return that holder's
+/// notification, stay parked without a redispatch, and succeed after release.
+fn contention_keeps_owner_notification<
+    'a,
+    P: carrick_core_abi::PinnedMetadataExtent,
+    Policy: carrick_core::mm::reservation::ReservationPolicy,
+    Geometry: carrick_core::mm::reservation::ReservationGeometry,
+    Venue: carrick_core::mm::transaction::OwnerVenue<C>,
+    B: carrick_mmu_core::owner_mmu::OwnerMmu,
+    C: ProcessContext + 'static,
+>(
+    portal: &carrick_core::mm::transaction::MmPortal<'a, P, Policy, Geometry, Venue, B, C>,
+    zone: &ZoneTables<C>,
+    handle: carrick_core_abi::El1MmHandle,
+    address: UserVa,
+) {
+    let mut held = portal
+        .root(handle.mm(), HELD_SLOT)
+        .expect("the holder takes the real admitted root");
+    assert!(
+        held.mapping(address.raw()).is_some(),
+        "the held root must hold the private anonymous mapping under test"
+    );
+
+    let wait = match private_anonymous_futex_mapping(portal, mm_of(handle), PROBE_SLOT, address) {
+        Err(NativeProcessError::OwnerWait(wait)) => wait,
+        other => panic!("real root contention must return the owner's wait, got {other:?}"),
+    };
+    assert_eq!(
+        wait.cause(),
+        PortalWaitCause::Reservations,
+        "mapping admission contends on the reservation root"
+    );
+    assert_eq!(wait.handle(), handle, "the wait names the authenticated MM");
+    assert!(
+        held.mapping(address.raw()).is_some(),
+        "the probe must not retry or steal the root while the holder owns it"
+    );
+    let entry = zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .expect("the admitted MM has a live space entry");
+    let observed = entry
+        .notifications(handle.incarnation())
+        .expect("the live notification source matches the handle")
+        .observe(SpaceWaitCause::Reservations);
+    assert_eq!(
+        wait.revision(),
+        observed.revision(),
+        "the wait carries the revision observed before the root lock probe"
+    );
+
+    // Enrol the exact returned wait once, as the production owner-wait path
+    // does, and prove only the real release can complete it.
+    let enrollment =
+        carrick_core_abi::wait::PortalWaitEnrollment::for_owner(zone, handle, wait).unwrap();
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: 909,
+            serial: 1,
+            mm: handle.mm().raw(),
+            file_table: 1,
+            generation: 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let operation = carrick_sched_core::object_wait::OperationToken::new(701, 11).unwrap();
+    enrollment
+        .park_host(record, operation, &|effects| {
+            let _ = effects.defer_handbacks();
+        })
+        .unwrap();
+    assert!(matches!(
+        zone.record(record).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    let mut delivered = Vec::new();
+    zone.take_completion_handbacks(&carrick_sched_core::BoundedSpin(0), &mut |record| {
+        delivered.push(record)
+    });
+    assert!(
+        delivered.is_empty(),
+        "no redispatch or handback while the holder still owns the root"
+    );
+
+    drop(held);
+    zone.take_completion_handbacks(&carrick_sched_core::BoundedSpin(0), &mut |record| {
+        delivered.push(record)
+    });
+    assert_eq!(
+        delivered,
+        [zone.record_ref(record)],
+        "the real root release delivers exactly one handback"
+    );
+    zone.take_completion_handbacks(&carrick_sched_core::BoundedSpin(0), &mut |_| {
+        panic!("a single release must not complete the waiter twice")
+    });
+    zone.free_record(record);
+
+    // The same authenticated handle now acquires the released root and answers
+    // from the real mapping tree.
+    assert_eq!(
+        private_anonymous_futex_mapping(portal, mm_of(handle), PROBE_SLOT, address),
+        Ok(true),
+        "the private anonymous mapping is admitted after release"
+    );
+    assert_eq!(
+        private_anonymous_futex_mapping(
+            portal,
+            mm_of(handle),
+            PROBE_SLOT,
+            UserVa::new(address.raw() + 0x0100_0000)
+        ),
+        Ok(false),
+        "an address outside the mapping stays unadmitted"
+    );
+}
+
+fn x86_deliver(
+    _: &ZoneTables<carrick_sched_core::ParkedContextWords>,
+    _: carrick_sched_core::Waker,
+    effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_sched_core::ParkedContextWords,
+    >,
+) {
+    // The VM-free carrier boundary retains the completed record for
+    // `take_completion_handbacks`; the guest venue owns SGI delivery.
+    let _ = effects.defer_handbacks();
+}
+
+struct X86Venue;
+impl carrick_core::mm::transaction::OwnerVenue<carrick_sched_core::ParkedContextWords>
+    for X86Venue
+{
+    fn space_access(
+        zone: &ZoneTables<carrick_sched_core::ParkedContextWords>,
+        slot: SlotId,
+    ) -> carrick_sched_core::spaces::notification::SpaceAccess<
+        '_,
+        carrick_sched_core::ParkedContextWords,
+    > {
+        carrick_core::wait::space_access(zone, slot, x86_deliver)
+    }
+    fn deliver_completion(
+        _: &ZoneTables<carrick_sched_core::ParkedContextWords>,
+        _: SlotId,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >,
+    ) {
+        let _ = effects.defer_handbacks();
+    }
+    fn encode_error(_: carrick_core::mm::transaction::MmError) -> u32 {
+        1
+    }
+    fn cancelled_copy_code() -> u32 {
+        1
+    }
+}
+
+#[test]
+fn real_mapping_root_contention_keeps_notification_aarch64() {
+    use crate::mm_portal::test_support::{ROOT, Region, VA, admit_notified, nodes};
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal: crate::mm_portal::MmPortal<'_, crate::mm_portal::test_support::NoPin> =
+        crate::mm_portal::MmPortal::new(
+            NonZeroU64::new(1).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    contention_keeps_owner_notification(&portal, zone, handle, UserVa::new(VA));
+}
+
+#[test]
+fn real_mapping_root_contention_keeps_notification_x86() {
+    use crate::mm_portal::test_support::{
+        NoPin, ROOT, Region, VA, admit_notified_x86, x86_nodes, x86_roots, x86_zone,
+    };
+    type X86Portal<'a> = carrick_core::mm::transaction::MmPortal<
+        'a,
+        NoPin,
+        carrick_personality_linux::mm::LinuxReservationPolicy,
+        carrick_el1::memory::reservations::X86Cpl0ReservationGeometry,
+        X86Venue,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+        carrick_sched_core::ParkedContextWords,
+    >;
+    let region = Region::new();
+    let zone = x86_zone(&region);
+    let mm = admit_notified_x86(&region, 77, ROOT, 1, 0);
+    let view = x86_nodes(&region);
+    let portal: X86Portal<'_> = carrick_core::mm::transaction::MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        x86_roots(&region),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap()
+    .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    contention_keeps_owner_notification(&portal, zone, handle, UserVa::new(VA));
+}
