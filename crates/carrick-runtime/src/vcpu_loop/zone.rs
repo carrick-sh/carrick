@@ -1591,6 +1591,7 @@ pub(crate) struct IpcPark {
     object: IpcObjectHandle,
     lane: WaitFor,
     snapshot: ObjectWaitSnapshot,
+    deadline: Option<u64>,
 }
 
 fn lane_index(lane: WaitFor) -> usize {
@@ -1702,29 +1703,38 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
     )
 }
 
-/// A timed epoll wait re-runs with what is left of its deadline: rewrite
-/// its timeout argument (`x3`) in the vCPU and, for a call the host is about
-/// to dispatch, in `request`, so the re-run never waits the full original
-/// timeout again.
+/// Apply the typed replay convention. Retained ppoll completion never
+/// rewrites an argument: its snapshot, endpoint and deadline remain owned.
 fn restart_with_remaining<E: ThreadedEngine>(
     engine: &mut E,
     request: Option<&mut SyscallRequest>,
     outcome: &host_ipc::IpcHostOutcome,
 ) -> Result<(), RuntimeError> {
-    let host_ipc::IpcHostOutcome::Restart {
-        timeout_ms: Some(timeout_ms),
-        ..
-    } = *outcome
-    else {
-        return Ok(());
-    };
-    let x3 = timeout_ms as u32 as u64;
-    engine
-        .set_reg(carrick_hal::Reg::X(3), x3)
-        .map_err(|error| ipc_error("restore x3", error))?;
-    if let Some(request) = request {
-        request.args.0[3] = x3;
+    let mut writes = 0;
+    if let Some((ordinal, argument, value)) = outcome.replay_argument() {
+        let actual = request.as_ref().map_or_else(
+            || engine.get_reg(carrick_hal::Reg::X(8)).unwrap_or(u64::MAX),
+            |request| request.number.raw(),
+        );
+        if actual != ordinal.raw() {
+            return Err(ipc_error("replay register convention", (actual, ordinal)));
+        }
+        engine
+            .set_reg(carrick_hal::Reg::X(argument as u8), value)
+            .map_err(|error| ipc_error("replay argument", error))?;
+        if let Some(request) = request {
+            request.args.0[argument] = value;
+        }
+        writes |= 1 << argument;
     }
+    let args = [0, 1, 2, 3, 4, 5].map(|reg| engine.get_reg(carrick_hal::Reg::X(reg)).unwrap_or(0));
+    carrick_el1_abi::record_host_ipc_replay(
+        engine.mailbox_slot(),
+        carrick_abi::CanonicalNr(engine.get_reg(carrick_hal::Reg::X(8)).unwrap_or(0)),
+        engine.current_pc().unwrap_or(0),
+        args,
+        writes,
+    );
     Ok(())
 }
 
@@ -1740,7 +1750,7 @@ pub(super) fn ipc_route(
         host_ipc::IpcHostOutcome::Complete { result, sigpipe } => IpcHandbackRoute::Complete(
             ipc_complete_for_owner(dispatcher, context, tid, result, sigpipe, producer)?,
         ),
-        host_ipc::IpcHostOutcome::Restart { .. } => IpcHandbackRoute::Restart,
+        host_ipc::IpcHostOutcome::Restart(_) => IpcHandbackRoute::Restart,
         host_ipc::IpcHostOutcome::OwnerMemory { token, outcome } => IpcHandbackRoute::OwnerMemory {
             pending: host_ipc::RetainedIpcOperation::new(context.kernel(), token)
                 .map_err(|error| ipc_error("retain owner copyout", error))?,
@@ -1750,6 +1760,7 @@ pub(super) fn ipc_route(
             token,
             object,
             lane,
+            deadline,
             ..
         } => {
             let snapshot = snapshots.and_then(|s| s[lane_index(lane)]).ok_or_else(|| {
@@ -1758,6 +1769,7 @@ pub(super) fn ipc_route(
                 )
             })?;
             IpcHandbackRoute::Park(IpcPark {
+                deadline,
                 token,
                 object,
                 lane,
@@ -1866,6 +1878,7 @@ where
         ctx.x[8] = request.number.raw();
         let key = host_ipc::wait_key(park.object, park.lane)
             .ok_or_else(|| ipc_error("wait key", park.object))?;
+        let deadline = park.deadline;
         let parked = {
             let guard = zone
                 .object_wait(key, &HostLockWait, &|owned| {
@@ -1885,7 +1898,7 @@ where
                 .map_err(|_| RuntimeError::Configuration("IPC token conversion".to_owned()))?;
             // The park's sequence (the same one `park` publishes).
             let seq = zone.next_seq(record);
-            match guard.park(park.snapshot, record, token) {
+            match guard.park_until(park.snapshot, record, token, deadline.unwrap_or(0)) {
                 Ok(()) => Ok((record, seq)),
                 Err((error, token)) => {
                     zone.free_record(record);
@@ -1911,7 +1924,7 @@ where
                         origin: executor::residency::ZoneResumeOrigin::GuestRecord,
                     },
                     seq,
-                    ZoneWaitPolicy::Ordinary(None),
+                    ZoneWaitPolicy::Ordinary(deadline.map(until_deadline)),
                     request,
                 )
                 .map(IpcParkAttempt::Parked)
@@ -1958,7 +1971,7 @@ where
                 .map_err(|error| ipc_error("IPC owner", error))?,
         )
         .map_err(|error| ipc_error("continuation", error))?;
-        // Re-entered at the SVC, the re-run reads its timeout from x3.
+        // Only epoll authorizes an argument rewrite; ppoll retains its operation.
         restart_with_remaining(engine, None, &outcome)?;
         Ok(ipc_route(
             &self.kernel.dispatcher,
@@ -2103,26 +2116,32 @@ where
         };
         let mut route = match cause {
             Some(cause) => {
+                let context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| ipc_error("interrupt context", error))?;
+                let snapshots = carrick_kernel::el1_zone::zone().map(|zone| {
+                    host_ipc::lane_snapshots(zone, IpcObjectHandle::from_raw(op.object))
+                });
                 let outcome = host_ipc::interrupt(
+                    &context,
                     &region,
                     token,
+                    IpcMmKey(self.state.zone_mm.unwrap_or(0)),
+                    engine,
                     cause,
                     &host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
                         .map_err(|error| ipc_error("IPC owner", error))?,
                 )
                 .map_err(|error| ipc_error("interrupt", error))?;
                 restart_with_remaining(engine, None, &outcome)?;
-                let context = self
-                    .kernel
-                    .dispatcher
-                    .capture_kernel_context(self.state.linux_tid)
-                    .map_err(|error| ipc_error("interrupt context", error))?;
                 ipc_route(
                     &self.kernel.dispatcher,
                     &context,
                     self.state.this_tid,
                     outcome,
-                    None,
+                    snapshots,
                     &mut self.state.external_signals,
                 )?
             }
@@ -2257,6 +2276,49 @@ mod ipc_tests {
         }
     }
 
+    #[test]
+    fn ppoll_host_replay_never_writes_signal_mask_or_timespec_arguments() {
+        let mut engine = super::super::tests::CrashCaptureTestEngine::default();
+        let args = [0x4000, 1, 0x5000, 0, 8, 0];
+        let mut request = SyscallRequest::new(73, carrick_observability::compat::SyscallArgs(args));
+        let region = region();
+        let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
+        let outcome = host_ipc::IpcHostOutcome::Blocked {
+            token,
+            object: IpcObjectHandle::from_raw(IpcOperation::EMPTY.object),
+            lane: WaitFor::Readable,
+            deadline: Some(5_000_000_000),
+            x0: args[0],
+            nr: 73,
+        };
+        restart_with_remaining(&mut engine, Some(&mut request), &outcome).unwrap();
+        assert!(engine.written_registers.is_empty());
+        assert_eq!(request.args.0, args);
+        restart_with_remaining(&mut engine, None, &outcome).unwrap();
+        assert!(engine.written_registers.is_empty());
+        let host_ipc::IpcHostOutcome::Blocked { token, .. } = outcome else {
+            unreachable!()
+        };
+        region.finish_operation(token, || {}).unwrap();
+    }
+
+    #[test]
+    fn epoll_replay_convention_cannot_be_applied_to_ppoll() {
+        let mut engine = super::super::tests::CrashCaptureTestEngine::default();
+        let mut request =
+            SyscallRequest::new(73, carrick_observability::compat::SyscallArgs([0; 6]));
+        let outcome = host_ipc::IpcHostOutcome::Restart(host_ipc::IpcRestart::EpollPwait {
+            x0: 3,
+            timeout_ms: 4999,
+        });
+        assert!(restart_with_remaining(&mut engine, Some(&mut request), &outcome).is_err());
+        assert!(engine.written_registers.is_empty());
+        request.number = carrick_abi::CanonicalNr(22);
+        restart_with_remaining(&mut engine, Some(&mut request), &outcome).unwrap();
+        assert_eq!(request.args.0[3], 4999);
+        assert_eq!(engine.written_registers, [(carrick_hal::Reg::X(3), 4999)]);
+    }
+
     fn dispatcher_and_context() -> (
         SyscallDispatcher,
         carrick_kernel::kernel::KernelContext,
@@ -2386,6 +2448,7 @@ mod ipc_tests {
             token,
             object,
             lane: WaitFor::Writable,
+            deadline: None,
             x0: 3,
             nr: 64,
         };
