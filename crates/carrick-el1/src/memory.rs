@@ -367,6 +367,7 @@ pub fn decide_reservation_syscall<
         Err(Refusal::ForeignMapping) => ReservationDisposition::Forward,
         Err(
             error @ (Refusal::Busy
+            | Refusal::DeferredReturn
             | Refusal::PreparedConflict
             | Refusal::Stale
             | Refusal::MetadataRequired),
@@ -1078,6 +1079,7 @@ pub fn serve_delegated_anonymous<
                 reservations::Refusal::Busy => {
                     DelegatedAnonymous::Contended(SpaceWaitCause::PendingEdit)
                 }
+                reservations::Refusal::DeferredReturn => forward(Leave::RootUnavailableBusy),
                 reservations::Refusal::MetadataRequired => {
                     forward(Leave::RootUnavailableMetadataRequired)
                 }
@@ -3109,7 +3111,7 @@ mod tests {
                         0x1000,
                         ReservationProtection::READ_WRITE
                     ),
-                    Err(Refusal::Busy)
+                    Err(Refusal::DeferredReturn)
                 );
                 // Fork inherits live memory; owed physical returns stay on parent.
                 let mut child_root = root(&spaces, &table, &child);
