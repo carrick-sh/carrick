@@ -1917,3 +1917,51 @@ fn private_file_page_beyond_eof_delivers_sigbus() {
 fn private_file_source_limit_returns_enomem() {
     private_file_fixture_with(false, &["-DEXPECT_SOURCE_LIMIT"], 0);
 }
+
+#[test]
+fn serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace() {
+    let dir = tempfile::tempdir().expect("loader file directory");
+    let path = dir.path().join("library");
+    std::fs::write(&path, b"loader library").expect("loader source file");
+    let define = format!("-DFILE_PATH=\"{}\"", path.display());
+    let elf = native_exit_fixture_with_flags("native_loader_reopen.S", &[&define]);
+    let oracle = dir.path().join("oracle");
+    std::fs::write(&oracle, &elf).expect("native oracle ELF");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o700))
+        .expect("executable oracle");
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("bounded native loader control");
+    assert!(native.status.success(), "native result: {native:?}");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        128,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .expect("production loader runtime");
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "open returns its errno as the exit code; 42=close failure, 43=fd reuse failure: {:?}",
+        outcome.run
+    );
+    assert!(!outcome.run.trap_limit_hit);
+    let witness = outcome
+        .run
+        .report
+        .execution_witness
+        .expect("KVM execution population");
+    assert_eq!(witness.backend, "kvm-x86-cpl0");
+    assert_eq!(witness.guest_entries, 7, "three pairs and exit_group");
+    assert!(witness.guest_refusal_families.is_empty());
+}
