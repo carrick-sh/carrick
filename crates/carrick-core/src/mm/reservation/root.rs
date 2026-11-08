@@ -95,6 +95,10 @@ pub use notification::{inject_root_busy_once, release_injected_root_busy};
 static INJECT_PREPARED_CONFLICT: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
 
+#[cfg(feature = "test-support")]
+static INJECT_METADATA_REQUIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Hold the next proposal at the shared prepared-conflict check.
 #[cfg(feature = "test-support")]
 pub fn inject_prepared_conflict_once() -> bool {
@@ -117,6 +121,19 @@ pub fn release_injected_prepared_conflict() -> bool {
     INJECT_PREPARED_CONFLICT
         .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
+}
+
+/// Make the next shared proposal request synchronous metadata provision.
+#[cfg(feature = "test-support")]
+pub fn inject_metadata_required_once() -> bool {
+    INJECT_METADATA_REQUIRED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[cfg(feature = "test-support")]
+fn take_injected_metadata_required() -> bool {
+    INJECT_METADATA_REQUIRED.swap(false, Ordering::AcqRel)
 }
 
 const ROOTS: usize = carrick_sched_core::spaces::ADDRESS_SPACES;
@@ -2036,6 +2053,10 @@ impl<
         }
         if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
+        }
+        #[cfg(feature = "test-support")]
+        if take_injected_metadata_required() {
+            return Err(Refusal::MetadataRequired);
         }
         if {
             #[cfg(feature = "test-support")]
