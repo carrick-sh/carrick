@@ -134,72 +134,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
         } else {
             MmFutexKey::private(address)?
         };
-        let zone = self.entry.source.zone;
-        let guard = zone.short_lock(
-            ZoneTables::<C>::bucket_of_with_context(mm.raw(), key.scheduler_address()),
-            &carrick_sched_core::ShortLockSpin,
-        );
-        let mut effects = WakeEffects::default();
-        let result = zone.wake_placed(
-            &guard,
-            mm.raw(),
-            key.scheduler_address(),
-            bitset,
-            limit,
-            Waker::El1 {
-                slot: self.entry.source.slot,
-            },
-            &mut [],
-            &mut effects,
-        );
-        let result = match result {
-            Err(carrick_sched_core::WakeRefusal::Unplaceable) => {
-                // The first pass changed no waiter. Claim the exact key/mask/
-                // count through scheduler transfer custody, then place each
-                // completed native wait after releasing the bucket lock.
-                let mut pending = Vec::new();
-                let count = zone.wake_host(
-                    &guard,
-                    mm.raw(),
-                    key.scheduler_address(),
-                    bitset,
-                    limit,
-                    true,
-                    &mut |transfer| pending.push(transfer),
-                    &mut |placement| {
-                        if placement.resched {
-                            effects.request_reschedule(placement.slot);
-                        }
-                    },
-                );
-                drop(guard);
-                for transfer in pending {
-                    if let Some(record) = transfer.finish(&carrick_sched_core::ShortLockSpin) {
-                        let Some(placement) = zone.place_native_handback(record) else {
-                            return Some(self.entry.run_failed(
-                                carrick_core_abi::NativeRunFailureReason::NativeStale,
-                            ));
-                        };
-                        if placement.resched {
-                            effects.request_reschedule(placement.slot);
-                        }
-                        effects.queued_own |= placement.slot == self.entry.source.slot;
-                    }
-                }
-                Ok(count)
-            }
-            result => {
-                drop(guard);
-                result
-            }
-        };
-        self.entry.service.wake_effects(effects);
+        let result = self.entry.wake_native_futex(mm, key, bitset, limit);
         match result {
             Ok(count) => Some(returned(i64::from(count))),
-            Err(_) => Some(
-                self.entry
-                    .run_failed(carrick_core_abi::NativeRunFailureReason::NativeStale),
-            ),
+            Err(reason) => Some(self.entry.run_failed(reason)),
         }
     }
     fn wait(&mut self, wait: FutexWait) -> Option<LifecycleOutcome> {
@@ -310,6 +248,83 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
+    /// One wake authority for native futex syscalls and clear-child-tid.
+    /// Unplaceable claims no waiter: transfer the same key/mask/count through
+    /// the scheduler's existing custody, then retain native placement after
+    /// dropping the bucket lock. A returning eligible driver consumes it.
+    pub(super) fn wake_native_futex(
+        &mut self,
+        mm: carrick_core_abi::ReservationMm,
+        key: MmFutexKey,
+        bitset: u32,
+        limit: u32,
+    ) -> Result<u32, carrick_core_abi::NativeRunFailureReason> {
+        let zone = self.source.zone;
+        let guard = zone.short_lock(
+            ZoneTables::<C>::bucket_of_with_context(mm.raw(), key.scheduler_address()),
+            &carrick_sched_core::ShortLockSpin,
+        );
+        let mut effects = WakeEffects::default();
+        let result = zone.wake_placed(
+            &guard,
+            mm.raw(),
+            key.scheduler_address(),
+            bitset,
+            limit,
+            Waker::El1 {
+                slot: self.source.slot,
+            },
+            &mut [],
+            &mut effects,
+        );
+        let result = match result {
+            Err(carrick_sched_core::WakeRefusal::Unplaceable) => {
+                // The first pass changed no waiter. Claim the exact key/mask/
+                // count through scheduler transfer custody, then place each
+                // completed native wait after releasing the bucket lock.
+                let mut pending = Vec::new();
+                let count = zone.wake_host(
+                    &guard,
+                    mm.raw(),
+                    key.scheduler_address(),
+                    bitset,
+                    limit,
+                    true,
+                    &mut |transfer| pending.push(transfer),
+                    &mut |placement| {
+                        if placement.resched {
+                            effects.request_reschedule(placement.slot);
+                        }
+                    },
+                );
+                drop(guard);
+                for transfer in pending {
+                    if let Some(record) = transfer.finish(
+                        &carrick_sched_core::ShortLockSpin,
+                        &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                        },
+                    ) {
+                        let Some(placement) = zone.place_native_handback(record) else {
+                            return Err(carrick_core_abi::NativeRunFailureReason::NativeStale);
+                        };
+                        if placement.resched {
+                            effects.request_reschedule(placement.slot);
+                        }
+                        effects.queued_own |= placement.slot == self.source.slot;
+                    }
+                }
+                Ok(count)
+            }
+            result => {
+                drop(guard);
+                result
+            }
+        };
+        self.service.wake_effects(effects);
+        result.map_err(|_| carrick_core_abi::NativeRunFailureReason::NativeStale)
+    }
+
     pub(super) fn serve_native_futex(
         &mut self,
         mut call: FutexCall,
