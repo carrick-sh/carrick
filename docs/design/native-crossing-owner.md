@@ -232,3 +232,26 @@ binaries or signed receipts blocks implementation acceptance. A docs review
 can approve an approach with those measurements pending; it cannot declare
 #1335 fixed or conformance restored. Keep the design PR draft until independent
 review and the director's implementation ordering are recorded.
+
+## Inherited redirected-write slice
+
+The existing `HostFileOp::Write` venue also serves a pinned
+`IpcPhysicalHold`, the physical backing of a host-opened description that a
+native child inherits. It uses the capsule's existing detached description
+projection and the existing `FileDescriptionFdLease`, not a new descriptor
+namespace or a backlink to the publication owner. Admission takes the physical
+lifetime transition lock inside the existing carrier resource pin; that lock
+is released before description I/O. No lock order or staging transport changes.
+
+The VM-free `native_child_write_serves_parent_redirected_stdout_after_host_close`
+witness opens through the host dispatcher, redirects fd 1 in the ring, forks
+the table, closes the last host descriptor, and calls the production venue.
+It checks both memory and host uppers, byte contents, cursor progress, EBADF
+after child close, and that the original publication owner is not retained.
+It was red with result -38 before the resource arm was added.
+
+This is not closure of #1335 or #1410. Writes still require the existing
+carrier-write admission (an unlimited caller file-size limit and no applicable
+watcher). The production x86 CPL0 staging gate does not yet admit write/writev.
+Namespace mutation cores, real shell redirect-and-restore, decoded-x86 runtime
+coverage, and signed evidence remain unfinished.
