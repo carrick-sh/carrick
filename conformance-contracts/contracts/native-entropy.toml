@@ -38,6 +38,8 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_fault_cancel_waits_once_then_settles",
   "carrick-x86-cpl0::file_region::native_output_backing_slot_busy_once_then_success",
   "carrick-x86-cpl0-host::cpl0_boot::anonymous_owner::custody_tests::native_backing_editor_exclusion_busy_once_then_success",
+  "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
+  "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
 ]
 embed = [
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_default_returns_eight_bytes",
@@ -48,6 +50,7 @@ embed = [
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_cow_preserves_parent",
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_lazy_output_returns_eight_bytes",
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_native_child_getrandom_boundary_returns_accessible_prefix",
+  "carrick-vmm-kvm::cpl0_boot::cpl0_layout_tests::production_boot_refuses_stale_layout_before_entry",
 ]
 
 [bindings.unresolved]
