@@ -20,15 +20,7 @@ pub const USER_COPY_GRANULE: u64 = 4096;
 /// generation `object generation + 1` (the scheduler requires nonzero,
 /// strictly increasing generations; object generations start at 0).
 pub fn wait_key(object: IpcObjectHandle, lane: WaitFor) -> Option<ObjectWaitKey> {
-    let lane = match lane {
-        WaitFor::Readable => 0,
-        WaitFor::Writable => 1,
-    };
-    let index = 1 + 2 * u64::from(object.index()) + lane;
-    if index >= carrick_sched_core::ZONE_RECORDS as u64 {
-        return None;
-    }
-    ObjectWaitKey::new(index as u32, u64::from(object.generation()) + 1)
+    carrick_el1_abi::ipc::object_wait_key(object, lane)
 }
 
 /// Move an owned IPC operation token into the scheduler's opaque form

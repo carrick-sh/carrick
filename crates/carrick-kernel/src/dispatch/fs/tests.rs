@@ -3843,6 +3843,43 @@ mod serial_host {
             assert_eq!(&actual[..expected.as_bytes().len()], expected.as_bytes());
         }
     }
+
+    #[test]
+    fn serial_host_pipe_create_out_of_range_wait_key_is_fatal() {
+        use super::SpliceTestRig;
+        const CHILD: &str = "CARRICK_TEST_IPC_WAIT_KEY_INVARIANT";
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: aligned zeroed storage is the scheduler's empty state.
+            let zone = unsafe {
+                let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<
+                    carrick_el1_abi::ZoneTables,
+                >());
+                assert!(!ptr.is_null());
+                Box::leak(Box::from_raw(ptr.cast::<carrick_el1_abi::ZoneTables>()))
+            };
+            crate::el1_zone::with_test_zone(zone, || {
+                let mut h = SpliceTestRig::new(4096);
+                crate::el1_ipc::inject_object_wait_key_out_of_range_once();
+                h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]);
+            });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dispatch::fs::tests::serial_host::serial_host_pipe_create_out_of_range_wait_key_is_fatal",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(output.status.signal(), Some(libc::SIGABRT));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("admitted object has no readiness wait key")
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -5210,6 +5247,69 @@ fn watched_file_close_marks_ring_replay_and_emits_inotify_close() {
     let event = h.memory.read_bytes(0x4200, value as usize).unwrap();
     let mask = u32::from_ne_bytes(event[4..8].try_into().unwrap());
     assert_ne!(mask & carrick_abi::LINUX_IN_CLOSE_WRITE, 0);
+}
+
+/// pipemass as PID 1: fill the descriptor table, close, and reuse slots.
+#[test]
+fn serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations() {
+    use crate::el1_zone::HostLockWait;
+    // SAFETY: zero is the valid empty scheduler state; use aligned heap
+    // storage because the complete zone is too large for a test stack.
+    let zone = unsafe {
+        let ptr =
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>());
+        assert!(!ptr.is_null());
+        Box::leak(Box::from_raw(ptr.cast::<carrick_el1_abi::ZoneTables>()))
+    };
+    crate::el1_zone::with_test_zone(zone, || {
+        let metadata = carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(1).unwrap();
+        zone.bind_object_wait(metadata, &HostLockWait).unwrap();
+        let mut h = SpliceTestRig::new(4096);
+        const LIMIT: usize = 8193;
+        let limit = (LIMIT as u64).to_ne_bytes().repeat(2);
+        h.memory.write_bytes(0x4100, &limit).unwrap();
+        assert_eq!(
+            h.run(261, [0, 7, 0x4100, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let initial = h.dispatcher.captured_file_table().slot_count();
+        // Bare stdio occupies fd numbers 0..3 without open_files entries.
+        // slot_count counts only explicit entries, not those three numbers.
+        const BARE_STDIO: usize = 3;
+        for round in 0..2 {
+            let mut pairs = Vec::new();
+            for pair in 0..(LIMIT - BARE_STDIO - initial) / 2 {
+                let outcome = h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]);
+                assert_eq!(
+                    outcome,
+                    DispatchOutcome::Returned { value: 0 },
+                    "round {round} pair {pair}"
+                );
+                let fds = h.memory.read_bytes(0x4000, 8).unwrap();
+                pairs.push((
+                    i32::from_ne_bytes(fds[0..4].try_into().unwrap()) as u64,
+                    i32::from_ne_bytes(fds[4..8].try_into().unwrap()) as u64,
+                ));
+            }
+            assert_eq!(
+                h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
+                DispatchOutcome::errno(carrick_abi::LINUX_EMFILE)
+            );
+            assert_eq!(
+                h.dispatcher.captured_file_table().slot_count(),
+                LIMIT - BARE_STDIO
+            );
+            for (reader, writer) in pairs {
+                h.close(reader);
+                h.close(writer);
+            }
+            assert_eq!(h.dispatcher.captured_file_table().slot_count(), initial);
+            assert!(
+                zone.object_wait(metadata, &HostLockWait).is_ok(),
+                "IPC must not overwrite metadata's queue generation"
+            );
+        }
+    });
 }
 
 #[test]

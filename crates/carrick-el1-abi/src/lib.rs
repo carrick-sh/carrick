@@ -3,11 +3,11 @@
 //!
 //! # Region Layout
 //!
-//! The EL1 kernel occupies a 64 MiB window starting at [`EL1_REGION_BASE`].
+//! The EL1 kernel occupies [`EL1_REGION_SIZE`] bytes at [`EL1_REGION_BASE`].
 //! This region is mapped kernel-only (`AP=00`, `UXN=1`, `PXN=0`) in stage-1
 //! page tables: EL0 userspace code cannot read, write, or execute within it.
 //!
-//! Within this 64 MiB region:
+//! Within this region:
 //! - Image: [`EL1_IMAGE_OFFSET`] plus the typed [`EL1_IMAGE_SIZE`] (1.5 MiB).
 //! - Counters and control tables: [`EL1_COUNTERS_OFFSET`] (1 MiB).
 //! - Per-vCPU stacks: [`EL1_STACKS_OFFSET`] (8 MiB), 256 slots of
@@ -15,9 +15,8 @@
 //!   (16 KiB) guard below each 16 KiB usable stack ([`EL1_STACK_SIZE`]).
 //! - Current tasks: [`EL1_CURRENT_TASKS_OFFSET`] (1 MiB).
 //! - Bootstrap metadata: [`EL1_BOOTSTRAP_METADATA_OFFSET`] (9 MiB).
-//! - Fixed-table heap: [`EL1_HEAP_OFFSET`] to the end of the region. The
-//!   stack guards (#369) took 4 MiB of it from the zone reservation's unused
-//!   tail ([`EL1_ZONE_SIZE`]).
+//! - Fixed-table heap: [`EL1_HEAP_OFFSET`] to the end of the region, including
+//!   page-rounded scheduler storage ([`EL1_ZONE_SIZE`]).
 //!
 //! A separate kernel-only window at [`EL1_IPC_BASE`] (after the dynamic
 //! metadata aperture) maps the host IPC authority's [`ipc::IpcDirectory`] and
@@ -86,13 +85,16 @@ use core::cell::UnsafeCell;
 pub mod ipc;
 pub mod ipc_tables;
 
-/// Guest VA/IPA base of the 64 MiB EL1 kernel region.
+/// Guest VA/IPA base of the EL1 kernel region.
 /// Placed at 180 GiB + 64 MiB, cleanly within the 180..181 GiB L2 block table (L2_B)
 /// and disjoint from all other guest memory ranges.
 pub const EL1_REGION_BASE: u64 = 0x2D_0400_0000;
 
-/// Total size of the EL1 kernel region: 64 MiB.
-pub const EL1_REGION_SIZE: u64 = 64 * 1024 * 1024;
+/// Total size, rounded to the region mapping granule. Fixed tables precede
+/// the scheduler, whose readiness capacity follows the IPC object ceiling.
+pub const EL1_REGION_SIZE: u64 = (EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE + EL1_ZONE_SIZE)
+    .div_ceil(0x0400_0000)
+    * 0x0400_0000;
 
 /// Byte offset of the executable EL1 image within the region.
 pub const EL1_IMAGE_OFFSET: u64 = 0x0;
@@ -378,7 +380,8 @@ pub const EL1_METADATA_MAILBOX_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x10_000
 pub const EL1_METADATA_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_METADATA_MAILBOX_OFFSET;
 
 /// Dedicated metadata readiness queue, outside guest IPC queue admission.
-pub const METADATA_WAIT_QUEUE_INDEX: u32 = carrick_sched_core::ZONE_RECORDS as u32;
+pub const METADATA_WAIT_QUEUE_INDEX: u32 =
+    carrick_sched_core::object_wait::ADDRESS_SPACE_WAIT_BASE as u32;
 
 pub const METADATA_MAILBOX_IDLE: u32 = 0;
 pub const METADATA_MAILBOX_GUEST_WRITING: u32 = 1;
@@ -586,7 +589,7 @@ pub const EL1_BOOTSTRAP_METADATA_SIZE: u64 = 0x90_0000;
 
 /// Base guest virtual address of the dynamic metadata grant aperture (64 MiB window).
 pub const X86_CPL0_DYNAMIC_METADATA_BASE: u64 = 0xffff_ffff_a000_0000;
-pub const EL1_DYNAMIC_METADATA_BASE: u64 = 0x2D_0800_0000;
+pub const EL1_DYNAMIC_METADATA_BASE: u64 = EL1_REGION_BASE + EL1_REGION_SIZE;
 
 const fn disjoint(a: u64, a_size: u64, b: u64, b_size: u64) -> bool {
     a + a_size <= b || b + b_size <= a
@@ -3138,17 +3141,17 @@ pub const EL1_ZONE_OFFSET: u64 = EL1_REGION_SIZE - EL1_ZONE_SIZE;
 /// Base guest virtual address of the zone tables.
 pub const EL1_ZONE_BASE: u64 = EL1_REGION_BASE + EL1_ZONE_OFFSET;
 
-/// Space reserved for the zone tables (7 MiB, to the end of the region).
-/// `ZoneTables` measures about 6.3 MiB; the reservation was 11 MiB until
-/// the EL1 stack guards (#369) took 4 MiB of its unused tail.
-pub const EL1_ZONE_SIZE: u64 = 0x70_0000;
+/// Page-rounded scheduler storage at the end of the region. Its object
+/// readiness arrays cover the same ceiling as the elastic IPC object store.
+pub const EL1_ZONE_SIZE: u64 =
+    (core::mem::size_of::<ZoneTables>() as u64).div_ceil(0x4000) * 0x4000;
 
 const _: () = assert!(core::mem::size_of::<ZoneTables>() as u64 <= EL1_ZONE_SIZE);
 const _: () = assert!(EL1_ZONE_OFFSET.is_multiple_of(core::mem::align_of::<ZoneTables>() as u64));
 const _: () = assert!(carrick_sched_core::ZONE_SLOTS as u64 >= EL1_STACK_SLOTS);
 
 const _: () = assert!(EL1_REGION_BASE.is_multiple_of(0x0400_0000));
-const _: () = assert!(EL1_REGION_SIZE == 64 * 1024 * 1024);
+const _: () = assert!(EL1_REGION_SIZE.is_multiple_of(0x0400_0000));
 const _: () = assert!(EL1_IMAGE_OFFSET + EL1_IMAGE_SIZE.raw() <= EL1_COUNTERS_OFFSET);
 const _: () = assert!(EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE <= EL1_STACKS_OFFSET);
 const _: () = assert!(
@@ -4563,7 +4566,7 @@ impl Default for InotifyNameCache {
 
 const _: () = {
     assert!(MAX_NAME_CACHE_PATH_LEN == NAME_CACHE_PATH_WORDS * core::mem::size_of::<u64>());
-    assert!(EL1_ABI_LAYOUT_HASH == 0x467db09da4cf61e1);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x213ab60223bf134b);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -4714,8 +4717,12 @@ mod tests {
     #[test]
     fn test_region_layout() {
         assert_eq!(EL1_REGION_BASE, 0x2D_0400_0000);
-        assert_eq!(EL1_REGION_SIZE, 0x0400_0000);
-        assert_eq!(EL1_IPC_BASE, 0x2D_0C00_0000);
+        assert_eq!(EL1_REGION_SIZE, 0x0800_0000);
+        assert_eq!(EL1_IPC_BASE, 0x2D_1000_0000);
+        const {
+            assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_ZONE_OFFSET);
+        }
+        assert_eq!(EL1_ZONE_OFFSET + EL1_ZONE_SIZE, EL1_REGION_SIZE);
     }
 
     #[test]
