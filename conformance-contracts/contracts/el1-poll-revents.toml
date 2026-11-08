@@ -1,0 +1,53 @@
+schema_version = 1
+id = "kernel.el1.poll-revents"
+title = "poll and ppoll publish only each entry's revents"
+guest_surfaces = [
+  "syscall:poll",
+  "syscall:ppoll",
+  "vmm:hvf",
+  "vmm:kvm",
+]
+semantic_authority = [
+  "man 2 poll and man 2 ppoll: on return the kernel sets each entry's revents field; fd and events are inputs and are never written back. A caller may rewrite its pollfd array while the call blocks, and those writes survive the return.",
+  "man 2 poll: a negative fd is ignored and its revents is set to zero; an fd absent from the caller's descriptor table reports POLLNVAL; the return value counts entries with a nonzero revents.",
+]
+fixture = "VM-free production dispatch on both ISAs: carrick-el1-linux::ipc::tests::host_wait_publishes_only_revents_and_keeps_the_callers_rewrites rewrites the second pollfd's fd/events inside the readiness crossing; carrick-el1-linux::ipc::tests::immediate_poll_publishes_only_revents_for_both_isa_frames covers the immediate and zero-timeout path; the retained native-venue owner wait publishes one two-byte field per entry"
+scale_points = [1, 2, 8, 1024]
+rationale = """
+Linux's poll(2) contract splits the pollfd record: `fd` and `events` are
+inputs, `revents` is the only output. A thread that rewrites its own pollfd
+array while the syscall blocks is therefore visible on return, and a kernel
+that republishes the array it read at entry silently reverts that write.
+
+Before this contract the shared legacy poll body in
+`crates/carrick-el1-linux/src/dispatch.rs` copied the whole resolver array
+back after a host readiness wait, and the same whole-array copy served the
+immediate and zero-timeout paths. Both ISAs reach that body: aarch64 through
+the EL1 carrier crossing and x86 through the CPL0 host crossing. Restoring a
+stale `fd` can redirect a later descriptor use, so this is a guest-visible
+correctness defect, not an efficiency question.
+
+The fix publishes one two-byte field per entry at
+`offset_of!(LinuxPollFd, revents)`, matching the kernel's own
+`FdWaitWrites::Poll` publication. The frozen ready count and result are
+unchanged; only the output shape narrows. The structural cost is unchanged
+and smaller in bytes: n two-byte writes instead of one 8n-byte run, with the
+same n entries visited.
+
+Not claimed here: a signed HVF or KVM guest run of the mutation witness, and
+a Docker differential (Linux's behaviour is documented and is the authority,
+not a measurement). Signed promotion remains director-owned.
+"""
+structural_budgets = []
+
+[bindings]
+vm_free = [
+  "carrick-el1-linux::ipc::tests::{host_wait_publishes_only_revents_and_keeps_the_callers_rewrites,immediate_poll_publishes_only_revents_for_both_isa_frames}",
+  "carrick-el1-linux::native_process_runtime::host_test_support::production_trap_frame_ppoll_retains_completed_output_across_owner_wait",
+  "carrick-el1-linux::dispatch::host_owned_poll_copyout_refusal_keeps_the_host_fallback",
+]
+
+[bindings.unresolved]
+embed = "No signed guest binding: the mutation witness drives production dispatch in the VM-free loop on both ISAs. A signed HVF/KVM run is not available on this worker VM."
+docker = "Linux's only-output-is-revents rule comes from man 2 poll/ppoll, not from a differential measurement; no Docker oracle is needed to establish the semantic."
+embed_structural = "The output shape is a fixed two-byte field per entry, so guest-memory copy bytes are exactly 2n; the retained owner-wait bindings already bound one preparation per published unit."
