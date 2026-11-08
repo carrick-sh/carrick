@@ -14052,3 +14052,395 @@ fn admission_thread_pending_custody_reports_identity() {
     );
     drop(writer);
 }
+
+#[test]
+fn round2_live_root_fork_wait_exit_reap_population() {
+    let in_ring = true; let sibling = false; let physical = false;
+    let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let fixture = Box::leak(Box::new(Fixture::with_identity(0x10000, asid(1), page, control,
+        ThreadIdentity { tid: 1, serial: 2, mm: 1, file_table: 5, generation: 3,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND, affinity: 1,
+            lifecycle_page: page as *const _ as u64, control_slot: control as *const _ as u64 })));
+
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut native = ThreadCtx::ZERO;
+    native.x[0] = 99;
+    let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let child_task = Box::leak(Box::new(CurrentTask::new()));
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            parked,
+        )
+        .unwrap(),
+    );
+    let owner_registry = registry();
+    owner_registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+
+    let stock: Vec<_> = (0..1024).map(|i| 0x20000 + i * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&stock);
+    if physical {
+        let mut stock = native_retirement_tests::PhysicalStock::new(&fixture.tables);
+        stock.bind_lane(
+            &fixture.task,
+            fixture.zone,
+            carrick_guest_arch::CpuId::new(0),
+            fixture.address.root,
+        );
+        crossing.physical = Some(std::sync::Mutex::new(stock));
+    }
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(words);
+
+    for round in 0..128 {
+    crossing.retirements.store(0, Ordering::Release);
+    let child_pid;
+    {
+        let mut parent_entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } =
+            parent_entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("expected fork return");
+        };
+        child_pid = result.raw() as u32;
+    }
+
+    let parent_key = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(1).unwrap(),
+        serial: TaskSerial::from_raw_u64(3).unwrap(),
+    };
+    let parent_binding = runtime.task_binding(parent_key).unwrap();
+    let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
+    let child_binding = runtime.task_binding(child_key).unwrap();
+
+    // A host-issued CLONE_THREAD sibling shares the process owner and can
+    // itself park the child wait while the leader remains live.
+    let sibling_control = if sibling {
+        fixture.zone.clear_current(fixture.slot);
+        let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
+        control
+            .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+            .unwrap();
+        assert!(control.publish_visible_tid(43));
+        control.publish_host_birth_identity(
+            carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                carrick_el1_abi::EntryTaskKey::from_raw(43),
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(13).unwrap(),
+                ),
+                carrick_el1_abi::EntryThreadGeneration::from_raw(103),
+            )
+            .unwrap(),
+        );
+        let host_slot = fixture.page.reserve_host_birth().unwrap();
+        carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
+        assert!(
+            fixture
+                .page
+                .publish_host_birth(host_slot, control.host_birth_identity().unwrap())
+        );
+        run_as(fixture, 43, 13, 103, control);
+        let record = fixture
+            .zone
+            .current_or_new(
+                fixture.slot,
+                ThreadIdentity {
+                    tid: 43,
+                    serial: 103,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 13,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: fixture.page as *const _ as u64,
+                    control_slot: control as *const _ as u64,
+                },
+            )
+            .unwrap();
+        control.bind_zone_record(fixture.zone.record_ref(record));
+        // SAFETY: this unpublished home record belongs exclusively to the fixture.
+        unsafe { *fixture.zone.record(record).ctx_mut() = parked };
+        owner_registry
+            .register_thread(
+                source,
+                &fixture.task,
+                fixture.address,
+                fixture.page,
+                control,
+            )
+            .unwrap();
+        Some(control)
+    } else {
+        None
+    };
+    let waiter_record = sibling_control
+        .and_then(|control| control.zone_record().map(|record| record.id))
+        .unwrap_or(parent_binding.record.id);
+
+    // Waiter yields slot to child.
+    let status_storage = carrick_test_support::GuestUserBuffer::from_value(0i32);
+    let status_va = status_storage.va();
+    {
+        let mut parent_entry = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                &parked,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            parent_entry.wait4(
+                ProcessWaitPid::from_syscall_argument(child_pid as u64),
+                status_va,
+                LinuxWaitOptions::empty(),
+                UserVa::new(0)
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(parent_entry.take_handoff_receipt().is_some());
+    }
+    if !in_ring {
+        fixture.zone.unhome(fixture.slot, waiter_record, 1);
+    }
+
+    // Now child exits with status 9
+    let child_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    activate(child_source, child_task, &child_binding);
+    *crossing.zone.lock().unwrap() = Some(fixture.zone);
+    *crossing.child.lock().unwrap() = Some((
+        super::common_entry::execution_binding(child_task),
+        child_binding.address,
+    ));
+
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        child_task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(words);
+
+    {
+        let mut child_entry = runtime
+            .enter(
+                child_source,
+                child_task,
+                child_binding.words,
+                &mut child_service,
+            )
+            .unwrap();
+        // No guest slot may place the parent: its executor is in the host
+        // continuation, and the child is the last execution on this slot.
+        if !in_ring {
+            fixture.zone.publish_slot(fixture.slot, 0, Some(0), 1);
+            fixture
+                .zone
+                .leave_guest(fixture.slot, &carrick_sched_core::ShortLockSpin);
+        }
+        let exit_outcome = child_entry.exit_group(9);
+        assert_eq!(child_entry.take_run_failure(), None);
+        assert!(matches!(
+            exit_outcome,
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+    }
+
+    assert_eq!(
+        crossing.retirements.load(Ordering::Acquire),
+        1,
+        "terminal child must retire before parent can reap"
+    );
+    assert!(
+        fixture
+            .zone
+            .spaces
+            .find(child_binding.address.mm.raw().get())
+            .is_none(),
+        "child exit must retire its reservation root without waiting for another fork"
+    );
+
+    if let Some(physical) = &crossing.physical {
+        assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+        physical.lock().unwrap().shutdown();
+    }
+    let binding = super::common_entry::execution_binding(child_task);
+    for candidate in [
+        binding,
+        carrick_el1_abi::ExecutionBinding {
+            generation: carrick_el1_abi::SnapshotGeneration::from_raw(binding.generation.raw() + 1),
+            ..binding
+        },
+    ] {
+        let mut duplicate =
+            carrick_el1_abi::NativeChildRetire::new(candidate, child_binding.address).unwrap();
+        assert_eq!(
+            crossing.cross_child_retire(&raw mut duplicate as u64, u64::from(fixture.slot.raw())),
+            Err(NativeProcessError::Stale)
+        );
+        assert_eq!(
+            duplicate.take(candidate, child_binding.address),
+            Some(Err(carrick_el1_abi::ChildRetireRefusal::Stale))
+        );
+        assert_eq!(crossing.retirements.load(Ordering::Acquire), 1);
+    }
+
+    // Now parent calls wait4 to consume the zombie
+    if in_ring {
+        assert_eq!(crossing.handbacks.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture.zone.record(waiter_record).claim(),
+            carrick_sched_core::Claim::Queued {
+                slot: fixture.slot,
+                seq: fixture.zone.next_seq(waiter_record).wrapping_sub(1)
+            }
+        );
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        let mut cpu = ResumeCpu {
+            inner: crate::sched::FakeCpu::default(),
+            runtime: &runtime,
+            registry: owner_registry,
+            source,
+            task: &fixture.task,
+            service: &mut service,
+        };
+        let counters = carrick_el1_abi::Counters::new();
+        assert_eq!(
+            (crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot: fixture.slot,
+                task: &fixture.task,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            })
+            .run_next(&mut frame, 0),
+            crate::sched::Served::Returned { switched: true }
+        );
+        assert_eq!(frame.x[0], u64::from(child_pid));
+        assert_eq!(fixture.task.visible_pid(), Some(1));
+    } else {
+        assert_eq!(crossing.handbacks.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture.zone.record(parent_binding.record.id).claim(),
+            carrick_sched_core::Claim::Queued {
+                slot: fixture.slot,
+                seq: fixture
+                    .zone
+                    .next_seq(parent_binding.record.id)
+                    .wrapping_sub(1)
+            }
+        );
+        assert!(
+            fixture
+                .zone
+                .record(parent_binding.record.id)
+                .is_native_owned()
+        );
+        assert_eq!(
+            fixture.zone.record(parent_binding.record.id).identity().mm,
+            parent_binding.address.mm.raw().get()
+        );
+        assert!(!fixture.zone.record(parent_binding.record.id).needs_host());
+        assert!(!fixture.zone.head_needs_host(fixture.slot));
+        assert!(
+            fixture
+                .zone
+                .spaces
+                .is_open(parent_binding.address.mm.raw().get())
+        );
+        fixture.zone.enter_guest(fixture.slot);
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        let mut cpu = ResumeCpu {
+            inner: crate::sched::FakeCpu::default(),
+            runtime: &runtime,
+            registry: owner_registry,
+            source,
+            task: &fixture.task,
+            service: &mut service,
+        };
+        let counters = carrick_el1_abi::Counters::new();
+        assert_eq!(
+            (crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot: fixture.slot,
+                task: &fixture.task,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            })
+            .run_next(&mut frame, 0),
+            crate::sched::Served::Returned { switched: true }
+        );
+        assert_eq!(frame.x[0], u64::from(child_pid));
+        assert_eq!(fixture.task.visible_pid(), Some(1));
+    }
+    assert_eq!(
+        status_storage.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(9 << 8).raw()
+    );
+
+    // Second wait on the consumed child must fail with ECHILD (error code -10)
+    let mut parent_entry = runtime
+        .enter_registered(
+            owner_registry,
+            source,
+            &fixture.task,
+            fixture.address,
+            &parked,
+            &mut service,
+        )
+        .unwrap();
+    let re_wait = parent_entry.wait4(
+        ProcessWaitPid::from_syscall_argument(child_pid as u64),
+        status_va,
+        LinuxWaitOptions::empty(),
+        UserVa::new(0),
+    );
+    assert!(matches!(
+        re_wait,
+        LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::NoChild.errno()
+    ));
+    drop(parent_entry);
+    with_process_entry(source, &fixture.task, &ThreadCtx::ZERO, fixture_ttbr0(fixture), fixture.page, fixture.control, &mut service, |_| ())
+        .expect("live root user-return after ECHILD must reuse its own group");
+    let root = runtime.task_binding(parent_key).unwrap().record;
+    println!("round={round} root={root:?} child={:?}", child_binding.record);
+    }
+    registry().unregister_root_for_test(&runtime);
+
+}
