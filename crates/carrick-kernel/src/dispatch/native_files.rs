@@ -1329,6 +1329,43 @@ mod tests {
     }
 
     #[test]
+    fn native_child_symlink_dispatch_preserves_target_and_errno_matrix() {
+        let fixture = mutation_child(Upper::Host);
+        let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+        let symlink = |target: &[u8], path: &[u8]| {
+            fixture.child_call(
+                &authority,
+                36,
+                [0, FDCWD as u64, 0, 0, 0, 0],
+                &[(0, target), (2, path)],
+            )
+        };
+        assert_eq!(symlink(b"../etc/ld.so.cache", b"link"), 0);
+        assert_eq!(
+            std::fs::read_link(fixture._upper.as_ref().unwrap().path().join("tmp/link")).unwrap(),
+            std::path::Path::new("../etc/ld.so.cache"),
+        );
+        assert_eq!(fixture.venue_contents(&authority, b"link"), b"cache");
+        assert_eq!(symlink(b"/etc/ld.so.cache", b"link"), -17);
+        assert_eq!(symlink(b"", b"empty-target"), -2);
+        assert_eq!(symlink(b"x", b""), -2);
+        assert_eq!(symlink(b"x", b"missing/link"), -2);
+        assert_eq!(symlink(b"x", b"/etc/ld.so.cache/link"), -20);
+        assert_eq!(symlink(b"x", &[b'x'; 256]), -36);
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                36,
+                [0, 999, 0, 0, 0, 0],
+                &[(0, b"x"), (2, b"link")]
+            ),
+            -9,
+        );
+        assert_eq!(symlink(b"cycle", b"cycle"), 0);
+        assert_eq!(symlink(b"x", b"cycle/child"), -40);
+    }
+
+    #[test]
     fn native_child_write_serves_parent_redirected_stdout_after_host_close() {
         for upper in [Upper::Memory, Upper::Host] {
             let mut fixture = writable_fixture(upper);
