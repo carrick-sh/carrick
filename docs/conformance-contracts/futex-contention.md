@@ -309,3 +309,17 @@ Shared operation 265 observed at native pthread_join, non-NULL absolute
 WAIT_BITSET timeouts and PI variants remain outside this correction. Signed
 Node startup and GNU/musl forkexecpthread must still run on the director's Mac;
 passing this VM-free binding alone does not close the reported abort.
+
+### Native scheduler placement contention (#1892)
+
+An address-only wake that cannot immediately place a native waiter completes
+through the scheduler's existing wake transfer and native handback custody.
+The all-or-nothing refusal changes no waiter; the transfer claims the original
+key, mask and count under the same bucket lock. After releasing the lock,
+native placement retains each completed wait until an eligible driver returns.
+No guest operand is read and no second futex wake is needed for that completion.
+`native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody` drives
+the production adapter with one excluded-mask waiter and two matching waiters.
+It requires exactly one counted completion, retained scheduler custody while
+the driver is away, and one completion on the driver's return. A second wake
+completes the remaining matching waiter and a third returns zero.

@@ -120,7 +120,47 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
             &mut [],
             &mut effects,
         );
-        drop(guard);
+        let result = match result {
+            Err(carrick_sched_core::WakeRefusal::Unplaceable) => {
+                // The first pass changed no waiter. Claim the exact key/mask/
+                // count through scheduler transfer custody, then place each
+                // completed native wait after releasing the bucket lock.
+                let mut pending = Vec::new();
+                let count = zone.wake_host(
+                    &guard,
+                    mm.raw(),
+                    key.scheduler_address(),
+                    bitset,
+                    limit,
+                    true,
+                    &mut |transfer| pending.push(transfer),
+                    &mut |placement| {
+                        if placement.resched {
+                            effects.request_reschedule(placement.slot);
+                        }
+                    },
+                );
+                drop(guard);
+                for transfer in pending {
+                    if let Some(record) = transfer.finish(&carrick_sched_core::ShortLockSpin) {
+                        let Some(placement) = zone.place_native_handback(record) else {
+                            return Some(self.entry.run_failed(
+                                carrick_core_abi::NativeRunFailureReason::NativeStale,
+                            ));
+                        };
+                        if placement.resched {
+                            effects.request_reschedule(placement.slot);
+                        }
+                        effects.queued_own |= placement.slot == self.entry.source.slot;
+                    }
+                }
+                Ok(count)
+            }
+            result => {
+                drop(guard);
+                result
+            }
+        };
         self.entry.service.wake_effects(effects);
         match result {
             Ok(count) => Some(returned(i64::from(count))),

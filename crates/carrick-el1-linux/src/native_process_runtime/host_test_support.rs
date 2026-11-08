@@ -8309,3 +8309,113 @@ fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
         "expiry must not re-read or replay the guest comparison"
     );
 }
+
+#[test]
+#[cfg(test)]
+fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
+    use carrick_personality_linux::sched::FutexCall;
+    use carrick_sched_core::{Claim, ShortLockSpin, WakeRefusal};
+    let fixture = native_exec_fixture();
+    let zone = fixture.zone;
+    let away = SlotId::new(1);
+    zone.drive(away, 2);
+    zone.publish_slot(away, 1, Some(1), 1);
+    zone.enter_guest(away);
+    zone.install_space(away, 1).unwrap();
+    let mut records = Vec::new();
+    for mask in [2, 1, 1] {
+        let mut identity = zone.record(fixture.record.id).identity();
+        identity.tid += records.len() as u64 + 1;
+        identity.affinity = 2;
+        let id = zone.alloc_record(identity).unwrap();
+        let record = zone.record_ref(id);
+        assert!(zone.mark_native_owned(id));
+        let seq = zone.next_seq(id);
+        let guard = zone.short_lock(
+            ZoneTables::<ParkedContextWords>::bucket_of_with_context(1, 0x1000),
+            &ShortLockSpin,
+        );
+        zone.enqueue(&guard, id, seq, 1, 0x1000, mask, 0).unwrap();
+        zone.publish_park(id, seq);
+        records.push(record);
+    }
+    zone.step_back(away, 2);
+    let guard = zone.short_lock(
+        ZoneTables::<ParkedContextWords>::bucket_of_with_context(1, 0x1000),
+        &ShortLockSpin,
+    );
+    assert_eq!(
+        zone.wake_placed(
+            &guard,
+            1,
+            0x1000,
+            1,
+            1,
+            Waker::El1 { slot: fixture.slot },
+            &mut [],
+            &mut WakeEffects::default()
+        ),
+        Err(WakeRefusal::Unplaceable)
+    );
+    drop(guard);
+    let mut service = fixture.service();
+    let saved = words(fixture.address);
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    struct NoCopy;
+    impl carrick_core::user_copy::UserCopy for NoCopy {
+        fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> carrick_core::user_copy::CopyOutcome {
+            panic!("address-only wake")
+        }
+        fn copy_out(&mut self, _: UserVa, _: &[u8]) -> carrick_core::user_copy::CopyOutcome {
+            panic!("address-only wake")
+        }
+    }
+    assert!(
+        matches!(entry.native_futex(FutexCall { args: [0x1000, 138, 1, 0, 0, 1] }, &mut NoCopy), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == 1)
+    );
+    assert!(entry.take_run_failure().is_none());
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| matches!(zone.record(r.id).claim(), Claim::Queued { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| matches!(zone.record(r.id).claim(), Claim::Parked { .. }))
+            .count(),
+        2
+    );
+    // Returning the eligible driver consumes the retained scheduler custody.
+    zone.drive(away, 2);
+    zone.enter_guest(away);
+    zone.install_space(away, 1).unwrap();
+    let selected = zone.switch_in_full(away).unwrap();
+    assert!(records[1..].iter().any(|r| r.id == selected.record));
+    assert_eq!(selected.result, Some(0));
+    assert!(
+        matches!(entry.native_futex(FutexCall { args: [0x1000, 138, 1, 0, 0, 1] }, &mut NoCopy), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == 1)
+    );
+    assert!(
+        matches!(entry.native_futex(FutexCall { args: [0x1000, 138, 1, 0, 0, 1] }, &mut NoCopy), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == 0)
+    );
+    assert!(
+        matches!(zone.record(records[0].id).claim(), Claim::Parked { .. }),
+        "nonmatching mask must stay asleep"
+    );
+}
