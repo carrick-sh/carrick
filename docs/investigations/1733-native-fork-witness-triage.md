@@ -88,3 +88,43 @@ stack page faulted at `0x7ffeee80` with the same port
 gave a #1733 COW verdict. The production result is **unverified**; neither
 RED nor GREEN is supported. ARM comparison remains unrun because no qualifying
 x86 production red was established.
+
+## Round 7: production-path feasibility and fault classification
+
+The VM-free `carrick-x86` integration test cannot construct the production
+CPL0 resolvers. `X86PreparedResolver` is compiled only for x86 `target_os =
+"none"` (`carrick-el1/src/fault.rs`) and checks the hardware live CR3 before
+committing. `X86CowResolver` has the same target restriction
+(`carrick-el1-linux/src/cow_resolver.rs`) and copies via retained supervisor
+addresses, then invalidates the CPL0 TLB. The production `X86CowMmu` owner
+is available only to that target and its defining crate's unit tests
+(`carrick-el1/src/cow.rs`); an integration test cannot select `cfg(test)` for
+its dependency. Its copy-alias authentication requires the CPL0 copy window.
+The other VM-free harnesses do not provide both this native fork lifecycle and
+the live CPL0 fault authority. Replacing the three fixture pieces in a host
+test would therefore create another simulation, not production-path proof.
+
+The shared dispatcher does expose a concrete possible explanation for the
+fixture red. A write fault reported with `present = false` is classified as
+`Translation(Write)` in `carrick-el1/src/fault.rs::x86_fault_class`, so it
+never enters `dispatch_classified_fault`'s `WritePermission` COW branch. A
+matching residency record instead sends the write to `commit_prepared` with
+`LeafAccess::Write`. Both fixture and production prepared resolvers lower that
+to `EditOperation::Publish`; the shared x86 descriptor transaction refuses a
+prepared leaf without `WRITE` as `PermissionDenied` even when its `COW` and
+`MAY_WRITE` bits are set (`carrick-mmu-core/src/x86/descriptor_txn.rs`,
+`DescriptorOp::Publish`). The recorded PTE `0x8010000010201e04` has
+`PREPARED|COW|MAY_WRITE|PRIVATE|USER|NX` and no `PRESENT|WRITE`. This explains
+the fixture's `(Forward, Unavailable)` without attributing the result to
+production CPL0: the hardware's page-fault present bit on this prepared COW
+leaf still needs a live observation. No kernel implementation changed and the
+ignored witness remains a fixture diagnostic. ARM comparison is premature
+without an x86 production red.
+
+One confirmation on the rebased head repeated the fixture red exactly: the
+parent write at `0x60001000` had `present=false`, PTE
+`0x8010000010201e04`, and `(Forward, Unavailable)` after child exit and
+`wait4`. The command was `timeout 180 env CARGO_BUILD_JOBS=3 cargo test
+--locked -j 3 -p carrick-x86 --test native_fork_cow
+serial_host_x86_native_fork_post_fork_first_touch_and_cow_refill_across_child_exit_wait4
+-- --ignored --nocapture`; exit 101, log `/tmp/1733-round7/witness.log`.
