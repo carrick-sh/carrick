@@ -64,6 +64,19 @@ Object and descriptor-table release sources both exercise this interleaving.
 The scheduling hook is test-only and thread-local; production admission adds
 no queue, polling, allocation or callback registry.
 
+Readiness-lock handoff now takes `ReadinessLockCustody`, admitted only by the
+owning scheduler zone for an IPC readiness index. It carries no incarnation or
+notification publisher and cannot select another zone during enrollment.
+The former raw-key handoff accepted a metadata index; the red witness observes
+that incorrect transfer. The typed boundary rejects metadata, operation-slot
+and data-lock release domains before touching a record. Two live host actors
+on each context layout encounter Busy under an old readiness generation,
+enroll through the public custody entry point, and recover their exact tokens
+once after unlock and rebind. An independent zone with identical record IDs
+is untouched. Existing first-bind, release-before-enrollment, admission-post
+and cancellation witnesses continue through the same intrusive handback owner.
+This is a typed scheduler boundary, not an executor or IPC syscall adapter.
+
 These are shared-guard and scheduler witnesses, not executor-pool or guest
 instruction witnesses. Production views are not yet attached to the release
 venue. The next operation layer must admit sources during directory

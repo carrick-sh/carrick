@@ -147,6 +147,55 @@ pub struct ObjectWaitKey {
     generation: u64,
 }
 
+/// Custody of one carrier's physical IPC readiness lock, not a readiness
+/// incarnation or a notification publisher. Rebinding cannot invalidate it.
+///
+/// ```compile_fail,E0451
+/// use carrick_sched_core::object_wait::ReadinessLockCustody;
+/// let custody = ReadinessLockCustody { zone: todo!(), index: 1 };
+/// ```
+#[must_use]
+pub struct ReadinessLockCustody<'z, C: Copy + Send + Sync + zerocopy::FromZeros> {
+    zone: &'z ZoneTables<C>,
+    index: u32,
+}
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> core::fmt::Debug for ReadinessLockCustody<'_, C> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReadinessLockCustody")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ReadinessLockCustody<'_, C> {
+    /// Transfer the exact owned operation to this lock's existing admission
+    /// chain. Failure returns the operation without transferring its record.
+    /// The execution venue must release its lease after successful enrollment.
+    pub fn defer(
+        self,
+        record: RecordId,
+        operation: OperationToken,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        let key = ObjectWaitKey {
+            index: self.index,
+            generation: self
+                .zone
+                .object_queue(self.index as usize)
+                .generation
+                .load(Ordering::Acquire),
+        };
+        self.zone.defer_object_admission(
+            key,
+            record,
+            operation,
+            completion,
+            AdmissionKind::LockRelease,
+            || {},
+            || {},
+        )
+    }
+}
+
 /// A storage owner's release queue, separate from service and IPC readiness.
 #[derive(
     ::core::clone::Clone,
@@ -1867,26 +1916,21 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         .publish(waker, completion);
     }
 
-    /// Retain an owned host operation on the real queue unlock, including
-    /// before first bind or while an older incarnation still owns the lock.
-    /// No notification publisher pin or readiness generation is consumed.
-    /// Every holder of this queue must supply a completion delivery venue.
-    pub fn defer_object_lock_release(
+    /// Authenticate the IPC readiness domain and retain its physical lock
+    /// identity, including before first bind or across incarnation reuse.
+    /// This custody cannot enroll on another zone or a metadata/release queue.
+    /// Every holder must supply the existing completion delivery venue.
+    pub fn readiness_lock_custody(
         &self,
         key: ObjectWaitKey,
-        record: RecordId,
-        operation: OperationToken,
-        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
-    ) -> Result<(), (ObjectWaitError, OperationToken)> {
-        self.defer_object_admission(
-            key,
-            record,
-            operation,
-            completion,
-            AdmissionKind::LockRelease,
-            || {},
-            || {},
-        )
+    ) -> Result<ReadinessLockCustody<'_, C>, ObjectWaitError> {
+        if key.index == 0 || key.index as usize >= IPC_WAIT_QUEUES {
+            return Err(ObjectWaitError::Exhausted);
+        }
+        Ok(ReadinessLockCustody {
+            zone: self,
+            index: key.index,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2466,20 +2510,144 @@ mod host_tests {
         let zone = fixture(true);
         let record = allocate(&zone, 506);
         let exact = zone.record_ref(record);
-        let operation = OperationToken::new(506, 1).unwrap();
-        let delivered = std::cell::Cell::new(0);
-        let completion = |owned: OwnedObjectWakeEffects<'_>| {
-            let _ = owned.deliver_handbacks(&mut |_| delivered.set(delivered.get() + 1));
-        };
-        let key = ObjectWaitKey::metadata_request(1).unwrap();
-        let result = zone.defer_object_lock_release(key, record, operation, &completion);
-        let (error, operation) = result.expect_err("metadata is not an IPC readiness lock");
-        assert_eq!(error, ObjectWaitError::Exhausted);
-        assert_eq!(operation.identity(), OperationToken::new(506, 1).unwrap().identity());
+        for key in [
+            ObjectWaitKey {
+                index: 0,
+                generation: 1,
+            },
+            ObjectWaitKey::metadata_request(1).unwrap(),
+            ObjectWaitKey::ipc_operation_slots(core::num::NonZeroU64::new(1).unwrap()),
+            super::ipc_release::IpcLockIndex::object(0)
+                .unwrap()
+                .key(core::num::NonZeroU64::new(1).unwrap()),
+        ] {
+            let error = zone
+                .readiness_lock_custody(key)
+                .expect_err("foreign domain is not an IPC readiness lock");
+            assert_eq!(error, ObjectWaitError::Exhausted);
+        }
         assert_eq!(zone.record_ref(record), exact);
         assert!(!zone.record(record).has_object_operation());
         assert_eq!(zone.record(record).claim(), Claim::Free);
-        assert_eq!(delivered.get(), 0);
+    }
+
+    fn readiness_custody_two_threads<C: Copy + Send + Sync + zerocopy::FromZeros>() {
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+        let zone = unsafe {
+            // SAFETY: the empty scheduler ABI uses zeroed, natively aligned storage.
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables<C>>());
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr.cast::<ZoneTables<C>>())
+        };
+        let foreign = unsafe {
+            // SAFETY: same aligned zeroed ABI, independently owned by this fixture.
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables<C>>());
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr.cast::<ZoneTables<C>>())
+        };
+        let records = [507, 508].map(|tid| {
+            let identity = ThreadIdentity {
+                tid,
+                serial: tid,
+                mm: 7,
+                file_table: 99,
+                generation: 1,
+                affinity_source: crate::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+            };
+            let record = zone.alloc_record(identity).unwrap();
+            assert_eq!(foreign.alloc_record(identity).unwrap(), record);
+            record
+        });
+        let old = ObjectWaitKey::new(3, 1).unwrap();
+        let newer = ObjectWaitKey::new(old.index(), 2).unwrap();
+        let delivered = Mutex::new(Vec::new());
+        let completion = |owned: OwnedObjectWakeEffects<'_, C>| {
+            let _ = owned.deliver_handbacks(&mut |r| delivered.lock().unwrap().push(r));
+        };
+        zone.bind_object_wait(old, &BoundedSpin(0), &completion)
+            .unwrap();
+        let held = zone.object_wait(old, &BoundedSpin(0), &completion).unwrap();
+        std::thread::scope(|scope| {
+            let (enrolled_tx, enrolled_rx) = mpsc::channel();
+            let mut actors = Vec::new();
+            for (i, record) in records.into_iter().enumerate() {
+                let enrolled = enrolled_tx.clone();
+                let zone = &zone;
+                let completion = &completion;
+                let (release_tx, release_rx) = mpsc::channel();
+                actors.push((
+                    release_tx,
+                    scope.spawn(move || {
+                        assert_eq!(
+                            zone.bind_object_wait(newer, &BoundedSpin(0), completion),
+                            Err(ObjectWaitError::Busy)
+                        );
+                        zone.readiness_lock_custody(newer)
+                            .unwrap()
+                            .defer(
+                                record,
+                                OperationToken::new(i as u64 + 1, 19).unwrap(),
+                                completion,
+                            )
+                            .unwrap();
+                        enrolled.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }),
+                ));
+            }
+            for _ in &records {
+                enrolled_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            assert!(delivered.lock().unwrap().is_empty());
+            for record in records {
+                assert!(matches!(
+                    zone.record(record).claim(),
+                    Claim::Transferring { .. }
+                ));
+                assert_eq!(foreign.record(record).claim(), Claim::Free);
+                assert!(!foreign.record(record).has_object_operation());
+            }
+            drop(held);
+            zone.bind_object_wait(newer, &BoundedSpin(0), &completion)
+                .unwrap();
+            for (release, actor) in actors {
+                release.send(()).unwrap();
+                actor.join().unwrap();
+            }
+        });
+        assert_eq!(delivered.lock().unwrap().len(), records.len());
+        for (i, record) in records.into_iter().enumerate() {
+            assert_eq!(
+                delivered
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.id == record)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                unsafe { zone.record(record).take_object_operation() }
+                    .unwrap()
+                    .identity(),
+                OperationToken::new(i as u64 + 1, 19).unwrap().identity()
+            );
+            assert!(unsafe { zone.record(record).take_object_operation() }.is_none());
+        }
+    }
+
+    #[test]
+    fn readiness_lock_custody_two_live_threads_cpl0() {
+        readiness_custody_two_threads::<crate::ParkedContextWords>();
+    }
+
+    #[test]
+    fn readiness_lock_custody_two_live_threads_aarch64() {
+        readiness_custody_two_threads::<crate::Aarch64ParkedContext>();
     }
 
     #[test]
@@ -2501,13 +2669,10 @@ mod host_tests {
                 zone.bind_object_wait(newer, &BoundedSpin(0), &completion),
                 Err(ObjectWaitError::Busy)
             );
-            zone.defer_object_lock_release(
-                newer,
-                record,
-                OperationToken::new(tid, 19).unwrap(),
-                &completion,
-            )
-            .unwrap();
+            zone.readiness_lock_custody(newer)
+                .unwrap()
+                .defer(record, OperationToken::new(tid, 19).unwrap(), &completion)
+                .unwrap();
             assert!(matches!(
                 zone.record(record).claim(),
                 Claim::Transferring { .. }
@@ -2561,24 +2726,18 @@ mod host_tests {
                     zone.bind_object_wait(key, &BoundedSpin(0), &completion),
                     Err(ObjectWaitError::Busy)
                 );
-                zone.defer_object_lock_release(
-                    key,
-                    record,
-                    OperationToken::new(503, 1).unwrap(),
-                    &completion,
-                )
-                .unwrap();
+                zone.readiness_lock_custody(key)
+                    .unwrap()
+                    .defer(record, OperationToken::new(503, 1).unwrap(), &completion)
+                    .unwrap();
                 assert!(delivered.borrow().is_empty());
                 drop(held);
             } else {
                 drop(held);
-                zone.defer_object_lock_release(
-                    key,
-                    record,
-                    OperationToken::new(503, 1).unwrap(),
-                    &completion,
-                )
-                .unwrap();
+                zone.readiness_lock_custody(key)
+                    .unwrap()
+                    .defer(record, OperationToken::new(503, 1).unwrap(), &completion)
+                    .unwrap();
             }
             assert_eq!(*delivered.borrow(), [zone.record_ref(record)]);
             assert_eq!(
@@ -2650,13 +2809,10 @@ mod host_tests {
         let held = zone.object_wait(key, &BoundedSpin(0), &completion).unwrap();
         let record = allocate(&zone, 505);
         let exact = zone.record_ref(record);
-        zone.defer_object_lock_release(
-            key,
-            record,
-            OperationToken::new(505, 1).unwrap(),
-            &completion,
-        )
-        .unwrap();
+        zone.readiness_lock_custody(key)
+            .unwrap()
+            .defer(record, OperationToken::new(505, 1).unwrap(), &completion)
+            .unwrap();
         assert_eq!(
             zone.claim_for_host(
                 exact,

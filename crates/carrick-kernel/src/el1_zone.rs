@@ -2104,7 +2104,9 @@ mod tests {
                     .unwrap();
                 let operation = OperationToken::new(1845, 1).unwrap();
                 let identity = operation.identity();
-                zone.defer_object_lock_release(key, record, operation, &completion)
+                zone.readiness_lock_custody(key)
+                    .unwrap()
+                    .defer(record, operation, &completion)
                     .unwrap();
                 assert!(!task.linux.has_pending_host_work());
                 drop(held);
