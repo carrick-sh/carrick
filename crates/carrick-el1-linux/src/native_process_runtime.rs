@@ -289,30 +289,27 @@ pub(crate) fn native_entry_owned(
     }
 }
 
-/// Admission refuses either with retained contention or an existing failure.
-/// There is no conversion from contention to NativeProcessError or errno.
-///
-/// ```compile_fail
-/// use carrick_el1_linux::native_process_runtime::{NativeAdmissionContention, NativeProcessError};
-/// fn lower(contention: NativeAdmissionContention) -> NativeProcessError {
-///     contention.into()
-/// }
-/// ```
-///
-/// ```compile_fail
-/// use carrick_el1_linux::{dispatch::invalid_completion, native_process_runtime::NativeAdmissionContention};
-/// fn fatal(contention: NativeAdmissionContention) -> ! {
-///     invalid_completion(contention)
-/// }
-/// ```
+/// Admission preserves main's process error and an optional refusal snapshot.
+/// Diagnostics describe the refusal without changing its routing policy.
 #[derive(Debug, Eq, PartialEq)]
-pub enum NativeAdmissionError {
-    Contended(Box<NativeAdmissionContention>),
-    Failure(NativeProcessError),
+pub struct NativeAdmissionError {
+    pub error: NativeProcessError,
+    pub diagnostic: Option<Box<NativeAdmissionContention>>,
 }
 impl From<NativeProcessError> for NativeAdmissionError {
     fn from(error: NativeProcessError) -> Self {
-        Self::Failure(error)
+        Self {
+            error,
+            diagnostic: None,
+        }
+    }
+}
+impl NativeAdmissionError {
+    pub(crate) fn with_diagnostic(diagnostic: Box<NativeAdmissionContention>) -> Self {
+        Self {
+            error: NativeProcessError::Busy,
+            diagnostic: Some(diagnostic),
+        }
     }
 }
 
@@ -361,7 +358,7 @@ pub enum NativeGroupAdmission<'a, M: Clone, C: ProcessContext> {
 
 impl NativeAdmissionError {
     pub fn with_group_lookup(mut self, lookup: NativeGroupLookup) -> Self {
-        if let Self::Contended(contention) = &mut self {
+        if let Some(contention) = &mut self.diagnostic {
             contention.group_lookup = Some(lookup);
         }
         self
@@ -2057,7 +2054,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     })
                 })
                 .unwrap_or(key);
-            return Err(NativeAdmissionError::Contended(Box::new(
+            return Err(NativeAdmissionError::with_diagnostic(Box::new(
                 NativeAdmissionContention {
                     group_lookup: None,
                     origin: NativeAdmissionOrigin::RootRegistrationCollision,
@@ -2174,7 +2171,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             return Err(NativeProcessError::Stale.into());
         }
         if old_record != reference && signal_record_exists(source.zone, old_record) {
-            return Err(NativeAdmissionError::Contended(Box::new(
+            return Err(NativeAdmissionError::with_diagnostic(Box::new(
                 NativeAdmissionContention {
                     group_lookup: None,
                     origin: NativeAdmissionOrigin::OldRecordRetained,
@@ -2187,7 +2184,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
         let record_key = Self::record_key(source.zone, reference);
         if old_key != key && state.members.contains_key(&key) {
-            return Err(NativeAdmissionError::Contended(Box::new(
+            return Err(NativeAdmissionError::with_diagnostic(Box::new(
                 NativeAdmissionContention {
                     group_lookup: None,
                     origin: NativeAdmissionOrigin::ExecutionKeyCollision,
@@ -2201,7 +2198,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if old_record != reference
             && let Some(owner) = state.records.get(&record_key)
         {
-            return Err(NativeAdmissionError::Contended(Box::new(
+            return Err(NativeAdmissionError::with_diagnostic(Box::new(
                 NativeAdmissionContention {
                     group_lookup: None,
                     origin: NativeAdmissionOrigin::RecordKeyCollision,
@@ -3001,7 +2998,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let record_key = Self::record_key(source.zone, source.zone.record_ref(record));
         if state.members.contains_key(&key) || state.records.contains_key(&record_key) {
             let owner = state.records.get(&record_key).copied().unwrap_or(key);
-            return Err(NativeAdmissionError::Contended(Box::new(
+            return Err(NativeAdmissionError::with_diagnostic(Box::new(
                 NativeAdmissionContention {
                     group_lookup: None,
                     origin: NativeAdmissionOrigin::ThreadRegistrationCollision,
@@ -3057,7 +3054,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 let retained = retain_member_control(control)?;
                 let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
                     .map_err(|_| {
-                        NativeAdmissionError::Contended(Box::new(NativeAdmissionContention {
+                        NativeAdmissionError::with_diagnostic(Box::new(NativeAdmissionContention {
                             group_lookup: None,
                             origin: NativeAdmissionOrigin::ThreadPendingCustody,
                             binding,
@@ -3988,7 +3985,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         for member in &mut members {
             let pending = carrick_el1_abi::NativePendingCustody::try_admit(member.control.clone())
                 .map_err(|_| {
-                    NativeAdmissionError::Contended(Box::new(NativeAdmissionContention {
+                    NativeAdmissionError::with_diagnostic(Box::new(NativeAdmissionContention {
                         group_lookup: None,
                         origin: NativeAdmissionOrigin::FreshRootPendingCustody,
                         binding,
@@ -11804,11 +11801,10 @@ mod tests {
         ));
         assert!(matches!(
             registry.register_thread(source, &thread, address, &page, &leader_control),
-            Err(
-                crate::native_process_runtime::NativeAdmissionError::Failure(
-                    NativeProcessError::Stale
-                )
-            )
+            Err(crate::native_process_runtime::NativeAdmissionError {
+                error: NativeProcessError::Stale,
+                ..
+            })
         ));
         registry
             .register_thread(source, &thread, address, &page, &thread_control)
@@ -12128,11 +12124,10 @@ mod tests {
         ));
         assert!(matches!(
             registry.register_thread(source, &thread, address, &page, &leader_control),
-            Err(
-                crate::native_process_runtime::NativeAdmissionError::Failure(
-                    NativeProcessError::Stale
-                )
-            )
+            Err(crate::native_process_runtime::NativeAdmissionError {
+                error: NativeProcessError::Stale,
+                ..
+            })
         ));
         registry
             .register_thread(source, &thread, address, &page, &thread_control)
@@ -12274,11 +12269,10 @@ mod tests {
             } else {
                 assert!(matches!(
                     admitted,
-                    Err(
-                        crate::native_process_runtime::NativeAdmissionError::Failure(
-                            NativeProcessError::Stale
-                        )
-                    )
+                    Err(crate::native_process_runtime::NativeAdmissionError {
+                        error: NativeProcessError::Stale,
+                        ..
+                    })
                 ));
             }
         }
@@ -12359,11 +12353,10 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(
-                crate::native_process_runtime::NativeAdmissionError::Failure(
-                    NativeProcessError::Invalid
-                )
-            )
+            Err(crate::native_process_runtime::NativeAdmissionError {
+                error: NativeProcessError::Invalid,
+                ..
+            })
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -12713,11 +12706,10 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(
-                crate::native_process_runtime::NativeAdmissionError::Failure(
-                    NativeProcessError::Invalid
-                )
-            )
+            Err(crate::native_process_runtime::NativeAdmissionError {
+                error: NativeProcessError::Invalid,
+                ..
+            })
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -12775,7 +12767,10 @@ mod tests {
             );
             assert!(matches!(
                 registry_ref.admit_existing_group(source, task_ref, address, page_ref, control_ref),
-                Err(NativeAdmissionError::Failure(NativeProcessError::Stale))
+                Err(NativeAdmissionError {
+                    error: NativeProcessError::Stale,
+                    ..
+                })
             ));
             drop(
                 carrick_el1_abi::NativePendingCustody::try_admit(retained)
@@ -12869,11 +12864,10 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(
-                crate::native_process_runtime::NativeAdmissionError::Failure(
-                    NativeProcessError::Invalid
-                )
-            )
+            Err(crate::native_process_runtime::NativeAdmissionError {
+                error: NativeProcessError::Invalid,
+                ..
+            })
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -13022,11 +13016,10 @@ mod tests {
                     address,
                     words(address),
                 ),
-                Err(
-                    crate::native_process_runtime::NativeAdmissionError::Failure(
-                        NativeProcessError::Invalid
-                    )
-                )
+                Err(crate::native_process_runtime::NativeAdmissionError {
+                    error: NativeProcessError::Invalid,
+                    ..
+                })
             ));
             assert_eq!(page.live(), 2, "admission must not remove a live member");
             page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -13308,11 +13301,10 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(
-                crate::native_process_runtime::NativeAdmissionError::Failure(
-                    NativeProcessError::Invalid
-                )
-            )
+            Err(crate::native_process_runtime::NativeAdmissionError {
+                error: NativeProcessError::Invalid,
+                ..
+            })
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
@@ -16731,11 +16723,10 @@ mod tests {
                 address,
                 words(address),
             ),
-            Err(
-                crate::native_process_runtime::NativeAdmissionError::Failure(
-                    NativeProcessError::Invalid
-                )
-            )
+            Err(crate::native_process_runtime::NativeAdmissionError {
+                error: NativeProcessError::Invalid,
+                ..
+            })
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census

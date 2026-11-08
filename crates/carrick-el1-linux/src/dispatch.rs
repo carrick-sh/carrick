@@ -1685,12 +1685,12 @@ pub(crate) fn declined_fault_admission_result(
     result: Result<Action, impl Into<super::native_process_runtime::NativeAdmissionError>>,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
 ) -> Result<Action, super::native_process_runtime::NativeProcessError> {
-    use super::native_process_runtime::{NativeAdmissionError, NativeProcessError};
-    let result = match result.map_err(Into::into) {
-        Err(NativeAdmissionError::Contended(_)) => return Ok(Action::Forward),
-        Err(NativeAdmissionError::Failure(error)) => Err(error),
-        Ok(action) => Ok(action),
-    };
+    use super::native_process_runtime::NativeProcessError;
+    let result =
+        match result.map_err(Into::<super::native_process_runtime::NativeAdmissionError>::into) {
+            Err(error) => Err(error.error),
+            Ok(action) => Ok(action),
+        };
     match result {
         Ok(action) => Ok(action),
         Err(NativeProcessError::OwnerWait(wait)) => {
@@ -1937,29 +1937,15 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[track_caller]
 fn fatal_admission(error: super::native_process_runtime::NativeAdmissionError) -> ! {
-    match error {
-        super::native_process_runtime::NativeAdmissionError::Contended(contention) => {
-            // Explicit diagnostic-only terminal policy for #887. This is not
-            // an invariant conversion or an errno; the owned retry is separate.
-            #[cfg(target_os = "none")]
-            {
-                let (identity, lookup) = contention.diagnostic_payload();
-                carrick_el1::substrate::sched::hw::fatal_entry_binding_with_identity(
-                    contention.fatal_reason(),
-                    identity,
-                    lookup,
-                );
-            }
-            #[cfg(not(target_os = "none"))]
-            carrick_fatal::carrick_fatal!(
-                "el1::entry_completion",
-                "admission contention: {contention:?}"
-            )
-        }
-        super::native_process_runtime::NativeAdmissionError::Failure(error) => {
-            invalid_completion(native_service_invariant(error))
-        }
+    if let Some(diagnostic) = &error.diagnostic {
+        let (identity, lookup) = diagnostic.diagnostic_payload();
+        carrick_el1::substrate::sched::hw::fatal_entry_binding_with_identity(
+            diagnostic.fatal_reason(),
+            identity,
+            lookup,
+        );
     }
+    invalid_completion(native_service_invariant(error.error))
 }
 
 /// [`dispatch_irq`] with explicitly supplied tables (EL1 and host tests).

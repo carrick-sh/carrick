@@ -952,21 +952,18 @@ fn fatal() -> ! {
     carrick_x86_carrier::entry::fatal_boot()
 }
 
-/// Preserve typed admission contention at the CPL0 terminal boundary, just
-/// as ARM does. This is diagnostic policy, not an errno or invariant lowering.
+/// Preserve the retained refusal snapshot at the CPL0 terminal boundary.
 #[track_caller]
 pub(super) fn fatal_admission(
     error: carrick_el1_linux::native_process_runtime::NativeAdmissionError,
 ) -> ! {
-    match error {
-        carrick_el1_linux::native_process_runtime::NativeAdmissionError::Contended(contention) => {
-            let (identity, lookup) = contention.diagnostic_payload();
-            carrick_el1::isa::x86::fatal_entry_binding_with_identity(
-                contention.fatal_reason(),
-                identity,
-                lookup,
-            )
-        }
-        carrick_el1_linux::native_process_runtime::NativeAdmissionError::Failure(_) => fatal(),
+    if let Some(diagnostic) = &error.diagnostic {
+        let (identity, lookup) = diagnostic.diagnostic_payload();
+        carrick_el1::isa::x86::fatal_entry_binding_with_identity(
+            diagnostic.fatal_reason(),
+            identity,
+            lookup,
+        )
     }
+    fatal()
 }

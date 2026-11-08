@@ -2288,7 +2288,7 @@ fn register_thread_busy_keeps_birth_authenticable() {
             fixture.page,
             sibling.control
         ),
-        Err(NativeAdmissionError::Contended(ref contention))
+        Err(NativeAdmissionError { error: NativeProcessError::Busy, diagnostic: Some(ref contention) })
             if contention.origin == NativeAdmissionOrigin::ThreadPendingCustody
                 && contention.binding == binding
                 && contention.conflicting_owner == Some(binding)
@@ -8024,7 +8024,7 @@ fn admission_root_registration_collision_reports_identity() {
         .unwrap_err();
     assert_eq!(
         error,
-        crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+        crate::native_process_runtime::NativeAdmissionError::with_diagnostic(Box::new(
             NativeAdmissionContention {
                 group_lookup: None,
                 origin: NativeAdmissionOrigin::RootRegistrationCollision,
@@ -8068,7 +8068,7 @@ fn admission_old_record_retained_reports_identity() {
         .unwrap();
     assert_eq!(
         error,
-        crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+        crate::native_process_runtime::NativeAdmissionError::with_diagnostic(Box::new(
             NativeAdmissionContention {
                 group_lookup: None,
                 origin: NativeAdmissionOrigin::OldRecordRetained,
@@ -8147,7 +8147,7 @@ fn admission_rehome_collision(record_collision: bool) {
         .unwrap();
     assert_eq!(
         error,
-        crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+        crate::native_process_runtime::NativeAdmissionError::with_diagnostic(Box::new(
             NativeAdmissionContention {
                 group_lookup: None,
                 origin: if record_collision {
@@ -8236,7 +8236,7 @@ fn admission_thread_registration_collision_reports_identity() {
         .unwrap();
     assert_eq!(
         error,
-        crate::native_process_runtime::NativeAdmissionError::Contended(Box::new(
+        crate::native_process_runtime::NativeAdmissionError::with_diagnostic(Box::new(
             NativeAdmissionContention {
                 group_lookup: None,
                 origin: NativeAdmissionOrigin::ThreadRegistrationCollision,
@@ -8387,7 +8387,7 @@ fn admission_group_lookup_captures_stored_and_observed_keys() {
     .err()
     .unwrap()
     .with_group_lookup(lookup);
-    let NativeAdmissionError::Contended(contention) = error else {
+    let Some(contention) = error.diagnostic else {
         panic!("expected custody refusal")
     };
     assert_eq!(
