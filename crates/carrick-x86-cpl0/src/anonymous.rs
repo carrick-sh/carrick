@@ -47,18 +47,6 @@ impl<'a> X86AnonymousVenue<'a> {
     }
 }
 
-// MapPrivate stages no user bytes. Keep all validation and descriptor policy in
-// the shared host-file staging owner, rather than a second mmap decoder.
-struct MappingUser;
-impl carrick_personality_linux::native_host_file::HostFileUser for MappingUser {
-    fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
-        false
-    }
-    fn writable(&mut self, _: u64, _: usize) -> usize {
-        0
-    }
-}
-
 impl X86AnonymousVenue<'_> {
     fn source(
         &self,
@@ -98,14 +86,15 @@ impl X86AnonymousVenue<'_> {
             }
             count
         };
-        let staged = native_host_file::stage(
+        let staged = carrick_el1_linux::dispatch::stage_native_host_file(
             HostFileCall::MapPrivate(key),
+            self.task,
+            &carrick_el1_linux::file::HardwareValidator,
             &mut NativeNamespace {
                 table,
                 resolve: &mut resolve,
                 releases: &mut releases,
             },
-            &mut MappingUser,
         );
         match staged {
             Some(HostFileStage::Request {
