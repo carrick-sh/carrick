@@ -626,7 +626,6 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
             output,
             request.kind == RequestKind::MergeGroup,
         )?);
-        validate_receipt(&load(&output.join("base.json"))?, &request.base)?;
     }
     write(
         &output.join("request.json"),
@@ -716,8 +715,6 @@ fn download_run_baseline(
             ],
             None,
         )?;
-        fs::copy(dir.path().join("candidate.json"), output.join("base.json"))
-            .map_err(|e| fail(e.to_string()))?;
         fs::copy(
             dir.path().join("candidate.json"),
             output.join(format!("base-{id:020}-{attempt:020}.json")),
@@ -1088,9 +1085,6 @@ fn publish(
                     .is_some_and(|name| name.starts_with("base-") && name.ends_with(".json"))
             });
             paths.sort_by(|a, b| b.cmp(a));
-            if paths.is_empty() {
-                paths.push(dir.join("base.json"));
-            }
             let bases = paths
                 .iter()
                 .map(|path| load(path))
