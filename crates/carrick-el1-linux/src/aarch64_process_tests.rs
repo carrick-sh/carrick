@@ -17,6 +17,8 @@ mod native_retirement_tests;
 mod native_signal_resume_tests;
 #[cfg(test)]
 mod native_signal_work_return_tests;
+#[cfg(all(test, not(target_os = "macos")))]
+mod pipe_metadata_tests;
 
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
@@ -10595,6 +10597,27 @@ fn native_descriptor_witness(
     zone_ceiling: bool,
     ofd_ceiling: bool,
 ) {
+    native_descriptor_metadata_witness(
+        constructor,
+        root_constructor,
+        inherited_epoll,
+        netpoll,
+        zone_ceiling,
+        ofd_ceiling,
+        None,
+    );
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_descriptor_metadata_witness(
+    constructor: Option<u64>,
+    root_constructor: bool,
+    inherited_epoll: bool,
+    netpoll: bool,
+    zone_ceiling: bool,
+    ofd_ceiling: bool,
+    metadata: Option<pipe_metadata_tests::Case>,
+) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
@@ -10864,6 +10887,18 @@ fn native_descriptor_witness(
     );
     for binding in &child_bindings {
         assert!(runtime.task_binding(binding.key).is_some());
+    }
+
+    if let Some(case) = metadata {
+        pipe_metadata_tests::exercise(case, |nr, args| {
+            let (route, result) = run_in_child_full(0, nr, args);
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "pipe metadata syscall {nr} must complete in ring: {route:?}, result {result}"
+            );
+            result
+        });
+        return;
     }
 
     if zone_ceiling {
