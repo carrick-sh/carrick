@@ -26,6 +26,22 @@ PLUGIN = _load_plugin()
 
 
 class CarrickLldbHelperTests(unittest.TestCase):
+    def test_syscall_frames_decode_host_register_writes_and_committed_rows(self):
+        import struct
+        rows = bytearray(32 * 16 * 8)
+        struct.pack_into("<16Q", rows, 0, 1, 8, 73, 0x1234, 2, 11, 12, 13, 14, 0x4000, 1, 0x5000, 0, 8, 0, 0)
+        struct.pack_into("<16Q", rows, 128, 1, 8, 22, 0x1234, 2, 11, 12, 13, 14, 3, 0x4000, 1, 4999, 0, 0, 8)
+        struct.pack_into("<16Q", rows, 256, 0, 1, 73, 0x1238, 2, 11, 12, 13, 14, 0x4000, 1, 0x5000, 0, 8, 0, 1)
+        lines = PLUGIN._syscall_frame_lines(rows)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("source=host-ipc-replay nr=73", lines[0])
+        self.assertIn("args=[0x4000,0x1,0x5000,0x0,0x8,0x0] argument-write-mask=0x0", lines[0])
+        self.assertIn("nr=22", lines[1])
+        self.assertIn("0x1387", lines[1])
+        self.assertIn("argument-write-mask=0x8", lines[1])
+        with self.assertRaises(ValueError):
+            PLUGIN._syscall_frame_lines(rows[:-1])
+
     def test_copy_refusals_decode_committed_rows_only(self):
         import struct
         rows = bytearray(16 * 23 * 8)
