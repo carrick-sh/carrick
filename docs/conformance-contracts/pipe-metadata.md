@@ -16,10 +16,14 @@ creates its pipe through pipe2. All I/O in these cases is nonblocking.
 The first witness set covers fstat, empty-path newfstatat, fcntl status and
 fd flags, both fcntl duplication commands, pipe capacity, FIONREAD, FIONBIO,
 TCGETS, lseek, dup, dup3 and close. It is deliberately red before routing
-and metadata repairs. Exec-successor and FIOCLEX/FIONCLEX cases extend the same matrix. The exec
+and metadata repairs. Exec-successor and FIOCLEX/FIONCLEX cases extend the
+same matrix. The exec
 fixture also checks an inherited CLOEXEC alias is removed while the parent
-keeps it, and the non-CLOEXEC pipe ends survive. Shrink-EBUSY, contention and
-x86 execution still need witnesses. No signed or end-to-end
+keeps it, and the non-CLOEXEC pipe ends survive. Capacity witnesses require
+EBUSY(16) when shrinking below 4097 buffered bytes, preserve the old capacity,
+and require the same shrink to succeed after draining. A combined CPython
+metadata pattern probes both a freshly created pipe and inherited fd 3.
+Contention and x86 execution still need witnesses. No signed or end-to-end
 CPython result is claimed by these VM-free tests.
 
 ## Required shared interface review before implementation

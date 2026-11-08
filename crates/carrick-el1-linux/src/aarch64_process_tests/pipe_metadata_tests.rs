@@ -12,6 +12,8 @@ pub(super) enum Case {
     Duplicate,
     DuplicateCloexec,
     PipeSize,
+    PipeShrinkBusy,
+    SubprocessPattern,
     Readable,
     Nonblocking,
     IoctlCloexec,
@@ -88,6 +90,16 @@ witness!(
     PipeSize
 );
 witness!(
+    serial_host_pipe_metadata_root_shrink_busy,
+    serial_host_pipe_metadata_child_shrink_busy,
+    PipeShrinkBusy
+);
+witness!(
+    serial_host_pipe_metadata_root_subprocess,
+    serial_host_pipe_metadata_child_subprocess,
+    SubprocessPattern
+);
+witness!(
     serial_host_pipe_metadata_root_fionread,
     serial_host_pipe_metadata_child_fionread,
     Readable
@@ -150,6 +162,8 @@ exec_witness!(
     DuplicateCloexec
 );
 exec_witness!(serial_host_pipe_metadata_exec_pipe_size, PipeSize);
+exec_witness!(serial_host_pipe_metadata_exec_shrink_busy, PipeShrinkBusy);
+exec_witness!(serial_host_pipe_metadata_exec_subprocess, SubprocessPattern);
 exec_witness!(serial_host_pipe_metadata_exec_readable, Readable);
 exec_witness!(serial_host_pipe_metadata_exec_nonblocking, Nonblocking);
 exec_witness!(serial_host_pipe_metadata_exec_ioctl_cloexec, IoctlCloexec);
@@ -280,6 +294,60 @@ pub(super) fn exercise(case: Case, mut call: impl FnMut(u64, [u64; 4]) -> i64) {
                 call(nr::FCNTL.raw(), [read, LINUX_F_GETPIPE_SZ, 0, 0]),
                 4096
             );
+        }
+        Case::PipeShrinkBusy => {
+            let payload = GuestUserBuffer::zeroed(4097);
+            assert_eq!(call(nr::WRITE.raw(), [write, payload.arg(), 4097, 0]), 4097);
+            assert_eq!(
+                call(nr::FCNTL.raw(), [read, LINUX_F_SETPIPE_SZ, 4096, 0]),
+                -16,
+                "shrinking below buffered bytes must return EBUSY(16)"
+            );
+            assert_eq!(
+                call(nr::FCNTL.raw(), [write, LINUX_F_GETPIPE_SZ, 0, 0]),
+                65536,
+                "a refused shrink preserves capacity"
+            );
+            let received = GuestUserBuffer::zeroed(4097);
+            assert_eq!(call(nr::READ.raw(), [read, received.arg(), 4097, 0]), 4097);
+            assert_eq!(
+                call(nr::FCNTL.raw(), [write, LINUX_F_SETPIPE_SZ, 4096, 0]),
+                4096,
+                "the same shrink succeeds after draining"
+            );
+        }
+        Case::SubprocessPattern => {
+            // CPython probes a new pipe before using it. Repeat those probes
+            // on fd 3, inherited from the still-live parent across fork/exec.
+            for fd in [read, 3] {
+                let stat = GuestUserBuffer::zeroed(core::mem::size_of::<LinuxStat>());
+                assert_eq!(call(nr::FSTAT.raw(), [fd, stat.arg(), 0, 0]), 0);
+                let stat =
+                    <LinuxStat as zerocopy::FromBytes>::read_from_bytes(stat.as_bytes()).unwrap();
+                assert_eq!(stat.st_mode & LINUX_S_IFMT, LINUX_S_IFIFO);
+                let count = GuestUserBuffer::from_value(-1i32);
+                assert_eq!(
+                    call(nr::IOCTL.raw(), [fd, LINUX_FIONREAD, count.arg(), 0]),
+                    0
+                );
+                assert_eq!(i32::from_ne_bytes(count.as_bytes().try_into().unwrap()), 0);
+                assert_eq!(call(nr::IOCTL.raw(), [fd, LINUX_TCGETS, 0, 0]), -25);
+                assert_eq!(call(nr::LSEEK.raw(), [fd, 0, 0, 0]), -29);
+                let flags = call(nr::FCNTL.raw(), [fd, LINUX_F_GETFL, 0, 0]);
+                assert!(flags >= 0, "F_GETFL errno number: {}", -flags);
+                assert_eq!(
+                    call(
+                        nr::FCNTL.raw(),
+                        [fd, LINUX_F_SETFL, flags as u64 | LINUX_O_NONBLOCK, 0]
+                    ),
+                    0
+                );
+                assert_eq!(
+                    call(nr::FCNTL.raw(), [fd, LINUX_F_GETFL, 0, 0]),
+                    flags | LINUX_O_NONBLOCK as i64
+                );
+                assert_eq!(call(nr::FCNTL.raw(), [fd, LINUX_F_GETPIPE_SZ, 0, 0]), 65536);
+            }
         }
         Case::Readable => {
             assert_eq!(call(nr::WRITE.raw(), [write, data.arg(), 3, 0]), 3);
