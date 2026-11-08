@@ -266,7 +266,7 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
     );
     write(
         "sched/Cargo.toml",
-        "[package]\nname='carrick-sched-core'\nversion='0.1.0'\nedition='2021'\n",
+        "[package]\nname='carrick-sched-core'\nversion='0.1.0'\nedition='2021'\n[features]\nunion-required=[]\n",
     );
     write(
         "sched/src/lib.rs",
@@ -292,7 +292,7 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
         "scripts/migrate/check-serial-host-tests.py",
         "# fixture authority\n",
     );
-    let recipe = "test:\n    cargo --locked --offline run -p carrick-xtask -- test-batch lanes\nlanes:\n    cargo --locked --offline test --workspace --lib -- --skip serial_host\n    env RUST_TEST_THREADS=1 cargo --locked --offline test --workspace --lib --features carrick-kernel/test-support serial_host\n";
+    let recipe = "test:\n    cargo --locked --offline run -p carrick-xtask -- test-batch lanes\nlanes:\n    cargo --locked --offline test --workspace --lib -- --skip serial_host\n    env RUST_TEST_THREADS=1 cargo --locked --offline test --workspace --lib --features carrick-kernel/test-support,carrick-sched-core/union-required serial_host\n";
     write("justfile", recipe);
     let git = |args: &[&str]| {
         let out = Command::new("git")
@@ -327,7 +327,7 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
     let base = git(&["rev-parse", "HEAD"]);
     write(
         "sched/src/lib.rs",
-        "#[test] fn cancelled_metadata_wait_releases_record_without_resume() { panic!(\"known regression\"); }\n#[test] fn serial_host_cancelled_deferred_metadata_wait_releases_record_without_resume() { assert_eq!(std::env::var(\"RUST_TEST_THREADS\").unwrap(), \"1\"); panic!(\"known regression\"); }\n",
+        "#[test] fn regular_feature_union() { assert!(cfg!(feature=\"union-required\")); }\n#[test] fn cancelled_metadata_wait_releases_record_without_resume() { panic!(\"known regression\"); }\n#[test] fn serial_host_cancelled_deferred_metadata_wait_releases_record_without_resume() { assert_eq!(std::env::var(\"RUST_TEST_THREADS\").unwrap(), \"1\"); panic!(\"known regression\"); }\n",
     );
     git(&["add", "sched/src/lib.rs"]);
     git(&[
@@ -379,6 +379,7 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
         "{text}"
     );
     assert!(!text.contains("must_not_run ... FAILED"), "{text}");
+    assert!(text.contains("regular_feature_union ... ok"), "{text}");
     if !text.contains("host facility unavailable") {
         assert!(
             text.contains("test-touched: carrick-kernel: PASS"),
