@@ -2123,11 +2123,8 @@ fn add_service_sibling(
     add_signal_sibling(fixture, operation, false)
 }
 
-fn add_signal_sibling(
-    fixture: &NativeSignalFixture,
-    operation: Option<carrick_core_abi::service::ServiceOperation>,
-    host_issued: bool,
-) -> ExecSibling {
+// Prepare a real published birth without entering native registration.
+fn prepare_signal_sibling(fixture: &NativeSignalFixture, host_issued: bool) -> ExecSibling {
     let binding = ExecutionBinding {
         task: carrick_core_abi::EntryTaskKey::from_raw(42),
         generation: carrick_core_abi::SnapshotGeneration::from_raw(12),
@@ -2240,6 +2237,136 @@ fn add_signal_sibling(
         .unwrap();
     let record = fixture.zone.record_ref(record);
     control.bind_zone_record(record);
+    ExecSibling {
+        task,
+        control,
+        slot,
+        record,
+        service_ticket: None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn register_thread_busy_keeps_birth_authenticable() {
+    let fixture = native_exec_fixture();
+    let sibling = prepare_signal_sibling(&fixture, true);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: sibling.slot,
+    };
+    let binding = crate::common_entry::execution_binding(sibling.task);
+    let birth = sibling.control.host_birth_identity().unwrap();
+    let writer = carrick_el1_abi::NativePendingCustody::try_admit(
+        retain_member_control(sibling.control).unwrap(),
+    )
+    .unwrap();
+    let before = {
+        let state = fixture.registry.state.lock();
+        (
+            state.members.len(),
+            state.records.len(),
+            state
+                .by_process
+                .values()
+                .map(|(_, members)| members.len())
+                .sum::<usize>(),
+        )
+    };
+    assert!(matches!(
+        fixture.registry.register_thread(
+            source,
+            sibling.task,
+            fixture.address,
+            fixture.page,
+            sibling.control
+        ),
+        Err(NativeProcessError::Busy)
+    ));
+    assert!(
+        IssuedHostThread::authenticate(
+            source,
+            binding,
+            41,
+            fixture.page,
+            sibling.control,
+            sibling.record.id
+        )
+        .is_ok(),
+        "Busy consumed the host birth before admission committed"
+    );
+    {
+        let graph = fixture.runtime.graph.lock();
+        let row = graph.owner.task(graph.root_key).unwrap();
+        assert!(
+            row.credentials_for(42).is_err(),
+            "Busy published thread credentials"
+        );
+        assert_eq!(row.native().resources().members.len(), 1);
+    }
+    {
+        let state = fixture.registry.state.lock();
+        assert_eq!(
+            (
+                state.members.len(),
+                state.records.len(),
+                state
+                    .by_process
+                    .values()
+                    .map(|(_, members)| members.len())
+                    .sum::<usize>()
+            ),
+            before
+        );
+    }
+    drop(writer);
+    fixture
+        .registry
+        .register_thread(
+            source,
+            sibling.task,
+            fixture.address,
+            fixture.page,
+            sibling.control,
+        )
+        .unwrap();
+    {
+        let graph = fixture.runtime.graph.lock();
+        let row = graph.owner.task(graph.root_key).unwrap();
+        assert!(row.credentials_for(42).is_ok());
+        assert_eq!(row.native().resources().members.len(), 2);
+    }
+    let state = fixture.registry.state.lock();
+    assert_eq!(
+        (
+            state.members.len(),
+            state.records.len(),
+            state
+                .by_process
+                .values()
+                .map(|(_, members)| members.len())
+                .sum::<usize>()
+        ),
+        (before.0 + 1, before.1 + 1, before.2 + 1)
+    );
+    assert!(
+        !fixture.page.release_adopted_host_birth(birth),
+        "birth must already be consumed exactly once"
+    );
+}
+
+fn add_signal_sibling(
+    fixture: &NativeSignalFixture,
+    operation: Option<carrick_core_abi::service::ServiceOperation>,
+    host_issued: bool,
+) -> ExecSibling {
+    let ExecSibling {
+        task,
+        control,
+        slot,
+        record,
+        ..
+    } = prepare_signal_sibling(fixture, host_issued);
     fixture
         .registry
         .register_thread(
