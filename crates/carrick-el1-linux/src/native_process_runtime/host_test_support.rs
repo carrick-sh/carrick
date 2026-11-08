@@ -2356,6 +2356,7 @@ fn register_thread_busy_keeps_birth_authenticable() {
 }
 
 // Existing payload allocations must survive production admission unchanged.
+#[cfg(test)]
 #[test]
 fn register_thread_preserves_existing_credential_storage() {
     use carrick_personality_linux::identity::TaskGid;
