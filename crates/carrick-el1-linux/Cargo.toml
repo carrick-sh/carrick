@@ -41,7 +41,7 @@ carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
 carrick-mem = { path = "../carrick-mem" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-test-support = { path = "../carrick-test-support" }
-carrick-core = { path = "../carrick-core", features = ["host-test"] }
+carrick-core = { path = "../carrick-core", features = ["host-test", "test-support"] }
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-sched-core = { path = "../carrick-sched-core", features = ["host-test"] }
