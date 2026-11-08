@@ -45,7 +45,7 @@ fn read_diagnostics(fd: libc::c_int, consumed: usize, payload: &mut [u8; 96]) ->
 
 /// Keep both processes alive while publishing inherited prepared backing,
 /// restoring PROT_NONE data and writing both inherited pages independently.
-pub(crate) fn run() -> i32 {
+pub(crate) fn run(touch_arguments: bool) -> i32 {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page <= 0 {
@@ -200,10 +200,21 @@ pub(crate) fn run() -> i32 {
         events: libc::POLLIN,
         revents: 0,
     };
-    let timeout = libc::timespec {
+    let mut timeout = libc::timespec {
         tv_sec: 5,
         tv_nsec: 0,
     };
+    if touch_arguments {
+        // Volatile stores cannot be folded into the initializers: exercise the
+        // guest write-fault path before the kernel reads these exact operands.
+        unsafe {
+            std::ptr::addr_of_mut!(pfd.fd).write_volatile(c2p_read.as_raw_fd());
+            std::ptr::addr_of_mut!(pfd.events).write_volatile(libc::POLLIN);
+            std::ptr::addr_of_mut!(pfd.revents).write_volatile(0);
+            std::ptr::addr_of_mut!(timeout.tv_sec).write_volatile(5);
+            std::ptr::addr_of_mut!(timeout.tv_nsec).write_volatile(0);
+        }
+    }
     let polled = unsafe { libc::ppoll(&mut pfd, 1, &timeout, std::ptr::null()) };
     let poll_errno = errno_if_failed(polled as i64);
     let mut count = [0u8; 8];
@@ -283,7 +294,7 @@ pub(crate) fn run() -> i32 {
     // unreached/missing observations; *_errno is 0 on success or errno NUMBER.
     // child_exit is requested _exit status; wait_status is the raw wait4 status.
     println!(
-        "prepared-fork-steps child_mprotect_r={} child_mprotect_r_errno={} child_hidden={} child_mprotect_rw={} child_mprotect_rw_errno={} child_middle={} child_write={} child_write_errno={} child_exit={} child_final_first={} child_final_middle={} child_final_hidden={} parent_mprotect_r={parent_protect} parent_mprotect_r_errno={parent_errno} parent_hidden={parent_hidden} parent_middle={parent_middle} ppoll={polled} ppoll_errno={poll_errno} revents={} read={read_rc} read_errno={read_errno} wait4={waited} wait4_errno={wait_errno} wait_status={status} diagnostic_read={diagnostic_read} diagnostic_errno={diagnostic_errno}",
+        "prepared-fork-steps child_mprotect_r={} child_mprotect_r_errno={} child_hidden={} child_mprotect_rw={} child_mprotect_rw_errno={} child_middle={} child_write={} child_write_errno={} child_exit={} child_final_first={} child_final_middle={} child_final_hidden={} parent_mprotect_r={parent_protect} parent_mprotect_r_errno={parent_errno} parent_hidden={parent_hidden} parent_middle={parent_middle} ppoll={polled} ppoll_errno={poll_errno} revents={} read={read_rc} read_errno={read_errno} wait4={waited} wait4_errno={wait_errno} wait_status={status} diagnostic_read={diagnostic_read} diagnostic_errno={diagnostic_errno} pollfd_touched={touch_arguments} timespec_touched={touch_arguments}",
         child[0],
         child[1],
         child[2],

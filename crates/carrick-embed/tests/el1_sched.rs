@@ -4083,6 +4083,25 @@ fn el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes() {
     );
 }
 
+/// Control: write the exact ppoll operands before entering the kernel.
+#[test]
+fn el1_prepared_fork_poll_arguments_touched_after_fork() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    let run = run_fixture(&carrier, &["prepared-fork-touch"], Duration::from_secs(30));
+    let output = run.result.stdout_utf8();
+    assert!(
+        output.contains(
+            "prepared-fork inherited_zero=true prot_none_bytes=true two_live_isolation=true ok=true"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains("pollfd_touched=true timespec_touched=true"),
+        "{output}"
+    );
+}
+
 /// The carrier pool's guest COW counters: (resolved, declined by reason).
 fn el1_cow_pool_counters() -> (u64, [u64; carrick_el1_abi::COW_DECLINE_REASONS]) {
     carrick_el1_abi::cow_grant_pool_host()
