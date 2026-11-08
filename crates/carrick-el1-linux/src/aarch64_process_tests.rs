@@ -10639,6 +10639,41 @@ fn native_descriptor_witness(
     ofd_ceiling: bool,
     poll_inherited_pipe: bool,
 ) {
+    native_descriptor_argument_witness(
+        constructor,
+        root_constructor,
+        inherited_epoll,
+        netpoll,
+        zone_ceiling,
+        ofd_ceiling,
+        poll_inherited_pipe,
+        None,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_prepared_fork_parent_ppoll_prepared_pollfd() {
+    native_descriptor_argument_witness(None, true, false, false, false, false, true, Some(false));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_prepared_fork_parent_ppoll_prepared_timeout() {
+    native_descriptor_argument_witness(None, true, false, false, false, false, true, Some(true));
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_descriptor_argument_witness(
+    constructor: Option<u64>,
+    root_constructor: bool,
+    inherited_epoll: bool,
+    netpoll: bool,
+    zone_ceiling: bool,
+    ofd_ceiling: bool,
+    poll_inherited_pipe: bool,
+    prepared_timeout: Option<bool>,
+) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
@@ -10649,7 +10684,12 @@ fn native_descriptor_witness(
     use carrick_personality_linux::dispatch::CompletionRoute;
     use std::sync::Arc;
 
-    let fixture = Fixture::new(0x10000, asid(1));
+    let fixture: &'static Fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    if prepared_timeout.is_some() {
+        let descriptor = fixture.tables.words[1536].load(Ordering::Relaxed);
+        fixture.tables.words[1536]
+            .store((descriptor & !1) | (1 << 56) | (1 << 57), Ordering::Relaxed);
+    }
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -10866,7 +10906,7 @@ fn native_descriptor_witness(
                 user: &crate::sched::HardwareUserWord,
             }),
             Some(&venue),
-            Some(&fixture),
+            Some(fixture),
             Some(&mut entry),
             Some(source),
             None,
@@ -11076,6 +11116,12 @@ fn native_descriptor_witness(
         let ack_reader = u32::from_ne_bytes(ack_output.as_bytes()[..4].try_into().unwrap()) as u64;
         let ack_writer = u32::from_ne_bytes(ack_output.as_bytes()[4..].try_into().unwrap()) as u64;
 
+        let pollfds = carrick_test_support::GuestUserBuffer::from_values(&[PollFd {
+            fd: reader as i32,
+            events: LINUX_POLLIN,
+            revents: 0x7777,
+        }]);
+        let timeout = carrick_test_support::GuestUserBuffer::from_values(&[5i64, 0]);
         let writer = {
             let mut writer_service = Aarch64NativeProcessService::with_crossing(
                 &task,
@@ -11108,37 +11154,34 @@ fn native_descriptor_witness(
             ));
             assert_eq!(result, 0);
         }
-        let pollfds = carrick_test_support::GuestUserBuffer::from_values(&[PollFd {
-            fd: reader as i32,
-            events: LINUX_POLLIN,
-            revents: 0x7777,
-        }]);
-        let timeout = carrick_test_support::GuestUserBuffer::from_values(&[5i64, 0]);
-        let (route, result) = run_binding(
-            &parent_binding,
-            sys::PPOLL.raw(),
-            [pollfds.arg(), 1, timeout.arg(), 0],
-        );
-        assert!(
-            matches!(
-                route,
-                CompletionRoute::Served | CompletionRoute::WithWork | CompletionRoute::Suspended
-            ),
-            "parent ppoll must park and switch in ring: route={route:?} result={result}",
-        );
-        assert!(
-            fixture
-                .zone
-                .record(parent_binding.record.id)
-                .has_object_operation(),
-            "the parent must retain its poll readiness operation"
-        );
-        assert_eq!(
-            pollfds.get::<PollFd>(0).revents,
-            0x7777,
-            "a parked poll must not publish output"
-        );
-
+        if prepared_timeout.is_none() {
+            let (route, result) = run_binding(
+                &parent_binding,
+                sys::PPOLL.raw(),
+                [pollfds.arg(), 1, timeout.arg(), 0],
+            );
+            assert!(
+                matches!(
+                    route,
+                    CompletionRoute::Served
+                        | CompletionRoute::WithWork
+                        | CompletionRoute::Suspended
+                ),
+                "parent ppoll must park and switch in ring: route={route:?} result={result}",
+            );
+            assert!(
+                fixture
+                    .zone
+                    .record(parent_binding.record.id)
+                    .has_object_operation(),
+                "the parent must retain its poll readiness operation"
+            );
+            assert_eq!(
+                pollfds.get::<PollFd>(0).revents,
+                0x7777,
+                "a parked poll must not publish output"
+            );
+        }
         activate(&writer);
         for fd in [reader, ack_writer] {
             let (route, result) = run_binding(&writer, sys::CLOSE.raw(), [fd, 0, 0, 0]);
@@ -11157,6 +11200,37 @@ fn native_descriptor_witness(
         ));
         assert_eq!(result, 8, "child pipe write errno {}", -result);
 
+        struct ResetAccess;
+        impl Drop for ResetAccess {
+            fn drop(&mut self) {
+                carrick_el1::substrate::file::TEST_USER_ACCESS
+                    .with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let _reset = ResetAccess;
+        if let Some(timeout_page) = prepared_timeout {
+            let descriptor = fixture.tables.words[1536].load(Ordering::Acquire);
+            assert!(carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private(descriptor));
+            assert_ne!(
+                descriptor & (1 << 59),
+                0,
+                "real fork must share prepared backing as COW"
+            );
+            let target = if timeout_page {
+                timeout.arg()
+            } else {
+                pollfds.arg()
+            };
+            carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |address, _, write| {
+                    if address != target {
+                        return true;
+                    }
+                    let descriptor = fixture.tables.words[1536].load(Ordering::Acquire);
+                    descriptor & 1 != 0 && (!write || descriptor & (1 << 7) == 0)
+                }));
+            });
+        }
         activate(&parent_binding);
         let (route, result) = run_binding(
             &parent_binding,
