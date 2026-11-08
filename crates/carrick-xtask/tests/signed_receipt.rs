@@ -1908,3 +1908,27 @@ else:
         );
     }
 }
+
+#[test]
+fn different_hosts_refuse_false_new_at_production_comparison() {
+    let mut a = serde_json::to_value(base()).unwrap();
+    a["host_identity"] =
+        json!({"runner_name":"host-a","hardware_model":"Mac14,2","product_build":"25A1"});
+    let mut b = a.clone();
+    b["host_identity"]["runner_name"] = json!("host-b");
+    b["steps"][0]["failed_tests"] = json!(["el1_sched::el1_tlb_first_missed_ack_is_terminal"]);
+    let result = compare(
+        &serde_json::from_value(a).unwrap(),
+        &serde_json::from_value(b).unwrap(),
+    );
+    assert!(
+        result.is_err(),
+        "different hosts must not produce NEW: {result:?}"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("incomparable base")
+    );
+}
