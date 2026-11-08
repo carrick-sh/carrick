@@ -2942,6 +2942,39 @@ impl AnonymousLeave {
     pub const COUNT: usize = 16;
 }
 
+/// Provenance only: permission faults do not establish COW ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyRefusalReason {
+    ForbiddenRange,
+    Validator,
+    GuardedFault,
+    OwnerFault,
+    ArmTranslation(u8),
+}
+
+impl CopyRefusalReason {
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::ForbiddenRange => 1,
+            Self::Validator => 2,
+            Self::GuardedFault => 3,
+            Self::OwnerFault => 4,
+            Self::ArmTranslation(fst) => 0x100 | fst as u64,
+        }
+    }
+}
+
+/// One diagnostic sample. It is observational and grants no copy authority.
+pub struct CopyRefusal {
+    pub ordinal: carrick_syscall_abi::CanonicalNr,
+    pub address: carrick_guest_arch::UserVa,
+    pub len: carrick_guest_arch::GuestLen,
+    pub argument: Option<usize>,
+    pub access: carrick_guest_arch::Access,
+    pub reason: CopyRefusalReason,
+    pub owner_present: bool,
+}
+
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
 #[repr(C)]
 pub struct Counters {
@@ -2972,6 +3005,11 @@ pub struct Counters {
     /// Carrier venue refusals, separate from ring routing refusals.
     pub venue_refused: [AtomicU64; 513],
     pub venue_refused_child: [AtomicU64; 513],
+    /// First 16 argument-copy refusals. Each immutable row is published by
+    /// word 0 (1 = committed): ordinal, VA, length, argument (6 = derived),
+    /// direction (0 = in, 1 = out), reason, matching-owner-present.
+    pub copy_refusals: [[AtomicU64; 8]; 16],
+    pub copy_refusal_slots: AtomicU64,
 }
 
 /// The authority that declined to serve the operation.
@@ -3002,6 +3040,8 @@ impl Counters {
             refused_child: [const { AtomicU64::new(0) }; 513],
             venue_refused: [const { AtomicU64::new(0) }; 513],
             venue_refused_child: [const { AtomicU64::new(0) }; 513],
+            copy_refusals: [const { [const { AtomicU64::new(0) }; 8] }; 16],
+            copy_refusal_slots: AtomicU64::new(0),
         }
     }
 
@@ -3059,7 +3099,43 @@ impl Counters {
                 Ordering::Relaxed,
             );
         }
+        for row in &self.copy_refusals {
+            if row[0].load(Ordering::Acquire) == 1 {
+                snapshot.publish_copy_refusal(core::array::from_fn(|i| {
+                    row[i + 1].load(Ordering::Relaxed)
+                }));
+            }
+        }
         snapshot
+    }
+
+    /// Bounded, non-blocking diagnostic publication; a full buffer is retained.
+    pub fn record_copy_refusal(&self, refusal: CopyRefusal) {
+        self.publish_copy_refusal([
+            refusal.ordinal.raw(),
+            refusal.address.raw(),
+            refusal.len.raw(),
+            refusal.argument.filter(|&i| i < 6).unwrap_or(6) as u64,
+            u64::from(refusal.access == carrick_guest_arch::Access::Write),
+            refusal.reason.code(),
+            u64::from(refusal.owner_present),
+        ]);
+    }
+
+    fn publish_copy_refusal(&self, words: [u64; 7]) {
+        let Ok(slot) =
+            self.copy_refusal_slots
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    (n < 16).then_some(n + 1)
+                })
+        else {
+            return;
+        };
+        let row = &self.copy_refusals[slot as usize];
+        for (target, value) in row[1..].iter().zip(words) {
+            target.store(value, Ordering::Relaxed);
+        }
+        row[0].store(1, Ordering::Release);
     }
 
     pub fn record_refusal(
@@ -4756,6 +4832,20 @@ mod tests {
     }
 
     #[test]
+    fn copy_refusals_keep_first_records_and_snapshot_committed_rows() {
+        let counters = Counters::new();
+        for n in 0..20 {
+            counters.publish_copy_refusal([73, n, 16, 2, 0, 3, 0]);
+        }
+        assert_eq!(counters.copy_refusal_slots.load(Ordering::Relaxed), 16);
+        let snapshot = counters.copy_snapshot();
+        for (n, row) in snapshot.copy_refusals.iter().enumerate() {
+            assert_eq!(row[0].load(Ordering::Acquire), 1);
+            assert_eq!(row[2].load(Ordering::Relaxed), n as u64);
+        }
+    }
+
+    #[test]
     fn test_counters_layout() {
         assert_eq!(
             core::mem::size_of::<Counters>(),
@@ -4766,7 +4856,9 @@ mod tests {
                 + IpcLeave::COUNT
                 + LifecycleDecline::COUNT
                 + AnonymousLeave::COUNT
-                + 4 * 513)
+                + 4 * 513
+                + 16 * 8
+                + 1)
                 * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);

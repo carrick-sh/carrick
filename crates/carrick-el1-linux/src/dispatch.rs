@@ -2415,13 +2415,25 @@ fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
     address: carrick_guest_arch::UserVa,
     bytes: &[u8],
     result: SyscallResult,
+    diagnostic: (&Counters, carrick_syscall_abi::CanonicalNr),
 ) -> FamilyCompletion {
     if let Some(process) = process {
-        return carrick_personality_linux::lifecycle::lifecycle_effect(&process.complete_copyout(
-            address,
-            bytes.to_vec(),
-            result,
-        ));
+        let outcome = process.complete_copyout(address, bytes.to_vec(), result);
+        if matches!(&outcome, lifecycle::LifecycleOutcome::Returned { result, .. } if result.raw() == -14)
+        {
+            diagnostic
+                .0
+                .record_copy_refusal(carrick_el1_abi::CopyRefusal {
+                    ordinal: diagnostic.1,
+                    address,
+                    len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                    argument: Some(0),
+                    access: carrick_guest_arch::Access::Write,
+                    reason: carrick_el1_abi::CopyRefusalReason::OwnerFault,
+                    owner_present: true,
+                });
+        }
+        return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
     }
     let mut copy = file::ValidatedCopy {
         task,
@@ -2446,6 +2458,7 @@ fn host_owned_poll_copyout_refusal_keeps_the_host_fallback() {
             carrick_guest_arch::UserVa::new(carrick_guest_arch::USER_CEILING),
             &[0; 8],
             SyscallResult::new(1),
+            (&Counters::new(), carrick_syscall_abi::CanonicalNr::new(73)),
         ),
         FamilyCompletion::Forward
     ));
@@ -2794,6 +2807,7 @@ impl<
                     carrick_guest_arch::UserVa::new(fds_ptr),
                     out_bytes,
                     SyscallResult::new(ready as i64),
+                    (self.counters, self.frame.canonical_ordinal()),
                 );
             }
         }
@@ -2827,6 +2841,7 @@ impl<
                 carrick_guest_arch::UserVa::new(fds_ptr),
                 out_bytes,
                 SyscallResult::new(ready as i64),
+                (self.counters, self.frame.canonical_ordinal()),
             )
         } else {
             // This venue has no retained readiness wait. Leave the call
@@ -4410,6 +4425,10 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     ),
                     &bytes,
                     SyscallResult::new(output.result),
+                    (
+                        self.counters,
+                        carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
+                    ),
                 );
             }
             return carrick_personality_linux::dispatch::transfer_effect(
