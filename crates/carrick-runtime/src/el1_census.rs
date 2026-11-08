@@ -153,6 +153,7 @@ pub struct CensusRow {
 /// Bounded mapped mmap failure evidence captured before terminal unmapping.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MmapFailureEvidence {
+    pub anonymous_leaves: Vec<u64>,
     pub attempted: u64,
     pub dropped: u64,
     pub incomplete: u64,
@@ -164,6 +165,11 @@ fn mmap_failure_evidence(counters: &carrick_el1_abi::Counters) -> MmapFailureEvi
     let census = &counters.mmap_failures;
     let attempted = census.attempted.load(Ordering::Acquire);
     let mut evidence = MmapFailureEvidence {
+        anonymous_leaves: counters
+            .anonymous_leaves
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect(),
         attempted,
         dropped: attempted.saturating_sub(census.records.len() as u64),
         incomplete: 0,
@@ -472,6 +478,25 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
         if census.schema != 3 {
             return Err(format!("unknown census schema {}", census.schema));
         }
+        if census.el1_counters != census.mmap_failures.is_some() {
+            return Err("mmap evidence availability contradicts mapped counters".to_owned());
+        }
+        if let Some(evidence) = &census.mmap_failures
+            && (evidence.anonymous_leaves.len() != carrick_el1_abi::AnonymousLeave::COUNT
+                || evidence.records.len() > carrick_el1_abi::MmapFailures::CAPACITY
+                || evidence.dropped
+                    != evidence
+                        .attempted
+                        .saturating_sub(carrick_el1_abi::MmapFailures::CAPACITY as u64)
+                || evidence
+                    .attempted
+                    .checked_sub(evidence.dropped)
+                    .and_then(|count| count.checked_sub(evidence.incomplete))
+                    != Some(evidence.records.len() as u64)
+                || evidence.records.iter().any(|words| words[6] != 1))
+        {
+            return Err("malformed mmap failure evidence".to_owned());
+        }
         for row in &census.rows {
             let entry = by_nr.entry(row.nr).or_insert_with(|| AggregateRow {
                 nr: row.nr,
@@ -505,7 +530,9 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
             .filter_map(|c| {
                 c.mmap_failures
                     .as_ref()
-                    .filter(|e| e.attempted != 0)
+                    .filter(|e| {
+                        e.attempted != 0 || e.anonymous_leaves.iter().any(|count| *count != 0)
+                    })
                     .map(|e| (c.pid, e.clone()))
             })
             .collect(),
@@ -561,6 +588,11 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
         ));
     }
     for (pid, evidence) in &aggregate.mmap_failures {
+        for (index, count) in evidence.anonymous_leaves.iter().enumerate() {
+            if *count != 0 {
+                out.push_str(&format!("\nanonymous_leave[{index}]={count} pid={pid}\n"));
+            }
+        }
         out.push_str(&format!(
             "\nmmap ENOMEM pid={pid}: attempted={} dropped={} incomplete={}\n",
             evidence.attempted, evidence.dropped, evidence.incomplete
@@ -641,7 +673,13 @@ mod tests {
 
     fn census(rows: Vec<CensusRow>) -> Census {
         Census {
-            mmap_failures: None,
+            mmap_failures: Some(MmapFailureEvidence {
+                anonymous_leaves: vec![0; carrick_el1_abi::AnonymousLeave::COUNT],
+                attempted: 0,
+                dropped: 0,
+                incomplete: 0,
+                records: Vec::new(),
+            }),
             refusal_evidence: refusal_evidence(
                 None,
                 carrick_spec::syscall_census::CensusIsa::Aarch64,
@@ -888,6 +926,7 @@ mod tests {
             .ready
             .store(0, Ordering::Relaxed);
         counters.served[222].store(18, Ordering::Relaxed);
+        counters.anonymous_leaves[1].store(2, Ordering::Relaxed);
         let census = snapshot_counters(
             None,
             Some(&counters),
@@ -904,6 +943,7 @@ mod tests {
         assert_eq!(evidence.records[0][3], 262144);
         let text = render_table(&aggregate(&[restored]).unwrap(), 10);
         assert!(text.contains("attempted=18 dropped=2 incomplete=1"));
+        assert!(text.contains("anonymous_leave[1]=2"));
         assert!(text.contains("length=262144 prot=0x3 flags=0x22 reason=1"));
         assert!(
             snapshot_counters(None, None, carrick_spec::syscall_census::CensusIsa::Aarch64)
@@ -916,6 +956,12 @@ mod tests {
     fn aggregate_fails_closed_on_empty_or_unknown_input() {
         assert!(aggregate(&[]).is_err());
         assert!(aggregate(&[census(vec![])]).is_err());
+        let mut missing = census(vec![row(1, 1, 1)]);
+        missing.mmap_failures = None;
+        assert!(aggregate(&[missing]).is_err());
+        let mut malformed = census(vec![row(1, 1, 1)]);
+        malformed.mmap_failures.as_mut().unwrap().attempted = 1;
+        assert!(aggregate(&[malformed]).is_err());
         let mut odd = census(vec![row(1, 1, 1)]);
         odd.schema = 4;
         assert!(aggregate(&[odd]).is_err());
