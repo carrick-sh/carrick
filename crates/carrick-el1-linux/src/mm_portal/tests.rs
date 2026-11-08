@@ -3019,7 +3019,7 @@ fn fork_child_write_preparation(prepare_first: bool) {
 
 /// The production anonymous editors over fixture table arenas: stage-1
 /// probe, permission and retirement steps of the real descriptor code.
-mod anonymous_editor {
+pub(crate) mod anonymous_editor {
     use super::Tables;
     use carrick_el1::memory::{
         AnonymousBackingProbe, AnonymousPermissionEditor, AnonymousRetirementEditor, Stage1Backing,
@@ -3032,9 +3032,9 @@ mod anonymous_editor {
     };
     use core::sync::atomic::Ordering;
 
-    pub(super) struct ForkAnonymousEditor<'a> {
-        pub(super) arenas: &'a [&'a Tables],
-        pub(super) pool: TableWindow,
+    pub(crate) struct ForkAnonymousEditor<'a> {
+        pub(crate) arenas: &'a [&'a Tables],
+        pub(crate) pool: TableWindow,
     }
     impl ForkAnonymousEditor<'_> {
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
