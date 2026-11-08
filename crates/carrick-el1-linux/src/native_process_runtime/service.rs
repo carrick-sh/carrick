@@ -1039,6 +1039,64 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             &mut record,
             || self.caller_file_size_soft_limit(),
         )?;
+        self.publish_host_file(record, output, map, chdir, call)
+    }
+
+    fn host_root_retains_filesystem(&self) -> bool {
+        self.is_root_process()
+            && self
+                .runtime
+                .graph
+                .lock()
+                .owner
+                .task(self.key)
+                .is_ok_and(|task| task.fs.is_none())
+    }
+
+    /// Retain a file call under the caller's filesystem authority. The initial
+    /// host root retains its exact resource custody in the carrier.
+    pub fn begin_host_file_call(
+        &mut self,
+        mut record: Box<[u8]>,
+        output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+        resolves_path: bool,
+        map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+        chdir: bool,
+        call: NativeServiceCall<'a>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let result = if self.host_root_retains_filesystem() {
+            use carrick_core_abi::host_file::{HostFileOp, HostFileRequestView};
+            let op = HostFileRequestView::parse(&mut record)
+                .map_err(|_| NativeProcessError::Invalid)?
+                .header()
+                .op;
+            if chdir || matches!(op, HostFileOp::Write) {
+                call.counters.record_refusal(
+                    call.ordinal,
+                    carrick_core_abi::service::ServiceOrigin::Initial,
+                    carrick_el1_abi::RefusalVenue::Ring,
+                );
+                Ok(NativeResume::Returned(SyscallResult::from_errno(
+                    carrick_syscall_abi::LINUX_ENOSYS,
+                )))
+            } else {
+                self.publish_host_file(record, output, map, chdir, call)
+            }
+        } else {
+            self.begin_host_file_service(record, output, resolves_path, map, chdir, call)
+        };
+        let result = self.drain_copyout(result);
+        self.finish_service_handoff(result)
+    }
+
+    fn publish_host_file(
+        &mut self,
+        record: Box<[u8]>,
+        output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+        map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+        chdir: bool,
+        call: NativeServiceCall<'a>,
+    ) -> Result<NativeResume, NativeProcessError> {
         self.service_phase = NativeServicePhase::Capability;
         let capability = self
             .runtime
