@@ -2029,3 +2029,47 @@ fn base_selection_prefers_matching_host_and_bundle_over_newest() {
     );
     assert!(select_base(&[], &candidate).is_err());
 }
+
+#[test]
+fn identical_fixture_content_from_different_commits_is_comparable() {
+    use carrick_xtask::fixtures::{BuildPolicy, Manifest};
+    use sha2::{Digest, Sha256};
+    let manifest = Manifest {
+        schema: "test".into(),
+        source_head: "a".repeat(40).try_into().unwrap(),
+        compiler_inputs: vec!["fixture.rs".into()],
+        sources: [("fixture.rs".into(), "1".repeat(64).try_into().unwrap())].into(),
+        build_policy: BuildPolicy::default(),
+        toolchain: carrick_xtask::fixtures::Toolchain {
+            rustc: "rustc pinned".into(),
+            cargo: "cargo pinned".into(),
+            gnu_linker: "ld pinned".into(),
+        },
+        executables: vec![carrick_xtask::fixtures::Executable {
+            path: "fixture".into(),
+            target: carrick_xtask::fixtures::GuestTarget::Musl,
+            sha256: "2".repeat(64).try_into().unwrap(),
+        }],
+    };
+    let receipt = |manifest: &Manifest| {
+        let mut receipt = base();
+        let validation = receipt.fixture_validation.as_mut().unwrap();
+        validation.bundle_source_head = manifest.source_head.clone();
+        validation.inputs_sha256 = manifest.input_identity().unwrap();
+        validation.manifest_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(manifest).unwrap())
+        )
+        .try_into()
+        .unwrap();
+        receipt
+    };
+    let old = receipt(&manifest);
+    let mut republished = manifest.clone();
+    republished.source_head = "b".repeat(40).try_into().unwrap();
+    assert_eq!(
+        manifest.input_identity().unwrap(),
+        republished.input_identity().unwrap()
+    );
+    assert!(compare(&old, &receipt(&republished)).unwrap().passed);
+}
