@@ -5695,8 +5695,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // Process close requests every member's exit. A ring-born member
         // that was runnable (queued, not parked in a wait) has no host
         // thread to honour that request: its next selection is the only
-        // point that can retire it, so it must not return to EL0.
-        if (continuation || (self.control.host_exit_requested() && !record.has_adapter_operation()))
+        // point that can retire it, so it must not return to EL0. Whether it
+        // is parked is whose-token-is-attached, not which authority: every
+        // domain's receipt means this thread is in a wait that its own
+        // producer will resolve, so no member retires here while one is held.
+        if (continuation || (self.control.host_exit_requested() && !record.has_object_operation()))
             && let Some(status) = self.pending_close_status()
         {
             return Some(match self.retire_closing_member(status) {
@@ -6008,9 +6011,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(reason);
         }
         match outcome {
-            // The thread-stock park token has the adapter shape, so the stock
-            // owner consumes its exact token before the generic IPC retry
-            // below could leave it attached to the resumed clone caller.
+            // The thread-stock park consumed the record's retained token, so
+            // any token still attached belongs to a producer that has not
+            // replayed yet. Retry through that owner -- whatever its authority
+            // -- before the generic IPC path could return to userspace and
+            // leave the saved syscall unreplayed.
             None => match self.resume_thread_stock_wait()? {
                 // A refused adapter admission published no service wait. The
                 // scheduler still owns the exact IPC token and pin: retry its
@@ -6020,7 +6025,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .source
                         .zone
                         .record(self.record.id)
-                        .has_adapter_operation() =>
+                        .has_object_operation() =>
                 {
                     Ok(syscall_retry)
                 }
