@@ -2462,6 +2462,27 @@ mod host_tests {
     }
 
     #[test]
+    fn readiness_lock_custody_rejects_foreign_domains_before_transfer() {
+        let zone = fixture(true);
+        let record = allocate(&zone, 506);
+        let exact = zone.record_ref(record);
+        let operation = OperationToken::new(506, 1).unwrap();
+        let delivered = std::cell::Cell::new(0);
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.deliver_handbacks(&mut |_| delivered.set(delivered.get() + 1));
+        };
+        let key = ObjectWaitKey::metadata_request(1).unwrap();
+        let result = zone.defer_object_lock_release(key, record, operation, &completion);
+        let (error, operation) = result.expect_err("metadata is not an IPC readiness lock");
+        assert_eq!(error, ObjectWaitError::Exhausted);
+        assert_eq!(operation.identity(), OperationToken::new(506, 1).unwrap().identity());
+        assert_eq!(zone.record_ref(record), exact);
+        assert!(!zone.record(record).has_object_operation());
+        assert_eq!(zone.record(record).claim(), Claim::Free);
+        assert_eq!(delivered.get(), 0);
+    }
+
+    #[test]
     fn legacy_lock_release_returns_two_owned_operations_after_unlock() {
         use std::cell::RefCell;
         let zone = fixture(true);
