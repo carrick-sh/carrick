@@ -217,6 +217,18 @@ pub fn el1_sched_vfs() -> InMemoryFileVfs {
             fixture.display()
         )
     });
+    // Record the bytes actually mounted, not just the runner's checkout or
+    // bundle receipt. CARGO_MANIFEST_DIR can name a different checkout when
+    // someone copies a signed test executable. Disabled USDT does no hashing.
+    carrick_observability::probes::embed_fixture_loaded_with(|| {
+        use sha2::{Digest, Sha256};
+        (
+            fixture.display().to_string(),
+            format!("{:x}", Sha256::digest(&bytes)),
+            bytes.len() as u64,
+            carrick_kernel::kernel::scheduler::guest_cpu_count() as u32,
+        )
+    });
     let vfs = InMemoryFileVfs::new();
     vfs.add_file_with_metadata(EL1_SCHED_FIXTURE, bytes, 0o755, NsUid::ROOT, NsGid::ROOT, 0)
         .expect("install executable el1-sched fixture");

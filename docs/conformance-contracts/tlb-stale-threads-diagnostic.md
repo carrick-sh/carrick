@@ -121,3 +121,46 @@ entry with an unusable signal stack. It is red before the diagnostic and
 green after, requiring the frame failure detail without changing the final
 SIGSEGV policy. It proves diagnostic reachability, not either #1857 fix.
 Fresh paired signed base/head populations remain director-owned.
+
+## Host and fixture dependence (director follow-up)
+
+Both current `main.rs` and `tlb.rs` support `omit-first-write-ack`. The version
+before that mode was introduced still recognized `tlb-stale-threads`, parsed
+only rounds/workers, and ignored the extra argument. Missing the omit mode
+alone would run the ordinary probe; it does not directly turn an unknown
+argument into SIGSEGV. A stale ELF can still have an independent runtime bug.
+
+`fixtures::inputs::FIXTURES` includes `fixtures/embed-el1-sched`.
+`resolve_graph` adds that whole local package directory; `source_hashes`
+enumerates its tracked files, including `src/tlb.rs` and `src/main.rs`, with
+`git ls-files` and hashes each one. The builder script and fixture Cargo.lock
+are inputs too. `Manifest::input_identity` covers this map, compiler-reported
+inputs and build policy. `test-signed-body.sh` runs `fixtures verify` before
+signing/execution; verification rehashes every installed executable. Thus a
+properly verified bundle cannot legitimately hide an older tlb.rs under the
+current source identity. This audit is not a verification of either Mac's
+actual installed bundle or mounted bytes.
+
+The loader's `common::repo_root` is compiled from CARGO_MANIFEST_DIR. A copied
+or mis-reused test artifact could therefore load a different checkout's ELF
+than the runner verified. No such mismatch is proven here. The new lazy
+`embed-fixture-loaded` USDT record names the **actual** path, SHA-256 and length
+of the exact Vec mounted by `el1_sched_vfs`, plus exposed guest CPU count.
+It is emitted before guest execution and does not add guest output/syscalls.
+Compare its ELF hash to the el1-sched destination's row in the verified
+`target/fixtures/installed.json` manifest on each host; also retain the
+`fixture_validation` row from the signed runner. Absent probes remain missing
+evidence. Enabling this record adds one fixture-sized hash before execution.
+
+The two tests do not install a fixed SchedulingPolicy: the default count comes
+from `host_facts::logical_cpu_count`, clamped to MAX_GUEST_CPUS. On macOS that
+honors CARRICK_EXPOSED_CPUS or prefers hw.perflevel0.logicalcpu before falling
+back to host logical counts. Two workers need CPU IDs 0, 1 and 2. A worker pin
+failure increments ERRORS (the main CPU-0 pin fails setup with exit 1), so a
+small topology can invalidate a result but is not by itself a demonstrated
+explanation for empty output and SIGSEGV. Preserve the FIXTURE guest_cpus,
+CARRICK_EXPOSED_CPUS, CARRICK_BOUND_EXECUTORS and CARRICK_SPARE_EXECUTORS values.
+Record `sw_vers`, `uname -a`, and `sysctl hw.model hw.logicalcpu
+hw.perflevel0.logicalcpu` with each Mac's artifact identity; these host facts
+cannot be recovered from this Linux worker. Do not make #1884's gate-side
+comparison changes in this PR.

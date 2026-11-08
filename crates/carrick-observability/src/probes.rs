@@ -5756,6 +5756,9 @@ mod real {
         fn el1__grant__refusal(_: u32, _: u64, _: u64, _: u64, _: u64) {}
         /// Failure-only native process refusal: CPU, MM, root GPA, typed debug reason.
         fn el1__native__diagnostic(_: u32, _: u64, _: u64, _: &str) {}
+        /// The bytes actually mounted by an embed fixture loader: host path,
+        /// SHA-256, byte length and exposed guest CPU count. No guest pointer.
+        fn embed__fixture__loaded(_: &str, _: &str, _: u64, _: u32) {}
         /// Refusal reason, requested/cached binding, requested/cached root context.
         fn el1__native__fork__stock__refusal(_: &str, _: &str, _: &str, _: &str, _: &str) {}
         /// Physical retention refusal for an EL1 owner read: selected IPA and
@@ -7283,6 +7286,16 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_el1_owner_grant_supply(address: u64, length: u64, phase: u32, detail: u64) {
         carrick_usdt::hvpatch__el1__owner__grant__supply!(|| (address, length, phase, detail));
+    }
+
+    /// Construct fixture provenance only for an attached consumer.
+    #[inline(never)]
+    pub fn embed_fixture_loaded_with(make_args: impl FnOnce() -> (String, String, u64, u32)) {
+        let mut storage = None;
+        carrick_usdt::embed__fixture__loaded!(|| {
+            let args = storage.get_or_insert_with(make_args);
+            (args.0.as_str(), args.1.as_str(), args.2, args.3)
+        });
     }
 
     #[inline(never)]
@@ -9835,6 +9848,8 @@ mod stub {
     stub!(hvpatch_el1_owner_grant_supply(address: u64, length: u64, phase: u32, detail: u64));
     stub!(el1_grant_refusal(row: u32, a: u64, b: u64, c: u64, d: u64));
     stub!(el1_native_diagnostic(cpu: u32, mm: u64, root: u64, reason: &str));
+    #[inline(always)]
+    pub fn embed_fixture_loaded_with(_make_args: impl FnOnce() -> (String, String, u64, u32)) {}
     stub!(el1_native_fork_stock_refusal(reason: &str, requested: &str, cached: &str, requested_context: &str, cached_context: &str));
     stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
 
