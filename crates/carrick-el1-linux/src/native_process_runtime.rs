@@ -7708,6 +7708,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             bytes,
             offset: 0,
             result: SyscallResult::new(0),
+            prefix_on_fault: false,
             effect: Some(effect),
         });
         self.finish_output_outcome(result)
