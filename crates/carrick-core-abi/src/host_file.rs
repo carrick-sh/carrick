@@ -60,6 +60,8 @@ pub enum HostFileOp {
     /// The header `fd` is unused (`-1`); each entry is pinned in the
     /// caller's table.
     Poll = 12,
+    /// Read the staged link path into the bounded output, without a NUL.
+    Readlinkat = 13,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -175,6 +177,7 @@ impl HostFileOp {
             10 => Self::Getdents64,
             11 => Self::MapPrivate,
             12 => Self::Poll,
+            13 => Self::Readlinkat,
             _ => return None,
         })
     }
@@ -185,7 +188,7 @@ impl HostFileOp {
     pub const fn resolves_path(self) -> bool {
         matches!(
             self,
-            Self::Openat | Self::Faccessat | Self::Newfstatat | Self::Statx
+            Self::Openat | Self::Faccessat | Self::Newfstatat | Self::Statx | Self::Readlinkat
         )
     }
 }

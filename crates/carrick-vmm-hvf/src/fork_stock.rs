@@ -199,6 +199,15 @@ impl Drop for NativeFrameBacking {
 
 #[derive(Debug)]
 pub struct ForkStockHostCustody {
+    /// RootOnly: the stopped root's live identity, consumed by its fork.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) root_executables: std::collections::BTreeMap<
+        carrick_guest_arch::CpuId,
+        (
+            carrick_hal::fork_stock::GrantExecution,
+            std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>,
+        ),
+    >,
     pub(crate) owner: ForkStock<AsidAllocator, NativeChildPhysical>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     backing: Option<NativeForkBacking>,
@@ -218,6 +227,8 @@ impl ForkStockHostCustody {
     pub fn with_asids(carrier: NonZeroU64, asids: AsidAllocator) -> Self {
         Self {
             owner: ForkStock::new(carrier, None, asids),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            root_executables: Default::default(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             backing: None,
             run_failure: Default::default(),
@@ -420,6 +431,9 @@ impl ForkStockHostCustody {
             .ok_or(ForkStockServiceError::StaleExecution)?;
         let mm = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
             .ok_or(ForkStockServiceError::StaleExecution)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.root_executables
+            .retain(|_, (seed, _)| seed.binding.mm != execution.binding.mm);
         self.owner.retire_exited_root(mm);
         Ok(status)
     }

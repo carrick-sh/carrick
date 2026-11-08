@@ -846,21 +846,8 @@ impl<'a> FsView<'a> {
             }
 
             let path = read_guest_c_string(&*cx.memory, pathname)?;
-            if path.len() > 1 && path.ends_with('/') {
-                let resolved = this.resolve_at_path(dirfd, &path)?;
-                let canonical = this
-                    .canonicalize_following(&resolved)
-                    .unwrap_or_else(|_| resolved.clone());
-                return match this.layered_metadata(&canonical) {
-                    Ok(md) => {
-                        if md.kind == RootFsEntryKind::Directory {
-                            Ok(DispatchOutcome::errno(LINUX_EINVAL))
-                        } else {
-                            Ok(DispatchOutcome::errno(LINUX_ENOTDIR))
-                        }
-                    }
-                    Err(e) => Ok(DispatchOutcome::errno(e)),
-                };
+            if let Err(errno) = this.readlink_trailing_slash(dirfd, &path) {
+                return Ok(DispatchOutcome::errno(errno));
             }
             // An empty pathname with an O_PATH|O_NOFOLLOW dirfd naming a SYMLINK
             // reads that link — readlinkat implicitly treats "" as AT_EMPTY_PATH
@@ -953,20 +940,9 @@ impl<'a> FsView<'a> {
                 // target Linux shows, so fd-introspection and 'are we piped?'
                 // checks see a real target instead of an empty string.
                 t
-            } else if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
-                match m.vfs.readlink(&m.full_path) {
-                    Ok(p) => p.to_string_lossy().into_owned(),
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                }
-            } else if let Ok(t) = this.fs.rootfs_vfs.dentry_readlink(&path) {
-                t
-            } else if let Some(t) = this.fs.rootfs_vfs.overlay.read_link(&path) {
-                // Symlink created in the writable backend (cap-std on --fs host).
-                t
             } else {
-                use carrick_vfs::Vfs as _;
-                match this.fs.rootfs_vfs.readlink(&path) {
-                    Ok(p) => p.to_string_lossy().into_owned(),
+                match this.readlink_path_target(&path) {
+                    Ok(target) => target,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             };
@@ -1769,6 +1745,63 @@ impl<'a> FsView<'a> {
                 }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
+        }
+    }
+}
+
+impl super::super::FsView<'_> {
+    pub(in crate::dispatch) fn readlink_trailing_slash(
+        &self,
+        dirfd: u64,
+        path: &str,
+    ) -> Result<(), LinuxErrno> {
+        if path.len() <= 1 || !path.ends_with('/') {
+            return Ok(());
+        }
+        let resolved = self.resolve_at_path(dirfd, path)?;
+        let canonical = self.canonicalize_following(&resolved).unwrap_or(resolved);
+        let md = self.layered_metadata(&canonical)?;
+        Err(if md.kind == RootFsEntryKind::Directory {
+            LINUX_EINVAL
+        } else {
+            LINUX_ENOTDIR
+        })
+    }
+
+    /// Shared readlink lookup; the native scope may name only its own MM's
+    /// executable. It must never consult the host-served root's ProcState.
+    pub(in crate::dispatch) fn readlink_path_target(
+        &self,
+        path: &str,
+    ) -> Result<String, LinuxErrno> {
+        if super::super::resources::in_native_fs_scope() {
+            if path == "/proc/self/exe" {
+                return super::super::resources::native_executable()
+                    .map(|executable| executable.display_path())
+                    .ok_or(LINUX_ENOSYS);
+            }
+            if path == "/proc"
+                || path.starts_with("/proc/")
+                || path == "/dev/fd"
+                || path.starts_with("/dev/fd/")
+            {
+                return Err(LINUX_ENOSYS);
+            }
+        }
+        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
+            m.vfs
+                .readlink(&m.full_path)
+                .map(|p| p.to_string_lossy().into_owned())
+        } else if let Ok(target) = self.fs.rootfs_vfs.dentry_readlink(path) {
+            Ok(target)
+        } else if let Some(target) = self.fs.rootfs_vfs.overlay.read_link(path) {
+            Ok(target)
+        } else {
+            use carrick_vfs::Vfs as _;
+            self.fs
+                .rootfs_vfs
+                .readlink(path)
+                .map(|p| p.to_string_lossy().into_owned())
         }
     }
 }

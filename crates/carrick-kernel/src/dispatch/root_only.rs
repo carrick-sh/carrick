@@ -45,6 +45,7 @@ root_only_state! {
     ResourceScope,
     ExecutionLease,
     HostWait,
+    // Includes the live executable copied into fork MM custody (#1862).
     RootForkSeed,
 }
 

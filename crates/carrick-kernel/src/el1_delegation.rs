@@ -3898,7 +3898,7 @@ mod tests {
             }));
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
-                let served = dispatcher.serve_native_host_file(&mut record);
+                let served = dispatcher.serve_native_host_file(&mut record, None);
                 done_tx.send(()).unwrap();
                 served.unwrap().retained_source.unwrap()
             });
