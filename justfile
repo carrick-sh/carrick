@@ -23,6 +23,8 @@ export CARRICK_SCCACHE_SEARCH_PATH := replace_regex(_build_env, _build_env_field
 _cargo := "cargo --locked --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
 _xtask := if env("CARRICK_XTASK_BIN", "") != "" { quote(env("CARRICK_XTASK_BIN")) } else { _cargo + " run --locked -p carrick-xtask --" }
 _admit := _xtask + " worktree-run --"
+# Gate hosts install the small lease supervisor before any checkout builds.
+_lease_runner := if os() == "macos" { if path_exists("/usr/local/bin/carrick-xtask") == "true" { "/usr/local/bin/carrick-xtask" } else { _xtask } } else { _xtask }
 # Only xtask test recipes opt into the exact, extracted CI test build.
 _xtask_test_artifacts := if env("CARRICK_XTASK_TEST_MANIFEST", "") != "" { "--artifacts " + quote(env("CARRICK_XTASK_TEST_MANIFEST")) } else { "" }
 
@@ -67,6 +69,12 @@ build *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     just --justfile {{justfile()}} check-disk
+    exec {{_lease_runner}} host-lease --mode carrick -- just --justfile {{justfile()}} _build {{ARGS}}
+
+[private]
+_build *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
         exec ./scripts/build-signed.sh {{ARGS}}
     fi
@@ -78,6 +86,11 @@ build *ARGS:
 # For a guest run that actually evaluates `debug_assert!`, use
 # `just build-debug-profile`.
 build-debug *ARGS:
+    just --justfile {{justfile()}} check-disk
+    {{_lease_runner}} host-lease --mode carrick -- just --justfile {{justfile()}} _build-debug {{ARGS}}
+
+[private]
+_build-debug *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
@@ -94,7 +107,8 @@ build-debug *ARGS:
 # an invariant that looks guarded and is not. Slow, and never a perf or
 # conformance artifact; use it to make a boot-path invariant actually assert.
 build-debug-profile *ARGS:
-    {{_admit}} just --justfile {{justfile()}} _build-debug-profile {{ARGS}}
+    just --justfile {{justfile()}} check-disk
+    {{_lease_runner}} host-lease --mode carrick -- {{_admit}} just --justfile {{justfile()}} _build-debug-profile {{ARGS}}
 
 [private]
 _build-debug-profile *ARGS:
@@ -167,11 +181,11 @@ lease MODE +CMD:
     set -euo pipefail
     lease_mode="$1"
     shift
-    exec {{_admit}} {{_xtask}} host-lease --mode "$lease_mode" -- "$@"
+    exec {{_lease_runner}} host-lease --mode "$lease_mode" -- {{_admit}} "$@"
 
 # Run the host and/or signed landing gate under an exclusive host lease (no Docker).
 accept *ARGS:
-    {{_admit}} {{_xtask}} accept --profile no-docker {{ARGS}}
+    {{_lease_runner}} host-lease --mode gate -- {{_admit}} {{_xtask}} accept --profile no-docker {{ARGS}}
 
 # Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt.
 remote-accept *ARGS:
@@ -379,23 +393,7 @@ check-disk:
         echo "disk: guard disabled (CARRICK_DISK_GUARD=0)"
         exit 0
     fi
-    floor="${CARRICK_DISK_FLOOR_GIB:-20}"
-    warn="${CARRICK_DISK_WARN_GIB:-75}"
-    # POSIX -P reports 1024-byte blocks; int($4/1048576) converts to GiB and rounds DOWN.
-    free="$(df -Pk . | awk 'NR==2 {print int($4/1048576)}')"
-    if [ "$free" -lt "$floor" ]; then
-        echo "error: only ${free} GiB free (floor ${floor} GiB)" >&2
-        echo "       A near-full disk fails as a corrupt link, a truncated gate log," >&2
-        echo "       or a guest dying somewhere unrelated — not as ENOSPC." >&2
-        echo "       Reclaim agent build output:  just worktree-gc" >&2
-        echo "       Override for one run:        CARRICK_DISK_GUARD=0 just ..." >&2
-        exit 1
-    fi
-    if [ "$free" -lt "$warn" ]; then
-        echo "disk: ${free} GiB free — below the ${warn} GiB mark; 'just worktree-gc' to reclaim"
-    else
-        echo "disk: ${free} GiB free"
-    fi
+    exec {{_lease_runner}} host-lease --mode gate -- {{_admit}} {{_xtask}} check-disk --floor-gib "${CARRICK_DISK_FLOOR_GIB:-20}" --warn-gib "${CARRICK_DISK_WARN_GIB:-75}"
 
 # Frame pointers must actually reach rustc, or `dtrace`'s `ustack()` silently
 # fabricates call stacks (see the rationale in `.cargo/config.toml`). A
@@ -1060,10 +1058,10 @@ conformance-probes: build
         # The deterministic arm64 rows run in-process against committed Docker
         # oracles. Only live-oracle and process-poisoning exceptions retain the
         # old signed-binary harness while their embed blockers remain open.
-        env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
+        env -u CARRICK_TEST_TARGET {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-generic-signed-artifacts.jsonl
-        env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
+        env -u CARRICK_TEST_TARGET {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-dedicated-signed-artifacts.jsonl
         {{_admit}} {{_cargo}} test -p carrick-cli --test conformance_cli_contract \
@@ -1125,7 +1123,7 @@ gate-containers: build
 # image, so it is an opt-in guest lane like conformance-quick — deliberately
 # NOT part of `just ci`.
 test-embed *ARGS: build
-    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-embed {{ARGS}}
+    env -u CARRICK_TEST_TARGET {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-embed {{ARGS}}
 
 # Signed first-boot smoke (#893), about 30 s on a warm build: builds only the
 # carrick-embed `smoke_signed` target, signs it and runs bootstrap -> clean root
@@ -1143,7 +1141,7 @@ smoke-signed *ARGS:
 
 # Guest-running tests of carrick-vmm-hvf from SIGNED cargo test executables.
 test-hvf *ARGS:
-    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
+    env -u CARRICK_TEST_TARGET {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
 
 # HVF trap-engine tests (`crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs`):
 # bring up a real VM via `new_hvf_trap_engine`, load the staged root onto a
@@ -1157,16 +1155,16 @@ test-hvf *ARGS:
 # fresh process: one VM per process), then runs the package's UNENTITLED
 # negative control (`unsigned_executable_maps_hv_denied_to_entitlement`).
 test-hvf-trap-engine:
-    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
+    env -u CARRICK_TEST_TARGET {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
 
 # Raw one-shot cancellation qualification for #978, including pre-entry WFI.
 # A missing cancellation is killed/reaped by the test's process watchdog.
 test-hvf-shutdown-kick:
-    CARRICK_TEST_TARGET=trap_engine_hvf ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_shutdown_kick_ --ignored --nocapture
+    CARRICK_TEST_TARGET=trap_engine_hvf {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_shutdown_kick_ --ignored --nocapture
 
 # Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
 test-conformance-next *ARGS: build
-    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
+    env -u CARRICK_TEST_TARGET {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
 
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:
@@ -1366,7 +1364,7 @@ ci-prebuild-xtask:
     if [[ -n "${CARRICK_XTASK_BIN:-}" ]]; then
         test -x "$CARRICK_XTASK_BIN"
     else
-        {{_cargo}} build --locked -p carrick-xtask
+        {{_lease_runner}} host-lease --mode carrick -- {{_cargo}} build --locked -p carrick-xtask
     fi
 
 ci-toolchain:

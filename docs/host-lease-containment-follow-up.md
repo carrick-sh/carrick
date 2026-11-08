@@ -109,3 +109,35 @@ of cleanup privilege, descriptor closure, reparenting and PID reuse. If all
 holders die, kernel flock cannot remain held: stronger recovery needs durable
 admission state checked by every participant, including Docker, before work.
 Privileged containment/service installation is a separate reviewed change.
+
+## Disk admission and build leases (#1693)
+
+All participants on a gate Mac use the same host lease, including the
+installed `/usr/local/bin/carrick-xtask` supervisor used before a checkout
+can build its own xtask. Install a protocol-compatible supervisor before
+running these workflows; do not bootstrap it beside a gate.
+
+`just check-disk` takes exclusive `gate` admission before reading free space.
+A shared build therefore drains before the floor is evaluated; there is no
+disk retry loop. A shortage after admission is real and reports both free
+GiB and floor GiB. `just build` checks the floor first, releases standalone
+exclusive admission, then takes shared `carrick` admission through its build
+and signing. Under an existing gate both admissions reuse the exclusive
+lease. Never call `just build` under an outer shared lease: check admission
+before taking shared custody instead. Shared-to-exclusive upgrades are
+refused, not waited on.
+
+The HVF workflow uses the installed supervisor for pre-checkout disk
+admission and for building checkout xtask. Its checkout tool lives in
+`target/lease-tools`, outside the host-gate debug-tree prune. PR jobs'
+`ci-prebuild-xtask` similarly uses the installed supervisor on gate Macs.
+Shared builds do not wait for gate-owned resources: their checkout admission
+is shared, Cargo locks belong to their own checkout, and they never acquire
+a remote checkout lock. Remote acceptance still takes its checkout lock
+before host admission.
+
+Direct `scripts/build-signed.sh` and `scripts/test-signed.sh` invocations
+still bootstrap xtask before their internal admission. Until those entry
+points are changed, invoke them through the installed supervisor in shared
+`carrick` mode. This remaining gap is recorded on #1693; these changes alone
+do not establish complete host coverage.
