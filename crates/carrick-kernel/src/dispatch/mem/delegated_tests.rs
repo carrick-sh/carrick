@@ -15,8 +15,8 @@ use carrick_el1::memory::reservations::{
     Decision, Layout, Placement, Refusal, Reservations, SharedReservations,
 };
 use carrick_el1_abi::{
-    ReservationBackingReceipt, ReservationCompletion, ReservationMm, ReservationProtection,
-    ReservationRange,
+    ReservationBackingReceipt, ReservationCompletion, ReservationMm, ReservationNodeFlags,
+    ReservationProtection, ReservationRange,
 };
 
 const SYS_BRK: u64 = 214;
@@ -7802,4 +7802,359 @@ fn native_code_reservation(case: NativeCodeReservationCase) {
         );
         assert!(!dispatcher.fault_requires_mm_mutation(mapped));
     }
+}
+
+/// Go's allocator (`runtime/malloc.go` + `runtime/mem_linux.go`) reserves a
+/// 64 MiB `heapArenaBytes` region at an outside-layout hint (`sysReserveOS`:
+/// `mmap(hint, 64 MiB, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)`), then
+/// commits sub-ranges inside that reservation with `MAP_FIXED` (`sysMapOS`:
+/// `mmap(sub, sub_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0)`),
+/// advises/reprotects sub-ranges (`sysUnusedOS` / `sysUsedOS` / `harddecommit`),
+/// and frees the arena (`sysFreeOS`).
+///
+/// On main `7cd7369176`, `Reservations::proposal_with_external_placement`
+/// admitted `Protect`, `Retire`, and `Decommit` under `image_cover` for
+/// `PLACED_OUTSIDE_LAYOUT` spans, but omitted `ReservationOperation::Prepare`
+/// (`MAP_FIXED`). Both in-ring decode and `next_delegated_address` refused the
+/// sub-range `MAP_FIXED` with `Refusal::ForeignMapping`, falling through to
+/// `MemState::demote_root_rows`, where `Reservations::insert_opaque` ->
+/// `insert_backed_node` rejected `ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT`
+/// on an admitted root with `Refusal::Invalid` and aborted the carrier.
+#[test]
+fn delegated_outside_hint_go_arena_fixed_subranges_keep_owner_authority() {
+    use carrick_el1::memory::{
+        AnonymousCall, AnonymousCallView, ReservationDisposition, decide_reservation_syscall,
+    };
+    use carrick_el1_abi::{CurrentTask, TrapFrame};
+    use carrick_guest_arch::{GuestIsa, UserVa};
+    use carrick_sched_core::SlotId;
+    use std::sync::atomic::Ordering;
+
+    const ARENA_BYTES: u64 = 64 * 1024 * 1024;
+    const SUB_OFFSET: u64 = 16 * PAGE;
+    const SUB_LEN: u64 = 32 * PAGE;
+    // Go's arm64 `arenaHints` start at `uintptr(i)<<40 | 0x0040<<32`
+    // (`0x0140_0000_0000`), alongside lower canonical outside-arena hints.
+    for hint in [
+        0x0140_0000_0000_u64,
+        0x00c0_0000_0000_u64,
+        0x70_0000_0000_u64,
+    ] {
+        let sub = hint + SUB_OFFSET;
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let mut memory = CountingMmapMemory::new(sub, SUB_LEN as usize);
+        memory.defer_anon = true;
+        memory.discard_anon = true;
+        memory.fail_protect_non_zero.set(true);
+
+        // 1. Go `sysReserveOS`: 64 MiB `PROT_NONE` reservation at outside hint.
+        let reserved = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            hint,
+            ARENA_BYTES,
+            0,
+            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+            -1,
+        )) as u64;
+        assert_eq!(
+            reserved, hint,
+            "outside-layout Go arena hint must be honoured"
+        );
+        let initial = root.lock().mapping(hint).expect("root owns Go arena");
+        assert!(initial.anonymous);
+        assert!(
+            initial
+                .flags
+                .contains(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT)
+        );
+
+        let fixed_flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED;
+        let rw = LINUX_PROT_READ | LINUX_PROT_WRITE;
+
+        // 2. Go `sysMapOS`: `mmap(MAP_FIXED, RW)` on an interior sub-range of
+        // the outside-layout reservation. On unpatched main, this call aborts
+        // inside `MemState::demote_root_rows` with `Refused(Invalid)`.
+        memory.owner_protect_log.borrow_mut().clear();
+        memory.protect_log.borrow_mut().clear();
+        let committed = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            sub,
+            SUB_LEN,
+            rw,
+            fixed_flags,
+            -1,
+        )) as u64;
+        assert_eq!(committed, sub);
+        assert!(
+            memory.protect_log.borrow().is_empty(),
+            "Go sysMapOS entered legacy sparse protection publication"
+        );
+        assert_eq!(memory.zero_backing_calls.get(), 0);
+
+        let sub_node = root
+            .lock()
+            .mapping(sub)
+            .expect("committed sub-range remains in root");
+        assert!(
+            sub_node.anonymous,
+            "Go sysMapOS sub-range must remain root-owned"
+        );
+        assert_eq!(sub_node.protection, ReservationProtection::READ_WRITE);
+        assert!(
+            sub_node
+                .flags
+                .contains(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT),
+            "replacement node must retain PLACED_OUTSIDE_LAYOUT for subsequent edits"
+        );
+
+        // Both guest ISAs must also admit in-ring `SYS_MMAP(MAP_FIXED)` inside
+        // the `PLACED_OUTSIDE_LAYOUT` reservation (both on untouched suffix
+        // bytes and across the already-committed sub-range), while forwarding
+        // any `MAP_FIXED` that straddles past the owned reservation.
+        let task = CurrentTask::new();
+        task.execution.task.store(211, Ordering::Relaxed);
+        task.mm.thread_generation.store(17, Ordering::Relaxed);
+        task.mm.key.store(root.mm.raw(), Ordering::Relaxed);
+        let next_sub = sub + SUB_LEN;
+        for isa in [GuestIsa::Aarch64, GuestIsa::X86_64] {
+            for target in [sub, next_sub] {
+                let native = AnonymousCall::new(
+                    carrick_core::CallOrdinal::from_raw(SYS_MMAP),
+                    [target, SUB_LEN, rw, fixed_flags, u64::MAX, 0],
+                    0,
+                    SlotId::from_index(0).unwrap(),
+                    UserVa::new(hint),
+                );
+                let mut arm = TrapFrame::default();
+                arm.x[8] = SYS_MMAP;
+                arm.x[..6].copy_from_slice(&[target, SUB_LEN, rw, fixed_flags, u64::MAX, 0]);
+                let call_view: &dyn AnonymousCallView = match isa {
+                    GuestIsa::Aarch64 => &arm,
+                    GuestIsa::X86_64 => &native,
+                };
+                let mut model = root.lock();
+                match decide_reservation_syscall(call_view, &task, &mut model, None) {
+                    ReservationDisposition::Work(pending) => {
+                        pending.cancel(&mut model).unwrap();
+                    }
+                    other => panic!(
+                        "{isa:?} Go sysMapOS MAP_FIXED at {target:#x} refused in-ring owner admission: {:?}",
+                        matches!(other, ReservationDisposition::Forward)
+                    ),
+                }
+            }
+
+            let straddle = hint + ARENA_BYTES - PAGE;
+            let straddle_native = AnonymousCall::new(
+                carrick_core::CallOrdinal::from_raw(SYS_MMAP),
+                [straddle, 2 * PAGE, rw, fixed_flags, u64::MAX, 0],
+                0,
+                SlotId::from_index(0).unwrap(),
+                UserVa::new(hint),
+            );
+            let mut straddle_arm = TrapFrame::default();
+            straddle_arm.x[8] = SYS_MMAP;
+            straddle_arm.x[..6].copy_from_slice(&[
+                straddle,
+                2 * PAGE,
+                rw,
+                fixed_flags,
+                u64::MAX,
+                0,
+            ]);
+            let straddle_view: &dyn AnonymousCallView = match isa {
+                GuestIsa::Aarch64 => &straddle_arm,
+                GuestIsa::X86_64 => &straddle_native,
+            };
+            let mut model = root.lock();
+            assert!(
+                matches!(
+                    decide_reservation_syscall(straddle_view, &task, &mut model, None),
+                    ReservationDisposition::Forward
+                ),
+                "{isa:?} straddling MAP_FIXED past outside-layout reservation must forward"
+            );
+        }
+
+        // 3. Go `sysUnusedOS` / `sysUsedOS`: `madvise(MADV_DONTNEED)` and
+        // cross-boundary `mprotect` spanning both the `MAP_FIXED` sub-range and
+        // adjacent untouched reservation pages.
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MADVISE,
+                [sub, 4 * PAGE, carrick_abi::LINUX_MADV_DONTNEED, 0, 0, 0]
+            )),
+            0
+        );
+        memory.owner_protect_log.borrow_mut().clear();
+        memory.protect_log.borrow_mut().clear();
+        let span_start = sub - 2 * PAGE;
+        let span_len = SUB_LEN + 4 * PAGE;
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MPROTECT,
+                [span_start, span_len, rw, 0, 0, 0]
+            )),
+            0
+        );
+        assert_eq!(
+            *memory.owner_protect_log.borrow(),
+            vec![(span_start, span_len as usize, rw)]
+        );
+        assert!(memory.protect_log.borrow().is_empty());
+
+        // 4. Go `harddecommit` (`PROT_NONE | MAP_FIXED`) + `sysFreeOS` (`munmap`).
+        assert_eq!(
+            returned(host_mmap(
+                &mut dispatcher,
+                &mut memory,
+                sub,
+                SUB_LEN,
+                0,
+                fixed_flags,
+                -1,
+            )) as u64,
+            sub
+        );
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MUNMAP,
+                [hint, ARENA_BYTES, 0, 0, 0, 0]
+            )),
+            0
+        );
+        assert!(root.lock().mapping(hint).is_none());
+        assert!(root.lock().mapping(sub).is_none());
+    }
+}
+
+/// When a genuinely host-served edit (such as `mprotect(PROT_GROWSDOWN)` or
+/// `mmap(MAP_PRIVATE | MAP_ANONYMOUS | MAP_DROPPABLE | MAP_FIXED)`) splits an
+/// outside-layout root reservation, `MemState::demote_root_rows` converts the
+/// clipped span from root-owned anonymous to a host-owned opaque obstacle.
+/// Opaque nodes cannot carry root-only outside-layout provenance
+/// (`PLACED_OUTSIDE_LAYOUT` / `IMAGE`), which `insert_backed_node` rejects on
+/// admitted roots with `Refusal::Invalid`; meanwhile the unclipped prefix and
+/// suffix must keep `PLACED_OUTSIDE_LAYOUT` and remain owner-editable.
+#[test]
+fn delegated_outside_hint_host_demotion_strips_outside_layout_provenance() {
+    const HINT: u64 = 0x70_0000_0000;
+    const LENGTH: u64 = 16 * PAGE;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, PAGE as usize);
+    memory.defer_anon = true;
+
+    let mapped = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        HINT,
+        LENGTH,
+        0,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+        -1,
+    )) as u64;
+    assert_eq!(mapped, HINT);
+
+    // `MAP_DROPPABLE | MAP_FIXED` is host-served (`!root_eligible`) and
+    // enters `next_delegated_address` -> `demote_root_rows` on `[HINT + 4*PAGE, HINT + 8*PAGE)`.
+    let demoted_start = HINT + 4 * PAGE;
+    let demoted_len = 4 * PAGE;
+    let outcome = host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        demoted_start,
+        demoted_len,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE
+            | LINUX_MAP_ANONYMOUS
+            | LINUX_MAP_FIXED
+            | carrick_abi::LINUX_MAP_DROPPABLE,
+        -1,
+    );
+    match outcome {
+        DispatchOutcome::MapHostAlias {
+            transaction, va, ..
+        } => {
+            assert_eq!(va, GuestVa::new(demoted_start));
+            transaction
+                .with_claim_for_test(|install| dispatcher.commit_host_alias_install(install))
+                .expect("claim")
+                .expect("commit");
+        }
+        other => panic!("expected host-alias transaction for droppable MAP_FIXED, got {other:?}"),
+    }
+
+    let demoted = root
+        .lock()
+        .mapping(demoted_start)
+        .expect("demoted opaque node");
+    assert!(
+        !demoted.anonymous,
+        "demoted sub-range must be host-owned opaque"
+    );
+    assert!(
+        !demoted.flags.intersects(
+            ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT.union(ReservationNodeFlags::IMAGE)
+        ),
+        "opaque node must not carry root-only outside-layout provenance: {:?}",
+        demoted.flags
+    );
+
+    let prefix = root
+        .lock()
+        .mapping(HINT)
+        .expect("prefix remains root-owned");
+    let suffix = root
+        .lock()
+        .mapping(HINT + 8 * PAGE)
+        .expect("suffix remains root-owned");
+    for piece in [prefix, suffix] {
+        assert!(piece.anonymous);
+        assert!(
+            piece
+                .flags
+                .contains(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT)
+        );
+    }
+
+    // Both remaining outside-layout pieces stay owner-editable via `SYS_MPROTECT`.
+    memory.fail_protect_non_zero.set(true);
+    memory.owner_protect_log.borrow_mut().clear();
+    memory.protect_log.borrow_mut().clear();
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [
+                HINT + 8 * PAGE,
+                8 * PAGE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                0,
+                0,
+                0
+            ]
+        )),
+        0
+    );
+    assert_eq!(
+        *memory.owner_protect_log.borrow(),
+        vec![(
+            HINT + 8 * PAGE,
+            (8 * PAGE) as usize,
+            LINUX_PROT_READ | LINUX_PROT_WRITE
+        )]
+    );
+    assert!(memory.protect_log.borrow().is_empty());
 }
