@@ -3447,6 +3447,162 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
 }
 
 #[test]
+fn anonymous_contention_then_metadata_provisions_without_park_serial_host() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served};
+    use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, SlotId, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+
+    struct BankAllocator(std::sync::Mutex<Vec<(usize, core::alloc::Layout)>>);
+    unsafe impl carrick_core::mm::reservation::ReservationMetadataAllocator for BankAllocator {
+        fn allocate_with_extent(
+            &self,
+            layout: core::alloc::Layout,
+        ) -> Option<(*mut u8, carrick_core_abi::ExtentGrantReceipt)> {
+            // SAFETY: the allocation is retained in self until after the table drops.
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            if ptr.is_null() {
+                return None;
+            }
+            self.0.lock().unwrap().push((ptr as usize, layout));
+            Some((
+                ptr,
+                carrick_core_abi::ExtentGrantReceipt {
+                    base_va: ptr as u64,
+                    size: layout.size(),
+                    token: ptr as u64,
+                },
+            ))
+        }
+        fn deallocate(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+            let mut allocations = self.0.lock().unwrap();
+            if let Some(index) = allocations
+                .iter()
+                .position(|(candidate, _)| *candidate == ptr as usize)
+            {
+                allocations.swap_remove(index);
+            }
+            // SAFETY: the reservation owner returned this exact allocation.
+            unsafe { std::alloc::dealloc(ptr, layout) };
+        }
+    }
+    impl Drop for BankAllocator {
+        fn drop(&mut self) {
+            for (ptr, layout) in self.0.get_mut().unwrap().drain(..) {
+                // SAFETY: the region and reservation table were declared after
+                // this allocator and have already dropped their references.
+                unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+            }
+        }
+    }
+
+    let metadata = BankAllocator(std::sync::Mutex::new(Vec::new()));
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &zone.spaces, &view)
+        .with_zone(zone)
+        .unwrap();
+    let slot = SlotId::from_index(0).unwrap();
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, mm.raw(), None, 0);
+    assert!(
+        zone.occupancy
+            .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, mm.raw())
+    );
+    zone.enter_guest(slot);
+    let task = CurrentTask::new();
+    task.set(
+        El1TaskId::from_linux_tid(101),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        5,
+    );
+    task.mm.key.store(mm.raw(), Ordering::Release);
+    task.mm.thread_generation.store(1101, Ordering::Release);
+    let counters = Counters::default();
+    let tables = Tables::new(ROOT, IPA, 0);
+    let arenas = [&tables];
+    let mut editor = ForkAnonymousEditor {
+        arenas: &arenas,
+        pool: TableWindow {
+            words: tables.words.as_ptr().cast_mut(),
+            physical_base: tables.base,
+            byte_len: tables.words.len() * 8,
+        },
+    };
+    let mut frame = TrapFrame {
+        slot: 0,
+        elr: 0x1004,
+        ..TrapFrame::default()
+    };
+    frame.x[0] = VA;
+    frame.x[1] = 4096;
+    frame.x[8] = 215;
+    let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
+    let held = portal.root(mm, 1).unwrap();
+    assert_eq!(
+        serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &task,
+            access,
+            region.table(),
+            &mut editor,
+            None,
+        ),
+        DelegatedAnonymous::Contended(SpaceWaitCause::Reservations)
+    );
+    drop(held);
+    assert!(carrick_core::mm::reservation::inject_metadata_required_once());
+    let generation = region.table().storage_generation();
+    let mut cpu = FakeCpu::default();
+    let mut sched = Sched {
+        handoff: None,
+        zone,
+        slot,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: &counters,
+    };
+    assert_eq!(
+        edit_wait::park_anonymous_edit_with_allocator(
+            &mut sched,
+            &mut frame,
+            region.table(),
+            SpaceWaitCause::Reservations,
+            &metadata,
+        ),
+        Some(Served::Returned { switched: false })
+    );
+    assert_eq!(frame.elr, 0x1000);
+    assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+    assert_eq!(region.table().storage_generation(), generation + 1);
+    // A real SVC re-entry advances the saved instruction address again.
+    frame.elr += 4;
+    let route = serve_delegated_anonymous(
+        &mut frame,
+        &counters,
+        &task,
+        access,
+        region.table(),
+        &mut editor,
+        None,
+    );
+    assert_eq!(
+        route,
+        DelegatedAnonymous::Served,
+        "leaves={:?}",
+        counters
+            .anonymous_leaves
+            .each_ref()
+            .map(|counter| counter.load(Ordering::Relaxed))
+    );
+}
+
+#[test]
 fn anonymous_edit_wait_reruns_when_root_releases_between_probe_and_park() {
     use carrick_core::wait::{EditWaitOutcome, coordinate_anonymous_edit_wait};
     use carrick_sched_core::object_wait::ObjectWaitError;

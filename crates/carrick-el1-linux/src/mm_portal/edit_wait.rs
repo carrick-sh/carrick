@@ -110,7 +110,23 @@ pub fn park_anonymous_edit<C: ThreadCpu, U: UserWord>(
     sched: &mut Sched<'_, C, U>,
     frame: &mut TrapFrame,
     table: &SharedReservations,
+    initial_cause: SpaceWaitCause,
+) -> Option<Served> {
+    park_anonymous_edit_with_allocator(
+        sched,
+        frame,
+        table,
+        initial_cause,
+        &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+    )
+}
+
+pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut TrapFrame,
+    table: &SharedReservations,
     _initial_cause: SpaceWaitCause,
+    _metadata: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
 ) -> Option<Served> {
     let mm = ReservationMm::new(sched.task.mm.key.load(Ordering::Acquire))?;
     let index = sched.zone.spaces.find(mm.raw())?;
