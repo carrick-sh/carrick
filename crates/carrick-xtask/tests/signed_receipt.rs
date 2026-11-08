@@ -849,6 +849,10 @@ else:
     let body = std::fs::read_to_string(results.join("comment.md")).unwrap();
     assert!(body.contains("INCOMPARABLE BASE — BLOCKED"), "{body}");
     assert!(!body.contains("NEW="), "{body}");
+    assert!(
+        !results.join("diff.json").exists(),
+        "refusal retained a stale comparison"
+    );
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(&posts)
         .unwrap()
         .lines()
