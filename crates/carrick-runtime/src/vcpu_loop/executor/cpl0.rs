@@ -947,7 +947,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 let source = if carrick_core_abi::host_file::reply(&record).is_some() {
                     None
                 } else {
-                    match dispatcher.serve_native_host_file(&mut record) {
+                    let served = if authority == ForwardAuthority::Task {
+                        dispatcher.serve_host_root_file(&binding.host_root_resources, &mut record)
+                    } else {
+                        dispatcher.serve_native_host_file(&mut record)
+                    };
+                    match served {
                         Ok(served) => served.retained_source,
                         Err(_) => {
                             carrick_core_abi::host_file::HostFileRequestView::parse(&mut record)
@@ -1484,6 +1489,7 @@ pub(crate) struct Cpl0TaskBinding {
     arch: GuestArchBinding,
     thread: ThreadKey,
     kernel_binding: KernelTaskBinding,
+    host_root_resources: carrick_kernel::dispatch::resources::HostRootResources,
     retained: Mutex<Option<RetainedForward>>,
     kernel_stack: Mutex<Option<KernelStackSnapshot>>,
     futex: Arc<carrick_thread::thread::FutexTable>,
@@ -1606,6 +1612,9 @@ impl Cpl0TaskBinding {
             arch,
             thread: context.thread().key(),
             kernel_binding: context.task_binding(),
+            host_root_resources: carrick_kernel::dispatch::resources::HostRootResources::capture(
+                context,
+            ),
             retained: Mutex::new(None),
             kernel_stack: Mutex::new(None),
             futex: Arc::new(carrick_thread::thread::FutexTable::new()),

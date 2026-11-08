@@ -183,6 +183,60 @@ impl NativeFsAuthority {
     }
 }
 
+/// Host-owned resources of a root whose execution has moved to the ring.
+///
+/// This custody deliberately exposes neither a host descriptor table nor an
+/// execution lease. Files opened with it belong to the caller's ring table.
+/// Credentials include supplementary groups and umask; limits remain attached
+/// to the task so a peer's prlimit update is visible to the next operation.
+#[derive(Clone)]
+pub struct HostRootResources {
+    binding: crate::kernel::KernelTaskBinding,
+    thread: crate::kernel::objects::ThreadKey,
+}
+
+impl HostRootResources {
+    pub fn capture(context: &crate::kernel::KernelContext) -> Self {
+        Self {
+            binding: context.task_binding(),
+            thread: context.thread().key(),
+        }
+    }
+
+    /// Capture the current resource generation, including credential COW
+    /// replacements, while rejecting a reused numeric thread identity.
+    pub fn snapshot(&self) -> Result<HostRootResourceSnapshot, crate::kernel::KernelError> {
+        let context = self.binding.capture(self.thread.tid)?;
+        if context.thread().key() != self.thread {
+            return Err(crate::kernel::KernelError::StaleTaskBinding(
+                self.binding.task_id(),
+            ));
+        }
+        Ok(HostRootResourceSnapshot {
+            filesystem: NativeFsAuthority::new(
+                context.resources().credentials(),
+                context.resources().fs_context(),
+            ),
+            limits: Arc::clone(context.task()),
+        })
+    }
+}
+
+pub struct HostRootResourceSnapshot {
+    filesystem: NativeFsAuthority,
+    limits: crate::kernel::TaskRef,
+}
+
+impl HostRootResourceSnapshot {
+    pub fn filesystem(&self) -> &NativeFsAuthority {
+        &self.filesystem
+    }
+
+    pub fn rlimits(&self) -> crate::kernel::RlimitSet {
+        self.limits.rlimits()
+    }
+}
+
 /// Run `operation` with `authority` as the credentials and filesystem
 /// context the filesystem helpers read. Never nests inside a host task's
 /// captured scope: the two authorities must not mix.
@@ -556,6 +610,46 @@ pub(super) fn mm() -> Option<Arc<crate::kernel::Mm>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_root_custody_observes_resource_replacement_without_host_file_scope() {
+        let dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let custody = HostRootResources::capture(&context);
+        let old_credentials = context.resources().credentials();
+        context
+            .kernel()
+            .update_credentials(&context, |credentials| {
+                credentials.set_fsuid(carrick_abi::NsUid::new(1234));
+                credentials.set_supplementary_groups(vec![carrick_abi::NsGid::new(4321)]);
+                credentials.set_umask(0o027);
+            })
+            .unwrap();
+        context
+            .resources()
+            .fs_context()
+            .set_cwd("/live-root-cwd".into());
+        let snapshot = custody.snapshot().unwrap();
+        let credentials = &snapshot.filesystem.credentials;
+        assert!(!Arc::ptr_eq(credentials, &old_credentials));
+        assert_eq!(credentials.fsuid, carrick_abi::NsUid::new(1234));
+        assert_eq!(credentials.umask, 0o027);
+        assert_eq!(
+            credentials.supplementary_groups_override(),
+            Some([carrick_abi::NsGid::new(4321)].as_slice())
+        );
+        assert!(Arc::ptr_eq(
+            &snapshot.filesystem.fs_context,
+            &context.resources().fs_context()
+        ));
+        with_native_fs_scope(snapshot.filesystem(), || {
+            assert!(in_native_fs_scope());
+            assert!(files().is_none());
+            assert!(mm().is_none());
+        })
+        .unwrap();
+        assert!(executor_boundary_is_clear());
+    }
 
     #[test]
     fn ordinary_scope_retains_bundles_without_cloning_each_resource() {
