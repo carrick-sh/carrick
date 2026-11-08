@@ -1909,27 +1909,8 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         control,
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
-    );
-    signal_user_return_admission(delivered)
-}
-
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-pub(super) fn signal_user_return_admission(
-    delivered: Result<
-        Option<carrick_personality_linux::dispatch::CompletionRoute>,
-        super::native_process_runtime::NativeProcessError,
-    >,
-) -> Action {
-    let delivered = match delivered {
-        Ok(delivered) => delivered,
-        // This is an opportunistic check after the SVC has completed. Entry
-        // admission has published no signal, so the pending state stays in
-        // the native owner and the next EL0 entry repeats the checkpoint.
-        // Keep the completed result and frame intact; there is no retained
-        // syscall operation or owner receipt to park here.
-        Err(super::native_process_runtime::NativeProcessError::Busy) => return Action::Served,
-        Err(error) => invalid_completion(native_service_invariant(error)),
-    };
+    )
+    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     match delivered {
         None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,

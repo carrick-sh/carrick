@@ -394,7 +394,6 @@ pub fn signal_user_return(
     forced: Option<LinuxSiginfo>,
 ) -> bool {
     use carrick_el1::isa::x86::context;
-    use carrick_el1_linux::native_process_runtime::NativeProcessError;
     if !native_process::is_admitted() {
         return false;
     }
@@ -409,28 +408,20 @@ pub fn signal_user_return(
         let _copy_gate = user_fault_gate::install();
         let words = capture(frame, xsave);
         let mut service = native_process::Service::new(task, slot);
-        match native_process::drain_external_ingress(source, &mut service) {
-            Ok(_) => {}
-            Err(NativeProcessError::Busy) if forced.is_none() => return true,
-            Err(_) => fatal_boot(),
-        }
-        let (process_runtime, address) = match native_process::runtime(source, task) {
-            Ok(runtime) => runtime,
-            Err(NativeProcessError::Busy) if forced.is_none() => return true,
-            Err(_) => fatal_boot(),
-        };
-        let mut process = match process_runtime.enter_registered(
-            native_process::registry(),
-            source,
-            task,
-            address,
-            &words,
-            &mut service,
-        ) {
-            Ok(process) => process,
-            Err(NativeProcessError::Busy) if forced.is_none() => return true,
-            Err(_) => fatal_boot(),
-        };
+        native_process::drain_external_ingress(source, &mut service)
+            .unwrap_or_else(|_| fatal_boot());
+        let (process_runtime, address) =
+            native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot());
+        let mut process = process_runtime
+            .enter_registered(
+                native_process::registry(),
+                source,
+                task,
+                address,
+                &words,
+                &mut service,
+            )
+            .unwrap_or_else(|_| fatal_boot());
         if let Some(info) = forced {
             use carrick_personality_linux::signal::policy::{SigBlockMask, Signal};
             let Some(thread) = GuestLifecycleVenue.thread(task) else {
