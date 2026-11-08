@@ -9407,6 +9407,15 @@ fn arm_caught_signal_returns_then_reexecutes_parked_anonymous_edit() {
         "anonymous edit interruption never returns EINTR"
     );
     assert!(
+        crate::mm_portal::complete_anonymous_edit_replay(
+            fixture.zone,
+            fixture.slot,
+            &fixture.task,
+        )
+        .unwrap(),
+        "successful replay must consume its anonymous operation"
+    );
+    assert!(
         !fixture
             .zone
             .record(binding.record.id)
