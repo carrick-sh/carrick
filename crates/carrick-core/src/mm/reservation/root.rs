@@ -2106,7 +2106,7 @@ impl<
                 | ReservationOperation::Decommit
         ) && self.return_owed_within(range)
         {
-            return Err(Refusal::Busy);
+            return Err(Refusal::DeferredReturn);
         }
         let mut cursor = range.start();
         let mut bytes = 0;
@@ -3870,10 +3870,11 @@ mod tests {
     }
 
     /// `MAP_FIXED` and `MAP_FIXED_NOREPLACE` name the address: over an owed
-    /// return they keep today's `Busy` (the host venue settles first);
+    /// return they keep the host-owned deferred-return route (the host venue
+    /// settles first);
     /// settling for a ring-owned MM is #1369's later slices.
     #[test]
-    fn fixed_placement_over_owed_return_keeps_busy() {
+    fn fixed_placement_over_owed_return_keeps_deferred_return() {
         let table = table();
         let mm = ReservationMm::new(1480).unwrap();
         table.publish(0, mm, layout()).unwrap();
@@ -3886,15 +3887,15 @@ mod tests {
         retire_owed(&mut root, owed);
         assert_eq!(
             root.mmap(Placement::Fixed(0x200000), 0x4000, rw),
-            Err(Refusal::Busy)
+            Err(Refusal::DeferredReturn)
         );
         assert_eq!(
             root.mmap(Placement::Fixed(0x203000), 0x2000, rw),
-            Err(Refusal::Busy)
+            Err(Refusal::DeferredReturn)
         );
         assert_eq!(
             root.mmap(Placement::NoReplace(0x201000), 0x1000, rw),
-            Err(Refusal::Busy)
+            Err(Refusal::DeferredReturn)
         );
         assert!(root.pending().is_none());
         // Adjacent to, not over, the owed extent: fixed placement proceeds.
