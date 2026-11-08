@@ -9423,6 +9423,7 @@ fn arm_caught_signal_returns_then_reexecutes_parked_anonymous_edit() {
     );
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 enum ArmAnonymousTerminalEntry {
     Exit,
