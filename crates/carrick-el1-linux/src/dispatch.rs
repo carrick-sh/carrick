@@ -4758,6 +4758,12 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             {
                 frame.x[0] = orig_x0;
                 let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+                // IPC families publish immediate results in their frame;
+                // unlike Poll, their shared completion does not install one.
+                if let lifecycle::LifecycleOutcome::Returned { result, .. } = &outcome {
+                    self.frame
+                        .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
+                }
                 return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
             }
             let result = frame.x[0] as i64;
