@@ -2848,8 +2848,12 @@ fn production_pipe_metadata_stays_in_the_ring_namespace() {
         code.extend_from_slice(&[0x0f, 0x05]);
     }
     // #1807: standard fd F_GETFD must have an x86 crossing on a decline.
-    call(&mut code, 72, [1, 1, 0]);
-    check(&mut code, &mut failures, 0);
+    for fd in [0, 1, 2] {
+        call(&mut code, 72, [fd, 1, 0]);
+        check(&mut code, &mut failures, 0);
+    }
+    call(&mut code, 72, [31, 1, 0]);
+    check(&mut code, &mut failures, -9);
     // Reserve writable user stack for pipe fds, stat, ioctl and empty path.
     code.extend_from_slice(&[0x48, 0x81, 0xec, 0x00, 0x04, 0x00, 0x00]);
     // pipe2(rsp, O_NONBLOCK), then read the allocated read fd into r12d.
