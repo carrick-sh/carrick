@@ -44,9 +44,8 @@ impl FutexCall {
             // glibc sem_wait supplies CLOCK_REALTIME even for an indefinite wait.
             // Keep absolute timeouts outside admission until their clock domain
             // and owner-copy protocol are implemented.
-            FUTEX_WAIT_BITSET_PRIVATE | FUTEX_WAIT_BITSET_PRIVATE_REALTIME => {
-                self.args[3] == 0 && self.args[5] as u32 != 0
-            }
+            FUTEX_WAIT_BITSET_PRIVATE => self.args[3] == 0 && self.args[5] as u32 != 0,
+            FUTEX_WAIT_BITSET_PRIVATE_REALTIME => self.args[3] == 0,
             FUTEX_WAKE_PRIVATE => self.args[2] as i32 > 0,
             FUTEX_WAKE_BITSET_PRIVATE => self.args[2] as i32 > 0 && self.args[5] as u32 != 0,
             _ => false,
@@ -70,6 +69,9 @@ pub trait FutexVenue {
     fn frequency(&self) -> FutexFrequency;
     fn now(&self) -> CounterTick;
     fn retained_deadline(&self) -> Option<CounterTick> {
+        None
+    }
+    fn invalid(&mut self, _result: SyscallResult) -> Option<Self::Served> {
         None
     }
 
@@ -105,6 +107,9 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
     } else {
         mask as u32
     };
+    if op == FUTEX_WAIT_BITSET_PRIVATE_REALTIME && bitset == 0 {
+        return venue.invalid(SyscallResult::new(LINUX_EINVAL.guest_retval()));
+    }
     if matches!(op, FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE) {
         return venue.wake(mm, address, bitset, expected as i32 as u32);
     }
