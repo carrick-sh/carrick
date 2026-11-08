@@ -253,11 +253,20 @@ where
         OperationToken,
     ) -> Result<T, (ObjectWaitError, OperationToken)>,
 {
+    // MetadataRequired is served by synchronous bank provisioning. There is
+    // no per-MM Metadata publisher, so it cannot be a parked wait cause.
+    const CAUSES: [SpaceWaitCause; 5] = [
+        SpaceWaitCause::PreparedOverlap,
+        SpaceWaitCause::Editor,
+        SpaceWaitCause::Reservations,
+        SpaceWaitCause::PendingEdit,
+        SpaceWaitCause::Gate,
+    ];
     loop {
         if !source.is_live() {
             return EditWaitOutcome::Refused;
         }
-        let observed = SpaceWaitCause::ALL.map(|cause| source.observe(cause));
+        let observed = CAUSES.map(|cause| source.observe(cause));
         let Some(conflict) = probe() else {
             return EditWaitOutcome::Refused;
         };
@@ -270,7 +279,7 @@ where
         }) {
             return EditWaitOutcome::StaleToken;
         }
-        let Some(snapshot) = SpaceWaitCause::ALL
+        let Some(snapshot) = CAUSES
             .into_iter()
             .zip(observed)
             .find_map(|(candidate, snapshot)| (candidate == cause).then_some(snapshot))
