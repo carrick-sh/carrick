@@ -623,6 +623,11 @@ pub fn stage(
     user: &mut dyn HostFileUser,
 ) -> Option<HostFileStage> {
     let staged = stage_call(call, namespace, user)?;
+    // readlink has no consumptive effect. Its reply length, not bufsiz,
+    // determines which pages the retained ring copyout must prepare.
+    if matches!(call, HostFileCall::Readlinkat { .. }) {
+        return Some(staged);
+    }
     if let HostFileStage::Request {
         output: Some(output),
         ..
