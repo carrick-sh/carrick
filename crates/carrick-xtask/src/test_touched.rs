@@ -213,9 +213,13 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
             }
             continue;
         }
-        if name == "carrick-kernel"
-            && let Err(e) = kernel_host_facilities()
-        {
+        let preflight: Result<()> = match name.as_str() {
+            "carrick-kernel" => kernel_host_facilities(),
+            "carrick-xtask" => crate::fixtures::reject_ambient_overrides()
+                .map_err(|e| format!("host configuration unavailable: {e}").into()),
+            _ => Ok(()),
+        };
+        if let Err(e) = preflight {
             eprintln!("test-touched: {name}: {e}");
             failures.push(format!("{name}: {e}"));
             continue;
