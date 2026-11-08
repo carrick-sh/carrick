@@ -124,6 +124,9 @@ pub struct StepResult {
     /// `ci-receipt diff` keys NEW/FIXED on these, never on exit codes alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_tests: Vec<String>,
+    /// Qualified test names explicitly skipped after the binary budget expired.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_run_tests: Vec<String>,
     /// Failures no test name explains: a crashed or signalled test binary, a
     /// compile error, a step killed by a signal, or a `test result: FAILED`
     /// line with empty itemization. Each is its own identity.
@@ -583,6 +586,7 @@ fn linux_host_failure_details(log: &str, exceptions: &[LinuxHostTestException]) 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedTestLog {
     pub failed_tests: Vec<String>,
+    pub not_run_tests: Vec<String>,
     pub unitemized_failures: Vec<String>,
     pub started_tests: Vec<String>,
     pub finished_binaries: Vec<String>,
@@ -688,6 +692,7 @@ pub fn parse_test_log(log: &str) -> ParsedTestLog {
     let mut saw_failed_result = false;
 
     let mut failed_tests = BTreeSet::new();
+    let mut not_run_tests = BTreeSet::new();
     let mut unitemized_failures = BTreeSet::new();
     let mut started_tests = BTreeSet::new();
     let mut finished_binaries = BTreeSet::new();
@@ -762,6 +767,32 @@ pub fn parse_test_log(log: &str) -> ParsedTestLog {
             continue;
         }
 
+        // The runner knows which exact test was skipped or killed. Historical
+        // logs emitted a synthetic FAILED immediately before both markers.
+        if let Some(rest) = trimmed.strip_prefix("test-signed: NOT-RUN ") {
+            let mut words = rest.split_whitespace();
+            if let (Some(exe), Some(name)) = (words.next(), words.next())
+                && is_valid_test_name(name)
+            {
+                let qualified = qualify_test(&binary_stem_from_path(exe), name);
+                if failed_tests.remove(&qualified) {
+                    current_run_itemized_count = current_run_itemized_count.saturating_sub(1);
+                }
+                started_tests.remove(&qualified);
+                not_run_tests.insert(qualified);
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("test-signed: DEADLINE ") {
+            let mut words = rest.split_whitespace();
+            if let (Some(exe), Some(name)) = (words.next(), words.next())
+                && is_valid_test_name(name)
+            {
+                let qualified = qualify_test(&binary_stem_from_path(exe), name);
+                failed_tests.remove(&qualified);
+                failed_tests.insert(format!("deadline:{qualified}"));
+            }
+        }
         if let Some((name, status)) = extract_test_line(line) {
             let qualified = qualify_test(&current_binary, name);
             if status != "ignored" && !status.starts_with("ignored,") {
@@ -874,6 +905,7 @@ pub fn parse_test_log(log: &str) -> ParsedTestLog {
 
     ParsedTestLog {
         failed_tests: failed_tests.into_iter().collect(),
+        not_run_tests: not_run_tests.into_iter().collect(),
         unitemized_failures: unitemized_failures.into_iter().collect(),
         started_tests: started_tests.into_iter().collect(),
         finished_binaries: finished_binaries.into_iter().collect(),
@@ -1080,6 +1112,7 @@ pub const NO_DOCKER_EXCLUSIONS: &[&str] = &[
 pub fn populate_step_from_log(step: &mut StepResult, log: &str, failures: &mut Vec<String>) {
     let parsed = parse_test_log(log);
     step.failed_tests = parsed.failed_tests;
+    step.not_run_tests = parsed.not_run_tests;
     step.unitemized_failures = parsed.unitemized_failures;
     step.started_tests = parsed.started_tests;
     step.finished_binaries = parsed.finished_binaries;
@@ -1703,6 +1736,7 @@ fn run_inner(
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                not_run_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
                 started_tests: Vec::new(),
                 finished_binaries: Vec::new(),
@@ -1763,6 +1797,7 @@ fn run_inner(
             passed: fixtures_valid,
             error,
             failed_tests: Vec::new(),
+            not_run_tests: Vec::new(),
             unitemized_failures: Vec::new(),
             started_tests: Vec::new(),
             finished_binaries: Vec::new(),
@@ -1879,6 +1914,7 @@ fn run_inner(
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                not_run_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
                 started_tests: Vec::new(),
                 finished_binaries: Vec::new(),
@@ -1952,6 +1988,7 @@ fn run_inner(
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                not_run_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
                 started_tests: Vec::new(),
                 finished_binaries: Vec::new(),
@@ -2018,6 +2055,7 @@ fn run_inner(
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                not_run_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
                 started_tests: Vec::new(),
                 finished_binaries: Vec::new(),
@@ -2099,6 +2137,7 @@ fn run_inner(
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                not_run_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
                 started_tests: Vec::new(),
                 finished_binaries: Vec::new(),
@@ -2176,6 +2215,7 @@ fn run_inner(
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                not_run_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
                 started_tests: Vec::new(),
                 finished_binaries: Vec::new(),
@@ -2237,6 +2277,7 @@ fn run_inner(
                     passed,
                     error,
                     failed_tests: Vec::new(),
+                    not_run_tests: Vec::new(),
                     unitemized_failures: Vec::new(),
                     started_tests: Vec::new(),
                     finished_binaries: Vec::new(),
@@ -2320,6 +2361,7 @@ fn run_inner(
                     passed,
                     error,
                     failed_tests: Vec::new(),
+                    not_run_tests: Vec::new(),
                     unitemized_failures: Vec::new(),
                     started_tests: Vec::new(),
                     finished_binaries: Vec::new(),
@@ -2402,6 +2444,7 @@ fn run_inner(
                     passed,
                     error,
                     failed_tests: Vec::new(),
+                    not_run_tests: Vec::new(),
                     unitemized_failures: Vec::new(),
                     started_tests: Vec::new(),
                     finished_binaries: Vec::new(),
@@ -2781,6 +2824,7 @@ mod tests {
                 passed: exit_code == 0,
                 error: None,
                 failed_tests: vec![],
+                not_run_tests: vec![],
                 unitemized_failures: vec![],
                 started_tests: vec![],
                 finished_binaries: vec![],
@@ -3044,6 +3088,7 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
                 passed: true,
                 error: None,
                 failed_tests: Vec::new(),
+                not_run_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
                 started_tests: Vec::new(),
                 finished_binaries: Vec::new(),

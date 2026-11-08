@@ -50,6 +50,7 @@ fn step(name: &str, passed: bool, failed: &[&str]) -> StepResult {
         passed,
         error: None,
         failed_tests: failed.iter().map(|t| (*t).to_owned()).collect(),
+        not_run_tests: vec![],
         unitemized_failures: vec![],
         started_tests: failed.iter().map(|t| (*t).to_owned()).collect(),
         finished_binaries: vec![],
@@ -3694,6 +3695,45 @@ test-signed: NOT-RUN /w/el1_sched-d12e72e26c1d1655 el1_tlb_cross_vcpu_mm_edits_l
     let parsed = parse_test_log(log);
     assert!(!parsed.failed_tests.iter().any(|t| t.contains("el1_tlb_")));
     let keys = failure_keys(&receipt_from_el1_log(false, log));
-    assert!(keys.contains("not-run:el1-embed:el1_sched::el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation"));
-    assert!(keys.contains("test:el1-embed:deadline:el1_sched::el1_thread_lifecycle_tgkill_right_after_clone"));
+    assert!(keys.contains(
+        "not-run:el1-embed:el1_sched::el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation"
+    ));
+    assert!(keys.contains(
+        "test:el1-embed:deadline:el1_sched::el1_thread_lifecycle_tgkill_right_after_clone"
+    ));
+}
+
+#[test]
+fn deadline_preserves_prior_failure_and_skips_are_never_new_or_fixed() {
+    for synthetic in ["test later ... FAILED\n", ""] {
+        let log = format!(
+            "test-signed: running /w/suite-abcdef\ntest real_failure ... FAILED\ntest timed_out ... FAILED\ntest-signed: DEADLINE /w/suite-abcdef timed_out (9s)\n{synthetic}test-signed: NOT-RUN /w/suite-abcdef later (binary budget of 600s spent)\ntest result: FAILED.\n"
+        );
+        let candidate = receipt_from_el1_log(false, &log);
+        assert_eq!(
+            candidate.steps[0].failed_tests,
+            ["deadline:suite::timed_out", "suite::real_failure"]
+        );
+        assert_eq!(candidate.steps[0].not_run_tests, ["suite::later"]);
+        let base = receipt_from_el1_log(
+            false,
+            "test-signed: running /w/suite-abcdef\ntest later ... FAILED\ntest result: FAILED.\n",
+        );
+        let delta = diff(&base, &candidate).unwrap();
+        assert!(
+            !delta
+                .new
+                .iter()
+                .chain(&delta.fixed)
+                .any(|key| key.contains("later"))
+        );
+        let reverse = diff(&candidate, &base).unwrap();
+        assert!(
+            !reverse
+                .new
+                .iter()
+                .chain(&reverse.fixed)
+                .any(|key| key.contains("later"))
+        );
+    }
 }
