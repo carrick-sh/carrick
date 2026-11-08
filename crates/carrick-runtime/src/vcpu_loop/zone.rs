@@ -1720,18 +1720,27 @@ fn restart_with_remaining<E: ThreadedEngine>(
             return Err(ipc_error("replay register convention", (actual, ordinal)));
         }
         engine
-            .set_reg(carrick_hal::Reg::X(argument as u8), value)
+            .set_reg(carrick_hal::Reg::X(argument as u32), value)
             .map_err(|error| ipc_error("replay argument", error))?;
         if let Some(request) = request {
             request.args.0[argument] = value;
         }
         writes |= 1 << argument;
     }
-    let args = [0, 1, 2, 3, 4, 5].map(|reg| engine.get_reg(carrick_hal::Reg::X(reg)).unwrap_or(0));
+    let mut args = [0; 6];
+    for (index, argument) in args.iter_mut().enumerate() {
+        let Ok(value) = engine.get_reg(carrick_hal::Reg::X(index as u32)) else {
+            return Ok(());
+        };
+        *argument = value;
+    }
+    let (Ok(nr), Ok(pc)) = (engine.get_reg(carrick_hal::Reg::X(8)), engine.current_pc()) else {
+        return Ok(());
+    };
     carrick_el1_abi::record_host_ipc_replay(
         engine.mailbox_slot(),
-        carrick_abi::CanonicalNr(engine.get_reg(carrick_hal::Reg::X(8)).unwrap_or(0)),
-        engine.current_pc().unwrap_or(0),
+        carrick_abi::CanonicalNr(nr),
+        pc,
         args,
         writes,
     );
