@@ -2151,7 +2151,14 @@ pub struct IpcObjectGuard<'a> {
 impl Drop for IpcObjectGuard<'_> {
     fn drop(&mut self) {
         self.record.lock.store(LOCK_FREE, Ordering::Release);
-
+        if let Some(release) = self.region.lock_release {
+            let Some(index) = carrick_sched_core::object_wait::ipc_release::IpcLockIndex::object(
+                self.handle.index as usize,
+            ) else {
+                unreachable!("IPC object outside its release domain");
+            };
+            release.released(index);
+        }
     }
 }
 
