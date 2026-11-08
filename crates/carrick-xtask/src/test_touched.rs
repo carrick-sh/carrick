@@ -167,10 +167,14 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
         for record in &records {
             let lane = crate::test_batch::parse(record.clone(), &meta)?;
             for package in meta["packages"].as_array().ok_or("missing packages")? {
-                if lane
-                    .targets
-                    .iter()
-                    .any(|(id, _)| Some(id.as_str()) == package["id"].as_str())
+                if (lane.doc
+                    && lane
+                        .packages
+                        .contains(package["name"].as_str().ok_or("missing name")?))
+                    || lane
+                        .targets
+                        .iter()
+                        .any(|(id, _)| Some(id.as_str()) == package["id"].as_str())
                 {
                     packages.insert(package["name"].as_str().ok_or("missing name")?.to_owned());
                 }
