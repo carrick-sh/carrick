@@ -34,7 +34,7 @@ fn object_release<C: crate::EntryContext>() {
         waker: Waker::Host,
         deliver: complete,
     };
-    let region = f.region.with_lock_release(&venue);
+    let region = f.region.with_lock_release(&venue).unwrap();
     let snapshot = || {
         zone.object_wait_with_completion(index.key(carrier), &EL1, &|e| complete(&zone, e))
             .unwrap()
@@ -66,7 +66,7 @@ fn ipc_table_unlock_publishes_release_after_exclusion() {
         waker: Waker::Host,
         deliver: complete,
     };
-    let region = f.region.with_lock_release(&venue);
+    let region = f.region.with_lock_release(&venue).unwrap();
     let authority = region.fd(BoundedSpin(0));
     let snapshot = || {
         zone.object_wait_with_completion(index.key(carrier), &EL1, &|e| complete(&zone, e))
@@ -127,7 +127,7 @@ fn ipc_busy_once_then_success_uses_a_release_ticket() {
         waker: Waker::Host,
         deliver: complete,
     };
-    let region = f.region.with_lock_release(&venue);
+    let region = f.region.with_lock_release(&venue).unwrap();
     let source = zone.ipc_lock_release_source(index, carrier).unwrap();
     let held = region.lock(object, &EL1).unwrap();
     let refusal = source.contend(|| {
@@ -189,7 +189,7 @@ fn after_park<C: crate::EntryContext>() {
         waker: Waker::Host,
         deliver: defer,
     };
-    let region = f.region.with_lock_release(&venue);
+    let region = f.region.with_lock_release(&venue).unwrap();
     let source = zone.ipc_lock_release_source(index, carrier).unwrap();
     let record = zone
         .alloc_record(ThreadIdentity {
@@ -286,7 +286,7 @@ fn ipc_release_does_not_wake_an_unrelated_object_lane() {
         waker: Waker::Host,
         deliver: complete,
     };
-    let region = f.region.with_lock_release(&venue);
+    let region = f.region.with_lock_release(&venue).unwrap();
     let snapshot = |index: IpcLockIndex| {
         zone.object_wait_with_completion(index.key(carrier), &EL1, &|e| complete(&zone, e))
             .unwrap()
@@ -296,4 +296,21 @@ fn ipc_release_does_not_wake_an_unrelated_object_lane() {
     drop(region.lock(first, &EL1).unwrap());
     assert_eq!(snapshot(indices[0]).revision(), before[0].revision() + 1);
     assert_eq!(snapshot(indices[1]), before[1]);
+}
+
+#[test]
+fn ipc_release_venue_rejects_a_foreign_region() {
+    let zone = zone::<ThreadCtx>();
+    let f = fixture(8 * 1024 * 1024);
+    let other = fixture(8 * 1024 * 1024);
+    let venue = IpcLockReleaseVenue {
+        zone: &zone,
+        carrier: f.region.operation_slot_generation(),
+        waker: Waker::Host,
+        deliver: complete,
+    };
+    assert!(matches!(
+        other.region.with_lock_release(&venue),
+        Err(IpcError::BadRegion)
+    ));
 }

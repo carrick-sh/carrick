@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 pub const RAM_SIZE: usize = 16 * 1024 * 1024;
-pub const META_GPA: u64 = 0xc0_0000;
+pub const META_GPA: u64 = carrick_core_abi::X86_CPL0_METADATA_GPA;
 pub const META_LEN: u64 = 0x10_0000;
 pub const PRODUCTION_METADATA_GPA: u64 = META_GPA;
 /// Bootstrap metadata has separate backing beyond the reserved initial image.

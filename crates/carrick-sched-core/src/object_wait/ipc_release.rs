@@ -44,6 +44,7 @@ impl IpcLockIndex {
 /// an already admitted source after exclusion has been released. They must not
 /// acquire the data lock, bind a source, allocate, or wait for execution.
 pub trait IpcLockRelease: Send + Sync {
+    fn carrier(&self) -> NonZeroU64;
     fn released(&self, index: IpcLockIndex);
 }
 
@@ -57,6 +58,9 @@ pub struct IpcLockReleaseVenue<'z, C: Copy + Send + Sync + zerocopy::FromZeros> 
     pub deliver: for<'a> fn(&'a ZoneTables<C>, OwnedObjectWakeEffects<'a, C>),
 }
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> IpcLockRelease for IpcLockReleaseVenue<'_, C> {
+    fn carrier(&self) -> NonZeroU64 {
+        self.carrier
+    }
     fn released(&self, index: IpcLockIndex) {
         let Ok(source) = self.zone.ipc_lock_release_source(index, self.carrier) else {
             unreachable!("IPC lock published without its admitted release source");
