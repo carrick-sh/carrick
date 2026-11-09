@@ -193,6 +193,62 @@ fn serial_host_native_root_getrandom_lazy_output_returns_eight_bytes() {
     );
 }
 
+/// #1808: a production x86 fork child's relative nanosleep parks on the
+/// shared sleep owner and its timer returns 0; it is never forwarded.
+#[test]
+fn serial_host_native_child_nanosleep_returns_zero() {
+    native_child_sleep_witness("serial_host_native_child_nanosleep_returns_zero", &[]);
+}
+
+#[test]
+fn serial_host_native_child_zero_nanosleep_returns_zero() {
+    native_child_sleep_witness(
+        "serial_host_native_child_zero_nanosleep_returns_zero",
+        &["-DSLEEP_ZERO=1"],
+    );
+}
+
+/// forkexecstorm's ready-child shape on x86: an already expired absolute
+/// CLOCK_MONOTONIC deadline returns 0 at once.
+#[test]
+fn serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero() {
+    native_child_sleep_witness(
+        "serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero",
+        &["-DSLEEP_ABSOLUTE=1"],
+    );
+}
+
+fn native_child_sleep_witness(test: &str, flags: &[&str]) {
+    // Bounded in a child test process like the entropy witness: a lost timer
+    // wake must fail, never hang CI.
+    const CHILD: &str = "CARRICK_SLEEP_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "10"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
+            .output()
+            .expect("bounded native sleep witness");
+        assert!(
+            output.status.success(),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = native_exit_fixture_with_flags("native_child_sleep.S", flags);
+    let outcome = run_pool_fixture(&elf, 128);
+    assert_eq!(
+        outcome.run.exit_code, 8,
+        "child sleep result (218 means ENOSYS)"
+    );
+    assert!(outcome.run.stdout.is_empty());
+    assert!(outcome.run.stderr.is_empty());
+}
+
 fn native_child_entropy_witness(test: &str, flags: &[&str]) {
     // A parked guest need not consume the pool's exit budget. Bound the whole
     // fixture in a separate test process so a lost child wake cannot hang CI.
