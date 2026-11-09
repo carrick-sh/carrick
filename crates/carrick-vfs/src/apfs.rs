@@ -322,36 +322,80 @@ fn conventional_mount_usable(_: &Path) -> bool {
     false
 }
 
-/// Run one volume query on the scratch-storage worker
-/// (`fs_backend::host`, thread `carrick-fs-cleanup`) and wait at most
-/// `deadline` for its answer. Unavailable worker, full queue, timeout and
-/// query error all return `Err`, which callers treat as "not usable".
+/// Wedge detector for a hung volume query on the scratch worker. This is
+/// not a load deadline: a slow but answering worker, or a full queue, is
+/// waited for however long it takes, so the scratch-root decision never
+/// depends on host load. Only a query that has produced no answer for this
+/// long (a hung volume) is given up on, and that is logged as an error.
 #[cfg(any(target_os = "macos", test))]
-fn bounded_volume_query(
-    deadline: std::time::Duration,
+const SCRATCH_VOLUME_WEDGE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long to yield between offers while the worker queue is full.
+#[cfg(any(target_os = "macos", test))]
+const SCRATCH_QUEUE_FULL_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Run one volume query on the scratch-storage worker (`fs_backend::host`,
+/// thread `carrick-fs-cleanup`) and return whether the volume is usable.
+/// A full queue is "not now" and is re-offered; a slow answer is waited for.
+/// `false` because of the worker happens only when it is unavailable, its
+/// reply sender is dropped, or no answer arrives within `wedge_bound`
+/// (total time waiting, including queue retries); each is logged as an
+/// error. A query that itself reports an error is a genuine "not usable".
+#[cfg(any(target_os = "macos", test))]
+fn scratch_volume_verdict(
+    wedge_bound: std::time::Duration,
     query: impl FnOnce() -> std::io::Result<bool> + Send + 'static,
-) -> std::io::Result<bool> {
-    let receiver = crate::fs_backend::host::enqueue_scratch_volume_query(Box::new(query))
-        .ok_or_else(|| std::io::Error::other("scratch worker unavailable or saturated"))?;
-    receiver.recv_timeout(deadline).map_err(|error| {
-        std::io::Error::other(format!(
-            "scratch volume classification did not complete: {error}"
-        ))
-    })?
+) -> bool {
+    use crate::fs_backend::host::{ScratchVolumeEnqueue, enqueue_scratch_volume_query};
+    use std::sync::mpsc::RecvTimeoutError;
+    let start = std::time::Instant::now();
+    let mut query: crate::fs_backend::host::ScratchVolumeQuery = Box::new(query);
+    let receiver = loop {
+        match enqueue_scratch_volume_query(query) {
+            ScratchVolumeEnqueue::Queued(receiver) => break receiver,
+            ScratchVolumeEnqueue::Full(returned) => {
+                if start.elapsed() >= wedge_bound {
+                    tracing::error!(
+                        ?wedge_bound,
+                        "scratch worker queue stayed full; worker wedged, skipping volume"
+                    );
+                    return false;
+                }
+                query = returned;
+                std::thread::sleep(SCRATCH_QUEUE_FULL_RETRY);
+            }
+            ScratchVolumeEnqueue::Unavailable => {
+                tracing::error!("scratch worker unavailable; skipping volume");
+                return false;
+            }
+        }
+    };
+    match receiver.recv_timeout(wedge_bound.saturating_sub(start.elapsed())) {
+        Ok(Ok(usable)) => usable,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "skipping conventional scratch volume");
+            false
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            tracing::error!(
+                ?wedge_bound,
+                "scratch volume query wedged without an answer; skipping volume"
+            );
+            false
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            tracing::error!("scratch worker dropped the volume query; skipping volume");
+            false
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn conventional_mount_usable(path: &Path) -> bool {
     let path = path.to_owned();
-    match bounded_volume_query(std::time::Duration::from_secs(2), move || {
+    scratch_volume_verdict(SCRATCH_VOLUME_WEDGE_BOUND, move || {
         classify_conventional_mount(&path)
-    }) {
-        Ok(usable) => usable,
-        Err(error) => {
-            tracing::warn!(%error, "skipping conventional scratch volume");
-            false
-        }
-    }
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -613,35 +657,91 @@ mod tests {
         use super::*;
 
         #[test]
-        fn conventional_volume_query_known_answer_and_deadline() {
+        fn volume_verdict_known_answers_and_wedge_is_only_timeout_refusal() {
             use std::sync::mpsc::sync_channel;
             use std::time::Duration;
 
-            assert!(bounded_volume_query(Duration::from_secs(5), || Ok(true)).unwrap());
-            assert!(
-                bounded_volume_query(Duration::from_secs(5), || {
-                    Err(std::io::Error::other("device query failed"))
-                })
-                .is_err()
-            );
-            let (release, blocked) = sync_channel(1);
+            let bound = SCRATCH_VOLUME_WEDGE_BOUND;
+            assert!(scratch_volume_verdict(bound, || Ok(true)));
+            assert!(!scratch_volume_verdict(bound, || Ok(false)));
+            assert!(!scratch_volume_verdict(bound, || {
+                Err(std::io::Error::other("device query failed"))
+            }));
+            // A wedged query (blocked past a tiny injected bound) is refused.
+            let (release, blocked) = sync_channel::<()>(1);
             let (finished, completion) = sync_channel(1);
-            let result = bounded_volume_query(Duration::from_millis(20), move || {
-                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            let usable = scratch_volume_verdict(Duration::from_millis(50), move || {
+                let _ = blocked.recv_timeout(Duration::from_secs(30));
                 finished.send(()).unwrap();
                 Ok(true)
             });
-            assert!(result.is_err());
+            assert!(!usable);
             let root = resolve_scratch_root_from(
                 Path::new("/Volumes/carrick"),
-                result.unwrap_or(false),
+                usable,
                 |_| panic!("unknown volume must not be probed"),
                 Some("/internal/home".into()),
                 None,
             );
             assert_eq!(root, PathBuf::from("/internal/home/scratch"));
             release.send(()).unwrap();
-            completion.recv_timeout(Duration::from_secs(5)).unwrap();
+            completion.recv_timeout(Duration::from_secs(30)).unwrap();
+        }
+
+        /// A slow answer (longer than the old 2 s deadline) is waited for.
+        #[test]
+        fn slow_volume_query_is_waited_for() {
+            assert!(scratch_volume_verdict(SCRATCH_VOLUME_WEDGE_BOUND, || {
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+                Ok(true)
+            }));
+        }
+
+        /// Busy once, then success: with the worker queue full the verdict
+        /// waits and returns the real answer once the queue drains.
+        #[test]
+        fn full_queue_is_not_now() {
+            use crate::fs_backend::host::{ScratchVolumeEnqueue, enqueue_scratch_volume_query};
+            use std::sync::mpsc::sync_channel;
+            use std::time::Duration;
+
+            let mut releases = Vec::new();
+            let mut receivers = Vec::new();
+            let full = loop {
+                let (release, blocked) = sync_channel::<()>(1);
+                let query: crate::fs_backend::host::ScratchVolumeQuery = Box::new(move || {
+                    let _ = blocked.recv_timeout(Duration::from_secs(60));
+                    Ok(false)
+                });
+                match enqueue_scratch_volume_query(query) {
+                    ScratchVolumeEnqueue::Queued(receiver) => {
+                        releases.push(release);
+                        receivers.push(receiver);
+                        assert!(releases.len() < 64, "queue never filled");
+                    }
+                    ScratchVolumeEnqueue::Full(_) => break true,
+                    ScratchVolumeEnqueue::Unavailable => panic!("worker unavailable"),
+                }
+            };
+            assert!(full);
+            let (done, answer) = sync_channel(1);
+            let caller = std::thread::spawn(move || {
+                done.send(scratch_volume_verdict(SCRATCH_VOLUME_WEDGE_BOUND, || {
+                    Ok(true)
+                }))
+                .unwrap();
+            });
+            // Still full: the caller must not have produced a verdict.
+            assert!(answer.recv_timeout(Duration::from_millis(200)).is_err());
+            drop(releases);
+            assert!(answer.recv_timeout(Duration::from_secs(60)).unwrap());
+            caller.join().unwrap();
+            for receiver in receivers {
+                receiver
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap()
+                    .unwrap();
+            }
         }
     }
 
