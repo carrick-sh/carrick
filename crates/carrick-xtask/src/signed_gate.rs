@@ -1065,10 +1065,15 @@ fn candidate_probes(
         archive: None,
     };
     if request.kind != RequestKind::Main && request.sha != request.base {
-        checked(
-            "git",
-            &["fetch", "--no-tags", "origin", &request.base, &request.sha],
-            Some(root),
+        fetch_with_retry(
+            || {
+                run_checked(
+                    "git",
+                    ["fetch", "--no-tags", "origin", &request.base, &request.sha],
+                    Some(root),
+                )
+            },
+            std::thread::sleep,
         )?;
         let temp = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
         let tree = temp.path().join("checkout");
@@ -1230,10 +1235,12 @@ fn execute(
             &lease,
             &run.commit,
             &run.fixture_publisher,
-            &bundle,
-            match run.side {
-                PairSide::Base => None,
-                PairSide::Candidate => candidate_probes.as_deref(),
+            FixtureSources {
+                bundle: &bundle,
+                candidate_probes: match run.side {
+                    PairSide::Base => None,
+                    PairSide::Candidate => candidate_probes.as_deref(),
+                },
             },
             &run.output,
             run.receipt_name,
@@ -1416,6 +1423,14 @@ fn write_fresh(path: &Path, data: impl AsRef<[u8]>) -> Result<(), ReceiptError> 
         .map_err(|e| fail(format!("{}: {e}", path.display())))
 }
 
+/// The fixtures one paired run restores: the base's trusted bundle and, for
+/// the candidate only, its added probes (#1980).
+#[derive(Debug, Clone, Copy)]
+struct FixtureSources<'a> {
+    bundle: &'a Path,
+    candidate_probes: Option<&'a Path>,
+}
+
 /// Build, accept and independently inspect one commit in a fresh detached
 /// worktree. The caller holds the exclusive gate lease for the whole pair.
 fn execute_one(
@@ -1423,11 +1438,14 @@ fn execute_one(
     lease: &HostLease,
     commit: &str,
     publisher: &str,
-    bundle: &Path,
-    candidate_probes: Option<&Path>,
+    fixtures: FixtureSources<'_>,
     output: &Path,
     receipt_name: &str,
 ) -> Result<(), ReceiptError> {
+    let FixtureSources {
+        bundle,
+        candidate_probes,
+    } = fixtures;
     fetch_with_retry(
         || run_checked("git", ["fetch", "--no-tags", "origin", commit], Some(root)),
         std::thread::sleep,
