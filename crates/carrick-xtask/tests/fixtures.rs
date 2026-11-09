@@ -3729,12 +3729,27 @@ fn built_row() -> serde_json::Value {
 
 /// Commit a new probe source and its inventory row on the checkout.
 fn commit_added_probe(root: &Path, name: &str, row: serde_json::Value) -> String {
+    commit_added_probe_source(
+        root,
+        name,
+        row,
+        format!("// added probe {name}\n").as_bytes(),
+    )
+}
+
+/// [`commit_added_probe`] with the probe's source text.
+fn commit_added_probe_source(
+    root: &Path,
+    name: &str,
+    row: serde_json::Value,
+    source: &[u8],
+) -> String {
     let inventory = fs::read_to_string(root.join(INVENTORY)).unwrap();
     write(root, INVENTORY, &inventory_with_row(&inventory, name, row));
     write(
         root,
         &format!("conformance-probes/src/bin/{name}.rs"),
-        format!("// added probe {name}\n").as_bytes(),
+        source,
     );
     git(root, &["add", "--", "conformance-probes"]);
     git(root, &["commit", "-qm", "add probe"]);
@@ -4173,4 +4188,110 @@ fn pr_1935_shape_is_admissible() {
         ),
         InputDifference::Other
     );
+}
+
+/// The reviewer's #1986 reproduction: the assembler reads `.incbin` files
+/// that rustc's dep-info never lists, so the dep-info admission check cannot
+/// see them. The production builder refuses such a probe before building or
+/// publishing anything; before the fix it built and published the set.
+#[test]
+fn added_probe_with_assembler_file_read_is_refused_before_building() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.repo.path();
+    // Outside every fixture input, as in the reviewer's reproduction.
+    commit(root, "unlisted-payload.bin", b"payload\n", "payload");
+    let probe = br#"#![no_main]
+core::arch::global_asm!(
+    ".pushsection .rodata", ".global review_payload", "review_payload:",
+    ".incbin \"../unlisted-payload.bin\"", ".popsection",
+);
+unsafe extern "C" {
+    static review_payload: u8;
+}
+#[unsafe(no_mangle)]
+extern "C" fn main() -> i32 {
+    unsafe { core::ptr::read_volatile(&review_payload) as i32 }
+}
+"#;
+    let sha = commit_added_probe_source(root, "incbinprobe", built_row(), probe);
+    let output = CanonicalTempDir::new();
+    match candidate_probes::build(root, &f.path, &sha, output.path()) {
+        Ok(CandidateBuild::Refused(error)) => assert!(
+            error.to_string().contains(
+                "added probe conformance-probes/src/bin/incbinprobe.rs uses `global_asm`"
+            ),
+            "{error}"
+        ),
+        other => panic!("assembler file read was not refused: {other:?}"),
+    }
+    assert_eq!(fs::read_dir(output.path()).unwrap().count(), 0);
+    assert!(!root.join(GuestTarget::Gnu.triple()).exists());
+    f.rejected("fixture input identity mismatch");
+}
+
+/// An ordinary libc-only added probe still plans a build, including one
+/// that calls `libc::link` and names a `link` variable.
+#[test]
+fn added_libc_probe_is_still_admitted() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.repo.path();
+    let probe = b"fn main() {\n    let link = c\"b\".as_ptr();\n    let _ = unsafe { libc::link(c\"a\".as_ptr(), link) };\n}\n";
+    commit_added_probe_source(root, "libcprobe", built_row(), probe);
+    commit_added_probe(root, "plainprobe", built_row());
+    let CandidateBuild::Build(plan) = candidate_probes::plan(root, &f.path).unwrap() else {
+        panic!("ordinary added probes were not planned");
+    };
+    let names: Vec<&str> = plan.probes.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["libcprobe", "plainprobe"]);
+}
+
+/// The ban's spellings: any assembly macro, any path or spacing, and the
+/// `link` attribute directly, spaced, commented or under `cfg_attr`.
+#[test]
+fn unlisted_reader_scan_refuses_assembler_and_linker_reads() {
+    for (source, token) in [
+        (r#"core::arch::asm!("nop");"#, "asm"),
+        (r#"asm !("nop");"#, "asm"),
+        (r#"use core::arch::asm as a; a!("nop");"#, "asm"),
+        (r#"core::arch::global_asm!(".incbin \"x\"");"#, "global_asm"),
+        (r#"std::arch::naked_asm!("ret")"#, "naked_asm"),
+        (r#"core::arch::r#asm!("nop");"#, "asm"),
+        (
+            r#"#[link(name = "x", kind = "static")] extern "C" {}"#,
+            "link",
+        ),
+        (r#"# [ link (name = "x")] extern "C" {}"#, "link"),
+        ("#[\n link\n(name = \"x\")] extern \"C\" {}", "link"),
+        (r#"#[/**/link/**/(name = "x")] extern "C" {}"#, "link"),
+        (
+            r#"#[cfg_attr(all(), link (name = "x"))] extern "C" {}"#,
+            "link",
+        ),
+        (r#"#![cfg_attr(unix, link_args = "x")]"#, "link_args"),
+        (
+            r#"macro_rules! m { ($a:ident) => { #[$a(name = "x")] extern "C" {} } } m!(link);"#,
+            "link",
+        ),
+    ] {
+        assert_eq!(
+            candidate_probes::unlisted_reader(source),
+            Some(token),
+            "{source}"
+        );
+    }
+    for source in [
+        r#"#[link_name = "__sigsetjmp"] fn f(); libc::link(a, b); fs::hard_link(a, b);"#,
+        r#"let link = p; libc::unlink(link); x.link(y); let wasm = 1;"#,
+        r#"// a hard link (to a symlink)"#,
+        r#"let s = concat!("a", "b"); println!("\x41");"#,
+        r#"include_bytes!("x.bin");"#,
+    ] {
+        assert_eq!(candidate_probes::unlisted_reader(source), None, "{source}");
+    }
 }

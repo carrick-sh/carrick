@@ -325,8 +325,9 @@ impl BuildPlan {
 pub enum CandidateBuild<T> {
     /// Fixture inputs equal the bundle's; the bundle serves the checkout.
     Equal,
-    /// A difference other than added probes: the receiver reports the input
-    /// identity refusal, so nothing is built (the error is that refusal).
+    /// A difference other than added probes, or an added probe that could
+    /// read unlisted files (see [`unlisted_reader`]): nothing is built, and
+    /// the receiver reports the input identity refusal (the error says why).
     Refused(super::FixturesError),
     /// The added probes to build, or the set they were built into.
     Build(T),
@@ -363,16 +364,88 @@ pub fn plan(root: &Path, base: &Path) -> Result<CandidateBuild<BuildPlan>> {
         base_inventory.as_bytes(),
         &current_inventory,
     ) {
-        InputDifference::AddedProbes(probes) => Ok(CandidateBuild::Build(BuildPlan {
-            base: manifest,
-            base_inventory,
-            probes,
-        })),
+        InputDifference::AddedProbes(probes) => {
+            for probe in &probes {
+                let text = fs::read(safe_path(root, &probe.name.source())?)?;
+                if let Some(token) = unlisted_reader(&String::from_utf8_lossy(&text)) {
+                    return Ok(CandidateBuild::Refused(fail(format!(
+                        "added probe {} uses `{token}`: assembly or link-attribute probes can \
+                         read files the compiler's dep-info does not list, so they go through a \
+                         normal fixture republish, not a candidate build",
+                        probe.name.source()
+                    ))));
+                }
+            }
+            Ok(CandidateBuild::Build(BuildPlan {
+                base: manifest,
+                base_inventory,
+                probes,
+            }))
+        }
         InputDifference::None => Ok(CandidateBuild::Equal),
         InputDifference::Other => Ok(CandidateBuild::Refused(super::identity_mismatch(
             &manifest, &current,
         )?)),
     }
+}
+
+/// The first assembly or link-attribute token in an added probe's source,
+/// or `None`.
+///
+/// [`build`] admits a compiler input only if dep-info lists it, but the
+/// assembler (`.incbin` and `.include` in `asm!`, `global_asm!` or
+/// `naked_asm!`) and the linker (`#[link(...)]`, `link_args`) read files
+/// dep-info never names. Rather than read assembly, an added probe is
+/// refused outright, failing closed on text (Rust parsing is out of reach
+/// here):
+/// - the identifiers `asm`, `global_asm` and `naked_asm` anywhere, whatever
+///   their path or `!` spacing (a `use .. as` rename still names them);
+/// - `link_args` anywhere;
+/// - the identifier `link` in attribute position: after `[` or `,` and
+///   before `(`, spacing and comments included (`#[link(`, `# [ link (`,
+///   `#[/**/link(`, `cfg_attr(.., link(..))`); and, in a source defining
+///   `macro_rules` (which can paste `link` into an attribute), any `link`
+///   that is not a path segment or method (`libc::link(`, `.link(`).
+///
+/// Files the compiler reads through `include_str!`, `include_bytes!`,
+/// `include!` or `#[path]` are in dep-info, which [`build`] checks.
+pub fn unlisted_reader(source: &str) -> Option<&'static str> {
+    let ident = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    let bytes = source.as_bytes();
+    let macros = source.contains("macro_rules");
+    let mut at = 0;
+    while at < bytes.len() {
+        if !ident(&bytes[at]) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < bytes.len() && ident(&bytes[at]) {
+            at += 1;
+        }
+        let word = &source[start..at];
+        match word {
+            "asm" => return Some("asm"),
+            "global_asm" => return Some("global_asm"),
+            "naked_asm" => return Some("naked_asm"),
+            "link_args" => return Some("link_args"),
+            "link" => {
+                let before = bytes[..start]
+                    .iter()
+                    .rev()
+                    .find(|b| !b.is_ascii_whitespace());
+                let after = bytes[at..].iter().find(|b| !b.is_ascii_whitespace());
+                let attribute = matches!(before, Some(b'[' | b',' | b'/'))
+                    && matches!(after, Some(b'(' | b'/'));
+                let path = matches!(before, Some(b':' | b'.'));
+                if attribute || (macros && !path) {
+                    return Some("link");
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Build the added probes of the checkout at `root` (exactly `sha`) with the
