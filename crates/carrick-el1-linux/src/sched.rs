@@ -137,13 +137,7 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
         self.frame.x[0] = result.raw() as u64;
         Some(Served::Returned { switched: false })
     }
-    fn wake(
-        &mut self,
-        mm: ReservationMm,
-        address: UserVa,
-        bitset: u32,
-        limit: u32,
-    ) -> Option<Served> {
+    fn wake(&mut self, mm: ReservationMm, address: UserVa, bitset: u32, limit: u32) -> Served {
         self.sched
             .wake_word(self.frame, mm.raw(), address.raw(), bitset, limit)
     }

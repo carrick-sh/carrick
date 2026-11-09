@@ -1999,6 +1999,26 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             seq,
         }
     }
+    /// Queue one detached transfer on the carrier's completion chain, which
+    /// owns it from here; [`Self::take_completion_handbacks`] rebuilds and
+    /// publishes it at the host boundary the caller must owe.
+    pub(super) fn defer_completion_handback(&self, transfer: HostTransfer<'_, C>) {
+        // Initialization has no resource dependency and cannot wait on this
+        // queue (the interruption path below makes the same call).
+        while !self.completion_handbacks.initialize() {
+            core::hint::spin_loop();
+        }
+        let id = transfer.record.id;
+        self.record(id).object.next.store(0, Ordering::Relaxed);
+        let _ = transfer;
+        self.completion_handbacks
+            .push(id.raw(), id.raw(), |previous, next| {
+                self.record(RecordId(previous))
+                    .object
+                    .next
+                    .store(next, Ordering::Release)
+            });
+    }
     /// Called at a notified host boundary, never as a periodic poll.
     pub fn take_completion_handbacks(
         &self,
@@ -2034,6 +2054,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 },
             )
         } {
+            // A woken `futex_waitv` park still has entries on its other
+            // futexes' buckets ([`ZoneTables::hand_waitv_to_host`]); no
+            // bucket lock is held here. Object waiters have none.
+            self.unlink_entries(RecordId(id), wait);
             if let Some(record) = self.completion_transfer(RecordId(id)).publish() {
                 handed(record);
             }

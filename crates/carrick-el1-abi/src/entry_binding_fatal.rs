@@ -74,6 +74,10 @@ pub enum EntryBindingFatalReason {
     /// claim was neither this slot's `OnCpu*` nor `Free` (#1100). Leaving it
     /// on no run queue would strand the thread.
     RequeueRefused = 61,
+    /// A family the ring owns declined an admitted call of a task that has
+    /// no host route (a ring-owned fork child): its forward has no server,
+    /// and a counted ENOSYS would lose the call (#1941: a lost futex wake).
+    OwnedFamilyForward = 62,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -128,6 +132,7 @@ impl EntryBindingFatalReason {
             48 => Some(Self::NativeServiceCompleteStale),
             60 => Some(Self::SwitchInStaleRoot),
             61 => Some(Self::RequeueRefused),
+            62 => Some(Self::OwnedFamilyForward),
 
             _ => None,
         }

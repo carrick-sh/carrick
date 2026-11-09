@@ -189,17 +189,15 @@ extern "C" fn carrick_progress_interrupt(
         let mut woken = [WakeRecord::Guest(
             carrick_sched_core::RecordRef::PLACEHOLDER,
         )];
-        let count = zone()
-            .wake(
-                &guard,
-                wake_mm,
-                wake_address,
-                u32::MAX,
-                1,
-                Waker::El1 { slot: SLOT },
-                &mut woken,
-            )
-            .unwrap_or_else(|_| stop(5));
+        let count = zone().wake(
+            &guard,
+            wake_mm,
+            wake_address,
+            u32::MAX,
+            1,
+            Waker::El1 { slot: SLOT },
+            &mut woken,
+        );
         // SAFETY: single fixture vCPU with IF=0; `wakes` and `scratch` have no
         // live references.
         unsafe {

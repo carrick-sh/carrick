@@ -372,26 +372,12 @@ impl<
             let Some(slot) = self.frame.slot() else {
                 self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
             };
-            let lifecycle = self.lifecycle;
-            if super::native_process_runtime::publish_terminal_notification(
+            super::native_process_runtime::publish_terminal_notification(
                 &notification,
                 zone.tables,
                 slot,
                 &carrick_sched_core::ShortLockSpin,
-                |channel| {
-                    if let Some(venue) = lifecycle {
-                        venue.wake_unplaceable_wait(channel, slot)
-                    } else {
-                        use super::aarch64_process::ForkStockCrossing;
-                        super::aarch64_process::HvcForkStockCrossing
-                            .cross_wait_channel_wake(channel, u64::from(slot.raw()))
-                    }
-                },
-            )
-            .is_err()
-            {
-                self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
-            }
+            );
         }
     }
     fn route_host_thread_exit(
@@ -638,18 +624,17 @@ impl<
         let Some(zone) = &mut self.zone else {
             return false;
         };
-        native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-            .wake_word(
-                match self.frame.arm_frame() {
-                    Some(frame) => frame,
-                    None => return false,
-                },
-                mm.raw(),
-                address.raw(),
-                carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
-                carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
-            )
-            .is_some()
+        native_scheduler(zone, task, self.counters, slot, &mut self.handoff).wake_word(
+            match self.frame.arm_frame() {
+                Some(frame) => frame,
+                None => return false,
+            },
+            mm.raw(),
+            address.raw(),
+            carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
+            carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
+        );
+        true
     }
     fn release_current(
         &mut self,

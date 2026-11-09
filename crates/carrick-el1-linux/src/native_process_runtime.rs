@@ -199,7 +199,7 @@ fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>
         .publish()
         .map_err(|_| NativeProcessError::Exhausted)?;
     let mut effects = WakeEffects::default();
-    let wake = zone.wake_placed(
+    zone.wake_placed(
         &guard,
         channel.mm,
         address,
@@ -210,13 +210,6 @@ fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>
         &mut effects,
     );
     drop(guard);
-    if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
-        return service.wake_unplaceable_wait(ProcessWaitChannel {
-            mm: carrick_el1_abi::EntryMmKey::from_raw(channel.mm),
-            address: core::num::NonZeroU64::new(address).ok_or(NativeProcessError::Quarantined)?,
-        });
-    }
-    wake.map_err(|_| NativeProcessError::Quarantined)?;
     service.wake_effects(effects);
     Ok(())
 }
@@ -548,12 +541,6 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn wake_effects(&mut self, effects: WakeEffects);
     /// A guest drain opened ingress capacity for an owned host admission.
     fn request_ingress_producer_boundary(&mut self);
-    fn wake_unplaceable_wait(
-        &mut self,
-        _channel: ProcessWaitChannel,
-    ) -> Result<(), NativeProcessError> {
-        Err(NativeProcessError::Quarantined)
-    }
     /// Plain fork copies descriptors into a graph-issued table identity.
     fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
         issued
@@ -6712,7 +6699,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.current.linux.mark_pending_host_work();
         }
         if let Some(notification) = member_notification {
-            let service = &mut self.service;
             publish_terminal_notification(
                 &notification,
                 self.source.zone,
@@ -6722,9 +6708,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     #[cfg(test)]
                     probe: self.publication_wait_probe,
                 },
-                |channel| service.wake_unplaceable_wait(channel),
-            )
-            .map_err(|_| NativeProcessError::Quarantined)?;
+            );
         }
         Ok((page, channel))
     }
@@ -6817,7 +6801,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     },
                 );
                 let mut effects = WakeEffects::default();
-                let wake = zone.wake_placed(
+                zone.wake_placed(
                     &guard,
                     self.binding.mm.raw(),
                     clear_child_tid,
@@ -6830,16 +6814,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     &mut effects,
                 );
                 drop(guard);
-                if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
-                    self.service.wake_unplaceable_wait(ProcessWaitChannel {
-                        mm: self.binding.mm,
-                        address: core::num::NonZeroU64::new(clear_child_tid)
-                            .ok_or(NativeProcessError::Quarantined)?,
-                    })?;
-                } else {
-                    wake.map_err(|_| NativeProcessError::Quarantined)?;
-                    self.service.wake_effects(effects);
-                }
+                self.service.wake_effects(effects);
                 self.control.set_clear_child_tid(0);
             }
         }
@@ -8391,19 +8366,11 @@ pub(super) fn publish_terminal_notification<C: carrick_el1_abi::EntryContext>(
     zone: &ZoneTables<C>,
     slot: carrick_el1_abi::SlotId,
     wait: &impl carrick_sched_core::ShortLockWait,
-    wake_unplaceable: impl FnOnce(ProcessWaitChannel) -> Result<(), NativeProcessError>,
-) -> Result<(), NativeProcessError> {
-    match notification.publish(zone, slot, wait) {
-        Ok(effects) => {
-            crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
-            Ok(())
-        }
-        Err(carrick_sched_core::WakeRefusal::Unplaceable) => wake_unplaceable(ProcessWaitChannel {
-            mm: notification.mm,
-            address: notification.address,
-        }),
-        Err(_) => Err(NativeProcessError::Quarantined),
-    }
+) {
+    // The wake always finishes in the ring (#1941): a waiter no slot may
+    // take now owes the host boundary its effects carry.
+    let effects = notification.publish(zone, slot, wait);
+    crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
 }
 
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
@@ -8436,8 +8403,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return;
         };
         if let Some(notification) = notification {
-            let service = &mut self.service;
-            if publish_terminal_notification(
+            publish_terminal_notification(
                 &notification,
                 self.source.zone,
                 self.source.slot,
@@ -8446,13 +8412,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     #[cfg(test)]
                     probe: self.publication_wait_probe,
                 },
-                |channel| service.wake_unplaceable_wait(channel),
-            )
-            .is_err()
-            {
-                self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
-                return;
-            }
+            );
         }
         // Reuse follows clear-child-tid publication and its wake. Replenishing
         // stock may drop the final namespace claim, so it belongs after both.
