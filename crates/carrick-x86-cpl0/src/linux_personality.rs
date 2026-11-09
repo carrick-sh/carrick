@@ -76,6 +76,19 @@ pub struct NativeDispatch<'a> {
     pub slot: Option<carrick_guest_arch::SlotId>,
     pub file_table: u64,
     pub files: &'a FileTables<'a>,
+    /// The caller's retained host-file venue; `None` keeps every call on
+    /// its existing route.
+    pub host_file: Option<HostFileVenue<'a>>,
+    /// The answer staged ahead of the crossing table, completed by the
+    /// caller on the `Forward` route.
+    pub staged: Option<carrick_personality_linux::native_host_file::HostFileStage>,
+}
+
+#[derive(Clone, Copy)]
+pub struct HostFileVenue<'a> {
+    pub task: &'a CurrentTask,
+    pub cpu_slot: u32,
+    pub origin: carrick_core_abi::service::ServiceOrigin,
 }
 
 impl SyscallFrame for NativeDispatch<'_> {
@@ -149,6 +162,15 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
             return false;
         }
         true
+    }
+
+    fn stage_native_host_file(&mut self) -> bool {
+        let Some(venue) = self.host_file else {
+            return false;
+        };
+        self.staged =
+            crate::native_host_file::stage(&self.call, venue.task, venue.cpu_slot, venue.origin);
+        self.staged.is_some()
     }
 
     fn release_host_object(
@@ -570,6 +592,65 @@ pub fn handle_user_page_fault_prepared(
     frame: &mut PageFaultStack,
     fpstate: &XsaveArea,
 ) -> u64 {
+    match supply_user_fault(prep) {
+        UserFaultSupply::Served => 0,
+        UserFaultSupply::Signal {
+            signum,
+            code,
+            address,
+        } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
+        UserFaultSupply::Unresolved(reason) => reason,
+    }
+}
+
+/// What the owner fault path made of one user access.
+pub enum UserFaultSupply {
+    /// The access is now resident; the faulting access may retry.
+    Served,
+    /// Linux refuses the access with this signal (an in-kernel user copy
+    /// answers EFAULT instead).
+    Signal {
+        signum: i32,
+        code: i32,
+        address: UserVa,
+    },
+    /// A broken boundary invariant: the #PF entry reports this reason.
+    Unresolved(u64),
+}
+
+/// Supply a syscall's staged user access through the same owner fault path
+/// as the #PF entry, so a non-resident buffer is faulted in, never EFAULT.
+fn supply_syscall_fault(
+    binding: &CpuBinding,
+    task: &CurrentTask,
+    counters: &Counters,
+    slot: carrick_sched_core::SlotId,
+    address: u64,
+    access: carrick_guest_arch::Access,
+) -> UserFaultSupply {
+    let fault = carrick_guest_arch::FaultInfo {
+        address: UserVa::new(address),
+        access,
+        // A write to a readable page is a permission (COW) fault.
+        present: access == carrick_guest_arch::Access::Write
+            && carrick_el1_linux::file::MemoryValidator::readable_bytes(
+                &carrick_el1_linux::file::HardwareValidator,
+                address,
+                1,
+            ) == 1,
+    };
+    supply_user_fault(&carrick_x86_carrier::entry::PreparedUserPageFault {
+        fault,
+        binding,
+        task,
+        counters,
+        slot,
+    })
+}
+
+fn supply_user_fault(
+    prep: &carrick_x86_carrier::entry::PreparedUserPageFault<'_>,
+) -> UserFaultSupply {
     use carrick_el1::fault::dispatch_x86_fault_with_prepared;
     let fault = prep.fault;
     let binding = prep.binding;
@@ -579,15 +660,15 @@ pub fn handle_user_page_fault_prepared(
     let mm_key = task.mm.key.load(Ordering::Acquire);
     let Some(words) = anonymous::live_words(match carrick_el1_abi::ReservationMm::new(mm_key) {
         Some(mm) => mm,
-        None => return 9,
+        None => return UserFaultSupply::Unresolved(9),
     }) else {
-        return 9;
+        return UserFaultSupply::Unresolved(9);
     };
     let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
     let Some(venues) = carrick_el1_abi::KernelFaultVenues::derive(layout)
         .and_then(carrick_el1_abi::KernelFaultVenues::require_upper_half)
     else {
-        return 7;
+        return UserFaultSupply::Unresolved(7);
     };
     // SAFETY: production KVM bootstrap maps and zero-initializes the
     // retained x86 kernel region at this typed upper-half layout.
@@ -605,7 +686,7 @@ pub fn handle_user_page_fault_prepared(
     let spaces = carrick_core::wait::space_access(zone, slot, anonymous::initial_release);
     let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
     let Some(prepared_mm) = core::num::NonZeroU64::new(mm_key) else {
-        return 9;
+        return UserFaultSupply::Unresolved(9);
     };
     // SAFETY: the shared fault owner acquires the exact-MM editor before
     // every prepared commit; InitialWords retains its mapped window.
@@ -639,24 +720,24 @@ pub fn handle_user_page_fault_prepared(
                 fault.address,
             );
         }
-        return 0;
+        return UserFaultSupply::Served;
     }
     use carrick_el1::fault::OwnerFaultSupplyOutcome;
     match supply.outcome() {
-        OwnerFaultSupplyOutcome::PolicyDeclined => deliver_page_fault_signal(
-            frame,
-            fpstate,
-            LINUX_SIGSEGV,
-            if fault.present {
+        OwnerFaultSupplyOutcome::PolicyDeclined => UserFaultSupply::Signal {
+            signum: LINUX_SIGSEGV,
+            code: if fault.present {
                 LINUX_SEGV_ACCERR
             } else {
                 LINUX_SEGV_MAPERR
             },
-            fault.address,
-        ),
+            address: fault.address,
+        },
         // This lane has no native-service birth handle, so it cannot mint
         // an owner wait. Refuse any such mismatched outcome at the boundary.
-        OwnerFaultSupplyOutcome::Wait(_) | OwnerFaultSupplyOutcome::Unavailable => 9,
+        OwnerFaultSupplyOutcome::Wait(_) | OwnerFaultSupplyOutcome::Unavailable => {
+            UserFaultSupply::Unresolved(9)
+        }
         OwnerFaultSupplyOutcome::CowSelected => {
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
@@ -685,13 +766,13 @@ pub fn handle_user_page_fault_prepared(
                 &mut cow,
             );
             if result != Action::Served || cow.completion.is_none() {
-                return 9;
+                return UserFaultSupply::Unresolved(9);
             }
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
             );
-            0
+            UserFaultSupply::Served
         }
         OwnerFaultSupplyOutcome::Selected => {
             cross_owner_grant(
@@ -699,7 +780,7 @@ pub fn handle_user_page_fault_prepared(
                 fault.address,
             );
             let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
-                return 9;
+                return UserFaultSupply::Unresolved(9);
             };
             let Some(window) = grant_slot.window() else {
                 // No physical backing for a still-authenticated file selection:
@@ -709,35 +790,33 @@ pub fn handle_user_page_fault_prepared(
                     && selected.host_backing.is_some()
                     && grant_slot.cancel_fault_selection(selected, generation)
                 {
-                    return deliver_page_fault_signal(
-                        frame,
-                        fpstate,
-                        carrick_syscall_abi::LINUX_SIGBUS,
-                        carrick_syscall_abi::LINUX_BUS_ADRERR,
-                        fault.address,
-                    );
+                    return UserFaultSupply::Signal {
+                        signum: carrick_syscall_abi::LINUX_SIGBUS,
+                        code: carrick_syscall_abi::LINUX_BUS_ADRERR,
+                        address: fault.address,
+                    };
                 }
-                return 9;
+                return UserFaultSupply::Unresolved(9);
             };
             let Some(index) = spaces.find(mm_key) else {
-                return 9;
+                return UserFaultSupply::Unresolved(9);
             };
             let Ok(mut root) =
                 roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot)
             else {
-                return 9;
+                return UserFaultSupply::Unresolved(9);
             };
             let Ok(target) = carrick_core::mm::frames::grant_target_in(
                 match portal.carrier() {
                     Some(carrier) => carrier,
-                    None => return 9,
+                    None => return UserFaultSupply::Unresolved(9),
                 },
                 &window,
                 spaces,
                 binding.cpu_slot,
                 &mut root,
             ) else {
-                return 9;
+                return UserFaultSupply::Unresolved(9);
             };
             let receipt = carrick_core::mm::frames::apply_grant::<
                 carrick_mmu_core::x86::owner_mmu::X86Mmu,
@@ -754,7 +833,11 @@ pub fn handle_user_page_fault_prepared(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
             );
-            if applied { 0 } else { 9 }
+            if applied {
+                UserFaultSupply::Served
+            } else {
+                UserFaultSupply::Unresolved(9)
+            }
         }
     }
 }
@@ -997,6 +1080,11 @@ impl Personality for LinuxPersonality {
                     &mut service,
                 )
                 .unwrap_or_else(|_| fatal_boot());
+            let origin = if process.is_root_process() {
+                carrick_core_abi::service::ServiceOrigin::Initial
+            } else {
+                carrick_core_abi::service::ServiceOrigin::Descendant
+            };
             let mut native = NativeDispatch {
                 frame,
                 fpstate: early_xstate,
@@ -1005,6 +1093,12 @@ impl Personality for LinuxPersonality {
                 slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
                 file_table,
                 files: &files,
+                host_file: Some(HostFileVenue {
+                    task,
+                    cpu_slot: binding.cpu_slot,
+                    origin,
+                }),
+                staged: None,
             };
             let mut route = dispatch_syscall_with_native(
                 &mut native,
@@ -1029,6 +1123,7 @@ impl Personality for LinuxPersonality {
                 anonymous.as_mut().map(|venue| venue as &mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue),
                 cache_lookup,
             );
+            let staged = native.staged.take();
             if route == CompletionRoute::NativeService
                 && call.canonical.raw() == carrick_personality_linux::crossing::nr::GETRANDOM.raw()
             {
@@ -1048,17 +1143,11 @@ impl Personality for LinuxPersonality {
                     _ => fatal_boot(),
                 };
             }
+            // Staged ahead of the crossing table by the dispatch owner, so a
+            // call the strict x86 set refuses (writev) still reaches the
+            // retained host-file venue, as ARM stages ahead of its route.
             if route == CompletionRoute::Forward
-                && let Some(stage) = crate::native_host_file::stage(
-                    &call,
-                    task,
-                    binding.cpu_slot,
-                    if process.is_root_process() {
-                        carrick_core_abi::service::ServiceOrigin::Initial
-                    } else {
-                        carrick_core_abi::service::ServiceOrigin::Descendant
-                    },
-                )
+                && let Some(stage) = staged
             {
                 use carrick_el1_linux::native_process_runtime::{NativeResume, NativeServiceCall};
                 // SAFETY: the admitted CPU binding retains the initialized counter
@@ -1066,6 +1155,7 @@ impl Personality for LinuxPersonality {
                 let counters: &'static Counters =
                     unsafe { &*(binding.counters_address as *const Counters) };
                 use carrick_personality_linux::native_host_file::HostFileStage;
+                let mut retry = false;
                 let result = match stage {
                     HostFileStage::Request {
                         record,
@@ -1108,27 +1198,39 @@ impl Personality for LinuxPersonality {
                             },
                         )
                     }
-                    // CPL0 has no syscall-retry fault supply (ARM re-enters the
-                    // owner fault selector, then retries the SVC). The kernel
-                    // copy ran under the user fault gate, so the buffer is
-                    // not resident: answer EFAULT, never a counted ENOSYS.
-                    HostFileStage::Fault { .. } => {
-                        Some(carrick_syscall_abi::LINUX_EFAULT.guest_retval())
+                    // Staging made no descriptor/IPC effect. Feed the exact
+                    // access through the owner fault path #PF entry uses, then
+                    // retry the same syscall, as ARM re-enters its SVC. Only a
+                    // refused access (no mapping, wrong protection, backing
+                    // past EOF) answers EFAULT, as Linux's user copy does.
+                    HostFileStage::Fault { address, access } => {
+                        match supply_syscall_fault(binding, task, counters, slot, address, access) {
+                            UserFaultSupply::Served => {
+                                retry = true;
+                                None
+                            }
+                            UserFaultSupply::Signal { .. } => {
+                                Some(carrick_syscall_abi::LINUX_EFAULT.guest_retval())
+                            }
+                            UserFaultSupply::Unresolved(_) => fatal_error(frame),
+                        }
                     }
                     HostFileStage::InRing => {
                         counters.record_refusal(
                             carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
-                            if process.is_root_process() {
-                                carrick_core_abi::service::ServiceOrigin::Initial
-                            } else {
-                                carrick_core_abi::service::ServiceOrigin::Descendant
-                            },
+                            origin,
                             carrick_el1_abi::RefusalVenue::Ring,
                         );
                         Some(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
                     }
                 };
-                route = if let Some(result) = result {
+                route = if retry {
+                    // Rewind to the `syscall` instruction with the original
+                    // number, exactly as a restarted call re-enters.
+                    frame.rax = call.native.raw();
+                    frame.rcx = frame.rcx.checked_sub(2).unwrap_or_else(|| fatal_boot());
+                    CompletionRoute::Served
+                } else if let Some(result) = result {
                     frame.rax = result as u64;
                     CompletionRoute::Served
                 } else {

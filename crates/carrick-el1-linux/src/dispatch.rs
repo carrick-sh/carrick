@@ -69,6 +69,11 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn preflight_host_crossing(&mut self, _ordinal: u64) -> bool {
         true
     }
+    /// Stage an unserved call on the venue's retained host-file owner ahead
+    /// of the crossing table. ARM stages after its `Forward` route instead.
+    fn stage_native_host_file(&mut self) -> bool {
+        false
+    }
     fn release_host_object(
         &mut self,
         _binding: carrick_el1_abi::HostObjectBinding,
@@ -2993,6 +2998,9 @@ impl<
     }
     fn preflight_host_crossing(&mut self, ordinal: u64) -> bool {
         self.frame.preflight_host_crossing(ordinal)
+    }
+    fn stage_native_host_file(&mut self) -> bool {
+        self.frame.stage_native_host_file()
     }
     fn record_refusal(&self, bucket: usize) {
         self.counters.record_refusal(

@@ -1125,6 +1125,8 @@ impl Personality for FixturePersonality {
                         slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
                         file_table,
                         files: &files,
+                        host_file: None,
+                        staged: None,
                     };
                     let route = match production_boundary(
                         carrick_el1_linux::dispatch::dispatch_syscall_with_lifecycle(
