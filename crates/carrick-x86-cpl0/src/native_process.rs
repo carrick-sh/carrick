@@ -71,6 +71,40 @@ pub(super) fn inject_caught_signal_on_park(
         .map(|record| source.zone.record_ref(record))
         .unwrap_or_else(|| fatal());
     let binding = carrick_el1_linux::common_entry::execution_binding(task);
+    if !inject_caught_signal(source, task, record, binding) {
+        fatal()
+    }
+}
+
+/// Test-image-only: publish a caught SIGUSR1 to `record` (bound to `binding`)
+/// once it has parked, through the production ingress owner. False while it
+/// has not parked yet.
+#[cfg(feature = "test-support")]
+pub(super) fn inject_caught_signal_once_parked(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    task: &'static CurrentTask,
+    record: carrick_sched_core::RecordRef,
+    binding: carrick_core_abi::ExecutionBinding,
+) -> bool {
+    if !matches!(
+        source.zone.record(record.id).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ) {
+        return false;
+    }
+    if !inject_caught_signal(source, task, record, binding) {
+        fatal()
+    }
+    true
+}
+
+#[cfg(feature = "test-support")]
+fn inject_caught_signal(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    task: &'static CurrentTask,
+    record: carrick_sched_core::RecordRef,
+    binding: carrick_core_abi::ExecutionBinding,
+) -> bool {
     let event = carrick_el1_abi::ExternalSignalRecord::new(
         carrick_core_abi::EntryEventIdentity::from_binding(binding),
         binding,
@@ -81,12 +115,9 @@ pub(super) fn inject_caught_signal_on_park(
         carrick_el1_abi::ExternalSignalSource::InZoneIpc,
     );
     let mut service = Service::new(task, source.slot);
-    if !REGISTRY
+    REGISTRY
         .admit_external_event(source.zone, event, source.slot, &mut service)
         .unwrap_or_else(|_| fatal())
-    {
-        fatal()
-    }
 }
 pub(super) fn drain_external_ingress(
     source: BornInZoneSource<'static, ParkedContextWords>,
@@ -836,7 +867,22 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        #[cfg(feature = "test-support")]
+        if crate::test_support::take_owned_copy_busy() {
+            return Err(NativeProcessError::Busy);
+        }
         self.copy_user_bytes(mm, address, bytes)
+    }
+    /// Test images can lag one read of the production counter.
+    #[cfg(feature = "test-support")]
+    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
+        use carrick_guest_arch::InterruptBackend;
+        if crate::test_support::signal_clock_read_lags() {
+            return Ok(carrick_guest_arch::CounterTick::new(0));
+        }
+        carrick_el1::isa::signal_clock()
+            .counter()
+            .map_err(|_| NativeProcessError::Unsupported)
     }
     fn quarantine_prepared(&mut self, p: Prepared) {
         core::mem::forget(p);

@@ -174,3 +174,34 @@ fn try_run_program_with_dispatcher_image(
     configure(&mut carrier);
     carrick_runtime::prepare::try_run_prepared_kvm_pool(carrier, root, dispatcher, max_exits)
 }
+
+/// Assemble one `tests/fixtures` guest source into a static ELF.
+#[allow(dead_code)]
+pub fn assemble_fixture(name: &str, flags: &[&str]) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let output = dir.path().join("guest");
+    let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let compiled = std::process::Command::new("timeout")
+        .args([
+            "10",
+            "cc",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+        ])
+        .args(flags)
+        .arg(source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("assemble native witness");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    std::fs::read(output).expect("fixture ELF")
+}
