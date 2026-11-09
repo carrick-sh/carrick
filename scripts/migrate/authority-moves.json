@@ -2,6 +2,16 @@
   "schema": 1,
   "authority_debt": [
     {
+      "from": "carrick_kernel::dispatch::fs::attr::FsView<'a>::set_fd_times",
+      "to": "carrick_kernel::dispatch::fs::attr::FsView<'a>::set_description_times",
+      "issue": 1335
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::FsView<'a>::ftruncate",
+      "to": "carrick_kernel::dispatch::fs::FsView<'a>::truncate_description",
+      "issue": 1335
+    },
+    {
       "from": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_at_path_string",
       "to": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_with_sink",
       "issue": 1335
