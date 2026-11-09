@@ -10425,15 +10425,46 @@ fn serial_host_missing_terminal_continuation_finishes_exit_owner() {
 /// Unlike a host clone, reset_for_birth leaves the host-only birth words empty.
 #[cfg(test)]
 fn abi_born_sibling(kernel: &Arc<Kernel>, parent: &KernelContext) -> KernelContext {
+    abi_born_sibling_adopting(kernel, parent, None)
+}
+
+/// First-entry adoption script: receives the executor's `before_publish`.
+#[cfg(test)]
+type BirthAdoptionScript = Arc<
+    dyn Fn(ThreadKey, &mut dyn FnMut() -> Result<(), String>) -> Result<(), String> + Send + Sync,
+>;
+
+#[cfg(test)]
+fn abi_born_sibling_adopting(
+    kernel: &Arc<Kernel>,
+    parent: &KernelContext,
+    adopt: Option<BirthAdoptionScript>,
+) -> KernelContext {
     use carrick_el1_abi::Lifecycle;
     use carrick_kernel::kernel::thread_adoption::{
         ThreadBirthAdoptionFactory, ThreadBirthAdoptionReservation,
     };
-    #[derive(Debug)]
-    struct BirthCapacity(carrick_kernel::kernel::TaskKey);
+    struct BirthCapacity(carrick_kernel::kernel::TaskKey, Option<BirthAdoptionScript>);
+    impl std::fmt::Debug for BirthCapacity {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("BirthCapacity").field(&self.0).finish()
+        }
+    }
     impl ThreadBirthAdoptionFactory for BirthCapacity {
         fn executable_births(&self) -> bool {
             true
+        }
+        fn adopt_first_host_entry(
+            &self,
+            context: &KernelContext,
+            _reservation: ThreadBirthAdoptionReservation,
+            _frame: &carrick_el1_abi::ThreadCtx,
+            before_publish: &mut dyn FnMut() -> Result<(), String>,
+        ) -> Result<(), String> {
+            match &self.1 {
+                Some(script) => script(context.thread().key(), before_publish),
+                None => Err("execution lane has no born-thread adoption binding".into()),
+            }
         }
         fn owner(&self) -> carrick_kernel::kernel::TaskKey {
             self.0
@@ -10444,7 +10475,7 @@ fn abi_born_sibling(kernel: &Arc<Kernel>, parent: &KernelContext) -> KernelConte
     }
     parent
         .task()
-        .install_thread_adoption_factory(Arc::new(BirthCapacity(parent.task().key())))
+        .install_thread_adoption_factory(Arc::new(BirthCapacity(parent.task().key(), adopt)))
         .unwrap();
     // The first host clone replenishes executable ABI birth capacity. Hardware
     // adoption is scripted by FakeFactory; birth and graph publication are real.
@@ -10674,6 +10705,125 @@ fn host_birth_without_a_host_thread_fails_closed_not_dropped() {
         matches!(outcome, Err(super::NextError::Fatal(ref why)) if why.contains("no host thread")),
         "a host birth with no host thread must fail closed"
     );
+}
+
+/// Which executor path hands a first entry to `adopt_born_record`.
+#[derive(Clone, Copy, Debug)]
+enum FirstEntryArm {
+    /// `take_pending_adoption`: the executor owes the thread it took off its vCPU.
+    PendingAdoption,
+    /// `take_service_head_for_executor` returned `ServiceHead::FirstEntry`.
+    ServiceHead,
+}
+
+/// Drive `probe_zone_runnable` down one first-entry arm with a factory that
+/// publishes through the production `publish_after_retirement`, and return
+/// the ordering the shared observer saw. Only one of the two arms emits
+/// `ExecutorTaken`, so the observation must not depend on it.
+fn first_entry_order(
+    arm: FirstEntryArm,
+    id: i32,
+) -> (
+    Result<usize, carrick_kernel::el1_zone::first_entry_test_control::OrderError>,
+    bool,
+) {
+    use carrick_kernel::el1_zone::first_entry_test_control::{
+        self as control, RetireBeforePublish,
+    };
+    let (kernel, root) = bootstrap(id);
+    root.thread().set_affinity(CpuAffinity::all(1));
+    let published = Arc::new(AtomicBool::new(false));
+    let script: BirthAdoptionScript = {
+        let published = Arc::clone(&published);
+        Arc::new(move |key, before_publish| {
+            super::super::thread_adoption::publish_after_retirement(key, before_publish, || {
+                published.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .map_err(|error| error.to_string())
+        })
+    };
+    let sibling = abi_born_sibling_adopting(&kernel, &root, Some(script));
+    let key = sibling.thread().key();
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    // SAFETY: TestEl1Region owns aligned, zeroed ABI storage for this test.
+    let zone: &'static carrick_el1_abi::ZoneTables = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<carrick_el1_abi::ZoneTables>()
+    };
+    let identity = carrick_el1_abi::ThreadIdentity {
+        tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+        serial: key.serial.raw(),
+        mm: sibling.shared().mm().id().raw(),
+        file_table: sibling.resources().files().id().raw(),
+        generation: 0,
+        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+        affinity: 1,
+        lifecycle_page: 1,
+        control_slot: 1,
+    };
+    let slot = carrick_sched_core::SlotId::new(0);
+    let record = match arm {
+        FirstEntryArm::PendingAdoption => {
+            let record = zone.record_ref(zone.alloc_host_runnable(identity).unwrap());
+            crate::vcpu_loop::zone::owe_adoption(record);
+            record
+        }
+        FirstEntryArm::ServiceHead => {
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, identity.mm, None, 0);
+            zone.enter_guest(slot);
+            let space = zone
+                .spaces
+                .publish_closed(identity.mm, 0x1000, 0x1000)
+                .unwrap();
+            zone.spaces.open(space);
+            zone.install_space(slot, identity.mm).unwrap();
+            let id = zone.alloc_record(identity).unwrap();
+            assert!(zone.requeue_preempted(slot, id).is_queued());
+            zone.record_ref(id)
+        }
+    };
+    assert!(zone.record(record.id).needs_host_first_entry());
+    let observed = Arc::new(parking_lot::Mutex::new(RetireBeforePublish::default()));
+    let subscription = {
+        let observed = Arc::clone(&observed);
+        control::subscribe(Arc::new(move |event| observed.lock().observe(event)))
+    };
+    let registration = scheduler
+        .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+        .unwrap();
+    carrick_kernel::el1_zone::with_test_zone(zone, || {
+        super::probe_zone_runnable(&scheduler, zone, slot, &registration)
+            .unwrap_or_else(|_| panic!("{arm:?}: first-entry probe failed"));
+    });
+    drop(subscription);
+    scheduler.unregister_executor(&registration).unwrap();
+    assert!(
+        zone.live(record).is_none(),
+        "{arm:?}: the old first-entry record must be retired"
+    );
+    let verdict = observed.lock().verdict();
+    (verdict, published.load(Ordering::SeqCst))
+}
+
+/// #1572: retire the stopped birth before the successor is runnable, on
+/// every path that adopts a first entry, and observe it on each.
+#[test]
+fn serial_host_pending_adoption_first_entry_retires_before_publication() {
+    let (verdict, published) = first_entry_order(FirstEntryArm::PendingAdoption, 19_940);
+    assert!(published, "pending-adoption arm never published");
+    assert_eq!(verdict, Ok(1));
+}
+
+#[test]
+fn serial_host_service_head_first_entry_retires_before_publication() {
+    let (verdict, published) = first_entry_order(FirstEntryArm::ServiceHead, 19_941);
+    assert!(published, "service-head arm never published");
+    assert_eq!(verdict, Ok(1));
 }
 
 #[test]

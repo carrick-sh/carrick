@@ -3751,36 +3751,20 @@ fn el1_metadata_allocator_grows_and_returns_extents() {
 
 /// Observe the real host publication while all allocator participants live.
 /// A successor must be able to rehome without the old activation blocking it.
+/// Both first-entry paths (pending adoption and the service head) retire
+/// through one closure, so the witness orders `ThreadRetired(key)` before
+/// `BeforePublish(key)` per thread rather than relying on `ExecutorTaken`,
+/// which only the service-head path emits. A publication whose retirement was
+/// never observed is a separate failure from a late retirement.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn el1_first_entry_retires_before_host_publication() {
-    use carrick_kernel::el1_zone::first_entry_test_control::{self, Event};
+    use carrick_kernel::el1_zone::first_entry_test_control::{self, RetireBeforePublish};
     let _guard = common::guest_lock();
-    let observed = std::sync::Arc::new(std::sync::Mutex::new((0, Vec::new(), Vec::new())));
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(RetireBeforePublish::default()));
     let observations = observed.clone();
     let _subscription = first_entry_test_control::subscribe(std::sync::Arc::new(move |event| {
-        let mut observed = observations.lock().unwrap();
-        if let Event::ExecutorTaken(record) = event {
-            let key = carrick_kernel::el1_zone::thread_key_of(record).unwrap();
-            observed.2.push((key, record));
-        }
-        if let Event::BeforePublish(key) = event {
-            let record = observed
-                .2
-                .iter()
-                .rev()
-                .find_map(|(candidate, record)| (*candidate == key).then_some(*record));
-            observed.0 += 1;
-            let claim = record.and_then(|record| {
-                carrick_el1_abi::zone_tables()
-                    .unwrap()
-                    .live(record)
-                    .map(|rec| rec.claim())
-            });
-            if claim.is_some() || record.is_none() {
-                observed.1.push((record, claim));
-            }
-        }
+        observations.lock().unwrap().observe(event);
     }));
     let carrier = carrier_or_fail();
     let measured = run_fixture(
@@ -3788,15 +3772,13 @@ fn el1_first_entry_retires_before_host_publication() {
         &["metadata-allocator", "concurrent"],
         Duration::from_secs(30),
     );
-    let observed = observed.lock().unwrap();
+    let verdict = observed.lock().unwrap().verdict();
+    let published = verdict.unwrap_or_else(|error| {
+        panic!("first-entry retirement ordering: {error:?}");
+    });
     assert!(
-        observed.0 > 0,
+        published > 0,
         "must reach real host first-entry publication"
-    );
-    assert!(
-        observed.1.is_empty(),
-        "runnable publication preceded old first-entry retirement: {:?}",
-        observed.1
     );
     assert!(measured.result.success(), "{}", describe(&measured));
 }

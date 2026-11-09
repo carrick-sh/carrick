@@ -139,7 +139,7 @@ pub(crate) fn take_pending_adoption() -> Option<RecordRef> {
     PENDING_ADOPTION.with(std::cell::Cell::take)
 }
 
-fn owe_adoption(record: RecordRef) {
+pub(crate) fn owe_adoption(record: RecordRef) {
     if let Some(previous) = PENDING_ADOPTION.with(|cell| cell.replace(Some(record))) {
         // One exit takes at most one thread off the vCPU, and the executor
         // claims it before its next run: a second is a protocol violation.

@@ -1410,6 +1410,10 @@ pub mod first_entry_test_control {
         BeforePublish(crate::kernel::ThreadKey),
         BeforeRetire(RecordRef),
         Retired(RecordRef),
+        /// Every first-entry adoption path retires through one closure; this
+        /// names the adopted thread, which `Retired` cannot once the record
+        /// is freed.
+        ThreadRetired(crate::kernel::ThreadKey),
         NextFatal,
     }
 
@@ -1437,6 +1441,98 @@ pub mod first_entry_test_control {
         let observer = OBSERVER.read().clone();
         if let Some(observer) = observer {
             observer(event);
+        }
+    }
+
+    /// Why a first-entry publication was not preceded by its retirement.
+    /// The two cases are distinct verdicts: one is the defect, the other an
+    /// incomplete observation that must never read as success.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum OrderError {
+        /// The old activation was retired only after runnable publication.
+        PublishedBeforeRetired(crate::kernel::ThreadKey),
+        /// No retirement was ever observed for a published thread.
+        RetirementUnobserved(crate::kernel::ThreadKey),
+    }
+
+    /// Per-thread ordering of [`Event::ThreadRetired`] before
+    /// [`Event::BeforePublish`], independent of which executor path took the
+    /// first entry.
+    #[derive(Debug, Default)]
+    pub struct RetireBeforePublish {
+        log: Vec<(crate::kernel::ThreadKey, bool)>,
+    }
+
+    impl RetireBeforePublish {
+        pub fn observe(&mut self, event: Event) {
+            match event {
+                Event::ThreadRetired(key) => self.log.push((key, false)),
+                Event::BeforePublish(key) => self.log.push((key, true)),
+                _ => {}
+            }
+        }
+
+        /// The number of publications checked, or the first violation.
+        pub fn verdict(&self) -> Result<usize, OrderError> {
+            let mut published = 0;
+            for (index, &(key, is_publish)) in self.log.iter().enumerate() {
+                if !is_publish {
+                    continue;
+                }
+                let retired = |entries: &[(crate::kernel::ThreadKey, bool)]| {
+                    entries.iter().any(|&(k, p)| k == key && !p)
+                };
+                if retired(&self.log[..index]) {
+                    published += 1;
+                } else if retired(&self.log[index..]) {
+                    return Err(OrderError::PublishedBeforeRetired(key));
+                } else {
+                    return Err(OrderError::RetirementUnobserved(key));
+                }
+            }
+            Ok(published)
+        }
+    }
+
+    #[cfg(test)]
+    mod order_tests {
+        use super::*;
+
+        fn key(tid: i32) -> crate::kernel::ThreadKey {
+            crate::kernel::ThreadKey::from_zone_identity(tid, std::num::NonZeroU64::new(1).unwrap())
+                .unwrap()
+        }
+
+        #[test]
+        fn retirement_before_publication_is_accepted_per_thread() {
+            let mut order = RetireBeforePublish::default();
+            order.observe(Event::ThreadRetired(key(10)));
+            order.observe(Event::BeforePublish(key(10)));
+            order.observe(Event::ThreadRetired(key(11)));
+            order.observe(Event::BeforePublish(key(11)));
+            assert_eq!(order.verdict(), Ok(2));
+        }
+
+        #[test]
+        fn publication_before_retirement_is_a_violation() {
+            let mut order = RetireBeforePublish::default();
+            order.observe(Event::BeforePublish(key(10)));
+            order.observe(Event::ThreadRetired(key(10)));
+            assert_eq!(
+                order.verdict(),
+                Err(OrderError::PublishedBeforeRetired(key(10)))
+            );
+        }
+
+        #[test]
+        fn another_threads_retirement_does_not_cover_a_publication() {
+            let mut order = RetireBeforePublish::default();
+            order.observe(Event::ThreadRetired(key(11)));
+            order.observe(Event::BeforePublish(key(10)));
+            assert_eq!(
+                order.verdict(),
+                Err(OrderError::RetirementUnobserved(key(10)))
+            );
         }
     }
 
