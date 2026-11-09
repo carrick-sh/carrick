@@ -379,14 +379,8 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     /// Send the same targeted SGIs and program the same queue timer as futex
     /// wakes. No object lock is held and no successful I/O result is forged.
     pub fn finish_object_wake(&mut self, effects: WakeEffects) {
-        self.send_sgis(&effects);
-        if effects.queued_own {
-            self.zone.note_queued_since(self.slot, self.cpu.now());
-            self.program_timer(true);
-        }
-        if effects.owes_host_boundary() {
-            self.task.linux.mark_pending_host_work();
-        }
+        let (zone, slot) = (self.zone, self.slot);
+        effects.apply(zone, slot, carrick_sched_core::WakerQueue::Unobserved, self);
     }
 }
 

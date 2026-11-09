@@ -4,7 +4,10 @@ use carrick_el1_abi::{
     GIC_SPURIOUS_INTID, GIC_VTIMER_INTID, RecordId, SlotId, ThreadIdentity, TrapFrame, Waker,
     ZoneTables,
 };
-use carrick_sched_core::{IDLE_SPIN_NS, PREEMPT_SLICE_NS, ShortLockSpin, SwitchedIn, WakeEffects};
+use carrick_sched_core::{
+    IDLE_SPIN_NS, PREEMPT_SLICE_NS, ShortLockSpin, SwitchedIn, WakeEffects, WakeMechanics,
+    WakerQueue,
+};
 use core::sync::atomic::Ordering;
 
 /// The earliest the virtual timer is armed from now: a deadline that could
@@ -343,7 +346,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         count: u32,
     ) -> Served {
         let (zone, slot) = (self.zone, self.slot);
-        let was_empty = zone.slot(slot).queued() == 0;
+        let before = WakerQueue::observe(zone, slot);
         let guard = zone.short_lock(
             ZoneTables::bucket_of_with_context(mm, uaddr),
             &ShortLockSpin,
@@ -360,19 +363,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             &mut effects,
         );
         drop(guard);
-        self.send_sgis(&effects);
-        if effects.queued_own && was_empty {
-            zone.note_queued_since(slot, self.cpu.now());
-        }
-        if effects.owes_host_boundary() {
-            // A woken thread sits here but may not run here, or a waitv
-            // waiter is on the completion chain: the exit this causes hands
-            // it to the host, which places or resumes it.
-            self.task.linux.mark_pending_host_work();
-        }
-        if effects.queued_own {
-            self.program_timer(true);
-        }
+        effects.apply(zone, slot, before, self);
         frame.x[0] = u64::from(n);
         Served::Returned { switched: false }
     }
@@ -1156,14 +1147,30 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     // Out of line: the interrupt frame is charged on every EL1 resume chain.
     #[inline(never)]
     fn send_sgis(&mut self, effects: &WakeEffects) {
-        for slot in effects.sgi_slots() {
-            let target = self.zone.slot(slot).sgi_target();
-            if target == 0 {
-                continue;
-            }
-            self.cpu.send_resched(slot, target);
-            self.zone.counters.el1_sgis.fetch_add(1, Ordering::Relaxed);
+        effects.send_kicks(self.zone, self);
+    }
+}
+
+/// ARM's mechanics for the one shared wake-effect applier
+/// ([`WakeEffects::apply`]): SGIs through the slot's published route, the
+/// virtual counter, the slice timer and the task's host-work doorbell.
+impl<C: ThreadCpu, U: UserWord> WakeMechanics for Sched<'_, C, U> {
+    fn send_resched(&mut self, slot: SlotId) -> bool {
+        let target = self.zone.slot(slot).sgi_target();
+        if target == 0 {
+            return false;
         }
+        self.cpu.send_resched(slot, target);
+        true
+    }
+    fn queue_tick(&self) -> u64 {
+        self.cpu.now()
+    }
+    fn arm_slice_timer(&mut self) {
+        self.program_timer(true);
+    }
+    fn mark_pending_host_work(&mut self) {
+        self.task.linux.mark_pending_host_work();
     }
 }
 

@@ -19,7 +19,8 @@ use carrick_personality_linux::{
     thread::LifecycleThread,
 };
 use carrick_sched_core::{
-    BoundedSpin, Claim, RecordRef, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
+    BoundedSpin, Claim, RecordRef, SlotId, ThreadIdentity, WakeEffects, Waker, WakerQueue,
+    ZoneTables,
 };
 use core::sync::atomic::{AtomicU16, Ordering};
 #[cfg(target_os = "none")]
@@ -764,6 +765,8 @@ impl NativeLane<'_> {
     /// A futex wake always finishes in the ring (#1941): the bucket lock is
     /// short, and [`ZoneTables::wake_placed`] never refuses an EL1 waker.
     fn wake_word(&mut self, mm: u64, address: u64, mask: u32, limit: u32) {
+        let (zone, slot) = (self.zone, self.lane.slot);
+        let before = WakerQueue::observe(zone, slot);
         let guard = self.zone.short_lock(
             ZoneTables::bucket_of(mm, address),
             &carrick_sched_core::ShortLockSpin,
@@ -781,6 +784,8 @@ impl NativeLane<'_> {
             &mut [],
             &mut effects,
         );
+        drop(guard);
+        effects.apply(zone, slot, before, self);
         self.frame.rax = u64::from(count);
         self.lane.wakes += u64::from(count);
     }
@@ -1375,6 +1380,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         {
             return None;
         }
+        let before = WakerQueue::observe(self.zone, self.lane.slot);
         let guard = committed(
             crate::process::child_exit().lock(self.zone),
             LifecycleInvariant::ExitPublication,
@@ -1407,6 +1413,8 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             self.lane.wakes += u64::from(count);
         }
         drop(guard);
+        let (zone, slot) = (self.zone, self.lane.slot);
+        effects.apply(zone, slot, before, self);
         let record = committed(
             self.zone.slot(self.lane.slot).current(),
             LifecycleInvariant::ExitRecord,
@@ -1432,6 +1440,43 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         ))
     }
 }
+/// x86's mechanics for the one shared wake-effect applier
+/// ([`WakeEffects::apply`]), the lane's half of #1941's single lane.
+impl carrick_sched_core::WakeMechanics for NativeLane<'_> {
+    /// x86 routes a reschedule by slot through its published APIC route
+    /// (`HardwareCpu::send_resched`); it has no per-slot SGI word.
+    fn send_resched(&mut self, slot: SlotId) -> bool {
+        #[cfg(target_os = "none")]
+        {
+            use carrick_el1::substrate::sched::ThreadCpu;
+            carrick_el1::substrate::sched::hw::HardwareCpu.send_resched(slot, 0);
+        }
+        #[cfg(not(target_os = "none"))]
+        let _ = slot;
+        true
+    }
+    fn queue_tick(&self) -> u64 {
+        #[cfg(target_os = "none")]
+        {
+            use carrick_el1::substrate::sched::ThreadCpu;
+            carrick_el1::substrate::sched::hw::HardwareCpu.now()
+        }
+        #[cfg(not(target_os = "none"))]
+        0
+    }
+    /// x86 CPL0 has no run-queue slice timer (its timer vector serves
+    /// signal timers only): a thread queued on the waker's own slot is a
+    /// reschedule kick to that slot, as the production process owner's
+    /// `wake_effects` does (`carrick-x86-cpl0/src/native_process.rs`).
+    fn arm_slice_timer(&mut self) {
+        let slot = self.lane.slot;
+        carrick_sched_core::WakeMechanics::send_resched(self, slot);
+    }
+    fn mark_pending_host_work(&mut self) {
+        self.task.linux.mark_pending_host_work();
+    }
+}
+
 impl FutexVenue for NativeLane<'_> {
     type Served = carrick_core::Served;
     fn mm(&self) -> Option<carrick_core_abi::ReservationMm> {
