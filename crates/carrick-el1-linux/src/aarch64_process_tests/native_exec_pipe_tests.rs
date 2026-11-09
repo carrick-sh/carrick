@@ -97,6 +97,11 @@ enum SleepCase {
     /// SIGINT pending at entry and the rem copy Busy once: the output and
     /// EINTR stay retained across carrier work, then are written.
     PendingSignalBusyRemainder,
+    /// SIGINT pending at entry and the rem copy waits on the mm owner once
+    /// (the child's page-table gate is raised): the caller parks on the
+    /// owner, the EINTR answer and its rem bytes stay retained across that
+    /// park, and the gate's release reruns the copy.
+    PendingSignalOwnerWaitRemainder,
     /// Woken before the deadline; the clock passes it between the sleep's
     /// clock read and any later read. It re-parks and returns 0, never EAGAIN.
     DeadlineCrossesChecks,
@@ -241,6 +246,19 @@ fn serial_host_native_child_nanosleep_eintr_retains_a_busy_remainder() {
         true,
         Some(TimerDeparture::Nanosleep(
             SleepCase::PendingSignalBusyRemainder,
+        )),
+    );
+}
+
+#[test]
+fn serial_host_native_child_nanosleep_eintr_retains_an_owner_wait_remainder() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        false,
+        true,
+        Some(TimerDeparture::Nanosleep(
+            SleepCase::PendingSignalOwnerWaitRemainder,
         )),
     );
 }
@@ -1799,6 +1817,7 @@ fn child_futex<'a>(
             | SleepCase::PendingSignal
             | SleepCase::PendingSignalLazyRemainder
             | SleepCase::PendingSignalBusyRemainder
+            | SleepCase::PendingSignalOwnerWaitRemainder
             | SleepCase::RacedPublication
             | SleepCase::DeadlineCrossesChecks
             | SleepCase::SignalBetweenChecks => {
@@ -1829,6 +1848,7 @@ fn child_futex<'a>(
             SleepCase::PendingSignal
                 | SleepCase::PendingSignalLazyRemainder
                 | SleepCase::PendingSignalBusyRemainder
+                | SleepCase::PendingSignalOwnerWaitRemainder
         );
         if pending_signal {
             assert!(
@@ -1848,6 +1868,23 @@ fn child_futex<'a>(
             }
             SleepCase::PendingSignalBusyRemainder => {
                 fail_signal_copies(&[NativeProcessError::Busy]);
+            }
+            // The child's page-table gate is raised, so the rem copy's
+            // OwnerWait is a live wait on this exact mm's notification.
+            SleepCase::PendingSignalOwnerWaitRemainder => {
+                let observed = space
+                    .notifications(handle.incarnation())
+                    .unwrap()
+                    .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+                access.raise(space.index());
+                // SAFETY: this exact live successor owner retains its raised gate.
+                fail_signal_copies(&[NativeProcessError::OwnerWait(unsafe {
+                    carrick_core_abi::PortalOwnerWait::from_owner(
+                        handle,
+                        carrick_core_abi::PortalWaitCause::Gate,
+                        observed.revision(),
+                    )
+                })]);
             }
             _ => {}
         }
@@ -2032,6 +2069,36 @@ fn child_futex<'a>(
             assert_eq!(
                 take_signal_copies(),
                 [(UserVa::new(remaining), timespec_bytes(100).to_vec())]
+            );
+            consume_injected_sigint(runtime, &fixture.task, worker.record);
+            return;
+        }
+        if case == SleepCase::PendingSignalOwnerWaitRemainder {
+            // OwnerWait once: the caller released its execution lease and
+            // parked on the mm owner, with the EINTR answer and its rem bytes
+            // retained in the service row. No timer lease: the sleep's
+            // decision is already made.
+            assert_eq!(route, CompletionRoute::Suspended, "parked on the owner");
+            assert!(take_signal_copies().is_empty(), "nothing written yet");
+            assert_ne!(
+                fixture.zone.slot(fixture.slot).current(),
+                Some(worker.record.id),
+                "the owner wait released the execution lease"
+            );
+            assert_eq!(fixture.zone.timer_node_count(), nodes, "no timer lease");
+            // The gate's release publishes the owner notification and wakes
+            // the parked caller; its checkpoint reruns the retained copy.
+            access.lower(space.index());
+            let resumed = resume!(entry => entry.resume_checkpoint(|_| Ok(None)));
+            let resumed = match resumed {
+                Ok(NativeResume::Returned(result)) => Some(result.raw()),
+                _ => None,
+            };
+            assert_eq!(resumed, Some(-4), "the retained EINTR answer");
+            assert_eq!(
+                take_signal_copies(),
+                [(UserVa::new(remaining), timespec_bytes(100).to_vec())],
+                "the retained rem bytes, written once after the wait"
             );
             consume_injected_sigint(runtime, &fixture.task, worker.record);
             return;
