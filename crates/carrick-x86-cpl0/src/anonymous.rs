@@ -119,26 +119,14 @@ pub(super) fn release_injected_edit_wait(
     else {
         return;
     };
-    fn release_while_scheduling(
-        _: &X86Cpl0Zone,
-        _: carrick_sched_core::Waker,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, ParkedContextWords>,
-    ) {
-        let _ = effects.deliver_handbacks(&mut |_| carrick_x86_carrier::entry::fatal_boot());
-        // This CPU has already entered its scheduler because of the injected
-        // suspension. The queued record needs no self-IPI to become visible.
-    }
     let venue = carrick_sched_core::spaces::notification::SpaceReleaseVenue {
         zone: source.zone,
         waker: carrick_sched_core::Waker::El1 { slot: source.slot },
         deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
-            release_while_scheduling,
+            crate::native_process::release,
         ),
     };
     venue.publish(notifications.reserve(cause));
-    if source.zone.slot(source.slot).queued() == 0 {
-        carrick_x86_carrier::entry::fatal_boot();
-    }
 }
 
 impl X86AnonymousVenue<'_> {
