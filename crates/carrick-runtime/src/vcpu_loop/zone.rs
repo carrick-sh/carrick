@@ -56,6 +56,7 @@ impl ZoneWaitPolicy {
             OwnedSyscallResume::Output(_)
             | OwnedSyscallResume::CopyoutRedispatch
             | OwnedSyscallResume::Ipc(_)
+            | OwnedSyscallResume::IpcLock(_)
             | OwnedSyscallResume::Io(_)
             | OwnedSyscallResume::Sleep(_) => Self::KillableOwnerMemory,
         }
@@ -65,6 +66,32 @@ impl ZoneWaitPolicy {
 #[cfg(test)]
 mod owner_copyout_policy_tests {
     use super::{OwnedSyscallResume, ZoneWaitPolicy};
+
+    /// #1845: a create retained across a held IPC lock is never interrupted
+    /// by a caught signal or stop (`pipe2(2)` has no EINTR); only terminal
+    /// cancellation ends it.
+    #[test]
+    fn ipc_lock_wait_is_killable_only_not_ordinary_signal_interruptible() {
+        let policy = |resume: &OwnedSyscallResume| ZoneWaitPolicy::for_owner_resume(resume);
+        assert!(matches!(
+            policy(&OwnedSyscallResume::CopyoutRedispatch),
+            ZoneWaitPolicy::KillableOwnerMemory
+        ));
+        // Exhaustive: a new resume arm must choose its policy here.
+        let _ = |resume: OwnedSyscallResume| match resume {
+            OwnedSyscallResume::IpcLock(pending) => {
+                assert!(matches!(
+                    ZoneWaitPolicy::for_owner_resume(&OwnedSyscallResume::IpcLock(pending)),
+                    ZoneWaitPolicy::KillableOwnerMemory
+                ));
+            }
+            OwnedSyscallResume::Output(_)
+            | OwnedSyscallResume::CopyoutRedispatch
+            | OwnedSyscallResume::Ipc(_)
+            | OwnedSyscallResume::Io(_)
+            | OwnedSyscallResume::Sleep(_) => {}
+        };
+    }
 
     #[test]
     fn copyout_redispatch_is_killable_only_not_ordinary_signal_interruptible() {
@@ -824,6 +851,115 @@ where
             OwnerMemoryAction::Syscall { frame, resume },
             wait,
         )
+    }
+
+    /// A host IPC operation met another party's held IPC lock (#1845).
+    /// Enroll this thread's zone record on that lock's existing release
+    /// handoff, then surrender the executor exactly as an owner-memory
+    /// syscall wait does: the same record receipt, killable gate and
+    /// [`HvpatchProductionPhase::ResumeOwnerZone`] resumption. A release
+    /// that raced enrollment hands the record back at once; nothing spins.
+    /// Caught signals and stops stay pending (the retained calls never
+    /// return EINTR); terminal cancellation drops and rolls back `pending`.
+    pub(super) fn ipc_lock_park(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        pending: Box<carrick_kernel::kernel::continuation::ipc_lock::RetainedIpcLockOperation>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_sched_core::object_wait::OperationToken;
+        let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
+            return Err(RuntimeError::Configuration(
+                "IPC lock wait has no exact carrier zone".to_owned(),
+            )
+            .into());
+        };
+        if !std::ptr::eq(zone, pending.zone()) {
+            return Err(RuntimeError::Configuration(
+                "IPC lock wait names another carrier's zone".to_owned(),
+            )
+            .into());
+        }
+        let state = engine.snapshot_guest_state_for_publication()?;
+        let (exit, request) = match self.state.ipc_user_return {
+            Some(request) => (ZoneExit::El0, request),
+            None => (
+                ZoneExit::Syscall { completed: true },
+                self.state
+                    .syscall_completion
+                    .guest("IPC lock wait lost its prepared completion token")?
+                    .syscall()
+                    .request,
+            ),
+        };
+        let ctx = zone_ctx_from_state(&state, exit)?;
+        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("IPC lock wait lost its Kernel context".to_owned())
+        })?;
+        let identity = ThreadIdentity {
+            tid: carrick_el1_abi::El1TaskId::from_linux_tid(self.state.linux_tid.raw()).raw(),
+            serial: context.thread().key().serial.raw(),
+            mm,
+            file_table: context.resources().files().id().raw(),
+            generation: control
+                .current_submission_key()
+                .map(|(_, generation)| generation.raw())
+                .unwrap_or(0),
+            affinity_source: context.thread().control_slot().affinity_source(),
+            affinity: context.thread().affinity().words()[0],
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        // The owner-wait receipt `consume_owner_zone` authenticates.
+        let token = OperationToken::metadata_request(context.thread().key().serial.raw())
+            .ok_or_else(|| {
+                RuntimeError::Configuration("IPC lock wait serial is zero".to_owned())
+            })?;
+        let record = zone.alloc_record(identity).map_err(|error| {
+            RuntimeError::Configuration(format!("IPC lock wait record unavailable: {error:?}"))
+        })?;
+        // SAFETY: this freshly allocated record has not been published.
+        unsafe { *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)? };
+        let seq = zone.next_seq(record);
+        if let Err((error, _token)) = pending.defer(record, token) {
+            // Nothing was transferred; a release race is not an error here
+            // (it hands the enrolled record back), so this is an invariant.
+            zone.free_record(record);
+            return Err(RuntimeError::Configuration(format!(
+                "IPC lock wait enrollment refused: {error:?}"
+            ))
+            .into());
+        }
+        zone.counters
+            .host_parks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let origin = self.state.owner_wait_origin()?;
+        let resume = OwnedSyscallResume::IpcLock(pending);
+        let exit = self.settle_into_zone(
+            control,
+            continuation::quantum::ZoneSave {
+                base: state,
+                record: zone.record_ref(record),
+                origin: match origin {
+                    carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0 => {
+                        executor::residency::ZoneResumeOrigin::HostEl0
+                    }
+                    carrick_hal::threaded::NativeOwnerWaitOrigin::HostTrap => {
+                        executor::residency::ZoneResumeOrigin::HostTrap
+                    }
+                },
+            },
+            seq,
+            ZoneWaitPolicy::for_owner_resume(&resume),
+            request,
+        )?;
+        self.phase = HvpatchProductionPhase::ResumeOwnerZone {
+            frame,
+            resume,
+            origin,
+        };
+        Ok(exit)
     }
 
     pub(super) fn park_retained_memory_owner(

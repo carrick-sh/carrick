@@ -201,15 +201,27 @@ fn object_error(error: core_pipe::Error) -> LinuxErrno {
 }
 
 impl PipeInner {
+    #[cfg(test)]
     pub(crate) fn create(
         owner: Arc<crate::el1_ipc::HostIpc>,
         pipe_id: u64,
         capacity: usize,
     ) -> Result<Self, crate::el1_ipc::CreateError> {
-        use crate::el1_ipc::CreateError;
         let object = owner
             .create_pipe(capacity)
-            .map_err(CreateError::from_admission)?;
+            .map_err(crate::el1_ipc::CreateError::from_admission)?;
+        Self::from_created(owner, pipe_id, object)
+    }
+
+    /// Publish both endpoints of a pipe whose object and readiness lanes
+    /// are fully created ([`crate::el1_ipc::PipeCreation::Created`]). The
+    /// caller hands over ownership of `object`; every refusal rolls it back.
+    pub(crate) fn from_created(
+        owner: Arc<crate::el1_ipc::HostIpc>,
+        pipe_id: u64,
+        object: carrick_el1_abi::ipc::IpcObjectHandle,
+    ) -> Result<Self, crate::el1_ipc::CreateError> {
+        use crate::el1_ipc::CreateError;
         let description = |end, access| {
             carrick_el1_abi::ipc::fd::Description::new(
                 IpcBacking::Pipe { object, end }.encode(),
@@ -1154,18 +1166,44 @@ pub(crate) fn write_pipe<I: Fn() -> bool>(
 impl<'a> FsView<'a> {
     define_syscall! {
         fn pipe2(this, cx, pipefd: GuestPtr, flags: u64) {
-            let address = pipefd.0;
-            let memory = &mut *cx.memory;
             if super::LinuxPipe2Flags::from_bits(flags).is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            this.pipe2_create(cx, pipefd, flags, None)
+        }
+    }
 
+    /// Resume a `pipe2` whose create was retained across a held IPC
+    /// readiness-lane lock ([`DispatchOutcome::IpcLockContended`]). Its
+    /// arguments were validated by the first dispatch; nothing it already
+    /// bound is redone, and it never returns EINTR.
+    pub(crate) fn resume_pipe2<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        retained: crate::kernel::continuation::ipc_lock::RetainedPipe2,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let (pipefd, flags, pipe_id, create) = retained.into_parts();
+        self.pipe2_create(cx, pipefd, flags, Some((pipe_id, create)))
+    }
+
+    fn pipe2_create<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        pipefd: GuestPtr,
+        flags: u64,
+        retained: Option<(u64, crate::el1_ipc::PendingPipeCreate)>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let this = self;
+        {
+            let address = pipefd.0;
+            let memory = &mut *cx.memory;
             let nonblock = flags & LINUX_O_NONBLOCK;
             let fd_flags = linux_fd_flags_from_open_flags(flags);
 
-            // Prepare the `pipefd` output before creating anything: an owner
-            // refusal parks and retries this syscall, which is only clean
-            // while no pipe or descriptor exists yet (#711).
+            // Prepare the `pipefd` output before publishing anything: an
+            // owner refusal parks and retries this syscall, which is only
+            // clean while no descriptor exists yet (#711). A retained create
+            // is rolled back here (dropped) and the retry starts afresh.
             let out = match crate::dispatch::copyout::UserOut::<LinuxFdPair>::new(address)
                 .prepare(cx.kernel, memory)
             {
@@ -1173,12 +1211,45 @@ impl<'a> FsView<'a> {
                 Err(refusal) => return Ok(refusal.into_outcome()),
             };
 
-            let pipe_id = next_pipe_id();
             // Only the authority's own host memory is ENOMEM; creation
             // refusals are typed Linux limits (ENFILE), never a table size.
-            let owner = cx.kernel.kernel().ipc().map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?;
-            let pipe = Arc::new(PipeInner::create(owner, pipe_id, DEFAULT_PIPE_CAPACITY)
-                .map_err(|error| DispatchError::Errno(error.errno()))?);
+            let create_error = |error| {
+                DispatchError::Errno(crate::el1_ipc::CreateError::from_admission(error).errno())
+            };
+            let (pipe_id, owner, creation) = match retained {
+                None => {
+                    let pipe_id = next_pipe_id();
+                    let owner = cx
+                        .kernel
+                        .kernel()
+                        .ipc()
+                        .map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?;
+                    let creation = owner
+                        .begin_pipe(DEFAULT_PIPE_CAPACITY)
+                        .map_err(create_error)?;
+                    (pipe_id, owner, creation)
+                }
+                Some((pipe_id, create)) => {
+                    let owner = Arc::clone(create.owner());
+                    (pipe_id, owner, create.resume().map_err(create_error)?)
+                }
+            };
+            let object = match creation {
+                crate::el1_ipc::PipeCreation::Created(object) => object,
+                crate::el1_ipc::PipeCreation::Contended(create) => {
+                    // No output permit or descriptor survives a park.
+                    drop(out);
+                    return Ok(DispatchOutcome::IpcLockContended(Box::new(
+                        crate::kernel::continuation::ipc_lock::RetainedIpcLockOperation::pipe2(
+                            pipefd, flags, pipe_id, create,
+                        ),
+                    )));
+                }
+            };
+            let pipe = Arc::new(
+                PipeInner::from_created(owner, pipe_id, object)
+                    .map_err(|error| DispatchError::Errno(error.errno()))?,
+            );
 
             let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock)
                 .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
@@ -1187,23 +1258,26 @@ impl<'a> FsView<'a> {
                 .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
             write_base.set_shared_pipe(Arc::clone(&pipe));
 
-            let read_open = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
-                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
-                    base: read_base,
-                    pipe: Arc::clone(&pipe),
-                })),
-                LINUX_O_RDONLY | nonblock,
-                fd_flags,
-            );
-            let write_open = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
-                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
-                    base: write_base,
-                    pipe,
-                })),
-                LINUX_O_WRONLY | nonblock,
-                fd_flags,
-            );
-            let Ok((read_fd, write_fd)) = this.install_fd_pair_at_or_above(0, read_open, write_open)
+            let read_open =
+                crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                    Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
+                        base: read_base,
+                        pipe: Arc::clone(&pipe),
+                    })),
+                    LINUX_O_RDONLY | nonblock,
+                    fd_flags,
+                );
+            let write_open =
+                crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                    Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
+                        base: write_base,
+                        pipe,
+                    })),
+                    LINUX_O_WRONLY | nonblock,
+                    fd_flags,
+                );
+            let Ok((read_fd, write_fd)) =
+                this.install_fd_pair_at_or_above(0, read_open, write_open)
             else {
                 return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
             };

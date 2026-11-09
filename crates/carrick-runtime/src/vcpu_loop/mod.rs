@@ -2042,7 +2042,64 @@ where
             binding::OwnedSyscallResume::Ipc(pending) => {
                 self.resume_ipc_copyout(kernel, engine, pending)
             }
+            binding::OwnedSyscallResume::IpcLock(pending) => {
+                self.resume_ipc_lock_operation(kernel, engine, pending, host_wait)
+            }
         }
+    }
+
+    /// Rerun a host IPC operation retained across another party's held IPC
+    /// lock, after that lock's release handed its record back (#1845). The
+    /// prepared syscall completion still owns the result; the operation
+    /// continues from its retained progress and may park again.
+    fn resume_ipc_lock_operation(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        pending: Box<carrick_kernel::kernel::continuation::ipc_lock::RetainedIpcLockOperation>,
+        host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
+    ) -> Result<DispatchOutcome, RuntimeError> {
+        let request = self
+            .syscall_completion
+            .guest("IPC lock continuation lost syscall completion")?
+            .syscall()
+            .request;
+        if let Some(scope) = kernel.dispatcher.work_scope() {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::KernelRedispatches,
+                1,
+            );
+        }
+        let context = self
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration("IPC lock continuation lost context".to_owned())
+            })?
+            .retain_exact();
+        let mut executor = self.guest_execution.take().ok_or_else(|| {
+            RuntimeError::Configuration("IPC lock continuation lost MM executor".to_owned())
+        })?;
+        let lease_guard = self.execution_lease.lock();
+        let lease = lease_guard.as_ref();
+        let thread = ThreadCtx::new(self.this_tid, &self.registry, &self.futex);
+        let route = OrdinaryDispatchRoute {
+            host_wait,
+            lease,
+            mm_executor: Some(&mut executor),
+        };
+        let result = kernel.dispatcher.resume_ipc_lock_operation(
+            &context,
+            request,
+            pending,
+            engine,
+            &kernel.reporter,
+            Some(thread),
+            route,
+        );
+        drop(lease_guard);
+        self.guest_execution = Some(executor);
+        Ok(result?)
     }
 
     fn redispatch_threaded_syscall_for_executor(

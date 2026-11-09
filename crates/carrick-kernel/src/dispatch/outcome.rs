@@ -510,6 +510,20 @@ pub enum DispatchOutcome {
     /// Backend: park on the exact memory dependency and resume the retained
     /// timespec copy before creating the sleep's timed continuation.
     SleepCopyInSuspended(#[serde(skip_serializing)] Box<super::OwnedSleepCopyIn>),
+    /// Another party holds an IPC lock this operation needs. Nothing was
+    /// lost or published: the exact operation (and any progress, such as a
+    /// pipe already created with some readiness lanes bound) is retained.
+    /// Never an errno, never fatal, never interruptible by a caught signal.
+    ///
+    /// Backend: enroll a zone record on the lock's release
+    /// ([`crate::kernel::continuation::ipc_lock::RetainedIpcLockOperation::defer`]),
+    /// release the execution lease, and resume this operation through
+    /// [`super::SyscallDispatcher::resume_ipc_lock_operation`] when the record
+    /// is handed back. Terminal cancellation drops it, rolling it back.
+    IpcLockContended(
+        #[serde(skip_serializing)]
+        Box<crate::kernel::continuation::ipc_lock::RetainedIpcLockOperation>,
+    ),
     /// Backend: write `value` into the guest's syscall return register, service any
     /// signal that became pending during the call, and resume the task.
     Returned { value: i64 },
