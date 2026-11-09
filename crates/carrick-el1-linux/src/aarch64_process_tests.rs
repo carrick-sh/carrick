@@ -6192,6 +6192,38 @@ fn leader_sees_thread(
         .unwrap()
 }
 
+/// The tgkill-after-clone fixture signals the child the instant `clone`
+/// returns, before the host-issued child has made its first syscall. Linux
+/// accepts that tid: the thread exists from clone onward.
+#[test]
+fn arm_tgkill_reaches_a_host_born_sibling_before_its_first_syscall() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let _control = host_born_sibling(fixture, 42);
+    run_as_leader(fixture);
+    // No gettid yet: the sibling is issued and published but not adopted.
+    for sig in [0_u64, 10] {
+        let mut probe = carrick_el1_abi::TrapFrame::default();
+        probe.x[8] = 131; // tgkill(tgid, tid, sig)
+        probe.x[0] = 41;
+        probe.x[1] = 42;
+        probe.x[2] = sig;
+        arm_call(fixture, fixture.control, &mut service, &mut probe).unwrap();
+        assert_eq!(
+            probe.x[0] as i64, 0,
+            "tgkill(sig {sig}) of a just-cloned, not yet adopted sibling"
+        );
+    }
+}
+
 #[test]
 fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
