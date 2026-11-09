@@ -31,6 +31,7 @@ pub mod loom_run;
 pub mod probe_coverage;
 pub mod probe_emitters;
 pub mod probe_inventory;
+pub mod probe_runners;
 pub mod process_helper;
 pub mod provision;
 mod prune_fs;

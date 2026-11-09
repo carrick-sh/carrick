@@ -17,7 +17,7 @@
 // production code, so allow unwrap/expect across this integration test file.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use carrick_xtask::probe_inventory::DEDICATED_PROBE_RUNNERS;
+use carrick_xtask::probe_runners::DEDICATED_PROBE_RUNNERS;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
