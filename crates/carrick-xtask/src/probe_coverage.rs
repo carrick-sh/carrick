@@ -19,9 +19,10 @@ use thiserror::Error;
 
 use crate::command::{self, CommandError};
 use crate::probe_inventory::{
-    InventoryError, ProbeInventoryRow, is_authorized_runner, load_inventory,
-    load_inventory_from_str, read_probe_source_names, validate_source_membership,
+    InventoryError, ProbeInventoryRow, load_inventory, load_inventory_from_str,
+    read_probe_source_names, validate_source_membership,
 };
+use crate::probe_runners::is_authorized_runner;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
