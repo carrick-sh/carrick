@@ -67,8 +67,8 @@ jobs:
   # The merge base's fixture bundle comes only from main's own publisher:
   # the kernel-runtime push run that built exactly that commit. Trusted main
   # code authenticates the producing run (repository, workflow, main branch,
-  # event) and blocks when no such bundle exists. No job builds fixtures from
-  # candidate code; both paired runs restore this one bundle (#1889).
+  # event) and blocks when no such bundle exists. Both paired runs restore
+  # this one bundle (#1889); candidate code builds only added probes (#1980).
   base-fixtures:
     needs: authorize
     runs-on: ubuntu-latest
@@ -100,8 +100,57 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-  gate:
+  # Owner decision #1980: when the candidate's only fixture-input difference
+  # from the base bundle is added conformance probes, build just those probes
+  # from candidate code with main's publisher build code, on the publisher's
+  # runner class. Trusted main code checks out the candidate itself and
+  # records any other difference as a refusal, which the Mac reports again.
+  candidate-probes:
     needs: [authorize, base-fixtures]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Verify native ARM Linux builder
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = aarch64
+      - name: Install pinned Rust toolchain and guest targets
+        run: rustup show active-toolchain
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-base-fixtures-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-fixtures
+      - name: Build the candidate's added probes beside the base bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=("$RUNNER_TEMP"/signed-fixtures/*.tar.gz)
+          test "${#bundles[@]}" -eq 1
+          cargo run --locked -p carrick-xtask -- signed-gate candidate-probes \
+            --request "$RUNNER_TEMP/request/request.json" --bundle "${bundles[0]}" \
+            --output "$RUNNER_TEMP/candidate-probes"
+      - name: Upload the candidate probe outcome
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-candidate-probes-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/candidate-probes/
+          if-no-files-found: error
+          compression-level: 0
+
+  gate:
+    needs: [authorize, base-fixtures, candidate-probes]
     runs-on: [self-hosted, macOS, ARM64, carrick-signed-gate]
     # Paired execution (#1884): the merge base and then the candidate run on
     # this one Mac, each about 22-35 min (60 min worst observed), under one
@@ -153,7 +202,11 @@ jobs:
         with:
           name: signed-base-fixtures-${{ github.run_attempt }}
           path: ${{ runner.temp }}/signed-fixtures
-      - name: Select the unique content-addressed archive
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-candidate-probes-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/candidate-probes
+      - name: Select the unique content-addressed archives
         id: fixture
         shell: bash
         run: |
@@ -162,16 +215,29 @@ jobs:
           bundles=("$RUNNER_TEMP"/signed-fixtures/*.tar.gz)
           test "${#bundles[@]}" -eq 1
           printf 'bundle=%s\n' "${bundles[0]}" >> "$GITHUB_OUTPUT"
+          test -f "$RUNNER_TEMP/candidate-probes/candidate-probes.json"
+          sets=("$RUNNER_TEMP"/candidate-probes/*/*.tar.gz)
+          test "${#sets[@]}" -le 1
+          printf 'candidate=%s\n' "${sets[0]:-}" >> "$GITHUB_OUTPUT"
       # Both runs restore the merge base's trusted bundle; a candidate whose
-      # fixture inputs differ is refused rather than served by its own build.
+      # fixture inputs differ is refused rather than served by its own build,
+      # except for added probes, served to the candidate run only (#1980).
       - name: Execute merge base and approved SHA on this Mac under one lease
+        shell: bash
         env:
           CARRICK_RUN_ID: signed-gate-${{ github.run_id }}-${{ github.run_attempt }}
           # Trusted base artifact; no API credential is passed to candidate code.
           CARRICK_SIGNED_FIXTURE_BUNDLE: ${{ steps.fixture.outputs.bundle }}
-        run: >-
-          cargo run --locked -p carrick-xtask -- signed-gate execute
-          --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/signed-result"
+          CANDIDATE_PROBES: ${{ steps.fixture.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          candidate=()
+          if [ -n "$CANDIDATE_PROBES" ]; then
+            candidate=(--candidate-probes "$CANDIDATE_PROBES")
+          fi
+          cargo run --locked -p carrick-xtask -- signed-gate execute \
+            --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/signed-result" \
+            ${candidate[@]+"${candidate[@]}"}
       - name: Upload paired receipts, artifact identities and step logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -241,7 +307,7 @@ jobs:
   # trusted-hardware-pr.yml. Never allow skipped authorization to pass a group.
   signed-queue-gate:
     name: Signed queue gate
-    needs: [authorize, base-fixtures, gate, publish]
+    needs: [authorize, base-fixtures, candidate-probes, gate, publish]
     if: always() && github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -250,10 +316,12 @@ jobs:
         env:
           AUTHORIZE: ${{ needs.authorize.result }}
           FIXTURES: ${{ needs.base-fixtures.result }}
+          PROBES: ${{ needs.candidate-probes.result }}
           GATE: ${{ needs.gate.result }}
           PUBLISH: ${{ needs.publish.result }}
         run: |
           test "$AUTHORIZE" = success
           test "$FIXTURES" = success
+          test "$PROBES" = success
           test "$GATE" = success
           test "$PUBLISH" = success
