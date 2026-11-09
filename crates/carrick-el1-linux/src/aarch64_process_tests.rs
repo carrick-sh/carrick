@@ -11649,6 +11649,7 @@ fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
 fn native_descriptor_witness(
     constructor: Option<u64>,
     root_constructor: bool,
@@ -12171,7 +12172,7 @@ fn native_descriptor_argument_witness(
             }
             assert_eq!(frame.x[8], nr);
             assert_eq!(
-                &frame.x[..4],
+                &frame.x[..6],
                 &args,
                 "preparation preserves original arguments"
             );
