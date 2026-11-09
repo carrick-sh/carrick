@@ -949,7 +949,19 @@ enum ScratchCleanupWork {
         #[cfg(test)]
         observer: Option<ScratchDiscoveryObserver>,
     },
+    /// Classify scratch storage (`apfs::conventional_mount_usable`) off the
+    /// caller's thread so the caller can bound its wait. The query runs on
+    /// this worker instead of a thread of its own: the worker is the one
+    /// host thread `carrick-vfs` owns for scratch-storage housekeeping.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    ClassifyVolume {
+        query: ScratchVolumeQuery,
+        reply: std::sync::mpsc::SyncSender<std::io::Result<bool>>,
+    },
 }
+
+/// One scratch-volume classification handed to the scratch worker.
+pub(crate) type ScratchVolumeQuery = Box<dyn FnOnce() -> std::io::Result<bool> + Send>;
 
 /// Proof that the cleanup worker finished one queued reclaim: which retired
 /// tree it was and which thread ran the recursive delete (never the caller's
@@ -1033,6 +1045,11 @@ fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<Scrat
                                 observer.cleanup_complete.wait();
                             }
                         }
+                        ScratchCleanupWork::ClassifyVolume { query, reply } => {
+                            // Capacity-1 reply owned by this item: never
+                            // blocks; a caller past its deadline dropped it.
+                            let _ = reply.try_send(query());
+                        }
                     }
                 }
             })
@@ -1049,18 +1066,30 @@ fn enqueue_scratch_cleanup(path: PathBuf) -> ScratchCleanupReceipt {
     // Never let a saturated cleanup queue become guest exit latency. A
     // dropped enqueue is still durable because the retired name is one the
     // next startup sweep owns unconditionally.
-    match sender.try_send(ScratchCleanupWork::Remove { path, completion }) {
+    match sender.try_send(ScratchCleanupWork::Remove {
+        path: path.clone(),
+        completion,
+    }) {
         Ok(()) => ScratchCleanupReceipt::Queued(receipt),
-        Err(
-            std::sync::mpsc::TrySendError::Full(work)
-            | std::sync::mpsc::TrySendError::Disconnected(work),
-        ) => match work {
-            ScratchCleanupWork::Remove { path, .. }
-            | ScratchCleanupWork::Discover { root: path, .. } => {
-                ScratchCleanupReceipt::NotQueued(path)
-            }
-        },
+        Err(_) => ScratchCleanupReceipt::NotQueued(path),
     }
+}
+
+/// Queue one scratch-volume classification on the scratch worker and return
+/// the receiver for its single reply. `None` when the worker is unavailable
+/// or its queue is full; callers fail closed (skip the candidate volume).
+/// A query that never returns wedges only this housekeeping worker: later
+/// reclaims report `NotQueued`, and the next startup sweep owns their names.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn enqueue_scratch_volume_query(
+    query: ScratchVolumeQuery,
+) -> Option<std::sync::mpsc::Receiver<std::io::Result<bool>>> {
+    let sender = scratch_cleanup_sender().as_ref()?;
+    let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+    sender
+        .try_send(ScratchCleanupWork::ClassifyVolume { query, reply })
+        .ok()
+        .map(|()| receiver)
 }
 fn enqueue_orphan_discovery(root: PathBuf) {
     if let Some(sender) = scratch_cleanup_sender() {

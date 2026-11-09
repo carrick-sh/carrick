@@ -322,17 +322,17 @@ fn conventional_mount_usable(_: &Path) -> bool {
     false
 }
 
+/// Run one volume query on the scratch-storage worker
+/// (`fs_backend::host`, thread `carrick-fs-cleanup`) and wait at most
+/// `deadline` for its answer. Unavailable worker, full queue, timeout and
+/// query error all return `Err`, which callers treat as "not usable".
 #[cfg(any(target_os = "macos", test))]
 fn bounded_volume_query(
     deadline: std::time::Duration,
     query: impl FnOnce() -> std::io::Result<bool> + Send + 'static,
 ) -> std::io::Result<bool> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("scratch-volume-classifier".into())
-        .spawn(move || {
-            let _ = sender.send(query());
-        })?;
+    let receiver = crate::fs_backend::host::enqueue_scratch_volume_query(Box::new(query))
+        .ok_or_else(|| std::io::Error::other("scratch worker unavailable or saturated"))?;
     receiver.recv_timeout(deadline).map_err(|error| {
         std::io::Error::other(format!(
             "scratch volume classification did not complete: {error}"
@@ -606,36 +606,43 @@ mod tests {
         assert_eq!(root, PathBuf::from("/tmp/carrick/scratch"));
     }
 
-    #[test]
-    fn conventional_volume_query_known_answer_and_deadline() {
-        use std::sync::mpsc::sync_channel;
-        use std::time::Duration;
+    /// The query runs on the process-wide scratch worker, which parallel
+    /// cleanup tests also occupy (some park it on barriers), so the exact
+    /// deadline answer is witnessed serially.
+    mod serial_host_scratch_worker {
+        use super::*;
 
-        assert!(bounded_volume_query(Duration::from_secs(5), || Ok(true)).unwrap());
-        assert!(
-            bounded_volume_query(Duration::from_secs(5), || {
-                Err(std::io::Error::other("device query failed"))
-            })
-            .is_err()
-        );
-        let (release, blocked) = sync_channel(1);
-        let (finished, completion) = sync_channel(1);
-        let result = bounded_volume_query(Duration::from_millis(20), move || {
-            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
-            finished.send(()).unwrap();
-            Ok(true)
-        });
-        assert!(result.is_err());
-        let root = resolve_scratch_root_from(
-            Path::new("/Volumes/carrick"),
-            result.unwrap_or(false),
-            |_| panic!("unknown volume must not be probed"),
-            Some("/internal/home".into()),
-            None,
-        );
-        assert_eq!(root, PathBuf::from("/internal/home/scratch"));
-        release.send(()).unwrap();
-        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        #[test]
+        fn conventional_volume_query_known_answer_and_deadline() {
+            use std::sync::mpsc::sync_channel;
+            use std::time::Duration;
+
+            assert!(bounded_volume_query(Duration::from_secs(5), || Ok(true)).unwrap());
+            assert!(
+                bounded_volume_query(Duration::from_secs(5), || {
+                    Err(std::io::Error::other("device query failed"))
+                })
+                .is_err()
+            );
+            let (release, blocked) = sync_channel(1);
+            let (finished, completion) = sync_channel(1);
+            let result = bounded_volume_query(Duration::from_millis(20), move || {
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                finished.send(()).unwrap();
+                Ok(true)
+            });
+            assert!(result.is_err());
+            let root = resolve_scratch_root_from(
+                Path::new("/Volumes/carrick"),
+                result.unwrap_or(false),
+                |_| panic!("unknown volume must not be probed"),
+                Some("/internal/home".into()),
+                None,
+            );
+            assert_eq!(root, PathBuf::from("/internal/home/scratch"));
+            release.send(()).unwrap();
+            completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
     }
 
     /// Plant a file where `probe_case_sensitive` writes its sentinel. The
