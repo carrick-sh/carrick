@@ -38,7 +38,7 @@ best-effort success; Memory path truncate retains EROFS.
 
 [bindings]
 vm_free = [
-  "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit}",
+  "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit,arm_native_fork_child_write_keeps_readable_prefix_before_unmapped_page}",
   "carrick-kernel::dispatch::native_files::tests::native_child_write_serves_parent_redirected_stdout_after_host_close",
   "carrick-kernel::dispatch::native_files::tests::native_child_ftruncate_retains_the_inherited_physical_file_after_host_close",
   "carrick-kernel::dispatch::native_files::tests::native_child_basic_filesystem_sequences_compose_through_the_public_venue",
