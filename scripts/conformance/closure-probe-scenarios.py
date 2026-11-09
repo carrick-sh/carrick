@@ -15,12 +15,16 @@ from typing import Any
 
 
 LIBCS = ("gnu", "musl")
-DEDICATED_SOURCE_COUNT = 24
-DEDICATED_RUNNER_COUNT = 18
+DEDICATED_SOURCE_COUNT = 25
+DEDICATED_RUNNER_COUNT = 19
 SIGNED_SCENARIO_RUNNERS = {
     "case_sched_affinity_threads_mask_reflection": (
         "carrick-conformance-next",
         "sched_affinity_threads",
+    ),
+    "case_native_prefix_write_child_inherited_file": (
+        "carrick-conformance-next",
+        "native_prefix_write",
     ),
     "production_rx_poketext_executes_warm_patched_instruction": (
         "carrick-conformance-next",

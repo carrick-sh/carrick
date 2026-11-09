@@ -20,7 +20,7 @@ class ProbeInventoryTest(unittest.TestCase):
         inventory = probe_inventory.load_inventory()
         sources = probe_inventory.source_names()
         self.assertEqual(set(inventory), sources)
-        self.assertEqual(len(inventory), 560)
+        self.assertEqual(len(inventory), 561)
         self.assertEqual(
             {name for name, row in inventory.items() if row["class"] == "performance"},
             {name for name in sources if name.startswith("perf_")},
