@@ -10,9 +10,9 @@
 //! to the legacy root dispatcher. Linux argument order, caller credentials,
 //! guest CPU-clock accounting, user-memory fault policy, and retained copyout
 //! remain in the ring; the host adapter serves bounded `ClockDomain` queries,
-//! atomic `timex` updates, and non-blocking sleep deadline subscriptions.
+//! and atomic `timex` updates. Sleeps never cross: the ring's signal wait owner
+//! serves them (`carrick_personality_linux::sleep`).
 
-use crate::EntryMmKey;
 use carrick_syscall_abi::LinuxErrno;
 use core::num::NonZeroU64;
 
@@ -62,10 +62,6 @@ pub enum ClockResourceOp {
     TimexPreflight = 2,
     /// Atomically apply a validated `timex` request and format its 208-byte reply.
     TimexApply = 3,
-    /// Sample/check a sleep deadline and arm or refresh non-blocking wake subscriptions.
-    SleepArm = 4,
-    /// Cancel an armed sleep subscription and optionally sample remaining duration.
-    SleepCancel = 5,
 }
 
 impl ClockResourceOp {
@@ -74,60 +70,9 @@ impl ClockResourceOp {
             1 => Some(Self::Sample),
             2 => Some(Self::TimexPreflight),
             3 => Some(Self::TimexApply),
-            4 => Some(Self::SleepArm),
-            5 => Some(Self::SleepCancel),
             _ => None,
         }
     }
-}
-
-/// Flags carried by [`ClockResourceOp::SleepArm`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClockSleepFlags(u64);
-
-impl ClockSleepFlags {
-    pub const NONE: Self = Self(0);
-    pub const ABSOLUTE: u64 = 1 << 0;
-    pub const PINNED_DEADLINE: u64 = 1 << 1;
-
-    pub const fn new(absolute: bool, pinned_deadline: bool) -> Self {
-        let mut bits = 0;
-        if absolute {
-            bits |= Self::ABSOLUTE;
-        }
-        if pinned_deadline {
-            bits |= Self::PINNED_DEADLINE;
-        }
-        Self(bits)
-    }
-
-    pub const fn from_raw(raw: u64) -> Option<Self> {
-        if raw & !(Self::ABSOLUTE | Self::PINNED_DEADLINE) != 0 {
-            return None;
-        }
-        Some(Self(raw))
-    }
-
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-
-    pub const fn is_absolute(self) -> bool {
-        self.0 & Self::ABSOLUTE != 0
-    }
-
-    pub const fn has_pinned_deadline(self) -> bool {
-        self.0 & Self::PINNED_DEADLINE != 0
-    }
-}
-
-/// Ring wait-channel identity woken when an armed sleep expires or its clock changes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClockSleepChannel {
-    pub record_id: u32,
-    pub record_generation: u64,
-    pub mm: EntryMmKey,
-    pub address: NonZeroU64,
 }
 
 /// Decoded request view over a validated 256-byte clock record.
@@ -144,21 +89,6 @@ pub enum ClockRequest<'a> {
         can_adjust: bool,
         timex: &'a [u8; CLOCK_TIMEX_BYTES],
     },
-    SleepArm {
-        clock_id: u64,
-        flags: ClockSleepFlags,
-        sleep_id: Option<NonZeroU64>,
-        secs: u64,
-        nanos: u32,
-        channel: ClockSleepChannel,
-    },
-    SleepCancel {
-        sleep_id: NonZeroU64,
-        clock_id: u64,
-        compute_remaining: bool,
-        deadline_secs: u64,
-        deadline_nanos: u32,
-    },
 }
 
 /// Decoded reply from a completed clock-resource record.
@@ -167,22 +97,6 @@ pub enum ClockReply<'a> {
     Sample(Result<(u64, u32), LinuxErrno>),
     TimexPreflight(Result<(), LinuxErrno>),
     TimexApply(Result<(i64, &'a [u8; CLOCK_TIMEX_BYTES]), LinuxErrno>),
-    SleepArm(Result<ClockSleepArmOutcome, LinuxErrno>),
-    SleepCancel {
-        remaining_secs: u64,
-        remaining_nanos: u32,
-    },
-}
-
-/// Non-blocking result of [`ClockResourceOp::SleepArm`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClockSleepArmOutcome {
-    Elapsed,
-    Armed {
-        sleep_id: NonZeroU64,
-        deadline_secs: u64,
-        deadline_nanos: u32,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,7 +107,6 @@ pub enum ClockRecordError {
 const REPLY_NONE: u32 = 0;
 const REPLY_OK: u32 = 1;
 const REPLY_ERRNO: u32 = 2;
-const REPLY_ARMED: u32 = 3;
 
 fn write_u16(buf: &mut [u8], offset: usize, val: u16) {
     buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
@@ -258,45 +171,6 @@ pub fn encode_timex_request(
     buf[CLOCK_HEADER_BYTES..].copy_from_slice(timex);
 }
 
-/// Encode a non-blocking sleep deadline poll/arm request into `buf`.
-pub fn encode_sleep_arm_request(
-    buf: &mut [u8; CLOCK_RECORD_BYTES],
-    clock_id: u64,
-    flags: ClockSleepFlags,
-    sleep_id: Option<NonZeroU64>,
-    secs: u64,
-    nanos: u32,
-    channel: ClockSleepChannel,
-) {
-    init_header(buf, ClockResourceOp::SleepArm);
-    write_u32(buf, 12, nanos);
-    write_u64(buf, 16, clock_id);
-    write_u64(buf, 24, flags.raw());
-    write_u64(buf, 32, sleep_id.map_or(0, NonZeroU64::get));
-    write_u64(buf, 40, secs);
-    write_u32(buf, CLOCK_HEADER_BYTES, channel.record_id);
-    write_u64(buf, CLOCK_HEADER_BYTES + 8, channel.record_generation);
-    write_u64(buf, CLOCK_HEADER_BYTES + 16, channel.mm.raw());
-    write_u64(buf, CLOCK_HEADER_BYTES + 24, channel.address.get());
-}
-
-/// Encode a sleep cancellation request into `buf`.
-pub fn encode_sleep_cancel_request(
-    buf: &mut [u8; CLOCK_RECORD_BYTES],
-    sleep_id: NonZeroU64,
-    clock_id: u64,
-    compute_remaining: bool,
-    deadline_secs: u64,
-    deadline_nanos: u32,
-) {
-    init_header(buf, ClockResourceOp::SleepCancel);
-    write_u32(buf, 12, deadline_nanos);
-    write_u64(buf, 16, sleep_id.get());
-    write_u64(buf, 24, clock_id);
-    write_u64(buf, 32, u64::from(compute_remaining));
-    write_u64(buf, 40, deadline_secs);
-}
-
 fn validate_envelope(bytes: &[u8]) -> Result<ClockResourceOp, ClockRecordError> {
     if bytes.len() != CLOCK_RECORD_BYTES
         || read_u32(bytes, 0) != Some(CLOCK_RECORD_MAGIC)
@@ -353,48 +227,6 @@ pub fn parse_request(bytes: &[u8]) -> Result<ClockRequest<'_>, ClockRecordError>
                 timex: payload,
             })
         }
-        ClockResourceOp::SleepArm => {
-            if aux >= 1_000_000_000 {
-                return Err(ClockRecordError::Invalid);
-            }
-            let flags = ClockSleepFlags::from_raw(w1).ok_or(ClockRecordError::Invalid)?;
-            let record_id = read_u32(bytes, CLOCK_HEADER_BYTES).ok_or(ClockRecordError::Invalid)?;
-            let record_generation =
-                read_u64(bytes, CLOCK_HEADER_BYTES + 8).ok_or(ClockRecordError::Invalid)?;
-            let mm = read_u64(bytes, CLOCK_HEADER_BYTES + 16).ok_or(ClockRecordError::Invalid)?;
-            let address_raw =
-                read_u64(bytes, CLOCK_HEADER_BYTES + 24).ok_or(ClockRecordError::Invalid)?;
-            let address = NonZeroU64::new(address_raw).ok_or(ClockRecordError::Invalid)?;
-            if mm == 0 {
-                return Err(ClockRecordError::Invalid);
-            }
-            Ok(ClockRequest::SleepArm {
-                clock_id: w0,
-                flags,
-                sleep_id: NonZeroU64::new(w2),
-                secs: w3,
-                nanos: aux,
-                channel: ClockSleepChannel {
-                    record_id,
-                    record_generation,
-                    mm: EntryMmKey::from_raw(mm),
-                    address,
-                },
-            })
-        }
-        ClockResourceOp::SleepCancel => {
-            if aux >= 1_000_000_000 || w2 > 1 {
-                return Err(ClockRecordError::Invalid);
-            }
-            let sleep_id = NonZeroU64::new(w0).ok_or(ClockRecordError::Invalid)?;
-            Ok(ClockRequest::SleepCancel {
-                sleep_id,
-                clock_id: w1,
-                compute_remaining: w2 != 0,
-                deadline_secs: w3,
-                deadline_nanos: aux,
-            })
-        }
     }
 }
 
@@ -443,52 +275,6 @@ pub fn write_timex_apply_reply(
     Ok(())
 }
 
-/// Write a [`ClockResourceOp::SleepArm`] reply in place.
-pub fn write_sleep_arm_reply(
-    bytes: &mut [u8],
-    outcome: ClockSleepArmOutcome,
-) -> Result<(), ClockRecordError> {
-    if validate_envelope(bytes)? != ClockResourceOp::SleepArm {
-        return Err(ClockRecordError::Invalid);
-    }
-    match outcome {
-        ClockSleepArmOutcome::Elapsed => {
-            write_u32(bytes, 8, REPLY_OK);
-            write_u32(bytes, 12, 0);
-        }
-        ClockSleepArmOutcome::Armed {
-            sleep_id,
-            deadline_secs,
-            deadline_nanos,
-        } => {
-            if deadline_nanos >= 1_000_000_000 {
-                return Err(ClockRecordError::Invalid);
-            }
-            write_u32(bytes, 8, REPLY_ARMED);
-            write_u32(bytes, 12, deadline_nanos);
-            write_u64(bytes, 16, sleep_id.get());
-            write_u64(bytes, 24, deadline_secs);
-        }
-    }
-    Ok(())
-}
-
-/// Write a [`ClockResourceOp::SleepCancel`] reply in place.
-pub fn write_sleep_cancel_reply(
-    bytes: &mut [u8],
-    remaining_secs: u64,
-    remaining_nanos: u32,
-) -> Result<(), ClockRecordError> {
-    if validate_envelope(bytes)? != ClockResourceOp::SleepCancel || remaining_nanos >= 1_000_000_000
-    {
-        return Err(ClockRecordError::Invalid);
-    }
-    write_u32(bytes, 8, REPLY_OK);
-    write_u32(bytes, 12, remaining_nanos);
-    write_u64(bytes, 16, remaining_secs);
-    Ok(())
-}
-
 /// Whether the carrier has written a valid reply into `bytes`.
 pub fn has_reply(bytes: &[u8]) -> bool {
     parse_reply(bytes).is_ok()
@@ -500,7 +286,6 @@ pub fn parse_reply(bytes: &[u8]) -> Result<ClockReply<'_>, ClockRecordError> {
     let tag = read_u32(bytes, 8).ok_or(ClockRecordError::Invalid)?;
     let aux = read_u32(bytes, 12).ok_or(ClockRecordError::Invalid)?;
     let w0 = read_u64(bytes, 16).ok_or(ClockRecordError::Invalid)?;
-    let w1 = read_u64(bytes, 24).ok_or(ClockRecordError::Invalid)?;
 
     if tag == REPLY_NONE {
         return Err(ClockRecordError::Invalid);
@@ -515,8 +300,6 @@ pub fn parse_reply(bytes: &[u8]) -> Result<ClockReply<'_>, ClockRecordError> {
             ClockResourceOp::Sample => Ok(ClockReply::Sample(Err(errno))),
             ClockResourceOp::TimexPreflight => Ok(ClockReply::TimexPreflight(Err(errno))),
             ClockResourceOp::TimexApply => Ok(ClockReply::TimexApply(Err(errno))),
-            ClockResourceOp::SleepArm => Ok(ClockReply::SleepArm(Err(errno))),
-            ClockResourceOp::SleepCancel => Err(ClockRecordError::Invalid),
         };
     }
 
@@ -534,29 +317,6 @@ pub fn parse_reply(bytes: &[u8]) -> Result<ClockReply<'_>, ClockRecordError> {
                 .try_into()
                 .map_err(|_| ClockRecordError::Invalid)?;
             Ok(ClockReply::TimexApply(Ok((value, output))))
-        }
-        (ClockResourceOp::SleepArm, REPLY_OK) => {
-            Ok(ClockReply::SleepArm(Ok(ClockSleepArmOutcome::Elapsed)))
-        }
-        (ClockResourceOp::SleepArm, REPLY_ARMED) => {
-            if aux >= 1_000_000_000 {
-                return Err(ClockRecordError::Invalid);
-            }
-            let sleep_id = NonZeroU64::new(w0).ok_or(ClockRecordError::Invalid)?;
-            Ok(ClockReply::SleepArm(Ok(ClockSleepArmOutcome::Armed {
-                sleep_id,
-                deadline_secs: w1,
-                deadline_nanos: aux,
-            })))
-        }
-        (ClockResourceOp::SleepCancel, REPLY_OK) => {
-            if aux >= 1_000_000_000 {
-                return Err(ClockRecordError::Invalid);
-            }
-            Ok(ClockReply::SleepCancel {
-                remaining_secs: w0,
-                remaining_nanos: aux,
-            })
         }
         _ => Err(ClockRecordError::Invalid),
     }
@@ -621,67 +381,5 @@ mod tests {
             write_u32(&mut buf, 12, invalid);
             assert_eq!(parse_reply(&buf), Err(ClockRecordError::Invalid));
         }
-    }
-
-    #[test]
-    fn sleep_arm_and_cancel_roundtrip() {
-        let mut buf = [0u8; CLOCK_RECORD_BYTES];
-        let channel = ClockSleepChannel {
-            record_id: 3,
-            record_generation: 9,
-            mm: EntryMmKey::from_raw(11),
-            address: NonZeroU64::new(0x1000).unwrap(),
-        };
-        let flags = ClockSleepFlags::new(true, false);
-        encode_sleep_arm_request(&mut buf, 0, flags, None, 100, 250, channel);
-        assert_eq!(
-            parse_request(&buf),
-            Ok(ClockRequest::SleepArm {
-                clock_id: 0,
-                flags,
-                sleep_id: None,
-                secs: 100,
-                nanos: 250,
-                channel,
-            })
-        );
-        let id = NonZeroU64::new(77).unwrap();
-        write_sleep_arm_reply(
-            &mut buf,
-            ClockSleepArmOutcome::Armed {
-                sleep_id: id,
-                deadline_secs: 100,
-                deadline_nanos: 250,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            parse_reply(&buf),
-            Ok(ClockReply::SleepArm(Ok(ClockSleepArmOutcome::Armed {
-                sleep_id: id,
-                deadline_secs: 100,
-                deadline_nanos: 250,
-            })))
-        );
-
-        encode_sleep_cancel_request(&mut buf, id, 1, true, 100, 250);
-        assert_eq!(
-            parse_request(&buf),
-            Ok(ClockRequest::SleepCancel {
-                sleep_id: id,
-                clock_id: 1,
-                compute_remaining: true,
-                deadline_secs: 100,
-                deadline_nanos: 250,
-            })
-        );
-        write_sleep_cancel_reply(&mut buf, 0, 500_000).unwrap();
-        assert_eq!(
-            parse_reply(&buf),
-            Ok(ClockReply::SleepCancel {
-                remaining_secs: 0,
-                remaining_nanos: 500_000,
-            })
-        );
     }
 }
