@@ -1221,14 +1221,50 @@ fn a_home_record_runs_only_on_its_home_slot() {
     assert!(effects.queued_own && !effects.misplaced);
 }
 
-/// A floating thread whose affinity excludes the waker's CPU and has no
-/// idle slot to go to is refused (the host places it); one queued on the
-/// waker's slot anyway is reported misplaced.
+/// A floating thread whose affinity excludes the waker's CPU goes to the
+/// busy slot of a CPU it may run on, with an SGI (#1941). With no such slot
+/// in the guest the wake is refused (the host places it).
+#[test]
+fn el1_queues_a_pinned_thread_on_its_busy_cpu() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let pinned = zone
+        .alloc_record(ThreadIdentity {
+            affinity: 1 << 1,
+            ..identity(3)
+        })
+        .unwrap();
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x4000), &HostWait)
+        .unwrap();
+    let seq = zone.next_seq(pinned);
+    zone.enqueue(&guard, pinned, seq, MM, 0x4000, u32::MAX, 0)
+        .unwrap();
+    zone.publish_park(pinned, seq);
+    drop(guard);
+    // OTHER (CPU 1) is running a thread, not idle.
+    assert_eq!(zone.placement(pinned, SLOT), Some(OTHER));
+    let (woken, effects) = wake_effects(&zone, 0x4000, 1, SLOT);
+    assert_eq!(woken.unwrap(), [pinned]);
+    assert_eq!(
+        zone.record(pinned).claim(),
+        Claim::Queued { slot: OTHER, seq }
+    );
+    assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), [OTHER]);
+    assert!(!effects.queued_own && !effects.misplaced);
+}
+
+/// A floating thread whose affinity excludes the waker's CPU, with no slot
+/// in the guest that may run it, is refused (the host places it); one
+/// queued on the waker's slot anyway is reported misplaced.
 #[test]
 fn el1_honours_affinity_for_floating_threads() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
+    // CPU 1's slot is stopped at a host exit.
+    zone.leave_guest(OTHER, &HostWait);
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, 0x4000), &HostWait)
         .unwrap();
@@ -1246,7 +1282,8 @@ fn el1_honours_affinity_for_floating_threads() {
     assert_eq!(zone.placement(pinned, SLOT), None);
     let (woken, _) = wake_effects(&zone, 0x4000, 1, SLOT);
     assert_eq!(woken, Err(WakeRefusal::Unplaceable));
-    // CPU 1's slot idles: it takes the pinned thread.
+    // CPU 1's slot returns and idles: it takes the pinned thread.
+    zone.enter_guest(OTHER);
     assert!(!zone.enter_idle(OTHER, false));
     assert_eq!(zone.placement(pinned, SLOT), Some(OTHER));
     let (woken, _) = wake_effects(&zone, 0x4000, 1, SLOT);

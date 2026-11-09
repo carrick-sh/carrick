@@ -3169,9 +3169,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if let Some(idle) = self.find_idle(rec, waker) {
             return Some(idle);
         }
-        (self.runs_mm_of(waker, rec)
-            && rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed)))
-        .then_some(waker)
+        if self.runs_mm_of(waker, rec)
+            && rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed))
+        {
+            return Some(waker);
+        }
+        // Every slot the thread may run on is busy: queue it on the least
+        // loaded one in the guest, which the reschedule SGI tells to switch
+        // (the host's own placement, `place_in_guest`, does the same). A
+        // refusal here forwards the wake, and a native process has no host
+        // lane to serve it (#1941).
+        self.least_loaded_except(rec, true, Some(waker))
     }
 
     /// Whether `slot` may run `rec` at EL0 by the address space installed on
@@ -3279,10 +3287,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             )
         {
             let is_home = home == Some(target);
+            let state = self.slot(target).state();
+            // A busy slot takes a thread that may run there, as an idle
+            // one does: the queue is its own, and the SGI below makes it
+            // reschedule ([`Self::placement`]).
             let takes = if is_home {
-                self.slot(target).state().in_guest()
+                state.in_guest()
             } else {
                 self.accepts(target, rec, false)
+                    || (state.in_guest() && self.accepts_running(target, rec))
             };
             if takes {
                 if !rec.cas(Claim::Parked { seq }, Claim::Queued { slot: target, seq }) {
