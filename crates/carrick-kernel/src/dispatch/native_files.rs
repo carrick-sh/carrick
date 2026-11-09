@@ -3058,6 +3058,231 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_child_mutations_refuse_watched_targets_before_effects() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let mut fixture = mutation_child(upper);
+            let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+            let file = fixture.venue_open(&authority, b"kept", CREATE, 0o644);
+            assert_eq!(fixture.venue_write(file, b"kept"), 4);
+            assert_eq!(
+                fixture.child_call(
+                    &authority,
+                    34,
+                    [FDCWD as u64, 0, 0o755, 0, 0, 0],
+                    &[(1, b"kept-dir")]
+                ),
+                0
+            );
+            let inotify = root_syscall(&mut fixture.dispatcher, 26, [0; 6], &[]);
+            assert!(inotify >= 0);
+            assert!(
+                root_syscall(
+                    &mut fixture.dispatcher,
+                    27,
+                    [inotify as u64, 0x4_0000, 0xfff, 0, 0, 0],
+                    b"/tmp\0"
+                ) >= 0
+            );
+            for (ordinal, args, inputs) in [
+                (
+                    34,
+                    [FDCWD as u64, 0, 0o755, 0, 0, 0],
+                    vec![(1, b"new".as_slice())],
+                ),
+                (
+                    35,
+                    [FDCWD as u64, 0, 0, 0, 0, 0],
+                    vec![(1, b"kept".as_slice())],
+                ),
+                (
+                    35,
+                    [FDCWD as u64, 0, 0x200, 0, 0, 0],
+                    vec![(1, b"kept-dir".as_slice())],
+                ),
+                (
+                    36,
+                    [0, FDCWD as u64, 0, 0, 0, 0],
+                    vec![(0, b"kept".as_slice()), (2, b"new".as_slice())],
+                ),
+                (
+                    37,
+                    [FDCWD as u64, 0, FDCWD as u64, 0, 0, 0],
+                    vec![(1, b"kept".as_slice()), (3, b"new".as_slice())],
+                ),
+                (
+                    38,
+                    [FDCWD as u64, 0, FDCWD as u64, 0, 0, 0],
+                    vec![(1, b"kept".as_slice()), (3, b"new".as_slice())],
+                ),
+                (
+                    88,
+                    [FDCWD as u64, 0, 0, 0, 0, 0],
+                    vec![(1, b"kept".as_slice())],
+                ),
+                (45, [0, 1, 0, 0, 0, 0], vec![(0, b"kept".as_slice())]),
+                (46, [file as u64, 1, 0, 0, 0, 0], vec![]),
+            ] {
+                assert_eq!(
+                    fixture.child_call(&authority, ordinal, args, &inputs),
+                    -38,
+                    "{upper:?}: watched ordinal {ordinal}"
+                );
+            }
+            assert_eq!(fixture.venue_contents(&authority, b"kept"), b"kept");
+            assert!(fixture.venue_open(&authority, b"kept-dir", 0, 0) >= 0);
+            assert_eq!(fixture.venue_open(&authority, b"new", 0, 0), -2);
+        }
+    }
+
+    #[test]
+    fn native_truncation_refuses_finite_or_unstamped_limits_before_resize() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = mutation_child(upper);
+            let authority = authority_of(&fixture.dispatcher);
+            let file = fixture.venue_open(&authority, b"/tmp/limited-size", CREATE, 0o644);
+            assert_eq!(fixture.venue_write(file, b"kept"), 4);
+            for limit in [0, 4096] {
+                let mut fd = record(
+                    fixture.table,
+                    HostFileOp::Ftruncate,
+                    file as i32,
+                    [1, limit, 0, 0],
+                    &[],
+                    0,
+                );
+                assert_eq!(fixture.serve(None, &mut fd), Err(NativeHostFileRefusal));
+                let mut path = record(
+                    fixture.table,
+                    HostFileOp::Truncate,
+                    FDCWD,
+                    [1, limit, 0, 0],
+                    b"/tmp/limited-size",
+                    0,
+                );
+                assert_eq!(
+                    fixture.serve(Some(&authority), &mut path),
+                    Err(NativeHostFileRefusal)
+                );
+                assert_eq!(
+                    fixture.venue_contents(&authority, b"/tmp/limited-size"),
+                    b"kept"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_child_basic_filesystem_sequences_compose_through_the_public_venue() {
+        let fixture = mutation_child(Upper::Host);
+        let authority = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+        for path in [b"a".as_slice(), b"a/b", b"/x", b"/x/y", b"/x/y/z"] {
+            assert_eq!(
+                fixture.child_call(
+                    &authority,
+                    34,
+                    [FDCWD as u64, 0, 0o755, 0, 0, 0],
+                    &[(1, path)]
+                ),
+                0
+            );
+        }
+        let (cwd, bytes) = fixture.result(
+            Some(&authority),
+            record(
+                fixture.table,
+                HostFileOp::Newfstatat,
+                FDCWD,
+                [0; 4],
+                b"a/b",
+                carrick_personality_linux::native_host_file::LINUX_STAT_BYTES + 4096,
+            ),
+        );
+        assert_eq!(cwd, 0);
+        assert_eq!(
+            &bytes[carrick_personality_linux::native_host_file::LINUX_STAT_BYTES..],
+            b"/tmp/a/b"
+        );
+        let file = fixture.venue_open(&authority, b"a.txt", CREATE, 0o644);
+        assert_eq!(fixture.venue_write(file, b"abcdef"), 6);
+        assert_eq!(
+            fixture.child_call(&authority, 46, [file as u64, 3, 0, 0, 0, 0], &[]),
+            0
+        );
+        assert_eq!(fixture.venue_contents(&authority, b"a.txt"), b"abc");
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                38,
+                [FDCWD as u64, 0, FDCWD as u64, 0, 0, 0],
+                &[(1, b"a.txt"), (3, b"b.txt")]
+            ),
+            0
+        );
+        assert_eq!(fixture.venue_contents(&authority, b"b.txt"), b"abc");
+        assert_eq!(fixture.venue_open(&authority, b"a.txt", 0, 0), -2);
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                37,
+                [FDCWD as u64, 0, FDCWD as u64, 0, 0, 0],
+                &[(1, b"b.txt"), (3, b"hard")]
+            ),
+            0
+        );
+        assert_eq!(fixture.venue_contents(&authority, b"hard"), b"abc");
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                88,
+                [FDCWD as u64, 0, 0, 0, 0, 0],
+                &[(1, b"b.txt")]
+            ),
+            0
+        );
+        let copied = fixture.venue_contents(&authority, b"b.txt");
+        let destination = fixture.venue_open(&authority, b"copy", CREATE, 0o644);
+        assert_eq!(fixture.venue_write(destination, &copied), 3);
+        assert_eq!(fixture.venue_contents(&authority, b"copy"), b"abc");
+        let append = fixture.venue_open(
+            &authority,
+            b"copy",
+            carrick_abi::LINUX_O_WRONLY | carrick_abi::LINUX_O_APPEND,
+            0,
+        );
+        assert_eq!(fixture.venue_write(append, b"def"), 3);
+        assert_eq!(fixture.venue_contents(&authority, b"copy"), b"abcdef");
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                34,
+                [FDCWD as u64, 0, 0o755, 0, 0, 0],
+                &[(1, b"rd")]
+            ),
+            0
+        );
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                35,
+                [FDCWD as u64, 0, 0x200, 0, 0, 0],
+                &[(1, b"rd")]
+            ),
+            0
+        );
+        assert_eq!(fixture.venue_open(&authority, b"rd", 0, 0), -2);
+        assert_eq!(
+            fixture.child_call(
+                &authority,
+                53,
+                [FDCWD as u64, 0, 0o640, 0, 0, 0],
+                &[(1, b"b.txt")]
+            ),
+            -38,
+            "chmod remains outside this slice"
+        );
+    }
+
     /// A watch anywhere in the run (here the root's inotify watch on
     /// `/etc`) leaves a native child's read-only opens served, as before
     /// write opens were: the open and its reads work, without the events a

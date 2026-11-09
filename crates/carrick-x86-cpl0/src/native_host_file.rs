@@ -7,6 +7,7 @@ pub(super) fn stage(
     call: &CanonicalCall,
     task: &CurrentTask,
     cpu_slot: u32,
+    origin: carrick_core_abi::service::ServiceOrigin,
 ) -> Option<HostFileStage> {
     let decoded = HostFileCall::decode(
         carrick_syscall_abi::CanonicalNr::new(call.canonical.raw()),
@@ -14,10 +15,16 @@ pub(super) fn stage(
     )?;
     // Descriptor-based reads remain on their existing route until slice 3
     // binds retained read/output preparation for every descriptor population.
-    if !matches!(
-        decoded,
-        HostFileCall::Openat { .. } | HostFileCall::Faccessat { .. } | HostFileCall::Statx { .. }
-    ) {
+    let mutation = decoded.uses_child_mutation_venue();
+    if (mutation && origin == carrick_core_abi::service::ServiceOrigin::Initial)
+        || (!mutation
+            && !matches!(
+                decoded,
+                HostFileCall::Openat { .. }
+                    | HostFileCall::Faccessat { .. }
+                    | HostFileCall::Statx { .. }
+            ))
+    {
         return None;
     }
     let Some(venue) = carrick_el1_linux::ipc::guest_venue(cpu_slot) else {

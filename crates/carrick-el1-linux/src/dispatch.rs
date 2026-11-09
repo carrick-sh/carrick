@@ -1058,6 +1058,7 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
     task: &CurrentTask,
     validator: &V,
     table: [u64; 3],
+    origin: carrick_core_abi::service::ServiceOrigin,
     mut descriptor: impl FnMut(i32) -> Option<NativeDescriptor>,
     releases: &mut dyn FnMut(&mut [carrick_core_abi::host_file::MapSourceReply]) -> usize,
 ) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
@@ -1072,6 +1073,11 @@ pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
             frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
         ],
     )?;
+    if origin == carrick_core_abi::service::ServiceOrigin::Initial
+        && call.uses_child_mutation_venue()
+    {
+        return None;
+    }
     let mut namespace = NativeNamespace {
         table,
         resolve: &mut descriptor,
@@ -1287,6 +1293,11 @@ fn arm_native_service_exit(
                     task,
                     &file::HardwareValidator,
                     table,
+                    if child() {
+                        carrick_core_abi::service::ServiceOrigin::Descendant
+                    } else {
+                        carrick_core_abi::service::ServiceOrigin::Initial
+                    },
                     |fd| ipc::native_descriptor(&venue, table, fd),
                     &mut |out| native_source_releases(task, access, lock_slot, out),
                 )
@@ -4999,6 +5010,7 @@ mod tests {
                 &task,
                 &Resident,
                 table,
+                carrick_core_abi::service::ServiceOrigin::Descendant,
                 |fd| {
                     asked = Some(fd);
                     Some(NativeDescriptor::InZone(InZoneKind::Pipe))
@@ -5021,6 +5033,7 @@ mod tests {
             &task,
             &Resident,
             table,
+            carrick_core_abi::service::ServiceOrigin::Descendant,
             |_| {
                 Some(NativeDescriptor::HostBacked {
                     access: DescriptionAccess::ReadWrite,
@@ -5041,7 +5054,15 @@ mod tests {
         // A contended namespace keeps the call's old route, and a non-SVC
         // exit is never a host-file call.
         assert_eq!(
-            native_host_file_stage(&frame, &task, &Resident, table, |_| None, &mut |_| 0),
+            native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                |_| None,
+                &mut |_| 0
+            ),
             None
         );
         frame.esr = 0x24 << 26;
@@ -5051,6 +5072,7 @@ mod tests {
                 &task,
                 &Resident,
                 table,
+                carrick_core_abi::service::ServiceOrigin::Descendant,
                 |_| { panic!("a fault never resolves descriptors") },
                 &mut |_| 0
             ),
@@ -5063,6 +5085,83 @@ mod tests {
     /// unrouted (only the carrier observes host descriptions); the native
     /// venue must stage it as one readiness snapshot instead of letting it
     /// reach the carrier as a bare crossing that is refused with ENOSYS.
+    #[test]
+    fn native_mutation_staging_is_child_scoped_and_root_keeps_its_host_route() {
+        use carrick_core_abi::service::ServiceOrigin;
+        use carrick_personality_linux::native_host_file::{DescriptionAccess, HostFileStage};
+        #[repr(align(4096))]
+        struct Path([u8; 4096]);
+        impl file::MemoryValidator for Path {
+            fn readable_bytes(&self, address: u64, len: usize) -> usize {
+                let base = self.0.as_ptr().addr() as u64;
+                if address < base {
+                    0
+                } else {
+                    (base + 4096).saturating_sub(address).min(len as u64) as usize
+                }
+            }
+            fn writable_bytes(&self, address: u64, len: usize) -> usize {
+                self.readable_bytes(address, len)
+            }
+        }
+        let mut path = Path([0; 4096]);
+        path.0[..4].copy_from_slice(b"path");
+        let pointer = path.0.as_ptr().addr() as u64;
+        let cwd = carrick_syscall_abi::LINUX_AT_FDCWD;
+        let task = CurrentTask::new();
+        for (ordinal, args) in [
+            (34, [cwd, pointer, 0o755, 0, 0, 0]),
+            (35, [cwd, pointer, 0, 0, 0, 0]),
+            (36, [pointer, cwd, pointer, 0, 0, 0]),
+            (37, [cwd, pointer, cwd, pointer, 0, 0]),
+            (38, [cwd, pointer, cwd, pointer, 0, 0]),
+            (276, [cwd, pointer, cwd, pointer, 1, 0]),
+            (88, [cwd, pointer, 0, 0, 0, 0]),
+            (45, [pointer, 1, 0, 0, 0, 0]),
+            (46, [1, 1, 0, 0, 0, 0]),
+        ] {
+            let mut frame = TrapFrame {
+                esr: 0x15 << 26,
+                ..TrapFrame::default()
+            };
+            frame.x[..6].copy_from_slice(&args);
+            frame.x[8] = ordinal;
+            let descriptor = |_| {
+                Some(NativeDescriptor::HostBacked {
+                    access: DescriptionAccess::ReadWrite,
+                })
+            };
+            assert_eq!(
+                native_host_file_stage(
+                    &frame,
+                    &task,
+                    &path,
+                    [3, 4, 5],
+                    ServiceOrigin::Initial,
+                    descriptor,
+                    &mut |_| 0,
+                ),
+                None,
+                "initial ordinal {ordinal} keeps its host wrapper"
+            );
+            assert!(
+                matches!(
+                    native_host_file_stage(
+                        &frame,
+                        &task,
+                        &path,
+                        [3, 4, 5],
+                        ServiceOrigin::Descendant,
+                        descriptor,
+                        &mut |_| 0,
+                    ),
+                    Some(HostFileStage::Request { .. })
+                ),
+                "child ordinal {ordinal} stages"
+            );
+        }
+    }
+
     #[test]
     fn native_ppoll_over_host_stdio_crosses_as_a_readiness_snapshot() {
         use carrick_personality_linux::native_host_file::{
@@ -5105,9 +5204,15 @@ mod tests {
             resolves_path,
             map,
             chdir,
-        }) = native_host_file_stage(&frame, &task, &Resident, table, host, &mut |_| {
-            panic!("a poll releases no mapping sources")
-        })
+        }) = native_host_file_stage(
+            &frame,
+            &task,
+            &Resident,
+            table,
+            carrick_core_abi::service::ServiceOrigin::Descendant,
+            host,
+            &mut |_| panic!("a poll releases no mapping sources"),
+        )
         else {
             panic!("a host-bound ppoll from a native process must stage a readiness snapshot");
         };
@@ -5149,6 +5254,7 @@ mod tests {
                 &task,
                 &Resident,
                 table,
+                carrick_core_abi::service::ServiceOrigin::Descendant,
                 |fd| Some(if fd == 0 {
                     NativeDescriptor::InZone(InZoneKind::Pipe)
                 } else {
@@ -6100,6 +6206,11 @@ mod tests {
                 &task,
                 &Resident,
                 [3, 4, 5],
+                if child {
+                    carrick_core_abi::service::ServiceOrigin::Descendant
+                } else {
+                    carrick_core_abi::service::ServiceOrigin::Initial
+                },
                 |_| {
                     Some(NativeDescriptor::HostBacked {
                         access: DescriptionAccess::ReadWrite,
