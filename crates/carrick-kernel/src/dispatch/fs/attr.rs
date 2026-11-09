@@ -642,10 +642,10 @@ impl<'a> FsView<'a> {
         if path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
-        let path = match this.resolve_at_path(dirfd, &path) {
+        let path = match this.resolve_at_path(dirfd, path) {
             Ok(path) => path,
             Err(errno) => {
-                crate::probes::fs_op("utimensat:resolve_err", &path, errno.get());
+                crate::probes::fs_op("utimensat:resolve_err", path, errno.get());
                 return Ok(DispatchOutcome::errno(errno));
             }
         };
