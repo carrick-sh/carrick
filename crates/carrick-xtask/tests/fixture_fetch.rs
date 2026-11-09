@@ -27,7 +27,7 @@ fn publisher_fetches_before_the_offline_environment_is_created() {
     let source = include_str!("../src/fixtures.rs");
     let build = &source[source.find("pub fn build(").unwrap()..];
     let fetch = build.find("fetch_dependencies(root)?").unwrap();
-    let environment = build.find("BuildEnvironment::new(root)?").unwrap();
+    let environment = build.find("BuildEnvironment::isolated(").unwrap();
     assert!(
         fetch < environment,
         "the shared cache must exist before the isolated environment links it"

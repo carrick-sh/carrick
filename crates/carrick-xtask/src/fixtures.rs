@@ -1018,9 +1018,12 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     // environment shares that cache only if it exists when it is created.
     fetch_dependencies(root)?;
     source_hashes(root, &[])?;
-    let environment = BuildEnvironment::new(root)?;
-    let snapshot = tempfile::tempdir_in(environment.scratch_root())?;
-    let archive = snapshot.path().join("source.tar");
+    // Stable per-SHA build paths under an exclusive per-SHA lock: a random
+    // checkout path changes Cargo's `-C metadata` for path dependencies and
+    // embedded source paths (#1891).
+    let environment =
+        BuildEnvironment::isolated(root, &environment::default_isolation_root(), &expected)?;
+    let archive = environment.scratch_root().join("source.tar");
     run_build(
         environment
             .configure(Command::new("git").current_dir(root))
@@ -1028,7 +1031,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
             .arg(&archive)
             .arg(&expected.0),
     )?;
-    let source = snapshot.path().join("source");
+    let source = environment.checkout();
     fs::create_dir(&source)?;
     run_build(
         environment
@@ -1158,6 +1161,11 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
             target,
         };
         validate_executable(&source.join(&executable.path), &executable)?;
+        environment::reject_embedded_path(
+            &executable.path,
+            &fs::read(source.join(&executable.path))?,
+            environment.scratch_root(),
+        )?;
         executables.push(executable);
     }
     let manifest = Manifest {
