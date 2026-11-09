@@ -653,6 +653,115 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
     );
 }
 
+/// #1941: an EL1 futex wake always finishes in the ring, whatever its
+/// waiters need. `wake_word` returns a `Served`, never the forward a
+/// declined wake took (a ring-owned fork child's forward answered ENOSYS and
+/// lost the wake). Three waiters EL1 used to refuse, each served here:
+/// - pinned to a vCPU busy running another thread (`Unplaceable`): queued
+///   there, with a reschedule SGI, as the host's `place_in_guest` does;
+/// - pinned to a vCPU stopped at a host exit (`Unplaceable`, no slot in the
+///   guest): queued on the waker, misplaced, for its host exit to relocate;
+/// - parked on two futexes (`MultiEntry`, a host `futex_waitv` park): handed
+///   to its host continuation through the completion chain.
+#[test]
+fn an_el1_futex_wake_always_finishes_in_ring() {
+    const OTHER: SlotId = SlotId::new(4);
+    let park = |zone: &ZoneTables, tid: u64, affinity: u64, words: &[u64]| {
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                affinity,
+                ..identity(tid)
+            })
+            .unwrap();
+        assert!(zone.mark_native_owned(record));
+        // SAFETY: freshly allocated and unpublished.
+        unsafe {
+            *zone.record(record).ctx_mut() =
+                Aarch64ParkedContext::from_register(thread_ctx(tid, words[0]), TTBR_MM, MM, 1)
+        };
+        let seq = zone.next_seq(record);
+        for (index, uaddr) in words.iter().enumerate() {
+            let guard = zone
+                .lock(ZoneTables::bucket_of_with_context(MM, *uaddr), &HostWait)
+                .unwrap();
+            zone.enqueue(&guard, record, seq, MM, *uaddr, u32::MAX, index as u32)
+                .unwrap();
+        }
+        zone.publish_park(record, seq);
+        (record, seq)
+    };
+    let setup = || {
+        let zone = zone();
+        // SLOT runs guest CPU 0 and OTHER guest CPU 1, each busy running a
+        // loaded thread (neither idle).
+        for (slot, cpu) in [(SLOT, 0), (OTHER, 1)] {
+            assert!(zone.reset_slot(slot));
+            host_publish(&zone, slot, MM, Some(cpu), 0);
+            zone.enter_guest(slot);
+        }
+        zone.slot(OTHER).set_sgi_target(0x77);
+        zone
+    };
+    let wake = |zone: &ZoneTables, uaddr: u64| {
+        let task = task_for(101);
+        let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
+        let served = serve_on(SLOT, &mut frame, &task, zone, &mut cpu, counters());
+        (served, frame.x[0], cpu.sgis, task)
+    };
+
+    // Pinned to a busy vCPU.
+    let zone = setup();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let (b, seq) = park(&zone, 202, 1 << 1, &[uaddr]);
+    let (served, x0, sgis, task) = wake(&zone, uaddr);
+    assert_eq!(served, RETURNED, "a busy pinned waiter is never refused");
+    assert_eq!(x0, 1);
+    assert_eq!(zone.record(b).claim(), Claim::Queued { slot: OTHER, seq });
+    assert_eq!(sgis, [0x77 | (u64::from(GIC_RESCHED_INTID) << 24)]);
+    assert_eq!(zone.slot(SLOT).queued(), 0, "nothing queued on the waker");
+    assert!(!task.linux.has_pending_host_work());
+
+    // Pinned to a vCPU stopped at a host exit.
+    let zone = setup();
+    zone.leave_guest(OTHER, &HostWait);
+    let (b, seq) = park(&zone, 202, 1 << 1, &[uaddr]);
+    let (served, x0, _, task) = wake(&zone, uaddr);
+    assert_eq!(
+        served, RETURNED,
+        "a waiter no slot may take is never refused"
+    );
+    assert_eq!(x0, 1);
+    assert_eq!(zone.record(b).claim(), Claim::Queued { slot: SLOT, seq });
+    assert_eq!(zone.counters.el1_misplaced.load(Ordering::Relaxed), 1);
+    assert!(
+        task.linux.has_pending_host_work(),
+        "the waker's host exit relocates it"
+    );
+
+    // Parked on two futexes.
+    let zone = setup();
+    let other_word = AtomicU32::new(0);
+    let other = other_word.as_ptr() as u64;
+    let (b, seq) = park(&zone, 202, 0, &[other, uaddr]);
+    let (served, x0, _, task) = wake(&zone, uaddr);
+    assert_eq!(served, RETURNED, "a futex_waitv waiter is never refused");
+    assert_eq!(x0, 1);
+    assert!(matches!(
+        zone.record(b).claim(),
+        Claim::Transferring { seq: s, .. } if s == seq
+    ));
+    assert!(
+        task.linux.has_pending_host_work(),
+        "the waker's host boundary settles the completion chain"
+    );
+    let mut handed = Vec::new();
+    zone.take_completion_handbacks(&HostWait, &mut |record| handed.push(record.id));
+    assert_eq!(handed, [b]);
+    assert_eq!(zone.record(b).entry_count(), 0);
+    assert_eq!(zone.record(b).result(), 1, "the index that fired");
+}
+
 /// Timer preemption at EL0: a thread queued behind a compute loop runs once
 /// its slice has passed, and the preempted loop later resumes with exactly
 /// its registers (no syscall result applied); neither ever left the guest.

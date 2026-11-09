@@ -680,7 +680,7 @@ impl TerminalNotification {
         zone: &carrick_sched_core::ZoneTables<C>,
         slot: carrick_sched_core::SlotId,
         wait: &impl carrick_sched_core::ShortLockWait,
-    ) -> Result<carrick_sched_core::WakeEffects, carrick_sched_core::WakeRefusal> {
+    ) -> carrick_sched_core::WakeEffects {
         let guard = zone.short_lock(
             carrick_sched_core::ZoneTables::<C>::bucket_of_with_context(
                 self.mm.raw(),
@@ -698,8 +698,8 @@ impl TerminalNotification {
             carrick_sched_core::Waker::El1 { slot },
             &mut [],
             &mut effects,
-        )?;
-        Ok(effects)
+        );
+        effects
     }
 }
 

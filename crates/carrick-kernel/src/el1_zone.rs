@@ -182,7 +182,7 @@ pub(crate) fn complete_object_wake<C: carrick_el1_abi::EntryContext>(
         carrick_sched_core::Waker::El1 { slot } => Some(slot),
         carrick_sched_core::Waker::Host => None,
     };
-    assert!(own.is_some() || (!effects.queued_own && !effects.misplaced));
+    assert!(own.is_some() || (!effects.queued_own && !effects.owes_host_boundary()));
     for slot in effects
         .sgi_slots()
         .chain(own.filter(|_| effects.queued_own))
@@ -190,7 +190,7 @@ pub(crate) fn complete_object_wake<C: carrick_el1_abi::EntryContext>(
         zone.owe_resched(slot);
         resched_slot(slot);
     }
-    if effects.misplaced
+    if effects.owes_host_boundary()
         && let Some(slot) = own
     {
         kick_slot(slot);
@@ -680,7 +680,7 @@ fn requeue<E>(
         let mut remaining = wake_count;
         let mut batch = [const { carrick_el1_abi::WakeRecord::Empty }; 64];
         while remaining > 0 {
-            let Ok(n) = zone.wake(
+            let n = zone.wake(
                 from_guard,
                 mm,
                 from,
@@ -688,9 +688,7 @@ fn requeue<E>(
                 remaining,
                 Waker::Host,
                 &mut batch,
-            ) else {
-                break;
-            };
+            );
             transfers.extend(
                 batch
                     .iter_mut()

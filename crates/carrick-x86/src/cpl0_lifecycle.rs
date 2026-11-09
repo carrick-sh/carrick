@@ -555,15 +555,15 @@ impl NativeLane<'_> {
                 .checked_add(size as u64)
                 .is_some_and(|end| end <= self.lane.data_end)
     }
-    fn wake_word(&mut self, mm: u64, address: u64, mask: u32, limit: u32) -> bool {
-        let Some(guard) = self
-            .zone
-            .lock(ZoneTables::bucket_of(mm, address), &BoundedSpin(1024))
-        else {
-            return false;
-        };
+    /// A futex wake always finishes in the ring (#1941): the bucket lock is
+    /// short, and [`ZoneTables::wake_placed`] never refuses an EL1 waker.
+    fn wake_word(&mut self, mm: u64, address: u64, mask: u32, limit: u32) {
+        let guard = self.zone.short_lock(
+            ZoneTables::bucket_of(mm, address),
+            &carrick_sched_core::ShortLockSpin,
+        );
         let mut effects = WakeEffects::default();
-        let result = self.zone.wake_placed(
+        let count = self.zone.wake_placed(
             &guard,
             mm,
             address,
@@ -575,13 +575,8 @@ impl NativeLane<'_> {
             &mut [],
             &mut effects,
         );
-        if let Ok(count) = result {
-            self.frame.rax = u64::from(count);
-            self.lane.wakes += u64::from(count);
-            true
-        } else {
-            false
-        }
+        self.frame.rax = u64::from(count);
+        self.lane.wakes += u64::from(count);
     }
     fn switch_next(&mut self) -> Option<carrick_core::Served> {
         let switched = self.zone.switch_in_full(self.lane.slot)?;
@@ -912,7 +907,8 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             address.raw(),
             carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
             carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
-        )
+        );
+        true
     }
     fn release_current(
         &mut self,
@@ -1184,22 +1180,17 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             LifecycleInvariant::ExitPublication,
         );
         let mut effects = WakeEffects::default();
-        let count = committed(
-            self.zone
-                .wake_placed(
-                    &guard.bucket,
-                    crate::process::parent_mm(),
-                    CHILD_WAIT_KEY,
-                    u32::MAX,
-                    1,
-                    Waker::El1 {
-                        slot: self.lane.slot,
-                    },
-                    &mut [],
-                    &mut effects,
-                )
-                .ok(),
-            LifecycleInvariant::ExitWake,
+        let count = self.zone.wake_placed(
+            &guard.bucket,
+            crate::process::parent_mm(),
+            CHILD_WAIT_KEY,
+            u32::MAX,
+            1,
+            Waker::El1 {
+                slot: self.lane.slot,
+            },
+            &mut [],
+            &mut effects,
         );
         if count != 0 {
             let child = committed(
@@ -1266,9 +1257,9 @@ impl FutexVenue for NativeLane<'_> {
         address: carrick_guest_arch::UserVa,
         mask: u32,
         limit: u32,
-    ) -> Option<Self::Served> {
-        self.wake_word(mm.raw(), address.raw(), mask, limit)
-            .then_some(carrick_core::Served::Returned { switched: false })
+    ) -> Self::Served {
+        self.wake_word(mm.raw(), address.raw(), mask, limit);
+        carrick_core::Served::Returned { switched: false }
     }
     fn wait(&mut self, wait: FutexWait) -> Option<Self::Served> {
         let zone = self.zone;

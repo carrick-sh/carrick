@@ -202,7 +202,7 @@ pub fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
         carrick_sched_core::Waker::El1 { slot } => Some(slot),
         carrick_sched_core::Waker::Host => None,
     };
-    assert!(own.is_some() || (!effects.queued_own && !effects.misplaced));
+    assert!(own.is_some() || (!effects.queued_own && !effects.owes_host_boundary()));
     for slot in effects
         .sgi_slots()
         .chain(own.filter(|slot| effects.queued_own && Some(*slot) != venue))
@@ -219,7 +219,7 @@ pub fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
             },
         );
     }
-    if effects.misplaced
+    if effects.owes_host_boundary()
         && let Some(slot) = own
     {
         (marks.0)(slot);
@@ -384,7 +384,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
             self.zone.note_queued_since(self.slot, self.cpu.now());
             self.program_timer(true);
         }
-        if effects.misplaced {
+        if effects.owes_host_boundary() {
             self.task.linux.mark_pending_host_work();
         }
     }

@@ -3123,7 +3123,7 @@ pub use carrick_sched_core::{
     ExcludedEditor, Exhausted, FirstEntryActivation, Handback, HostClaim, HostPlacement,
     HostTransfer, LockWait, ParkedContextRead, RecordId, RecordRef, Requeue, ServiceHead,
     SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects, WakeRecord,
-    WakeRefusal, Waker, ZONE_SLOTS,
+    Waker, ZONE_SLOTS,
 };
 
 /// The ARM guest and its carrier share one record context type. Every zone

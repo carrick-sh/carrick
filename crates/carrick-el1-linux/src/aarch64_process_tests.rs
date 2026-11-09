@@ -3842,45 +3842,6 @@ impl super::thread_setup::LifecycleVenue for Fixture {
         }
         Some(unsafe { &*(address as *const ThreadControlSlot) })
     }
-    fn wake_unplaceable_wait(
-        &self,
-        channel: super::native_process_runtime::ProcessWaitChannel,
-        _slot: SlotId,
-    ) -> Result<(), super::native_process_runtime::NativeProcessError> {
-        let mut transfers = Vec::new();
-        let guard = self
-            .zone
-            .lock(
-                ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(
-                    channel.mm.raw(),
-                    channel.address.get(),
-                ),
-                &carrick_sched_core::ShortLockSpin,
-            )
-            .unwrap();
-        let _ = self.zone.wake_host(
-            &guard,
-            channel.mm.raw(),
-            channel.address.get(),
-            u32::MAX,
-            u32::MAX,
-            false,
-            &mut |transfer| transfers.push(transfer),
-            &mut |_| panic!("must hand back unplaceable wait to host"),
-        );
-        drop(guard);
-        for transfer in transfers {
-            assert!(
-                transfer
-                    .finish(&carrick_sched_core::ShortLockSpin, &|owned| {
-                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                    })
-                    .is_some()
-            );
-        }
-        self.task.linux.mark_pending_host_work();
-        Ok(())
-    }
 }
 
 #[test]
@@ -9100,6 +9061,10 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
     assert_eq!(fixture.page.live(), 0);
 }
 
+/// The unadopted sibling's terminal notification wakes a closing owner no
+/// guest slot may run now: in the ring, never refused (#1941). The owner is
+/// queued on the waker's slot, misplaced, and the waker's host boundary
+/// relocates it (the host crossing this used to take is gone).
 #[test]
 fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -9143,9 +9108,9 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
                 carrick_personality_linux::dispatch::CompletionRoute::Suspended
             );
             assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
-            // Make the parked closing owner unplaceable in the zone so the
-            // unadopted sibling's venue-absent terminal notification must take
-            // the unplaceable host-handback branch.
+            // Make the parked closing owner unplaceable in the zone: no
+            // guest slot may run it when the unadopted sibling's
+            // venue-absent terminal notification wakes it.
             fixture.zone.unhome(fixture.slot, leader_record, 1);
             fixture.zone.publish_slot(fixture.slot, 0, Some(0), 1);
             fixture.zone.release_space(fixture.slot);
@@ -9188,9 +9153,15 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
     assert!(
         matches!(
             fixture.zone.record(leader_record).claim(),
-            carrick_el1_abi::Claim::Host { .. }
+            carrick_el1_abi::Claim::Queued { slot, .. } if slot == fixture.slot
         ),
-        "venue-absent unplaceable wake must hand the closing owner back to host"
+        "venue-absent unplaceable wake queues the closing owner on the waker: {:?}",
+        fixture.zone.record(leader_record).claim()
+    );
+    assert_eq!(
+        fixture.zone.counters.el1_misplaced.load(Ordering::Acquire),
+        1,
+        "misplaced, for the waker's host boundary to relocate"
     );
 }
 

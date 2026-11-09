@@ -328,6 +328,12 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         (u128::from(ns) * u128::from(self.cpu.freq()) / 1_000_000_000) as u64
     }
 
+    /// Serve a futex wake in the ring. It always finishes here (#1941): a
+    /// waiter no slot may take now is queued on this slot for the host to
+    /// relocate, and a `futex_waitv` waiter goes to its host continuation
+    /// through the completion chain; both owe the host boundary this
+    /// slot's exit gives. A forwarded wake has no server in a ring-owned
+    /// fork child (its answer was ENOSYS, and the waiter slept forever).
     pub fn wake_word(
         &mut self,
         frame: &mut TrapFrame,
@@ -335,7 +341,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         uaddr: u64,
         bitset: u32,
         count: u32,
-    ) -> Option<Served> {
+    ) -> Served {
         let (zone, slot) = (self.zone, self.slot);
         let was_empty = zone.slot(slot).queued() == 0;
         let guard = zone.short_lock(
@@ -343,33 +349,32 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             &ShortLockSpin,
         );
         let mut effects = WakeEffects::default();
-        let n = zone
-            .wake_placed(
-                &guard,
-                mm,
-                uaddr,
-                bitset,
-                count,
-                Waker::El1 { slot },
-                &mut [],
-                &mut effects,
-            )
-            .ok()?;
+        let n = zone.wake_placed(
+            &guard,
+            mm,
+            uaddr,
+            bitset,
+            count,
+            Waker::El1 { slot },
+            &mut [],
+            &mut effects,
+        );
         drop(guard);
         self.send_sgis(&effects);
         if effects.queued_own && was_empty {
             zone.note_queued_since(slot, self.cpu.now());
         }
-        if effects.misplaced {
-            // A woken thread sits here but may not run here: the exit this
-            // causes hands it to the host, which places it.
+        if effects.owes_host_boundary() {
+            // A woken thread sits here but may not run here, or a waitv
+            // waiter is on the completion chain: the exit this causes hands
+            // it to the host, which places or resumes it.
             self.task.linux.mark_pending_host_work();
         }
         if effects.queued_own {
             self.program_timer(true);
         }
         frame.x[0] = u64::from(n);
-        Some(Served::Returned { switched: false })
+        Served::Returned { switched: false }
     }
 
     #[allow(clippy::too_many_arguments)]

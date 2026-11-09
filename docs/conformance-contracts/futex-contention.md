@@ -309,3 +309,51 @@ Shared operation 265 observed at native pthread_join, non-NULL absolute
 WAIT_BITSET timeouts and PI variants remain outside this correction. Signed
 Node startup and GNU/musl forkexecpthread must still run on the director's Mac;
 passing this VM-free binding alone does not close the reported abort.
+
+## EL1 wakes always finish in the ring (#1941)
+
+Linux `FUTEX_WAKE` never fails for lack of a place to run a waiter: it wakes
+up to `count` eligible waiters and returns how many it woke. EL1 used to
+refuse a wake as a whole when one waiter could only run where EL1 could not
+queue it (`Unplaceable`) or parked on several futexes (`MultiEntry`), and the
+futex family then forwarded the call for the host to serve. A ring-owned fork
+child has no host task, so the final capture answered that forward with a
+counted ENOSYS. Guests ignore a wake's return value, so the waiter slept
+forever: `el1_sched_two_processes_share_vcpus` hung 10 of 10.
+
+`ZoneTables::wake_placed` now has no refusal. A waiter whose allowed CPUs are
+all busy is queued on the least loaded of them with a reschedule SGI, the
+choice the host's `place_in_guest` makes. A waiter no guest slot may run
+(its only slot stopped at a host exit) is queued on the waker's own slot and
+reported misplaced; the waker's host exit relocates it. A `futex_waitv`
+waiter, which only the host parks, is claimed into a transfer, its woken entry
+is unlinked under the bucket lock, and it goes to the carrier completion
+chain; the host boundary the waker then owes unlinks its other entries and
+hands it to its continuation with the index that fired. `wake_word` and the
+Linux `FutexVenue::wake` return a `Served`, so a decline cannot be written.
+The final capture treats a forward of an admitted private futex call from a
+task with no host route as `EntryBindingFatalReason::OwnedFamilyForward`,
+never a counted ENOSYS; unported futex operations keep the counted ENOSYS.
+
+Witnesses:
+
+- `forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu` (red on
+  main `fa3f74317`: `exit Refused(Served), x0 -38`): a real root and fork
+  child through `dispatch_arm_syscall_with_native_process` and
+  `native_unstaged_exit`; the child's wake returns 1 and queues the pinned
+  waiter on its busy vCPU with one SGI.
+- `an_el1_futex_wake_always_finishes_in_ring`: busy pinned, stopped pinned and
+  two-futex waiters, each served by `wake_word`.
+- `native_fork_child_owned_futex_forward_is_an_invariant_break`: the typed
+  fatal for admitted wakes and waits; ENOSYS for `FUTEX_REQUEUE`; the host
+  route for a root.
+- `carrick-sched-core`: `el1_queues_a_pinned_thread_on_its_busy_cpu`,
+  `el1_honours_affinity_for_floating_threads`,
+  `el1_hands_a_multi_entry_waiter_to_its_host_continuation` and
+  `unplaceable_parent_is_woken_once_in_ring`.
+
+The lifecycle wait-channel wake crossing (`cross_wait_channel_wake`, HVC
+`GRANT_OP_WAIT_CHANNEL_WAKE`) has no guest caller left; retiring its host
+handler is follow-up work. The signed end-to-end check (the two-process test
+from 0/10 to 10/10) is outstanding, and the separate `entry_binding` fatal at
+`arm_signal_user_return` may still end some signed runs of that test.

@@ -571,9 +571,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         #[cfg(test)]
                         probe: self.publication_wait_probe,
                     },
-                    |channel| self.service.wake_unplaceable_wait(channel),
-                )
-                .map_err(|_| NativeProcessError::Quarantined)?;
+                );
             }
             Ok(())
         })

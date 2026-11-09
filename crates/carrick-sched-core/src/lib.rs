@@ -1647,22 +1647,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> BucketGuard<'_, C> {
     }
 }
 
-/// A wake would need a feature the caller's venue does not serve.
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-pub enum WakeRefusal {
-    /// A matching waiter parks on several futexes (`futex_waitv`).
-    MultiEntry,
-    /// A waiter may run only where EL1 cannot queue it now: its home slot is
-    /// stopped at a host exit, or no slot its affinity allows is available.
-    Unplaceable,
-}
-
 /// What an EL1 wake did besides claiming its waiters: the slots owed a
 /// reschedule SGI once the waker released its locks, and whether it had to
 /// queue a waiter on its own slot although the waiter belongs elsewhere (the
@@ -1681,11 +1665,22 @@ pub struct WakeEffects {
     /// A woken thread was queued on the waker's own slot where it may not
     /// run; the waker must exit to the host.
     pub misplaced: bool,
+    /// A woken `futex_waitv` waiter (a host park) went to the carrier's
+    /// completion chain; the waker must exit to the host boundary that
+    /// settles the chain and hands the waiter to its continuation.
+    pub handed_to_host: bool,
     /// The waker's own run queue gained a thread.
     pub queued_own: bool,
 }
 
 impl WakeEffects {
+    /// Whether the waker owes the host a boundary: a misplaced thread for
+    /// it to relocate, or a completion chain for it to settle. Both ride
+    /// the waker's pending-host-work doorbell.
+    pub fn owes_host_boundary(&self) -> bool {
+        self.misplaced || self.handed_to_host
+    }
+
     /// Request a return-to-user reschedule through the existing IRQ lane.
     pub fn request_reschedule(&mut self, slot: SlotId) {
         self.push_sgi(slot);
@@ -3037,12 +3032,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// `bitset`, in queue order, under the lock `guard` holds. Returns the
     /// number woken and writes the woken records to `woken` (as many as fit).
     ///
-    /// An EL1 waker is refused as a whole (nothing changes) if a waiter it
-    /// would wake parks on several futexes, or if a waiter can only run where
-    /// EL1 cannot queue it now; it then forwards the syscall. A host waker
-    /// wakes at most `woken.len()` (the caller loops) and wakes a
-    /// `futex_waitv` park too: it must call [`Self::unlink_all`] for each
-    /// woken record after releasing `guard`.
+    /// An EL1 wake always finishes in the ring: it wakes every eligible
+    /// waiter up to `count` ([`Self::wake_placed`]). A host waker wakes at
+    /// most `woken.len()` (the caller loops) and wakes a `futex_waitv` park
+    /// too: it must call [`Self::unlink_all`] for each woken record after
+    /// releasing `guard`.
     #[allow(clippy::too_many_arguments)]
     pub fn wake<'a>(
         &'a self,
@@ -3053,7 +3047,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         count: u32,
         waker: Waker,
         woken: &mut [WakeRecord<'a, C>],
-    ) -> Result<u32, WakeRefusal> {
+    ) -> u32 {
         let mut effects = WakeEffects::default();
         self.wake_placed(guard, mm, uaddr, bitset, count, waker, woken, &mut effects)
     }
@@ -3062,10 +3056,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     ///
     /// EL1 places each woken thread ([`Self::placement`]): a home record on
     /// its home slot, any other on the slot it last ran on if that slot is
-    /// idle, else on another idle slot, else on the waker's own slot. It
-    /// claims a thread for another slot under that slot's lock, only while
-    /// the slot is in the guest, and falls back to its own run queue (which
-    /// is unbounded) when the slot it planned changed meanwhile.
+    /// idle, else on another idle slot, else on the waker's own slot, else
+    /// on a busy slot its affinity allows (with a reschedule SGI). It claims
+    /// a thread for another slot under that slot's lock, only while the slot
+    /// is in the guest, and falls back to its own run queue (which is
+    /// unbounded) when no slot may take it now or the slot it planned
+    /// changed meanwhile; a thread queued there that may not run there is
+    /// reported [`WakeEffects::misplaced`] for the host to relocate. A
+    /// `futex_waitv` waiter (only the host parks one) goes to the carrier's
+    /// completion chain ([`WakeEffects::handed_to_host`]).
+    ///
+    /// An EL1 wake is never refused (#1941): a refused wake used to forward,
+    /// and a ring-owned fork child has no host task to serve a forward, so
+    /// its wake answered ENOSYS and the waiter slept forever.
     #[allow(clippy::too_many_arguments)]
     pub fn wake_placed<'a>(
         &'a self,
@@ -3077,32 +3080,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         waker: Waker,
         woken: &mut [WakeRecord<'a, C>],
         effects: &mut WakeEffects,
-    ) -> Result<u32, WakeRefusal> {
+    ) -> u32 {
         let bucket = &self.buckets[guard.bucket];
-        // An EL1 wake is all or nothing: it must wake every eligible waiter
-        // up to `count` or refuse (the host then serves it), never return a
+        // An EL1 wake wakes every eligible waiter up to `count`, never a
         // short count. A host wake takes a batch and the caller loops.
         let limit = match waker {
-            Waker::El1 { slot } => {
-                // First pass: decide without changing anything.
-                let mut planned = 0usize;
-                let mut cursor = bucket.head.load(Ordering::Relaxed);
-                while cursor != NIL && planned < count as usize {
-                    let entry = self.entry(cursor);
-                    let next = entry.next.load(Ordering::Relaxed);
-                    if let Some(record) = self.eligible(entry, mm, uaddr, bitset) {
-                        if self.record(record).entry_count() != 1 {
-                            return Err(WakeRefusal::MultiEntry);
-                        }
-                        if self.placement(record, slot).is_none() {
-                            return Err(WakeRefusal::Unplaceable);
-                        }
-                        planned += 1;
-                    }
-                    cursor = next;
-                }
-                planned
-            }
+            Waker::El1 { .. } => count as usize,
             Waker::Host => (count as usize).min(woken.len()),
         };
         // Second pass: claim. A record the host claimed meanwhile (a signal
@@ -3119,6 +3102,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 let identity = self.record_ref(record);
                 let mut pending = WakeRecord::Guest(identity);
                 let claimed = match waker {
+                    Waker::El1 { .. } if self.record(record).entry_count() != 1 => {
+                        self.hand_waitv_to_host(guard, record, seq, index, cursor, effects)
+                    }
                     Waker::El1 { slot } => {
                         self.claim_for_el1(record, seq, index, slot, effects, || {
                             self.unlink(guard, cursor);
@@ -3152,12 +3138,46 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             }
             cursor = next;
         }
-        Ok(done as u32)
+        done as u32
+    }
+
+    /// EL1 wakes `record`, parked (`seq`) on several futexes: a
+    /// `futex_waitv` park, which only the host makes, so its thread resumes
+    /// through its host continuation. Under the bucket lock `guard` the
+    /// waker takes the record's transfer, removes the woken entry
+    /// (`entry_id`, waitv `index`) and queues the record on the carrier's
+    /// completion chain; the host boundary the waker then owes
+    /// ([`WakeEffects::handed_to_host`]) unlinks the record's other entries
+    /// and publishes it ([`Self::take_completion_handbacks`]). Its other
+    /// entries match no wake meanwhile: the record is no longer parked.
+    fn hand_waitv_to_host(
+        &self,
+        guard: &BucketGuard<'_, C>,
+        record: RecordId,
+        seq: u32,
+        index: u64,
+        entry_id: u32,
+        effects: &mut WakeEffects,
+    ) -> bool {
+        let Some(transfer) =
+            self.begin_host_transfer(self.record_ref(record), Claim::Parked { seq })
+        else {
+            return false;
+        };
+        let rec = self.record(record);
+        self.mark_woken(rec, index);
+        self.unlink(guard, entry_id);
+        self.drop_entry(rec, entry_id);
+        self.defer_completion_handback(transfer);
+        effects.handed_to_host = true;
+        self.counters.el1_wakes.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Where EL1 on `waker` may queue `record` now: `Some(waker)` for its own
-    /// run queue, `Some(other)` for another slot, `None` if nowhere (lock-free
-    /// hint; the claim re-checks under the slot's lock).
+    /// run queue, `Some(other)` for another slot, `None` if no slot in the
+    /// guest may run it (lock-free hint; the claim re-checks under the
+    /// slot's lock and otherwise queues it on the waker, misplaced).
     pub fn placement(&self, record: RecordId, waker: SlotId) -> Option<SlotId> {
         let rec = self.record(record);
         if let Some(home) = rec.home() {
@@ -3172,9 +3192,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if let Some(idle) = self.find_idle(rec, waker) {
             return Some(idle);
         }
-        (self.runs_mm_of(waker, rec)
-            && rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed)))
-        .then_some(waker)
+        if self.runs_mm_of(waker, rec)
+            && rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed))
+        {
+            return Some(waker);
+        }
+        // Every slot the thread may run on is busy: queue it on the least
+        // loaded one in the guest, which the reschedule SGI tells to switch.
+        // The host's own placement (`place_in_guest`) makes the same choice.
+        self.least_loaded_except(rec, true, Some(waker))
     }
 
     /// Whether `slot` may run `rec` at EL0 by the address space installed on
@@ -3282,10 +3308,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             )
         {
             let is_home = home == Some(target);
+            let state = self.slot(target).state();
+            // A busy slot takes a thread that may run there, as an idle one
+            // does: the queue is its own, and the SGI below makes it
+            // reschedule ([`Self::placement`]).
             let takes = if is_home {
-                self.slot(target).state().in_guest()
+                state.in_guest()
             } else {
                 self.accepts(target, rec, false)
+                    || (state.in_guest() && self.accepts_running(target, rec))
             };
             if takes {
                 if !rec.cas(Claim::Parked { seq }, Claim::Queued { slot: target, seq }) {
@@ -3463,6 +3494,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
     ) {
         self.unlink_object(record, wait, completion);
+        self.unlink_entries(record, wait);
+    }
+
+    /// Unlink and free every futex queue entry of `record` (the futex half
+    /// of [`Self::unlink_all`]), with the same ownership rule.
+    fn unlink_entries(&self, record: RecordId, wait: &impl LockWait<C>) {
         let rec = self.record(record);
         loop {
             let entry_id = rec.first_entry.load(Ordering::Acquire);

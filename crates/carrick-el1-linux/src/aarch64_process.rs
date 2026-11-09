@@ -2708,13 +2708,6 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             fatal();
         }
     }
-    fn wake_unplaceable_wait(
-        &mut self,
-        channel: super::native_process_runtime::ProcessWaitChannel,
-    ) -> Result<(), NativeProcessError> {
-        self.crossing
-            .cross_wait_channel_wake(channel, u64::from(self.worker()))
-    }
 
     #[inline(never)]
     fn copy_signal_bytes(

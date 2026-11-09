@@ -53,6 +53,15 @@ impl FutexCall {
     }
 }
 
+/// Whether AArch64 `ordinal` with these argument registers is a call the
+/// ring's futex family owns: an admitted private wake or wait ([`serve_futex`]
+/// serves it, and a wake always finishes there). Its decline is an
+/// invariant break for a task with no host route, never an unported call
+/// (#1941: a fork child's declined wake was answered a counted ENOSYS).
+pub fn ring_owned_futex(ordinal: carrick_guest_arch::NativeOrdinal, args: [u64; 6]) -> bool {
+    ordinal.raw() == SYS_FUTEX as u64 && FutexCall { args }.admitted()
+}
+
 /// Custody of the original expiry while the futex operand waits for its owner.
 /// This is moved with the operation; it is never stored in a register save area.
 pub struct RelativeFutexWait {
@@ -73,13 +82,11 @@ pub trait FutexVenue {
     }
     fn invalid(&mut self, result: SyscallResult) -> Option<Self::Served>;
 
-    fn wake(
-        &mut self,
-        mm: ReservationMm,
-        address: UserVa,
-        bitset: u32,
-        limit: u32,
-    ) -> Option<Self::Served>;
+    /// An admitted wake always finishes in the venue: no `None` to decline
+    /// it with (#1941; a declined wake forwarded, and a ring-owned fork
+    /// child's forward answers ENOSYS).
+    fn wake(&mut self, mm: ReservationMm, address: UserVa, bitset: u32, limit: u32)
+    -> Self::Served;
     fn wait(&mut self, wait: FutexWait) -> Option<Self::Served>;
 }
 
@@ -109,7 +116,7 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
         return venue.invalid(SyscallResult::new(LINUX_EINVAL.guest_retval()));
     }
     if matches!(op, FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE) {
-        return venue.wake(mm, address, bitset, expected as i32 as u32);
+        return Some(venue.wake(mm, address, bitset, expected as i32 as u32));
     }
     let deadline = if let Some(deadline) = venue.retained_deadline() {
         Some(deadline)

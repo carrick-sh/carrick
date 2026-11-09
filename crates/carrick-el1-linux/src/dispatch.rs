@@ -777,6 +777,10 @@ pub(super) enum NativeUnstagedExit {
     Refused(Action),
     /// Park on this operation for the carrier.
     Operation(carrick_core_abi::service::ServiceOperation),
+    /// A ring-owned family declined an admitted call of a task with no host
+    /// route: no server exists for its forward. Fatal
+    /// ([`NativeInvariant::OwnedFamilyForward`]), never a silent errno.
+    OwnedFamilyForward,
     /// No operation describes this boundary: the entry keeps its action.
     Declined,
 }
@@ -797,6 +801,17 @@ pub(super) fn native_unstaged_exit(
         && (frame.esr >> 26) & 0x3f == 0x15
         && unclaimed_native_syscall(owner()) == UnclaimedNativeSyscall::CountedEnosys
     {
+        // The counted ENOSYS answers an unported call. A family the ring
+        // owns never forwards its admitted calls (a futex wake always
+        // finishes in ring); one that did would lose the call (#1941).
+        let mut args = [0; 6];
+        args.copy_from_slice(&frame.x[..6]);
+        if carrick_personality_linux::sched::ring_owned_futex(
+            carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+            args,
+        ) {
+            return NativeUnstagedExit::OwnedFamilyForward;
+        }
         return NativeUnstagedExit::Refused(refuse_unclaimed_native_syscall(frame, counters));
     }
     native_service_operation(frame, state, action)
@@ -1420,6 +1435,9 @@ fn arm_native_service_exit(
                     (Some(operation), None, None, None, false)
                 }
                 NativeUnstagedExit::Declined => return None,
+                NativeUnstagedExit::OwnedFamilyForward => {
+                    invalid_completion(NativeInvariant::OwnedFamilyForward)
+                }
             },
         }
     };
@@ -2254,6 +2272,9 @@ pub enum NativeInvariant {
     SignalNumber,
     ProcessGraph(super::process_owner::GuestProcessInvariant),
     PipeOutput,
+    /// [`NativeUnstagedExit::OwnedFamilyForward`]: an owned family's forward
+    /// for a task with no host route.
+    OwnedFamilyForward,
 }
 
 impl core::fmt::Debug for NativeInvariant {
@@ -2261,6 +2282,7 @@ impl core::fmt::Debug for NativeInvariant {
         match self {
             Self::EntryBinding => f.write_str("EntryBinding"),
             Self::PipeOutput => f.write_str("PipeOutput"),
+            Self::OwnedFamilyForward => f.write_str("OwnedFamilyForward"),
             Self::NativeService(error) => f.debug_tuple("NativeService").field(error).finish(),
             Self::PhysicalCustody(reason) => f
                 .debug_tuple("PhysicalCustody")
@@ -2284,6 +2306,7 @@ impl NativeInvariant {
         match self {
             NativeInvariant::EntryBinding => Fatal::EntryBinding,
             NativeInvariant::PipeOutput => Fatal::NativeServiceQuarantined,
+            NativeInvariant::OwnedFamilyForward => Fatal::OwnedFamilyForward,
             NativeInvariant::NativeService(reason) => *reason,
             NativeInvariant::PhysicalCustody(reason) => match reason {
                 PhysicalCustodyInvariant::RootExitRefused => Fatal::RootExitRefused,
@@ -5362,6 +5385,99 @@ mod tests {
         assert_eq!(counters.refused[281].load(Ordering::Relaxed), 1);
     }
 
+    /// #1941: a fork child's admitted private futex call belongs to the
+    /// ring's futex family, which never forwards it (a wake always finishes
+    /// in ring). A forward of one reaching the final capture is the typed
+    /// invariant break, never the counted ENOSYS that lost the child's wake;
+    /// an unported futex operation keeps the counted ENOSYS, and a root
+    /// keeps its host route.
+    #[test]
+    fn native_fork_child_owned_futex_forward_is_an_invariant_break() {
+        use super::super::native_process_runtime::NativeThreadGroupOwner;
+        use carrick_core_abi::service::ServiceOperation;
+        use carrick_personality_linux::sched::{
+            FUTEX_WAIT_PRIVATE, FUTEX_WAKE_BITSET_PRIVATE, FUTEX_WAKE_PRIVATE,
+        };
+
+        let futex = |op: u64, count: u64, mask: u64| {
+            let mut frame = TrapFrame {
+                esr: 0x15 << 26,
+                ..TrapFrame::default()
+            };
+            frame.x[8] = 98;
+            frame.x[0] = 0x2d9e18;
+            frame.x[1] = op;
+            frame.x[2] = count;
+            frame.x[5] = mask;
+            frame
+        };
+        let task = CurrentTask::new();
+        for mut frame in [
+            futex(FUTEX_WAKE_PRIVATE, 1, 0),
+            futex(FUTEX_WAKE_BITSET_PRIVATE, 1, u64::from(u32::MAX)),
+            futex(FUTEX_WAIT_PRIVATE, 1, 0),
+        ] {
+            let counters = Counters::new();
+            assert_eq!(
+                native_unstaged_exit(
+                    &mut frame,
+                    &task.linux,
+                    Action::Forward,
+                    || NativeThreadGroupOwner::ForkChild,
+                    &counters,
+                ),
+                NativeUnstagedExit::OwnedFamilyForward,
+                "op {:#x}",
+                frame.x[1]
+            );
+            assert_eq!(frame.x[0], 0x2d9e18, "no errno written");
+            assert_eq!(counters.refused[98].load(Ordering::Relaxed), 0);
+            assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(
+            NativeInvariant::OwnedFamilyForward.fatal_reason(),
+            carrick_el1_abi::EntryBindingFatalReason::OwnedFamilyForward
+        );
+        assert_eq!(
+            carrick_el1_abi::EntryBindingFatalReason::from_raw(
+                carrick_el1_abi::EntryBindingFatalReason::OwnedFamilyForward as u64
+            ),
+            Some(carrick_el1_abi::EntryBindingFatalReason::OwnedFamilyForward)
+        );
+
+        // An operation the family does not serve (FUTEX_REQUEUE_PRIVATE)
+        // is unported: the counted ENOSYS stays its answer.
+        let counters = Counters::new();
+        let mut frame = futex(128 | 3, 1, 0);
+        assert_eq!(
+            native_unstaged_exit(
+                &mut frame,
+                &task.linux,
+                Action::Forward,
+                || NativeThreadGroupOwner::ForkChild,
+                &counters,
+            ),
+            NativeUnstagedExit::Refused(Action::Served)
+        );
+        assert_eq!(frame.x[0] as i64, -38);
+        assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 1);
+
+        // A root keeps its host route for the same call.
+        let counters = Counters::new();
+        let mut frame = futex(FUTEX_WAKE_PRIVATE, 1, 0);
+        assert!(matches!(
+            native_unstaged_exit(
+                &mut frame,
+                &task.linux,
+                Action::Forward,
+                || NativeThreadGroupOwner::Root,
+                &counters,
+            ),
+            NativeUnstagedExit::Operation(ServiceOperation::Crossing { .. })
+        ));
+        assert_eq!(counters.refused[98].load(Ordering::Relaxed), 0);
+    }
+
     /// The production order of an owned native entry no stage served
     /// (#1530): the unclaimed-syscall decision runs before the crossing
     /// capture, so a fork child's unclaimed call is one counted in-ring
@@ -5627,18 +5743,16 @@ mod tests {
                         self.zone.clear_current(slot);
                         let mut effects = carrick_sched_core::WakeEffects::default();
                         assert_eq!(
-                            self.zone
-                                .wake_placed(
-                                    &guard,
-                                    mm,
-                                    address,
-                                    u32::MAX,
-                                    1,
-                                    carrick_sched_core::Waker::El1 { slot },
-                                    &mut [],
-                                    &mut effects
-                                )
-                                .unwrap(),
+                            self.zone.wake_placed(
+                                &guard,
+                                mm,
+                                address,
+                                u32::MAX,
+                                1,
+                                carrick_sched_core::Waker::El1 { slot },
+                                &mut [],
+                                &mut effects
+                            ),
                             1
                         );
                         drop(guard);

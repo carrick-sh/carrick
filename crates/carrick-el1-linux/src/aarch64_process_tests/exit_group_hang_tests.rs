@@ -241,19 +241,16 @@ fn deferred_control_handback(registered: bool) {
         ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(1, address),
         &ShortLockSpin,
     );
-    fixture
-        .zone
-        .wake_placed(
-            &guard,
-            1,
-            address,
-            u32::MAX,
-            1,
-            Waker::El1 { slot },
-            &mut [],
-            &mut carrick_sched_core::WakeEffects::default(),
-        )
-        .unwrap();
+    fixture.zone.wake_placed(
+        &guard,
+        1,
+        address,
+        u32::MAX,
+        1,
+        Waker::El1 { slot },
+        &mut [],
+        &mut carrick_sched_core::WakeEffects::default(),
+    );
     drop(guard);
     assert_eq!(fixture.zone.switch_in_full(slot).unwrap().record, record.id);
     assert!(matches!(
