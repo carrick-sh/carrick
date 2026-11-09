@@ -238,13 +238,31 @@ inputs and their existing cache lock domain; it contains no user config.
 Other ambient variables (including shell startup hooks and compiler flags)
 are absent from compiler and build-script processes.
 
-Metadata reads only explicitly selected tracked checkout configs. Builds run
-in the fresh archive snapshot beneath an isolated temporary directory whose
-ancestors must contain no Cargo config. Cargo-home and checkout-parent config
-files therefore cannot change the effective build. Untracked or symlinked
-checkout configs are rejected before Cargo runs. Toolchain and linker version
+Metadata reads only explicitly selected tracked checkout configs, from a
+private scratch directory. Builds run in the fresh archive snapshot inside a
+**stable, commit-derived build directory**,
+`$TMPDIR/carrick-fixture-builds/<sha>/` (`home`, `cargo` and `checkout`
+beneath it), whose ancestors must contain no Cargo config. An exclusive
+`flock` on `carrick-fixture-builds/<sha>.lock` admits one build of a commit
+at a time; a second build of the same commit waits, and builds of different
+commits proceed independently. A directory left by a crashed build is removed
+under the lock before reuse, and the directory is removed again before the
+lock is released. Removal never follows the cache symlinks into the shared
+registry.
+
+The isolated Cargo home holds one publisher-written `config.toml` and nothing
+from the user. It passes `--remap-path-prefix` for the snapshot (`/src`) and
+the isolated Cargo home (`/cargo`) in `build.rustflags` and in the musl
+target's `rustflags`, joining the tracked lists of the same keys (Cargo uses a
+target list instead of `build.rustflags` whenever any config names the
+triple, and the tracked root config names only the musl triple). The
+publisher refuses any executable whose bytes contain its build directory, so
+a remap lost to a future config change fails the publish rather than shipping
+a path-dependent bundle. Cargo-home and checkout-parent user config files
+therefore cannot change the effective build. Untracked or symlinked checkout
+configs are rejected before Cargo runs. Toolchain and linker version
 identities remain in the manifest; this is a controlled build-input policy,
-not a sandbox for untrusted build scripts or a claim of bit reproducibility.
+not a sandbox for untrusted build scripts.
 
 ## Comparing clean builds
 
@@ -256,8 +274,9 @@ just xtask fixtures build --sha "$(git rev-parse HEAD)" --output target/fixtures
 just xtask fixtures compare --first /absolute/path/to/first/manifest.json --second /absolute/path/to/second/manifest.json
 ```
 
-Each build takes a fresh source snapshot and builds into its own target
-directories. The comparison checks the bundles' content addresses, rehashes
+Each build takes a fresh source snapshot in the emptied per-commit build
+directory, so no target cache survives from the first build to the second;
+builds of one commit run one at a time under its lock. The comparison checks the bundles' content addresses, rehashes
 all objects, checks both inventories against the current checkout, requires
 identical input identities and toolchain records, and reports every differing
 or missing executable. It compares bundle contents, not their admission by the
@@ -266,18 +285,26 @@ Use the manifest paths printed by the build commands. The publisher rejects
 ambient compiler wrappers and Cargo build overrides; remove those from the
 publisher's environment if necessary.
 
-**Reproducibility remains unresolved.** Two clean x86_64 Linux builds of the
-same inputs reproduced 19 differing executables out of 1,195: `connrefused`,
-`eventwaitmatrix`, `fifonode`, `inzonetcp`, `mock_network_socket`, `pollevent`,
-`procconfigloop`, `pselecteintr`, and `selecttimeout` for each libc, plus
-`el1-sched-aarch64`. The GNU probes' `.rodata` contains the isolated Cargo
-home's random directory in a `libc` source path; its GNU build ID also changes.
-The musl probes contain the same path and have changed section layouts. For
-the scheduler fixture, separate source directories cause Cargo to pass different
-`-C metadata` values for its local `carrick-el1-control-abi` dependency and
-the scheduler executable; symbol names and executable sections differ.
-Neither disabling build IDs nor comparing only selected sections would resolve
-these byte differences. Keep using one authenticated bundle for paired gates.
+**Two clean builds on one publisher are byte-identical** (#1891). Builds of
+the same commit with the same `$TMPDIR` produce the same 1,195 executables,
+and therefore the same manifest content address.
+
+Before the stable build directory, two clean x86_64 Linux builds of the same
+inputs differed in 19 of 1,195 executables: `connrefused`, `eventwaitmatrix`,
+`fifonode`, `inzonetcp`, `mock_network_socket`, `pollevent`, `procconfigloop`,
+`pselecteintr` and `selecttimeout` for each libc, plus `el1-sched-aarch64`.
+The probes embedded the isolated Cargo home's random directory in a `libc`
+source path (in GNU `.rodata`, with a changed build ID, and in musl section
+layouts). The remap now writes that path as `/cargo/registry/...`. The
+scheduler differed because Cargo hashes the absolute location of a path
+dependency outside the fixture workspace (`carrick-el1-control-abi`) into
+`-C metadata`, changing symbol names and code. The commit-derived directory
+holds that location fixed.
+
+Remapping does not reach Cargo's crate identity. Publishers with different
+isolation roots (another `$TMPDIR`) still differ in `el1-sched-aarch64` alone;
+the 1,194 other executables match. Byte equality across publishers needs the
+same `$TMPDIR`. Keep using one authenticated bundle for paired gates.
 
 ## Scoped tests and red-first work
 
