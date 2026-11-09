@@ -56,6 +56,7 @@ pub fn next_nonzero(source: &AtomicU64) -> u64 {
 }
 
 pub mod ipc;
+pub mod ipc_lock;
 pub mod output;
 use output::{CompletionOutputSource, RetainedOutputCompletion};
 pub mod readiness;
@@ -1636,6 +1637,7 @@ impl BlockedContinuation {
             | DispatchOutcome::SleepCopyInSuspended(_)
             | DispatchOutcome::OwnerCancelled(_)
             | DispatchOutcome::PipeReadSuspended(_)
+            | DispatchOutcome::IpcLockContended(_)
             | DispatchOutcome::OutputSuspended(_)
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }

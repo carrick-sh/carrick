@@ -248,6 +248,9 @@ pub(super) enum OwnedSyscallResume {
     Output(Box<carrick_kernel::kernel::continuation::output::RetainedOutputCompletion>),
     CopyoutRedispatch,
     Ipc(carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation),
+    /// A host IPC operation retained across another party's held IPC lock
+    /// (#1845); its record waits on that lock's release, not on a portal.
+    IpcLock(Box<carrick_kernel::kernel::continuation::ipc_lock::RetainedIpcLockOperation>),
     Io(OwnedIoResume),
     Sleep(Box<carrick_kernel::dispatch::OwnedSleepCopyIn>),
 }
@@ -3591,6 +3594,15 @@ where
         outcome: DispatchOutcome,
         resume: Option<OwnedSyscallResume>,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let DispatchOutcome::IpcLockContended(pending) = outcome {
+            if resume.is_some() {
+                return Err(RuntimeError::Configuration(
+                    "IPC lock wait would displace another retained operation".to_owned(),
+                )
+                .into());
+            }
+            return self.ipc_lock_park(engine, control, frame, pending);
+        }
         if let DispatchOutcome::OwnerMemorySupply { request, committed } = outcome {
             self.state.owner_read_progress = self
                 .state
