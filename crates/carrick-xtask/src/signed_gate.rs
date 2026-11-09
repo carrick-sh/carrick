@@ -5,7 +5,7 @@ use crate::accept::{
 };
 use crate::ci_receipt::{ReceiptError, load};
 use crate::ci_scaler::REPOSITORY;
-use crate::command::run_checked;
+use crate::command::{CommandError, CommandOutput, run_checked};
 use crate::host_lease::{HostLease, HostLeaseMode};
 use crate::signed_receipt;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 // Only the owner may request a signed gate. The carrick-workers App is held
 // by agents and worker VMs; admitting it would let agent-written code run on a
@@ -151,6 +152,69 @@ fn checked(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<String, R
     run_checked(program, args, cwd)
         .map(|o| o.stdout)
         .map_err(|e| fail(e.to_string()))
+}
+/// Whether a failed `git fetch` is worth another attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchFailure {
+    Transient,
+    Permanent,
+}
+
+/// Total attempts (first try plus two retries) and the pauses between them.
+const FETCH_ATTEMPTS: usize = 3;
+const FETCH_BACKOFF: [Duration; FETCH_ATTEMPTS - 1] =
+    [Duration::from_secs(2), Duration::from_secs(4)];
+
+fn classify_fetch_failure(err: &CommandError) -> FetchFailure {
+    // Network-layer messages git prints when GitHub or the path to it hiccups.
+    const TRANSIENT_NEEDLES: &[&str] = &[
+        "recv failure",
+        "operation timed out",
+        "connection reset",
+        "could not resolve host",
+        "ssl_connect",
+        "ssl_error",
+        "tls",
+        "ssl connection",
+    ];
+    let CommandError::NonZeroExit { status, stderr, .. } = err else {
+        return FetchFailure::Permanent;
+    };
+    let stderr = stderr.to_lowercase();
+    if status.code() == Some(128) && TRANSIENT_NEEDLES.iter().any(|n| stderr.contains(n)) {
+        FetchFailure::Transient
+    } else {
+        FetchFailure::Permanent
+    }
+}
+
+/// Run a `git fetch` up to `FETCH_ATTEMPTS` times, retrying only transient
+/// transport errors. Infrastructure retry only: no test verdict depends on it.
+fn fetch_with_retry(
+    mut run: impl FnMut() -> Result<CommandOutput, CommandError>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<CommandOutput, ReceiptError> {
+    let mut attempt = 1;
+    loop {
+        let err = match run() {
+            Ok(output) => return Ok(output),
+            Err(err) => err,
+        };
+        let class = classify_fetch_failure(&err);
+        let first_line = err
+            .stderr()
+            .and_then(|s| s.lines().next())
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect::<String>();
+        eprintln!("git fetch attempt {attempt}/{FETCH_ATTEMPTS}: {class:?}: {first_line}");
+        if class == FetchFailure::Permanent || attempt == FETCH_ATTEMPTS {
+            return Err(fail(err.to_string()));
+        }
+        sleep(FETCH_BACKOFF[attempt - 1]);
+        attempt += 1;
+    }
 }
 fn read_json(path: &Path) -> Result<Value, ReceiptError> {
     let bytes = fs::read(path).map_err(|e| fail(format!("{}: {e}", path.display())))?;
@@ -1217,7 +1281,10 @@ fn execute_one(
     output: &Path,
     receipt_name: &str,
 ) -> Result<(), ReceiptError> {
-    checked("git", &["fetch", "--no-tags", "origin", commit], Some(root))?;
+    fetch_with_retry(
+        || run_checked("git", ["fetch", "--no-tags", "origin", commit], Some(root)),
+        std::thread::sleep,
+    )?;
     let temp = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
     let tree = temp.path().join("checkout");
     checked(
@@ -1545,5 +1612,123 @@ pub fn run(root: &Path, args: SignedGateArgs) -> Result<(), ReceiptError> {
             run_url,
             execution_result,
         } => publish(&request, &results, &run_url, &execution_result),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    const TIMEOUT: &str = "fatal: unable to access 'https://github.com/carrick-sh/carrick/': Recv failure: Operation timed out";
+
+    fn exit(code: i32, stderr: &str) -> CommandError {
+        CommandError::NonZeroExit {
+            program: "git".into(),
+            status: ExitStatus::from_raw(code << 8),
+            stdout: String::new(),
+            stderr: stderr.into(),
+        }
+    }
+    fn ok() -> CommandOutput {
+        CommandOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+    /// Run `fetch_with_retry` against scripted results; returns the result,
+    /// the invocation count and the recorded sleeps.
+    fn drive(
+        script: Vec<Result<CommandOutput, CommandError>>,
+    ) -> (Result<CommandOutput, ReceiptError>, usize, Vec<Duration>) {
+        let mut script = script.into_iter();
+        let mut calls = 0;
+        let mut sleeps = Vec::new();
+        let result = fetch_with_retry(
+            || {
+                calls += 1;
+                script.next().expect("more invocations than scripted")
+            },
+            |d| sleeps.push(d),
+        );
+        (result, calls, sleeps)
+    }
+
+    #[test]
+    fn transient_failure_then_success_retries_once() {
+        let (r, calls, sleeps) = drive(vec![Err(exit(128, TIMEOUT)), Ok(ok())]);
+        assert!(r.is_ok());
+        assert_eq!(calls, 2);
+        assert_eq!(sleeps, vec![Duration::from_secs(2)]);
+    }
+
+    #[test]
+    fn missing_ref_is_permanent() {
+        let (r, calls, sleeps) = drive(vec![Err(exit(
+            128,
+            "fatal: couldn't find remote ref abc123",
+        ))]);
+        assert!(r.is_err());
+        assert_eq!(calls, 1);
+        assert!(sleeps.is_empty());
+    }
+
+    #[test]
+    fn auth_failure_is_permanent() {
+        let (r, calls, sleeps) = drive(vec![Err(exit(
+            128,
+            "remote: Authentication failed for 'https://github.com/x'",
+        ))]);
+        assert!(r.is_err());
+        assert_eq!(calls, 1);
+        assert!(sleeps.is_empty());
+    }
+
+    #[test]
+    fn exhausted_transient_failures_return_last_error() {
+        let (r, calls, sleeps) = drive(vec![
+            Err(exit(128, TIMEOUT)),
+            Err(exit(128, TIMEOUT)),
+            Err(exit(128, TIMEOUT)),
+        ]);
+        assert!(r.is_err());
+        assert_eq!(calls, 3);
+        assert_eq!(sleeps, vec![Duration::from_secs(2), Duration::from_secs(4)]);
+    }
+
+    #[test]
+    fn classifier_table() {
+        for needle in [
+            "Recv failure",
+            "Operation timed out",
+            "Connection reset by peer",
+            "Could not resolve host: github.com",
+            "SSL_connect: SSL_ERROR_SYSCALL",
+            "gnutls_handshake() failed: The TLS connection was non-properly terminated",
+            "OpenSSL SSL connection error",
+            "operation timed out",
+        ] {
+            assert_eq!(
+                classify_fetch_failure(&exit(128, &format!("fatal: {needle}"))),
+                FetchFailure::Transient,
+                "{needle}"
+            );
+            assert_eq!(
+                classify_fetch_failure(&exit(1, &format!("fatal: {needle}"))),
+                FetchFailure::Permanent,
+                "exit 1: {needle}"
+            );
+        }
+        assert_eq!(
+            classify_fetch_failure(&exit(128, "fatal: Repository not found")),
+            FetchFailure::Permanent
+        );
+        let spawn = CommandError::Spawn {
+            program: "git".into(),
+            source: std::io::Error::other("Recv failure"),
+        };
+        assert_eq!(classify_fetch_failure(&spawn), FetchFailure::Permanent);
     }
 }
