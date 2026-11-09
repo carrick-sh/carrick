@@ -322,13 +322,16 @@ fn conventional_mount_usable(_: &Path) -> bool {
     false
 }
 
-/// Wedge detector for a hung volume query on the scratch worker. This is
-/// not a load deadline: a slow but answering worker, or a full queue, is
-/// waited for however long it takes, so the scratch-root decision never
-/// depends on host load. Only a query that has produced no answer for this
-/// long (a hung volume) is given up on, and that is logged as an error.
+/// No-progress wedge detector for the scratch worker. Not a load deadline
+/// and not a total-time budget: the worker bumps a progress counter each
+/// time it starts or finishes an item, and the verdict gives up only when
+/// that counter has not moved for this long. The one thing that stops it
+/// moving is a single item (in practice a hung volume syscall) that does
+/// not return. Trade-off, stated plainly: a long item that is still making
+/// no progress for this long IS treated as a wedge, even if it would have
+/// finished later; queue delay behind many items that each finish is not.
 #[cfg(any(target_os = "macos", test))]
-const SCRATCH_VOLUME_WEDGE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+const SCRATCH_WORKER_NO_PROGRESS_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long to yield between offers while the worker queue is full.
 #[cfg(any(target_os = "macos", test))]
@@ -338,26 +341,51 @@ const SCRATCH_QUEUE_FULL_RETRY: std::time::Duration = std::time::Duration::from_
 /// thread `carrick-fs-cleanup`) and return whether the volume is usable.
 /// A full queue is "not now" and is re-offered; a slow answer is waited for.
 /// `false` because of the worker happens only when it is unavailable, its
-/// reply sender is dropped, or no answer arrives within `wedge_bound`
-/// (total time waiting, including queue retries); each is logged as an
-/// error. A query that itself reports an error is a genuine "not usable".
+/// reply sender is dropped, or its progress counter has not advanced for
+/// `no_progress_bound` (each logged as an error). A query that itself
+/// reports an error is a genuine "not usable".
 #[cfg(any(target_os = "macos", test))]
 fn scratch_volume_verdict(
-    wedge_bound: std::time::Duration,
+    no_progress_bound: std::time::Duration,
     query: impl FnOnce() -> std::io::Result<bool> + Send + 'static,
 ) -> bool {
-    use crate::fs_backend::host::{ScratchVolumeEnqueue, enqueue_scratch_volume_query};
+    scratch_volume_verdict_observed(no_progress_bound, query, || {})
+}
+
+/// `scratch_volume_verdict` with `on_full` invoked each time the worker
+/// queue is observed full, so tests can acknowledge the retry branch.
+#[cfg(any(target_os = "macos", test))]
+fn scratch_volume_verdict_observed(
+    no_progress_bound: std::time::Duration,
+    query: impl FnOnce() -> std::io::Result<bool> + Send + 'static,
+    mut on_full: impl FnMut(),
+) -> bool {
+    use crate::fs_backend::host::{
+        ScratchVolumeEnqueue, enqueue_scratch_volume_query, scratch_worker_progress,
+    };
     use std::sync::mpsc::RecvTimeoutError;
-    let start = std::time::Instant::now();
+    use std::time::{Duration, Instant};
+    let poll = (no_progress_bound / 4).clamp(Duration::from_millis(5), Duration::from_millis(250));
+    let mut last_progress = scratch_worker_progress();
+    let mut last_change = Instant::now();
+    let mut note_progress = || {
+        let now = scratch_worker_progress();
+        if now != last_progress {
+            last_progress = now;
+            last_change = Instant::now();
+        }
+        last_change.elapsed() >= no_progress_bound
+    };
     let mut query: crate::fs_backend::host::ScratchVolumeQuery = Box::new(query);
     let receiver = loop {
         match enqueue_scratch_volume_query(query) {
             ScratchVolumeEnqueue::Queued(receiver) => break receiver,
             ScratchVolumeEnqueue::Full(returned) => {
-                if start.elapsed() >= wedge_bound {
+                on_full();
+                if note_progress() {
                     tracing::error!(
-                        ?wedge_bound,
-                        "scratch worker queue stayed full; worker wedged, skipping volume"
+                        ?no_progress_bound,
+                        "scratch worker made no progress with a full queue; skipping volume"
                     );
                     return false;
                 }
@@ -370,22 +398,26 @@ fn scratch_volume_verdict(
             }
         }
     };
-    match receiver.recv_timeout(wedge_bound.saturating_sub(start.elapsed())) {
-        Ok(Ok(usable)) => usable,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "skipping conventional scratch volume");
-            false
-        }
-        Err(RecvTimeoutError::Timeout) => {
-            tracing::error!(
-                ?wedge_bound,
-                "scratch volume query wedged without an answer; skipping volume"
-            );
-            false
-        }
-        Err(RecvTimeoutError::Disconnected) => {
-            tracing::error!("scratch worker dropped the volume query; skipping volume");
-            false
+    loop {
+        match receiver.recv_timeout(poll) {
+            Ok(Ok(usable)) => return usable,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "skipping conventional scratch volume");
+                return false;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if note_progress() {
+                    tracing::error!(
+                        ?no_progress_bound,
+                        "scratch worker made no progress; skipping volume"
+                    );
+                    return false;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                tracing::error!("scratch worker dropped the volume query; skipping volume");
+                return false;
+            }
         }
     }
 }
@@ -393,7 +425,7 @@ fn scratch_volume_verdict(
 #[cfg(target_os = "macos")]
 fn conventional_mount_usable(path: &Path) -> bool {
     let path = path.to_owned();
-    scratch_volume_verdict(SCRATCH_VOLUME_WEDGE_BOUND, move || {
+    scratch_volume_verdict(SCRATCH_WORKER_NO_PROGRESS_BOUND, move || {
         classify_conventional_mount(&path)
     })
 }
@@ -661,7 +693,7 @@ mod tests {
             use std::sync::mpsc::sync_channel;
             use std::time::Duration;
 
-            let bound = SCRATCH_VOLUME_WEDGE_BOUND;
+            let bound = SCRATCH_WORKER_NO_PROGRESS_BOUND;
             assert!(scratch_volume_verdict(bound, || Ok(true)));
             assert!(!scratch_volume_verdict(bound, || Ok(false)));
             assert!(!scratch_volume_verdict(bound, || {
@@ -691,26 +723,37 @@ mod tests {
         /// A slow answer (longer than the old 2 s deadline) is waited for.
         #[test]
         fn slow_volume_query_is_waited_for() {
-            assert!(scratch_volume_verdict(SCRATCH_VOLUME_WEDGE_BOUND, || {
-                std::thread::sleep(std::time::Duration::from_millis(2500));
-                Ok(true)
-            }));
+            assert!(scratch_volume_verdict(
+                SCRATCH_WORKER_NO_PROGRESS_BOUND,
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(2500));
+                    Ok(true)
+                }
+            ));
         }
 
-        /// Busy once, then success: with the worker queue full the verdict
-        /// waits and returns the real answer once the queue drains.
-        #[test]
-        fn full_queue_is_not_now() {
+        /// Park the scratch worker on blocking items until its bounded
+        /// queue is full. Returns one release handle and one reply receiver
+        /// per item, in worker order.
+        fn fill_worker_queue(
+            item_timeout: std::time::Duration,
+        ) -> (
+            Vec<std::sync::mpsc::SyncSender<()>>,
+            Vec<std::sync::mpsc::Receiver<std::io::Result<bool>>>,
+        ) {
             use crate::fs_backend::host::{ScratchVolumeEnqueue, enqueue_scratch_volume_query};
             use std::sync::mpsc::sync_channel;
-            use std::time::Duration;
-
             let mut releases = Vec::new();
             let mut receivers = Vec::new();
-            let full = loop {
+            let (started, first_started) = sync_channel::<()>(1);
+            loop {
                 let (release, blocked) = sync_channel::<()>(1);
+                let started = releases.is_empty().then(|| started.clone());
                 let query: crate::fs_backend::host::ScratchVolumeQuery = Box::new(move || {
-                    let _ = blocked.recv_timeout(Duration::from_secs(60));
+                    if let Some(started) = started {
+                        let _ = started.try_send(());
+                    }
+                    let _ = blocked.recv_timeout(item_timeout);
                     Ok(false)
                 });
                 match enqueue_scratch_volume_query(query) {
@@ -718,21 +761,50 @@ mod tests {
                         releases.push(release);
                         receivers.push(receiver);
                         assert!(releases.len() < 64, "queue never filled");
+                        if releases.len() == 1 {
+                            // Full only counts once the worker is parked in
+                            // the first item; before that a slot frees up
+                            // behind our back.
+                            first_started
+                                .recv_timeout(std::time::Duration::from_secs(60))
+                                .expect("worker never started the first item");
+                        }
                     }
-                    ScratchVolumeEnqueue::Full(_) => break true,
+                    ScratchVolumeEnqueue::Full(_) => return (releases, receivers),
                     ScratchVolumeEnqueue::Unavailable => panic!("worker unavailable"),
                 }
-            };
-            assert!(full);
+            }
+        }
+
+        /// Busy once, then success: with the worker queue full the verdict
+        /// waits and returns the real answer once the queue drains. The
+        /// release happens only after the CALLER observed `Full`, so the
+        /// retry branch is what produces the answer.
+        #[test]
+        fn full_queue_is_not_now() {
+            use std::sync::mpsc::sync_channel;
+            use std::time::Duration;
+
+            let (releases, receivers) = fill_worker_queue(Duration::from_secs(60));
+            let (full_seen, observed) = sync_channel::<()>(1);
             let (done, answer) = sync_channel(1);
             let caller = std::thread::spawn(move || {
-                done.send(scratch_volume_verdict(SCRATCH_VOLUME_WEDGE_BOUND, || {
-                    Ok(true)
-                }))
-                .unwrap();
+                let verdict = scratch_volume_verdict_observed(
+                    SCRATCH_WORKER_NO_PROGRESS_BOUND,
+                    || Ok(true),
+                    move || {
+                        let _ = full_seen.try_send(());
+                    },
+                );
+                done.send(verdict).unwrap();
             });
-            // Still full: the caller must not have produced a verdict.
-            assert!(answer.recv_timeout(Duration::from_millis(200)).is_err());
+            observed
+                .recv_timeout(Duration::from_secs(60))
+                .expect("caller never observed a full queue");
+            assert!(
+                answer.try_recv().is_err(),
+                "verdict before the queue drained"
+            );
             drop(releases);
             assert!(answer.recv_timeout(Duration::from_secs(60)).unwrap());
             caller.join().unwrap();
@@ -742,6 +814,81 @@ mod tests {
                     .unwrap()
                     .unwrap();
             }
+        }
+
+        /// Queue delay is not wedge time: the worker is occupied by nine
+        /// items released one at a time, totalling several times the bound
+        /// while progress advances between releases. The real answer wins.
+        #[test]
+        fn queue_delay_does_not_consume_the_no_progress_budget() {
+            use std::sync::mpsc::sync_channel;
+            use std::time::Duration;
+
+            let bound = Duration::from_millis(500);
+            let gap = Duration::from_millis(150);
+            let (mut releases, receivers) = fill_worker_queue(Duration::from_secs(60));
+            let (full_seen, observed) = sync_channel::<()>(1);
+            let (done, answer) = sync_channel(1);
+            let caller = std::thread::spawn(move || {
+                let verdict = scratch_volume_verdict_observed(
+                    bound,
+                    || Ok(true),
+                    move || {
+                        let _ = full_seen.try_send(());
+                    },
+                );
+                done.send(verdict).unwrap();
+            });
+            observed
+                .recv_timeout(Duration::from_secs(60))
+                .expect("caller never observed a full queue");
+            let started = std::time::Instant::now();
+            for release in releases.drain(..) {
+                release.send(()).unwrap();
+                std::thread::sleep(gap);
+            }
+            assert!(answer.recv_timeout(Duration::from_secs(60)).unwrap());
+            assert!(
+                started.elapsed() > bound * 2,
+                "delay did not exceed the bound"
+            );
+            caller.join().unwrap();
+            for receiver in receivers {
+                receiver
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+
+        /// A first item that makes no progress at all is the one refusal.
+        #[test]
+        fn stuck_first_item_is_refused_without_progress() {
+            use crate::fs_backend::host::{ScratchVolumeEnqueue, enqueue_scratch_volume_query};
+            use std::sync::mpsc::sync_channel;
+            use std::time::Duration;
+
+            let (release, blocked) = sync_channel::<()>(1);
+            let query: crate::fs_backend::host::ScratchVolumeQuery = Box::new(move || {
+                let _ = blocked.recv_timeout(Duration::from_secs(60));
+                Ok(false)
+            });
+            let ScratchVolumeEnqueue::Queued(stuck) = enqueue_scratch_volume_query(query) else {
+                panic!("scratch worker did not accept the stuck item");
+            };
+            assert!(!scratch_volume_verdict(Duration::from_millis(300), || Ok(
+                true
+            )));
+            release.send(()).unwrap();
+            stuck
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap()
+                .unwrap();
+            // The worker recovers and answers for real afterwards.
+            assert!(scratch_volume_verdict(
+                SCRATCH_WORKER_NO_PROGRESS_BOUND,
+                || Ok(true)
+            ));
         }
     }
 
