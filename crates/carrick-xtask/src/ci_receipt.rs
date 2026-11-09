@@ -1393,7 +1393,24 @@ impl ReceiptWait {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MainAncestor {
     pub selector_sha: String,
-    pub before_sha: String,
+    pub before_sha: MainCommit,
+}
+
+/// A commit known to be on trusted `main`'s first-parent history. Queue-group
+/// SHAs cannot become one by accident: only `resolve_main_ancestor` and the
+/// push-event constructor produce it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MainCommit(String);
+
+impl MainCommit {
+    /// A push event's `before` is the old tip of `main` by definition.
+    pub fn trusted_push_before(before: &str) -> Self {
+        Self(before.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Resolve the nearest first-parent commit on `main_ref` (e.g. `HEAD` or
@@ -1456,15 +1473,17 @@ pub fn resolve_main_ancestor(
         )));
     }
     let cand_text = String::from_utf8_lossy(&cand_out.stdout);
-    let before_sha = cand_text
-        .lines()
-        .find(|sha| main_first_parents.contains(sha))
-        .ok_or_else(|| {
-            ReceiptError::InvalidPushHistory(format!(
-                "candidate {candidate_sha} shares no first-parent ancestor with {main_ref}"
-            ))
-        })?
-        .to_owned();
+    let before_sha = MainCommit(
+        cand_text
+            .lines()
+            .find(|sha| main_first_parents.contains(sha))
+            .ok_or_else(|| {
+                ReceiptError::InvalidPushHistory(format!(
+                    "candidate {candidate_sha} shares no first-parent ancestor with {main_ref}"
+                ))
+            })?
+            .to_owned(),
+    );
 
     Ok(MainAncestor {
         selector_sha,
@@ -1482,17 +1501,29 @@ pub fn select_baseline_from_main(
     lookup: impl FnMut(Lane, &str) -> Result<Baseline, ReceiptError>,
 ) -> Result<(MainAncestor, BaselineSelection), ReceiptError> {
     let ancestor = resolve_main_ancestor(root, main_ref, candidate_sha)?;
-    let selected = select_baseline(root, lane, &ancestor.before_sha, candidate_sha, lookup)?;
+    let selected = select_baseline(
+        root,
+        lane,
+        ancestor.before_sha.as_str(),
+        &ancestor.before_sha,
+        candidate_sha,
+        lookup,
+    )?;
     Ok((ancestor, selected))
 }
 
-/// Resolve from the push event's old tip, never from HEAD^1. Receipt lookup
-/// waits for Pending runs before deciding absence. The search inspects at most
-/// 50 first-parent commits and shares one bounded wait across all lookups.
+/// Resolve from the push event's old tip, never from HEAD^1. `before` (the
+/// event base, possibly the head of a queue group ahead) is only validated as
+/// a proper first-parent ancestor of `pushed`; the search walks `main`'s
+/// history from `main_commit`, which must be at or below `before`. Receipt
+/// lookup waits for Pending runs before deciding absence. The search inspects
+/// at most 50 first-parent commits from `main_commit` and shares one bounded
+/// wait across all lookups.
 pub fn select_baseline(
     root: &Path,
     lane: Lane,
     before: &str,
+    main_commit: &MainCommit,
     pushed: &str,
     lookup: impl FnMut(Lane, &str) -> Result<Baseline, ReceiptError>,
 ) -> Result<BaselineSelection, ReceiptError> {
@@ -1500,6 +1531,7 @@ pub fn select_baseline(
         root,
         lane,
         before,
+        main_commit,
         pushed,
         lookup,
         ReceiptWait::new(Duration::from_secs(90 * 60), Duration::from_secs(60)),
@@ -1509,6 +1541,7 @@ fn select_baseline_waiting(
     root: &Path,
     lane: Lane,
     before: &str,
+    main_commit: &MainCommit,
     pushed: &str,
     mut lookup: impl FnMut(Lane, &str) -> Result<Baseline, ReceiptError>,
     wait: ReceiptWait,
@@ -1536,6 +1569,16 @@ fn select_baseline_waiting(
     let history: Vec<&str> = text.lines().collect();
     let before_index = history.iter().position(|sha| *sha == before).filter(|n| *n > 0)
         .ok_or_else(|| ReceiptError::InvalidPushHistory(format!("before {before} is not a first-parent ancestor of {pushed}; force pushes are refused")))?;
+    let main_index = history
+        .iter()
+        .position(|sha| *sha == main_commit.as_str())
+        .filter(|n| *n >= before_index)
+        .ok_or_else(|| {
+            ReceiptError::InvalidPushHistory(format!(
+                "main commit {} is not at or below before {before} in the first-parent history of {pushed}",
+                main_commit.as_str()
+            ))
+        })?;
     let mut observed = BTreeMap::new();
     let mut has_receipt = |sha: &str| -> Result<bool, ReceiptError> {
         if let Some(found) = observed.get(sha) {
@@ -1545,11 +1588,11 @@ fn select_baseline_waiting(
         observed.insert(sha.to_owned(), found);
         Ok(found)
     };
-    let candidates = &history[before_index..];
+    let candidates = &history[main_index..];
     let mut chosen = None;
     for (offset, sha) in candidates.iter().take(50).enumerate() {
         if has_receipt(sha)? {
-            chosen = Some(before_index + offset);
+            chosen = Some(main_index + offset);
             break;
         }
     }
@@ -1557,14 +1600,16 @@ fn select_baseline_waiting(
         Some(index) => index,
         None if candidates.len() > 50 => {
             return Err(ReceiptError::BaselineWalkLimit(format!(
-                "no trusted {} receipt in the first 50 commits from {before}; refusing to search farther",
-                lane.name()
+                "no trusted {} receipt in the first 50 commits from {}; refusing to search farther",
+                lane.name(),
+                main_commit.as_str()
             )));
         }
         None => {
             return Err(ReceiptError::NoBaseline(format!(
-                "no trusted {} receipt from {before} to the first-parent root. No regression comparison was made. Seed the current main tip with an owner dispatch for subsequent pushes",
-                lane.name()
+                "no trusted {} receipt from {} to the first-parent root. No regression comparison was made. Seed the current main tip with an owner dispatch for subsequent pushes",
+                lane.name(),
+                main_commit.as_str()
             )));
         }
     };
@@ -1930,6 +1975,7 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                     &history_dir,
                     lane,
                     &before_sha,
+                    &MainCommit::trusted_push_before(&before_sha),
                     &candidate_sha,
                     query_baseline,
                     wait,
@@ -1941,13 +1987,14 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                             select_baseline_waiting(
                                 &history_dir,
                                 lane,
+                                ancestor.before_sha.as_str(),
                                 &ancestor.before_sha,
                                 &candidate_sha,
                                 query_baseline,
                                 wait,
                             )
                             .map(|selected| {
-                                let before = ancestor.before_sha.clone();
+                                let before = ancestor.before_sha.as_str().to_owned();
                                 (Some(ancestor), before, selected)
                             })
                         },
@@ -1965,7 +2012,7 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                         format!(
                             "selector_sha={}\nbefore_sha={}\nsha={}\nreuse={}",
                             ancestor.selector_sha,
-                            ancestor.before_sha,
+                            ancestor.before_sha.as_str(),
                             selected.baseline_sha,
                             selected.baseline_sha == ancestor.selector_sha
                         )
@@ -2013,6 +2060,7 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                     let selected = select_baseline_waiting(
                         root,
                         lane,
+                        ancestor.before_sha.as_str(),
                         &ancestor.before_sha,
                         &candidate_sha,
                         query_baseline,

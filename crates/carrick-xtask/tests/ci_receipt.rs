@@ -1782,7 +1782,7 @@ fn retirement_refuses_opaque_item_macros_and_unscanned_target_paths() {
 
 mod ancestor_selection {
     use super::*;
-    use carrick_xtask::ci_receipt::{ReceiptError, select_baseline};
+    use carrick_xtask::ci_receipt::{MainCommit, ReceiptError, select_baseline};
     use std::collections::BTreeSet;
 
     struct History {
@@ -1815,6 +1815,14 @@ mod ancestor_selection {
             before: &str,
             receipted: &[usize],
         ) -> Result<carrick_xtask::ci_receipt::BaselineSelection, ReceiptError> {
+            self.select_from_main(before, before, receipted)
+        }
+        fn select_from_main(
+            &self,
+            before: &str,
+            main: &str,
+            receipted: &[usize],
+        ) -> Result<carrick_xtask::ci_receipt::BaselineSelection, ReceiptError> {
             let receipts: BTreeSet<_> = receipted
                 .iter()
                 .map(|n| self.commits[*n].as_str())
@@ -1823,6 +1831,7 @@ mod ancestor_selection {
                 self.dir.path(),
                 Lane::Hvf,
                 before,
+                &MainCommit::trusted_push_before(main),
                 self.commits.last().unwrap(),
                 |_, sha| {
                     Ok(if receipts.contains(sha) {
@@ -1884,10 +1893,14 @@ mod ancestor_selection {
         );
         let old = git(h.dir.path(), &["rev-parse", "HEAD"]);
         for before in ["0".repeat(40), old, h.commits[3].clone()] {
-            let result =
-                select_baseline(h.dir.path(), Lane::Hvf, &before, &h.commits[3], |_, _| {
-                    panic!("invalid history must not query receipts")
-                });
+            let result = select_baseline(
+                h.dir.path(),
+                Lane::Hvf,
+                &before,
+                &MainCommit::trusted_push_before(&before),
+                &h.commits[3],
+                |_, _| panic!("invalid history must not query receipts"),
+            );
             assert!(
                 matches!(result, Err(ReceiptError::InvalidPushHistory(_))),
                 "{result:?}"
@@ -1906,6 +1919,7 @@ mod ancestor_selection {
             h.dir.path(),
             Lane::Hvf,
             &h.commits[51],
+            &MainCommit::trusted_push_before(&h.commits[51]),
             &h.commits[52],
             |_, sha| {
                 queried.push(sha.to_owned());
@@ -1933,8 +1947,46 @@ mod ancestor_selection {
     fn serial_host_group_ahead_with_more_than_50_commits_still_finds_mains_receipt() {
         // main commit 0 (receipted), 55 commits of the group ahead, 2 candidate commits.
         let h = History::new(58);
-        let selected = h.select(&h.commits[55], &[0]).unwrap();
+        let selected = h
+            .select_from_main(&h.commits[55], &h.commits[0], &[0])
+            .unwrap();
         assert_eq!(selected.baseline_sha, h.commits[0]);
+        assert_eq!(selected.before_sha, h.commits[55]);
+        assert_eq!(selected.covered_as_range, h.commits[1..57]);
+    }
+    #[test]
+    fn serial_host_main_without_receipt_in_50_is_still_refused() {
+        // 60 main commits (none receipted), 55 group commits, 1 candidate.
+        let h = History::new(116);
+        let err = h
+            .select_from_main(&h.commits[114], &h.commits[59], &[])
+            .unwrap_err();
+        match err {
+            ReceiptError::BaselineWalkLimit(msg) => assert!(msg.contains(&h.commits[59]), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        let short = History::new(10);
+        let err = short
+            .select_from_main(&short.commits[7], &short.commits[3], &[])
+            .unwrap_err();
+        assert!(matches!(err, ReceiptError::NoBaseline(_)), "{err:?}");
+    }
+    #[test]
+    fn main_commit_above_before_or_off_history_is_invalid_push_history() {
+        let h = History::new(8);
+        git(h.dir.path(), &["checkout", "-q", &h.commits[0]]);
+        git(
+            h.dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "side"],
+        );
+        let side = git(h.dir.path(), &["rev-parse", "HEAD"]);
+        for main in [h.commits[5].clone(), side] {
+            let err = h.select_from_main(&h.commits[3], &main, &[0]).unwrap_err();
+            assert!(
+                matches!(err, ReceiptError::InvalidPushHistory(_)),
+                "{err:?}"
+            );
+        }
     }
     fn invoke_selector(
         h: &History,
@@ -2415,7 +2467,7 @@ else:
             )
             .unwrap();
             assert_eq!(&resolved.selector_sha, &main_commits[3]);
-            assert_eq!(&resolved.before_sha, expected_before);
+            assert_eq!(resolved.before_sha.as_str(), expected_before.as_str());
         }
 
         // Mock `gh` serving both `gh api` (select-baseline + gate) and `gh run download` (gate).

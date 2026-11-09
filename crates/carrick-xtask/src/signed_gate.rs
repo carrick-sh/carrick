@@ -574,8 +574,8 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
                 ));
             }
         }
-        let base = if comparison_sha == ancestor.before_sha {
-            ancestor.before_sha
+        let base = if comparison_sha == ancestor.before_sha.as_str() {
+            ancestor.before_sha.as_str().to_owned()
         } else {
             // Reuse select-baseline's first-parent validation of the event base.
             // Only the exact main ancestor is eligible: signed receipts must not
@@ -584,9 +584,10 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
                 graph.path(),
                 crate::ci_receipt::Lane::Hvf,
                 comparison_sha,
+                &ancestor.before_sha,
                 &requested_sha,
                 |_, candidate| {
-                    if candidate == ancestor.before_sha {
+                    if candidate == ancestor.before_sha.as_str() {
                         Ok(crate::ci_receipt::Baseline::Found(0, String::new()))
                     } else {
                         Ok(crate::ci_receipt::Baseline::Missing)
