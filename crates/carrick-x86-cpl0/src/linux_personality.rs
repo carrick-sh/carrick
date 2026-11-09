@@ -634,7 +634,7 @@ pub enum UserFaultSupply {
         code: i32,
         address: UserVa,
     },
-    /// A broken boundary invariant: the #PF entry reports this reason.
+    /// No owner could supply the access: the #PF entry reports this reason.
     Unresolved(u64),
 }
 
@@ -1247,10 +1247,13 @@ impl Personality for LinuxPersonality {
                                 retry = true;
                                 None
                             }
-                            UserFaultSupply::Signal { .. } => {
+                            // The owner refused or could not supply the
+                            // access (no reservation names it). The staged
+                            // copy made no effect, so this is the user
+                            // copy's EFAULT, never a carrier abort.
+                            UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
                                 Some(carrick_syscall_abi::LINUX_EFAULT.guest_retval())
                             }
-                            UserFaultSupply::Unresolved(_) => fatal_error(frame),
                         }
                     }
                     HostFileStage::InRing => {
