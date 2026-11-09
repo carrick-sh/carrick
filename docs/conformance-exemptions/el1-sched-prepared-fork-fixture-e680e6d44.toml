@@ -1,0 +1,18 @@
+schema = "carrick.conformance-exemption.v1"
+base = "fa3f7431756ffe47afa1f0cc9338791abf37c8b6"
+head = "e680e6d4401e9b847332b94f32c4cb7c7e6e2ec5"
+contracts = [
+  "kernel.el1.anonymous-first-touch",
+  "kernel.el1.fault-entry",
+  "kernel.el1.fork-cow",
+  "kernel.el1.futex-handoff",
+  "kernel.el1.guest-run-queue",
+  "kernel.el1.guest-scheduler",
+  "kernel.el1.metadata-allocation",
+  "kernel.mm.address-space-occupancy",
+]
+paths = [
+  "fixtures/embed-el1-sched/src/main.rs",
+  "fixtures/embed-el1-sched/src/prepared_fork.rs",
+]
+rationale = "Fixture-only split of #1880 under the owner exception in docs/ci/signed-gate.md (PRs that change fixture inputs): the merge-queue signed gate cannot compare a candidate whose fixture inputs differ from main's bundle, so the el1-sched guest fixture lands alone first. The diff adds the prepared-fork argument-write control and diagnostic step reporting; existing cases keep their syscalls. The host-side tests that drive the new controls, and the runtime fix they verify, land in #1880 on top of this, where those contracts get their test evidence and a normal signed queue comparison. This PR's own evidence is the exception procedure: an exact-head fixture bundle and an exact-head signed run with every step finished, reviewed by the owner on the PR."
