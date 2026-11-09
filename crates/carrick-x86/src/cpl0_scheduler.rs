@@ -261,6 +261,53 @@ pub unsafe fn install_root(root: RootGpa) {
     }
 }
 
+/// x86's mechanics for the one shared wake-effect applier
+/// ([`carrick_sched_core::WakeEffects::apply`], #1941): every x86 CPL0
+/// waker (the production process owner and the lifecycle lane) consumes a
+/// wake through these. `task` is the waker CPU's current task, whose
+/// pending-host-work doorbell carries a misplaced or host-handed waiter to
+/// the host; `waker` is its slot. On `target_os = "none"` this file is
+/// compiled only inside `carrick-el1` (`isa::x86::context::scheduler`),
+/// so `crate::substrate` is that crate's hardware CPU.
+pub struct WakeCpu<'a> {
+    pub task: &'a carrick_el1_abi::CurrentTask,
+    pub waker: SlotId,
+}
+
+impl carrick_sched_core::WakeMechanics for WakeCpu<'_> {
+    /// x86 routes a reschedule by slot through its published APIC route
+    /// (`HardwareCpu::send_resched`); it has no per-slot SGI word.
+    fn send_resched(&mut self, slot: SlotId) -> bool {
+        #[cfg(target_os = "none")]
+        {
+            use crate::substrate::sched::ThreadCpu;
+            crate::substrate::sched::hw::HardwareCpu.send_resched(slot, 0);
+        }
+        #[cfg(not(target_os = "none"))]
+        let _ = slot;
+        true
+    }
+    fn queue_tick(&self) -> u64 {
+        #[cfg(target_os = "none")]
+        {
+            use crate::substrate::sched::ThreadCpu;
+            crate::substrate::sched::hw::HardwareCpu.now()
+        }
+        #[cfg(not(target_os = "none"))]
+        0
+    }
+    /// x86 CPL0 has no run-queue slice timer (its timer vector serves
+    /// signal timers only): a thread queued on the waker's own slot is a
+    /// reschedule kick to that slot.
+    fn arm_slice_timer(&mut self) {
+        let slot = self.waker;
+        carrick_sched_core::WakeMechanics::send_resched(self, slot);
+    }
+    fn mark_pending_host_work(&mut self) {
+        self.task.linux.mark_pending_host_work();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
