@@ -5,8 +5,8 @@ for this repository's `main` queue. On one assigned Mac, under one host
 lease, it builds, signs and accepts the event's **base_sha** and then the exact
 group head, compares the two receipts, and posts `signed-gate` as a commit
 status. The **Signed queue gate** check requires successful authorization, the
-trusted base fixture fetch, execution and verdict publication; skipped, cancelled or failed dependencies
-fail it. Main's merge ruleset must require this GitHub Actions check. Its
+trusted base fixture fetch, the candidate probe build, execution and verdict
+publication; skipped, cancelled or failed dependencies fail it. Main's merge ruleset must require this GitHub Actions check. Its
 PR-only placeholder permits enqueueing without a separate PR signed run.
 There are no path filters that could leave a required group check missing.
 
@@ -42,6 +42,24 @@ main bundles with identical inputs differed in 19 of 1195 executables), so a
 second, candidate-built bundle would never have equal `content_sha256`;
 publication still requires equal content and input identity.
 
+**Added probes are built from candidate code** (owner decision, #1980). The
+`candidate-probes` job runs trusted `main` code on the publisher's runner
+class (`ubuntu-24.04-arm`). It checks out the candidate itself and compares
+its fixture inputs with the base bundle's manifest. When the only difference
+is added probes (defined below), it builds just those probes, for both ARM
+libc sets, with the publisher's own snapshot, build environment, policy and
+probe build commands. It also requires the bundle's exact toolchain record
+and that the compiler read only the added sources and unchanged bundle
+inputs. The result is a content-addressed *candidate probe set*. The gate
+serves it beside the base bundle to the candidate run only, after
+re-checking the candidate checkout independently on the Mac. Both receipts
+keep the base bundle's `inputs_sha256` and `content_sha256`, so publication
+compares them exactly as before. The candidate receipt's `fixture_validation`
+also records `candidate_probes`: each added probe's name and source SHA-256
+(`hash_source`), plus the set's digest. The job's `candidate-probes.json`
+records `equal`, `built` or `refused`. A refusal builds nothing, and the Mac
+reports the same input identity refusal on the PR as before.
+
 **An incomplete base blocks.** Completed tests with known failures stay
 comparable, because the gate is differential. A base step that did not run
 to completion (a killed or unfinished binary, a build failure, zero tests
@@ -63,11 +81,30 @@ isolation, which this lane does not provide.
 
 ### Owner exception: PRs that change fixture inputs
 
-A PR that changes fixture inputs (probe sources, fixture lockfiles, the
-compiler pin or build policy) cannot pass this gate: main has no bundle for
-its inputs, and comparability is never relaxed for it. Do not retry, rebuild
-the bundle from candidate code inside the gate, or edit the comparison. Land
-such a change only through this owner-approved exception:
+**Added probes no longer need this exception** (#1980). A PR qualifies when,
+relative to the base bundle's manifest (not git history), its fixture inputs
+differ only by:
+
+- new `conformance-probes/src/bin/<name>.rs` files, each with a valid probe
+  name and nothing else added, removed or edited; and
+- one new row per added probe in `conformance-probes/probe-inventory.json`,
+  in a class the publisher builds (`conformance`, `helper` or `performance`)
+  and not `excluded`, with every existing row unchanged.
+
+The predicate is `fixtures::candidate_probes::classify_inputs`. A dedicated
+runner row goes in `crates/carrick-xtask/src/probe_runners.rs`, which is not
+a fixture input. The added probe may read, at compile time, only its own
+source and unchanged bundle inputs (such as `src/lib.rs`).
+
+Every other fixture-input change still needs the exception and is refused by
+the gate with its input identity message. That covers edits to or removals
+of existing probe sources or rows, fixture `Cargo.toml`/`Cargo.lock` files,
+the `rust-toolchain.toml` pin, build policy, the publisher's own sources, and
+any added file that is not a probe source. The same holds for an added probe
+combined with any of these. Such a PR cannot pass this gate: main has no
+bundle for its inputs, and comparability is never relaxed for it. Do not
+retry, rebuild the bundle from candidate code inside the gate, or edit the
+comparison. Land such a change only through this owner-approved exception:
 
 1. Keep the fixture-input change in its own small PR, with no unrelated
    runtime changes, so the unverified surface is only the fixtures.
