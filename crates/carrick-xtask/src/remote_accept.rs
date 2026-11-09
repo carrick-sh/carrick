@@ -584,8 +584,8 @@ pub fn capture_fixture_bundle(
     let mut captured = tempfile::NamedTempFile::new_in(&directory)?;
     io::copy(&mut input, captured.as_file_mut())?;
     let expected = crate::fixtures::expected_head(root, None)?;
-    let (_, identity) =
-        crate::fixtures::archive::verify(root, captured.path(), &String::from(expected))?;
+    let (_, _, identity) =
+        crate::fixtures::archive::verify(root, captured.path(), None, &String::from(expected))?;
     let archive_sha256 = crate::provision::compute_sha256(captured.path())?;
     let captured_path = directory.join("captured.tar.gz");
     captured
@@ -1543,6 +1543,7 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
                 manifest_sha256: "1".repeat(64).try_into().unwrap(),
                 inputs_sha256: "2".repeat(64).try_into().unwrap(),
                 content_sha256: Some("3".repeat(64).try_into().unwrap()),
+                candidate_probes: None,
             }),
             el1: None,
             probe_diffs: vec![],

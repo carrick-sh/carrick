@@ -13,10 +13,12 @@ use crate::{command, probe_inventory, provision};
 
 pub mod archive;
 pub mod build_code;
+pub mod candidate_probes;
 pub mod dep_info;
 mod environment;
 mod inputs;
 pub mod linker;
+use candidate_probes::{CandidateProbeEvidence, CandidateProbeSet};
 use environment::BuildEnvironment;
 pub use environment::BuildPolicy;
 pub(crate) use environment::reject_ambient_overrides;
@@ -80,8 +82,25 @@ pub enum FixturesAction {
             conflicts_with = "manifest"
         )]
         bundle: Option<PathBuf>,
+        /// Candidate probe set archive (`build-candidate-probes`) to serve
+        /// beside the bundle; admitted only for a checkout that adds exactly
+        /// its probes.
+        #[arg(long, requires = "bundle")]
+        candidate_probes: Option<PathBuf>,
         #[arg(long, help = "Expected commit (default: checkout HEAD)")]
         sha: Option<String>,
+    },
+    /// Build only the probes the checkout adds relative to a trusted bundle
+    /// archive, with the publisher's build code and policy (Linux), and
+    /// write a candidate probe set archive. Writes nothing when inputs are
+    /// equal; any other input difference is the input identity refusal.
+    BuildCandidateProbes {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        sha: String,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Capture, verify and restore a bundle with durable remote-run provenance.
     Prepare {
@@ -220,7 +239,7 @@ pub enum GuestTarget {
     Gnu,
 }
 impl GuestTarget {
-    fn triple(self) -> &'static str {
+    pub fn triple(self) -> &'static str {
         match self {
             Self::Musl => "aarch64-unknown-linux-musl",
             Self::Gnu => "aarch64-unknown-linux-gnu",
@@ -228,14 +247,14 @@ impl GuestTarget {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Executable {
     pub path: String,
     pub target: GuestTarget,
     pub sha256: ContentHash,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Toolchain {
     pub rustc: String,
@@ -296,6 +315,9 @@ struct Installed {
     validation: ValidationReceipt,
     manifest_sha256: ContentHash,
     manifest: Manifest,
+    /// Added probes built from candidate code beside `manifest` (#1980).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_probes: Option<CandidateProbeSet>,
 }
 
 /// Fixture evidence is scoped to input bytes, never a claim of full-tree equality.
@@ -315,6 +337,10 @@ pub struct ValidationReceipt {
     /// Legacy receipts lack executed-content evidence and cannot be compared.
     #[serde(default)]
     pub content_sha256: Option<ContentHash>,
+    /// Added probes built from candidate code and served beside the bundle;
+    /// `inputs_sha256` and `content_sha256` still name the bundle (#1980).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_probes: Option<CandidateProbeEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +363,7 @@ pub enum ElfHashVerification {
 fn validation_receipt(
     root: &Path,
     manifest: &Manifest,
+    candidate: Option<&CandidateProbeSet>,
     elf_hash_verification: ElfHashVerification,
 ) -> Result<ValidationReceipt> {
     Ok(ValidationReceipt {
@@ -351,6 +378,7 @@ fn validation_receipt(
         manifest_sha256: hash_bytes(&manifest_bytes(manifest)?),
         inputs_sha256: manifest.input_identity()?,
         content_sha256: Some(manifest.content_identity()?),
+        candidate_probes: candidate.map(CandidateProbeSet::evidence).transpose()?,
     })
 }
 
@@ -392,8 +420,13 @@ fn working_tree(root: &Path) -> Result<GitTreeId> {
 /// Revalidate fixture inputs and report whether installed ELF hashes were
 /// recomputed or admitted by a fresh stat stamp for this invocation.
 pub fn verify_installed_receipt(root: &Path) -> Result<ValidationReceipt> {
-    let (manifest, hashes) = verify_installed_with_hashes(root)?;
-    validation_receipt(root, &manifest, hashes)
+    let (installed, hashes) = verify_installed_record(root)?;
+    validation_receipt(
+        root,
+        &installed.manifest,
+        installed.candidate_probes.as_ref(),
+        hashes,
+    )
 }
 
 fn hash_bytes(bytes: &[u8]) -> ContentHash {
@@ -431,12 +464,16 @@ fn hash_regular_file(path: &Path) -> Result<ContentHash> {
             path.display()
         )));
     }
-    let bytes = fs::read(path)?;
+    hash_source_bytes(&fs::read(path)?)
+}
+
+/// The source entry digest of `bytes` as a regular file (see `hash_source`).
+fn hash_source_bytes(bytes: &[u8]) -> Result<ContentHash> {
     let length = u64::try_from(bytes.len()).map_err(|e| fail(e.to_string()))?;
     let mut digest = Sha256::new();
     digest.update(SOURCE_DOMAIN);
     digest.update(length.to_be_bytes());
-    digest.update(&bytes);
+    digest.update(bytes);
     Ok(ContentHash(format!("{:x}", digest.finalize())))
 }
 fn fail(message: impl Into<String>) -> FixturesError {
@@ -598,8 +635,13 @@ fn validate_executable(path: &Path, executable: &Executable) -> Result<()> {
 }
 
 /// Admission is exact on fixture inputs and independent of unrelated files:
-/// the bundle's input identity must equal the checkout's current one.
-fn validate_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
+/// the bundle's input identity must equal the checkout's current one, or,
+/// with a candidate probe set, differ only by the probes that set built.
+fn validate_manifest(
+    root: &Path,
+    manifest: &Manifest,
+    candidate: Option<&CandidateProbeSet>,
+) -> Result<()> {
     if manifest.schema != SCHEMA {
         return Err(fail("unknown fixture manifest schema"));
     }
@@ -613,24 +655,12 @@ fn validate_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
         return Err(fail("noncanonical fixture compiler input list"));
     }
     let current = source_hashes(root, &manifest.compiler_inputs)?;
-    if manifest.sources != current {
-        let changed: Vec<_> = manifest
-            .sources
-            .keys()
-            .chain(current.keys())
-            .filter(|path| manifest.sources.get(*path) != current.get(*path))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .take(8)
-            .cloned()
-            .collect();
-        return Err(fail(format!(
-            "fixture input identity mismatch (source hashes or inventory mismatch): bundle {} built at {}, checkout {}; differing inputs include {}",
-            manifest.input_identity()?,
-            manifest.source_head.0,
-            input_identity(&current, &manifest.compiler_inputs, &BuildPolicy::default())?,
-            changed.join(", ")
-        )));
+    let admitted = match candidate {
+        None => manifest.sources == current,
+        Some(set) => candidate_probes::admit(root, manifest, &current, set)?,
+    };
+    if !admitted {
+        return Err(identity_mismatch(manifest, &current)?);
     }
     let pin = fs::read_to_string(root.join("rust-toolchain.toml"))?;
     let release = manifest
@@ -648,17 +678,49 @@ fn validate_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
         return Err(fail("missing or mismatched fixture toolchain identity"));
     }
     let expected_paths = executable_inventory(root)?;
-    let actual: BTreeMap<_, _> = manifest
-        .executables
-        .iter()
-        .map(|e| (e.path.clone(), e.target))
-        .collect();
-    if actual.len() != manifest.executables.len() || actual != expected_paths {
+    let served: Vec<_> = served_executables(manifest, candidate).collect();
+    let actual: BTreeMap<_, _> = served.iter().map(|e| (e.path.clone(), e.target)).collect();
+    if actual.len() != served.len() || actual != expected_paths {
         return Err(fail(
             "incomplete, duplicate, or unexpected fixture executable inventory",
         ));
     }
     Ok(())
+}
+
+/// The input identity refusal, naming up to eight differing inputs.
+fn identity_mismatch(
+    manifest: &Manifest,
+    current: &BTreeMap<String, ContentHash>,
+) -> Result<FixturesError> {
+    let changed: Vec<_> = manifest
+        .sources
+        .keys()
+        .chain(current.keys())
+        .filter(|path| manifest.sources.get(*path) != current.get(*path))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .take(8)
+        .cloned()
+        .collect();
+    Ok(fail(format!(
+        "fixture input identity mismatch (source hashes or inventory mismatch): bundle {} built at {}, checkout {}; differing inputs include {}",
+        manifest.input_identity()?,
+        manifest.source_head.0,
+        input_identity(current, &manifest.compiler_inputs, &BuildPolicy::default())?,
+        changed.join(", ")
+    )))
+}
+
+/// Every executable a restore serves: the bundle's, then any candidate-built.
+fn served_executables<'a>(
+    manifest: &'a Manifest,
+    candidate: Option<&'a CandidateProbeSet>,
+) -> impl Iterator<Item = &'a Executable> {
+    manifest
+        .executables
+        .iter()
+        .chain(candidate.into_iter().flat_map(|set| set.executables.iter()))
 }
 
 fn manifest_bytes(manifest: &Manifest) -> Result<Vec<u8>> {
@@ -771,11 +833,23 @@ fn compare_bundles(root: &Path, first: &Path, second: &Path) -> Result<usize> {
 /// `sha`, when given, asserts the checkout's HEAD; the bundle itself is
 /// admitted by input identity whichever commit published it.
 pub fn verify_bundle(root: &Path, path: &Path, sha: Option<&str>) -> Result<Manifest> {
+    verify_bundle_with(root, path, None, sha).map(|(manifest, _)| manifest)
+}
+
+/// `verify_bundle` with an optional candidate probe set (a set manifest
+/// path) admitted beside the bundle; every object of both is checked.
+pub fn verify_bundle_with(
+    root: &Path,
+    path: &Path,
+    candidate: Option<&Path>,
+    sha: Option<&str>,
+) -> Result<(Manifest, Option<CandidateProbeSet>)> {
     expected_head(root, sha)?;
     let manifest = read_bundle_manifest(path)?;
-    validate_manifest(root, &manifest)?;
+    let set = candidate.map(candidate_probes::inspect_set).transpose()?;
+    validate_manifest(root, &manifest, set.as_ref())?;
     check_bundle_objects(path, &manifest)?;
-    Ok(manifest)
+    Ok((manifest, set))
 }
 
 /// Select one unambiguous bundle for `sha`, never mutable probe caches.
@@ -838,20 +912,21 @@ pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result
 }
 
 pub fn verify_installed(root: &Path) -> Result<Manifest> {
-    verify_installed_with_hashes(root).map(|(manifest, _)| manifest)
+    verify_installed_record(root).map(|(installed, _)| installed.manifest)
 }
 
-fn verify_installed_with_hashes(root: &Path) -> Result<(Manifest, ElfHashVerification)> {
+fn verify_installed_record(root: &Path) -> Result<(Installed, ElfHashVerification)> {
     let installed: Installed =
         serde_json::from_slice(&fs::read(safe_path(root, INSTALLED_MANIFEST)?)?)?;
     if hash_bytes(&manifest_bytes(&installed.manifest)?) != installed.manifest_sha256 {
         return Err(fail("installed manifest hash mismatch"));
     }
-    validate_manifest(root, &installed.manifest)?;
+    let candidate = installed.candidate_probes.as_ref();
+    validate_manifest(root, &installed.manifest, candidate)?;
     // Always admit current source inputs above. Only the expensive installed
     // ELF byte verification is cached, never checkout validation evidence.
     let stamp_path = root.join("target/fixtures/verified-stat-v1.json");
-    let signature = installed_stat_signature(root, &installed.manifest)?;
+    let signature = installed_stat_signature(root, &installed.manifest, candidate)?;
     let fresh = fs::metadata(&stamp_path)
         .and_then(|m| m.modified())
         .ok()
@@ -865,10 +940,10 @@ fn verify_installed_with_hashes(root: &Path) -> Result<(Manifest, ElfHashVerific
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        for executable in &installed.manifest.executables {
+        for executable in served_executables(&installed.manifest, candidate) {
             validate_executable(&safe_path(root, &executable.path)?, executable)?;
         }
-        if installed_stat_signature(root, &installed.manifest)? != signature {
+        if installed_stat_signature(root, &installed.manifest, candidate)? != signature {
             return Err(fail("fixture tree changed during verification"));
         }
         crate::atomic_file::write(&stamp_path, &signature)?;
@@ -876,12 +951,19 @@ fn verify_installed_with_hashes(root: &Path) -> Result<(Manifest, ElfHashVerific
     } else {
         ElfHashVerification::ReusedStamp
     };
-    Ok((installed.manifest, hashes))
+    Ok((installed, hashes))
 }
 
-fn installed_stat_signature(root: &Path, manifest: &Manifest) -> Result<Vec<u8>> {
+fn installed_stat_signature(
+    root: &Path,
+    manifest: &Manifest,
+    candidate: Option<&CandidateProbeSet>,
+) -> Result<Vec<u8>> {
     let mut signature = manifest_bytes(manifest)?;
-    for executable in &manifest.executables {
+    if let Some(set) = candidate {
+        signature.extend_from_slice(&candidate_probes::set_bytes(set)?);
+    }
+    for executable in served_executables(manifest, candidate) {
         let path = safe_path(root, &executable.path)?;
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.is_file() {
@@ -942,26 +1024,37 @@ fn publish_file(path: &Path, bytes: &[u8], kind: PublicationKind) -> Result<usiz
     Ok(0)
 }
 
-/// Restore a bundle while the caller holds an exclusive gate lease. The CLI
+/// Restore a bundle, and optionally a candidate probe set (a set manifest
+/// path) beside it, while the caller holds an exclusive gate lease. The CLI
 /// passes the machine lease; tests pass one on a private lock, so no unit test
 /// waits behind a real gate on a shared host (#1180).
 pub fn restore(
     root: &Path,
     path: &Path,
+    candidate: Option<&Path>,
     sha: Option<&str>,
     gate: &crate::host_lease::HostLease,
 ) -> Result<RestoreWork> {
     if gate.mode() != crate::host_lease::HostLeaseMode::Gate {
         return Err(fail("fixture restore requires an exclusive gate lease"));
     }
-    let manifest = verify_bundle(root, path, sha)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| fail("manifest has no parent"))?;
+    let (manifest, set) = verify_bundle_with(root, path, candidate, sha)?;
+    let mut sources = Vec::new();
+    for executable in &manifest.executables {
+        sources.push((path, executable));
+    }
+    if let (Some(set), Some(set_path)) = (&set, candidate) {
+        for executable in &set.executables {
+            sources.push((set_path, executable));
+        }
+    }
     let stage = tempfile::tempdir()?;
     // Capture and revalidate before changing destinations; a changed bundle
     // cannot confer acceptance via a previously verified path.
-    for (index, executable) in manifest.executables.iter().enumerate() {
+    for (index, (origin, executable)) in sources.iter().enumerate() {
+        let parent = origin
+            .parent()
+            .ok_or_else(|| fail("manifest has no parent"))?;
         let from = safe_path(parent, &format!("objects/{}", executable.sha256.0))?;
         let to = stage.path().join(index.to_string());
         fs::copy(from, &to)?;
@@ -975,7 +1068,7 @@ pub fn restore(
         Err(e) => return Err(e.into()),
     }
     let mut work = RestoreWork::default();
-    for (index, executable) in manifest.executables.iter().enumerate() {
+    for (index, (_, executable)) in sources.iter().enumerate() {
         work.durability_flushes += publish_file(
             &safe_path(root, &executable.path)?,
             &fs::read(stage.path().join(index.to_string()))?,
@@ -984,9 +1077,15 @@ pub fn restore(
         work.executable_publications += 1;
     }
     let installed = Installed {
-        validation: validation_receipt(root, &manifest, ElfHashVerification::Recomputed)?,
+        validation: validation_receipt(
+            root,
+            &manifest,
+            set.as_ref(),
+            ElfHashVerification::Recomputed,
+        )?,
         manifest_sha256: hash_bytes(&manifest_bytes(&manifest)?),
         manifest,
+        candidate_probes: set,
     };
     work.durability_flushes += publish_file(
         &installed_path,
@@ -1008,104 +1107,150 @@ fn run_build(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// The publisher's build snapshot: the exact commit extracted into its
+/// isolated per-SHA environment, with the compilers and linkers that build
+/// every fixture there. The publisher and the candidate probe build share it.
+struct Snapshot {
+    environment: BuildEnvironment,
+    checkout: PathBuf,
+    toolchain: Toolchain,
+    sysroot: PathBuf,
+    lld: PathBuf,
+    linker: &'static str,
+}
+
+impl Snapshot {
+    fn new(root: &Path, expected: &CommitSha) -> Result<Self> {
+        environment::reject_ambient_overrides()?;
+        if std::env::consts::OS != "linux" {
+            return Err(fail("fixtures build requires Linux; restore on cloudmac"));
+        }
+        // The only network step: populate the host Cargo cache from every fixture
+        // lockfile. Resolution and builds below stay offline, and the controlled
+        // environment shares that cache only if it exists when it is created.
+        fetch_dependencies(root)?;
+        source_hashes(root, &[])?;
+        // Stable per-SHA build paths under an exclusive per-SHA lock: a random
+        // checkout path changes Cargo's `-C metadata` for path dependencies and
+        // embedded source paths (#1891).
+        let environment =
+            BuildEnvironment::isolated(root, &environment::default_isolation_root(), expected)?;
+        let archive = environment.scratch_root().join("source.tar");
+        run_build(
+            environment
+                .configure(Command::new("git").current_dir(root))
+                .args(["archive", "--format=tar", "--output"])
+                .arg(&archive)
+                .arg(&expected.0),
+        )?;
+        let checkout = environment.checkout();
+        fs::create_dir(&checkout)?;
+        run_build(
+            environment
+                .configure(&mut Command::new("tar"))
+                .args(["-xf"])
+                .arg(&archive)
+                .arg("-C")
+                .arg(&checkout),
+        )?;
+        // Git metadata is deliberately separate; source_hashes is captured from
+        // the original clean checkout again after builds to reject source races.
+        let rustc = environment
+            .output(environment.configure(Command::new("rustc").current_dir(root).arg("-vV")))?;
+        let cargo = environment.output(
+            environment.configure(
+                crate::command::locked_cargo()
+                    .current_dir(root)
+                    .arg("--version"),
+            ),
+        )?;
+        let host = rustc
+            .lines()
+            .find_map(|l| l.strip_prefix("host: "))
+            .ok_or_else(|| fail("missing compiler host"))?;
+        let sysroot = environment.output(
+            environment.configure(
+                Command::new("rustc")
+                    .current_dir(root)
+                    .args(["--print", "sysroot"]),
+            ),
+        )?;
+        let sysroot = PathBuf::from(sysroot.trim());
+        let lld = sysroot.join("lib/rustlib").join(host).join("bin/rust-lld");
+        let linker = if std::env::consts::ARCH == "aarch64" {
+            "cc"
+        } else {
+            "aarch64-linux-gnu-gcc"
+        };
+        let gnu_linker = environment.output(
+            environment.configure(Command::new(linker).current_dir(root).arg("--version")),
+        )?;
+        Ok(Self {
+            environment,
+            checkout,
+            toolchain: Toolchain {
+                rustc,
+                cargo,
+                gnu_linker,
+            },
+            sysroot,
+            lld,
+            linker,
+        })
+    }
+
+    /// Build conformance probe binaries for both ARM libc sets.
+    fn build_probes(&self, names: &[String]) -> Result<()> {
+        for target in [GuestTarget::Musl, GuestTarget::Gnu] {
+            let mut command = crate::command::locked_cargo();
+            self.environment
+                .configure(&mut command)
+                .current_dir(self.checkout.join("conformance-probes"))
+                .args([
+                    "build",
+                    "--locked",
+                    "--release",
+                    "--target",
+                    target.triple(),
+                ]);
+            match target {
+                GuestTarget::Musl => {
+                    command.env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", &self.lld);
+                }
+                GuestTarget::Gnu => {
+                    command.env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER", self.linker);
+                }
+            }
+            for name in names {
+                command.args(["--bin", name]);
+            }
+            run_build(&mut command)?;
+        }
+        Ok(())
+    }
+
+    /// Roots outside the snapshot whose files dep-info may name.
+    fn external_roots(&self) -> Vec<PathBuf> {
+        let mut external = self.environment.cargo_cache_roots();
+        external.push(self.sysroot.clone());
+        external
+    }
+
+    fn reject_embedded_path(&self, executable: &str) -> Result<()> {
+        environment::reject_embedded_path(
+            executable,
+            &fs::read(self.checkout.join(executable))?,
+            self.environment.scratch_root(),
+        )
+    }
+}
+
 pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
-    environment::reject_ambient_overrides()?;
-    if std::env::consts::OS != "linux" {
-        return Err(fail("fixtures build requires Linux; restore on cloudmac"));
-    }
     let expected = expected_head(root, Some(sha))?;
-    // The only network step: populate the host Cargo cache from every fixture
-    // lockfile. Resolution and builds below stay offline, and the controlled
-    // environment shares that cache only if it exists when it is created.
-    fetch_dependencies(root)?;
-    source_hashes(root, &[])?;
-    // Stable per-SHA build paths under an exclusive per-SHA lock: a random
-    // checkout path changes Cargo's `-C metadata` for path dependencies and
-    // embedded source paths (#1891).
-    let environment =
-        BuildEnvironment::isolated(root, &environment::default_isolation_root(), &expected)?;
-    let archive = environment.scratch_root().join("source.tar");
-    run_build(
-        environment
-            .configure(Command::new("git").current_dir(root))
-            .args(["archive", "--format=tar", "--output"])
-            .arg(&archive)
-            .arg(&expected.0),
-    )?;
-    let source = environment.checkout();
-    fs::create_dir(&source)?;
-    run_build(
-        environment
-            .configure(&mut Command::new("tar"))
-            .args(["-xf"])
-            .arg(&archive)
-            .arg("-C")
-            .arg(&source),
-    )?;
-    // Git metadata is deliberately separate; source_hashes is captured from
-    // the original clean checkout again after builds to reject source races.
-    let rustc = environment
-        .output(environment.configure(Command::new("rustc").current_dir(root).arg("-vV")))?;
-    let cargo = environment.output(
-        environment.configure(
-            crate::command::locked_cargo()
-                .current_dir(root)
-                .arg("--version"),
-        ),
-    )?;
-    let host = rustc
-        .lines()
-        .find_map(|l| l.strip_prefix("host: "))
-        .ok_or_else(|| fail("missing compiler host"))?;
-    let sysroot = environment.output(
-        environment.configure(
-            Command::new("rustc")
-                .current_dir(root)
-                .args(["--print", "sysroot"]),
-        ),
-    )?;
-    let lld = Path::new(sysroot.trim())
-        .join("lib/rustlib")
-        .join(host)
-        .join("bin/rust-lld");
-    let linker = if std::env::consts::ARCH == "aarch64" {
-        "cc"
-    } else {
-        "aarch64-linux-gnu-gcc"
-    };
-    let gnu_linker = environment
-        .output(environment.configure(Command::new(linker).current_dir(root).arg("--version")))?;
-    let toolchain = Toolchain {
-        rustc,
-        cargo,
-        gnu_linker,
-    };
-    let names = probe_names(&source)?;
-    for target in [GuestTarget::Musl, GuestTarget::Gnu] {
-        let mut command = crate::command::locked_cargo();
-        environment
-            .configure(&mut command)
-            .current_dir(source.join("conformance-probes"))
-            .args([
-                "build",
-                "--locked",
-                "--release",
-                "--target",
-                target.triple(),
-            ]);
-        match target {
-            GuestTarget::Musl => {
-                command.env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", &lld);
-            }
-            GuestTarget::Gnu => {
-                command.env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER", linker);
-            }
-        }
-        for name in &names {
-            command.args(["--bin", name]);
-        }
-        run_build(&mut command)?;
-    }
+    let snapshot = Snapshot::new(root, &expected)?;
+    let source = snapshot.checkout.clone();
+    let (environment, lld, linker) = (&snapshot.environment, &snapshot.lld, snapshot.linker);
+    snapshot.build_probes(&probe_names(&source)?)?;
     for script in BUILD_SCRIPTS {
         run_build(
             environment
@@ -1115,7 +1260,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
                         .arg(script)
                         .env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER", linker),
                 )
-                .env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", &lld),
+                .env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", lld),
         )?;
     }
     // GNU startup witnesses require the publisher's GNU CRT and linker. The
@@ -1143,9 +1288,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     for path in executable_inventory(&source)?.keys() {
         dep_info_files.push(source.join(dep_info::dep_info_path(path, EMBED)?));
     }
-    let mut external = environment.cargo_cache_roots();
-    external.push(PathBuf::from(sysroot.trim()));
-    let compiler_inputs = dep_info::classify(&source, &dep_info_files, &external)?;
+    let compiler_inputs = dep_info::classify(&source, &dep_info_files, &snapshot.external_roots())?;
     let sources = source_hashes(root, &compiler_inputs)?;
     linker::check_build_script_outputs(&source, inputs::FIXTURES)?;
     // Match the build snapshot byte-for-byte with the recorded source inputs.
@@ -1162,11 +1305,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
             target,
         };
         validate_executable(&source.join(&executable.path), &executable)?;
-        environment::reject_embedded_path(
-            &executable.path,
-            &fs::read(source.join(&executable.path))?,
-            environment.scratch_root(),
-        )?;
+        snapshot.reject_embedded_path(&executable.path)?;
         executables.push(executable);
     }
     let manifest = Manifest {
@@ -1175,10 +1314,10 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         compiler_inputs,
         sources,
         build_policy: BuildPolicy::default(),
-        toolchain,
+        toolchain: snapshot.toolchain.clone(),
         executables,
     };
-    validate_manifest(root, &manifest)?;
+    validate_manifest(root, &manifest, None)?;
     let bytes = manifest_bytes(&manifest)?;
     let store = output
         .map(Path::to_path_buf)
@@ -1205,6 +1344,28 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Unpack a trusted bundle archive, build the checkout's added probes beside
+/// it (see `candidate_probes::build`) and pack the set under `output`.
+pub fn build_candidate_probes(
+    root: &Path,
+    bundle: &Path,
+    sha: &str,
+    output: &Path,
+) -> Result<candidate_probes::CandidateBuild<PathBuf>> {
+    use candidate_probes::CandidateBuild;
+    let unpacked = archive::unpack_bundle(bundle)?;
+    let scratch = tempfile::tempdir()?;
+    Ok(
+        match candidate_probes::build(root, unpacked.manifest(), sha, scratch.path())? {
+            CandidateBuild::Build(set) => {
+                CandidateBuild::Build(archive::pack_candidate(&set, output)?)
+            }
+            CandidateBuild::Equal => CandidateBuild::Equal,
+            CandidateBuild::Refused(error) => CandidateBuild::Refused(error),
+        },
+    )
+}
+
 pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Result<()> {
     match action {
         FixturesAction::Publish { sha } => {
@@ -1227,13 +1388,20 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
         FixturesAction::Restore {
             manifest,
             bundle,
+            candidate_probes,
             sha,
         } => {
             let gate =
                 crate::host_lease::HostLease::acquire(crate::host_lease::HostLeaseMode::Gate)?;
             let work = match (manifest, bundle) {
-                (Some(manifest), None) => restore(root, &manifest, sha.as_deref(), &gate)?,
-                (None, Some(bundle)) => archive::restore(root, &bundle, sha.as_deref(), &gate)?,
+                (Some(manifest), None) => restore(root, &manifest, None, sha.as_deref(), &gate)?,
+                (None, Some(bundle)) => archive::restore(
+                    root,
+                    &bundle,
+                    candidate_probes.as_deref(),
+                    sha.as_deref(),
+                    &gate,
+                )?,
                 _ => return Err(fail("supply exactly one of --manifest or --bundle")),
             };
             writeln!(
@@ -1256,8 +1424,30 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
             )?;
             let gate =
                 crate::host_lease::HostLease::acquire(crate::host_lease::HostLeaseMode::Gate)?;
-            archive::restore(root, Path::new(&provenance.captured_path), None, &gate)?;
+            archive::restore(
+                root,
+                Path::new(&provenance.captured_path),
+                None,
+                None,
+                &gate,
+            )?;
         }
+        FixturesAction::BuildCandidateProbes {
+            bundle,
+            sha,
+            output,
+        } => match build_candidate_probes(root, &bundle, &sha, &output)? {
+            candidate_probes::CandidateBuild::Build(artifact) => writeln!(
+                writer,
+                "fixtures: candidate probe set {}",
+                artifact.display()
+            )?,
+            candidate_probes::CandidateBuild::Equal => writeln!(
+                writer,
+                "fixtures: fixture inputs equal the bundle's; no candidate probes"
+            )?,
+            candidate_probes::CandidateBuild::Refused(error) => return Err(error),
+        },
         FixturesAction::Fetch => {
             let count = fetch_dependencies(root)?;
             writeln!(writer, "fixtures: fetched {count} fixture lockfiles")?;
@@ -1300,8 +1490,10 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
             receipt,
         } => {
             let expected = expected_head(root, sha.as_deref())?;
+            let mut candidate = None;
             let (manifest, hashes) = if let Some(bundle_path) = bundle {
-                let (manifest, identity) = archive::verify(root, &bundle_path, &expected.0)?;
+                let (manifest, _, identity) =
+                    archive::verify(root, &bundle_path, None, &expected.0)?;
                 let archive_sha256 = provision::compute_sha256(&bundle_path)?;
                 writeln!(
                     writer,
@@ -1318,13 +1510,22 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                         verify_bundle(root, &path, sha.as_deref())?,
                         ElfHashVerification::Recomputed,
                     ),
-                    None => verify_installed_with_hashes(root)?,
+                    None => {
+                        let (installed, hashes) = verify_installed_record(root)?;
+                        candidate = installed.candidate_probes;
+                        (installed.manifest, hashes)
+                    }
                 }
             };
             if let Some(path) = receipt {
                 crate::atomic_file::write(
                     &path,
-                    &serde_json::to_vec_pretty(&validation_receipt(root, &manifest, hashes)?)?,
+                    &serde_json::to_vec_pretty(&validation_receipt(
+                        root,
+                        &manifest,
+                        candidate.as_ref(),
+                        hashes,
+                    )?)?,
                 )?;
             }
             writeln!(
