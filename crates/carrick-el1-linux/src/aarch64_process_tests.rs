@@ -14667,6 +14667,7 @@ fn arm_kill_nonleader_prefers_named_member_and_keeps_blocked_fallback() {
     }
 }
 
+#[cfg(test)]
 fn arm_kill_nonleader_recipient(blocked: bool) {
     use carrick_personality_linux::signal::{
         ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
