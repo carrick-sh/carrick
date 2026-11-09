@@ -2126,6 +2126,18 @@ mod tests {
             self.call_with_owner(frame, false)
         }
         fn call_with_owner(&mut self, frame: &mut TrapFrame, native: bool) -> IpcServed {
+            self.trap(frame, native, None)
+        }
+        /// One trap with `mask` standing in for the native signal owner.
+        fn call_with_mask_owner(&mut self, frame: &mut TrapFrame, mask: &MaskState) -> IpcServed {
+            self.trap(frame, true, Some(mask))
+        }
+        fn trap(
+            &mut self,
+            frame: &mut TrapFrame,
+            native: bool,
+            mask: Option<&MaskState>,
+        ) -> IpcServed {
             let zone: &ZoneTables = &self.zone;
             let mut sched = Sched {
                 handoff: None,
@@ -2140,11 +2152,36 @@ mod tests {
                 region: *self.region,
                 tables: &self.tables,
             };
-            let mut user = User {
+            let user = User {
                 task: &self.task,
                 mem: &self.mem,
             };
-            serve_ipc_with_signals(&mut sched, frame, &venue, &mut user, native, &mut || false).0
+            match mask {
+                None => {
+                    let mut user = user;
+                    serve_ipc_with_signals(
+                        &mut sched,
+                        frame,
+                        &venue,
+                        &mut user,
+                        native,
+                        &mut || false,
+                    )
+                    .0
+                }
+                Some(state) => {
+                    let mut user = MaskOwner { inner: user, state };
+                    serve_ipc_with_signals(
+                        &mut sched,
+                        frame,
+                        &venue,
+                        &mut user,
+                        native,
+                        &mut || false,
+                    )
+                    .0
+                }
+            }
         }
         /// Queue thread `tid` of `mm`, runnable on the slot, about to issue
         /// the syscall in `frame` (its SVC at `svc`).
@@ -2596,15 +2633,29 @@ mod tests {
         w.mem.write(MM, va + 0x100, &1u64.to_ne_bytes());
         let mut f = syscall(SYS_WRITE, e, va + 0x100, 8, A_SVC);
         assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 8));
-        // Forwarded unchanged: a signal mask, no maxevents, host items, a
+        // EINVAL in the guest: a mask whose size is not 8, no maxevents.
+        let mut f = epoll_pwait(ep, va, 8, -1, A_SVC);
+        f.x[4] = va;
+        f.x[5] = 4;
+        assert_eq!(
+            (w.call(&mut f), f.x[0] as i64),
+            (RETURNED, linux::EINVAL),
+            "sigsetsize"
+        );
+        let mut f = epoll_pwait(ep, va, 0, -1, A_SVC);
+        assert_eq!(
+            (w.call(&mut f), f.x[0] as i64),
+            (RETURNED, linux::EINVAL),
+            "maxevents"
+        );
+        // Forwarded unchanged: a signal mask EL1 cannot read, host items, a
         // buffer that cannot take the report.
         let mut f = epoll_pwait(ep, va, 8, -1, A_SVC);
         f.x[4] = 0x30000;
+        f.x[5] = 8;
         let regs = f.x;
         assert_eq!(w.call(&mut f), IpcServed::Forward);
         assert_eq!(f.x, regs);
-        let mut f = epoll_pwait(ep, va, 0, -1, A_SVC);
-        assert_eq!(w.call(&mut f), IpcServed::Forward);
         w.region.epoll_set_host_items(object, 1, &HostWait).unwrap();
         let mut f = epoll_pwait(ep, va, 8, -1, A_SVC);
         assert_eq!(w.call(&mut f), IpcServed::Forward);
@@ -2636,6 +2687,109 @@ mod tests {
         assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, linux::EBADF));
         // Every pin was dropped: only the descriptor's own reference.
         assert_eq!(w.host().refcount(t, Fd(ep)), Ok(1));
+    }
+
+    /// What the native owner stand-in saw: the armed mask, and each arm.
+    struct MaskState {
+        armed: core::cell::Cell<Option<u64>>,
+        arms: core::cell::Cell<u32>,
+        accept: core::cell::Cell<bool>,
+    }
+    /// A native owner stand-in: records the mask the wait armed.
+    struct MaskOwner<'a> {
+        inner: User<'a>,
+        state: &'a MaskState,
+    }
+    impl UserCopy for MaskOwner<'_> {
+        fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
+            self.inner.copy_out(dst_va, src)
+        }
+        fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool {
+            self.inner.copy_in(dst, src_va)
+        }
+        fn arm_wait_sigmask(&mut self, temporary: u64) -> bool {
+            self.state.arms.set(self.state.arms.get() + 1);
+            let accept = self.state.accept.get();
+            if accept {
+                assert!(
+                    self.state.armed.replace(Some(temporary)).is_none(),
+                    "armed twice"
+                );
+            }
+            accept
+        }
+        fn disarm_wait_sigmask(&mut self) {
+            self.state.armed.set(None);
+        }
+    }
+
+    /// libuv's `epoll_pwait(.., sigmask)` on a ring epoll: served in ring.
+    /// A call that returns without waiting never touches the mask; a parked
+    /// wait arms it, and the re-entered call restores it before harvesting.
+    /// A caller without a native signal owner still leaves for the host,
+    /// which swaps the mask around its own wait.
+    #[test]
+    fn el1_epoll_zone_sigmask_wait_arms_while_parked_and_never_forwards_a_native_call() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let e = w.eventfd(a, 0, EventMode::Counter, NONBLOCK);
+        let (ep, _) = zone_epoll(&w, a, e, 7);
+        let (r2, _w2, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.map(OTHER_MM, va, PAGE);
+        let sigprof = 1u64 << 26;
+        w.mem.write(MM, va + 0x200, &sigprof.to_le_bytes());
+        let mask = MaskState {
+            armed: Default::default(),
+            arms: Default::default(),
+            accept: core::cell::Cell::new(true),
+        };
+        let masked = |ready_timeout: i32| {
+            let mut f = epoll_pwait(ep, va, 4, ready_timeout, A_SVC);
+            f.x[4] = va + 0x200;
+            f.x[5] = 8;
+            f
+        };
+        // Nothing ready and a zero timeout: no wait, so no mask change.
+        let mut f = masked(0);
+        assert_eq!(w.call_with_mask_owner(&mut f, &mask), RETURNED);
+        assert_eq!((f.x[0], mask.arms.get(), mask.armed.get()), (0, 0, None));
+        // A caller the signal owner does not serve forwards the blocking call.
+        let mut f = masked(-1);
+        let regs = f.x;
+        mask.accept.set(false);
+        assert_eq!(w.call_with_mask_owner(&mut f, &mask), IpcServed::Forward);
+        mask.accept.set(true);
+        assert_eq!((f.x, mask.arms.get()), (regs, 1));
+        assert_eq!(leaves(&w, IpcLeave::EpollSigmask), 1);
+        // The native owner's wait parks with the mask armed.
+        let b_write = syscall(SYS_WRITE, e, va, 8, B_SVC);
+        w.mem.write(OTHER_MM, va, &1u64.to_ne_bytes());
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        let mut f = masked(-1);
+        let a_regs = f.x;
+        assert_eq!(w.call_with_mask_owner(&mut f, &mask), SWITCHED);
+        assert_eq!(mask.armed.get(), Some(sigprof));
+        assert_eq!(leaves(&w, IpcLeave::EpollSigmask), 1, "no new forward");
+        f = b_write;
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 8), "B writes");
+        // B blocks on an empty pipe: the vCPU goes back to A.
+        let mut g = syscall(SYS_READ, r2, va + 0x300, 16, B_SVC);
+        assert_eq!(w.call_with_owner(&mut g, false), SWITCHED);
+        assert_eq!(g.x, a_regs, "A's original arguments");
+        reenter(&mut g, A_SVC);
+        assert_eq!(w.call_with_mask_owner(&mut g, &mask), RETURNED);
+        let f = g;
+        assert_eq!(f.x[0], 1, "the event, in ring");
+        assert_eq!(
+            mask.armed.get(),
+            None,
+            "the re-entered call restored the mask"
+        );
+        assert_eq!(host_calls(&w), 0);
+        assert_eq!(leaves(&w, IpcLeave::EpollSigmask), 1);
     }
 
     /// The ping-pong half: A blocks in epoll_pwait, B's eventfd write wakes

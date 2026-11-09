@@ -7782,6 +7782,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         }
         pending
     }
+    fn arm_wait_sigmask(&mut self, temporary: u64) -> bool {
+        // The same slot protocol a forwarded temporary-mask wait uses: the
+        // persistent mask is published before the temporary one is visible,
+        // and the next signal checkpoint (`take_suspend_mask`) restores it
+        // after any handler selected under the temporary mask.
+        if !self.control.forwarded_wait_mask_armed() {
+            let unmaskable = carrick_signal_core::policy::Signal::KILL.bit()
+                | carrick_signal_core::policy::Signal::STOP.bit();
+            self.control.arm_forwarded_wait_mask(
+                carrick_personality_linux::abi::thread::BlockedMask(temporary & !unmaskable),
+                self.control.blocked(),
+            );
+        }
+        true
+    }
+    fn disarm_wait_sigmask(&mut self) {
+        if let Some(saved) = self.control.take_forwarded_wait_mask() {
+            self.control.init_blocked(saved);
+        }
+    }
     fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
         core::mem::take(&mut self.owner_continuation)
             .then(|| self.resume_pending_lifecycle())

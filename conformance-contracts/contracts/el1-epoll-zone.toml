@@ -46,6 +46,8 @@ an epoll costs no host exit in steady state.
 vm_free = [
   "carrick-el1-abi::ipc::epoll::tests::{bounded_ready_count_preserves_edges_and_oneshots,ready_count_survives_cursor_replacement_between_batches,ready_count_requires_shared_zone_only_proof}",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::{s1_empty_epoll_skips_owner_preparation,s1_host_epoll_refusals_preserve_edge_and_empty_host_policy}",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_epoll_pwait_sigmask_on_a_ring_epoll_is_never_forwarded (production native-child entry, #1671: two live tasks share one ring epoll; libuv's epoll_pwait with a SIGPROF mask EINVALs on a bad sigsetsize, parks in ring with the mask armed and restored on the re-entered call, and is never forwarded to the host; no signed, EINTR-handler or x86 execution claim)",
+  "carrick-el1-linux::ipc::tests::el1_epoll_zone_sigmask_wait_arms_while_parked_and_never_forwards_a_native_call",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_netpoll_eventfd_wait (production native-child entry, child-created eventfd and epoll, EPOLLIN|EPOLLET ADD/MOD/DEL, timeout-zero readiness, finite park and inherited eventfd writer wake; zero forwarded calls and released execution capacity, no signed or x86 execution claim)",
 ]
 embed = [

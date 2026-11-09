@@ -341,6 +341,20 @@ pub trait UserCopy {
         false
     }
 
+    /// Make `temporary` (a signal-set word, `epoll_pwait`'s sigmask) the
+    /// calling thread's blocked mask for the wait it is about to park, saving
+    /// the persistent mask for the native signal checkpoint that ends the
+    /// call. `false`: this user has no native signal owner, so the host
+    /// swaps the mask around its own wait.
+    fn arm_wait_sigmask(&mut self, _temporary: u64) -> bool {
+        false
+    }
+
+    /// Restore the persistent mask [`arm_wait_sigmask`](Self::arm_wait_sigmask)
+    /// saved, when the wait ends without a signal checkpoint (a re-entered
+    /// call, or a park that did not happen). A no-op when nothing is armed.
+    fn disarm_wait_sigmask(&mut self) {}
+
     /// Copy `src` to the user buffer at `dst_va`.
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool;
     /// Fill `dst` from the user buffer at `src_va`.
