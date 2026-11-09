@@ -1241,6 +1241,15 @@ impl FutexVenue for NativeLane<'_> {
         carrick_core_abi::ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))
     }
     fn timed_wait_allowed(&self) -> bool {
+        // Timers are leased to the exact record/park sequence through the
+        // shared scheduler owner, as on ARM. Only the counter is x86's: the
+        // TSC, whose rate CPUID must qualify before a deadline is computed.
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            carrick_el1::isa::x86::X86Backend.frequency().is_ok()
+        }
+        #[cfg(not(target_os = "none"))]
         false
     }
     fn read_u64(&self, address: carrick_guest_arch::UserVa) -> Option<u64> {
@@ -1251,9 +1260,23 @@ impl FutexVenue for NativeLane<'_> {
         Some(unsafe { core::ptr::read_unaligned(address.raw() as *const u64) })
     }
     fn frequency(&self) -> FutexFrequency {
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            if let Ok(frequency) = carrick_el1::isa::x86::X86Backend.frequency() {
+                return FutexFrequency::from_hz(frequency.raw().get());
+            }
+        }
         FutexFrequency::from_hz(1)
     }
     fn now(&self) -> carrick_guest_arch::CounterTick {
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            if let Ok(now) = carrick_el1::isa::x86::X86Backend.counter() {
+                return now;
+            }
+        }
         carrick_guest_arch::CounterTick::new(0)
     }
     fn invalid(&mut self, result: SyscallResult) -> Option<Self::Served> {
@@ -1322,7 +1345,21 @@ impl FutexVenue for NativeLane<'_> {
             record,
         )?;
         let seq = self.zone.next_seq(record);
-        self.zone
+        // Reserve the exact record/sequence timer lease, with the timeout
+        // answer, before the park is published: wake and expiry then
+        // arbitrate on that one park, and the winner releases the lease.
+        if wait.deadline.is_some() {
+            self.zone
+                .arm_timer_result(
+                    self.lane.slot,
+                    record,
+                    seq,
+                    carrick_guest_arch::NativeReturnWord(wait.timeout_result.raw() as u64),
+                )
+                .ok()?;
+        }
+        if self
+            .zone
             .enqueue(
                 &guard,
                 record,
@@ -1332,7 +1369,13 @@ impl FutexVenue for NativeLane<'_> {
                 wait.bitset,
                 0,
             )
-            .ok()?;
+            .is_err()
+        {
+            self.zone.cancel_timer_admission(reference);
+            return None;
+        }
+        self.zone
+            .set_deadline(record, wait.deadline.map_or(0, |deadline| deadline.raw()));
         self.handoff = Some(carrick_core::entry::publish_handoff_park(
             start,
             &guard,
