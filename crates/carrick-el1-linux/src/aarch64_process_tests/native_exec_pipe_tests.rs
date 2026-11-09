@@ -70,6 +70,24 @@ enum TimerDeparture {
     SlotReset,
     CarrierExitWake,
     SlotResetWake,
+    Nanosleep(SleepCase),
+}
+
+/// #1808: what a native fork/exec child's sleep must do through production
+/// entry while its exec leader stays parked in a timed futex.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SleepCase {
+    /// Park, depart the executor, expire once at the original deadline: 0.
+    Expiry,
+    /// Park, then a terminal SIGINT: EINTR and the unslept interval in rem.
+    Interrupted,
+    /// SIGINT already pending at entry: EINTR and the whole interval, no park.
+    PendingSignal,
+    /// forkexecstorm's ready-child shape: an expired absolute deadline is 0.
+    ExpiredAbsolute,
+    /// A zero relative interval is 0 without a timer lease.
+    ZeroRelative,
+    InvalidTimespec,
 }
 
 #[test]
@@ -113,6 +131,72 @@ fn serial_host_native_child_timed_futex_slot_reset_wake() {
         true,
         None,
         Some(TimerDeparture::SlotResetWake),
+    );
+}
+
+#[test]
+fn serial_host_native_child_nanosleep_is_routed() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+        Some(TimerDeparture::Nanosleep(SleepCase::Expiry)),
+    );
+}
+
+#[test]
+fn serial_host_native_child_nanosleep_eintr_writes_remaining() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+        Some(TimerDeparture::Nanosleep(SleepCase::Interrupted)),
+    );
+}
+
+#[test]
+fn serial_host_native_child_nanosleep_pending_signal_is_eintr() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+        Some(TimerDeparture::Nanosleep(SleepCase::PendingSignal)),
+    );
+}
+
+#[test]
+fn serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+        Some(TimerDeparture::Nanosleep(SleepCase::ExpiredAbsolute)),
+    );
+}
+
+#[test]
+fn serial_host_native_child_zero_nanosleep_returns_zero() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+        Some(TimerDeparture::Nanosleep(SleepCase::ZeroRelative)),
+    );
+}
+
+#[test]
+fn serial_host_native_child_nanosleep_rejects_invalid_timespec() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+        Some(TimerDeparture::Nanosleep(SleepCase::InvalidTimespec)),
     );
 }
 
@@ -1579,6 +1663,222 @@ fn child_futex<'a>(
     drop(entry);
     if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
         work.settled();
+    }
+    if let Some(TimerDeparture::Nanosleep(case)) = departure {
+        use carrick_personality_linux::sleep::timespec_bytes;
+        // The Physical clock reads 1000 until a timeout is served, then 2000;
+        // one tick is one nanosecond. The exec leader stays parked in its
+        // timed futex (deadline far beyond 1100), so this is a two-live-thread
+        // native child: the sleeping clone and the waiting leader.
+        let mut user = carrick_test_support::GuestUserBuffer::zeroed(32);
+        let (request, remaining) = (user.arg(), user.arg() + 16);
+        match case {
+            SleepCase::InvalidTimespec => {
+                user.as_mut_bytes()[8..16].copy_from_slice(&1_000_000_000_i64.to_le_bytes());
+            }
+            SleepCase::ZeroRelative => {}
+            SleepCase::ExpiredAbsolute => {
+                user.as_mut_bytes()[..16].copy_from_slice(&timespec_bytes(500));
+            }
+            SleepCase::Expiry | SleepCase::Interrupted | SleepCase::PendingSignal => {
+                user.as_mut_bytes()[..16].copy_from_slice(&timespec_bytes(100));
+            }
+        }
+        user.as_mut_bytes()[16..].fill(0xa5);
+        if case == SleepCase::ExpiredAbsolute {
+            // clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, {0, 500}, rem)
+            frame.x[8] = 115;
+            frame.x[..4].copy_from_slice(&[1, 1, request, remaining]);
+        } else {
+            frame.x[8] = 101;
+            frame.x[..2].copy_from_slice(&[request, remaining]);
+        }
+        let interrupt = carrick_el1_abi::ExternalSignalRecord::new(
+            carrick_core_abi::EntryEventIdentity::from_binding(
+                crate::common_entry::execution_binding(&fixture.task),
+            ),
+            crate::common_entry::execution_binding(&fixture.task),
+            worker.record,
+            carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::MIN),
+            carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+            carrick_el1_abi::ExternalSignalSource::Terminal,
+        );
+        if case == SleepCase::PendingSignal {
+            assert!(
+                registry
+                    .admit_external_event(fixture.zone, interrupt, fixture.slot, service)
+                    .unwrap()
+            );
+        }
+        let _ = crate::native_process_runtime::host_test_support::take_signal_copies();
+        let nodes = fixture.zone.timer_node_count();
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                worker.address,
+                &worker.words,
+                service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &word,
+            }),
+            None,
+            Some(&venue),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        drop(entry);
+        assert_ne!(
+            route,
+            CompletionRoute::Forward,
+            "native child nanosleep cannot use a host continuation"
+        );
+        assert_eq!(
+            counters.forwarded[frame.x[8] as usize].load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters.refused[frame.x[8] as usize].load(Ordering::Relaxed),
+            0
+        );
+        let sleeper = fixture.zone.record(worker.record.id);
+        let immediate = match case {
+            SleepCase::ZeroRelative | SleepCase::ExpiredAbsolute => Some(0),
+            SleepCase::InvalidTimespec => Some(-22),
+            SleepCase::PendingSignal => Some(-4),
+            SleepCase::Expiry | SleepCase::Interrupted => None,
+        };
+        if let Some(result) = immediate {
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
+            assert_eq!(frame.x[0] as i64, result, "{case:?}");
+            assert_eq!(
+                fixture.zone.slot(fixture.slot).current(),
+                Some(worker.record.id),
+                "an answered sleep never parks"
+            );
+            assert_eq!(fixture.zone.timer_node_count(), nodes, "no timer lease");
+            let copies = crate::native_process_runtime::host_test_support::take_signal_copies();
+            if case == SleepCase::PendingSignal {
+                // A deliverable signal at entry: EINTR with the whole interval.
+                assert_eq!(
+                    copies,
+                    [(UserVa::new(remaining), timespec_bytes(100).to_vec())]
+                );
+            } else {
+                assert!(copies.is_empty(), "only EINTR writes rem: {copies:?}");
+            }
+            return;
+        }
+        // Parked: the clone released its execution lease and its timer lease
+        // holds the original deadline.
+        assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        assert!(matches!(
+            sleeper.claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        assert_eq!(sleeper.deadline(), Some(1100));
+        assert_eq!(fixture.zone.timer_node_count(), nodes + 1);
+        let expected = if case == SleepCase::Expiry {
+            // The executor departs; the deadline survives on the carrier
+            // driver's heap and expires exactly once at its original tick.
+            fixture.zone.leave_guest(fixture.slot, &ShortLockSpin);
+            carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+                carrick_kernel::el1_zone::hand_back_foreign_timer(fixture.slot);
+            });
+            assert_eq!(
+                sleeper.deadline(),
+                Some(1100),
+                "departure keeps the deadline"
+            );
+            let expire = |now| {
+                fixture.zone.expire_native_timer(
+                    carrick_guest_arch::CounterTick::new(now),
+                    &ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                )
+            };
+            assert!(expire(1099).is_none(), "no early expiry");
+            assert_eq!(expire(1100).map(|record| record.id), Some(worker.record.id));
+            assert!(expire(1100).is_none(), "one resolution");
+            assert_eq!(fixture.zone.timer_node_count(), nodes);
+            carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+                carrick_kernel::el1_zone::hand_back(&[worker.record]);
+            });
+            fixture.zone.enter_guest(fixture.slot);
+            0
+        } else {
+            // A terminal SIGINT reaches the parked member through the
+            // production ingress owner and wakes it before its deadline.
+            assert!(
+                registry
+                    .admit_external_event(fixture.zone, interrupt, fixture.slot, service)
+                    .unwrap()
+            );
+            assert!(
+                !matches!(sleeper.claim(), carrick_sched_core::Claim::Parked { .. }),
+                "a deliverable signal wakes the parked sleep"
+            );
+            assert_eq!(
+                fixture.zone.timer_node_count(),
+                nodes,
+                "wake cancels the timer"
+            );
+            -4
+        };
+        activate_target(source, &fixture.task, &worker);
+        let identity = fixture.zone.record(worker.record.id).identity();
+        fixture.task.set(
+            El1TaskId::from_linux_tid(identity.tid as i32),
+            carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+            identity.file_table,
+        );
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                worker.address,
+                &worker.words,
+                service,
+            )
+            .unwrap();
+        let resumed = match entry.resume_pending_wait() {
+            Some(LifecycleOutcome::Returned { result, .. }) => Some(result.raw()),
+            _ => None,
+        };
+        drop(entry);
+        assert_eq!(resumed, Some(expected), "{case:?}");
+        let copies = crate::native_process_runtime::host_test_support::take_signal_copies();
+        if case == SleepCase::Interrupted {
+            assert_eq!(
+                copies,
+                [(UserVa::new(remaining), timespec_bytes(100).to_vec())]
+            );
+        } else {
+            assert!(copies.is_empty(), "a completed sleep never writes rem");
+        }
+        return;
     }
     let wake_after_departure = matches!(
         departure,
