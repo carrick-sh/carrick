@@ -10278,14 +10278,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if pid > 0 {
             let target_pid = pid as u32;
             for (&_id, task) in graph.owner.tasks() {
-                if task.metadata().namespace_pid == target_pid || task.has_thread(target_pid) {
-                    // Logical membership licenses kill even while a host
-                    // member has no live zone record. Use the exact physical
-                    // member only as a preference for signal interruption.
-                    if task.metadata().namespace_pid != target_pid {
-                        preferred_member = task
-                            .native()
-                            .resources()
+                if task.metadata().namespace_pid == target_pid {
+                    targets.push((
+                        task.key(),
+                        task.native().resources().signals().clone(),
+                        task.parent(),
+                    ));
+                    break;
+                }
+            }
+            if targets.is_empty() {
+                // Keep leader lookup independent of member population.
+                // Logical membership licenses a nonleader even while a host
+                // member has no live zone context; that record is only the
+                // preference for which eligible member to interrupt.
+                for task in graph.owner.tasks().values() {
+                    if task.has_thread(target_pid) {
+                        let resources = task.native().resources();
+                        preferred_member = resources
                             .live_signal_member(
                                 task.key(),
                                 task.metadata().namespace_pid,
@@ -10293,13 +10303,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 target_pid,
                             )
                             .map(|(record, _)| record);
+                        targets.push((task.key(), resources.signals().clone(), task.parent()));
+                        break;
                     }
-                    targets.push((
-                        task.key(),
-                        task.native().resources().signals().clone(),
-                        task.parent(),
-                    ));
-                    break;
                 }
             }
             if targets.is_empty() {
