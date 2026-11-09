@@ -119,10 +119,28 @@ jobs:
       cancel-in-progress: false
     timeout-minutes: 180
     steps:
+      # Disk admission and the checkout build both need the root-owned lease
+      # supervisor. There is deliberately no unleased fallback: measuring free
+      # space beside a running build is the #1693 race. Fail with the runbook
+      # step instead of a bare "No such file or directory".
+      - name: Verify installed host-lease supervisor
+        run: |
+          set -euo pipefail
+          xtask=/usr/local/bin/carrick-xtask
+          if [ ! -x "$xtask" ] || [ -L "$xtask" ] || [ "$(/usr/bin/stat -f %u "$xtask")" != 0 ]; then
+            echo "::error title=host-lease supervisor missing::$xtask is not an installed root-owned binary; install it per docs/ci/mac-hvf-runner.md, setup step 3 (Root-owned carrick-xtask)"
+            exit 1
+          fi
+          if ! "$xtask" host-lease --help >/dev/null 2>&1; then
+            echo "::error title=host-lease supervisor stale::$xtask has no host-lease subcommand; reinstall it per docs/ci/mac-hvf-runner.md, setup step 3 (Root-owned carrick-xtask)"
+            exit 1
+          fi
+
       - name: Disk admission
         env:
           HVF_DISK_FLOOR_GIB: "60"
         run: |
+          /usr/local/bin/carrick-xtask host-lease --mode gate -- bash -s <<'DISK_ADMISSION'
           set -euo pipefail
           if [ -z "${RUNNER_WORKSPACE:-}" ] || [ ! -d "$RUNNER_WORKSPACE" ]; then
             echo "::error title=HVF disk admission failed::RUNNER_WORKSPACE is unset or missing: ${RUNNER_WORKSPACE:-<unset>}"
@@ -142,6 +160,7 @@ jobs:
             exit 1
           fi
           echo "disk admission passed: ${avail_gib} GiB free on $RUNNER_WORKSPACE (floor ${HVF_DISK_FLOOR_GIB} GiB)"
+          DISK_ADMISSION
 
       - uses: actions/checkout@v4
 
@@ -236,6 +255,11 @@ jobs:
             ${{ steps.cargo-home.outputs.dir }}/git/db
           key: hvf-cargo-registry-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: hvf-cargo-registry-v2-
+
+      - name: Build checkout xtask under shared lease
+        run: |
+          /usr/local/bin/carrick-xtask host-lease --mode carrick -- cargo build --locked -p carrick-xtask --target-dir target/lease-tools
+          echo "CARRICK_XTASK_BIN=$GITHUB_WORKSPACE/target/lease-tools/debug/carrick-xtask" >> "$GITHUB_ENV"
 
       - name: Fetch fixture lockfile dependencies
         run: just xtask fixtures fetch
