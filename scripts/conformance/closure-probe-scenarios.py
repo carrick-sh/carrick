@@ -17,23 +17,24 @@ from typing import Any
 LIBCS = ("gnu", "musl")
 DEDICATED_SOURCE_COUNT = 25
 DEDICATED_RUNNER_COUNT = 19
+SignedScenario = namedtuple("SignedScenario", "package test_target ignored")
+# `ignored` mirrors whether the test carries `#[ignore]`; test-signed.sh keeps
+# `--ignored` as ignored-only selection, so passing it for a plain `#[test]`
+# matches zero tests.
 SIGNED_SCENARIO_RUNNERS = {
-    "case_sched_affinity_threads_mask_reflection": (
-        "carrick-conformance-next",
-        "sched_affinity_threads",
+    "case_sched_affinity_threads_mask_reflection": SignedScenario(
+        "carrick-conformance-next", "sched_affinity_threads", False
     ),
-    "case_native_prefix_write_child_inherited_file": (
-        "carrick-conformance-next",
-        "native_prefix_write",
+    "case_native_prefix_write_child_inherited_file": SignedScenario(
+        "carrick-conformance-next", "native_prefix_write", False
     ),
-    "production_rx_poketext_executes_warm_patched_instruction": (
-        "carrick-conformance-next",
-        "ptrace_poketext_signed",
+    "production_rx_poketext_executes_warm_patched_instruction": SignedScenario(
+        "carrick-conformance-next", "ptrace_poketext_signed", True
     ),
 }
 Source = namedtuple("Source", "name runner")
 RunnerCommand = namedtuple(
-    "RunnerCommand", "runner package test_target transport sources"
+    "RunnerCommand", "runner package test_target transport sources ignored"
 )
 Plan = namedtuple("Plan", "sources commands")
 CompletedRow = namedtuple("CompletedRow", "libc source runner")
@@ -71,8 +72,9 @@ def build_plan(inventory: dict[str, Any]) -> Plan:
         signed_route = SIGNED_SCENARIO_RUNNERS.get(runner)
         if signed_route is None:
             package, test_target, transport = "carrick-cli", "conformance", "cargo"
+            ignored = False
         else:
-            package, test_target = signed_route
+            package, test_target, ignored = signed_route
             transport = "test-signed"
         commands.append(
             RunnerCommand(
@@ -81,6 +83,7 @@ def build_plan(inventory: dict[str, Any]) -> Plan:
                 test_target,
                 transport,
                 tuple(names),
+                ignored,
             )
         )
     if len(commands) != DEDICATED_RUNNER_COUNT:
@@ -129,7 +132,7 @@ def _run_command(root: Path, command: RunnerCommand, libc: str) -> CommandResult
             command.package,
             command.runner,
             "--exact",
-            "--ignored",
+            *(["--ignored"] if command.ignored else []),
             "--nocapture",
         ]
     else:
