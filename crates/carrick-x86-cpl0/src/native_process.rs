@@ -855,6 +855,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        #[cfg(feature = "test-support")]
+        if crate::test_support::take_owned_copy_busy(false) {
+            return Err(NativeProcessError::Busy);
+        }
         self.copy_user_bytes(mm, address, bytes)
             .map_err(|error| match error {
                 NativeProcessError::OwnerWait(_) => NativeProcessError::Busy,
@@ -868,10 +872,15 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
         #[cfg(feature = "test-support")]
-        if crate::test_support::take_owned_copy_busy() {
+        if crate::test_support::take_owned_copy_busy(true) {
             return Err(NativeProcessError::Busy);
         }
-        self.copy_user_bytes(mm, address, bytes)
+        let copied = self.copy_user_bytes(mm, address, bytes);
+        #[cfg(feature = "test-support")]
+        if copied.is_ok() {
+            crate::test_support::record_owned_copy_done();
+        }
+        copied
     }
     /// Test images can lag one read of the production counter.
     #[cfg(feature = "test-support")]
