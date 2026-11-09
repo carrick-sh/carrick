@@ -82,7 +82,19 @@ pub trait GuestDispatchFrame: SyscallFrame {
         let frame = self
             .arm_frame()
             .unwrap_or_else(|| invalid_completion(NativeInvariant::EntryBinding));
-        frame.elr = frame.elr.wrapping_sub(4);
+        frame.elr = frame.elr.wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN);
+    }
+    /// The PC of this call's syscall instruction, where a parked operation
+    /// re-executes it: the saved return PC rewound by the same ISA length
+    /// [`Self::restart_syscall`] uses.
+    fn operation_resume_pc(
+        &self,
+    ) -> Option<carrick_el1::substrate::sched::object_wait::OperationResumePc> {
+        carrick_el1::substrate::sched::object_wait::OperationResumePc::new(
+            self.arm_frame_ref()?
+                .elr
+                .wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN),
+        )
     }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
     fn arm_frame_ref(&self) -> Option<&TrapFrame>;
@@ -3434,6 +3446,27 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     }
 }
 
+/// The IPC transfer capability for this entry (#1756): the running record's
+/// park/wake boundary over the shared transfer engine. Only ARM's scheduler
+/// builds one. x86 builds none (its zone stays `None` here), so an x86
+/// in-ring transfer remains the counted refusal until its capability exists.
+#[allow(clippy::type_complexity)]
+fn ipc_execution<'s, 'z: 's, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>(
+    frame: &'s mut G,
+    zone: &'s mut Option<Zone<'z, C, U>>,
+    current_tasks: &'s [CurrentTask],
+    counters: &'s Counters,
+    handoff: &'s mut Option<
+        carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
+    >,
+) -> Option<(sched::Sched<'s, C, U>, &'s mut TrapFrame, &'s CurrentTask)> {
+    let frame = frame.arm_frame()?;
+    let task = current_tasks.get(frame.slot as usize)?;
+    let slot = SlotId::from_index(frame.slot as usize)?;
+    let sched = native_scheduler(zone.as_mut()?, task, counters, slot, handoff);
+    Some((sched, frame, task))
+}
+
 // An unavailable publication cannot select the legacy numeric namespace.
 enum NativeDescriptorNamespace {
     Legacy,
@@ -4348,20 +4381,21 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             return FamilyCompletion::Forward;
         };
         let native_signals = self.process.is_some();
-        let Some(frame) = self.frame.arm_frame() else {
+        let counters = self.counters;
+        let Some((mut sched, frame, task)) = ipc_execution(
+            &mut *self.frame,
+            &mut self.zone,
+            self.current_tasks,
+            counters,
+            &mut self.handoff,
+        ) else {
+            // No execution binding for this entry: an explicit, counted
+            // refusal rather than a transfer without a park boundary.
             self.frame.record_isa_unsupported_forward();
             return FamilyCompletion::Forward;
         };
-        let counters = self.counters;
-        let zone = &mut self.zone;
-        let current_tasks = self.current_tasks;
-        let slot = frame.slot as usize;
-        let cur_task = current_tasks.get(slot);
-        if let (Some(zone), Some(task), Some(zslot)) =
-            (zone.as_mut(), cur_task, SlotId::from_index(slot))
         {
             let orig_x0 = frame.x[0];
-            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
             let mut user = file::OwnerCopy {
                 inner: file::DiagnosedCopy {
                     inner: file::ValidatedCopy {
@@ -4409,15 +4443,13 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             if sigpipe_owed {
                 raise_native_sigpipe(self.process.as_deref_mut());
             }
-            return carrick_personality_linux::dispatch::transfer_effect(
+            carrick_personality_linux::dispatch::transfer_effect(
                 &task.linux,
                 orig_x0,
                 result,
                 disposition,
-            );
+            )
         }
-
-        FamilyCompletion::Forward
     }
 
     fn ipc_poll_transfer(&mut self) -> FamilyCompletion

@@ -104,8 +104,15 @@ impl SyscallFrame for NativeDispatch<'_> {
 
 impl GuestDispatchFrame for NativeDispatch<'_> {
     fn restart_syscall(&mut self) {
-        // RCX holds the saved user return PC in the SYSCALL frame.
-        self.frame.rcx = self.frame.rcx.wrapping_sub(2);
+        self.frame.restart_syscall();
+    }
+    fn operation_resume_pc(
+        &self,
+    ) -> Option<carrick_el1::substrate::sched::object_wait::OperationResumePc> {
+        // x86 instructions are byte-aligned: only a null PC is refused.
+        carrick_el1::substrate::sched::object_wait::OperationResumePc::from_raw(
+            self.frame.syscall_pc(),
+        )
     }
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
         self.call.native

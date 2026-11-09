@@ -36,11 +36,11 @@
 //!   ([`IpcHandback`]) and carries the original `x0` and syscall number.
 
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
+use crate::dispatch::GuestDispatchFrame;
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{
     PrefixCopy, StepStatus, from_sched_token, to_sched_token, wait_key,
 };
-use carrick_el1::substrate::sched::object_wait::OperationResumePc;
 pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
@@ -51,7 +51,7 @@ use carrick_el1_abi::ipc::{
 };
 use carrick_el1_abi::ipc_tables::IpcTableMap;
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave, TrapFrame};
-use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitError};
+use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitError, OperationToken};
 use carrick_sched_core::{LockWait, ShortLockSpin, WakeEffects};
 use core::sync::atomic::Ordering;
 
@@ -67,13 +67,29 @@ mod linux {
     pub const MAX_RW_COUNT: u64 = 0x7fff_f000;
     /// eventfd reads and writes move one native-endian u64.
     pub const EVENTFD_WORD: u64 = 8;
-    /// Length of the AArch64 SVC instruction ELR points past.
-    pub const SVC_LEN: u64 = 4;
 }
 pub use linux::{SYS_READ, SYS_WRITE};
 
 mod epoll;
 pub use epoll::SYS_EPOLL_PWAIT;
+mod execution;
+pub use execution::IpcExecution;
+
+/// One Linux syscall argument word from the shared frame.
+fn arg(frame: &impl GuestDispatchFrame, index: usize) -> u64 {
+    frame.argument(index).unwrap_or_else(|| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    })
+}
+
+/// The canonical Linux ordinal family selection decodes.
+fn ordinal(frame: &impl GuestDispatchFrame) -> usize {
+    frame.canonical_ordinal().raw() as usize
+}
+
+fn set_result(frame: &mut impl GuestDispatchFrame, value: u64) {
+    frame.set_result(carrick_guest_arch::NativeReturnWord(value));
+}
 
 /// Where the venue finds a task's descriptor table in the shared authority.
 /// Returns a table only when it is the task's complete descriptor namespace
@@ -400,9 +416,9 @@ impl LockWait for Finish {
 
 /// Serve read(2)/write(2) on a pipe or eventfd, and epoll_pwait(2) on a
 /// zone epoll, in EL1.
-pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+pub fn serve_ipc<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
 ) -> IpcServed {
@@ -412,15 +428,15 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
 /// Serve IPC with the native signal owner. The pending-interruption probe
 /// runs after enrollment and before settling an interrupted retained operation.
 /// `sigpipe_owed` lets that same owner raise SIGPIPE without a host task.
-pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+pub fn serve_ipc_with_signals<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     native_signals: bool,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> (IpcServed, bool) {
-    let nr = frame.x[8] as usize;
+    let nr = ordinal(frame);
     if nr != SYS_READ && nr != SYS_WRITE && nr != 66 && nr != SYS_EPOLL_PWAIT {
         return (IpcServed::Forward, false);
     }
@@ -445,21 +461,21 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     false,
                 );
             };
-            if op.task != task_key(sched.task) || op.mm != mm_key(sched.task) {
+            if op.task != task_key(sched.task()) || op.mm != mm_key(sched.task()) {
                 if native_signals {
                     retain_native_operation(sched, token);
                     crate::dispatch::invalid_completion(
                         crate::dispatch::NativeInvariant::EntryBinding,
                     );
                 }
-                let served = handback(frame, token, op, IpcHandback::Continue, 0, venue);
+                let served = handback(sched, frame, token, op, IpcHandback::Continue, 0, venue);
                 return (leave(sched, IpcLeave::ForeignOperation, served), false);
             }
             let reason = sched
-                .zone
-                .slot(sched.slot)
+                .zone()
+                .slot(sched.slot())
                 .current()
-                .and_then(|id| sched.zone.record(id).handback());
+                .and_then(|id| sched.zone().record(id).handback());
             if native_signals {
                 let interrupted = reason == Some(carrick_sched_core::Handback::Signal)
                     && (user.interrupt_pending_wait() || interrupt());
@@ -468,7 +484,7 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 if interrupted || timed_out {
                     finish(sched, token, &venue.region);
                     if timed_out {
-                        frame.x[0] = 0;
+                        set_result(frame, 0);
                     } else {
                         use carrick_signal_core::wait::{
                             RestartClass, TransferredBytes, WaitDecision, WaitProgress,
@@ -482,17 +498,17 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         // defers SA_RESTART to arm_signal::restart_forwarded_frame
                         // and its shared is_native_restartable_syscall predicate,
                         // through the zero-progress marker below.
-                        frame.x[0] =
+                        let result =
                             match interrupted_wait(RestartClass::Never, progress, Some(false)) {
                                 WaitDecision::CompletePartial(bytes) => bytes.get() as u64,
                                 _ => carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
                             };
+                        set_result(frame, result);
                         // The shared native signal checkpoint already owns
                         // SA_RESTART frame publication. Preserve arg0 in its
                         // existing mailbox marker, only before any progress.
                         if op.progress.written == 0 && op.kind != IpcOpKind::EpollWait {
-                            frame.esr = 0xfffe;
-                            frame.far = op.orig_x0;
+                            sched.mark_restart(frame, op.orig_x0);
                         }
                     }
                     return (IpcServed::Returned { switched: false }, false);
@@ -512,7 +528,7 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
         Ok(None) => match admit(sched, frame, venue, user) {
             Admission::Admitted(token, op) => (token, op, false),
             Admission::Immediate(result) => {
-                frame.x[0] = result as u64;
+                set_result(frame, result as u64);
                 return (IpcServed::Returned { switched: false }, false);
             }
             Admission::Forward => return (IpcServed::Forward, false),
@@ -524,7 +540,10 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     return (IpcServed::Forward, false);
                 }
                 if native_signals {
-                    frame.x[0] = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
+                    set_result(
+                        frame,
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64,
+                    );
                     return (IpcServed::Returned { switched: false }, false);
                 }
                 return (IpcServed::Forward, false);
@@ -534,7 +553,7 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     finish_native(sched, token, &venue.region);
                     return (IpcServed::Forward, false);
                 }
-                let served = handback(frame, token, op, IpcHandback::Restart, 0, venue);
+                let served = handback(sched, frame, token, op, IpcHandback::Restart, 0, venue);
                 return (leave(sched, IpcLeave::Restart, served), false);
             }
         },
@@ -946,20 +965,20 @@ pub fn admit_operation_wait<'a, C: carrick_el1_abi::EntryContext>(
 }
 
 /// Decode a fresh call and take ownership of it, before any effect.
-fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &TrapFrame,
+fn admit<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
 ) -> Admission {
-    let task = sched.task;
+    let task = sched.task();
     let region = &venue.region;
     let Some(table) = venue.tables.table_of(task) else {
         return refuse(sched, IpcLeave::NoTable);
     };
     let table = TableId::from_raw(table);
-    let fd = Fd(frame.x[0] as i32);
-    let reading = frame.x[8] as usize == SYS_READ;
+    let fd = Fd(arg(frame, 0) as i32);
+    let reading = ordinal(frame) == SYS_READ;
     let fda = region.fd(EL1_WAIT);
     // A snapshot first (no retention): host-backed descriptions are never
     // pinned in EL1, so EL1 never holds a hold it could not release.
@@ -974,9 +993,9 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         pin,
         task: task_key(task),
         mm: mm_key(task),
-        buf: IpcUserVa(frame.x[1]),
-        orig_x0: frame.x[0],
-        nr: frame.x[8] as u32,
+        buf: IpcUserVa(arg(frame, 1)),
+        orig_x0: arg(frame, 0),
+        nr: frame.native_number().raw() as u32,
         ..IpcOperation::EMPTY
     };
     let (pin, desc) = match fda.pin(table, fd) {
@@ -1017,19 +1036,19 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         AccessMode::WriteOnly => !reading,
         AccessMode::Path => false,
     };
-    let vectored = frame.x[8] == 66;
+    let vectored = ordinal(frame) == 66;
     if vectored && kind != IpcOpKind::PipeWrite {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Forward;
     }
-    if vectored && permitted && frame.x[2] > carrick_el1_abi::ipc::IPC_MAX_IOVECS as u64 {
+    if vectored && permitted && arg(frame, 2) > carrick_el1_abi::ipc::IPC_MAX_IOVECS as u64 {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Immediate(linux::EINVAL);
     }
     let count = if vectored {
         1
     } else {
-        frame.x[2].min(linux::MAX_RW_COUNT)
+        arg(frame, 2).min(linux::MAX_RW_COUNT)
     };
     let eventfd = matches!(kind, IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite);
     let immediate = if !permitted {
@@ -1048,7 +1067,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     // eventfd(2): a write copies its value once, before it can block.
     let mut value = [0u8; linux::EVENTFD_WORD as usize];
     if kind == IpcOpKind::EventFdWrite
-        && PrefixCopy::new(user).copy_in(&mut value, frame.x[1]) != value.len()
+        && PrefixCopy::new(user).copy_in(&mut value, arg(frame, 1)) != value.len()
     {
         // No effect yet: retain preparable input through the owner, or
         // complete a genuine bad address through explicit fault admission.
@@ -1065,9 +1084,9 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
             if vectored {
                 let mut header_copy_refused = false;
                 let imported =
-                    region.import_vectors(&token, frame.x[2] as usize, |index, header| {
+                    region.import_vectors(&token, arg(frame, 2) as usize, |index, header| {
                         let copied =
-                            frame.x[1]
+                            arg(frame, 1)
                                 .checked_add(index as u64 * 16)
                                 .is_some_and(|address| {
                                     PrefixCopy::new(user).copy_in(header, address) == header.len()
@@ -1125,11 +1144,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
 /// another party's short object-lock section, and wakes the peer lane (EOF
 /// for readers, EPIPE for writers). Only IPC-backed descriptions are ever
 /// pinned in EL1.
-fn release_pin<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    pin: OfdPin,
-    region: &IpcRegion<'_>,
-) {
+fn release_pin<E: IpcExecution>(sched: &mut E, pin: OfdPin, region: &IpcRegion<'_>) {
     let Ok(Some(description)) = region.fd(EL1_WAIT).unpin(pin) else {
         return;
     };
@@ -1139,7 +1154,7 @@ fn release_pin<C: ThreadCpu, U: UserWord>(
         return;
     };
     if wake.host_owed {
-        sched.task.linux.mark_pending_host_work();
+        sched.task().linux.mark_pending_host_work();
     }
     // A freed object has no waiters: each holds a pin on it.
     if !freed {
@@ -1157,9 +1172,9 @@ fn release_pin<C: ThreadCpu, U: UserWord>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn run<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     mut token: IpcOpToken,
@@ -1277,11 +1292,12 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 drop(guard);
                 let written = op.progress.written;
                 finish_native(sched, token, region);
-                frame.x[0] = if written > 0 {
+                let result = if written > 0 {
                     written
                 } else {
                     carrick_syscall_abi::LINUX_ENOMEM.guest_retval() as u64
                 };
+                set_result(frame, result);
                 return (IpcServed::Returned { switched: false }, false);
             }
             Err(_) => {
@@ -1310,7 +1326,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
         };
         let published = guard.publish(wake);
         if published.host_owed {
-            sched.task.linux.mark_pending_host_work();
+            sched.task().linux.mark_pending_host_work();
         }
         let effects = notify(sched, object, wake);
         let epoll_effects = notify_epolls(sched, &published);
@@ -1413,7 +1429,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         // Only copied bytes were consumed. Report that exact
                         // prefix and leave the refused suffix at its source.
                         finish_native(sched, restored, region);
-                        frame.x[0] = op.progress.written;
+                        set_result(frame, op.progress.written);
                         return (IpcServed::Returned { switched: false }, false);
                     }
                     return (
@@ -1438,7 +1454,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     );
                 }
                 CopyoutPreparation::Complete(result) => {
-                    frame.x[0] = result as u64;
+                    set_result(frame, result as u64);
                     return (IpcServed::Returned { switched: false }, false);
                 }
                 CopyoutPreparation::Suspended => return (IpcServed::Idle, false),
@@ -1448,28 +1464,16 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             });
         }
         if let Some(wait) = owner_wait {
-            if wait.handle().mm().raw() != mm_key(sched.task).0 {
+            if wait.handle().mm().raw() != mm_key(sched.task()).0 {
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
             }
-            let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
-                sched.zone,
-                wait.handle(),
-                wait,
-            )
-            .unwrap_or_else(|_| {
+            if region.update_operation(&token, op).is_err() {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+            }
+            let operation = to_sched_token(token).unwrap_or_else(|_| {
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
             });
-            match park_key(
-                sched,
-                frame,
-                region,
-                token,
-                op,
-                enrollment.key(),
-                enrollment.observed_snapshot(),
-                None,
-                None,
-            ) {
+            match park_result(sched.park_owner(frame, wait, operation)) {
                 Parked::Done(served) => return (served, false),
                 Parked::Retry(t) => {
                     token = t;
@@ -1569,7 +1573,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     linux::EPIPE
                 };
                 finish(sched, token, region);
-                frame.x[0] = result as u64;
+                set_result(frame, result as u64);
                 return (IpcServed::Returned { switched: false }, true);
             }
             StepStatus::Broken if written == 0 && !resumed => {
@@ -1586,7 +1590,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 } else {
                     linux::EPIPE
                 };
-                let served = handback(frame, token, op, IpcHandback::Sigpipe, result, venue);
+                let served = handback(sched, frame, token, op, IpcHandback::Sigpipe, result, venue);
                 return (leave(sched, IpcLeave::SigpipeHandback, served), false);
             }
             StepStatus::Fault if native_signals => {
@@ -1635,7 +1639,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
         };
         finish(sched, token, region);
-        frame.x[0] = result as u64;
+        set_result(frame, result as u64);
         return (IpcServed::Returned { switched: false }, false);
     }
 }
@@ -1643,8 +1647,8 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
 /// Notify the waiters of every zone epoll a member's change queued items
 /// on (their `Readable` lane), under the member's lock like the member's
 /// own lanes (lock order: object state, then a queue).
-fn notify_epolls<C: ThreadCpu, U: UserWord>(
-    sched: &Sched<'_, C, U>,
+fn notify_epolls<E: IpcExecution>(
+    sched: &E,
     wake: &carrick_el1_abi::ipc::IpcWake,
 ) -> [Option<WakeEffects>; carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS] {
     let mut out = [None; carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS];
@@ -1659,8 +1663,8 @@ fn notify_epolls<C: ThreadCpu, U: UserWord>(
 }
 
 /// Notify both lanes' waiters the step owes, under the object lock.
-fn notify<C: ThreadCpu, U: UserWord>(
-    sched: &Sched<'_, C, U>,
+fn notify<E: IpcExecution>(
+    sched: &E,
     object: IpcObjectHandle,
     wake: WakeSet,
 ) -> [Option<WakeEffects>; 2] {
@@ -1681,7 +1685,7 @@ fn notify<C: ThreadCpu, U: UserWord>(
             match sched.notify_object(key) {
                 Ok((report, effects)) => {
                     if report.deferred != 0 {
-                        sched.task.linux.mark_pending_host_work();
+                        sched.task().linux.mark_pending_host_work();
                     }
                     out[i] = Some(effects);
                     break;
@@ -1690,7 +1694,7 @@ fn notify<C: ThreadCpu, U: UserWord>(
                 // Never bound: nobody ever waited on this incarnation.
                 Err(ObjectWaitError::Stale) => break,
                 Err(_) => {
-                    sched.task.linux.mark_pending_host_work();
+                    sched.task().linux.mark_pending_host_work();
                     break;
                 }
             }
@@ -1701,8 +1705,8 @@ fn notify<C: ThreadCpu, U: UserWord>(
 
 /// Sample the lane's wait epoch under the object lock (binding the queue to
 /// this incarnation on first use).
-fn snapshot<C: ThreadCpu, U: UserWord>(
-    sched: &Sched<'_, C, U>,
+fn snapshot<E: IpcExecution>(
+    sched: &E,
     object: IpcObjectHandle,
     lane: WaitFor,
 ) -> Option<ObjectStateSnapshot> {
@@ -1712,7 +1716,7 @@ fn snapshot<C: ThreadCpu, U: UserWord>(
         // predicate and this observation, so no release can pass the probe.
         Ok(snap) => Some(unsafe { ObjectStateSnapshot::taken_under_object_lock(snap) }),
         Err(ObjectWaitError::Stale) => {
-            let _ = sched.zone.bind_object_wait(key, &EL1_WAIT, &|owned| {
+            let _ = sched.zone().bind_object_wait(key, &EL1_WAIT, &|owned| {
                 crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
             });
             // SAFETY: same retained IPC object guard as the first attempt.
@@ -1732,9 +1736,9 @@ enum Parked {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn park<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn park<E: IpcExecution>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     region: &IpcRegion<'_>,
     token: IpcOpToken,
     op: IpcOperation,
@@ -1761,9 +1765,9 @@ fn park<C: ThreadCpu, U: UserWord>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn park_key<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn park_key<E: IpcExecution>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     region: &IpcRegion<'_>,
     token: IpcOpToken,
     op: IpcOperation,
@@ -1772,9 +1776,6 @@ fn park_key<C: ThreadCpu, U: UserWord>(
     deadline: Option<u64>,
     interrupt: Option<&mut dyn FnMut() -> bool>,
 ) -> Parked {
-    let Some(resume) = OperationResumePc::new(frame.elr.wrapping_sub(linux::SVC_LEN)) else {
-        return Parked::Refused(token);
-    };
     if region.update_operation(&token, op).is_err() {
         return Parked::Refused(token);
     }
@@ -1782,23 +1783,12 @@ fn park_key<C: ThreadCpu, U: UserWord>(
         Ok(t) => t,
         Err(token) => return Parked::Refused(token),
     };
-    match sched.park_object(frame, key, snap, resume, sched_token, deadline) {
-        Ok(parked) => {
-            // Enrollment precedes the single pending-signal probe. A signal
-            // before enrollment is seen here; a later one owns queue intake.
-            if interrupt.is_some_and(|interrupt| interrupt()) {
-                sched.task.linux.mark_pending_host_work();
-            }
-            let served = if sched.task.linux.has_pending_host_work() {
-                sched.leave_after_object_park(parked)
-            } else {
-                sched.resume_after_object_park(frame, parked, 0)
-            };
-            Parked::Done(match served {
-                Some(Served::Returned { switched }) => IpcServed::Returned { switched },
-                Some(Served::Idle) | None => IpcServed::Idle,
-            })
-        }
+    park_result(sched.park(frame, key, snap, sched_token, deadline, interrupt))
+}
+
+fn park_result(parked: Result<IpcServed, (ObjectWaitError, OperationToken)>) -> Parked {
+    match parked {
+        Ok(served) => Parked::Done(served),
         Err((error, t)) => {
             let Some(token) = from_sched_token(t) else {
                 // Unreachable for a token this adapter converted.
@@ -1826,13 +1816,9 @@ fn notify_operation_release<C: carrick_el1_abi::EntryContext>(
 }
 
 /// Retire the operation record and drop its pin.
-fn finish<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    token: IpcOpToken,
-    region: &IpcRegion<'_>,
-) {
+fn finish<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<'_>) {
     if let Ok(op) = region.finish_operation(token, || {
-        notify_operation_release(region, sched.zone, sched.slot)
+        notify_operation_release(region, sched.zone(), sched.slot())
     }) {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
     }
@@ -1869,20 +1855,16 @@ pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
 }
 
 /// Count why a call leaves for the host (`Counters::ipc_leaves`).
-fn note<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) {
-    sched.counters.ipc_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
+fn note<E: IpcExecution>(sched: &E, why: IpcLeave) {
+    sched.counters().ipc_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
 }
 
-fn leave<C: ThreadCpu, U: UserWord>(
-    sched: &Sched<'_, C, U>,
-    why: IpcLeave,
-    served: IpcServed,
-) -> IpcServed {
+fn leave<E: IpcExecution>(sched: &E, why: IpcLeave, served: IpcServed) -> IpcServed {
     note(sched, why);
     served
 }
 
-fn refuse<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) -> Admission {
+fn refuse<E: IpcExecution>(sched: &E, why: IpcLeave) -> Admission {
     note(sched, why);
     Admission::Forward
 }
@@ -1890,9 +1872,9 @@ fn refuse<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) -> 
 /// The call cannot continue in EL1: before any effect of a never-parked
 /// call, forward it unchanged; otherwise hand the owned operation back.
 #[allow(clippy::too_many_arguments)]
-fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn bail<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     token: IpcOpToken,
     op: IpcOperation,
     resumed: bool,
@@ -1927,7 +1909,7 @@ fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     })),
                 OwnedOperationYield::Suspended => Ok(IpcServed::Idle),
                 OwnedOperationYield::Complete(result) => {
-                    frame.x[0] = result as u64;
+                    set_result(frame, result as u64);
                     Ok(IpcServed::Returned { switched: false })
                 }
                 OwnedOperationYield::Unrouted(_) => crate::dispatch::invalid_completion(
@@ -1942,40 +1924,53 @@ fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
         }
         finish_native(sched, token, &venue.region);
-        frame.x[0] = if matches!(why, IpcLeave::FaultFirst) {
+        let result = if matches!(why, IpcLeave::FaultFirst) {
             if op.progress.written == 0 {
                 carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64
             } else {
                 op.progress.written
             }
         } else {
-            sched.counters.record_refusal(
+            sched.counters().record_refusal(
                 carrick_guest_arch::NativeOrdinal::new(u64::from(op.nr)),
                 user.service_origin(),
                 carrick_el1_abi::RefusalVenue::Ring,
             );
             carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64
         };
+        set_result(frame, result);
         return Ok(IpcServed::Returned { switched: false });
     }
     if op.progress.written == 0 && !resumed {
         finish(sched, token, &venue.region);
         return Ok(IpcServed::Forward);
     }
-    Ok(handback(frame, token, op, IpcHandback::Continue, 0, venue))
+    Ok(handback(
+        sched,
+        frame,
+        token,
+        op,
+        IpcHandback::Continue,
+        0,
+        venue,
+    ))
 }
 
-fn retain_native_operation<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, token: IpcOpToken) {
+fn retain_native_operation<E: IpcExecution>(sched: &E, token: IpcOpToken) {
     let operation = to_sched_token(token).unwrap_or_else(|_| {
         crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
     });
-    let record = sched.zone.slot(sched.slot).current().unwrap_or_else(|| {
-        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
-    });
+    let record = sched
+        .zone()
+        .slot(sched.slot())
+        .current()
+        .unwrap_or_else(|| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
     carrick_core::wait::restore_object_operation(
-        sched.zone,
-        sched.slot,
-        sched.zone.record(record).identity(),
+        sched.zone(),
+        sched.slot(),
+        sched.zone().record(record).identity(),
         operation,
     )
     .unwrap_or_else(|_| {
@@ -1983,14 +1978,10 @@ fn retain_native_operation<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, t
     });
 }
 
-fn finish_native<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    token: IpcOpToken,
-    region: &IpcRegion<'_>,
-) {
+fn finish_native<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<'_>) {
     let op = region
         .finish_operation(token, || {
-            notify_operation_release(region, sched.zone, sched.slot)
+            notify_operation_release(region, sched.zone(), sched.slot())
         })
         .unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
@@ -2001,16 +1992,22 @@ fn finish_native<C: ThreadCpu, U: UserWord>(
         .unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
         });
-    settle_native_release(region, release, Some((sched.zone, sched.slot)), sched.task)
-        .unwrap_or_else(|_| {
-            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
-        });
+    settle_native_release(
+        region,
+        release,
+        Some((sched.zone(), sched.slot())),
+        sched.task(),
+    )
+    .unwrap_or_else(|_| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    });
 }
 
 /// Hand the owned operation to the host: the record says what to do; the
 /// frame carries only the token (`x0`) and [`IPC_HANDBACK_NR`] (`x8`).
-fn handback(
-    frame: &mut TrapFrame,
+fn handback<E: IpcExecution>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     token: IpcOpToken,
     mut op: IpcOperation,
     what: IpcHandback,
@@ -2021,12 +2018,11 @@ fn handback(
     op.result = result;
     if op.nr == 0 {
         // A resumed operation: the re-executed SVC carries its registers.
-        op.orig_x0 = frame.x[0];
-        op.nr = frame.x[8] as u32;
+        op.orig_x0 = arg(frame, 0);
+        op.nr = frame.native_number().raw() as u32;
     }
     let _ = venue.region.update_operation(&token, op);
-    frame.x[8] = IPC_HANDBACK_NR;
-    frame.x[0] = token.into_raw().pack();
+    sched.hand_back(frame, token.into_raw().pack());
     IpcServed::Handback
 }
 

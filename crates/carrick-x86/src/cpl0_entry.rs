@@ -303,6 +303,18 @@ impl NativeFrame {
     pub fn valid_user_return(&self) -> bool {
         carrick_sched_core::valid_user_return_words(self.rcx, self.rsp, self.r11)
     }
+
+    /// The PC of this call's `SYSCALL`: RCX holds the return PC it saved.
+    /// A parked or restarted call re-executes the instruction here.
+    pub fn syscall_pc(&self) -> u64 {
+        self.rcx
+            .wrapping_sub(carrick_guest_arch::X86_64_SYSCALL_LEN)
+    }
+
+    /// Re-enter this call's `SYSCALL` with every argument register intact.
+    pub fn restart_syscall(&mut self) {
+        self.rcx = self.syscall_pc();
+    }
 }
 
 impl X86Registers for NativeFrame {
@@ -396,6 +408,22 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    /// #1756 S1 resume token: an x86 operation resumes at its 2-byte
+    /// `SYSCALL`, which the native dispatch frame's `operation_resume_pc`
+    /// and `restart_syscall` hooks both take from here.
+    #[test]
+    fn syscall_resume_pc_rewinds_rcx_by_the_syscall_length() {
+        let mut frame = super::NativeFrame {
+            rcx: 0x40_1007,
+            rax: 0x1234,
+            rdi: 3,
+            ..Default::default()
+        };
+        assert_eq!(frame.syscall_pc(), 0x40_1005);
+        frame.restart_syscall();
+        assert_eq!(frame.rcx, 0x40_1005);
+        assert_eq!((frame.rax, frame.rdi), (0x1234, 3));
+    }
     #[test]
     fn scheduler_slot_conversion_rejects_unissued_high_bits() {
         use super::checked_scheduler_slot;
