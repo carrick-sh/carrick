@@ -538,9 +538,6 @@ pub unsafe trait ReservationMetadataAllocator {
 )]
 pub enum Refusal {
     Busy,
-    /// The proposal overlaps frames whose physical return is still awaiting
-    /// the host inventory acknowledgement. This is not an edit lock.
-    DeferredReturn,
     PreparedConflict,
     Stale,
     Invalid,
