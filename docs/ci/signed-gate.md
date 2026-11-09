@@ -95,11 +95,30 @@ The predicate is `fixtures::candidate_probes::classify_inputs`. A dedicated
 runner row goes in `crates/carrick-xtask/src/probe_runners.rs`, which is not
 a fixture input. The added probe may read, at compile time, only its own
 source and unchanged bundle inputs (such as `src/lib.rs`). Because rustc's
-dep-info does not list files the assembler or linker reads, an added probe
-whose source uses `asm!`, `global_asm!`, `naked_asm!`, a `#[link(...)]`
-attribute (also under `cfg_attr`) or `link_args` is refused before anything
-is built (`candidate_probes::unlisted_reader`); such probes go through a
-normal fixture republish.
+dep-info does not list files the assembler or linker reads, each added
+probe's source is parsed with `syn` and refused before anything is built
+(`candidate_probes::unlisted_reader`) when it:
+
+- does not parse as Rust;
+- names `asm`, `global_asm`, `naked_asm` or `link_args` anywhere, raw
+  (`r#asm`) or not, as a macro, path, `use` or rename;
+- has `link` (raw or not) in any attribute, outer or inner, at any
+  `cfg_attr` depth, on any item, extern block, field, statement, expression
+  or closure, in any nested module;
+- defines `macro_rules!` or other syntax `syn` keeps verbatim (generated
+  tokens can't be inspected), calls `include!`, `include_bytes!` or
+  `include_str!`, or declares an out-of-line `mod name;`;
+- has any of those identifiers, `link` or `mod` anywhere in a macro call's
+  tokens, which `syn` leaves opaque (so `assert!(libc::link(..) == 0)` is
+  refused too; bind the call outside the macro).
+
+Comments and string literals are not tokens and never refuse a probe. Such
+probes go through a normal fixture republish. The refusal comes from
+planning, which reads only the checkout and the bundle: a refused probe
+runs no `cargo fetch`, builds nothing and publishes nothing. Dependency
+fetching starts only once the build is admitted, in the publisher's
+snapshot step. Existing probe sources are never scanned; they are bundle
+inputs. The dep-info check still runs on every admitted build.
 
 Every other fixture-input change still needs the exception and is refused by
 the gate with its input identity message. That covers edits to or removals
