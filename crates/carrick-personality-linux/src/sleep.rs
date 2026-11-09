@@ -10,7 +10,9 @@
 //! conversion of an absolute deadline into the guest counter's domain.
 //!
 //! Clock domains in ring: `CLOCK_MONOTONIC` is the guest counter divided by
-//! its frequency, exactly what the raw clock fast path and the vDSO report.
+//! its frequency, exactly what the raw clock fast path and the vDSO report
+//! (on HVF that counter is the host's CLOCK_UPTIME_RAW, the host dispatcher's
+//! monotonic clock too).
 //! `CLOCK_REALTIME` is that plus the vvar realtime word the caller's own vDSO
 //! adds ([`crate::abi::vvar`]). A relative sleep measures the counter whatever
 //! its clock id, as POSIX requires for relative sleeps.
@@ -45,8 +47,9 @@ pub enum SleepClock {
 /// Classify a sleep clock exactly as the host dispatcher's
 /// `linux_clock_nanosleep_now` does, so the run root (host continuation) and
 /// a native child (ring) give one answer: CPU-time clocks are `EOPNOTSUPP`,
-/// unknown ids `EINVAL`. BOOTTIME has no suspend gap in a carrick run and is
-/// measured as MONOTONIC, like the host's approximation.
+/// unknown ids `EINVAL`. BOOTTIME is measured on the guest counter like
+/// MONOTONIC: after a host suspend the host's BOOTTIME runs ahead of it, so an
+/// absolute BOOTTIME deadline then fires late by the suspended time.
 pub fn sleep_clock(clock_id: u64) -> Result<SleepClock, LinuxErrno> {
     match clock_id {
         LINUX_CLOCK_REALTIME
