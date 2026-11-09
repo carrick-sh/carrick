@@ -333,10 +333,6 @@ fn conventional_mount_usable(_: &Path) -> bool {
 #[cfg(any(target_os = "macos", test))]
 const SCRATCH_WORKER_NO_PROGRESS_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long to yield between offers while the worker queue is full.
-#[cfg(any(target_os = "macos", test))]
-const SCRATCH_QUEUE_FULL_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
-
 /// Run one volume query on the scratch-storage worker (`fs_backend::host`,
 /// thread `carrick-fs-cleanup`) and return whether the volume is usable.
 /// A full queue is "not now" and is re-offered; a slow answer is waited for.
@@ -412,6 +408,7 @@ fn scratch_volume_verdict_observed(
     };
     let mut query: crate::fs_backend::host::ScratchVolumeQuery = Box::new(query);
     let receiver = loop {
+        let observed = crate::fs_backend::host::scratch_worker_progress();
         match enqueue_scratch_volume_query(query) {
             ScratchVolumeEnqueue::Queued(receiver) => break receiver,
             ScratchVolumeEnqueue::Full(returned) => {
@@ -424,7 +421,10 @@ fn scratch_volume_verdict_observed(
                     return false;
                 }
                 query = returned;
-                std::thread::sleep(SCRATCH_QUEUE_FULL_RETRY);
+                // Block until the worker finishes or starts an item (a
+                // slot may be free), bounded by `poll` so the injected
+                // no-progress decision is re-evaluated.
+                crate::fs_backend::host::wait_scratch_worker_progress_after(observed, poll);
             }
             ScratchVolumeEnqueue::Unavailable => {
                 tracing::error!("scratch worker unavailable; skipping volume");
@@ -767,6 +767,30 @@ mod tests {
                     Ok(true)
                 }
             ));
+        }
+
+        /// The full-queue wait is a notification, not a pacing delay: a
+        /// wait armed on a stale observation returns at once, and one armed
+        /// on the current value is woken by the worker's next item.
+        #[test]
+        fn full_queue_wait_wakes_on_worker_progress() {
+            use crate::fs_backend::host::{
+                ScratchVolumeEnqueue, enqueue_scratch_volume_query, scratch_worker_progress,
+                wait_scratch_worker_progress_after,
+            };
+            use std::time::Duration;
+            // Generous bound: only a lost wakeup reaches it.
+            let bound = Duration::from_secs(60);
+            let stale = scratch_worker_progress();
+            let ScratchVolumeEnqueue::Queued(receiver) =
+                enqueue_scratch_volume_query(Box::new(|| Ok(true)))
+            else {
+                panic!("idle worker queue must accept an item");
+            };
+            assert!(receiver.recv_timeout(bound).unwrap().unwrap());
+            // The worker bumps progress after replying; the wait observes it.
+            wait_scratch_worker_progress_after(stale, bound);
+            assert_ne!(scratch_worker_progress(), stale);
         }
 
         /// Park the scratch worker on blocking items until its bounded
