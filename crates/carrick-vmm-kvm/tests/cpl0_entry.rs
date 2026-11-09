@@ -949,9 +949,12 @@ fn serial_host_native_child_sleep_eintr_writes_the_remainder() {
     );
 }
 
-/// #1808 finding 2 on x86 CPL0: as above, with that rem copy Busy once. The
+/// #1808 finding 2 on x86 CPL0: as above, with the next exact-MM user write
+/// (the rem copy) Busy once, on the owned and the direct copy path alike. The
 /// EINTR answer and its bytes stay retained across the carrier crossing and
-/// are written afterwards.
+/// are written afterwards; the guest then reads the injected-copy census and
+/// requires one refusal and one owned rerun (else exit 92). A direct rem copy
+/// cannot retain the refused answer, so it fails this witness.
 #[test]
 fn serial_host_native_child_sleep_eintr_retains_a_busy_remainder() {
     instrumented_sleep_witness(
