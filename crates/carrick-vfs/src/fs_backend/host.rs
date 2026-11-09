@@ -1018,6 +1018,9 @@ struct ScratchWorker {
     /// Read only by the macOS volume verdict and tests.
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Signalled (under the lock) after each item's progress bump, so a
+    /// caller facing a full queue blocks until the worker moves on.
+    slot_freed: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 }
 
 fn scratch_cleanup_sender() -> &'static ScratchWorker {
@@ -1025,12 +1028,20 @@ fn scratch_cleanup_sender() -> &'static ScratchWorker {
     SENDER.get_or_init(|| {
         let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let worker_progress = std::sync::Arc::clone(&progress);
+        let slot_freed =
+            std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new()));
+        let worker_slot_freed = std::sync::Arc::clone(&slot_freed);
         let (sender, receiver) = std::sync::mpsc::sync_channel(SCRATCH_CLEANUP_QUEUE_DEPTH);
         let sender = std::thread::Builder::new()
             .name("carrick-fs-cleanup".to_string())
             .spawn(move || {
                 let note_progress = || {
                     worker_progress.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    // Taking the lock orders this wake after any waiter's
+                    // predicate check, so a wake is never lost.
+                    let (lock, condvar) = &*worker_slot_freed;
+                    drop(lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+                    condvar.notify_all();
                 };
                 while let Ok(work) = receiver.recv() {
                     note_progress();
@@ -1072,7 +1083,11 @@ fn scratch_cleanup_sender() -> &'static ScratchWorker {
             })
             .ok()
             .map(|_| sender);
-        ScratchWorker { sender, progress }
+        ScratchWorker {
+            sender,
+            progress,
+            slot_freed,
+        }
     })
 }
 
@@ -1083,6 +1098,23 @@ pub(crate) fn scratch_worker_progress() -> u64 {
     scratch_cleanup_sender()
         .progress
         .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Block until the scratch worker's progress differs from `observed` or
+/// `timeout` passes. `observed` must be read before the enqueue that came
+/// back full, so progress made in between is seen, not waited out.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn wait_scratch_worker_progress_after(observed: u64, timeout: std::time::Duration) {
+    let worker = scratch_cleanup_sender();
+    let (lock, condvar) = &*worker.slot_freed;
+    let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drop(
+        condvar
+            .wait_timeout_while(guard, timeout, |()| {
+                worker.progress.load(std::sync::atomic::Ordering::Acquire) == observed
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
 }
 
 fn enqueue_scratch_cleanup(path: PathBuf) -> ScratchCleanupReceipt {
