@@ -6,6 +6,7 @@ use super::anonymous;
 use crate::rust_alloc::{boxed::Box, sync::Arc, vec::Vec};
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue};
+use carrick_el1::isa::x86::context::scheduler::WakeCpu;
 use carrick_el1::memory::reservations::{
     X86Cpl0ReservationGeometry, X86Cpl0Zone, shared_x86_cpl0_guest,
 };
@@ -28,7 +29,7 @@ use carrick_guest_arch::{
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use carrick_personality_linux::mm::{LinuxReservationPolicy, MmErrorLinux};
-use carrick_sched_core::{ParkedContextWords, SlotId, WakeEffects, ZoneTables};
+use carrick_sched_core::{ParkedContextWords, SlotId, WakeEffects, WakerQueue, ZoneTables};
 use carrick_x86_carrier::entry::InitialWords;
 use core::{marker::PhantomData, num::NonZeroU64, sync::atomic::Ordering};
 
@@ -162,15 +163,6 @@ fn release(
     effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, ParkedContextWords>,
 ) {
     carrick_el1::substrate::sched::object_wait::deliver_host_completion(effects.zone(), effects);
-}
-fn deliver_wakes(effects: WakeEffects) {
-    for slot in effects.sgi_slots() {
-        if carrick_el1::isa::x86::interrupt::send_resched(slot).is_err() {
-            fatal();
-        }
-    }
-    // Native execution handles its own queued/misplaced work after leaving
-    // the current entry; a worker never waits synchronously for another task.
 }
 type Portal = MmPortal<
     'static,
@@ -859,11 +851,22 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         };
         self.copy_signal_bytes(mm, address, bytes)
     }
-    fn wake_effects(&mut self, mut effects: WakeEffects) {
-        if effects.queued_own {
-            effects.request_reschedule(self.slot);
-        }
-        deliver_wakes(effects);
+    /// The shared applier with x86's wake mechanics (#1941, #1973): kicks,
+    /// the self-kick for a thread queued here, and the host boundary a
+    /// misplaced or host-handed waiter owes. The runtime hands over a
+    /// finished wake without reading this run queue before the bucket lock,
+    /// so a thread queued here restamps the queue's wait.
+    fn wake_effects(&mut self, effects: WakeEffects) {
+        let zone = carrick_x86_carrier::native_execution::source(self.slot).zone;
+        effects.apply(
+            zone,
+            self.slot,
+            WakerQueue::Unobserved,
+            &mut WakeCpu {
+                task: self.task,
+                waker: self.slot,
+            },
+        );
     }
     fn request_ingress_producer_boundary(&mut self) {
         self.task.linux.mark_pending_host_work();

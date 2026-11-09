@@ -3,9 +3,9 @@
 //! owners. This two-context sidecar is fixture hardware custody, not a binding
 //! of the runtime's production executor pool.
 use crate::cpl0_entry::{CpuBinding, NativeFrame};
-use crate::cpl0_scheduler::XsaveArea;
 #[cfg(target_os = "none")]
 use crate::cpl0_scheduler::{NativeTlsRegister, read_tls, write_tls};
+use crate::cpl0_scheduler::{WakeCpu, XsaveArea};
 use carrick_core_abi::EntryMmKey;
 use carrick_el1_abi::{Counters, CurrentTask, EntryRef, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_arch::{RootGpa, UserVa};
@@ -753,6 +753,13 @@ impl NativeLane<'_> {
             },
         )
     }
+    /// This lane's CPU as the shared x86 wake mechanics.
+    fn wake_cpu(&self) -> WakeCpu<'_> {
+        WakeCpu {
+            task: self.task,
+            waker: self.lane.slot,
+        }
+    }
     fn current_index(&self) -> usize {
         usize::from(self.task.execution.task.load(Ordering::Acquire) != self.lane.parent.tid)
     }
@@ -785,7 +792,7 @@ impl NativeLane<'_> {
             &mut effects,
         );
         drop(guard);
-        effects.apply(zone, slot, before, self);
+        effects.apply(zone, slot, before, &mut self.wake_cpu());
         self.frame.rax = u64::from(count);
         self.lane.wakes += u64::from(count);
     }
@@ -1414,7 +1421,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         }
         drop(guard);
         let (zone, slot) = (self.zone, self.lane.slot);
-        effects.apply(zone, slot, before, self);
+        effects.apply(zone, slot, before, &mut self.wake_cpu());
         let record = committed(
             self.zone.slot(self.lane.slot).current(),
             LifecycleInvariant::ExitRecord,
@@ -1440,43 +1447,6 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         ))
     }
 }
-/// x86's mechanics for the one shared wake-effect applier
-/// ([`WakeEffects::apply`]), the lane's half of #1941's single lane.
-impl carrick_sched_core::WakeMechanics for NativeLane<'_> {
-    /// x86 routes a reschedule by slot through its published APIC route
-    /// (`HardwareCpu::send_resched`); it has no per-slot SGI word.
-    fn send_resched(&mut self, slot: SlotId) -> bool {
-        #[cfg(target_os = "none")]
-        {
-            use carrick_el1::substrate::sched::ThreadCpu;
-            carrick_el1::substrate::sched::hw::HardwareCpu.send_resched(slot, 0);
-        }
-        #[cfg(not(target_os = "none"))]
-        let _ = slot;
-        true
-    }
-    fn queue_tick(&self) -> u64 {
-        #[cfg(target_os = "none")]
-        {
-            use carrick_el1::substrate::sched::ThreadCpu;
-            carrick_el1::substrate::sched::hw::HardwareCpu.now()
-        }
-        #[cfg(not(target_os = "none"))]
-        0
-    }
-    /// x86 CPL0 has no run-queue slice timer (its timer vector serves
-    /// signal timers only): a thread queued on the waker's own slot is a
-    /// reschedule kick to that slot, as the production process owner's
-    /// `wake_effects` does (`carrick-x86-cpl0/src/native_process.rs`).
-    fn arm_slice_timer(&mut self) {
-        let slot = self.lane.slot;
-        carrick_sched_core::WakeMechanics::send_resched(self, slot);
-    }
-    fn mark_pending_host_work(&mut self) {
-        self.task.linux.mark_pending_host_work();
-    }
-}
-
 impl FutexVenue for NativeLane<'_> {
     type Served = carrick_core::Served;
     fn mm(&self) -> Option<carrick_core_abi::ReservationMm> {

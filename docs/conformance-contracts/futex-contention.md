@@ -367,17 +367,31 @@ A wake's placement reports what the waker still owes in `WakeEffects`:
 reschedule kicks for busy slots that took a waiter, a queue stamp and slice
 for a thread queued on its own slot, and a host boundary for a misplaced or
 host-handed waiter. One ISA-neutral applier, `WakeEffects::apply` in
-`carrick-sched-core`, consumes them for every waker. ISAs lend only their
-mechanics through `WakeMechanics`. ARM's `Sched` lends an SGI by the slot's
-target, the virtual counter, its slice timer and the task's host-work
-doorbell. The x86 CPL0 lifecycle lane's `NativeLane` lends a reschedule IPI
-by the slot's APIC route, the TSC and the same doorbell. x86 CPL0 has no
-run-queue slice timer, so a thread queued on the waker's own slot gets a
-reschedule kick to that slot, as the production process owner already does.
-ARM's `Sched::wake_word`, `Sched::finish_object_wake`, x86
-`NativeLane::wake_word` and the lane's child-exit `CHILD_WAIT_KEY` wake all
-call it. The x86 lane used to drop its effects: a waiter queued on a busy
-slot was never kicked, and a misplaced waiter owed the host nothing.
+`carrick-sched-core`, consumes them. ISAs lend only their mechanics through
+`WakeMechanics`. ARM's `Sched` lends an SGI by the slot's target, the
+virtual counter, its slice timer and the task's host-work doorbell. x86 CPL0
+lends one type, `WakeCpu` in `carrick-x86/src/cpl0_scheduler.rs`: a
+reschedule IPI by the slot's APIC route, the TSC and the waker task's
+doorbell. x86 CPL0 has no run-queue slice timer, so a thread queued on the
+waker's own slot gets a reschedule kick to that slot. Exactly these sites
+call the applier:
+
+- ARM `Sched::wake_word` and `Sched::finish_object_wake`;
+- x86 `NativeLane::wake_word` and the lane's child-exit `CHILD_WAIT_KEY`
+  wake (`carrick-x86/src/cpl0_lifecycle.rs`);
+- the x86 production process owner's `Service::wake_effects`
+  (`carrick-x86-cpl0/src/native_process.rs`, #1973), which every shared
+  native-process runtime wake on x86 reaches. Its callers hand over a
+  finished wake without reading the run queue first
+  (`WakerQueue::Unobserved`).
+
+The x86 lane used to drop its effects: a waiter queued on a busy slot was
+never kicked, and a misplaced waiter owed the host nothing. The production
+owner used to send only the kicks and never rang the doorbell for a
+misplaced or host-handed waiter. Not migrated: ARM's native process owner
+(`aarch64_process.rs` `wake_effects`) and the object-wait completion venues
+consume effects through `deliver_effects_with` in
+`carrick-el1/src/sched/object_wait.rs`.
 
 x86 witnesses (host tests of `PendingFamilies::futex` for `NativeLane`, red
 on PR head `adb6aec667`):
@@ -388,6 +402,18 @@ on PR head `adb6aec667`):
 - `native_futex_wake_of_a_waiter_on_a_stopped_cpu_owes_a_host_boundary`: the
   waiter's only CPU is stopped; it is queued misplaced on the waker's slot
   and the waker has pending host work (was false).
+
+x86 production owner guard (real KVM production image,
+`carrick-vmm-kvm/tests/cpl0_initial_mm.rs`):
+`native_exit_wake_to_a_busy_home_is_misplaced_and_owes_the_host`. A fork
+child's exit wake on CPU 1 reaches `Service::wake_effects` while the host
+holds the parent's home queue, so the parent is queued misplaced on slot 1
+and the waker leaves at the WORK doorbell with its doorbell rung. It is not
+red before the migration: the exit path rings that doorbell itself. No
+guest-driven production path today shows the old owner's missing doorbell:
+x86 slots never leave the guest, so a home slot always takes its waiter
+unless its queue lock is busy, and the production root's `FUTEX_WAIT` is
+ENOSYS, so no in-ring futex park exists for a signal to interrupt.
 
 The lifecycle wait-channel wake crossing (`cross_wait_channel_wake`, HVC
 `GRANT_OP_WAIT_CHANNEL_WAKE`) has no guest caller left; retiring its host
