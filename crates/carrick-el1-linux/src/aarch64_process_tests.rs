@@ -10791,6 +10791,7 @@ fn native_descriptor_witness(
         netpoll,
         zone_ceiling,
         ofd_ceiling,
+        epoll_sigmask,
         None,
     );
 }
@@ -10803,6 +10804,7 @@ fn native_descriptor_metadata_witness(
     netpoll: bool,
     zone_ceiling: bool,
     ofd_ceiling: bool,
+    epoll_sigmask: bool,
     metadata: Option<pipe_metadata_tests::Case>,
 ) {
     use crate::ipc::IpcTables;

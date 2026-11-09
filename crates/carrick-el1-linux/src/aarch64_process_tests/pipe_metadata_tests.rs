@@ -35,6 +35,7 @@ fn serial_host_pipe_metadata_root_stat() {
         false,
         false,
         false,
+        false,
         Some(Case::Stat),
     );
 }
@@ -43,6 +44,7 @@ fn serial_host_pipe_metadata_root_stat() {
 fn serial_host_pipe_metadata_child_stat() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -61,6 +63,7 @@ fn serial_host_pipe_metadata_root_empty_path() {
         false,
         false,
         false,
+        false,
         Some(Case::EmptyPath),
     );
 }
@@ -69,6 +72,7 @@ fn serial_host_pipe_metadata_root_empty_path() {
 fn serial_host_pipe_metadata_child_empty_path() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -87,6 +91,7 @@ fn serial_host_pipe_metadata_root_flags() {
         false,
         false,
         false,
+        false,
         Some(Case::Flags),
     );
 }
@@ -95,6 +100,7 @@ fn serial_host_pipe_metadata_root_flags() {
 fn serial_host_pipe_metadata_child_flags() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -113,6 +119,7 @@ fn serial_host_pipe_metadata_root_fdflags() {
         false,
         false,
         false,
+        false,
         Some(Case::DescriptorFlags),
     );
 }
@@ -121,6 +128,7 @@ fn serial_host_pipe_metadata_root_fdflags() {
 fn serial_host_pipe_metadata_child_fdflags() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -139,6 +147,7 @@ fn serial_host_pipe_metadata_root_dupfd() {
         false,
         false,
         false,
+        false,
         Some(Case::Duplicate),
     );
 }
@@ -147,6 +156,7 @@ fn serial_host_pipe_metadata_root_dupfd() {
 fn serial_host_pipe_metadata_child_dupfd() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -165,6 +175,7 @@ fn serial_host_pipe_metadata_root_dupfd_cloexec() {
         false,
         false,
         false,
+        false,
         Some(Case::DuplicateCloexec),
     );
 }
@@ -173,6 +184,7 @@ fn serial_host_pipe_metadata_root_dupfd_cloexec() {
 fn serial_host_pipe_metadata_child_dupfd_cloexec() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -191,6 +203,7 @@ fn serial_host_pipe_metadata_root_size() {
         false,
         false,
         false,
+        false,
         Some(Case::PipeSize),
     );
 }
@@ -199,6 +212,7 @@ fn serial_host_pipe_metadata_root_size() {
 fn serial_host_pipe_metadata_child_size() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -217,6 +231,7 @@ fn serial_host_pipe_metadata_root_shrink_busy() {
         false,
         false,
         false,
+        false,
         Some(Case::PipeShrinkBusy),
     );
 }
@@ -225,6 +240,7 @@ fn serial_host_pipe_metadata_root_shrink_busy() {
 fn serial_host_pipe_metadata_child_shrink_busy() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -243,6 +259,7 @@ fn serial_host_pipe_metadata_root_subprocess() {
         false,
         false,
         false,
+        false,
         Some(Case::SubprocessPattern),
     );
 }
@@ -251,6 +268,7 @@ fn serial_host_pipe_metadata_root_subprocess() {
 fn serial_host_pipe_metadata_child_subprocess() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -269,6 +287,7 @@ fn serial_host_pipe_metadata_root_fionread() {
         false,
         false,
         false,
+        false,
         Some(Case::Readable),
     );
 }
@@ -277,6 +296,7 @@ fn serial_host_pipe_metadata_root_fionread() {
 fn serial_host_pipe_metadata_child_fionread() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -295,6 +315,7 @@ fn serial_host_pipe_metadata_root_fionbio() {
         false,
         false,
         false,
+        false,
         Some(Case::Nonblocking),
     );
 }
@@ -303,6 +324,7 @@ fn serial_host_pipe_metadata_root_fionbio() {
 fn serial_host_pipe_metadata_child_fionbio() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -321,6 +343,7 @@ fn serial_host_pipe_metadata_root_terminal() {
         false,
         false,
         false,
+        false,
         Some(Case::Terminal),
     );
 }
@@ -329,6 +352,7 @@ fn serial_host_pipe_metadata_root_terminal() {
 fn serial_host_pipe_metadata_child_terminal() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -347,6 +371,7 @@ fn serial_host_pipe_metadata_root_seek() {
         false,
         false,
         false,
+        false,
         Some(Case::Seek),
     );
 }
@@ -355,6 +380,7 @@ fn serial_host_pipe_metadata_root_seek() {
 fn serial_host_pipe_metadata_child_seek() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -373,6 +399,7 @@ fn serial_host_pipe_metadata_root_dup() {
         false,
         false,
         false,
+        false,
         Some(Case::Dup),
     );
 }
@@ -381,6 +408,7 @@ fn serial_host_pipe_metadata_root_dup() {
 fn serial_host_pipe_metadata_child_dup() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -399,6 +427,7 @@ fn serial_host_pipe_metadata_root_dup3() {
         false,
         false,
         false,
+        false,
         Some(Case::Dup3),
     );
 }
@@ -407,6 +436,7 @@ fn serial_host_pipe_metadata_root_dup3() {
 fn serial_host_pipe_metadata_child_dup3() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -425,6 +455,7 @@ fn serial_host_pipe_metadata_root_close() {
         false,
         false,
         false,
+        false,
         Some(Case::Close),
     );
 }
@@ -433,6 +464,7 @@ fn serial_host_pipe_metadata_root_close() {
 fn serial_host_pipe_metadata_child_close() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -451,6 +483,7 @@ fn serial_host_pipe_metadata_root_ioctl_cloexec() {
         false,
         false,
         false,
+        false,
         Some(Case::IoctlCloexec),
     );
 }
@@ -459,6 +492,7 @@ fn serial_host_pipe_metadata_root_ioctl_cloexec() {
 fn serial_host_pipe_metadata_child_ioctl_cloexec() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
@@ -786,6 +820,7 @@ pub(super) fn exercise(case: Case, mut call: impl FnMut(u64, [u64; 4]) -> i64) {
 fn serial_host_pipe_metadata_busy_once_then_success() {
     super::native_descriptor_metadata_witness(
         None,
+        false,
         false,
         false,
         false,
