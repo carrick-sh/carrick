@@ -1075,22 +1075,40 @@ fn enqueue_scratch_cleanup(path: PathBuf) -> ScratchCleanupReceipt {
     }
 }
 
-/// Queue one scratch-volume classification on the scratch worker and return
-/// the receiver for its single reply. `None` when the worker is unavailable
-/// or its queue is full; callers fail closed (skip the candidate volume).
+/// Outcome of offering one volume classification to the scratch worker.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) enum ScratchVolumeEnqueue {
+    /// Queued; the receiver yields the single reply.
+    Queued(std::sync::mpsc::Receiver<std::io::Result<bool>>),
+    /// The bounded queue is full right now ("not now"). The query is handed
+    /// back so the caller can offer it again unchanged.
+    Full(ScratchVolumeQuery),
+    /// The worker thread could not be started or has exited.
+    Unavailable,
+}
+
+/// Queue one scratch-volume classification on the scratch worker. A full
+/// queue is contention, not a verdict: callers retry with the returned
+/// query. Only `Unavailable` means the worker is gone.
 /// A query that never returns wedges only this housekeeping worker: later
 /// reclaims report `NotQueued`, and the next startup sweep owns their names.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn enqueue_scratch_volume_query(
-    query: ScratchVolumeQuery,
-) -> Option<std::sync::mpsc::Receiver<std::io::Result<bool>>> {
-    let sender = scratch_cleanup_sender().as_ref()?;
+pub(crate) fn enqueue_scratch_volume_query(query: ScratchVolumeQuery) -> ScratchVolumeEnqueue {
+    use std::sync::mpsc::TrySendError;
+    let Some(sender) = scratch_cleanup_sender().as_ref() else {
+        return ScratchVolumeEnqueue::Unavailable;
+    };
     let (reply, receiver) = std::sync::mpsc::sync_channel(1);
-    sender
-        .try_send(ScratchCleanupWork::ClassifyVolume { query, reply })
-        .ok()
-        .map(|()| receiver)
+    match sender.try_send(ScratchCleanupWork::ClassifyVolume { query, reply }) {
+        Ok(()) => ScratchVolumeEnqueue::Queued(receiver),
+        Err(TrySendError::Full(ScratchCleanupWork::ClassifyVolume { query, .. })) => {
+            ScratchVolumeEnqueue::Full(query)
+        }
+        Err(TrySendError::Full(_)) => unreachable!("try_send returns the work it was given"),
+        Err(TrySendError::Disconnected(_)) => ScratchVolumeEnqueue::Unavailable,
+    }
 }
+
 fn enqueue_orphan_discovery(root: PathBuf) {
     if let Some(sender) = scratch_cleanup_sender() {
         let _ = sender.try_send(ScratchCleanupWork::Discover {
