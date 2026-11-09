@@ -125,20 +125,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
         address: UserVa,
         bitset: u32,
         limit: u32,
-    ) -> Option<LifecycleOutcome> {
-        if !self.authenticate_mapping(address)? {
-            return None;
-        }
+    ) -> LifecycleOutcome {
+        // `serve_native_futex` authenticated a shared candidate's mapping
+        // before policy: an admitted wake always finishes here (#1941).
+        // Admission requires an aligned word, so a key always exists.
         let key = if self.shared {
-            MmFutexKey::shared_private(address)?
+            MmFutexKey::shared_private(address)
         } else {
-            MmFutexKey::private(address)?
+            MmFutexKey::private(address)
         };
-        let result = self.entry.wake_native_futex(mm, key, bitset, limit);
-        match result {
-            Ok(count) => Some(returned(i64::from(count))),
-            Err(reason) => Some(self.entry.run_failed(reason)),
-        }
+        let Some(key) = key else {
+            return returned(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
+        };
+        returned(i64::from(
+            self.entry.wake_native_futex(mm, key, bitset, limit),
+        ))
     }
     fn wait(&mut self, wait: FutexWait) -> Option<LifecycleOutcome> {
         if let Some(deadline) = wait.deadline {
@@ -249,23 +250,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
     /// One wake authority for native futex syscalls and clear-child-tid.
-    /// Unplaceable claims no waiter: transfer the same key/mask/count through
-    /// the scheduler's existing custody, then retain native placement after
-    /// dropping the bucket lock. A returning eligible driver consumes it.
+    /// An EL1 wake always finishes in the ring (#1941): a waiter no guest
+    /// slot may run now is queued on the waker, misplaced, and the shared
+    /// effects consumer marks the host boundary that relocates it.
     pub(super) fn wake_native_futex(
         &mut self,
         mm: carrick_core_abi::ReservationMm,
         key: MmFutexKey,
         bitset: u32,
         limit: u32,
-    ) -> Result<u32, carrick_core_abi::NativeRunFailureReason> {
+    ) -> u32 {
         let zone = self.source.zone;
         let guard = zone.short_lock(
             ZoneTables::<C>::bucket_of_with_context(mm.raw(), key.scheduler_address()),
             &carrick_sched_core::ShortLockSpin,
         );
         let mut effects = WakeEffects::default();
-        let result = zone.wake_placed(
+        let count = zone.wake_placed(
             &guard,
             mm.raw(),
             key.scheduler_address(),
@@ -277,51 +278,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             &mut [],
             &mut effects,
         );
-        let result = match result {
-            Err(carrick_sched_core::WakeRefusal::Unplaceable) => {
-                // The first pass changed no waiter. Claim the exact key/mask/
-                // count through scheduler transfer custody, then place each
-                // completed native wait after releasing the bucket lock.
-                let mut pending = Vec::new();
-                let count = zone.wake_host(
-                    &guard,
-                    mm.raw(),
-                    key.scheduler_address(),
-                    bitset,
-                    limit,
-                    true,
-                    &mut |transfer| pending.push(transfer),
-                    &mut |placement| {
-                        if placement.resched {
-                            effects.request_reschedule(placement.slot);
-                        }
-                    },
-                );
-                drop(guard);
-                for transfer in pending {
-                    if let Some(record) =
-                        transfer.finish(&carrick_sched_core::ShortLockSpin, &|owned| {
-                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                        })
-                    {
-                        let Some(placement) = zone.place_native_handback(record) else {
-                            return Err(carrick_core_abi::NativeRunFailureReason::NativeStale);
-                        };
-                        if placement.resched {
-                            effects.request_reschedule(placement.slot);
-                        }
-                        effects.queued_own |= placement.slot == self.source.slot;
-                    }
-                }
-                Ok(count)
-            }
-            result => {
-                drop(guard);
-                result
-            }
-        };
+        drop(guard);
         self.service.wake_effects(effects);
-        result.map_err(|_| carrick_core_abi::NativeRunFailureReason::NativeStale)
+        count
     }
 
     pub(super) fn serve_native_futex(
@@ -357,7 +316,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             frequency,
             retained,
         };
-        let result = carrick_personality_linux::sched::serve_futex(call, &mut adapter);
+        // A shared operation is a candidate only on private anonymous
+        // storage. A wake cannot decline once policy runs, so its mapping
+        // is authenticated first; a wait authenticates after policy has
+        // decoded its relative expiry.
+        let result = if shared.is_some()
+            && call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
+            && adapter.authenticate_mapping(UserVa::new(call.args[0])) != Some(true)
+        {
+            None
+        } else {
+            carrick_personality_linux::sched::serve_futex(call, &mut adapter)
+        };
         if let Some(error) = adapter.mapping_refusal {
             return Some(match error {
                 NativeProcessError::OwnerWait(_) | NativeProcessError::Busy => {
