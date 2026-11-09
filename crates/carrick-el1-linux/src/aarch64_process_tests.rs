@@ -2797,6 +2797,15 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         fixture.zone.unhome(fixture.slot, waiter_record, 1);
     }
 
+    // Retain the same counted venue that an admitted anonymous edit borrows.
+    // Final exit must close admission now and defer entry reuse until release.
+    let child_notifications = fixture
+        .zone
+        .space_entry(child_binding.address.mm.raw())
+        .unwrap()
+        .live_notifications()
+        .unwrap();
+
     // Now child exits with status 9
     let child_source = BornInZoneSource {
         zone: fixture.zone,
@@ -2852,6 +2861,17 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         1,
         "terminal child must retire before parent can reap"
     );
+    assert!(
+        fixture
+            .zone
+            .space_entry(child_binding.address.mm.raw())
+            .unwrap()
+            .live_notifications()
+            .is_err(),
+        "terminal entry rejects new notification borrowers"
+    );
+    drop(child_notifications);
+
     assert!(
         fixture
             .zone
