@@ -1865,22 +1865,25 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.object.expired.load(Ordering::Acquire) & OBJECT_HOST_CONTINUATION != 0
     }
 
-    /// Retire a cancelled metadata receipt under the cancellation or slot
-    /// owner's exclusive custody (`Host`, `Transferring`, `OnCpu`, or
-    /// `OnCpuRequested`). Unlike an IPC operation, this token has no external
-    /// pin or adapter cleanup: its only resource is this record. Do not
-    /// manufacture an orphan adapter handback for it.
-    pub(crate) fn retire_cancelled_metadata_operation(&self) {
-        if !self.is_cancelled()
-            || !matches!(
-                self.claim(),
-                Claim::Host { .. }
-                    | Claim::Transferring { .. }
-                    | Claim::OnCpu { .. }
-                    | Claim::OnCpuRequested { .. }
-            )
-            || self.object.queue.load(Ordering::Acquire) != 0
-        {
+    /// Settle a detached metadata receipt under terminal record custody.
+    /// Cancellation owns the ordinary host/slot claims (`Host`,
+    /// `Transferring`, `OnCpu`, `OnCpuRequested`). A first-entry adopter owns
+    /// `Retiring` after retaining the saved retry context in its host thread,
+    /// so no adapter can run on that old record again. Unlike an IPC
+    /// operation, this token has no external pin or adapter cleanup: its only
+    /// resource is this record. Do not manufacture an orphan adapter handback.
+    pub(crate) fn retire_terminal_metadata_operation(&self) {
+        let claim = self.claim();
+        let terminal = matches!(claim, Claim::Retiring { .. })
+            || (self.is_cancelled()
+                && matches!(
+                    claim,
+                    Claim::Host { .. }
+                        | Claim::Transferring { .. }
+                        | Claim::OnCpu { .. }
+                        | Claim::OnCpuRequested { .. }
+                ));
+        if !terminal || self.object.queue.load(Ordering::Acquire) != 0 {
             return;
         }
         // The reserved metadata index cannot name an external operation.
