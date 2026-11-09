@@ -252,6 +252,8 @@ It was red with result -38 before the resource arm was added.
 
 This is not closure of #1335 or #1410. Writes still require the existing
 carrier-write admission (an unlimited caller file-size limit and no applicable
-watcher). The production x86 CPL0 staging gate does not yet admit write/writev.
+watcher). The x86 CPL0 staging gate admits write/writev for both origins like ARM
+(`native_stage::admits`); a non-resident buffer answers EFAULT there, since
+CPL0 has no syscall-retry fault supply.
 Namespace mutation cores, real shell redirect-and-restore, decoded-x86 runtime
 coverage, and signed evidence remain unfinished.

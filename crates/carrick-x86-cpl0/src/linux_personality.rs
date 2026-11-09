@@ -1108,7 +1108,14 @@ impl Personality for LinuxPersonality {
                             },
                         )
                     }
-                    HostFileStage::InRing | HostFileStage::Fault { .. } => {
+                    // CPL0 has no syscall-retry fault supply (ARM re-enters the
+                    // owner fault selector, then retries the SVC). The kernel
+                    // copy ran under the user fault gate, so the buffer is
+                    // not resident: answer EFAULT, never a counted ENOSYS.
+                    HostFileStage::Fault { .. } => {
+                        Some(carrick_syscall_abi::LINUX_EFAULT.guest_retval())
+                    }
+                    HostFileStage::InRing => {
                         counters.record_refusal(
                             carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
                             if process.is_root_process() {
