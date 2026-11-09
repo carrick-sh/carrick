@@ -1773,6 +1773,31 @@ fn in_zone_child_host_read_is_refused_not_served_under_root_context() {
     );
 }
 
+/// #1756 slice 1 no-change witness: x86 builds no IPC execution capability
+/// yet, so the shared transfer engine never runs for an x86 `write` to an
+/// in-ring pipe. The child's `write` to the pipe's write end stays the
+/// explicit refusal it was before the seam: typed and
+/// counted for its native ordinal, before any forward token is taken.
+/// Slice 4 constructs the capability and turns this run green.
+#[test]
+fn in_zone_child_pipe_write_without_ipc_execution_stays_refused() {
+    let elf = native_exit_fixture("native_pipe_child_write.S");
+    let failure = match try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER) {
+        Ok(outcome) => panic!(
+            "an x86 in-ring pipe write completed without an IPC execution binding: exit {} \
+             (child write errno, or 90 pipe2 / 91 fork-wait)",
+            outcome.run.exit_code
+        ),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        failure.authority_refusals,
+        vec![carrick_runtime::prepare::ForwardAuthorityRefusal::HostTaskContext { native: 1 }],
+        "unexpected refusal error: {}",
+        failure.error
+    );
+}
+
 /// Ruling 2 on #542: a child's blocking wait never parks on another task's
 /// lease. The child's `ppoll` on never-readable stdout must wait 50 ms; with
 /// no lease of its own the run is refused before any forward token is taken.
