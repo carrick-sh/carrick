@@ -1802,7 +1802,7 @@ fn native_clock_requires_retained_payload_before_service_publication() {
 fn native_clock_sample_retains_reply_across_copyout_busy() {
     use carrick_core_abi::clock::{CLOCK_RECORD_BYTES, ClockCapabilityId};
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
-    use carrick_kernel::clock_service::{ClockResourceService, El1ZoneClockSleepWaker};
+    use carrick_kernel::clock_service::ClockResourceService;
     use carrick_kernel::kernel::container::ClockDomain;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -1816,7 +1816,7 @@ fn native_clock_sample_retains_reply_across_copyout_busy() {
     let clock = Arc::new(ClockDomain::deterministic(
         UNIX_EPOCH + Duration::from_secs(1234),
     ));
-    let resource = ClockResourceService::new(clock.clone(), Arc::new(El1ZoneClockSleepWaker));
+    let resource = ClockResourceService::new(clock.clone());
     take_signal_copies();
     {
         let mut entry = fixture
