@@ -101,10 +101,16 @@ pub(super) fn resume<C: ThreadCpu, U: UserWord, M: UserCopy>(
     } else {
         op.deadline.get().map_or(Wait::Forever, Wait::Until)
     };
+    let record = sched.zone.slot(sched.slot).current();
     finish(sched, token, &venue.region);
-    // The park armed the temporary mask; this re-entry is not a checkpoint.
-    user.disarm_wait_sigmask();
-    serve_with(sched, frame, venue, user, Some(wait), interrupt)
+    // A continuation keeps the accepted mask in the control slot. In
+    // particular, lost readiness must re-park under that same snapshot.
+    let served = serve_with(sched, frame, venue, user, Some(wait), interrupt);
+    let parked = record.is_some_and(|id| sched.zone.record(id).has_object_operation());
+    if !parked || matches!(served, IpcServed::Forward | IpcServed::Handback) {
+        user.disarm_wait_sigmask();
+    }
+    served
 }
 
 /// Serve a fresh `epoll_pwait` (see the module docs for what forwards).
@@ -129,7 +135,8 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
     interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
     // epoll_pwait(2) checks the mask argument before the set.
-    let sigmask = if frame.x[4] == 0 {
+    let sigmask = if wait.is_some() || frame.x[4] == 0 {
+        // Resumption uses the already-armed slot, never user memory again.
         None
     } else if frame.x[5] != SIGSET_BYTES as u64 {
         return returned(frame, linux::EINVAL);
