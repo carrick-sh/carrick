@@ -1,10 +1,10 @@
 schema_version = 1
 id = "kernel.native.host-file-venue"
 title = "Native processes cross to the host only for host files, through the dispatcher's own path"
-guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev", "syscall:chdir", "syscall:getcwd", "syscall:execve"]
-semantic_authority = ["man 2 read", "man 2 pread", "man 2 lseek", "man 2 getdents64", "man 2 fstat", "man 2 statx", "man 2 openat", "man 2 pipe", "owner decision on #231, #894 and #937"]
+guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev", "syscall:chdir", "syscall:getcwd", "syscall:execve", "syscall:mkdirat", "syscall:unlinkat", "syscall:symlinkat", "syscall:linkat", "syscall:renameat", "syscall:renameat2", "syscall:utimensat", "syscall:truncate", "syscall:ftruncate"]
+semantic_authority = ["man 2 read", "man 2 pread", "man 2 lseek", "man 2 getdents64", "man 2 fstat", "man 2 statx", "man 2 openat", "man 2 pipe", "man 2 mkdirat", "man 2 unlinkat", "man 2 symlinkat", "man 2 linkat", "man 2 renameat2", "man 2 utimensat", "man 2 truncate", "owner decision on #231, #894 and #937"]
 fixture = "unit:native_reads_equal_the_dispatchers_own_syscalls"
-scale_points = [1]
+scale_points = [1, 4095]
 structural_budgets = []
 rationale = """
 A ring-owned (native) process has no host task. Its calls on in-zone objects
@@ -20,12 +20,32 @@ access context (ids, umask, groups, cwd, root) from its ring task row, which
 fork copies and a host-served root's fork seeds once with the root's live cwd
 (#1392). A ring chdir is one lookup crossing; getcwd is answered in ring. The VM-free witnesses compare venue results with the
 dispatcher's syscalls byte for byte and prove the in-zone routing.
+
+#1335 round 2 serves descendant namespace mutations through shared path
+and description cores. Initial tasks keep their existing host-task route;
+Write admission and inherited redirected-description custody are unchanged.
+There is no new host task, named-description index, lock or lifetime owner.
+Paired paths carry two NUL-delimited names. At lengths 1 and 4095, aligned
+and mixed-alignment staging requires at most four page-bounded input copies,
+at most 8192 copied bytes and at most 8191 encoded input bytes, with no
+output preparation. These deterministic unit assertions are not a signed
+WorkObservation or a claim about complete namespace resolution cost.
+Watched and task-relative synthetic mutations refuse before effects.
+Native directory/memory rename publication and finite/unstamped truncate
+limits remain refused. Rootfs timestamps retain the host wrapper's existing
+best-effort success; Memory path truncate retains EROFS.
 """
 
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit}",
   "carrick-kernel::dispatch::native_files::tests::native_child_write_serves_parent_redirected_stdout_after_host_close",
+  "carrick-kernel::dispatch::native_files::tests::native_child_ftruncate_retains_the_inherited_physical_file_after_host_close",
+  "carrick-kernel::dispatch::native_files::tests::native_child_basic_filesystem_sequences_compose_through_the_public_venue",
+  "carrick-kernel::dispatch::native_files::tests::native_truncation_refuses_finite_or_unstamped_limits_before_resize",
+  "carrick-kernel::dispatch::native_files::tests::native_child_mutations_refuse_watched_targets_before_effects",
+  "carrick-personality-linux::native_host_file::tests::mutation_pair_staging_has_a_fixed_two_path_copy_and_record_budget",
+  "carrick-el1-linux::dispatch::tests::native_mutation_staging_is_child_scoped_and_root_keeps_its_host_route",
   "carrick-el1-linux::native_process_runtime::host_test_support::host_root_open_publishes_unstamped_record_through_service_notice",
   "carrick-el1-linux::native_process_runtime::host_test_support::root_exec_access_refusal_is_counted_before_service_publication (production admitted and registered root has no filesystem authority: host-file open and exec refuse before service publication)",
   "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls",
@@ -55,5 +75,5 @@ embed = [
 [bindings.unresolved]
 embed_structural = "The director owns the signed carrier binding and exact-artifact verification for this venue."
 observation = "No versioned WorkObservation counts venue crossings yet; the routing witnesses prove zero host requests for in-zone objects."
-embed = "The signed native pipeline witnesses (`sh -c 'ls / | head -2'`, `true | true`) bind the exec successor's image import and RELRO end to end (#894 ruling 1); acceptance waits on the director's recorded signed run. A static-pie successor witness is tracked as a follow-up."
+embed = "The signed native pipeline witnesses (`sh -c 'ls / | head -2'`, `true | true`) bind the exec successor's image import and RELRO end to end (#894 ruling 1); acceptance waits on the director's recorded signed run. A static-pie successor witness is tracked as a follow-up. Round-2 mutation witnesses execute real ring fork, shared staging and the public carrier venue, not ELF/sh or the full service-notice lifecycle. Signed cases 05/07/08/09/10/12/14/16/17/19/20/21 remain director-owned."
 docker = "Semantics come from the syscall specifications; the dispatcher's own syscalls are the in-tree oracle for byte equality."
