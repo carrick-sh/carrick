@@ -618,15 +618,16 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
     /// Retire a closed entry through its unique notification owner. A live
     /// borrower keeps the index unavailable until its final release; callers
     /// must not require synchronous source destruction.
-    pub fn retire_entry(self, index: SpaceIndex) {
+    pub fn retire_entry(self, index: SpaceIndex) -> Result<(), ObjectWaitError> {
         if let Some(venue) = self.venue {
-            let mm = NonZeroU64::new(self.spaces.key(index)).expect("retiring MM identity");
-            let entry = venue.zone.space_entry(mm).expect("retiring MM entry");
+            let mm = NonZeroU64::new(self.spaces.key(index)).ok_or(ObjectWaitError::Stale)?;
+            let entry = venue.zone.space_entry(mm).ok_or(ObjectWaitError::Stale)?;
             assert_eq!(entry.index(), index);
             entry.retire_entry(venue);
         } else {
             self.spaces.free(index);
         }
+        Ok(())
     }
     pub fn table(self) -> &'a super::AddressSpaces {
         self.spaces
