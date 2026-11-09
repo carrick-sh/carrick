@@ -298,6 +298,39 @@ fn is_ancestor(graph: &Path, ancestor: &str, descendant: &str) -> Result<bool, R
     }
 }
 
+/// Authorizes the merge-group head against the live merge-queue entries.
+pub fn validate_queue_entries(
+    queue_entries: &[Value],
+    requested_sha: &str,
+    queue_pr: u64,
+) -> Result<(), ReceiptError> {
+    for (index, node) in queue_entries.iter().enumerate() {
+        if node["baseCommit"]["oid"].as_str().is_none()
+            || node["headCommit"]["oid"].as_str().is_none()
+            || node["pullRequest"]["number"].as_u64().is_none()
+            || node["pullRequest"]["baseRefName"].as_str().is_none()
+            || node["pullRequest"]["baseRepository"]["nameWithOwner"]
+                .as_str()
+                .is_none()
+        {
+            return Err(fail(format!(
+                "mergeQueue entry {index} is null or incomplete"
+            )));
+        }
+    }
+    if !queue_entries.iter().any(|node| {
+        node["headCommit"]["oid"] == requested_sha
+            && node["pullRequest"]["number"].as_u64() == Some(queue_pr)
+            && node["pullRequest"]["baseRefName"] == "main"
+            && node["pullRequest"]["baseRepository"]["nameWithOwner"] == REPOSITORY
+    }) {
+        return Err(fail(
+            "merge-group head is not the live entry named by its main queue ref",
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_merge_group_prs(
     graph: &Path,
     base: &str,
@@ -339,20 +372,7 @@ fn resolve_merge_group_prs(
             prs.insert(number);
         }
     }
-    for (index, node) in queue_entries.iter().enumerate() {
-        if node["baseCommit"]["oid"].as_str().is_none()
-            || node["headCommit"]["oid"].as_str().is_none()
-            || node["pullRequest"]["number"].as_u64().is_none()
-            || node["pullRequest"]["baseRefName"].as_str().is_none()
-            || node["pullRequest"]["baseRepository"]["nameWithOwner"]
-                .as_str()
-                .is_none()
-        {
-            return Err(fail(format!(
-                "mergeQueue entry {index} is null or incomplete"
-            )));
-        }
-    }
+    validate_queue_entries(queue_entries, requested_sha, queue_pr)?;
     for node in queue_entries {
         if let Some(oid) = node["headCommit"]["oid"].as_str()
             && let Some(base_oid) = node["baseCommit"]["oid"].as_str()
@@ -385,16 +405,6 @@ fn resolve_merge_group_prs(
                 }
             }
         }
-    }
-    if !queue_entries.iter().any(|node| {
-        node["headCommit"]["oid"] == requested_sha
-            && node["pullRequest"]["number"].as_u64() == Some(queue_pr)
-            && node["pullRequest"]["baseRefName"] == "main"
-            && node["pullRequest"]["baseRepository"]["nameWithOwner"] == REPOSITORY
-    }) {
-        return Err(fail(
-            "merge-group head is not the live entry named by its main queue ref",
-        ));
     }
     // Any commit not covered by a live queue entry may have merged onto main
     // between event creation and this query. Resolve every such commit through
