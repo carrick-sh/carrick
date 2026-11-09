@@ -2091,7 +2091,7 @@ where
         let result = kernel.dispatcher.resume_ipc_lock_operation(
             &context,
             request,
-            pending,
+            *pending,
             engine,
             &kernel.reporter,
             Some(thread),
