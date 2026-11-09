@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use carrick_xtask::accept::{AcceptReceipt, ProbeDiff};
-use carrick_xtask::signed_gate::{allowed, label_authorized, validate_receipt};
+use carrick_xtask::signed_gate::{
+    allowed, label_authorized, validate_queue_entries, validate_receipt,
+};
 use carrick_xtask::signed_receipt::compare;
 use serde_json::json;
 use std::process::Command;
@@ -2626,4 +2628,54 @@ else:
         });
         assert_eq!(planted, 0, "{mode}: downloaded an untrusted bundle");
     }
+}
+
+fn queue_entry(head: &str, number: u64) -> serde_json::Value {
+    json!({
+        "baseCommit": {"oid": "b".repeat(40)},
+        "headCommit": {"oid": head},
+        "pullRequest": {
+            "number": number,
+            "baseRefName": "main",
+            "baseRepository": {"nameWithOwner": "carrick-sh/carrick"}
+        }
+    })
+}
+
+fn unmergeable_entry() -> serde_json::Value {
+    json!({
+        "baseCommit": null,
+        "headCommit": null,
+        "pullRequest": {"number": 1902, "baseRefName": null, "baseRepository": null}
+    })
+}
+
+#[test]
+fn queue_ignores_unmergeable_sibling() {
+    let head = "a".repeat(40);
+    for sibling in [unmergeable_entry(), serde_json::Value::Null] {
+        let entries = [queue_entry(&head, 1950), sibling];
+        validate_queue_entries(&entries, &head, 1950).unwrap();
+    }
+}
+
+#[test]
+fn queue_refuses_incomplete_own_entry() {
+    let head = "a".repeat(40);
+    let mut no_base = queue_entry(&head, 1950);
+    no_base["baseCommit"] = serde_json::Value::Null;
+    let mut no_number = queue_entry(&head, 1950);
+    no_number["pullRequest"]["number"] = serde_json::Value::Null;
+    for own in [no_base, no_number] {
+        let err = validate_queue_entries(&[own], &head, 1950).unwrap_err();
+        assert!(err.to_string().contains("null or incomplete"), "{err}");
+    }
+}
+
+#[test]
+fn queue_refuses_missing_own_entry() {
+    let head = "a".repeat(40);
+    let entries = [queue_entry(&"c".repeat(40), 1951), unmergeable_entry()];
+    let err = validate_queue_entries(&entries, &head, 1950).unwrap_err();
+    assert!(err.to_string().contains("not the live entry"), "{err}");
 }
