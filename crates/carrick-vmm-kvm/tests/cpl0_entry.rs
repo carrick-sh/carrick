@@ -2981,6 +2981,32 @@ fn production_pipe_metadata_stays_in_the_ring_namespace() {
         code.extend_from_slice(&[0x0f, 0x05]);
         check(&mut code, &mut failures, expected);
     }
+    // NULL path without AT_EMPTY_PATH is EFAULT, not an empty path (Linux
+    // 6.11+ accepts NULL only with the flag), for the live dup of the pipe
+    // in fd 31 and for r12, the ring-owned read end closed just above (an fd
+    // the ring never owned forwards instead of pinning), and never touches
+    // the stat buffer.
+    for (closed_r12, flags, expected) in [
+        (false, 0, -14),
+        (true, 0, -14),
+        (true, carrick_abi::LINUX_AT_EMPTY_PATH, -9),
+    ] {
+        code.extend_from_slice(&[0xc7, 0x44, 0x24, 0x28, 0x5a, 0x5a, 0x5a, 0x5a]);
+        if closed_r12 {
+            code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+        } else {
+            mov(&mut code, 7, 31);
+        }
+        mov(&mut code, 6, 0);
+        code.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 0x10]);
+        code.extend_from_slice(&[0x49, 0xba]);
+        code.extend_from_slice(&flags.to_le_bytes());
+        mov(&mut code, 0, 262);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        check(&mut code, &mut failures, expected);
+        code.extend_from_slice(&[0x8b, 0x44, 0x24, 0x28]);
+        check(&mut code, &mut failures, 0x5a5a5a5a);
+    }
     call(&mut code, 231, [0, 0, 0]);
     for (index, offset) in failures.into_iter().enumerate() {
         let relative = (code.len() as i64 - offset as i64 - 4) as i32;
