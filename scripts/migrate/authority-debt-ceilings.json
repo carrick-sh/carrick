@@ -2426,7 +2426,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:ipc::admission",
-      "owner": "carrick_kernel::el1_ipc::HostIpc::bind_waits",
+      "owner": "carrick_kernel::el1_ipc::pipe_lane_key",
       "lane": "shared",
       "ceiling": 1
     },
@@ -2496,7 +2496,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:ipc::pipe",
-      "owner": "carrick_kernel::dispatch::fs::pipe::PipeInner::create",
+      "owner": "carrick_kernel::dispatch::fs::pipe::PipeInner::from_created",
       "lane": "shared",
       "ceiling": 2
     },
@@ -33989,7 +33989,7 @@
     {
       "family": "k1_inspect_misc",
       "operation": "write_open_files",
-      "owner": "carrick_kernel::dispatch::fs::pipe::FsView<'a>::pipe2",
+      "owner": "carrick_kernel::dispatch::fs::pipe::FsView<'a>::pipe2_create",
       "lane": "shared",
       "ceiling": 1
     },
