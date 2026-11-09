@@ -12,10 +12,13 @@ use super::{
     source_hashes,
 };
 use crate::probe_inventory::{ProbeInventoryRow, load_inventory_from_str};
+use quote::ToTokens;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use syn::ext::IdentExt;
+use syn::visit::{self, Visit};
 
 const CANDIDATE_SCHEMA: &str = "carrick.fixtures.candidate-probes.v1";
 /// The probe inventory: a fixture input and the source of `probe_names`.
@@ -367,11 +370,16 @@ pub fn plan(root: &Path, base: &Path) -> Result<CandidateBuild<BuildPlan>> {
         InputDifference::AddedProbes(probes) => {
             for probe in &probes {
                 let text = fs::read(safe_path(root, &probe.name.source())?)?;
-                if let Some(token) = unlisted_reader(&String::from_utf8_lossy(&text)) {
+                let reason = match std::str::from_utf8(&text) {
+                    Ok(source) => unlisted_reader(source),
+                    Err(_) => Some("is not UTF-8".to_owned()),
+                };
+                if let Some(reason) = reason {
                     return Ok(CandidateBuild::Refused(fail(format!(
-                        "added probe {} uses `{token}`: assembly or link-attribute probes can \
-                         read files the compiler's dep-info does not list, so they go through a \
-                         normal fixture republish, not a candidate build",
+                        "added probe {} {reason}: assembly, link-attribute, file-including and \
+                         macro-generating probes can read files the compiler's dep-info does not \
+                         list, or hide such reads from this check, so they go through a normal \
+                         fixture republish, not a candidate build",
                         probe.name.source()
                     ))));
                 }
@@ -389,63 +397,175 @@ pub fn plan(root: &Path, base: &Path) -> Result<CandidateBuild<BuildPlan>> {
     }
 }
 
-/// The first assembly or link-attribute token in an added probe's source,
-/// or `None`.
+/// Why an added probe's source may read files the compiler's dep-info does
+/// not list, or hide such a read from this check; `None` admits it.
 ///
 /// [`build`] admits a compiler input only if dep-info lists it, but the
 /// assembler (`.incbin` and `.include` in `asm!`, `global_asm!` or
 /// `naked_asm!`) and the linker (`#[link(...)]`, `link_args`) read files
-/// dep-info never names. Rather than read assembly, an added probe is
-/// refused outright, failing closed on text (Rust parsing is out of reach
-/// here):
-/// - the identifiers `asm`, `global_asm` and `naked_asm` anywhere, whatever
-///   their path or `!` spacing (a `use .. as` rename still names them);
-/// - `link_args` anywhere;
-/// - the identifier `link` in attribute position: after `[` or `,` and
-///   before `(`, spacing and comments included (`#[link(`, `# [ link (`,
-///   `#[/**/link(`, `cfg_attr(.., link(..))`); and, in a source defining
-///   `macro_rules` (which can paste `link` into an attribute), any `link`
-///   that is not a path segment or method (`libc::link(`, `.link(`).
+/// dep-info never names. Rather than read assembly, the source is parsed
+/// with `syn` (refused if it does not parse) and refused on, anywhere in the
+/// tree including nested modules, statements and closures:
+/// - the identifiers `asm`, `global_asm`, `naked_asm` and `link_args`, raw or
+///   not (`r#asm`), in any position: a macro call, a path, a `use` or rename;
+/// - `link` in any attribute, outer or inner, at any `cfg_attr` depth;
+/// - `macro_rules!`, whose expansion can paste any of these together, and
+///   syntax `syn` keeps verbatim (such as `macro` items);
+/// - `include!`, `include_bytes!` and `include_str!`, and out-of-line
+///   `mod name;` items: the only other files a probe could pull in. Their
+///   reads are in dep-info, which [`build`] still checks, but this check
+///   would not see what an included Rust file contains.
 ///
-/// Files the compiler reads through `include_str!`, `include_bytes!`,
-/// `include!` or `#[path]` are in dep-info, which [`build`] checks.
-pub fn unlisted_reader(source: &str) -> Option<&'static str> {
-    let ident = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
-    let bytes = source.as_bytes();
-    let macros = source.contains("macro_rules");
-    let mut at = 0;
-    while at < bytes.len() {
-        if !ident(&bytes[at]) {
-            at += 1;
-            continue;
-        }
-        let start = at;
-        while at < bytes.len() && ident(&bytes[at]) {
-            at += 1;
-        }
-        let word = &source[start..at];
-        match word {
-            "asm" => return Some("asm"),
-            "global_asm" => return Some("global_asm"),
-            "naked_asm" => return Some("naked_asm"),
-            "link_args" => return Some("link_args"),
-            "link" => {
-                let before = bytes[..start]
-                    .iter()
-                    .rev()
-                    .find(|b| !b.is_ascii_whitespace());
-                let after = bytes[at..].iter().find(|b| !b.is_ascii_whitespace());
-                let attribute = matches!(before, Some(b'[' | b',' | b'/'))
-                    && matches!(after, Some(b'(' | b'/'));
-                let path = matches!(before, Some(b':' | b'.'));
-                if attribute || (macros && !path) {
-                    return Some("link");
-                }
-            }
-            _ => {}
+/// syn leaves macro arguments and attribute arguments as opaque tokens, so
+/// every token of every macro call and attribute is searched recursively
+/// for those identifiers and for `link`, `mod`, `macro_rules` and the
+/// include macros. That refuses `assert!(libc::link(..) == 0)`; bind the
+/// call outside the macro instead. Comments and string literals are not
+/// tokens and never cause a refusal. The probe crate has no proc-macro
+/// dependency, so no other macro can build these identifiers.
+pub fn unlisted_reader(source: &str) -> Option<String> {
+    let file = match syn::parse_file(source) {
+        Ok(file) => file,
+        Err(error) => return Some(format!("does not parse as Rust ({error})")),
+    };
+    let mut scan = UnlistedReader::default();
+    scan.visit_file(&file);
+    scan.found
+}
+
+/// Identifiers refused anywhere in the parsed tree.
+const ASSEMBLY_OR_LINKER: &[&str] = &["asm", "global_asm", "naked_asm", "link_args"];
+/// Macros that read another file into the probe.
+const INCLUDES: &[&str] = &["include", "include_bytes", "include_str"];
+/// Identifiers refused anywhere in an opaque macro or attribute token stream.
+const OPAQUE: &[&str] = &[
+    "asm",
+    "global_asm",
+    "naked_asm",
+    "link_args",
+    "link",
+    "macro_rules",
+    "mod",
+    "include",
+    "include_bytes",
+    "include_str",
+];
+
+#[derive(Default)]
+struct UnlistedReader {
+    found: Option<String>,
+}
+
+impl UnlistedReader {
+    fn refuse(&mut self, reason: String) {
+        if self.found.is_none() {
+            self.found = Some(reason);
         }
     }
-    None
+
+    /// Refuse the first [`OPAQUE`] identifier in `tokens`, at any depth.
+    fn tokens(&mut self, tokens: proc_macro2::TokenStream, context: &str) {
+        for token in tokens {
+            match token {
+                proc_macro2::TokenTree::Ident(ident) => {
+                    let name = ident.unraw().to_string();
+                    if OPAQUE.contains(&name.as_str()) {
+                        self.refuse(format!("uses `{name}` in {context}"));
+                    }
+                }
+                proc_macro2::TokenTree::Group(group) => self.tokens(group.stream(), context),
+                _ => {}
+            }
+        }
+    }
+
+    fn verbatim(&mut self, kind: &str) {
+        self.refuse(format!("has a {kind} syn keeps verbatim"));
+    }
+}
+
+impl<'ast> Visit<'ast> for UnlistedReader {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        let name = ident.unraw().to_string();
+        if ASSEMBLY_OR_LINKER.contains(&name.as_str()) {
+            self.refuse(format!("uses `{name}`"));
+        }
+    }
+
+    fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+        self.tokens(attribute.meta.to_token_stream(), "an attribute");
+        visit::visit_attribute(self, attribute);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if let Some(last) = mac.path.segments.last() {
+            let name = last.ident.unraw().to_string();
+            if ASSEMBLY_OR_LINKER.contains(&name.as_str())
+                || INCLUDES.contains(&name.as_str())
+                || name == "macro_rules"
+            {
+                self.refuse(format!("uses `{name}`"));
+            }
+        }
+        self.tokens(mac.tokens.clone(), "a macro call");
+        visit::visit_macro(self, mac);
+    }
+
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        if module.content.is_none() {
+            self.refuse(format!("declares out-of-line module `{}`", module.ident));
+        }
+        visit::visit_item_mod(self, module);
+    }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if let syn::Item::Verbatim(_) = item {
+            self.verbatim("item");
+        }
+        visit::visit_item(self, item);
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if let syn::ForeignItem::Verbatim(_) = item {
+            self.verbatim("foreign item");
+        }
+        visit::visit_foreign_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if let syn::ImplItem::Verbatim(_) = item {
+            self.verbatim("impl item");
+        }
+        visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if let syn::TraitItem::Verbatim(_) = item {
+            self.verbatim("trait item");
+        }
+        visit::visit_trait_item(self, item);
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if let syn::Expr::Verbatim(_) = expr {
+            self.verbatim("expression");
+        }
+        visit::visit_expr(self, expr);
+    }
+
+    fn visit_pat(&mut self, pat: &'ast syn::Pat) {
+        if let syn::Pat::Verbatim(_) = pat {
+            self.verbatim("pattern");
+        }
+        visit::visit_pat(self, pat);
+    }
+
+    fn visit_type(&mut self, ty: &'ast syn::Type) {
+        if let syn::Type::Verbatim(_) = ty {
+            self.verbatim("type");
+        }
+        visit::visit_type(self, ty);
+    }
 }
 
 /// Build the added probes of the checkout at `root` (exactly `sha`) with the
@@ -458,8 +578,9 @@ pub fn build(
     output: &Path,
 ) -> Result<CandidateBuild<PathBuf>> {
     let expected = expected_head(root, Some(sha))?;
-    // Resolution below is offline; populate the Cargo cache first.
-    super::fetch_dependencies(root)?;
+    // Planning reads only the checkout and the bundle, so a refused probe
+    // costs no dependency fetch and no build: `Snapshot::new` below is the
+    // first step that fetches (the publisher's order).
     let plan = match plan(root, base)? {
         CandidateBuild::Build(plan) => plan,
         CandidateBuild::Equal => return Ok(CandidateBuild::Equal),

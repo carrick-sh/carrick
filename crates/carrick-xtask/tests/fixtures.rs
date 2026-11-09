@@ -4251,46 +4251,290 @@ fn added_libc_probe_is_still_admitted() {
     assert_eq!(names, ["libcprobe", "plainprobe"]);
 }
 
-/// The ban's spellings: any assembly macro, any path or spacing, and the
-/// `link` attribute directly, spaced, commented or under `cfg_attr`.
+/// The reviewer's second #1986 reproduction: a raw-identifier `r#link`
+/// attribute (bare and under `cfg_attr`) naming a static archive outside
+/// every fixture input, with `+verbatim` so the linker reads exactly that
+/// path. The linker's read is not in dep-info; the old text scan missed the
+/// raw identifier and built and published the set. The archive is a valid
+/// `ar` archive committed beside the fixture inputs; its member is not an
+/// ARM64 object, which does not matter because the probe is refused while
+/// planning, before anything is linked.
 #[test]
-fn unlisted_reader_scan_refuses_assembler_and_linker_reads() {
-    for (source, token) in [
-        (r#"core::arch::asm!("nop");"#, "asm"),
-        (r#"asm !("nop");"#, "asm"),
-        (r#"use core::arch::asm as a; a!("nop");"#, "asm"),
-        (r#"core::arch::global_asm!(".incbin \"x\"");"#, "global_asm"),
-        (r#"std::arch::naked_asm!("ret")"#, "naked_asm"),
-        (r#"core::arch::r#asm!("nop");"#, "asm"),
-        (
-            r#"#[link(name = "x", kind = "static")] extern "C" {}"#,
-            "link",
+fn added_probe_with_raw_link_attribute_is_refused_before_building() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    for (index, attribute) in [
+        "#[r#link(name = \"{archive}\", kind = \"static\", modifiers = \"+verbatim\")]",
+        "#[cfg_attr(all(), r#link(name = \"{archive}\", kind = \"static\", modifiers = \"+verbatim\"))]",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let f = Fixture::new();
+        let root = f.repo.path();
+        commit(root, "unlisted/libreview.a", &ar_archive(), "archive");
+        let archive = format!(
+            "{}{}",
+            "../".repeat(32),
+            root.join("unlisted/libreview.a").display()
+        );
+        let probe = format!(
+            "{} unsafe extern \"C\" {{ fn review_payload() -> i32; }}\n\
+             fn main() {{ std::process::exit(unsafe {{ review_payload() }}) }}\n",
+            attribute.replace("{archive}", &archive)
+        );
+        let name = format!("linkprobe{index}");
+        let sha = commit_added_probe_source(root, &name, built_row(), probe.as_bytes());
+        let output = CanonicalTempDir::new();
+        match candidate_probes::build(root, &f.path, &sha, output.path()) {
+            Ok(CandidateBuild::Refused(error)) => assert!(
+                error.to_string().contains(&format!(
+                    "added probe conformance-probes/src/bin/{name}.rs uses `link` in an attribute"
+                )),
+                "{error}"
+            ),
+            other => panic!("raw link attribute was not refused: {other:?}"),
+        }
+        assert_eq!(fs::read_dir(output.path()).unwrap().count(), 0);
+        assert!(!root.join(GuestTarget::Gnu.triple()).exists());
+    }
+}
+
+/// A one-member `ar` archive (the static library format).
+fn ar_archive() -> Vec<u8> {
+    let member = b"review payload\n";
+    let mut bytes = b"!<arch>\n".to_vec();
+    bytes.extend_from_slice(
+        format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            "payload.o/",
+            0,
+            0,
+            0,
+            644,
+            member.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(member);
+    bytes.push(b'\n');
+    bytes
+}
+
+/// A refused probe costs no dependency fetch: the production builder plans
+/// (and refuses) before anything runs `cargo`. A `cargo` on `PATH` that
+/// records every invocation and fails stands in for the real one; before
+/// the fix `build` ran `cargo --locked fetch` for every fixture lockfile
+/// first.
+#[test]
+fn serial_host_banned_added_probe_is_refused_before_any_cargo_fetch() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.repo.path();
+    let probe = b"fn main() { unsafe { core::arch::asm!(\"nop\") } }\n";
+    let sha = commit_added_probe_source(root, "asmprobe", built_row(), probe);
+    let bin = tempfile::tempdir().unwrap();
+    let log = bin.path().join("cargo.log");
+    let cargo = bin.path().join("cargo");
+    fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
+            log.display()
         ),
-        (r#"# [ link (name = "x")] extern "C" {}"#, "link"),
-        ("#[\n link\n(name = \"x\")] extern \"C\" {}", "link"),
-        (r#"#[/**/link/**/(name = "x")] extern "C" {}"#, "link"),
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let old = std::env::var_os("PATH").unwrap();
+    let paths = std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&old));
+    // SAFETY: this clean-environment child runs only this test (`--exact`).
+    unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+    let output = CanonicalTempDir::new();
+    let result = candidate_probes::build(root, &f.path, &sha, output.path());
+    // SAFETY: as above.
+    unsafe { std::env::set_var("PATH", &old) };
+    let ran = fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(ran, "", "cargo ran before the refusal");
+    match result {
+        Ok(CandidateBuild::Refused(error)) => {
+            assert!(error.to_string().contains("uses `asm`"), "{error}")
+        }
+        other => panic!("assembly probe was not refused: {other:?}"),
+    }
+    assert_eq!(fs::read_dir(output.path()).unwrap().count(), 0);
+}
+
+/// Comments and string literals are not tokens: `asm` and `#[link(..)]`
+/// there no longer refuse a probe (the old text scan refused them).
+#[test]
+fn added_probe_mentioning_assembly_in_comments_and_strings_is_admitted() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.repo.path();
+    let probe = br##"// Not asm!("nop"), nor #[link(name = "x")], nor link_args.
+/* global_asm!(".incbin \"x\"") */
+fn main() {
+    let text = "asm! global_asm! naked_asm! #[link(name = \"x\")] link_args";
+    let raw = r#"#[r#link(name = "x")]"#;
+    println!("{}{}", text.len(), raw.len());
+}
+"##;
+    commit_added_probe_source(root, "commentprobe", built_row(), probe);
+    let CandidateBuild::Build(plan) = candidate_probes::plan(root, &f.path).unwrap() else {
+        panic!("a probe naming assembly only in comments and strings was not planned");
+    };
+    let names: Vec<&str> = plan.probes.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["commentprobe"]);
+}
+
+/// The parse-based ban, position by position: assembly identifiers raw or
+/// not in any path, `link` in any attribute (inner, nested `cfg_attr`, on
+/// items, extern blocks, fields, statements, expressions and closures, in
+/// nested modules), anything inside a macro call's tokens, macro
+/// generation, file inclusion and unparseable sources.
+#[test]
+fn unlisted_reader_refuses_assembler_and_linker_reads() {
+    for (source, reason) in [
         (
-            r#"#[cfg_attr(all(), link (name = "x"))] extern "C" {}"#,
-            "link",
+            r#"fn f() { unsafe { core::arch::asm!("nop") } }"#,
+            "uses `asm`",
         ),
-        (r#"#![cfg_attr(unix, link_args = "x")]"#, "link_args"),
+        (r#"fn f() { unsafe { asm !("nop") } }"#, "uses `asm`"),
         (
-            r#"macro_rules! m { ($a:ident) => { #[$a(name = "x")] extern "C" {} } } m!(link);"#,
-            "link",
+            r#"fn f() { unsafe { core::arch::r#asm!("nop") } }"#,
+            "uses `asm`",
         ),
+        (
+            r#"use core::arch::asm as a; fn f() { unsafe { a!("nop") } }"#,
+            "uses `asm`",
+        ),
+        (r#"use core::arch::{asm as a};"#, "uses `asm`"),
+        (
+            r#"core::arch::global_asm!(".incbin \"x\"");"#,
+            "uses `global_asm`",
+        ),
+        (r#"r#global_asm!(".incbin \"x\"");"#, "uses `global_asm`"),
+        (
+            r#"mod a { mod b { core::arch::r#global_asm!(""); } }"#,
+            "uses `global_asm`",
+        ),
+        (
+            r#"#[unsafe(naked)] extern "C" fn f() { std::arch::naked_asm!("ret") }"#,
+            "uses `naked_asm`",
+        ),
+        (
+            r#"#[link(name = "x", kind = "static")] unsafe extern "C" {}"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"#[r#link(name = "x")] unsafe extern "C" {}"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"#![link(name = "x")] fn main() {}"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"#![r#link(name = "x")] fn main() {}"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"#[cfg_attr(all(), link(name = "x"))] unsafe extern "C" {}"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"#[cfg_attr(unix, cfg_attr(all(), r#link(name = "x")))] unsafe extern "C" {}"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"mod a { mod b { #[cfg_attr(unix, link(name = "x"))] unsafe extern "C" {} } }"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"mod a { #![link(name = "x")] }"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"unsafe extern "C" { #[link(name = "x")] fn f(); }"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"struct S { #[link(name = "x")] f: u8 }"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"fn f() { #[link(name = "x")] let _ = 1; }"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"fn f() { let _ = #[cfg_attr(all(), link(name = "x"))] 1; }"#,
+            "uses `link` in an attribute",
+        ),
+        (
+            r#"fn f() { let _ = #[link(name = "x")] || 1; }"#,
+            "uses `link` in an attribute",
+        ),
+        (r#"#![cfg_attr(unix, link_args = "x")]"#, "uses `link_args`"),
+        (
+            r#"fn f() { std::thread_local! { #[link(name = "x")] static S: u8 = 0; } }"#,
+            "uses `link` in a macro call",
+        ),
+        (
+            r#"fn f() { assert!(unsafe { libc::link(a, b) } == 0); }"#,
+            "uses `link` in a macro call",
+        ),
+        (
+            r#"fn f() { println!("{}", r#asm); }"#,
+            "uses `asm` in a macro call",
+        ),
+        (
+            r#"macro_rules! m { ($a:ident) => { #[$a(name = "x")] unsafe extern "C" {} } } m!(link);"#,
+            "uses `macro_rules`",
+        ),
+        (
+            r#"fn f() { macro_rules! m { () => {} } }"#,
+            "uses `macro_rules`",
+        ),
+        (
+            r#"static B: &[u8] = include_bytes!("x.bin");"#,
+            "uses `include_bytes`",
+        ),
+        (
+            r#"#[doc = include_str!("x.md")] fn f() {}"#,
+            "uses `include_str`",
+        ),
+        (
+            r#"#[cfg_attr(all(), doc = include_str!("x.md"))] fn f() {}"#,
+            "uses `include_str`",
+        ),
+        (r#"include!("x.rs");"#, "uses `include`"),
+        (r#"mod other;"#, "declares out-of-line module `other`"),
+        (
+            r#"#[path = "/tmp/x.rs"] mod other;"#,
+            "declares out-of-line module `other`",
+        ),
+        (r#"macro m() {}"#, "keeps verbatim"),
+        (r#"fn main() { asm!("#, "does not parse as Rust"),
+        (r#"#[link(name = "x")"#, "does not parse as Rust"),
     ] {
-        assert_eq!(
-            candidate_probes::unlisted_reader(source),
-            Some(token),
-            "{source}"
+        let found = candidate_probes::unlisted_reader(source);
+        assert!(
+            found.as_deref().is_some_and(|found| found.contains(reason)),
+            "{source}: {found:?}, expected {reason}"
         );
     }
     for source in [
-        r#"#[link_name = "__sigsetjmp"] fn f(); libc::link(a, b); fs::hard_link(a, b);"#,
-        r#"let link = p; libc::unlink(link); x.link(y); let wasm = 1;"#,
-        r#"// a hard link (to a symlink)"#,
-        r#"let s = concat!("a", "b"); println!("\x41");"#,
-        r#"include_bytes!("x.bin");"#,
+        r#"unsafe extern "C" { #[link_name = "__sigsetjmp"] fn f(); }
+           fn g() { let link = 1; let _ = unsafe { libc::link(a, b) }; std::fs::hard_link(a, b); }"#,
+        r#"fn f() { let link = p; libc::unlink(link); x.link(y); let wasm = 1; }"#,
+        r#"// a hard link (to a symlink), asm!("nop"), #[link(name = "x")]"#,
+        r#"fn f() { let s = concat!("a", "b"); println!("\x41 asm! #[link(name = \"x\")]"); }"#,
+        r#"#[cfg(target_os = "linux")] mod inline { pub fn f() {} }"#,
     ] {
         assert_eq!(candidate_probes::unlisted_reader(source), None, "{source}");
     }
