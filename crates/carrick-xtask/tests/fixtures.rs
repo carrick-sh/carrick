@@ -3925,7 +3925,10 @@ fn assert_candidate_refusal(f: &Fixture, set: &Path, case: &str) {
                 .contains("fixture input identity mismatch"),
             "{case}: {error}"
         ),
-        Ok(other) => panic!("{case}: planned {other:?}"),
+        Ok(other) => assert!(
+            matches!(other, CandidateBuild::Refused(_)),
+            "{case}: planned {other:?}"
+        ),
         // A pin the host cannot resolve fails before hashing; still refused.
         Err(error) => assert!(case.contains("toolchain"), "{case}: {error}"),
     }
