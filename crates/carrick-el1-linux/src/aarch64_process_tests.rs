@@ -1909,12 +1909,47 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
         .unwrap();
     let cause = carrick_sched_core::spaces::notification::SpaceWaitCause::Gate;
     let before = notifications.observe(cause).revision();
+    let owner = super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    drop(
+        owner
+            .root_any(
+                ReservationMm::new(fixture.address.mm.raw().get()).unwrap(),
+                0,
+            )
+            .unwrap(),
+    );
+    let predecessor_notifications = fixture
+        .zone
+        .space_entry(fixture.address.mm.raw())
+        .unwrap()
+        .live_notifications()
+        .unwrap();
     // Exercise the production physical switch with the admitted successor's
     // notification source. The test crossing deliberately refuses only the
     // final host settlement, after the real gate and install transitions.
     assert_eq!(
         service.finish_exec_successor(fixture.address, successor.address),
         Err(NativeProcessError::Unsupported),
+    );
+    assert!(
+        fixture
+            .zone
+            .space_entry(fixture.address.mm.raw())
+            .unwrap()
+            .live_notifications()
+            .is_err()
+    );
+    drop(predecessor_notifications);
+    assert!(
+        fixture
+            .zone
+            .spaces
+            .find(fixture.address.mm.raw().get())
+            .is_none()
     );
     assert!(fixture.zone.spaces.is_open(successor_mm.raw()));
     assert_eq!(notifications.observe(cause).revision(), before + 1);
@@ -2799,12 +2834,14 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
 
     // Retain the same counted venue that an admitted anonymous edit borrows.
     // Final exit must close admission now and defer entry reuse until release.
-    let child_notifications = fixture
-        .zone
-        .space_entry(child_binding.address.mm.raw())
-        .unwrap()
-        .live_notifications()
-        .unwrap();
+    let child_notifications = (!physical).then(|| {
+        fixture
+            .zone
+            .space_entry(child_binding.address.mm.raw())
+            .unwrap()
+            .live_notifications()
+            .unwrap()
+    });
 
     // Now child exits with status 9
     let child_source = BornInZoneSource {
@@ -2861,15 +2898,17 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         1,
         "terminal child must retire before parent can reap"
     );
-    assert!(
-        fixture
-            .zone
-            .space_entry(child_binding.address.mm.raw())
-            .unwrap()
-            .live_notifications()
-            .is_err(),
-        "terminal entry rejects new notification borrowers"
-    );
+    if child_notifications.is_some() {
+        assert!(
+            fixture
+                .zone
+                .space_entry(child_binding.address.mm.raw())
+                .unwrap()
+                .live_notifications()
+                .is_err(),
+            "terminal entry rejects new notification borrowers"
+        );
+    }
     drop(child_notifications);
 
     assert!(
