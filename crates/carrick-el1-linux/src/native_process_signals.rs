@@ -144,7 +144,14 @@ struct SignalShared<'a, T> {
     projection_visits: core::sync::atomic::AtomicUsize,
     #[cfg(test)]
     projection_stores: core::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    after_empty_check: SpinLock<Option<EmptyCheckHook<'a, T>>>,
 }
+
+/// Runs once, right after a deliverable check found nothing: the window a
+/// concurrent signal publication can land in before the checker acts.
+#[cfg(test)]
+pub(crate) type EmptyCheckHook<'a, T> = Box<dyn FnOnce(&NativeProcessSignals<'a, T>) + Send + 'a>;
 
 impl<'a, T> SignalShared<'a, T> {
     fn new(page: &'a ThreadLifecyclePage, resources: SignalResources<'a, T>) -> Self {
@@ -157,6 +164,8 @@ impl<'a, T> SignalShared<'a, T> {
             projection_visits: core::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             projection_stores: core::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            after_empty_check: SpinLock::new(None),
         };
         {
             let state = shared.state.lock();
@@ -521,6 +530,28 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         tid: carrick_sched_core::RecordRef,
         blocked: SigBlockMask,
     ) -> bool {
+        let deliverable = self.deliverable_now(tid, blocked);
+        #[cfg(test)]
+        if !deliverable {
+            let hook = self.resources.after_empty_check.lock().take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
+        deliverable
+    }
+    /// Arm `hook` to run after the next deliverable check that finds nothing.
+    #[cfg(test)]
+    pub(crate) fn after_next_empty_check(&self, hook: EmptyCheckHook<'a, T>) {
+        assert!(
+            self.resources
+                .after_empty_check
+                .lock()
+                .replace(hook)
+                .is_none()
+        );
+    }
+    fn deliverable_now(&self, tid: carrick_sched_core::RecordRef, blocked: SigBlockMask) -> bool {
         let resources = self.resources.lock();
         let thread = resources.thread_pending_set(tid);
         let mut selected = blocked.select(resources.inbox.pending().present().union(thread));
