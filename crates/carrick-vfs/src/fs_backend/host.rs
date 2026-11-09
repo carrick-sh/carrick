@@ -1009,31 +1009,31 @@ pub(crate) struct ScratchDiscoveryObserver {
     pub(crate) cleanup_complete: std::sync::Arc<std::sync::Barrier>,
 }
 
-/// Progress of the scratch worker: bumped when it starts an item and again
-/// when it finishes one, so a reader can tell "busy" from "hung".
-static SCRATCH_WORKER_PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Current scratch worker progress; changes whenever the worker starts or
-/// finishes an item.
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn scratch_worker_progress() -> u64 {
-    SCRATCH_WORKER_PROGRESS.load(std::sync::atomic::Ordering::Acquire)
+/// The scratch worker's queue and its progress counter. The counter is
+/// bumped when the worker starts an item and again when it finishes one, so
+/// a reader can tell "busy" from "hung". It lives with the sender so the
+/// worker owns one process-wide state, not a second static.
+struct ScratchWorker {
+    sender: Option<std::sync::mpsc::SyncSender<ScratchCleanupWork>>,
+    /// Read only by the macOS volume verdict and tests.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-fn note_scratch_worker_progress() {
-    SCRATCH_WORKER_PROGRESS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-}
-
-fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<ScratchCleanupWork>> {
-    static SENDER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<ScratchCleanupWork>>> =
-        std::sync::OnceLock::new();
+fn scratch_cleanup_sender() -> &'static ScratchWorker {
+    static SENDER: std::sync::OnceLock<ScratchWorker> = std::sync::OnceLock::new();
     SENDER.get_or_init(|| {
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_progress = std::sync::Arc::clone(&progress);
         let (sender, receiver) = std::sync::mpsc::sync_channel(SCRATCH_CLEANUP_QUEUE_DEPTH);
-        std::thread::Builder::new()
+        let sender = std::thread::Builder::new()
             .name("carrick-fs-cleanup".to_string())
             .spawn(move || {
+                let note_progress = || {
+                    worker_progress.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                };
                 while let Ok(work) = receiver.recv() {
-                    note_scratch_worker_progress();
+                    note_progress();
                     match work {
                         ScratchCleanupWork::Remove { path, completion } => {
                             let _ = std::fs::remove_dir_all(&path);
@@ -1067,16 +1067,26 @@ fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<Scrat
                             let _ = reply.try_send(query());
                         }
                     }
-                    note_scratch_worker_progress();
+                    note_progress();
                 }
             })
             .ok()
-            .map(|_| sender)
+            .map(|_| sender);
+        ScratchWorker { sender, progress }
     })
 }
 
+/// Current scratch worker progress; changes whenever the worker starts or
+/// finishes an item.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn scratch_worker_progress() -> u64 {
+    scratch_cleanup_sender()
+        .progress
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn enqueue_scratch_cleanup(path: PathBuf) -> ScratchCleanupReceipt {
-    let Some(sender) = scratch_cleanup_sender() else {
+    let Some(sender) = scratch_cleanup_sender().sender.as_ref() else {
         return ScratchCleanupReceipt::NotQueued(path);
     };
     let (completion, receipt) = std::sync::mpsc::sync_channel(1);
@@ -1112,7 +1122,7 @@ pub(crate) enum ScratchVolumeEnqueue {
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn enqueue_scratch_volume_query(query: ScratchVolumeQuery) -> ScratchVolumeEnqueue {
     use std::sync::mpsc::TrySendError;
-    let Some(sender) = scratch_cleanup_sender().as_ref() else {
+    let Some(sender) = scratch_cleanup_sender().sender.as_ref() else {
         return ScratchVolumeEnqueue::Unavailable;
     };
     let (reply, receiver) = std::sync::mpsc::sync_channel(1);
@@ -1127,7 +1137,7 @@ pub(crate) fn enqueue_scratch_volume_query(query: ScratchVolumeQuery) -> Scratch
 }
 
 fn enqueue_orphan_discovery(root: PathBuf) {
-    if let Some(sender) = scratch_cleanup_sender() {
+    if let Some(sender) = scratch_cleanup_sender().sender.as_ref() {
         let _ = sender.try_send(ScratchCleanupWork::Discover {
             root,
             #[cfg(test)]
@@ -1139,6 +1149,7 @@ fn enqueue_orphan_discovery(root: PathBuf) {
 #[cfg(test)]
 pub(crate) fn enqueue_orphan_discovery_observed(root: PathBuf, observer: ScratchDiscoveryObserver) {
     scratch_cleanup_sender()
+        .sender
         .as_ref()
         .expect("scratch cleanup worker")
         .send(ScratchCleanupWork::Discover {
