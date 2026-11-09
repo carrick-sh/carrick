@@ -172,7 +172,7 @@ fn resume(
     dispatcher: &SyscallDispatcher,
     memory: &mut LinearMemory,
     out: u64,
-    op: Box<RetainedIpcLockOperation>,
+    op: RetainedIpcLockOperation,
 ) -> DispatchOutcome {
     let context = dispatcher.capture_one_task_context().unwrap();
     dispatcher
@@ -299,7 +299,7 @@ fn busy_once_then_success(order: Release, lane: WaitFor) {
             }
             consume(zone, record, 1845);
             assert_eq!(
-                resume(dispatcher, &mut memory, OUT, op),
+                resume(dispatcher, &mut memory, OUT, *op),
                 DispatchOutcome::Returned { value: 0 }
             );
         });
@@ -483,7 +483,7 @@ fn pipe2_lane_contention_does_not_exhaust_the_default_executor_pool() {
                             }
                             Job::Resume(i, op) => {
                                 let outcome =
-                                    resume(dispatcher, &mut memories[i].lock().unwrap(), OUT, op);
+                                    resume(dispatcher, &mut memories[i].lock().unwrap(), OUT, *op);
                                 match outcome {
                                     DispatchOutcome::Returned { value: 0 } => {
                                         events_tx.send(Ok((i, None))).unwrap()
