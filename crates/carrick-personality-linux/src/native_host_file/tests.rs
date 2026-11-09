@@ -104,6 +104,274 @@ fn request(stage: Option<HostFileStage>) -> (Box<[u8]>, Option<HostFileOutput>, 
 }
 
 #[test]
+fn mutation_decode_and_staging_keep_the_canonical_arguments_and_wire_shape() {
+    let mut user = memory(b"source\0target\0");
+    for (number, args, op, input, path) in [
+        (
+            34,
+            [LINUX_AT_FDCWD as u64, BASE, 0o755, 0, 0, 0],
+            HostFileOp::Mkdirat,
+            b"source".as_slice(),
+            true,
+        ),
+        (
+            35,
+            [LINUX_AT_FDCWD as u64, BASE, 0x200, 0, 0, 0],
+            HostFileOp::Unlinkat,
+            b"source".as_slice(),
+            true,
+        ),
+        (
+            36,
+            [BASE, LINUX_AT_FDCWD as u64, BASE + 7, 0, 0, 0],
+            HostFileOp::Symlinkat,
+            b"source\0target".as_slice(),
+            true,
+        ),
+        (
+            37,
+            [
+                LINUX_AT_FDCWD as u64,
+                BASE,
+                LINUX_AT_FDCWD as u64,
+                BASE + 7,
+                0x400,
+                0,
+            ],
+            HostFileOp::Linkat,
+            b"source\0target".as_slice(),
+            true,
+        ),
+        (
+            38,
+            [
+                LINUX_AT_FDCWD as u64,
+                BASE,
+                LINUX_AT_FDCWD as u64,
+                BASE + 7,
+                0xff,
+                0,
+            ],
+            HostFileOp::Renameat,
+            b"source\0target".as_slice(),
+            true,
+        ),
+        (
+            276,
+            [
+                LINUX_AT_FDCWD as u64,
+                BASE,
+                LINUX_AT_FDCWD as u64,
+                BASE + 7,
+                1,
+                0,
+            ],
+            HostFileOp::Renameat,
+            b"source\0target".as_slice(),
+            true,
+        ),
+        (
+            88,
+            [LINUX_AT_FDCWD as u64, BASE, 0, 0, 0, 0],
+            HostFileOp::Utimensat,
+            b"source".as_slice(),
+            true,
+        ),
+        (
+            88,
+            [1, 0, 0, 0, 0, 0],
+            HostFileOp::SetFdTimes,
+            b"".as_slice(),
+            false,
+        ),
+        (
+            45,
+            [BASE, 123, 0, 0, 0, 0],
+            HostFileOp::Truncate,
+            b"source".as_slice(),
+            true,
+        ),
+        (
+            46,
+            [1, 123, 0, 0, 0, 0],
+            HostFileOp::Ftruncate,
+            b"".as_slice(),
+            false,
+        ),
+    ] {
+        let call = HostFileCall::decode(CanonicalNr::new(number), &args).unwrap();
+        assert!(call.uses_child_mutation_venue());
+        let (mut bytes, output, resolves_path) = request(run(call, &mut user));
+        assert_eq!(output, None);
+        assert_eq!(resolves_path, path);
+        let view = HostFileRequestView::parse(&mut bytes).unwrap();
+        assert_eq!(view.header().table, TABLE);
+        assert_eq!(view.header().op, op);
+        assert_eq!(view.input(), input);
+        assert_eq!(view.output_capacity(), 0);
+        if matches!(op, HostFileOp::Truncate | HostFileOp::Ftruncate) {
+            assert_eq!(view.header().args, [123, 0, 0, 0]);
+        }
+    }
+    assert!(
+        !HostFileCall::Write {
+            fd: 1,
+            buf: BASE,
+            count: 1
+        }
+        .uses_child_mutation_venue()
+    );
+}
+
+#[test]
+fn mutation_argument_errors_precede_copy_and_keep_source_dirfd_priority() {
+    let mut user = memory(b"\0target\0");
+    for call in [
+        HostFileCall::Unlinkat {
+            dirfd: LINUX_AT_FDCWD,
+            path: u64::MAX,
+            flags: 1,
+        },
+        HostFileCall::Linkat {
+            olddirfd: LINUX_AT_FDCWD,
+            oldpath: u64::MAX,
+            newdirfd: LINUX_AT_FDCWD,
+            newpath: u64::MAX,
+            flags: 1,
+        },
+        HostFileCall::Renameat {
+            olddirfd: LINUX_AT_FDCWD,
+            oldpath: u64::MAX,
+            newdirfd: LINUX_AT_FDCWD,
+            newpath: u64::MAX,
+            flags: 3,
+        },
+        HostFileCall::Utimensat {
+            dirfd: LINUX_AT_FDCWD,
+            path: u64::MAX,
+            times: u64::MAX,
+            flags: 1,
+        },
+        HostFileCall::Truncate {
+            path: u64::MAX,
+            length: u64::MAX,
+        },
+        HostFileCall::Ftruncate {
+            fd: 999,
+            length: u64::MAX,
+        },
+    ] {
+        assert_eq!(
+            run(call, &mut user),
+            returned(carrick_syscall_abi::LINUX_EINVAL)
+        );
+    }
+    let link = |olddirfd, oldpath| HostFileCall::Linkat {
+        olddirfd,
+        oldpath,
+        newdirfd: 999,
+        newpath: BASE + 1,
+        flags: 0,
+    };
+    assert_eq!(
+        run(link(LINUX_AT_FDCWD, BASE), &mut user),
+        returned(carrick_syscall_abi::LINUX_ENOENT)
+    );
+    assert_eq!(
+        run(link(0, BASE + 1), &mut user),
+        returned(carrick_syscall_abi::LINUX_ENOTDIR)
+    );
+    assert_eq!(
+        run(
+            HostFileCall::Utimensat {
+                dirfd: LINUX_AT_FDCWD,
+                path: BASE + 1,
+                times: BASE + 4096,
+                flags: 0,
+            },
+            &mut user
+        ),
+        Some(HostFileStage::Fault {
+            address: BASE + 4096,
+            access: Access::Read
+        })
+    );
+}
+
+#[test]
+fn mutation_pair_staging_has_a_fixed_two_path_copy_and_record_budget() {
+    struct Counted {
+        memory: Memory,
+        calls: usize,
+        copied: usize,
+    }
+    impl HostFileUser for Counted {
+        fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+            self.calls += 1;
+            self.copied += dst.len();
+            self.memory.copy_in(dst, src)
+        }
+        fn writable(&mut self, dst: u64, len: usize) -> usize {
+            self.memory.writable(dst, len)
+        }
+    }
+    for length in [1, LINUX_PATH_MAX - 1] {
+        for offset in [0, 1, 4095] {
+            let target = 3 * LINUX_PATH_MAX + offset;
+            let mut bytes = vec![0; 6 * LINUX_PATH_MAX];
+            bytes[offset..offset + length].fill(b'x');
+            bytes[target..target + length].fill(b'y');
+            let mut user = Counted {
+                memory: memory(&bytes),
+                calls: 0,
+                copied: 0,
+            };
+            let mut resolve = caller;
+            let mut namespace = NativeNamespace {
+                table: TABLE,
+                resolve: &mut resolve,
+                releases: &mut |_| 0,
+            };
+            let (mut record, output, _) = request(stage(
+                HostFileCall::Symlinkat {
+                    target: BASE + offset as u64,
+                    dirfd: LINUX_AT_FDCWD,
+                    path: BASE + target as u64,
+                },
+                &mut namespace,
+                &mut user,
+            ));
+            assert!(user.calls <= 4, "two page-bounded copies per path");
+            assert!(user.copied <= 2 * LINUX_PATH_MAX);
+            if offset == 0 {
+                assert_eq!(user.calls, 2);
+                assert_eq!(user.copied, 2 * LINUX_PATH_MAX);
+            }
+            assert_eq!(
+                HostFileRequestView::parse(&mut record)
+                    .unwrap()
+                    .input()
+                    .len(),
+                2 * length + 1
+            );
+            assert_eq!(output, None);
+        }
+    }
+    let mut user = memory(&[b'x'; LINUX_PATH_MAX]);
+    assert_eq!(
+        run(
+            HostFileCall::Mkdirat {
+                dirfd: LINUX_AT_FDCWD,
+                path: BASE,
+                mode: 0o755
+            },
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_ENAMETOOLONG)
+    );
+}
+
+#[test]
 fn in_zone_objects_never_build_a_host_request() {
     let mut user = memory(b"hello\0");
     for call in [
@@ -669,6 +937,12 @@ fn write_records_carry_the_writers_file_size_limit() {
         let view = host_file::HostFileRequestView::parse(&mut write).unwrap();
         assert_eq!(view.header().args, [limit, 0, 0, 0]);
         assert_eq!(view.input(), b"abc");
+        for op in [HostFileOp::Truncate, HostFileOp::Ftruncate] {
+            let mut resize = staged(op, [123, 0, 0, 0]);
+            stamp_write_file_size_limit::<()>(&mut resize, || Ok(limit)).unwrap();
+            let view = HostFileRequestView::parse(&mut resize).unwrap();
+            assert_eq!(view.header().args, [123, limit, 0, 0]);
+        }
     }
     let mut open = staged(HostFileOp::Openat, [0o1101, 0o644, 0, 0]);
     stamp_write_file_size_limit::<()>(&mut open, || panic!("an open has no file-size stamp"))

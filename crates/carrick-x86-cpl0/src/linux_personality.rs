@@ -1087,7 +1087,16 @@ impl Personality for LinuxPersonality {
                 frame.rax = venue.original_syscall_number();
             }
             if route == CompletionRoute::Forward
-                && let Some(stage) = crate::native_host_file::stage(&call, task, binding.cpu_slot)
+                && let Some(stage) = crate::native_host_file::stage(
+                    &call,
+                    task,
+                    binding.cpu_slot,
+                    if process.is_root_process() {
+                        carrick_core_abi::service::ServiceOrigin::Initial
+                    } else {
+                        carrick_core_abi::service::ServiceOrigin::Descendant
+                    },
+                )
             {
                 use carrick_el1_linux::native_process_runtime::{NativeResume, NativeServiceCall};
                 // SAFETY: the admitted CPU binding retains the initialized counter
