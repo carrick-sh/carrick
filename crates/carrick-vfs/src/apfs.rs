@@ -769,11 +769,12 @@ mod tests {
             ));
         }
 
-        /// The full-queue wait is a notification, not a pacing delay: a
-        /// wait armed on a stale observation returns at once, and one armed
-        /// on the current value is woken by the worker's next item.
+        /// A wait armed on an observation the worker has already moved past
+        /// returns at once instead of parking. This covers the
+        /// observed-before-enqueue ordering only; it does not exercise a
+        /// notification (see `full_queue_wait_is_woken_by_worker_progress`).
         #[test]
-        fn full_queue_wait_wakes_on_worker_progress() {
+        fn wait_returns_immediately_when_progress_already_advanced() {
             use crate::fs_backend::host::{
                 ScratchVolumeEnqueue, enqueue_scratch_volume_query, scratch_worker_progress,
                 wait_scratch_worker_progress_after,
@@ -875,6 +876,78 @@ mod tests {
                     .recv_timeout(Duration::from_secs(60))
                     .unwrap()
                     .unwrap();
+            }
+        }
+
+        /// The full-queue wait is a notification, not a pacing delay. The
+        /// no-progress bound is 60 s, so the retry poll clamps to 250 ms;
+        /// with the queue full of gated items the caller parks, and the
+        /// worker's progress notification alone must bring it back. The
+        /// verdict is then complete well inside one poll period after the
+        /// release. A worker that bumped progress without notifying would
+        /// only be noticed at the 250 ms poll.
+        #[test]
+        fn full_queue_wait_is_woken_by_worker_progress() {
+            use std::sync::mpsc::{SyncSender, sync_channel};
+
+            /// Signals the first clock reading after the queue was observed
+            /// full: the last thing the caller does before it parks.
+            struct EnrolSource {
+                real: RealVerdictSource,
+                full: Arc<AtomicBool>,
+                enrolled: SyncSender<()>,
+            }
+            impl VerdictSource for EnrolSource {
+                fn now(&self) -> Duration {
+                    if self.full.swap(false, Ordering::SeqCst) {
+                        let _ = self.enrolled.try_send(());
+                    }
+                    self.real.now()
+                }
+                fn progress(&self) -> u64 {
+                    self.real.progress()
+                }
+            }
+
+            let guard = Duration::from_secs(60);
+            let (mut releases, receivers) = fill_worker_queue(guard);
+            let full = Arc::new(AtomicBool::new(false));
+            let (enrolled, parked) = sync_channel::<()>(1);
+            let source = EnrolSource {
+                real: RealVerdictSource::new(),
+                full: Arc::clone(&full),
+                enrolled,
+            };
+            let (done, answer) = sync_channel(1);
+            let caller = std::thread::spawn(move || {
+                let verdict = scratch_volume_verdict_observed(
+                    Duration::from_secs(60),
+                    || Ok(true),
+                    move || full.store(true, Ordering::SeqCst),
+                    &source,
+                );
+                done.send(verdict).unwrap();
+            });
+            parked
+                .recv_timeout(guard)
+                .expect("caller never observed a full queue");
+            let released = std::time::Instant::now();
+            for release in releases.drain(..) {
+                release.send(()).unwrap();
+            }
+            // The caller's own item queues behind the drained ones and is
+            // answered at once; only a missed wake costs the 250 ms poll.
+            let verdict = answer.recv_timeout(guard).expect("verdict never returned");
+            let elapsed = released.elapsed();
+            caller.join().unwrap();
+            assert!(verdict);
+            assert!(
+                elapsed < Duration::from_millis(100),
+                "verdict took {elapsed:?} after release: the parked caller was not woken by \
+                 worker progress"
+            );
+            for receiver in receivers {
+                receiver.recv_timeout(guard).unwrap().unwrap();
             }
         }
 
