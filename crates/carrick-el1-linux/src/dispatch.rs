@@ -4121,6 +4121,12 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 carrick_guest_arch::UserVa::new(address),
                 &bytes,
                 SyscallResult::new(0),
+                (
+                    self.counters,
+                    self.frame.canonical_ordinal(),
+                    core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0)),
+                    self.frame.arm_frame_ref().map_or(0, |frame| frame.elr),
+                ),
             );
         }
         result
