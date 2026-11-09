@@ -58,6 +58,17 @@ mod test_support {
         }
     }
 
+    static EDIT_PARK_PUBLISHED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    pub fn publish_edit_park() {
+        EDIT_PARK_PUBLISHED.store(true, Ordering::Release);
+    }
+
+    pub fn take_edit_park() -> bool {
+        EDIT_PARK_PUBLISHED.swap(false, Ordering::AcqRel)
+    }
+
     static ANONYMOUS_WAIT_HANDBACKS: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
     static METADATA_ON_REPROBE: core::sync::atomic::AtomicBool =

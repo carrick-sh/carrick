@@ -14,6 +14,12 @@ could be released by either physical CPU's scheduler. A wake placed on
 CPU0's queue leaves CPU1's queue empty, which is valid. Discarding the wake
 effects also loses the required reschedule IPI.
 
+A first correction exposed an earlier edge in the same hook: CPU1 can
+consume the synthetic Busy before CPU0 publishes its wait (2/60 runs returned
+fixture exit 9). A test-image publication latch now admits the holder release
+only after `EditWaitOutcome::Parked`. It orders the synthetic actor; it does
+not delay or serialize production execution.
+
 The correction reuses `native_process::release`, which already delivers the
 shared scheduler's owned notification effects through
 `carrick_el1::sched::object_wait::deliver_host_completion`. No queue, lock,
