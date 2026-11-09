@@ -2814,7 +2814,6 @@ pub const LINUX_EDESTADDRREQ: LinuxErrno = LinuxErrno::new(89);
 pub const LINUX_EMSGSIZE: LinuxErrno = LinuxErrno::new(90);
 pub const LINUX_EPROTOTYPE: LinuxErrno = LinuxErrno::new(91);
 pub const LINUX_EPROTONOSUPPORT: LinuxErrno = LinuxErrno::new(93);
-pub const LINUX_EOPNOTSUPP: LinuxErrno = LinuxErrno::new(95); // ≡ ENOTSUP
 pub const LINUX_EPFNOSUPPORT: LinuxErrno = LinuxErrno::new(96);
 pub const LINUX_EADDRINUSE: LinuxErrno = LinuxErrno::new(98);
 pub const LINUX_EADDRNOTAVAIL: LinuxErrno = LinuxErrno::new(99);
@@ -3727,7 +3726,6 @@ pub use carrick_syscall_abi::{
 };
 pub const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 pub const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
-pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
 /// `TFD_TIMER_CANCEL_ON_SET` (timerfd_settime): cancel a CLOCK_REALTIME timer if
 /// the realtime clock is discontinuously reset. carrick's virtual clock never
 /// triggers such a discontinuity, so this is accepted and ignored — but it IS a
@@ -3887,17 +3885,6 @@ pub const LINUX_SIG_UNBLOCK: u64 = 1;
 pub const LINUX_SIG_SETMASK: u64 = 2;
 pub const LINUX_BOOTSTRAP_PID: u64 = 1;
 pub const LINUX_MINSIGSTKSZ: u64 = 2048;
-pub const LINUX_CLOCK_REALTIME: u64 = 0;
-pub const LINUX_CLOCK_MONOTONIC: u64 = 1;
-pub const LINUX_CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
-pub const LINUX_CLOCK_THREAD_CPUTIME_ID: u64 = 3;
-pub const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
-pub const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
-pub const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
-pub const LINUX_CLOCK_BOOTTIME: u64 = 7;
-pub const LINUX_CLOCK_REALTIME_ALARM: u64 = 8;
-pub const LINUX_CLOCK_BOOTTIME_ALARM: u64 = 9;
-pub const LINUX_CLOCK_TAI: u64 = 11;
 pub const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
 pub const LINUX_ITIMER_REAL: u64 = 0;
 pub const LINUX_ITIMER_VIRTUAL: u64 = 1;

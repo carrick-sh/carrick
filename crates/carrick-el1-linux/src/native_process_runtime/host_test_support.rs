@@ -537,6 +537,14 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             carrick_guest_arch::CounterTick::new(1000 + nanos),
         ))
     }
+    /// One tick per nanosecond, matching `signal_deadline` above.
+    fn signal_frequency(
+        &mut self,
+    ) -> Result<carrick_guest_arch::CounterFrequency, NativeProcessError> {
+        Ok(carrick_guest_arch::CounterFrequency::new(
+            NonZeroU64::new(1_000_000_000).ok_or(NativeProcessError::Invalid)?,
+        ))
+    }
     fn arm_signal_timer(
         &mut self,
         _: carrick_guest_arch::Deadline,

@@ -35,8 +35,8 @@ pub use errno::{
     LINUX_E2BIG, LINUX_EACCES, LINUX_EAGAIN, LINUX_EBADF, LINUX_ECHILD, LINUX_EEXIST, LINUX_EFAULT,
     LINUX_EFBIG, LINUX_EIDRM, LINUX_EINTR, LINUX_EINVAL, LINUX_EIO, LINUX_EMFILE,
     LINUX_ENAMETOOLONG, LINUX_ENODEV, LINUX_ENOENT, LINUX_ENOMEM, LINUX_ENOMSG, LINUX_ENOSPC,
-    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTTY, LINUX_EPERM, LINUX_ERANGE, LINUX_ESPIPE,
-    LINUX_ESRCH, LINUX_ETIMEDOUT, LinuxErrno,
+    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTTY, LINUX_EOPNOTSUPP, LINUX_EPERM, LINUX_ERANGE,
+    LINUX_ESPIPE, LINUX_ESRCH, LINUX_ETIMEDOUT, LinuxErrno,
 };
 mod signal;
 pub use signal::{
@@ -138,6 +138,22 @@ pub mod nr {
 /// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
 /// From include/uapi/linux/sched.h. Value 4 is intentionally skipped
 /// (reserved for the never-merged SCHED_ISO).
+/// Linux `clockid_t` values (`include/uapi/linux/time.h`). Shared by the
+/// host dispatcher and the ring sleep owner so both classify one clock set.
+pub const LINUX_CLOCK_REALTIME: u64 = 0;
+pub const LINUX_CLOCK_MONOTONIC: u64 = 1;
+pub const LINUX_CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+pub const LINUX_CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+pub const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
+pub const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
+pub const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
+pub const LINUX_CLOCK_BOOTTIME: u64 = 7;
+pub const LINUX_CLOCK_REALTIME_ALARM: u64 = 8;
+pub const LINUX_CLOCK_BOOTTIME_ALARM: u64 = 9;
+pub const LINUX_CLOCK_TAI: u64 = 11;
+/// `clock_nanosleep`/`timer_settime` absolute-deadline flag.
+pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
+
 pub const LINUX_SCHED_OTHER: i32 = 0; // a.k.a. SCHED_NORMAL
 pub const LINUX_SCHED_FIFO: i32 = 1;
 pub const LINUX_SCHED_RR: i32 = 2;
