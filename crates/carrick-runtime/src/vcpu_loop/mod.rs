@@ -2043,7 +2043,7 @@ where
                 self.resume_ipc_copyout(kernel, engine, pending)
             }
             binding::OwnedSyscallResume::IpcLock(pending) => {
-                self.resume_ipc_lock_operation(kernel, engine, pending, host_wait)
+                self.resume_ipc_lock_operation(kernel, engine, *pending, host_wait)
             }
         }
     }
@@ -2056,7 +2056,7 @@ where
         &mut self,
         kernel: &Kernel,
         engine: &mut E,
-        pending: Box<carrick_kernel::kernel::continuation::ipc_lock::RetainedIpcLockOperation>,
+        pending: carrick_kernel::kernel::continuation::ipc_lock::RetainedIpcLockOperation,
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         let request = self
@@ -2091,7 +2091,7 @@ where
         let result = kernel.dispatcher.resume_ipc_lock_operation(
             &context,
             request,
-            *pending,
+            pending,
             engine,
             &kernel.reporter,
             Some(thread),

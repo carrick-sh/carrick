@@ -1236,7 +1236,7 @@ impl<'a> FsView<'a> {
             };
             let object = match creation {
                 crate::el1_ipc::PipeCreation::Created(object) => object,
-                crate::el1_ipc::PipeCreation::Contended(create) => {
+                crate::el1_ipc::PipeCreation::Retained(create) => {
                     // No output permit or descriptor survives a park.
                     drop(out);
                     return Ok(DispatchOutcome::IpcLockContended(Box::new(

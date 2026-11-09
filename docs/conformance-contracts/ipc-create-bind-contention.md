@@ -27,7 +27,7 @@ timer expiry). Before this slice `HostIpc::bind_waits` waited with the
 short-section `HostLockWait`, which spins and never refuses.
 
 Now `HostIpc::begin_pipe` binds with `IpcCreateLockWait`, which refuses at
-once. A refused lane returns `PipeCreation::Contended(PendingPipeCreate)`:
+once. A refused lane returns `PipeCreation::Retained(PendingPipeCreate)`:
 the unpublished object plus the lanes already bound. `pipe2` drops its
 output permit and returns `DispatchOutcome::IpcLockContended` carrying the
 validated arguments, pipe id and pending create.
