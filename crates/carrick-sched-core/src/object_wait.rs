@@ -2057,7 +2057,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// publishes it at the host boundary the caller must owe.
     pub(super) fn defer_completion_handback(&self, transfer: HostTransfer<'_, C>) {
         // Initialization has no resource dependency and cannot wait on this
-        // queue (the interruption path below makes the same call).
+        // queue (the object-wait interruption path makes the same call).
         while !self.completion_handbacks.initialize() {
             core::hint::spin_loop();
         }
