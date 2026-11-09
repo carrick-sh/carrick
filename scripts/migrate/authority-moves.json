@@ -97,5 +97,11 @@
       "issue": 1845
     }
   ],
+  "authority_debt_admissions": [
+    {
+      "owner": "carrick_runtime::deadline_driver::DeadlineDriver::start",
+      "issue": 1977
+    }
+  ],
   "terminal_custody": []
 }
