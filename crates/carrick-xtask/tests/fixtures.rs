@@ -3729,12 +3729,27 @@ fn built_row() -> serde_json::Value {
 
 /// Commit a new probe source and its inventory row on the checkout.
 fn commit_added_probe(root: &Path, name: &str, row: serde_json::Value) -> String {
+    commit_added_probe_source(
+        root,
+        name,
+        row,
+        format!("// added probe {name}\n").as_bytes(),
+    )
+}
+
+/// [`commit_added_probe`] with the probe's source text.
+fn commit_added_probe_source(
+    root: &Path,
+    name: &str,
+    row: serde_json::Value,
+    source: &[u8],
+) -> String {
     let inventory = fs::read_to_string(root.join(INVENTORY)).unwrap();
     write(root, INVENTORY, &inventory_with_row(&inventory, name, row));
     write(
         root,
         &format!("conformance-probes/src/bin/{name}.rs"),
-        format!("// added probe {name}\n").as_bytes(),
+        source,
     );
     git(root, &["add", "--", "conformance-probes"]);
     git(root, &["commit", "-qm", "add probe"]);
@@ -4173,4 +4188,131 @@ fn pr_1935_shape_is_admissible() {
         ),
         InputDifference::Other
     );
+}
+
+/// The reviewer's #1986 reproduction: the assembler reads `.incbin` files
+/// that rustc's dep-info never lists, so the dep-info admission check cannot
+/// see them. The production builder refuses such a probe before building or
+/// publishing anything; before the fix it built and published the set.
+#[test]
+fn added_probe_with_assembler_file_read_is_refused_before_building() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.repo.path();
+    // Outside every fixture input, as in the reviewer's reproduction.
+    commit(root, "unlisted-payload.bin", b"payload\n", "payload");
+    let probe = br#"#![no_main]
+core::arch::global_asm!(
+    ".pushsection .rodata", ".global review_payload", "review_payload:",
+    ".incbin \"../unlisted-payload.bin\"", ".popsection",
+);
+unsafe extern "C" {
+    static review_payload: u8;
+}
+#[unsafe(no_mangle)]
+extern "C" fn main() -> i32 {
+    unsafe { core::ptr::read_volatile(&review_payload) as i32 }
+}
+"#;
+    let sha = commit_added_probe_source(root, "incbinprobe", built_row(), probe);
+    let output = CanonicalTempDir::new();
+    match candidate_probes::build(root, &f.path, &sha, output.path()) {
+        Ok(CandidateBuild::Refused(error)) => assert!(
+            error.to_string().contains(
+                "added probe conformance-probes/src/bin/incbinprobe.rs contains `incbin`"
+            ),
+            "{error}"
+        ),
+        other => panic!("assembler file read was not refused: {other:?}"),
+    }
+    assert_eq!(fs::read_dir(output.path()).unwrap().count(), 0);
+    assert!(!root.join(GuestTarget::Gnu.triple()).exists());
+    f.rejected("fixture input identity mismatch");
+}
+
+/// Ordinary inline assembly and an ordinary added probe still plan a build.
+#[test]
+fn added_probe_with_ordinary_asm_is_still_admitted() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.repo.path();
+    let probe = b"fn main() {\n    let x: u64;\n    unsafe { core::arch::asm!(\"mov {0}, #1\", out(reg) x) };\n    println!(\"{x}\\n\");\n    let _ = unsafe { libc::link(c\"a\".as_ptr(), c\"b\".as_ptr()) };\n}\n";
+    commit_added_probe_source(root, "asmprobe", built_row(), probe);
+    commit_added_probe(root, "plainprobe", built_row());
+    let CandidateBuild::Build(plan) = candidate_probes::plan(root, &f.path).unwrap() else {
+        panic!("ordinary added probes were not planned");
+    };
+    let names: Vec<&str> = plan.probes.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["asmprobe", "plainprobe"]);
+}
+
+/// The scan's spellings: each refused form, and every probe main already
+/// carries passes (the scan admits today's probes if they were added).
+#[test]
+fn unlisted_reader_scan_refuses_assembler_and_linker_reads() {
+    for (source, token) in [
+        (r#"global_asm!(".incbin \"x\"");"#, "incbin"),
+        (r#"asm!(".INCBIN \"x\"");"#, "incbin"),
+        (r#"asm!(".Include \"x.s\"");"#, ".include"),
+        (r#"asm!(concat!(".inc", "bin \"x\""));"#, "concat"),
+        (
+            r#"use core::concat as c; asm!(c!(".inc", "bin"));"#,
+            "concat",
+        ),
+        (r#"asm!("\x2einclude \"x\"");"#, "\\x"),
+        (r#"asm!("\u{2e}include");"#, "\\u{"),
+        ("asm!(\".inc\\\nlude\");", "\\\n"),
+        (r#"asm!(".macro m a\n .\\a \"x\"\n.endm");"#, "\\\\"),
+        (r#"asm!(".altmacro");"#, ".altmacro"),
+        (r#"asm!(".irpc c,x");"#, ".irp"),
+        (r#"naked_asm!(".{s} \"x\"", s = sym f);"#, ".{"),
+        (
+            r#"#[link(name = "x", kind = "static")] extern "C" {}"#,
+            "link(",
+        ),
+        (
+            r#"#[cfg_attr(all(), link (name = "x"))] extern "C" {}"#,
+            "link(",
+        ),
+        (r#"asm!("nop"); let s = "\x2e";"#, "\\x"),
+    ] {
+        assert_eq!(
+            candidate_probes::unlisted_reader(source),
+            Some(token),
+            "{source}"
+        );
+    }
+    for source in [
+        r#"asm!("mov {0}, #1", out(reg) x);"#,
+        r#"#[link_name = "__sigsetjmp"] fn f(); libc::link(a, b); fs::hard_link(a, b);"#,
+        r#"let s = concat!("a", "b"); println!("\x41");"#,
+        r#"asm!("nop"); let elf = b"\x7fELF\u{0}";"#,
+        r#"// a hard link (to a symlink) and link(86)"#,
+        r#"include_bytes!("x.bin");"#,
+    ] {
+        assert_eq!(candidate_probes::unlisted_reader(source), None, "{source}");
+    }
+    let probes = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance-probes/src/bin");
+    let mut scanned = 0;
+    for entry in fs::read_dir(probes).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            let text = fs::read_to_string(&path).unwrap();
+            // Assembler macros are refused even without a file read.
+            assert!(
+                matches!(
+                    candidate_probes::unlisted_reader(&text),
+                    None | Some(".macro")
+                ),
+                "{}",
+                path.display()
+            );
+            scanned += 1;
+        }
+    }
+    assert!(scanned > 100, "scanned only {scanned} probes");
 }

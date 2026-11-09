@@ -94,7 +94,12 @@ differ only by:
 The predicate is `fixtures::candidate_probes::classify_inputs`. A dedicated
 runner row goes in `crates/carrick-xtask/src/probe_runners.rs`, which is not
 a fixture input. The added probe may read, at compile time, only its own
-source and unchanged bundle inputs (such as `src/lib.rs`).
+source and unchanged bundle inputs (such as `src/lib.rs`). Because rustc's
+dep-info does not list files the assembler or linker reads, an added probe
+whose source contains an assembler file read (`.incbin`, `.include`), a
+`#[link(...)]` attribute, or, in a source using `asm`, a spelling that could
+hide one (`concat!`, escapes, assembler macros) is refused before anything
+is built (`candidate_probes::unlisted_reader`).
 
 Every other fixture-input change still needs the exception and is refused by
 the gate with its input identity message. That covers edits to or removals

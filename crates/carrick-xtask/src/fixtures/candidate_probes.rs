@@ -325,8 +325,9 @@ impl BuildPlan {
 pub enum CandidateBuild<T> {
     /// Fixture inputs equal the bundle's; the bundle serves the checkout.
     Equal,
-    /// A difference other than added probes: the receiver reports the input
-    /// identity refusal, so nothing is built (the error is that refusal).
+    /// A difference other than added probes, or an added probe that could
+    /// read unlisted files (see [`unlisted_reader`]): nothing is built, and
+    /// the receiver reports the input identity refusal (the error says why).
     Refused(super::FixturesError),
     /// The added probes to build, or the set they were built into.
     Build(T),
@@ -363,16 +364,99 @@ pub fn plan(root: &Path, base: &Path) -> Result<CandidateBuild<BuildPlan>> {
         base_inventory.as_bytes(),
         &current_inventory,
     ) {
-        InputDifference::AddedProbes(probes) => Ok(CandidateBuild::Build(BuildPlan {
-            base: manifest,
-            base_inventory,
-            probes,
-        })),
+        InputDifference::AddedProbes(probes) => {
+            for probe in &probes {
+                let text = fs::read(safe_path(root, &probe.name.source())?)?;
+                if let Some(token) = unlisted_reader(&String::from_utf8_lossy(&text)) {
+                    return Ok(CandidateBuild::Refused(fail(format!(
+                        "added probe {} contains `{token}`, which can read files the compiler's \
+                         dep-info does not list; it cannot be built from candidate code",
+                        probe.name.source()
+                    ))));
+                }
+            }
+            Ok(CandidateBuild::Build(BuildPlan {
+                base: manifest,
+                base_inventory,
+                probes,
+            }))
+        }
         InputDifference::None => Ok(CandidateBuild::Equal),
         InputDifference::Other => Ok(CandidateBuild::Refused(super::identity_mismatch(
             &manifest, &current,
         )?)),
     }
+}
+
+/// The first token in an added probe's source that could make the toolchain
+/// read a file rustc's dep-info does not record, or `None`.
+///
+/// [`build`] admits a compiler input only if dep-info lists it, but the
+/// assembler (`.incbin`, `.include` inside `asm!`, `global_asm!` or
+/// `naked_asm!`) and the linker (`#[link(...)]`) read files dep-info never
+/// names. Rust parsing is out of reach here, so the check fails closed on
+/// text, case-insensitively, before anything is built:
+/// - `incbin` and `.include` anywhere, and a `link(` attribute (`link`
+///   directly after `[`, `,` or `(`, as in `#[link(` or `cfg_attr(.., link(`);
+/// - in a source that mentions `asm` at all, anything that could spell a
+///   directive the scan does not see: `concat`, `stringify`, an escaped
+///   backslash (`\\`), a `\x` or `\u{..}` escape of a printable character,
+///   a string line continuation, a template placeholder right after a dot
+///   (`.{`), and assembler macros (`.macro`, `.altmacro`, `.irp`).
+///
+/// Files the compiler reads through `include_str!`, `include_bytes!`,
+/// `include!` or `#[path]` are in dep-info, which [`build`] checks.
+pub fn unlisted_reader(source: &str) -> Option<&'static str> {
+    let text = source.to_ascii_lowercase();
+    for token in ["incbin", ".include"] {
+        if text.contains(token) {
+            return Some(token);
+        }
+    }
+    let bytes = text.as_bytes();
+    for (at, _) in text.match_indices("link") {
+        let before = bytes[..at].iter().rev().find(|b| !b.is_ascii_whitespace());
+        let after = bytes[at + 4..].iter().find(|b| !b.is_ascii_whitespace());
+        if matches!(before, Some(b'[' | b',' | b'(')) && after == Some(&b'(') {
+            return Some("link(");
+        }
+    }
+    if !text.contains("asm") {
+        return None;
+    }
+    for token in [
+        "concat",
+        "stringify",
+        "\\\\",
+        "\\\n",
+        "\\\r",
+        ".{",
+        ".macro",
+        ".altmacro",
+        ".irp",
+    ] {
+        if text.contains(token) {
+            return Some(token);
+        }
+    }
+    let printable = |digits: &str| {
+        u32::from_str_radix(digits, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .is_none_or(|c| c.is_ascii_graphic())
+    };
+    for (at, _) in text.match_indices("\\x") {
+        if printable(text.get(at + 2..at + 4).unwrap_or("")) {
+            return Some("\\x");
+        }
+    }
+    for (at, _) in text.match_indices("\\u{") {
+        let digits = text[at + 3..].split('}').next().unwrap_or("");
+        if printable(&digits.replace('_', "")) {
+            return Some("\\u{");
+        }
+    }
+    None
 }
 
 /// Build the added probes of the checkout at `root` (exactly `sha`) with the
