@@ -974,7 +974,7 @@ enum NativeExecStage {
 /// The EL0 data-abort syndrome a staging copy would have taken: a read or a
 /// write translation fault, or a write permission fault on a present page
 /// (COW), so the ordinary owner fault selector resolves it exactly.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn native_stage_fault_syndrome(fault: carrick_guest_arch::FaultInfo) -> u64 {
     const DATA_ABORT_EL0: u64 = 0x24 << 26;
     const WRITE: u64 = 1 << 6;
@@ -995,7 +995,7 @@ fn native_stage_fault_syndrome(fault: carrick_guest_arch::FaultInfo) -> u64 {
 
 /// A staged host-file request, boxed so the service exit frame (a retained
 /// EL1 stack chain) does not carry it by value.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 struct StagedHostFile {
     record: alloc::boxed::Box<[u8]>,
     output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
@@ -1027,7 +1027,7 @@ pub(super) fn native_entropy_stage(
     )
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 enum NativeServiceStage {
     Exec(alloc::boxed::Box<[u8]>),
     HostFile(alloc::boxed::Box<StagedHostFile>),
@@ -1075,7 +1075,7 @@ pub fn stage_native_host_file<V: file::MemoryValidator>(
 }
 
 /// The owner fault a host-file stage needs supplied before it can retry.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn native_host_file_fault(
     address: u64,
     access: carrick_guest_arch::Access,
@@ -1254,6 +1254,337 @@ fn native_host_file_return(
     result
 }
 
+/// A staged native service request, ready for its owner to publish.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) struct NativeServiceBegin {
+    operation: Option<carrick_core_abi::service::ServiceOperation>,
+    exec_payload: Option<alloc::boxed::Box<[u8]>>,
+    host_file: Option<alloc::boxed::Box<StagedHostFile>>,
+    entropy: Option<(
+        carrick_guest_arch::UserVa,
+        usize,
+        crate::native_process_runtime::NativeEntropyFlags,
+        carrick_guest_arch::GuestLen,
+    )>,
+    retry_exec_stage: bool,
+    stage_prefix: Option<alloc::boxed::Box<[u8]>>,
+    service_wait: Option<carrick_core_abi::PortalOwnerWait>,
+}
+
+/// What staging decided for one owned native syscall or exception exit.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) enum NativeServiceDecision {
+    /// The call keeps its existing route.
+    Decline,
+    /// The ring answered the call with this value; no carrier request.
+    Reply(i64),
+    /// The ring finished the exit with this action; no carrier request.
+    Action(Action),
+    /// Publish this request to the carrier.
+    Begin(alloc::boxed::Box<NativeServiceBegin>),
+}
+
+/// Decide what an owned native exit publishes. `host_file` stages the
+/// host-file venue in the caller's ring namespace (None keeps the call's
+/// route); the bare-metal wrapper supplies the guest IPC venue and hardware
+/// validator, host witnesses their own, but everything after staging is this
+/// one body.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
+pub(super) fn native_service_decision(
+    frame: &mut TrapFrame,
+    task: &CurrentTask,
+    action: Action,
+    wait: Option<carrick_core_abi::PortalOwnerWait>,
+    counters: &Counters,
+    owner: impl Fn() -> super::native_process_runtime::NativeThreadGroupOwner,
+    host_file: impl FnOnce(
+        &TrapFrame,
+    ) -> Option<carrick_personality_linux::native_host_file::HostFileStage>,
+) -> NativeServiceDecision {
+    let child = || owner() == super::native_process_runtime::NativeThreadGroupOwner::ForkChild;
+    let mut service_wait = wait;
+    let staged = match native_exec_stage(frame, task) {
+        Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
+        Some(NativeExecStage::Failed(errno)) => NativeServiceStage::Return(errno.guest_retval()),
+        Some(NativeExecStage::Fault(fault)) => NativeServiceStage::Fault {
+            fault,
+            prefix: None,
+        },
+        // Only an unserved call crosses. A call served with owed host
+        // work first settles that work (CarrierWork) and is replayed;
+        // staging it here would pre-empt the settlement forever.
+        None if action != Action::Forward => NativeServiceStage::Operation,
+        None if frame.x[8] == 278 => {
+            let (address, capacity, flags, requested) = native_entropy_stage(frame);
+            NativeServiceStage::Entropy {
+                address,
+                capacity,
+                flags,
+                requested,
+            }
+        }
+        None => match host_file(frame) {
+            Some(carrick_personality_linux::native_host_file::HostFileStage::Request {
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+            }) => NativeServiceStage::HostFile(alloc::boxed::Box::new(StagedHostFile {
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+            })),
+            Some(carrick_personality_linux::native_host_file::HostFileStage::Returned(result)) => {
+                NativeServiceStage::Return(native_host_file_return(
+                    result.raw(),
+                    carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    counters,
+                    child,
+                ))
+            }
+            Some(carrick_personality_linux::native_host_file::HostFileStage::InRingReply {
+                output,
+                bytes,
+            }) => {
+                // Staging proved the destination writable; the ring
+                // copies its own answer.
+                let mut copy = file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                };
+                NativeServiceStage::Return(
+                    if file::UserCopy::copy_out(&mut copy, output.address, &bytes) {
+                        0
+                    } else {
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+                    },
+                )
+            }
+            Some(carrick_personality_linux::native_host_file::HostFileStage::Fault {
+                address,
+                access,
+            }) => NativeServiceStage::Fault {
+                fault: native_host_file_fault(address, access),
+                prefix: None,
+            },
+            Some(
+                carrick_personality_linux::native_host_file::HostFileStage::FaultAfterPrefix {
+                    address,
+                    prefix,
+                },
+            ) => NativeServiceStage::Fault {
+                fault: native_host_file_fault(address, carrick_guest_arch::Access::Read),
+                prefix: Some(prefix),
+            },
+            Some(carrick_personality_linux::native_host_file::HostFileStage::InRing) => {
+                // An in-zone object the ring does not serve yet never
+                // exits to the host: counted ENOSYS here, in ring.
+                NativeServiceStage::Return(native_host_file_return(
+                    carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+                    carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    counters,
+                    child,
+                ))
+            }
+            None => NativeServiceStage::Operation,
+        },
+    };
+    let (operation, exec_payload, host_file, entropy, retry_exec_stage, stage_prefix) = match staged
+    {
+        NativeServiceStage::Exec(payload) => (None, Some(payload), None, None, false, None),
+        NativeServiceStage::HostFile(staged) => (None, None, Some(staged), None, false, None),
+        NativeServiceStage::Entropy {
+            address,
+            capacity,
+            flags,
+            requested,
+        } => (
+            None,
+            None,
+            None,
+            Some((address, capacity, flags, requested)),
+            false,
+            None,
+        ),
+        NativeServiceStage::Return(result) => {
+            return NativeServiceDecision::Reply(result);
+        }
+        NativeServiceStage::Fault { fault, prefix } => {
+            // `AT S1E0R` reports an inherited sparse page without taking
+            // an EL0 abort. Feed that exact read through the ordinary
+            // owner fault selector, retaining the syscall frame for retry.
+            let mut synthetic = *frame;
+            synthetic.esr = native_stage_fault_syndrome(fault);
+            synthetic.far = fault.address.raw();
+            let mut fault_wait = None;
+            match super::cow_resolver::dispatch_fault(&mut synthetic, counters, &mut fault_wait) {
+                Action::Served => {
+                    // Staging made no descriptor/IPC effect. Re-enter the
+                    // ring at the same SVC rather than staging InRing into
+                    // ENOSYS after the owner resolved its destination.
+                    frame.elr = frame.elr.wrapping_sub(4);
+                    return NativeServiceDecision::Action(Action::Served);
+                }
+                Action::Forward | Action::ServedWithWork => {
+                    service_wait = fault_wait;
+                    (
+                        Some(carrick_core_abi::service::ServiceOperation::Fault(fault)),
+                        None,
+                        None,
+                        None,
+                        true,
+                        prefix,
+                    )
+                }
+                Action::Idle | Action::HostCustody => {
+                    invalid_completion(NativeInvariant::EntryBinding)
+                }
+            }
+        }
+        NativeServiceStage::Operation => {
+            match native_unstaged_exit(frame, &task.linux, action, || owner(), counters) {
+                NativeUnstagedExit::Refused(refused) => {
+                    return NativeServiceDecision::Action(refused);
+                }
+                NativeUnstagedExit::Operation(operation) => {
+                    (Some(operation), None, None, None, false, None)
+                }
+                NativeUnstagedExit::Declined => return NativeServiceDecision::Decline,
+            }
+        }
+    };
+    NativeServiceDecision::Begin(alloc::boxed::Box::new(NativeServiceBegin {
+        operation,
+        exec_payload,
+        host_file,
+        entropy,
+        retry_exec_stage,
+        stage_prefix,
+        service_wait,
+    }))
+}
+
+/// Begin the staged request on the native process entry and settle its exit.
+/// `service_counters` outlives every continuation of the request.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
+pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>(
+    process: &mut super::native_process_runtime::NativeProcessEntry<
+        '_,
+        'static,
+        super::aarch64_process::Mm,
+        carrick_el1_abi::Aarch64ParkedContext,
+        super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    >,
+    ordinal: u64,
+    begin: alloc::boxed::Box<NativeServiceBegin>,
+    fault_sequence: Option<core::num::NonZeroU64>,
+    counters: &Counters,
+    service_counters: &'static Counters,
+    exec_table: impl FnOnce() -> Option<[u64; 3]>,
+) -> (
+    Result<
+        super::native_process_runtime::NativeResume,
+        super::native_process_runtime::NativeProcessError,
+    >,
+    super::native_process_runtime::NativeServicePhase,
+) {
+    let NativeServiceBegin {
+        operation,
+        exec_payload,
+        host_file,
+        entropy,
+        retry_exec_stage,
+        stage_prefix,
+        service_wait,
+    } = *begin;
+    let exit = if matches!(
+        operation,
+        Some(carrick_core_abi::service::ServiceOperation::CarrierWork { .. })
+    ) {
+        super::native_process_runtime::NativeServiceExit::CarrierWork
+    } else {
+        super::native_process_runtime::NativeServiceExit::Bridge
+    };
+    let result = if let Some(payload) = exec_payload {
+        if service_wait.is_some() {
+            Err(super::native_process_runtime::NativeProcessError::Quarantined)
+        } else {
+            // The exec service resolves a descriptor `execveat`
+            // names in the caller's own ring table (#1530), read
+            // through the stable owned-table authority: an unrelated
+            // table-map update must not read as "no table" (ENOSYS).
+            let table = exec_table();
+            process.begin_exec_service(
+                payload,
+                table,
+                crate::native_process_runtime::NativeServiceCall::new(
+                    carrick_guest_arch::NativeOrdinal::new(ordinal),
+                    counters,
+                ),
+            )
+        }
+    } else if let Some((address, capacity, flags, requested)) = entropy {
+        process.begin_entropy_service(address, capacity, flags, requested)
+    } else if let Some(staged) = host_file {
+        if service_wait.is_some() {
+            Err(super::native_process_runtime::NativeProcessError::Quarantined)
+        } else {
+            let StagedHostFile {
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+            } = *staged;
+            process.begin_host_file_service(
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+                crate::native_process_runtime::NativeServiceCall::new(
+                    carrick_guest_arch::NativeOrdinal::new(ordinal),
+                    service_counters,
+                ),
+            )
+        }
+    } else if retry_exec_stage {
+        match operation {
+            Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) => process
+                .begin_exec_stage_fault_service(
+                    fault,
+                    fault_sequence,
+                    service_wait,
+                    stage_prefix.map(|record| {
+                        (
+                            record,
+                            crate::native_process_runtime::NativeServiceCall::new(
+                                carrick_guest_arch::NativeOrdinal::new(ordinal),
+                                service_counters,
+                            ),
+                        )
+                    }),
+                ),
+            _ => Err(super::native_process_runtime::NativeProcessError::Quarantined),
+        }
+    } else if let Some(operation) = operation {
+        if let Some(wait) = service_wait {
+            process.begin_owner_service_wait(operation, wait)
+        } else {
+            process.begin_service(operation, fault_sequence)
+        }
+    } else {
+        Err(super::native_process_runtime::NativeProcessError::Quarantined)
+    };
+    let result = process.settle_service_exit(result, exit);
+    (result, process.native_service_phase())
+}
+
 /// Capture the exception while its native owner still owns the trap words.
 /// The host receives a selector only after this continuation has parked.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -1304,184 +1635,42 @@ fn arm_native_service_exit(
     if refuse_traced_native_exec(frame, task, counters, child) {
         return Some(arm_signal_user_return(frame));
     }
-    let mut service_wait = wait;
-    let (operation, exec_payload, host_file, entropy, retry_exec_stage, stage_prefix) = {
-        let staged = match native_exec_stage(frame, task) {
-            Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
-            Some(NativeExecStage::Failed(errno)) => {
-                NativeServiceStage::Return(errno.guest_retval())
-            }
-            Some(NativeExecStage::Fault(fault)) => NativeServiceStage::Fault {
-                fault,
-                prefix: None,
-            },
-            // Only an unserved call crosses. A call served with owed host
-            // work first settles that work (CarrierWork) and is replayed;
-            // staging it here would pre-empt the settlement forever.
-            None if action != Action::Forward => NativeServiceStage::Operation,
-            None if frame.x[8] == 278 => {
-                let (address, capacity, flags, requested) = native_entropy_stage(frame);
-                NativeServiceStage::Entropy {
-                    address,
-                    capacity,
-                    flags,
-                    requested,
-                }
-            }
-            None => match ipc::guest_venue(frame.slot as u32).and_then(|venue| {
-                let table = ipc::native_table(&venue, task)?;
-                let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
-                let lock_slot = frame.slot as u32;
-                native_host_file_stage(
-                    frame,
-                    task,
-                    &file::HardwareValidator,
-                    table,
-                    if child() {
-                        carrick_core_abi::service::ServiceOrigin::Descendant
-                    } else {
-                        carrick_core_abi::service::ServiceOrigin::Initial
-                    },
-                    |fd| ipc::native_descriptor(&venue, table, fd),
-                    &mut |out| native_source_releases(task, access, lock_slot, out),
-                )
-            }) {
-                Some(carrick_personality_linux::native_host_file::HostFileStage::Request {
-                    record,
-                    output,
-                    resolves_path,
-                    map,
-                    chdir,
-                }) => NativeServiceStage::HostFile(alloc::boxed::Box::new(StagedHostFile {
-                    record,
-                    output,
-                    resolves_path,
-                    map,
-                    chdir,
-                })),
-                Some(carrick_personality_linux::native_host_file::HostFileStage::Returned(
-                    result,
-                )) => NativeServiceStage::Return(native_host_file_return(
-                    result.raw(),
-                    carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
-                    counters,
-                    child,
-                )),
-                Some(carrick_personality_linux::native_host_file::HostFileStage::InRingReply {
-                    output,
-                    bytes,
-                }) => {
-                    // Staging proved the destination writable; the ring
-                    // copies its own answer.
-                    let mut copy = file::ValidatedCopy {
-                        task,
-                        validator: &file::HardwareValidator,
-                    };
-                    NativeServiceStage::Return(
-                        if file::UserCopy::copy_out(&mut copy, output.address, &bytes) {
-                            0
-                        } else {
-                            carrick_syscall_abi::LINUX_EFAULT.guest_retval()
-                        },
-                    )
-                }
-                Some(carrick_personality_linux::native_host_file::HostFileStage::Fault {
-                    address,
-                    access,
-                }) => NativeServiceStage::Fault {
-                    fault: native_host_file_fault(address, access),
-                    prefix: None,
-                },
-                Some(
-                    carrick_personality_linux::native_host_file::HostFileStage::FaultAfterPrefix {
-                        address,
-                        prefix,
-                    },
-                ) => NativeServiceStage::Fault {
-                    fault: native_host_file_fault(address, carrick_guest_arch::Access::Read),
-                    prefix: Some(prefix),
-                },
-                Some(carrick_personality_linux::native_host_file::HostFileStage::InRing) => {
-                    // An in-zone object the ring does not serve yet never
-                    // exits to the host: counted ENOSYS here, in ring.
-                    NativeServiceStage::Return(native_host_file_return(
-                        carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
-                        carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
-                        counters,
-                        child,
-                    ))
-                }
-                None => NativeServiceStage::Operation,
-            },
-        };
-        match staged {
-            NativeServiceStage::Exec(payload) => (None, Some(payload), None, None, false, None),
-            NativeServiceStage::HostFile(staged) => (None, None, Some(staged), None, false, None),
-            NativeServiceStage::Entropy {
-                address,
-                capacity,
-                flags,
-                requested,
-            } => (
-                None,
-                None,
-                None,
-                Some((address, capacity, flags, requested)),
-                false,
-                None,
-            ),
-            NativeServiceStage::Return(result) => {
-                frame.x[0] = result as u64;
-                return Some(arm_signal_user_return(frame));
-            }
-            NativeServiceStage::Fault { fault, prefix } => {
-                // `AT S1E0R` reports an inherited sparse page without taking
-                // an EL0 abort. Feed that exact read through the ordinary
-                // owner fault selector, retaining the syscall frame for retry.
-                let mut synthetic = *frame;
-                synthetic.esr = native_stage_fault_syndrome(fault);
-                synthetic.far = fault.address.raw();
-                let mut fault_wait = None;
-                match super::cow_resolver::dispatch_fault(&mut synthetic, counters, &mut fault_wait)
-                {
-                    Action::Served => {
-                        // Staging made no descriptor/IPC effect. Re-enter the
-                        // ring at the same SVC rather than staging InRing into
-                        // ENOSYS after the owner resolved its destination.
-                        frame.elr = frame.elr.wrapping_sub(4);
-                        return Some(Action::Served);
-                    }
-                    Action::Forward | Action::ServedWithWork => {
-                        service_wait = fault_wait;
-                        (
-                            Some(carrick_core_abi::service::ServiceOperation::Fault(fault)),
-                            None,
-                            None,
-                            None,
-                            true,
-                            prefix,
-                        )
-                    }
-                    Action::Idle | Action::HostCustody => {
-                        invalid_completion(NativeInvariant::EntryBinding)
-                    }
-                }
-            }
-            NativeServiceStage::Operation => match native_unstaged_exit(
+    let begin = match native_service_decision(
+        frame,
+        task,
+        action,
+        wait,
+        counters,
+        || arm_thread_group_owner(zone, task, page),
+        |frame| {
+            let venue = ipc::guest_venue(frame.slot as u32)?;
+            let table = ipc::native_table(&venue, task)?;
+            let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
+            let lock_slot = frame.slot as u32;
+            native_host_file_stage(
                 frame,
-                &task.linux,
-                action,
-                || arm_thread_group_owner(zone, task, page),
-                counters,
-            ) {
-                NativeUnstagedExit::Refused(refused) => return Some(refused),
-                NativeUnstagedExit::Operation(operation) => {
-                    (Some(operation), None, None, None, false, None)
-                }
-                NativeUnstagedExit::Declined => return None,
-            },
+                task,
+                &file::HardwareValidator,
+                table,
+                if child() {
+                    carrick_core_abi::service::ServiceOrigin::Descendant
+                } else {
+                    carrick_core_abi::service::ServiceOrigin::Initial
+                },
+                |fd| ipc::native_descriptor(&venue, table, fd),
+                &mut |out| native_source_releases(task, access, lock_slot, out),
+            )
+        },
+    ) {
+        NativeServiceDecision::Decline => return None,
+        NativeServiceDecision::Reply(result) => {
+            frame.x[0] = result as u64;
+            return Some(arm_signal_user_return(frame));
         }
+        NativeServiceDecision::Action(action) => return Some(action),
+        NativeServiceDecision::Begin(begin) => begin,
     };
+    let operation = begin.operation;
     // This CPU still exclusively owns its portal slot. Bind its selection
     // before park, so even a delayed first intake cannot steal a successor.
     let fault_sequence =
@@ -1514,96 +1703,23 @@ fn arm_native_service_exit(
         control,
         &mut service,
         |process| {
-            let exit = if matches!(
-                operation,
-                Some(carrick_core_abi::service::ServiceOperation::CarrierWork { .. })
-            ) {
-                super::native_process_runtime::NativeServiceExit::CarrierWork
-            } else {
-                super::native_process_runtime::NativeServiceExit::Bridge
-            };
-            let result = if let Some(payload) = exec_payload {
-                if service_wait.is_some() {
-                    Err(super::native_process_runtime::NativeProcessError::Quarantined)
-                } else {
-                    // The exec service resolves a descriptor `execveat`
-                    // names in the caller's own ring table (#1530), read
-                    // through the stable owned-table authority: an unrelated
-                    // table-map update must not read as "no table" (ENOSYS).
-                    let table = ipc::guest_venue(frame.slot as u32)
-                        .and_then(|venue| ipc::native_exec_table(venue.tables, task));
-                    process.begin_exec_service(
-                        payload,
-                        table,
-                        crate::native_process_runtime::NativeServiceCall::new(
-                            carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
-                            counters,
-                        ),
-                    )
-                }
-            } else if let Some((address, capacity, flags, requested)) = entropy {
-                process.begin_entropy_service(address, capacity, flags, requested)
-            } else if let Some(staged) = host_file {
-                if service_wait.is_some() {
-                    Err(super::native_process_runtime::NativeProcessError::Quarantined)
-                } else {
-                    let StagedHostFile {
-                        record,
-                        output,
-                        resolves_path,
-                        map,
-                        chdir,
-                    } = *staged;
-                    process.begin_host_file_service(
-                        record,
-                        output,
-                        resolves_path,
-                        map,
-                        chdir,
-                        crate::native_process_runtime::NativeServiceCall::new(
-                            carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
-                            // SAFETY: this in-ring path retains the fixed ABI
-                            // mapping for the lifetime of every continuation.
-                            unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const Counters) },
-                        ),
-                    )
-                }
-            } else if retry_exec_stage {
-                match operation {
-                    Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) => {
-                        process.begin_exec_stage_fault_service(
-                            fault,
-                            fault_sequence,
-                            service_wait,
-                            stage_prefix.map(|record| {
-                                (
-                                    record,
-                                    crate::native_process_runtime::NativeServiceCall::new(
-                                        carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
-                                        // SAFETY: this in-ring path retains the
-                                        // fixed ABI mapping for every continuation.
-                                        unsafe {
-                                            &*(carrick_el1_abi::EL1_COUNTERS_BASE
-                                                as *const Counters)
-                                        },
-                                    ),
-                                )
-                            }),
-                        )
-                    }
-                    _ => Err(super::native_process_runtime::NativeProcessError::Quarantined),
-                }
-            } else if let Some(operation) = operation {
-                if let Some(wait) = service_wait {
-                    process.begin_owner_service_wait(operation, wait)
-                } else {
-                    process.begin_service(operation, fault_sequence)
-                }
-            } else {
-                Err(super::native_process_runtime::NativeProcessError::Quarantined)
-            };
-            let result = process.settle_service_exit(result, exit);
-            (result, process.native_service_phase())
+            begin_native_service(
+                process,
+                frame.x[8],
+                begin,
+                fault_sequence,
+                counters,
+                // SAFETY: this in-ring path retains the fixed ABI mapping for
+                // the lifetime of every continuation.
+                unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const Counters) },
+                || {
+                    // The exec service resolves a descriptor `execveat` names
+                    // in the caller's own ring table (#1530), read through the
+                    // stable owned-table authority.
+                    ipc::guest_venue(frame.slot as u32)
+                        .and_then(|venue| ipc::native_exec_table(venue.tables, task))
+                },
+            )
         },
     )
     // Keep entry admission separate from dispatch/settlement: these source
