@@ -300,6 +300,13 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn preflight_host_crossing(&mut self, _ordinal: u64) -> bool {
         true
     }
+    /// Offer an unserved call to the venue's retained host-file staging
+    /// before the crossing table can refuse it, as ARM stages ahead of its
+    /// operation route. `true` means the venue retained a staged answer and
+    /// completes it on the `Forward` route without a host crossing.
+    fn stage_native_host_file(&mut self) -> bool {
+        false
+    }
     /// Record a policy refusal together with its caller provenance.
     fn record_refusal(&self, _bucket: usize) {}
     fn publish_forward_work(&self, original_argument0: u64) {
@@ -1123,6 +1130,12 @@ fn finish<'a, C: EntryContext + 'a>(
         if !pending.preflight_host_crossing(ordinal) {
             return CompletionRoute::Served;
         }
+        // Only an unserved, effect-free decline is staged: Handback retains
+        // its operation and AccountedForward has already run its family.
+        if result == FamilyCompletion::Forward && pending.stage_native_host_file() {
+            pending.record_forwarded(ordinal);
+            return CompletionRoute::Forward;
+        }
         let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
         let crossing_set = pending.crossing_set();
         let ring_first_strict = pending.ring_first_strict();
@@ -1470,6 +1483,7 @@ mod ring_first_tests {
                 work: false,
                 handback: false,
                 signal_restore_calls: 0,
+                stages: false,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
@@ -1503,6 +1517,7 @@ mod ring_first_tests {
                 work: false,
                 handback: false,
                 signal_restore_calls: 0,
+                stages: false,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
@@ -1574,6 +1589,7 @@ mod ring_first_tests {
                 work: false,
                 handback: false,
                 signal_restore_calls: 0,
+                stages: false,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
@@ -1597,6 +1613,8 @@ mod ring_first_tests {
         work: bool,
         handback: bool,
         signal_restore_calls: u32,
+        /// Whether the venue's retained host-file staging claims the call.
+        stages: bool,
         refused: &'a [AtomicU64; 513],
         forwarded: [AtomicU64; 512],
     }
@@ -1663,6 +1681,9 @@ mod ring_first_tests {
         }
         fn record_refusal(&self, bucket: usize) {
             self.refused[bucket].fetch_add(1, Ordering::Relaxed);
+        }
+        fn stage_native_host_file(&mut self) -> bool {
+            self.stages
         }
         fn original_argument0(&self) -> u64 {
             self.result as u64
@@ -1862,33 +1883,42 @@ mod ring_first_tests {
     }
 
     #[test]
-    fn x86_writev_remains_counted_enosys_under_strict_ring_first() {
-        let refused = [const { AtomicU64::new(0) }; 513];
-        let mut pending = CarrierOwned {
-            set: HostCrossingSet::X86,
-            mutate_forward: false,
-            strict: true,
-            state: crate::abi::entry::LinuxTaskState::new(),
-            native: carrick_syscall_abi::NativeNr(20),
-            admitted: true,
-            result: 42,
-            work: false,
-            handback: false,
-            signal_restore_calls: 0,
-            refused: &refused,
-            forwarded: [const { AtomicU64::new(0) }; 512],
-        };
-        // Main already excludes writev from the strict x86 crossing set.
-        // A claimed family without an x86 IPC venue must still settle as
-        // counted ENOSYS, never leak an unauthorized host replay.
+    fn x86_writev_is_staged_before_the_strict_crossing_refusal() {
+        // #1954: writev stays outside the strict x86 crossing set, so a call
+        // no venue stages still settles as counted ENOSYS and never leaks a
+        // host replay. A call the retained host-file venue stages is offered
+        // before that refusal (as ARM stages ahead of its operation route)
+        // and completes on the Forward route without a refusal.
         assert!(!HostCrossingSet::X86.is_allowed(CanonicalNr::new(66)));
-        assert_eq!(
-            dispatch(66, u64::MAX, &mut pending),
-            CompletionRoute::Served
-        );
-        assert_eq!(pending.result, -38);
-        assert_eq!(pending.forwarded[66].load(Ordering::Relaxed), 0);
-        assert_eq!(refused[20].load(Ordering::Relaxed), 1);
+        for stages in [false, true] {
+            let refused = [const { AtomicU64::new(0) }; 513];
+            let mut pending = CarrierOwned {
+                set: HostCrossingSet::X86,
+                mutate_forward: false,
+                strict: true,
+                state: crate::abi::entry::LinuxTaskState::new(),
+                native: carrick_syscall_abi::NativeNr(20),
+                admitted: true,
+                result: 42,
+                work: false,
+                handback: false,
+                signal_restore_calls: 0,
+                stages,
+                refused: &refused,
+                forwarded: [const { AtomicU64::new(0) }; 512],
+            };
+            let route = dispatch(66, u64::MAX, &mut pending);
+            if stages {
+                assert_eq!(route, CompletionRoute::Forward);
+                assert_eq!(pending.result, 42, "the venue owns the staged result");
+                assert_eq!(refused[20].load(Ordering::Relaxed), 0);
+            } else {
+                assert_eq!(route, CompletionRoute::Served);
+                assert_eq!(pending.result, -38);
+                assert_eq!(pending.forwarded[66].load(Ordering::Relaxed), 0);
+                assert_eq!(refused[20].load(Ordering::Relaxed), 1);
+            }
+        }
     }
 
     #[test]
@@ -1905,6 +1935,7 @@ mod ring_first_tests {
             work: true,
             handback: false,
             signal_restore_calls: 0,
+            stages: false,
             refused: &refused,
             forwarded: [const { AtomicU64::new(0) }; 512],
         };
@@ -1931,6 +1962,7 @@ mod ring_first_tests {
             work: true,
             handback: false,
             signal_restore_calls: 0,
+            stages: false,
             refused: &refused,
             forwarded: [const { AtomicU64::new(0) }; 512],
         };
@@ -1959,6 +1991,7 @@ mod ring_first_tests {
             work: false,
             handback: false,
             signal_restore_calls: 0,
+            stages: false,
             refused: &refused,
             forwarded: [const { AtomicU64::new(0) }; 512],
         };
@@ -2000,6 +2033,7 @@ mod ring_first_tests {
                 work,
                 handback,
                 signal_restore_calls: 0,
+                stages: false,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
@@ -2053,6 +2087,7 @@ mod ring_first_tests {
                 work: true,
                 handback: false,
                 signal_restore_calls: 0,
+                stages: false,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
@@ -2090,6 +2125,7 @@ mod ring_first_tests {
                 work: true,
                 handback: false,
                 signal_restore_calls: 0,
+                stages: false,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
@@ -2123,6 +2159,7 @@ mod ring_first_tests {
             work: false,
             handback: false,
             signal_restore_calls: 0,
+            stages: false,
             refused: &refused,
             forwarded: [const { AtomicU64::new(0) }; 512],
         };
@@ -2160,6 +2197,7 @@ mod ring_first_tests {
                 work: false,
                 handback: false,
                 signal_restore_calls: 0,
+                stages: false,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
