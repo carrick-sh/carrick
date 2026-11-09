@@ -9722,6 +9722,15 @@ fn arm_terminal_entries_release_parked_anonymous_edit() {
         owner_registry
             .register_root(runtime.clone(), source, &fixture.task, fixture.address)
             .unwrap();
+        // This low-level fixture publishes an already-issued sibling directly.
+        // Reserve its tid before native registration claims that exact birth.
+        fixture
+            .zone
+            .namespace()
+            .with_view(&carrick_sched_core::ShortLockSpin, |namespace| {
+                use carrick_sched_core::process::identity_allocator::ClaimKind;
+                namespace.reserve_exact(42, ClaimKind::Thread).unwrap();
+            });
         let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
         let mut service = Aarch64NativeProcessService::with_crossing(
             &fixture.task,
