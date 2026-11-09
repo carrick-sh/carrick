@@ -74,7 +74,7 @@ validated arguments, pipe id and pending create.
 
 ## Witnesses
 
-VM-free, through the threaded `pipe2` dispatcher entry
+Dispatcher layer, VM-free, through the threaded `pipe2` dispatcher entry
 (`carrick-kernel::dispatch::ipc_lock_contention_tests`), with a live holder
 thread owning the real zone queue lock and every wait bounded:
 
@@ -84,10 +84,31 @@ thread owning the real zone queue lock and every wait bounded:
 | `pipe2_held_readable_lane_retains_unbound_create_then_succeeds_once` | Readable lane held: object retained with no lane bound |
 | `pipe2_lane_release_before_enrollment_reruns_now` | Release between refusal and enrollment hands back at once |
 | `pipe2_cancel_while_parked_leaks_no_object_or_binding` | Dropped continuation frees the object; the release retires the cancelled record; the slot binds again |
-| `pipe2_lane_contention_does_not_exhaust_the_default_executor_pool` | Four waiters on the runtime's default single-CPU pool (three workers) with the holder's release queued on the same pool: all complete with distinct pairs |
 
 Red on the commit before the policy switch: the first three time out with
-"the create pinned its executor"; the pool witness reports "pool wedged: 0
-of 4 pipe2 waiters returned their worker". The runtime arm compiles on Linux
-and `cross-check-macos`; its signed execution is director-owned and
-unclaimed here.
+"the create pinned its executor".
+
+Runtime layer, VM-free (`carrick-runtime::vcpu_loop::ipc_lock_park_tests`):
+a real contended `pipe2` from `service_threaded_syscall` goes through
+`route_outcome` → `service_outcome` → `ipc_lock_park` → `settle_into_zone`,
+the real scheduler's `settle_blocked_continuation`, the zone handback, and
+`resume_owner_zone` → `resume_ipc_lock_operation`:
+
+| Witness | Shows |
+| --- | --- |
+| `serial_host_pipe2_lane_release_after_enrollment_resumes_through_runtime_once` | The parked create returns its executor (the same worker takes the process's other runnable thread); the release wakes it once; one pair (3, 4), one output commit, the retained object itself is published, no second wake |
+| `serial_host_pipe2_lane_release_before_enrollment_hands_back_through_runtime` | A release that completed before `ipc_lock_park` enrolled hands the record back before the scheduler settles; the create completes once |
+| `serial_host_pipe2_lane_park_keeps_caught_signal_pending_until_completion` | A caught SIGUSR1 leaves the create parked and pending; it is delivered after `pipe2` returns 0 |
+| `serial_host_pipe2_lane_park_sigkill_reclaims_the_retained_create` | SIGKILL while parked reaches production termination; the object, its bound lane, the record and the output/descriptor reservations are reclaimed |
+| `serial_host_pipe2_lane_resume_output_refusal_rolls_back_and_reruns_once` | The resumed create's `pipefd` is owner-refused: the retained create is rolled back on the resumed dispatcher (no lane left bound or held, no leak, no fatal), the thread parks on the editor, and `pipe2` reruns once after release |
+| `pipe2_lane_contention_does_not_exhaust_the_default_executor_pool` | More waiters than the production `ExecutorPoolConfig` default single-CPU pool, with the holder's release queued on the same pool: all complete with distinct pairs |
+| `zone::owner_copyout_policy_tests::ipc_lock_wait_is_killable_only_not_ordinary_signal_interruptible` | A real retained create maps to the killable owner gate |
+
+SIGKILL while the holder still holds the lane takes effect at the holder's
+release: the parked record sits on that lock's admission chain, and a host
+claim of it is deferred until the release drains the chain. The holder is a
+host thread in a short section or an EL1 vCPU, which needs no executor of
+the parked thread to finish.
+
+The runtime arm's signed (HVF) execution is director-owned and unclaimed
+here.
