@@ -632,6 +632,25 @@ where
     })
 }
 
+/// Retire the stopped birth before runnable publication permits rehome: once
+/// the successor is runnable another executor may load it and the old record
+/// must no longer hold the activation it is replacing.
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+pub(crate) fn publish_after_retirement<T>(
+    key: carrick_kernel::kernel::ThreadKey,
+    before_publish: &mut dyn FnMut() -> Result<(), String>,
+    publish: impl FnOnce() -> Result<T, TrapError>,
+) -> Result<T, TrapError> {
+    before_publish().map_err(TrapError::Hypervisor)?;
+    #[cfg(any(test, feature = "test-support"))]
+    carrick_kernel::el1_zone::first_entry_test_control::emit(
+        carrick_kernel::el1_zone::first_entry_test_control::Event::BeforePublish(key),
+    );
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = key;
+    publish()
+}
+
 fn activate_born_thread<E: ThreadedEngine + 'static>(
     context: &KernelContext,
     reservation: ThreadBirthAdoptionReservation,
@@ -725,15 +744,9 @@ where
             .ok_or_else(|| TrapError::Hypervisor("born adoption lost start proof".into()))?;
         logical.install_start_gate(gate)?;
         let proof = logical.activation_proof()?;
-        // Retire the stopped birth before runnable publication permits rehome.
-        before_publish().map_err(TrapError::Hypervisor)?;
-        #[cfg(any(test, feature = "test-support"))]
-        carrick_kernel::el1_zone::first_entry_test_control::emit(
-            carrick_kernel::el1_zone::first_entry_test_control::Event::BeforePublish(
-                context.thread().key(),
-            ),
-        );
-        let result = dormant.activate(&scheduler, context.thread().clone(), proof);
+        let result = publish_after_retirement(context.thread().key(), before_publish, || {
+            dormant.activate(&scheduler, context.thread().clone(), proof)
+        });
         // Registration, member enrollment and submission are all inside admission.
         drop(birth_admission);
         result

@@ -1640,6 +1640,10 @@ fn adopt_born_record(
         carrick_kernel::el1_zone::first_entry_test_control::emit(
             carrick_kernel::el1_zone::first_entry_test_control::Event::Retired(record),
         );
+        #[cfg(any(test, feature = "test-support"))]
+        carrick_kernel::el1_zone::first_entry_test_control::emit(
+            carrick_kernel::el1_zone::first_entry_test_control::Event::ThreadRetired(key),
+        );
         Ok(())
     };
     let adoption = scheduler
