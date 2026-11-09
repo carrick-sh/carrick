@@ -17,3 +17,9 @@ test = "carrick_el1_linux::ipc::tests::el1_ipc_io_first_write_to_an_unbacked_pip
 reason = "#1506: native-child pipe2 is now served in ring with owned descriptor publication, so the first write to an unbacked pipe supplies shared storage (or returns ENOMEM) instead of forwarding; the witness was renamed for what it proves (ae515b5b91)."
 replaced_by = "carrick_el1_linux::ipc::tests::el1_ipc_io_first_write_supplies_shared_storage_or_returns_enomem"
 pr = 1740
+
+[[retired]]
+test = "carrick_el1_linux::sched::tests::timed_waits_this_vcpu_cannot_keep_forward"
+reason = "#1894: a switched-in thread's timed wait is now served in ring on its own timer lease (`timed_wait_allowed` no longer forwards when the thread is not the vCPU's host record), so the forwarding witness became a witness that the wait times out in ring with ETIMEDOUT and consumes its lease; the invalid-timespec refusal is still asserted in the same test."
+replaced_by = "carrick_el1_linux::sched::tests::switched_in_timed_wait_uses_its_own_timer_lease"
+pr = 1894
