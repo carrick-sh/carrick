@@ -1531,7 +1531,7 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
             writeln!(
                 writer,
                 "fixtures: verified {} executables for {} by input_identity {} (bundle built at {})",
-                manifest.executables.len(),
+                served_executables(&manifest, candidate.as_ref()).count(),
                 expected.0,
                 manifest.input_identity()?,
                 manifest.source_head.0
