@@ -207,6 +207,9 @@ impl AuthorityDebtCeilings {
         base.validate()?;
         let old: BTreeMap<_, _> = base.counters.iter().map(|c| (c.key(), c.ceiling)).collect();
         let new: BTreeMap<_, _> = self.counters.iter().map(|c| (c.key(), c.ceiling)).collect();
+        moves
+            .check_admissions(&old, |key| key.owner.as_str())
+            .map_err(DebtError::Policy)?;
         let settled = moves
             .settle(
                 &old,
@@ -239,6 +242,9 @@ impl AuthorityDebtCeilings {
                         "ceiling increase: {key:?}: {previous} -> {ceiling}"
                     ));
                 }
+                None if moves
+                    .admits(&old, &key.owner, |key| key.owner.as_str())
+                    .map_err(DebtError::Policy)? => {}
                 None => return fail(format!("unknown family/owner cohort in head: {key:?}")),
             }
         }

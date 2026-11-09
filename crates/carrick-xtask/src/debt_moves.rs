@@ -29,12 +29,25 @@ pub struct DebtMove {
     pub issue: u32,
 }
 
+/// An owner-approved new owner cohort: code that has no predecessor to move
+/// from (a new carrier thread, say). Admits the owner's cohorts only while the
+/// base has no cohort of that owner.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebtAdmission {
+    pub owner: String,
+    /// The issue recording the owner's approval.
+    pub issue: u32,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebtMoves {
     pub schema: u32,
     #[serde(default)]
     pub authority_debt: Vec<DebtMove>,
+    #[serde(default)]
+    pub authority_debt_admissions: Vec<DebtAdmission>,
     #[serde(default)]
     pub terminal_custody: Vec<DebtMove>,
 }
@@ -49,7 +62,14 @@ struct Move {
 
 /// A validated one-to-one list of moves.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MoveMap(Vec<Move>);
+pub struct MoveMap(Vec<Move>, Vec<Admission>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Admission {
+    owner: String,
+    /// Listed identically in the base revision's move file.
+    inherited: bool,
+}
 
 impl MoveMap {
     /// `moves` is the head's list; `inherited` is the base revision's list.
@@ -81,7 +101,70 @@ impl MoveMap {
                         .any(|old| old.from == entry.from && old.to == entry.to),
                 })
                 .collect(),
+            Vec::new(),
         ))
+    }
+
+    /// Attach the head's owner admissions; `inherited` is the base's list.
+    pub fn with_admissions(
+        mut self,
+        admissions: &[DebtAdmission],
+        inherited: &[DebtAdmission],
+    ) -> Result<Self, String> {
+        let mut owners = BTreeSet::new();
+        for entry in admissions {
+            if entry.owner.is_empty() || !owners.insert(entry.owner.as_str()) {
+                return Err(format!("invalid debt admission: {entry:?}"));
+            }
+        }
+        self.1 = admissions
+            .iter()
+            .map(|entry| Admission {
+                owner: entry.owner.clone(),
+                inherited: inherited.iter().any(|old| old.owner == entry.owner),
+            })
+            .collect();
+        Ok(self)
+    }
+
+    /// Fail on an admission this change adds that the base's owners make stale.
+    pub fn check_admissions<K>(
+        &self,
+        base: &BTreeMap<K, u64>,
+        name: impl Fn(&K) -> &str,
+    ) -> Result<(), String> {
+        for admission in self.1.iter().filter(|a| !a.inherited) {
+            if base.keys().any(|key| name(key) == admission.owner) {
+                return Err(format!(
+                    "stale debt admission {}: the owner already exists in the base",
+                    admission.owner
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a reviewed admission covers `owner`, a name the base lacks.
+    /// An admission this change adds for an owner the base already has is
+    /// stale; one inherited from the base's file settles nothing.
+    pub fn admits<K>(
+        &self,
+        base: &BTreeMap<K, u64>,
+        owner: &str,
+        name: impl Fn(&K) -> &str,
+    ) -> Result<bool, String> {
+        let in_base = base.keys().any(|key| name(key) == owner);
+        for admission in self.1.iter().filter(|a| a.owner == owner) {
+            if !in_base {
+                return Ok(true);
+            }
+            if !admission.inherited {
+                return Err(format!(
+                    "stale debt admission {owner}: the owner already exists in the base"
+                ));
+            }
+        }
+        Ok(false)
     }
 
     /// Check every move against `base` and `head` and return the keys it
@@ -190,7 +273,10 @@ impl DebtMoves {
     }
 
     pub fn authority_debt(&self, base: &Self) -> Result<MoveMap, String> {
-        MoveMap::new(&self.authority_debt, &base.authority_debt)
+        MoveMap::new(&self.authority_debt, &base.authority_debt)?.with_admissions(
+            &self.authority_debt_admissions,
+            &base.authority_debt_admissions,
+        )
     }
 
     pub fn terminal_custody(&self, base: &Self) -> Result<MoveMap, String> {
