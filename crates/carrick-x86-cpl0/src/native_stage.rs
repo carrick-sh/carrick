@@ -169,7 +169,9 @@ mod tests {
 
     #[test]
     fn write_to_in_zone_pipe_stays_in_ring() {
-        let pipe = Some(NativeDescriptor::InZone(InZoneKind::Pipe));
+        let pipe = Some(NativeDescriptor::InZone(InZoneKind::Pipe(
+            carrick_syscall_abi::LinuxPipeIdentity::new(1, 1),
+        )));
         let bytes = *b"x";
         let args = [1, bytes.as_ptr() as u64, 1, 0, 0, 0];
         assert_eq!(stage(1, args, CHILD, pipe), Some(HostFileStage::InRing));
