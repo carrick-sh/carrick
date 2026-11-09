@@ -193,7 +193,8 @@ action:
 /* Rows: clock, flags, expected rax. The register's upper half is not part
  * of clockid_t; Linux reads only TIMER_ABSTIME. x86 CPL0 has no guest
  * monotonic epoch, so every absolute deadline keeps the counted ENOSYS
- * refusal (-38), as do clocks the ring cannot measure. */
+ * refusal (-38), as do clocks the ring cannot measure (process and
+ * per-thread CPU clocks, ALARM). */
 table:
     .quad 0, 0, 0
     .quad 1, 0, 0
@@ -217,7 +218,7 @@ table:
     .quad 6, 0, -95
     .quad 0x100000004, 0, -95
     .quad 0xffffffe3, 0, -95 /* posix-clock fd 3 */
-    .quad 0xfffffff6, 0, -22 /* thread CPU clock of tid 1 */
+    .quad 0xfffffff6, 0, -38 /* thread CPU clock of tid 1: Linux reads the request first */
     .quad 10, 0, -22
     .quad 12, 0, -22
 table_end:

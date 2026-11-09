@@ -2279,6 +2279,10 @@ fn native_fork_child_clock_nanosleep_clocks_and_flags_match_linux() {
         // reading the request; the ring measures neither.
         (2, 0, REFUSED),
         (process_cpu(1), 0, REFUSED),
+        // Dynamic per-thread CPU clocks: a raw `clock_nanosleep` reads the
+        // request first (EFAULT on NULL) and then answers by the named
+        // thread (0 for a live sibling, 22 for the caller).
+        (thread_cpu(1), 0, REFUSED),
         (8, 0, REFUSED),
         (9, 0, REFUSED),
         (3, 0, EOPNOTSUPP),
@@ -2287,7 +2291,6 @@ fn native_fork_child_clock_nanosleep_clocks_and_flags_match_linux() {
         (6, 0, EOPNOTSUPP),
         (0x1_0000_0004, 0, EOPNOTSUPP),
         (clock_fd(3), 0, EOPNOTSUPP),
-        (thread_cpu(1), 0, EINVAL),
         (10, 0, EINVAL),
         (12, 0, EINVAL),
         (u64::from(i32::MAX as u32), 0, EINVAL),
