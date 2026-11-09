@@ -2972,6 +2972,59 @@ pub struct Counters {
     /// Carrier venue refusals, separate from ring routing refusals.
     pub venue_refused: [AtomicU64; 513],
     pub venue_refused_child: [AtomicU64; 513],
+    /// Ring refusals by the entry arm that answered ENOSYS, indexed by
+    /// [`carrick_personality_linux::dispatch::RefusalArm`] (#1941).
+    pub refusal_arms: [AtomicU64; carrick_personality_linux::dispatch::RefusalArm::COUNT],
+    /// The latest attributed ring refusal, word by word as
+    /// [`RefusalContext`] lays it out; [`REFUSAL_CONTEXT_NONE`] marks an
+    /// unknown word.
+    pub last_refusal: [AtomicU64; RefusalContext::WORDS],
+}
+
+/// Marks a [`RefusalContext`] word the refusing venue could not read.
+pub const REFUSAL_CONTEXT_NONE: u64 = u64::MAX;
+
+/// Admission facts captured when an entry arm refuses a call (#1941). Each
+/// flag names one check of `carrick_core::entry::admit` or
+/// `admit_born_in_zone`, so a hung core says which check failed.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+pub struct RefusalContext {
+    pub arm: carrick_personality_linux::dispatch::RefusalArm,
+    pub ordinal: carrick_guest_arch::NativeOrdinal,
+    /// The vCPU slot of the refused entry, or [`REFUSAL_CONTEXT_NONE`].
+    pub slot: u64,
+    /// The slot's current record id, or [`REFUSAL_CONTEXT_NONE`].
+    pub record: u64,
+    /// The current record's encoded claim word, or [`REFUSAL_CONTEXT_NONE`].
+    pub claim: u64,
+    pub flags: RefusalFlags,
+}
+
+impl RefusalContext {
+    pub const WORDS: usize = 6;
+}
+
+/// One bit per admission fact in a [`RefusalContext`].
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, Default)]
+pub struct RefusalFlags(u64);
+
+impl RefusalFlags {
+    pub const BINDING: u64 = 1 << 0;
+    pub const BINDING_ISSUED: u64 = 1 << 1;
+    pub const SOURCE: u64 = 1 << 2;
+    pub const UNADOPTED_BIRTH: u64 = 1 << 3;
+    pub const IDENTITY_MATCHES: u64 = 1 << 4;
+    pub const SPACE_INSTALLED: u64 = 1 << 5;
+    pub const CHILD: u64 = 1 << 6;
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    pub const fn with(self, bit: u64, set: bool) -> Self {
+        if set { Self(self.0 | bit) } else { self }
+    }
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
 }
 
 /// The authority that declined to serve the operation.
@@ -3002,6 +3055,9 @@ impl Counters {
             refused_child: [const { AtomicU64::new(0) }; 513],
             venue_refused: [const { AtomicU64::new(0) }; 513],
             venue_refused_child: [const { AtomicU64::new(0) }; 513],
+            refusal_arms: [const { AtomicU64::new(0) };
+                carrick_personality_linux::dispatch::RefusalArm::COUNT],
+            last_refusal: [const { AtomicU64::new(REFUSAL_CONTEXT_NONE) }; RefusalContext::WORDS],
         }
     }
 
@@ -3059,7 +3115,33 @@ impl Counters {
                 Ordering::Relaxed,
             );
         }
+        for (target, source) in snapshot.refusal_arms.iter().zip(&self.refusal_arms) {
+            target.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for (target, source) in snapshot.last_refusal.iter().zip(&self.last_refusal) {
+            target.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
         snapshot
+    }
+
+    /// Count the arm that refused and keep its admission context. Words are
+    /// relaxed and may tear across concurrent refusals; a single refusal
+    /// (the #1941 shape) reads back exactly.
+    pub fn record_refusal_arm(&self, context: RefusalContext) {
+        if let Some(count) = self.refusal_arms.get(context.arm as usize) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        let words = [
+            context.arm as u64,
+            context.ordinal.raw(),
+            context.slot,
+            context.record,
+            context.claim,
+            context.flags.bits(),
+        ];
+        for (word, value) in self.last_refusal.iter().zip(words) {
+            word.store(value, Ordering::Relaxed);
+        }
     }
 
     pub fn record_refusal(

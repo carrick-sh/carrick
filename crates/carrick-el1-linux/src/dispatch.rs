@@ -755,6 +755,15 @@ fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -
         carrick_core_abi::service::ServiceOrigin::Descendant,
         carrick_el1_abi::RefusalVenue::Ring,
     );
+    counters.record_refusal_arm(carrick_el1_abi::RefusalContext {
+        arm: carrick_personality_linux::dispatch::RefusalArm::UnclaimedNative,
+        ordinal,
+        slot: frame.slot,
+        record: carrick_el1_abi::REFUSAL_CONTEXT_NONE,
+        claim: carrick_el1_abi::REFUSAL_CONTEXT_NONE,
+        flags: carrick_el1_abi::RefusalFlags::empty()
+            .with(carrick_el1_abi::RefusalFlags::CHILD, true),
+    });
     if let Some(served) = counters.served.get(ordinal.raw() as usize) {
         served.fetch_add(1, Ordering::Relaxed);
     }
@@ -2997,6 +3006,70 @@ impl<
             },
             carrick_el1_abi::RefusalVenue::Ring,
         );
+    }
+    fn record_refusal_arm(&self, arm: carrick_personality_linux::dispatch::RefusalArm) {
+        use carrick_el1_abi::{REFUSAL_CONTEXT_NONE, RefusalFlags};
+        let binding = <Self as PendingFamilies<'a, Context>>::binding(self);
+        let source = <Self as PendingFamilies<'a, Context>>::record_source(self);
+        let child = self
+            .process
+            .as_deref()
+            .is_some_and(|process| !process.is_root_process());
+        let mut flags = RefusalFlags::empty()
+            .with(RefusalFlags::BINDING, binding.is_some())
+            .with(
+                RefusalFlags::BINDING_ISSUED,
+                binding.is_some_and(|binding| binding.issued()),
+            )
+            .with(RefusalFlags::SOURCE, source.is_some())
+            .with(RefusalFlags::CHILD, child);
+        let (slot, record, claim) = match source {
+            Some(source) => match source.zone.slot(source.slot).current() {
+                Some(current) => {
+                    let owned = source.zone.record(current);
+                    let id = owned.identity();
+                    flags = flags
+                        .with(RefusalFlags::UNADOPTED_BIRTH, owned.is_unadopted_birth())
+                        .with(
+                            RefusalFlags::IDENTITY_MATCHES,
+                            binding.is_some_and(|binding| {
+                                id.tid == binding.task.raw()
+                                    && id.generation == binding.generation.raw()
+                                    && id.mm == binding.mm.raw()
+                                    && id.serial == binding.thread_generation.raw()
+                            }),
+                        )
+                        .with(
+                            RefusalFlags::SPACE_INSTALLED,
+                            source.zone.installed_space(source.slot) == id.mm,
+                        );
+                    (
+                        u64::from(source.slot.raw()),
+                        u64::from(current.raw()),
+                        owned.claim().encode(),
+                    )
+                }
+                None => (
+                    u64::from(source.slot.raw()),
+                    REFUSAL_CONTEXT_NONE,
+                    REFUSAL_CONTEXT_NONE,
+                ),
+            },
+            None => (
+                REFUSAL_CONTEXT_NONE,
+                REFUSAL_CONTEXT_NONE,
+                REFUSAL_CONTEXT_NONE,
+            ),
+        };
+        self.counters
+            .record_refusal_arm(carrick_el1_abi::RefusalContext {
+                arm,
+                ordinal: self.frame.native_number(),
+                slot,
+                record,
+                claim,
+                flags,
+            });
     }
     fn lifecycle_native(
         &mut self,

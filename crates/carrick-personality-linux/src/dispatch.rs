@@ -85,6 +85,27 @@ pub enum FamilyCompletion {
     AccountedSuspended,
 }
 
+/// The kernel-entry arm that answered a call with a counted ENOSYS. The
+/// per-syscall refusal census says *which* call was refused; this says *why*,
+/// so one hung run names the arm (#1941).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RefusalArm {
+    /// [`dispatch`] found no completion authority: neither
+    /// `carrick_core::entry::admit` nor `admit_born_in_zone` admitted the
+    /// entry, so the call went straight to the crossing table.
+    Unadmitted = 0,
+    /// [`finish`]: a family declined an unported call and the crossing
+    /// table refused it.
+    UnportedCrossing = 1,
+    /// A fork child's native syscall that no ring stage claimed.
+    UnclaimedNative = 2,
+}
+
+impl RefusalArm {
+    pub const COUNT: usize = 4;
+}
+
 /// Retained IPC/futex progress before the single entry owner settles the turn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpcServed {
@@ -302,6 +323,8 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     }
     /// Record a policy refusal together with its caller provenance.
     fn record_refusal(&self, _bucket: usize) {}
+    /// Record which entry arm refused, with the venue's admission context.
+    fn record_refusal_arm(&self, _arm: RefusalArm) {}
     fn publish_forward_work(&self, original_argument0: u64) {
         if let Some(task) = self.task_state() {
             // No family ran: after owed work drains the execution owner must
@@ -1140,6 +1163,7 @@ fn finish<'a, C: EntryContext + 'a>(
                     .crossing_set()
                     .refusal_bucket(pending.native_number()),
             );
+            pending.record_refusal_arm(RefusalArm::UnportedCrossing);
             if pending.host_work() || pending.return_requires_host_boundary() {
                 if let Some(task) = pending.task_state() {
                     task.orig_arg0
@@ -1258,6 +1282,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
                         .crossing_set()
                         .refusal_bucket(pending.native_number()),
                 );
+                pending.record_refusal_arm(RefusalArm::Unadmitted);
                 return CompletionRoute::Served;
             }
             pending.record_forwarded(ordinal);
