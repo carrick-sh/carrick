@@ -117,7 +117,7 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
     let runner = jobs["changes"]["outputs"]["macos_runner"].as_str().unwrap();
     assert_eq!(
         runner,
-        "${{ github.event_name == 'merge_group' && '[\"self-hosted\",\"macOS\",\"ARM64\",\"carrick-macos-queue\"]' || ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '[\"self-hosted\",\"macOS\",\"ARM64\",\"carrick-macos-ci\"]' || '\"macos-15\"') }}",
+        "${{ github.event_name == 'merge_group' && '[\"self-hosted\",\"macOS\",\"ARM64\",\"carrick-macos-queue\"]' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '[\"self-hosted\",\"macOS\",\"ARM64\",\"carrick-macos-ci\"]' || '\"macos-15\"' }}",
         "changes.outputs.macos_runner: merge groups -> carrick-macos-queue only; same-repo PRs -> carrick-macos-ci; everything else hosted macos-15"
     );
     assert!(
