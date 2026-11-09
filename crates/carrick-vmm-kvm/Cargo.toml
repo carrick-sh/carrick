@@ -18,11 +18,18 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Test-only fixtures (e.g. `Cpl0Carrier::fixture_hold_ipc_readiness_lanes`,
+# which spawns a host thread). Enabled only through the self dev-dependency
+# below, so production builds of this crate never contain them.
+test-fixtures = []
+
 [build-dependencies]
 # build.rs derives the CPL0 image inputs directly from local manifests.
 toml.workspace = true
 
 [dev-dependencies]
+carrick-vmm-kvm = { path = ".", features = ["test-fixtures"] }
 carrick-vfs = { path = "../carrick-vfs" }
 carrick-x86-cpl0-host = { path = "../carrick-x86-cpl0-host", features = ["test-support"] }
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }

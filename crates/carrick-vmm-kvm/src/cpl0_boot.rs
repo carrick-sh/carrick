@@ -291,11 +291,13 @@ pub struct Cpl0Carrier {
 
 /// A live holder of two production-zone readiness-lane locks, from
 /// [`Cpl0Carrier::fixture_hold_ipc_readiness_lanes`]. Dropping it releases.
+#[cfg(feature = "test-fixtures")]
 pub struct FixtureReadinessLaneHold {
     release: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<bool>>,
 }
 
+#[cfg(feature = "test-fixtures")]
 impl FixtureReadinessLaneHold {
     /// Release both locks. `true` when this request released them, `false`
     /// when the holder had already given up at its bound.
@@ -309,6 +311,7 @@ impl FixtureReadinessLaneHold {
     }
 }
 
+#[cfg(feature = "test-fixtures")]
 impl Drop for FixtureReadinessLaneHold {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
@@ -2726,6 +2729,7 @@ impl Cpl0Carrier {
     /// their real queue locks on its own thread until told to release, or
     /// until `bound`. The hold retains the carrier RAM, so it may outlive a
     /// run that consumed this carrier.
+    #[cfg(feature = "test-fixtures")]
     pub fn fixture_hold_ipc_readiness_lanes(
         &self,
         object: carrick_el1_abi::ipc::IpcObjectHandle,
