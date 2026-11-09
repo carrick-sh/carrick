@@ -35,8 +35,12 @@ mod test_support {
     /// Once the calling member next parks, publish a caught SIGUSR1 to it
     /// through the production ingress owner.
     pub const INJECT_CAUGHT_SIGNAL_ON_NEXT_PARK: u64 = 0xffff_ffff_ffff_fe1a;
-    /// The next owned (exact-MM, retained-output) user copy is Busy once.
+    /// The next exact-MM user write is Busy once, whether it is an owned
+    /// (retained-output) copy or a direct signal-output copy.
     pub const INJECT_OWNED_COPY_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe1b;
+    /// Read the injected-copy census: refusals in the high 32 bits, owned
+    /// copies that completed after an owned refusal in the low 32 bits.
+    pub const INJECT_OWNED_COPY_CENSUS: u64 = 0xffff_ffff_ffff_fe1c;
     pub const INJECT_PEER_IDLE_RELEASE_ONCE: u64 = 0xffff_ffff_ffff_fe18;
     // Test-only actor ordering: armed by CPU0's fixture syscall; CPU0
     // publishes Parked before requesting CPU1's scheduler to release it.
@@ -87,6 +91,11 @@ mod test_support {
     static SIGNAL_CLOCK_LAG: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static OWNED_COPY_BUSY: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+    static OWNED_COPY_REFUSALS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    static OWNED_COPY_RETAINED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static OWNED_COPY_RERUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     type ArmedSignal = (
         carrick_sched_core::RecordRef,
         carrick_core_abi::ExecutionBinding,
@@ -123,8 +132,23 @@ mod test_support {
         }
     }
 
-    pub fn take_owned_copy_busy() -> bool {
-        OWNED_COPY_BUSY.swap(false, Ordering::AcqRel)
+    /// Consume the armed Busy for this exact-MM write. `owned` marks a
+    /// retained-output copy, whose next completion counts as its rerun.
+    pub fn take_owned_copy_busy(owned: bool) -> bool {
+        let refused = OWNED_COPY_BUSY.swap(false, Ordering::AcqRel);
+        if refused {
+            OWNED_COPY_REFUSALS.fetch_add(1, Ordering::AcqRel);
+            if owned {
+                OWNED_COPY_RETAINED.store(true, Ordering::Release);
+            }
+        }
+        refused
+    }
+
+    pub fn record_owned_copy_done() {
+        if OWNED_COPY_RETAINED.swap(false, Ordering::AcqRel) {
+            OWNED_COPY_RERUNS.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub fn take_caught_signal_on_park() -> bool {
@@ -203,6 +227,10 @@ mod test_support {
             INJECT_OWNED_COPY_BUSY_ONCE => {
                 (!OWNED_COPY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
             }
+            INJECT_OWNED_COPY_CENSUS => Some(
+                (OWNED_COPY_REFUSALS.load(Ordering::Acquire) << 32)
+                    | (OWNED_COPY_RERUNS.load(Ordering::Acquire) & u64::from(u32::MAX)),
+            ),
             INJECT_CAUGHT_SIGNAL_ON_PARK => {
                 if !CAUGHT_SIGNAL_ON_PARK.swap(true, Ordering::AcqRel)
                     && carrick_sched_core::spaces::inject_editor_busy_once()
