@@ -25,7 +25,9 @@ fn fetch_plan_covers_every_fixture_lockfile_including_conformance_probes() {
 #[test]
 fn publisher_fetches_before_the_offline_environment_is_created() {
     let source = include_str!("../src/fixtures.rs");
-    let build = &source[source.find("pub fn build(").unwrap()..];
+    // `Snapshot::new` is the publisher's (and the candidate probe build's)
+    // single entry to the isolated environment.
+    let build = &source[source.find("impl Snapshot {").unwrap()..];
     let fetch = build.find("fetch_dependencies(root)?").unwrap();
     let environment = build.find("BuildEnvironment::isolated(").unwrap();
     assert!(
