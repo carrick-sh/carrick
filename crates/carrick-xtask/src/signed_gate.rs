@@ -298,35 +298,44 @@ fn is_ancestor(graph: &Path, ancestor: &str, descendant: &str) -> Result<bool, R
     }
 }
 
+fn not_live() -> ReceiptError {
+    fail("merge-group head is not the live entry named by its main queue ref")
+}
+
 /// Authorizes the merge-group head against the live merge-queue entries.
 pub fn validate_queue_entries(
     queue_entries: &[Value],
     requested_sha: &str,
     queue_pr: u64,
 ) -> Result<(), ReceiptError> {
-    for (index, node) in queue_entries.iter().enumerate() {
-        if node["baseCommit"]["oid"].as_str().is_none()
-            || node["headCommit"]["oid"].as_str().is_none()
-            || node["pullRequest"]["number"].as_u64().is_none()
-            || node["pullRequest"]["baseRefName"].as_str().is_none()
-            || node["pullRequest"]["baseRepository"]["nameWithOwner"]
-                .as_str()
-                .is_none()
-        {
-            return Err(fail(format!(
-                "mergeQueue entry {index} is null or incomplete"
-            )));
-        }
+    let Some((index, own)) = queue_entries
+        .iter()
+        .enumerate()
+        .find(|(_, node)| node["headCommit"]["oid"] == requested_sha)
+    else {
+        return Err(not_live());
+    };
+    if own["baseCommit"]["oid"].as_str().is_none()
+        || own["pullRequest"]["number"].as_u64().is_none()
+        || own["pullRequest"]["baseRefName"].as_str().is_none()
+        || own["pullRequest"]["baseRepository"]["nameWithOwner"]
+            .as_str()
+            .is_none()
+    {
+        return Err(fail(format!(
+            "mergeQueue entry {index} (the merge-group head) is null or incomplete"
+        )));
     }
-    if !queue_entries.iter().any(|node| {
-        node["headCommit"]["oid"] == requested_sha
-            && node["pullRequest"]["number"].as_u64() == Some(queue_pr)
-            && node["pullRequest"]["baseRefName"] == "main"
-            && node["pullRequest"]["baseRepository"]["nameWithOwner"] == REPOSITORY
-    }) {
-        return Err(fail(
-            "merge-group head is not the live entry named by its main queue ref",
-        ));
+    if own["pullRequest"]["number"].as_u64() != Some(queue_pr)
+        || own["pullRequest"]["baseRefName"] != "main"
+        || own["pullRequest"]["baseRepository"]["nameWithOwner"] != REPOSITORY
+    {
+        return Err(not_live());
+    }
+    for (other, node) in queue_entries.iter().enumerate() {
+        if other != index && node["headCommit"]["oid"].as_str().is_none() {
+            eprintln!("signed-gate: ignoring incomplete sibling mergeQueue entry {other}");
+        }
     }
     Ok(())
 }
