@@ -329,8 +329,8 @@ an unreadable input. It covers host behavior, not native-child routing.
 
 `nanosleep` (101) and `clock_nanosleep` (115) now route to
 `Family::Sleep` on both ISAs. `carrick_personality_linux::sleep` owns the
-Linux argument contract (flags and clock ids as the host dispatcher
-classifies them, EFAULT, EINVAL, zero interval, no `rem` for
+Linux argument contract (flags and clock ids as Linux classifies them,
+see the fix round below; EFAULT, EINVAL, zero interval, no `rem` for
 TIMER_ABSTIME). The native process owner serves the call only for a
 process without a host continuation (`ProcessSignals::sleeps_in_ring`):
 every fork/exec child. The run root keeps its Permanent host crossing,
@@ -344,14 +344,44 @@ departs, and the signal wake channel. On resume the deadline wins first
 (0); a deliverable signal returns EINTR after the exact-MM `rem` copy;
 anything else re-parks on the same deadline.
 
-Clock domains in ring: MONOTONIC/BOOTTIME are the guest counter (the raw
-clock fast path's domain). REALTIME/TAI absolute deadlines subtract the
-caller's own vvar realtime word, the value its vDSO adds. Known divergences:
-a later `clock_settime` does not move an armed absolute REALTIME sleep, and
-a scaled, frozen or deterministic `ClockDomain` is not applied to child
-sleeps (native futex and `rt_sigtimedwait` timeouts already share that
-limit). With the vDSO disabled there is no vvar page; an absolute REALTIME
-child sleep then stays unserved (counted ENOSYS).
+Clock domains in ring: a relative sleep measures the guest counter. An
+absolute MONOTONIC/BOOTTIME deadline is served only on ARM, whose vDSO
+reports the guest counter as CLOCK_MONOTONIC. Known divergence: a scaled,
+frozen or deterministic `ClockDomain` is not applied to child sleeps
+(native futex and `rt_sigtimedwait` timeouts already share that limit).
+
+## Review fix round (#1836 findings 1, 2, 3 and 5)
+
+- **One complete sleep decision.** `sleep_until` serves the entry and every
+  resume of a sleep: a passed deadline returns 0; a deliverable signal
+  returns EINTR; anything else parks on the same deadline with the observed
+  channel generation, rescanning when enrollment is refused. A resumed
+  sleep no longer reaches the `rt_sigtimedwait` result path, where a
+  deadline crossing between two clock reads answered EAGAIN (-11) and a
+  signal between two deliverable checks answered EINTR without `rem`.
+- **Retained `rem`.** The EINTR remainder is an `OwnedCopyout` with an
+  EINTR result through `finish_copyout`: a lazy page is prepared, and a
+  Busy or owner-wait copy keeps the answer and reruns it.
+- **Linux clocks and flags** (clock_nanosleep(2), errno numbers from a
+  native Linux 6.12 probe): REALTIME, MONOTONIC, BOOTTIME and TAI sleep;
+  MONOTONIC_RAW, the COARSE clocks, CLOCK_THREAD_CPUTIME_ID and posix-clock
+  fds give 95; dynamic per-thread CPU clocks and unknown ids give 22; the
+  clock id is a C int. Unknown flag bits are ignored, as Linux ignores
+  them (the run root's host dispatcher still answers EINVAL). Process
+  CPU-time clocks (Linux sleeps on them) and the ALARM clocks (EPERM
+  without CAP_WAKE_ALARM, decided after reading the request) are not
+  measurable in ring and keep the counted refusal.
+- **Absolute deadlines.** REALTIME/TAI keep the counted refusal on every
+  ISA until a durable realtime authority exists (#1981). x86 CPL0 defines
+  no guest-visible monotonic epoch: its counter is raw RDTSC
+  (`carrick-el1/src/isa/x86/interrupt.rs`, `X86Backend::counter`), its
+  initial stack publishes no `AT_SYSINFO_EHDR`
+  (`carrick-el1/src/isa/x86/initial_mm.rs`, `build_initial_stack`) and
+  child `clock_gettime` is slice 3. Every absolute deadline therefore
+  keeps the counted refusal on x86 (`sleep::absolute_monotonic_epoch`).
+- **x86 lazy `rem` (#1984).** On x86 CPL0 a signal-woken child's kernel
+  write to a lazy page fails, with the pre-#1836 direct copy too. Resident
+  and COW pages, and a Busy-once copy, are witnessed on real KVM.
 
 The earlier clock-resource sleep subscription (`NativeSleep`, the
 `SleepArm`/`SleepCancel` wire operations and the host `TimerHub` thread) is
