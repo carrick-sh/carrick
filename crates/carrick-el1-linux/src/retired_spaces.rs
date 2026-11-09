@@ -216,7 +216,8 @@ pub fn retire_closed_space<
     owner
         .space_access(worker)
         .map_err(|_| NativeProcessError::Stale)?
-        .retire_entry(index);
+        .retire_entry(index)
+        .map_err(|_| NativeProcessError::Stale)?;
     Ok(())
 }
 
