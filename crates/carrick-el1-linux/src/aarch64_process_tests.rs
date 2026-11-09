@@ -10720,42 +10720,56 @@ fn serial_host_native_root_creates_timerfd_with_live_children() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_epoll_ctl_observes_peer_pipe_write() {
-    native_descriptor_witness(None, false, true, false, false, false);
+    native_descriptor_witness(None, false, true, false, false, false, false);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_epoll_pwait_sigmask_on_a_ring_epoll_is_never_forwarded() {
+    native_descriptor_witness(None, false, false, false, false, false, true);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_netpoll_eventfd_wait() {
-    native_descriptor_witness(None, false, false, true, false, false);
+    native_descriptor_witness(None, false, false, true, false, false, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_root_pipe_zone_ceiling() {
-    native_descriptor_witness(None, true, false, false, true, false);
+    native_descriptor_witness(None, true, false, false, true, false, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_pipe_zone_ceiling() {
-    native_descriptor_witness(None, false, false, false, true, false);
+    native_descriptor_witness(None, false, false, false, true, false, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_root_pipe_zone_ofd_ceiling() {
-    native_descriptor_witness(None, true, false, false, false, true);
+    native_descriptor_witness(None, true, false, false, false, true, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_pipe_zone_ofd_ceiling() {
-    native_descriptor_witness(None, false, false, false, false, true);
+    native_descriptor_witness(None, false, false, false, false, true, false);
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
 fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
-    native_descriptor_witness(constructor, root_constructor, false, false, false, false);
+    native_descriptor_witness(
+        constructor,
+        root_constructor,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -10766,6 +10780,7 @@ fn native_descriptor_witness(
     netpoll: bool,
     zone_ceiling: bool,
     ofd_ceiling: bool,
+    epoll_sigmask: bool,
 ) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
@@ -10848,7 +10863,7 @@ fn native_descriptor_witness(
 
     // Supply an inherited, fully admitted epoll only in the control witness.
     // Constructor witnesses still have to create their object through dispatch.
-    let epoll = inherited_epoll.then(|| {
+    let epoll = (inherited_epoll || epoll_sigmask).then(|| {
         let object = owner.create_epoll().unwrap();
         let description = owner
             .admit_description(fd::Description::new(
@@ -10946,12 +10961,12 @@ fn native_descriptor_witness(
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
 
-    let run_binding = |binding: &super::native_process_runtime::NativeRecordBinding<
+    let run_binding6 = |binding: &super::native_process_runtime::NativeRecordBinding<
         AddressContext<RootGpa>,
         Aarch64ParkedContext,
     >,
-                       nr: u64,
-                       args: [u64; 4]|
+                        nr: u64,
+                        args: [u64; 6]|
      -> (CompletionRoute, i64) {
         let mut cpu = crate::sched::FakeCpu {
             // Keep the timerfd past-deadline witness independent of defaults.
@@ -10980,6 +10995,8 @@ fn native_descriptor_witness(
         frame.x[1] = args[1];
         frame.x[2] = args[2];
         frame.x[3] = args[3];
+        frame.x[4] = args[4];
+        frame.x[5] = args[5];
         carrick_test_support::assert_guest_args(&args);
         let route = super::dispatch::dispatch_syscall_with_native(
             &mut frame,
@@ -11003,6 +11020,15 @@ fn native_descriptor_witness(
             |_| core::ptr::null_mut(),
         );
         (route, frame.x[0] as i64)
+    };
+    let run_binding = |binding: &super::native_process_runtime::NativeRecordBinding<
+        AddressContext<RootGpa>,
+        Aarch64ParkedContext,
+    >,
+                       nr: u64,
+                       args: [u64; 4]|
+     -> (CompletionRoute, i64) {
+        run_binding6(binding, nr, [args[0], args[1], args[2], args[3], 0, 0])
     };
 
     let run_in_child_full = |idx: usize, nr: u64, args: [u64; 4]| {
@@ -11346,6 +11372,136 @@ fn native_descriptor_witness(
                 .iter()
                 .all(|count| count.load(Ordering::Relaxed) == 0)
         );
+        return;
+    }
+
+    if epoll_sigmask {
+        // #1671: libuv's `uv__io_poll` calls `epoll_pwait` with a SIGPROF
+        // mask. Two live tasks share one ring epoll (inherited across fork):
+        // child 0 waits with the mask while child 1 makes the pipe readable.
+        // The call must never be forwarded: the host has no such descriptor.
+        use carrick_el1_abi::IpcLeave;
+        use carrick_personality_linux::crossing::nr as sys;
+        let pwait = sys::EPOLL_PWAIT.raw();
+        let forwarded = || counters.forwarded[pwait as usize].load(Ordering::Relaxed);
+        let sigmask_leaves =
+            || counters.ipc_leaves[IpcLeave::EpollSigmask as usize].load(Ordering::Relaxed);
+        let sigprof = 1u64 << (27 - 1);
+        let mask = carrick_test_support::GuestUserBuffer::from_bytes(&sigprof.to_le_bytes());
+        let cookie = 0x1671_0000_0000_0001u64;
+        let mut interest = [0u8; 16];
+        interest[..4].copy_from_slice(&carrick_abi::LINUX_EPOLLIN.to_ne_bytes());
+        interest[8..].copy_from_slice(&cookie.to_ne_bytes());
+        let interest = carrick_test_support::GuestUserBuffer::from_bytes(&interest);
+        let events = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 16]);
+        let forever = u64::from(u32::MAX); // timeout -1
+        let control = |binding: &super::native_process_runtime::NativeRecordBinding<
+            AddressContext<RootGpa>,
+            Aarch64ParkedContext,
+        >| {
+            let address = fixture
+                .zone
+                .record(binding.record.id)
+                .identity()
+                .control_slot;
+            assert_ne!(address, 0);
+            // SAFETY: the live zone record retains its published control slot.
+            unsafe {
+                &*(address as *const carrick_personality_linux::abi::thread::ThreadControlSlot)
+            }
+        };
+        let (waiter, writer) = (&child_bindings[0], &child_bindings[1]);
+        let waiter_control = control(waiter);
+        let original = waiter_control.blocked();
+        let in_ring = |(route, result): (CompletionRoute, i64)| {
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "epoll_pwait with a sigmask must be served in ring, got {route:?} ({result}); \
+                 forwarded epoll_pwait {}, IpcLeave::EpollSigmask {}",
+                forwarded(),
+                sigmask_leaves()
+            );
+            result
+        };
+        assert_eq!(
+            in_ring(run_binding6(
+                waiter,
+                sys::EPOLL_CTL.raw(),
+                [6, carrick_abi::LINUX_EPOLL_CTL_ADD, 3, interest.arg(), 0, 0]
+            )),
+            0
+        );
+        // A size other than 8 is EINVAL, in ring, before any wait.
+        assert_eq!(
+            in_ring(run_binding6(
+                waiter,
+                pwait,
+                [6, events.arg(), 1, forever, mask.arg(), 4]
+            )),
+            -22
+        );
+        // Nothing ready, zero timeout: served with the mask untouched.
+        assert_eq!(
+            in_ring(run_binding6(
+                waiter,
+                pwait,
+                [6, events.arg(), 1, 0, mask.arg(), 8]
+            )),
+            0
+        );
+        assert_eq!(waiter_control.blocked(), original);
+        assert!(!waiter_control.forwarded_wait_mask_armed());
+
+        // Nothing ready, no timeout: the wait parks in ring under the mask.
+        task.linux.mark_pending_host_work();
+        let (route, _) = run_binding6(waiter, pwait, [6, events.arg(), 1, forever, mask.arg(), 8]);
+        assert_eq!(
+            route,
+            CompletionRoute::Suspended,
+            "a ring epoll with a sigmask must park in ring (forwarded {}, sigmask leaves {})",
+            forwarded(),
+            sigmask_leaves()
+        );
+        assert_eq!(forwarded(), 0);
+        assert_eq!(sigmask_leaves(), 0);
+        assert!(waiter_control.forwarded_wait_mask_armed());
+        assert_eq!(waiter_control.blocked().0, sigprof);
+
+        // The peer task makes the member readable; the waiter re-enters the
+        // same call, harvests the event and has its own mask back.
+        activate_target(source, &task, writer);
+        let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"peer");
+        assert_eq!(
+            in_ring(run_binding(
+                writer,
+                sys::WRITE.raw(),
+                [4, payload.arg(), 4, 0]
+            )),
+            4
+        );
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, writer.record.id)
+                .is_queued()
+        );
+        activate_target(source, &task, waiter);
+        assert_eq!(
+            in_ring(run_binding6(
+                waiter,
+                pwait,
+                [6, events.arg(), 1, forever, mask.arg(), 8]
+            )),
+            1
+        );
+        assert_eq!(
+            u64::from_ne_bytes(events.as_bytes()[8..16].try_into().unwrap()),
+            cookie
+        );
+        assert!(!waiter_control.forwarded_wait_mask_armed());
+        assert_eq!(waiter_control.blocked(), original);
+        assert_eq!(forwarded(), 0);
+        assert_eq!(sigmask_leaves(), 0);
         return;
     }
 
