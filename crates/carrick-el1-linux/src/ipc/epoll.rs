@@ -40,8 +40,9 @@
 //! reports `Changed`.
 
 use super::{
-    EL1_WAIT, Finish, IpcExecution, IpcServed, IpcVenue, Parked, UserCopy, arg, finish, leave,
-    linux, mm_key, notify_operation_release, park, release_pin, set_result, snapshot, task_key,
+    EL1_WAIT, Finish, IpcExecution, IpcServed, IpcVenue, Parked, UserCopy, argument_word, finish,
+    leave, linux, mm_key, notify_operation_release, park, release_pin, set_result, snapshot,
+    task_key,
 };
 use crate::dispatch::GuestDispatchFrame;
 use carrick_el1_abi::IpcLeave;
@@ -135,24 +136,24 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
     interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
     // epoll_pwait(2) checks the mask argument before the set.
-    let sigmask = if wait.is_some() || arg(frame, 4) == 0 {
+    let sigmask = if wait.is_some() || argument_word(frame, 4) == 0 {
         // Resumption uses the already-armed slot, never user memory again.
         None
-    } else if arg(frame, 5) != SIGSET_BYTES as u64 {
+    } else if argument_word(frame, 5) != SIGSET_BYTES as u64 {
         return returned(frame, linux::EINVAL);
     } else {
         let mut bytes = [0u8; SIGSET_BYTES];
-        if !user.copy_in(&mut bytes, arg(frame, 4)) {
+        if !user.copy_in(&mut bytes, argument_word(frame, 4)) {
             // The host resolves a first touch, or reports EFAULT.
             return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
         }
         Some(u64::from_le_bytes(bytes))
     };
-    let maxevents = i64::from(arg(frame, 2) as i32);
+    let maxevents = i64::from(argument_word(frame, 2) as i32);
     if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
         return returned(frame, linux::EINVAL);
     }
-    let wait = wait.unwrap_or_else(|| match arg(frame, 3) as i32 {
+    let wait = wait.unwrap_or_else(|| match argument_word(frame, 3) as i32 {
         0 => Wait::Poll,
         ms if ms < 0 => Wait::Forever,
         // Round up by one tick: the wait lasts at least `ms` (epoll_wait(2)).
@@ -169,7 +170,7 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
         return leave(sched, IpcLeave::NoTable, IpcServed::Forward);
     };
     let table = TableId::from_raw(table);
-    let fd = Fd(arg(frame, 0) as i32);
+    let fd = Fd(argument_word(frame, 0) as i32);
     let fda = region.fd(EL1_WAIT);
     match fda.get(table, fd) {
         Ok(snapshot) if epoll_of(snapshot.backing).is_some() => {}
@@ -187,8 +188,8 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
         object,
         task: task_key(task),
         mm: mm_key(task),
-        buf: IpcUserVa(arg(frame, 1)),
-        orig_x0: arg(frame, 0),
+        buf: IpcUserVa(argument_word(frame, 1)),
+        orig_x0: argument_word(frame, 0),
         nr: SYS_EPOLL_PWAIT as u32,
         ..IpcOperation::EMPTY
     };
@@ -218,7 +219,7 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
     if let Wait::Until(deadline) = wait {
         op.deadline = IpcCounterDeadline::at(deadline);
     }
-    let buf = arg(frame, 1);
+    let buf = argument_word(frame, 1);
     let limit = usize::try_from(maxevents).map_or(BATCH, |n| n.min(BATCH));
     loop {
         // Before the harvest: an item queued after it moves this snapshot.
