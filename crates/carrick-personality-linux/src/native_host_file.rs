@@ -250,6 +250,22 @@ pub const LINUX_MAP_PRIVATE: u64 = 0x02;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 
 impl HostFileCall {
+    /// These native-child mutations reuse host syscall cores. The initial
+    /// task keeps its existing host-task route and publication authority.
+    pub const fn uses_child_mutation_venue(self) -> bool {
+        matches!(
+            self,
+            Self::Mkdirat { .. }
+                | Self::Unlinkat { .. }
+                | Self::Symlinkat { .. }
+                | Self::Linkat { .. }
+                | Self::Renameat { .. }
+                | Self::Utimensat { .. }
+                | Self::Truncate { .. }
+                | Self::Ftruncate { .. }
+        )
+    }
+
     /// Decode a canonical syscall the venue may serve. `None` for every
     /// other call, which keeps its existing in-ring or unrouted handling.
     pub fn decode(canonical: CanonicalNr, args: &[u64; 6]) -> Option<Self> {
@@ -986,10 +1002,13 @@ fn stage_call(
                 Path::Bytes(path) => path,
                 Path::Stage(stage) => return Some(stage),
             };
-            let new = match staging.path_input(user, newdirfd, newpath)? {
-                Ok(path) => path,
-                Err(stage) => return Some(stage),
+            let new = match copy_path(user, newpath) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
             };
+            if new.is_empty() {
+                return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
+            }
             if old.is_empty() {
                 return Some(errno(if flags & u64::from(LINUX_AT_EMPTY_PATH) != 0 {
                     carrick_syscall_abi::LINUX_ENOSYS
@@ -998,6 +1017,9 @@ fn stage_call(
                 }));
             }
             if let Some(answer) = staging.path_base(olddirfd, &old)? {
+                return Some(answer);
+            }
+            if let Some(answer) = staging.path_base(newdirfd, &new)? {
                 return Some(answer);
             }
             staging.request(
@@ -1486,11 +1508,11 @@ pub fn complete(
 }
 
 /// Stamp a staged `Write` record with its writer's own `RLIMIT_FSIZE` soft
-/// limit (`args[0]`, `u64::MAX` unlimited), which only the ring that owns
-/// the writer's limits knows. The carrier writes a regular file only for an
-/// unlimited writer, so an unstamped record (0) fails closed. Any other
-/// record is left as staged, and `soft_limit` is consulted only for a
-/// `Write`.
+/// limit (`args[0]` for Write, `args[1]` for Truncate/Ftruncate,
+/// `u64::MAX` unlimited), which only the caller's ring owns. The carrier
+/// grows a regular file only for an unlimited caller, so an unstamped
+/// record (0) fails closed. Other records remain as staged and never
+/// consult `soft_limit`.
 pub fn stamp_write_file_size_limit<E>(
     record: &mut [u8],
     soft_limit: impl FnOnce() -> Result<u64, E>,
