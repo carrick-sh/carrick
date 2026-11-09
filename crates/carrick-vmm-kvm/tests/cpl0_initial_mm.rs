@@ -1839,6 +1839,74 @@ fn in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle() {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// #1877 on x86: the shared poll/select owner must park a blocked `ppoll`
+/// or `poll` on a not-ready zone pipe and wake it on another task's write.
+/// The child sleeps 50 ms, then writes one byte; the parent must return 1
+/// with `revents == POLLIN` and its `fd`/`events` intact, then reap the
+/// child. The same source runs natively first as the oracle. Exit codes
+/// name the failed stage (see `native_pipe_poll_wake.S`).
+///
+/// x86 does not reach #1877's retained zone poll owner: CPL0 dispatches
+/// without a `Zone` or ARM frame, so `ipc_poll_transfer` leaves the call
+/// unrouted. The writer-close variants pass on main and on #1880 alike
+/// and guard that path. The write variants are red on both: the child's
+/// `write` on a zone pipe has no x86 ring IPC venue (#1756) and is refused
+/// for lacking a host task context.
+fn zone_pipe_poll_wake(flags: &[&str]) {
+    let elf = native_exit_fixture_with_flags("native_pipe_poll_wake.S", flags);
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    std::fs::write(&oracle, &elf).expect("native oracle ELF");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o700))
+        .expect("executable oracle");
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .status()
+        .expect("bounded native oracle");
+    assert_eq!(native.code(), Some(7), "native oracle: {native:?}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(try_run_pool_fixture_with_root_affinity(
+            &elf,
+            256,
+            ROOT_AFFINITY_IDLE_PEER,
+        ));
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("blocked zone pipe poll must complete, not hang")
+        .expect("zone pipe poll run");
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "stdout {:?} stderr {:?}",
+        outcome.run.stdout, outcome.run.stderr
+    );
+}
+
+#[test]
+#[ignore = "#1756: x86 has no ring IPC venue for the child's zone pipe write"]
+fn zone_pipe_ppoll_blocks_until_peer_write_and_preserves_pollfd() {
+    zone_pipe_poll_wake(&[]);
+}
+
+#[test]
+#[ignore = "#1756: x86 has no ring IPC venue for the child's zone pipe write"]
+fn zone_pipe_poll_blocks_until_peer_write_and_preserves_pollfd() {
+    zone_pipe_poll_wake(&["-DUSE_POLL"]);
+}
+
+#[test]
+fn zone_pipe_ppoll_blocks_until_last_writer_closes() {
+    zone_pipe_poll_wake(&["-DWAKE_BY_CLOSE"]);
+}
+
+#[test]
+fn zone_pipe_poll_blocks_until_last_writer_closes() {
+    zone_pipe_poll_wake(&["-DUSE_POLL", "-DWAKE_BY_CLOSE"]);
+}
+
 fn private_file_fixture(cow: bool) {
     private_file_fixture_with(cow, &[], 0);
 }
