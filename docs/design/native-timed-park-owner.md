@@ -162,22 +162,13 @@ witness checks the join obligation.
 
 ## Nanosleep and #1836
 
-Native nanosleep intentionally stays red here: it requires the retained sleep
-operation and wire protocol implemented by #1836, rather than a bounded
-addition to the futex timeout result owner. The exact proposed continuation is
-to carry #1836's non-Copy `NativeSleep` through arm/cancel ACK, retain clock id,
-absolute/relative mode, original deadline and remaining-time output, and bind
-its resource timer delivery to the shared deadline driver. A scalar futex
-return cannot represent interruption output or a clock-change subscription.
-No edits to crossing.rs or the ring-first flip table are proposed in this PR;
-any routing change is director-owned. Clock_nanosleep and pselect remain
-crossings too.
-
-#1836 is **partly absorbed** at the driver-mechanism level only: the shared
-Condvar worker here is reusable by its clock service, while its sleep owner,
-wire protocol and clock subscriptions are not imported. Its current synthetic
-address/native_service wake channel is not used for futex timeout completion.
-When integrating the two PRs, add a runtime target adapter over its kernel clock service (no kernel to
-runtime dependency), adapt its timer hub to this shared driver, and reconcile the ABI hash and overlapping zone code; do not retain two workers
-for the same carrier deadline heap. This PR makes no native nanosleep success
-claim.
+Implemented by #1836 on this owner. A native child's sleep is the
+`rt_sigtimedwait` member wait with nothing to wait for: it parks with
+`PendingSignalKind::Sleep`, leases its record's timer node through
+`arm_park_timer`, and therefore uses this note's departure transfer and
+carrier deadline driver unchanged. The scalar timeout result is 0; the
+resumed owner re-checks the deadline, then a deliverable signal (EINTR with
+the exact-MM `rem` copy), then re-parks. The clock-resource sleep
+subscription and its host worker were removed, so one owner serves every
+native timed park. `crossing.rs` keeps nanosleep/clock_nanosleep as
+Permanent crossings for the run root only; children never reach them.

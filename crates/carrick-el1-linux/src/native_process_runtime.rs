@@ -5,7 +5,6 @@ extern crate alloc;
 mod futex;
 mod service;
 pub use futex::private_anonymous_futex_mapping;
-pub use service::sleep::{NativeSleep, SleepCompletion, SleepProgress, SleepRequest};
 pub(crate) mod thread_stock;
 use super::{
     native_fork_refusal::{NativeForkStage, at_busy_site, busy},
