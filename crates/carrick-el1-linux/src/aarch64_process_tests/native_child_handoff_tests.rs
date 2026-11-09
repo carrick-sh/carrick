@@ -211,6 +211,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
                     task,
                     &crate::file::HardwareValidator,
                     [5, 1, 0],
+                    carrick_core_abi::service::ServiceOrigin::Descendant,
                     |fd| {
                         assert_eq!(fd, 1);
                         Some(NativeDescriptor::HostBacked {
