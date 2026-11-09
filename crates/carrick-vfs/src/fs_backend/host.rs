@@ -1018,6 +1018,7 @@ struct ScratchWorker {
     /// Read only by the macOS volume verdict and tests.
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     /// Signalled (under the lock) after each item's progress bump, so a
     /// caller facing a full queue blocks until the worker moves on.
     slot_freed: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
