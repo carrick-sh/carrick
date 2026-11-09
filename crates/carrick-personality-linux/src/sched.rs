@@ -53,13 +53,18 @@ impl FutexCall {
     }
 }
 
-/// Whether AArch64 `ordinal` with these argument registers is a call the
-/// ring's futex family owns: an admitted private wake or wait ([`serve_futex`]
-/// serves it, and a wake always finishes there). Its decline is an
-/// invariant break for a task with no host route, never an unported call
-/// (#1941: a fork child's declined wake was answered a counted ENOSYS).
+/// Whether AArch64 `ordinal` with these argument registers is a futex call
+/// the ring guarantees to finish: an admitted private wake, which
+/// [`serve_futex`] always serves ([`FutexVenue::wake`] has no decline). Its
+/// forward is an invariant break for a task with no host route, never an
+/// unported call (#1941: a fork child's declined wake was answered a
+/// counted ENOSYS). An admitted wait is not covered: it may still decline
+/// (a timed wait where the venue refuses one, an exhausted futex-entry
+/// pool) and keeps the counted refusal.
 pub fn ring_owned_futex(ordinal: carrick_guest_arch::NativeOrdinal, args: [u64; 6]) -> bool {
-    ordinal.raw() == SYS_FUTEX as u64 && FutexCall { args }.admitted()
+    ordinal.raw() == SYS_FUTEX as u64
+        && matches!(args[1], FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE)
+        && FutexCall { args }.admitted()
 }
 
 /// Custody of the original expiry while the futex operand waits for its owner.

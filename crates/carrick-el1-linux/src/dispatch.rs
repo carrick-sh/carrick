@@ -777,8 +777,9 @@ pub(super) enum NativeUnstagedExit {
     Refused(Action),
     /// Park on this operation for the carrier.
     Operation(carrick_core_abi::service::ServiceOperation),
-    /// A ring-owned family declined an admitted call of a task with no host
-    /// route: no server exists for its forward. Fatal
+    /// A ring-owned family forwarded a call it guarantees to finish (an
+    /// admitted futex wake) for a task with no host route: no server exists
+    /// for its forward. Fatal
     /// ([`NativeInvariant::OwnedFamilyForward`]), never a silent errno.
     OwnedFamilyForward,
     /// No operation describes this boundary: the entry keeps its action.
@@ -801,9 +802,10 @@ pub(super) fn native_unstaged_exit(
         && (frame.esr >> 26) & 0x3f == 0x15
         && unclaimed_native_syscall(owner()) == UnclaimedNativeSyscall::CountedEnosys
     {
-        // The counted ENOSYS answers an unported call. A family the ring
-        // owns never forwards its admitted calls (a futex wake always
-        // finishes in ring); one that did would lose the call (#1941).
+        // The counted ENOSYS answers an unported call or a declined one. An
+        // admitted futex wake always finishes in ring; a forward of one
+        // would lose the wake (#1941). A futex wait may decline and keeps
+        // the counted refusal.
         let mut args = [0; 6];
         args.copy_from_slice(&frame.x[..6]);
         if carrick_personality_linux::sched::ring_owned_futex(
@@ -5385,14 +5387,14 @@ mod tests {
         assert_eq!(counters.refused[281].load(Ordering::Relaxed), 1);
     }
 
-    /// #1941: a fork child's admitted private futex call belongs to the
-    /// ring's futex family, which never forwards it (a wake always finishes
-    /// in ring). A forward of one reaching the final capture is the typed
-    /// invariant break, never the counted ENOSYS that lost the child's wake;
-    /// an unported futex operation keeps the counted ENOSYS, and a root
-    /// keeps its host route.
+    /// #1941: a fork child's admitted private futex wake always finishes in
+    /// ring. A forward of one reaching the final capture is the typed
+    /// invariant break, never the counted ENOSYS that lost the child's wake.
+    /// An admitted wait may legitimately decline (timed while switched in,
+    /// exhausted entry pool) and keeps the counted ENOSYS, as does an
+    /// unported futex operation; a root keeps its host route.
     #[test]
-    fn native_fork_child_owned_futex_forward_is_an_invariant_break() {
+    fn native_fork_child_futex_wake_forward_is_an_invariant_break() {
         use super::super::native_process_runtime::NativeThreadGroupOwner;
         use carrick_core_abi::service::ServiceOperation;
         use carrick_personality_linux::sched::{
@@ -5415,7 +5417,6 @@ mod tests {
         for mut frame in [
             futex(FUTEX_WAKE_PRIVATE, 1, 0),
             futex(FUTEX_WAKE_BITSET_PRIVATE, 1, u64::from(u32::MAX)),
-            futex(FUTEX_WAIT_PRIVATE, 1, 0),
         ] {
             let counters = Counters::new();
             assert_eq!(
@@ -5445,22 +5446,25 @@ mod tests {
             Some(carrick_el1_abi::EntryBindingFatalReason::OwnedFamilyForward)
         );
 
-        // An operation the family does not serve (FUTEX_REQUEUE_PRIVATE)
-        // is unported: the counted ENOSYS stays its answer.
-        let counters = Counters::new();
-        let mut frame = futex(128 | 3, 1, 0);
-        assert_eq!(
-            native_unstaged_exit(
-                &mut frame,
-                &task.linux,
-                Action::Forward,
-                || NativeThreadGroupOwner::ForkChild,
-                &counters,
-            ),
-            NativeUnstagedExit::Refused(Action::Served)
-        );
-        assert_eq!(frame.x[0] as i64, -38);
-        assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 1);
+        // An admitted wait's decline and an operation the family does not
+        // serve (FUTEX_REQUEUE_PRIVATE) keep the counted ENOSYS.
+        for op in [FUTEX_WAIT_PRIVATE, 128 | 3] {
+            let counters = Counters::new();
+            let mut frame = futex(op, 1, 0);
+            assert_eq!(
+                native_unstaged_exit(
+                    &mut frame,
+                    &task.linux,
+                    Action::Forward,
+                    || NativeThreadGroupOwner::ForkChild,
+                    &counters,
+                ),
+                NativeUnstagedExit::Refused(Action::Served),
+                "op {op:#x}"
+            );
+            assert_eq!(frame.x[0] as i64, -38);
+            assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 1);
+        }
 
         // A root keeps its host route for the same call.
         let counters = Counters::new();

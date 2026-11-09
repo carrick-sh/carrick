@@ -331,9 +331,15 @@ is unlinked under the bucket lock, and it goes to the carrier completion
 chain; the host boundary the waker then owes unlinks its other entries and
 hands it to its continuation with the index that fired. `wake_word` and the
 Linux `FutexVenue::wake` return a `Served`, so a decline cannot be written.
-The final capture treats a forward of an admitted private futex call from a
-task with no host route as `EntryBindingFatalReason::OwnedFamilyForward`,
-never a counted ENOSYS; unported futex operations keep the counted ENOSYS.
+The final capture treats a forward of an admitted private futex wake
+(`FUTEX_WAKE_PRIVATE`, `FUTEX_WAKE_BITSET_PRIVATE`) from a task with no host
+route as `EntryBindingFatalReason::OwnedFamilyForward`, never a counted
+ENOSYS. Only wakes are guarded, because only a wake is guaranteed to finish
+in ring. An admitted wait may still decline: a switched-in fork child's timed
+`FUTEX_WAIT_PRIVATE` (timed waits are not admitted there) and an untimed wait
+that finds the futex-entry pool exhausted both return no completion. Such a
+decline, like an unported futex operation, keeps the counted ENOSYS, exactly
+as on main.
 
 Witnesses:
 
@@ -344,9 +350,14 @@ Witnesses:
   waiter on its busy vCPU with one SGI.
 - `an_el1_futex_wake_always_finishes_in_ring`: busy pinned, stopped pinned and
   two-futex waiters, each served by `wake_word`.
-- `native_fork_child_owned_futex_forward_is_an_invariant_break`: the typed
-  fatal for admitted wakes and waits; ENOSYS for `FUTEX_REQUEUE`; the host
-  route for a root.
+- `native_fork_child_futex_wake_forward_is_an_invariant_break`: the typed
+  fatal for admitted wakes; ENOSYS for an admitted wait's forward and for
+  `FUTEX_REQUEUE`; the host route for a root.
+- `forked_child_timed_futex_wait_decline_stays_a_counted_refusal` and
+  `forked_child_futex_wait_on_an_exhausted_entry_pool_stays_a_counted_refusal`
+  (red on `38fc414d5`: `OwnedFamilyForward`): a real fork child's declined
+  waits through `dispatch_arm_syscall_with_native_process` and
+  `native_unstaged_exit` stay `Refused(Served)` with one counted refusal.
 - `carrick-sched-core`: `el1_queues_a_pinned_thread_on_its_busy_cpu`,
   `el1_honours_affinity_for_floating_threads`,
   `el1_hands_a_multi_entry_waiter_to_its_host_continuation` and
