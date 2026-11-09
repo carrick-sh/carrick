@@ -1620,6 +1620,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 ._custody
                 .lock()
                 .map_err(|_| fail("physical custody poisoned"))?;
+            let accepted = served.is_ok();
             self.cpu.with_idle_peer_io(|io| {
                 let lease = StoppedCpuLease {
                     cpu: carrick_guest_arch::CpuId::new(1),
@@ -1627,6 +1628,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 };
                 custody.finish_native_host_file(&lease, *pending, served)
             })?;
+            if accepted {
+                custody.idle_peer_host_files = custody
+                    .idle_peer_host_files
+                    .checked_add(1)
+                    .ok_or_else(|| fail("idle peer host-file counter exhausted"))?;
+            }
         }
         if let Some((served, doorbell)) = work_flags {
             on_work(served, doorbell);
@@ -2387,6 +2394,15 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody.idle_peer_forwards)
     }
 
+    /// Authenticated host-file requests completed on the idle peer (CPU 1).
+    pub fn idle_peer_host_file_witness(&self) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.idle_peer_host_files)
+    }
+
     pub fn anonymous_private_pages(&self) -> Result<u64, TrapError> {
         let custody = self
             .custody
@@ -2630,6 +2646,7 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     /// Host forwards captured from a task stopped on the idle peer (CPU 1),
     /// so a fixture can prove where EL1 placed the forwarding task.
     idle_peer_forwards: u64,
+    idle_peer_host_files: u64,
     host_yields: u64,
     kicks: u64,
     work_exits: u64,
@@ -4039,6 +4056,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             initial_sources: None,
             host_forwards: 0,
             idle_peer_forwards: 0,
+            idle_peer_host_files: 0,
             host_yields: 0,
             kicks: 0,
             work_exits: 0,

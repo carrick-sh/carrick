@@ -1638,9 +1638,9 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
         .expect("parent survives child file-table retirement");
 }
 
-/// #143: the forked child's SyscallTrap stops the idle peer (CPU 1) and is
-/// handed back to the host. Root affinity 2 makes EL1 queue the inherited
-/// child only on CPU 1, so the idle-peer lane, not a timing race, serves it.
+/// #143: the forked child's retained host-file write is served on CPU 1.
+/// Root affinity 2 makes EL1 queue the inherited child only on CPU 1, so
+/// the idle-peer lane, not a timing race, serves it.
 #[test]
 fn idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
     let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
@@ -1649,12 +1649,12 @@ fn idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
     assert_eq!(outcome.run.exit_code, 7);
     assert_eq!(outcome.run.stdout, b"E");
     assert!(outcome.run.stderr.is_empty());
-    assert!(
+    assert_eq!(
         outcome
             .physical
-            .idle_peer_forward_witness()
-            .expect("idle peer forward witness")
-            >= 1,
+            .idle_peer_host_file_witness()
+            .expect("idle peer host-file witness"),
+        1,
         "the child's write must be served from the idle peer"
     );
 }
