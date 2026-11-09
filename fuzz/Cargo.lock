@@ -537,6 +537,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-core",
  "carrick-core-abi",
+ "carrick-fd-core",
  "carrick-guest-arch",
  "carrick-personality-api",
  "carrick-sched-core",
