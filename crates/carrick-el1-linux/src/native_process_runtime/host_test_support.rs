@@ -1846,6 +1846,7 @@ fn native_clock_sample_retains_reply_across_copyout_busy() {
                 carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record)
                     .unwrap(),
                 &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
             )
             .unwrap();
         // SAFETY: the fixture retains the exact member under its service queue.

@@ -582,7 +582,9 @@ pub fn wake_native_sleep_channel(channel: carrick_core_abi::clock::ClockSleepCha
             incarnation: channel.record_generation,
         };
         if let Some(key) = carrick_sched_core::object_wait::ObjectWaitKey::native_service(record)
-            && let Ok(queue) = zone.object_wait(key, &HostLockWait)
+            && let Ok(queue) = zone.object_wait(key, &HostLockWait, &|owned| {
+                complete_object_wake(owned.zone(), owned)
+            })
         {
             let mut delivery = ObjectWakeDelivery::new();
             let ObjectWakeDelivery { handed, len, slots } = &mut delivery;
