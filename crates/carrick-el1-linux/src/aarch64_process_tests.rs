@@ -14659,6 +14659,187 @@ std::thread_local! {
     };
 }
 
+#[test]
+fn arm_kill_nonleader_prefers_named_member_and_keeps_blocked_fallback() {
+    for blocked in [false, true] {
+        arm_kill_nonleader_recipient(blocked);
+    }
+}
+
+fn arm_kill_nonleader_recipient(blocked: bool) {
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
+    };
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    let fixture: &'static Fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let initial = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            initial,
+        )
+        .unwrap(),
+    );
+    let owner_registry = registry();
+    owner_registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let waiter = fixture
+        .zone
+        .record_ref(fixture.zone.slot(fixture.slot).host_record().unwrap());
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, waiter.id)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        waiter.id
+    );
+    let mut service = fixture.process_service();
+    {
+        let mut entry = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                &initial,
+                &mut service,
+            )
+            .unwrap();
+        entry
+            .rt_sigaction(
+                Signal::from_number(10).unwrap(),
+                Some(Action {
+                    disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+    }
+    let control = host_born_sibling(fixture, 42);
+    run_as_leader(fixture);
+    let sender_task: &'static CurrentTask = Box::leak(Box::new(CurrentTask::new()));
+    sender_task.set(
+        El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+        5,
+    );
+    sender_task.mm.key.store(1, Ordering::Release);
+    sender_task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    sender_task.publish_visible_pid(41);
+    sender_task.publish_root_generation(fixture.address.generation);
+    sender_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    let sender_slot = SlotId::new(1);
+    fixture.zone.drive(sender_slot, 2);
+    fixture.zone.publish_slot(sender_slot, 1, Some(0), 1);
+    fixture.zone.enter_guest(sender_slot);
+    fixture.zone.install_space(sender_slot, 1).unwrap();
+    let sender_record = fixture
+        .zone
+        .current_or_new(
+            sender_slot,
+            ThreadIdentity {
+                tid: 42,
+                serial: 102,
+                mm: 1,
+                file_table: 5,
+                generation: 12,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: fixture.page as *const _ as u64,
+                control_slot: control as *const _ as u64,
+            },
+        )
+        .unwrap();
+    control.bind_zone_record(fixture.zone.record_ref(sender_record));
+    let sender_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: sender_slot,
+    };
+    owner_registry
+        .register_thread(
+            sender_source,
+            sender_task,
+            fixture.address,
+            fixture.page,
+            control,
+        )
+        .unwrap();
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(sender_slot, sender_record)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(sender_slot).unwrap().record,
+        sender_record
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+
+    let signal = Signal::from_number(10).unwrap();
+    if blocked {
+        control.init_blocked(carrick_el1_abi::BlockedMask(signal.bit()));
+    }
+    fixture.zone.slot(fixture.slot).set_sgi_target(0x1000);
+    fixture.zone.slot(sender_slot).set_sgi_target(0x2000);
+    crate::sched::object_wait::clear_test_wake_trace();
+    let mut entry = runtime
+        .enter_registered(
+            owner_registry,
+            source,
+            &fixture.task,
+            fixture.address,
+            &initial,
+            &mut service,
+        )
+        .unwrap();
+    entry
+        .kill(
+            SignalProcessSelector::from_abi(42),
+            SignalRequest::Deliver(signal),
+            SignalInfo::Generated(None),
+        )
+        .unwrap();
+    let (slot, target) = if blocked {
+        (fixture.slot, 0x1000)
+    } else {
+        (sender_slot, 0x2000)
+    };
+    assert_eq!(
+        crate::sched::object_wait::test_wake_trace(),
+        [(slot, target)],
+        "one eligible recipient: named member first, sibling when blocked"
+    );
+    // A tkill substitution would leave this pending signal private to the
+    // named sibling. Blocking the caller now must expose shared custody.
+    fixture
+        .control
+        .init_blocked(carrick_el1_abi::BlockedMask(signal.bit()));
+    assert_eq!(
+        entry.rt_sigpending(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::EMPTY.with(signal),
+        )),
+        signal.bit(),
+        "kill retains process-pending custody visible to another member"
+    );
+}
+
 #[cfg(test)]
 #[test]
 fn tgkill_during_futex_enrollment_returns_eintr() {
