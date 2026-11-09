@@ -34,7 +34,8 @@ fn link_matches(expected: &[u8]) -> Result<(), i32> {
 }
 
 // Failure record after an `X` byte on a report pipe: holder pid (i32 LE),
-// kind (`e` errno payload i32 LE, `l` link bytes), payload length (u16 LE),
+// kind (`e` readlink errno, `x` execve errno, both i32 LE; `l` link bytes),
+// payload length (u16 LE),
 // payload. The observer prints it; the participant's stderr is not captured.
 const FAILURE_HEADER: usize = 7;
 const FAILURE_PAYLOAD_MAX: usize = 4096;
@@ -219,8 +220,13 @@ fn read_failure(fd: i32) -> String {
         return format!("holder pid={pid}: truncated failure detail");
     }
     match header[4] {
-        b'e' if payload.len() == 4 => format!(
-            "participant pid={pid} errno={}",
+        b'e' | b'x' if payload.len() == 4 => format!(
+            "participant pid={pid} {} errno={}",
+            if header[4] == b'x' {
+                "execve failed"
+            } else {
+                "readlinkat(/proc/self/exe) failed"
+            },
             i32::from_le_bytes(payload[..4].try_into().unwrap())
         ),
         b'l' => format!(
@@ -429,7 +435,7 @@ fn start(path: &CStr, expected: &str) -> (i32, i32, i32) {
             err_bytes(b"holder execve failed errno=");
             err_number(errno() as i64);
             err_bytes(b"\n");
-            send_failure(output[1], b'e', &errno().to_le_bytes());
+            send_failure(output[1], b'x', &errno().to_le_bytes());
             libc::_exit(120);
         }
     }
