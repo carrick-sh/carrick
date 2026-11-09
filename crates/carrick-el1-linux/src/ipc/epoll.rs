@@ -40,11 +40,11 @@
 //! reports `Changed`.
 
 use super::{
-    EL1_WAIT, Finish, IpcServed, IpcVenue, Parked, Sched, ThreadCpu, UserCopy, UserWord, finish,
-    leave, linux, mm_key, notify_operation_release, park, release_pin, snapshot, task_key,
+    EL1_WAIT, Finish, IpcExecution, IpcServed, IpcVenue, Parked, UserCopy, arg, finish, leave,
+    linux, mm_key, notify_operation_release, park, release_pin, set_result, snapshot, task_key,
 };
+use crate::dispatch::GuestDispatchFrame;
 use carrick_el1_abi::IpcLeave;
-use carrick_el1_abi::TrapFrame;
 use carrick_el1_abi::ipc::epoll::{EpollItemRef, EpollReport};
 use carrick_el1_abi::ipc::fd::{Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::WaitFor;
@@ -87,9 +87,9 @@ enum Wait {
 /// A woken, expired or re-entered wait: retire the operation (dropping its
 /// pin), then serve the call from its original registers with what is left
 /// of its wait.
-pub(super) fn resume<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+pub(super) fn resume<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     token: IpcOpToken,
@@ -101,12 +101,12 @@ pub(super) fn resume<C: ThreadCpu, U: UserWord, M: UserCopy>(
     } else {
         op.deadline.get().map_or(Wait::Forever, Wait::Until)
     };
-    let record = sched.zone.slot(sched.slot).current();
+    let record = sched.zone().slot(sched.slot()).current();
     finish(sched, token, &venue.region);
     // A continuation keeps the accepted mask in the control slot. In
     // particular, lost readiness must re-park under that same snapshot.
     let served = serve_with(sched, frame, venue, user, Some(wait), interrupt);
-    let parked = record.is_some_and(|id| sched.zone.record(id).has_object_operation());
+    let parked = record.is_some_and(|id| sched.zone().record(id).has_object_operation());
     if !parked || matches!(served, IpcServed::Forward | IpcServed::Handback) {
         user.disarm_wait_sigmask();
     }
@@ -114,9 +114,9 @@ pub(super) fn resume<C: ThreadCpu, U: UserWord, M: UserCopy>(
 }
 
 /// Serve a fresh `epoll_pwait` (see the module docs for what forwards).
-pub(super) fn serve<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+pub(super) fn serve<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     interrupt: &mut dyn FnMut() -> bool,
@@ -126,51 +126,50 @@ pub(super) fn serve<C: ThreadCpu, U: UserWord, M: UserCopy>(
 
 /// `wait`: what is left of a resumed call's wait (`None`: a fresh call,
 /// whose timeout argument starts now).
-fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn serve_with<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     wait: Option<Wait>,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
     // epoll_pwait(2) checks the mask argument before the set.
-    let sigmask = if wait.is_some() || frame.x[4] == 0 {
+    let sigmask = if wait.is_some() || arg(frame, 4) == 0 {
         // Resumption uses the already-armed slot, never user memory again.
         None
-    } else if frame.x[5] != SIGSET_BYTES as u64 {
+    } else if arg(frame, 5) != SIGSET_BYTES as u64 {
         return returned(frame, linux::EINVAL);
     } else {
         let mut bytes = [0u8; SIGSET_BYTES];
-        if !user.copy_in(&mut bytes, frame.x[4]) {
+        if !user.copy_in(&mut bytes, arg(frame, 4)) {
             // The host resolves a first touch, or reports EFAULT.
             return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
         }
         Some(u64::from_le_bytes(bytes))
     };
-    let maxevents = i64::from(frame.x[2] as i32);
+    let maxevents = i64::from(arg(frame, 2) as i32);
     if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
         return returned(frame, linux::EINVAL);
     }
-    let wait = wait.unwrap_or_else(|| match frame.x[3] as i32 {
+    let wait = wait.unwrap_or_else(|| match arg(frame, 3) as i32 {
         0 => Wait::Poll,
         ms if ms < 0 => Wait::Forever,
         // Round up by one tick: the wait lasts at least `ms` (epoll_wait(2)).
         ms => Wait::Until(
             sched
-                .cpu
                 .now()
                 .saturating_add(sched.ticks(ms as u64 * 1_000_000))
                 .saturating_add(1),
         ),
     });
-    let task = sched.task;
+    let task = sched.task();
     let region = &venue.region;
     let Some(table) = venue.tables.table_of(task) else {
         return leave(sched, IpcLeave::NoTable, IpcServed::Forward);
     };
     let table = TableId::from_raw(table);
-    let fd = Fd(frame.x[0] as i32);
+    let fd = Fd(arg(frame, 0) as i32);
     let fda = region.fd(EL1_WAIT);
     match fda.get(table, fd) {
         Ok(snapshot) if epoll_of(snapshot.backing).is_some() => {}
@@ -188,8 +187,8 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
         object,
         task: task_key(task),
         mm: mm_key(task),
-        buf: IpcUserVa(frame.x[1]),
-        orig_x0: frame.x[0],
+        buf: IpcUserVa(arg(frame, 1)),
+        orig_x0: arg(frame, 0),
         nr: SYS_EPOLL_PWAIT as u32,
         ..IpcOperation::EMPTY
     };
@@ -219,12 +218,12 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
     if let Wait::Until(deadline) = wait {
         op.deadline = IpcCounterDeadline::at(deadline);
     }
-    let buf = frame.x[1];
+    let buf = arg(frame, 1);
     let limit = usize::try_from(maxevents).map_or(BATCH, |n| n.min(BATCH));
     loop {
         // Before the harvest: an item queued after it moves this snapshot.
         let wait = match wait {
-            Wait::Until(deadline) if sched.cpu.now() >= deadline => Wait::Poll,
+            Wait::Until(deadline) if sched.now() >= deadline => Wait::Poll,
             wait => wait,
         };
         let snap = if wait == Wait::Poll {
@@ -327,7 +326,7 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     user.disarm_wait_sigmask();
                 }
                 match region.finish_operation(token, || {
-                    notify_operation_release(region, sched.zone, sched.slot)
+                    notify_operation_release(region, sched.zone(), sched.slot())
                 }) {
                     Ok(back) => op = back,
                     Err(_) => return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
@@ -344,22 +343,22 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
     }
 }
 
-fn returned(frame: &mut TrapFrame, result: i64) -> IpcServed {
-    frame.x[0] = result as u64;
+fn returned(frame: &mut impl GuestDispatchFrame, result: i64) -> IpcServed {
+    set_result(frame, result as u64);
     IpcServed::Returned { switched: false }
 }
 
 /// No effect was taken but the pin is not one EL1 may drop: the host drops
 /// it and runs the original call.
-fn restart<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn restart<E: IpcExecution>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     op: IpcOperation,
 ) -> IpcServed {
     match venue.region.begin_operation(op) {
         Ok(token) => {
-            let served = super::handback(frame, token, op, IpcHandback::Restart, 0, venue);
+            let served = super::handback(sched, frame, token, op, IpcHandback::Restart, 0, venue);
             leave(sched, IpcLeave::Restart, served)
         }
         Err(_) => {
