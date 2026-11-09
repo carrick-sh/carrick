@@ -3568,6 +3568,8 @@ pub struct LifecycleObservation {
     pub forwards: u64,
     pub words: [u64; 8],
     pub parked_parent_result: u64,
+    /// Timer leases still held in the shared zone's timer index.
+    pub timer_nodes: usize,
 }
 
 #[cfg(test)]
