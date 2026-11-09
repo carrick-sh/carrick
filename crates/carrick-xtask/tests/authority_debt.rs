@@ -3583,3 +3583,45 @@ fn raw_owner_wait_census_counts_producers_across_moves_and_excludes_fixtures() {
         assert_eq!(sites[0].lane, Lane::Shared);
     }
 }
+fn admission(owner: &str) -> [carrick_xtask::debt_moves::DebtAdmission; 1] {
+    [carrick_xtask::debt_moves::DebtAdmission {
+        owner: owner.into(),
+        issue: 1977,
+    }]
+}
+#[test]
+fn a_reviewed_admission_admits_only_a_new_owner() {
+    let base = owned("carrick_kernel::poll", 3);
+    let mut head = owned("carrick_kernel::poll", 3);
+    let mut added = owned("carrick_runtime::deadline_driver::start", 1).counters;
+    head.counters.append(&mut added);
+    assert!(
+        head.ratchet(&base, &MoveMap::default())
+            .unwrap_err()
+            .to_string()
+            .contains("unknown family/owner cohort"),
+        "an undeclared new owner still fails"
+    );
+    let admitted = MoveMap::default()
+        .with_admissions(&admission("carrick_runtime::deadline_driver::start"), &[])
+        .unwrap();
+    assert!(
+        head.ratchet(&base, &admitted).is_ok(),
+        "declared owner passes"
+    );
+    let other = MoveMap::default()
+        .with_admissions(&admission("carrick_runtime::other"), &[])
+        .unwrap();
+    assert!(head.ratchet(&base, &other).is_err(), "other owner does not");
+    let stale = MoveMap::default()
+        .with_admissions(&admission("carrick_kernel::poll"), &[])
+        .unwrap();
+    assert!(
+        owned("carrick_kernel::poll", 3)
+            .ratchet(&base, &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("stale debt admission"),
+        "an admission for an owner the base has is stale"
+    );
+}
