@@ -3,11 +3,17 @@
 //!
 //! The set's zone half lives in the shared record
 //! (`carrick_el1_abi::ipc::epoll`); EL1 runs the same harvest routine the
-//! host does. EL1 serves a wait only when the set has no host-half items and
-//! no signal mask is passed; everything else is forwarded unchanged, before
-//! any effect:
+//! host does. EL1 serves a wait only when the set has no host-half items;
+//! the rest is forwarded unchanged, before any effect:
 //!
-//! - a non-NULL sigmask (the host swaps the mask around its wait);
+//! - a non-NULL sigmask that EL1 cannot honour: unreadable, or the caller has
+//!   no native signal owner (the host swaps the mask around its wait). A
+//!   native caller's mask is swapped in by EL1 as the wait parks: the
+//!   persistent mask is saved in the thread's control slot and restored by
+//!   the signal checkpoint that ends the call (so a handler runs under the
+//!   temporary mask, as for `rt_sigsuspend`), or by the re-entered call
+//!   before it harvests again. A call that returns without parking never
+//!   changes the mask;
 //! - host-half items (only the host harvests both halves);
 //! - a finite timeout with nothing ready while another thread's timed
 //!   park holds the slot's timer (a slot's timer has one owner);
@@ -57,6 +63,8 @@ const BATCH: usize = 32;
 const EVENT_BYTES: usize = 16;
 /// Largest `maxevents` Linux accepts (`EP_MAX_EVENTS`).
 const EP_MAX_EVENTS: i64 = i32::MAX as i64 / EVENT_BYTES as i64;
+/// The kernel `sigset_t` `epoll_pwait` takes (`sigsetsize` must equal it).
+const SIGSET_BYTES: usize = 8;
 
 fn epoll_of(backing: BackingToken) -> Option<IpcObjectHandle> {
     match IpcBacking::decode(backing)? {
@@ -94,6 +102,8 @@ pub(super) fn resume<C: ThreadCpu, U: UserWord, M: UserCopy>(
         op.deadline.get().map_or(Wait::Forever, Wait::Until)
     };
     finish(sched, token, &venue.region);
+    // The park armed the temporary mask; this re-entry is not a checkpoint.
+    user.disarm_wait_sigmask();
     serve_with(sched, frame, venue, user, Some(wait), interrupt)
 }
 
@@ -118,13 +128,22 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
     wait: Option<Wait>,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
-    if frame.x[4] != 0 {
-        return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
-    }
+    // epoll_pwait(2) checks the mask argument before the set.
+    let sigmask = if frame.x[4] == 0 {
+        None
+    } else if frame.x[5] != SIGSET_BYTES as u64 {
+        return returned(frame, linux::EINVAL);
+    } else {
+        let mut bytes = [0u8; SIGSET_BYTES];
+        if !user.copy_in(&mut bytes, frame.x[4]) {
+            // The host resolves a first touch, or reports EFAULT.
+            return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
+        }
+        Some(u64::from_le_bytes(bytes))
+    };
     let maxevents = i64::from(frame.x[2] as i32);
     if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
-        // EINVAL, from the host's full validation.
-        return IpcServed::Forward;
+        return returned(frame, linux::EINVAL);
     }
     let wait = wait.unwrap_or_else(|| match frame.x[3] as i32 {
         0 => Wait::Poll,
@@ -264,9 +283,19 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
             release_pin(sched, OfdPin::from_raw(op.pin), region);
             return leave(sched, IpcLeave::ParkRefused, IpcServed::Forward);
         };
+        // Armed before the park, whose post-enrollment probe must already see
+        // the temporary mask.
+        let armed = sigmask.is_some_and(|mask| user.arm_wait_sigmask(mask));
+        if sigmask.is_some() && !armed {
+            release_pin(sched, OfdPin::from_raw(op.pin), region);
+            return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
+        }
         let token = match region.begin_operation(op) {
             Ok(token) => token,
             Err(_) => {
+                if armed {
+                    user.disarm_wait_sigmask();
+                }
                 release_pin(sched, OfdPin::from_raw(op.pin), region);
                 return leave(sched, IpcLeave::NoOperationRecord, IpcServed::Forward);
             }
@@ -286,13 +315,21 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
             Parked::Done(served) => return served,
             // Readiness moved before the park: retire the record (the pin
             // stays with `op`) and harvest again.
-            Parked::Retry(token) => match region.finish_operation(token, || {
-                notify_operation_release(region, sched.zone, sched.slot)
-            }) {
-                Ok(back) => op = back,
-                Err(_) => return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
-            },
+            Parked::Retry(token) => {
+                if armed {
+                    user.disarm_wait_sigmask();
+                }
+                match region.finish_operation(token, || {
+                    notify_operation_release(region, sched.zone, sched.slot)
+                }) {
+                    Ok(back) => op = back,
+                    Err(_) => return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
+                }
+            }
             Parked::Refused(token) => {
+                if armed {
+                    user.disarm_wait_sigmask();
+                }
                 finish(sched, token, region);
                 return leave(sched, IpcLeave::ParkRefused, IpcServed::Forward);
             }

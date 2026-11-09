@@ -255,6 +255,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/ipc.rs", contract = "kernel.el1.ipc-lifecycle" },
   { path = "crates/carrick-el1-linux/src/ipc.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-el1-linux/src/ipc.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-el1-linux/src/ipc/epoll.rs", contract = "kernel.el1.epoll-zone" },
   { path = "crates/carrick-el1-linux/src/ipc/epoll.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-el1-linux/src/lifecycle.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-el1-linux/src/lifecycle.rs", contract = "kernel.scheduler.runnable-progress" },

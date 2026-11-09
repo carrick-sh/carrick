@@ -343,6 +343,13 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn interrupt_pending_wait(&mut self) -> bool {
         false
     }
+    /// Swap an `epoll_pwait` sigmask in for a ring-owned wait (see
+    /// `UserCopy::arm_wait_sigmask`). `false`: no native signal owner.
+    fn arm_wait_sigmask(&mut self, _temporary: u64) -> bool {
+        false
+    }
+    /// Undo [`arm_wait_sigmask`](Self::arm_wait_sigmask) without a checkpoint.
+    fn disarm_wait_sigmask(&mut self) {}
     fn binding(&self) -> ExecutionBinding;
     fn pid_exists(&self, _pid: u32) -> Option<bool> {
         None
