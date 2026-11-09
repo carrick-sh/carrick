@@ -8,22 +8,26 @@ use carrick_personality_linux::native_host_file::{
     HostFileCall, HostFileStage, NativeDescriptor, NativeNamespace,
 };
 
-/// Whether CPL0 stages this decoded call for `origin`, mirroring ARM's
-/// `native_host_file_stage`. Mutations are child-scoped (the initial task
-/// keeps its host route). Beyond path opens/stats, only `Write`/`Writev`
-/// are admitted so a redirected host-file stdout is served for both origins;
-/// descriptor reads stay on their existing route until slice 3.
+/// Whether CPL0 stages this decoded call for `origin`. Mutations are
+/// child-scoped (the initial task keeps its host route). Beyond path
+/// opens/stats, only `Write`/`Writev` are admitted, and only for a
+/// descendant, so a child's redirected host-file stdout is served; descriptor
+/// reads stay on their existing route until slice 3. The initial task's
+/// write keeps its host route: x86 `begin_host_file_call` refuses an initial
+/// root's staged `Write` (counted ENOSYS) while the carrier retains its
+/// filesystem custody.
 pub(crate) fn admits(call: HostFileCall, origin: ServiceOrigin) -> bool {
-    if call.uses_child_mutation_venue() {
+    if call.uses_child_mutation_venue()
+        || matches!(
+            call,
+            HostFileCall::Write { .. } | HostFileCall::Writev { .. }
+        )
+    {
         return origin != ServiceOrigin::Initial;
     }
     matches!(
         call,
-        HostFileCall::Openat { .. }
-            | HostFileCall::Faccessat { .. }
-            | HostFileCall::Statx { .. }
-            | HostFileCall::Write { .. }
-            | HostFileCall::Writev { .. }
+        HostFileCall::Openat { .. } | HostFileCall::Faccessat { .. } | HostFileCall::Statx { .. }
     )
 }
 
@@ -111,18 +115,34 @@ mod tests {
         let bytes = *b"hello\n";
         let buf = bytes.as_ptr() as u64;
         let iov = [buf, bytes.len() as u64];
-        for origin in [CHILD, INITIAL] {
-            let write = stage(1, [1, buf, bytes.len() as u64, 0, 0, 0], origin, host());
-            assert!(
-                matches!(write, Some(HostFileStage::Request { .. })),
-                "{origin:?} write {write:?}"
-            );
-            let writev = stage(20, [1, iov.as_ptr() as u64, 1, 0, 0, 0], origin, host());
-            assert!(
-                matches!(writev, Some(HostFileStage::Request { .. })),
-                "{origin:?} writev {writev:?}"
-            );
-        }
+        let write = stage(1, [1, buf, bytes.len() as u64, 0, 0, 0], CHILD, host());
+        assert!(
+            matches!(write, Some(HostFileStage::Request { .. })),
+            "write {write:?}"
+        );
+        let writev = stage(20, [1, iov.as_ptr() as u64, 1, 0, 0, 0], CHILD, host());
+        assert!(
+            matches!(writev, Some(HostFileStage::Request { .. })),
+            "writev {writev:?}"
+        );
+    }
+
+    #[test]
+    fn initial_write_and_writev_keep_the_host_route() {
+        // #1954: an initial root's staged write reaches `begin_host_file_call`,
+        // which refuses it as counted ENOSYS (-38) while the carrier retains
+        // the root's filesystem; the initial write keeps its host route.
+        let bytes = *b"hello\n";
+        let buf = bytes.as_ptr() as u64;
+        let iov = [buf, bytes.len() as u64];
+        assert_eq!(
+            stage(1, [1, buf, bytes.len() as u64, 0, 0, 0], INITIAL, host()),
+            None
+        );
+        assert_eq!(
+            stage(20, [1, iov.as_ptr() as u64, 1, 0, 0, 0], INITIAL, host()),
+            None
+        );
     }
 
     #[test]
