@@ -57,7 +57,7 @@ impl ClockResourceService {
             ClockRequest::Sample { clock_id } => {
                 match sample_container_clock(&self.clock, clock_id) {
                     Ok(now) => write_sample_reply(bytes, now.as_secs(), now.subsec_nanos()),
-                    Err(errno) => write_errno_reply(bytes, errno),
+                    Err(errno) => write_errno_reply(bytes, clock_errno(errno)?),
                 }
             }
             ClockRequest::TimexPreflight { can_adjust, timex } => {
@@ -88,20 +88,20 @@ impl ClockResourceService {
         let request = match TimexRequest::validate(&parsed, access) {
             Ok(req) => req,
             Err(TimexValidationError::Errno(errno)) => {
-                return write_errno_reply(bytes, errno);
+                return write_errno_reply(bytes, clock_errno(errno)?);
             }
             Err(TimexValidationError::InvalidModeOutput) => {
-                return write_errno_reply(bytes, LINUX_EINVAL);
+                return write_errno_reply(bytes, clock_errno(LINUX_EINVAL)?);
             }
         };
         let step = match request.realtime_step(|| {
             carrick_abi::LinuxTimexStatus::from_bits_retain(self.clock.adjtimex_state().status)
         }) {
             Ok(step) => step,
-            Err(errno) => return write_errno_reply(bytes, errno),
+            Err(errno) => return write_errno_reply(bytes, clock_errno(errno)?),
         };
         if step.is_some() && self.clock.is_controlled() {
-            return write_errno_reply(bytes, LINUX_EPERM);
+            return write_errno_reply(bytes, clock_errno(LINUX_EPERM)?);
         }
         write_timex_preflight_ok(bytes)
     }
@@ -123,10 +123,10 @@ impl ClockResourceService {
         let request = match TimexRequest::validate(&parsed, access) {
             Ok(req) => req,
             Err(TimexValidationError::Errno(errno)) => {
-                return write_errno_reply(bytes, errno);
+                return write_errno_reply(bytes, clock_errno(errno)?);
             }
             Err(TimexValidationError::InvalidModeOutput) => {
-                return write_errno_reply(bytes, LINUX_EINVAL);
+                return write_errno_reply(bytes, clock_errno(LINUX_EINVAL)?);
             }
         };
         let mut output = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
@@ -138,9 +138,19 @@ impl ClockResourceService {
                     .map_err(|_| ClockRecordError::Invalid)?;
                 write_timex_apply_reply(bytes, value, out_bytes)
             }
-            Err(errno) => write_errno_reply(bytes, errno),
+            Err(errno) => write_errno_reply(bytes, clock_errno(errno)?),
         }
     }
+}
+
+/// Every Linux errno the service answers is a positive number below 4096.
+fn clock_errno(
+    errno: carrick_abi::LinuxErrno,
+) -> Result<carrick_core_abi::clock::ClockErrno, ClockRecordError> {
+    u16::try_from(errno.get())
+        .ok()
+        .and_then(carrick_core_abi::clock::ClockErrno::new)
+        .ok_or(ClockRecordError::Invalid)
 }
 
 fn sample_container_clock(
@@ -177,6 +187,9 @@ mod tests {
         assert_eq!(parse_reply(&buf), Ok(ClockReply::Sample(Ok((0, 0)))));
         encode_sample_request(&mut buf, carrick_abi::LINUX_CLOCK_PROCESS_CPUTIME_ID);
         service.serve_record(&mut buf).unwrap();
-        assert_eq!(parse_reply(&buf), Ok(ClockReply::Sample(Err(LINUX_EINVAL))));
+        assert_eq!(
+            parse_reply(&buf),
+            Ok(ClockReply::Sample(Err(clock_errno(LINUX_EINVAL).unwrap())))
+        );
     }
 }

@@ -1753,6 +1753,7 @@ fn child_futex<'a>(
                     copies,
                     [(UserVa::new(remaining), timespec_bytes(100).to_vec())]
                 );
+                consume_injected_sigint(runtime, &fixture.task, worker.record);
             } else {
                 assert!(copies.is_empty(), "only EINTR writes rem: {copies:?}");
             }
@@ -1851,6 +1852,7 @@ fn child_futex<'a>(
                 copies,
                 [(UserVa::new(remaining), timespec_bytes(100).to_vec())]
             );
+            consume_injected_sigint(runtime, &fixture.task, worker.record);
         } else {
             assert!(copies.is_empty(), "a completed sleep never writes rem");
         }
@@ -2056,4 +2058,19 @@ fn child_futex<'a>(
     }
     assert_eq!(counters.forwarded[98].load(Ordering::Relaxed), 0);
     assert!(runtime.task_binding(parent).is_some());
+}
+
+/// Consume a SIGINT a sleep witness injected. Pending signals publish a
+/// process-global summary word that later tests' empty-checkpoint fast path
+/// reads; a leaked fixture must not leave one behind.
+fn consume_injected_sigint(
+    runtime: &NativeProcessRuntime<'_, AddressContext<RootGpa>, Aarch64ParkedContext>,
+    task: &CurrentTask,
+    record: carrick_sched_core::RecordRef,
+) {
+    let signals = runtime
+        .current_signals(task)
+        .expect("sleeping clone's signal owner");
+    let taken = signals.take_deliverable(record, carrick_signal_core::policy::SigBlockMask::NONE);
+    assert_eq!(taken.map(|(signal, ..)| signal.number()), Some(2));
 }
