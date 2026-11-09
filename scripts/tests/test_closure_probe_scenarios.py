@@ -25,11 +25,11 @@ class ClosureProbeScenarioTest(unittest.TestCase):
             (ROOT / "conformance-probes/probe-inventory.json").read_text(encoding="utf-8")
         )
 
-    def test_plan_selects_exactly_twenty_four_dedicated_sources_and_eighteen_runners(self):
+    def test_plan_selects_exactly_twenty_five_dedicated_sources_and_nineteen_runners(self):
         plan = scenarios.build_plan(self.inventory)
 
-        self.assertEqual(len(plan.sources), 24)
-        self.assertEqual(len(plan.commands), 18)
+        self.assertEqual(len(plan.sources), 25)
+        self.assertEqual(len(plan.commands), 19)
         self.assertEqual(
             {
                 (command.package, command.test_target, command.transport)
@@ -37,6 +37,11 @@ class ClosureProbeScenarioTest(unittest.TestCase):
             },
             {
                 ("carrick-cli", "conformance", "cargo"),
+                (
+                    "carrick-conformance-next",
+                    "native_prefix_write",
+                    "test-signed",
+                ),
                 (
                     "carrick-conformance-next",
                     "ptrace_poketext_signed",
@@ -57,7 +62,7 @@ class ClosureProbeScenarioTest(unittest.TestCase):
         plan = scenarios.build_plan(self.inventory)
         rows = scenarios.expected_rows(plan)
 
-        self.assertEqual(len(rows), 48)
+        self.assertEqual(len(rows), 50)
         self.assertEqual({row.libc for row in rows}, {"musl", "gnu"})
         for source in plan.sources:
             self.assertEqual(
@@ -182,9 +187,9 @@ class ClosureProbeScenarioTest(unittest.TestCase):
         with redirect_stdout(StringIO()):
             rows = scenarios.run_plan(ROOT, plan, command_runner=fake_runner)
 
-        self.assertEqual(len(calls), 36)
+        self.assertEqual(len(calls), 38)
         self.assertEqual({libc for libc, _runner in calls}, {"gnu", "musl"})
-        self.assertEqual(len(rows), 48)
+        self.assertEqual(len(rows), 50)
         self.assertEqual(
             sum(row.status == "FAIL" for row in rows),
             len(plan.commands[0].sources),
