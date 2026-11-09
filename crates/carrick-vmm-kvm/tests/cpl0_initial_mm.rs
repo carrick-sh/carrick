@@ -2134,3 +2134,158 @@ fn loader_reopen_with_publication(contended: bool) {
     assert_eq!(witness.guest_entries, 7, "three pairs and exit_group");
     assert!(witness.guest_refusal_families.is_empty());
 }
+
+/// Run `test` in a separate `timeout`-bounded process: a parked guest need
+/// not consume the pool's exit budget, so a lost wake must not hang CI.
+fn bounded_witness(test: &str, witness: impl FnOnce()) {
+    const CHILD: &str = "CARRICK_REDIRECT_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(test)) {
+        witness();
+        return;
+    }
+    let output = std::process::Command::new("timeout")
+        .args(["--kill-after=1", "30"])
+        .arg(std::env::current_exe().expect("current test executable"))
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, test)
+        .output()
+        .expect("bounded redirect witness");
+    assert!(
+        output.status.success(),
+        "bounded child witness: {:?}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Production x86 dispatch with fd 1 redirected to a real host file (seeded
+/// through production dispatch like a shell's `>`), returning the guest exit
+/// code and the destination file's bytes.
+fn redirected_stdout_fixture(flags: &[&str]) -> (i32, Vec<u8>) {
+    let dir = tempfile::tempdir().expect("redirect directory");
+    let path = dir.path().join("stdout");
+    let elf = native_exit_fixture_with_flags("native_redirect_write.S", flags);
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let root = dispatcher
+        .capture_one_task_context()
+        .expect("redirect task");
+    let mut path_bytes = path.as_os_str().as_encoded_bytes().to_vec();
+    path_bytes.push(0);
+    let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x4000, path_bytes);
+    let mut call = |nr: u64, args: [u64; 6]| {
+        let outcome = dispatcher
+            .dispatch(
+                &root,
+                carrick_kernel::dispatch::SyscallRequest::new(
+                    nr,
+                    carrick_kernel::compat::SyscallArgs::from(args),
+                ),
+                &mut memory,
+                &carrick_kernel::compat::CompatReporter::default(),
+            )
+            .expect("production setup call");
+        let carrick_kernel::dispatch::DispatchOutcome::Returned { value } = outcome else {
+            panic!("setup call {nr} failed: {outcome:?}");
+        };
+        value
+    };
+    // openat(AT_FDCWD, path, O_WRONLY | O_CREAT | O_TRUNC, 0644), then
+    // dup3(fd, 1, 0) and close(fd): canonical (aarch64) numbering.
+    let fd = call(56, [(-100_i64) as u64, 0x4000, 0x241, 0o644, 0, 0]);
+    assert_eq!(fd, 3);
+    assert_eq!(call(24, [3, 1, 0, 0, 0, 0]), 1);
+    assert_eq!(call(57, [3, 0, 0, 0, 0, 0]), 0);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        128,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .expect("redirected stdout production runtime");
+    assert!(!outcome.run.trap_limit_hit, "{:?}", outcome.run);
+    assert!(outcome.run.stdout.is_empty(), "{:?}", outcome.run.stdout);
+    (
+        outcome.run.exit_code,
+        std::fs::read(&path).expect("redirect destination"),
+    )
+}
+
+/// #1954 P0-1: a native child's `writev` to a host-file stdout is staged on
+/// the retained host-file venue ahead of the strict x86 crossing refusal.
+/// Red before the fix: counted ENOSYS (exit 218) and an empty file.
+#[test]
+fn serial_host_native_child_writev_reaches_redirected_host_file() {
+    bounded_witness(
+        "serial_host_native_child_writev_reaches_redirected_host_file",
+        || {
+            let (exit, bytes) = redirected_stdout_fixture(&[]);
+            assert_eq!(exit, 12, "writev result (218 = ENOSYS, 242 = EFAULT)");
+            assert_eq!(bytes, b"hello world\n");
+        },
+    );
+}
+
+/// #1954 P0-3: an untouched readable anonymous page is a valid source. The
+/// staged copy's fault is supplied through the owner fault path and the
+/// syscall retried, so the file receives zeros instead of EFAULT (exit 242).
+#[test]
+fn serial_host_native_child_write_from_untouched_page_supplies_zeros() {
+    bounded_witness(
+        "serial_host_native_child_write_from_untouched_page_supplies_zeros",
+        || {
+            let (exit, bytes) = redirected_stdout_fixture(&["-DUNTOUCHED"]);
+            assert_eq!(exit, 100, "write result (218 = ENOSYS, 242 = EFAULT)");
+            assert_eq!(bytes, vec![0; 100]);
+        },
+    );
+}
+
+/// #1954 P0-2: with no ring descriptor table published for the initial task,
+/// its stdout write keeps the existing route instead of counted ENOSYS (-38).
+#[test]
+fn serial_host_initial_write_without_ring_table_keeps_stdout_route() {
+    bounded_witness(
+        "serial_host_initial_write_without_ring_table_keeps_stdout_route",
+        || {
+            let elf = native_exit_fixture_with_flags("native_redirect_write.S", &["-DROOT_WRITE"]);
+            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+            let key = dispatcher
+                .capture_one_task_context()
+                .expect("root")
+                .resources()
+                .files()
+                .id()
+                .raw();
+            let program =
+                carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+            let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+                &program,
+                64,
+                ROOT_AFFINITY_LOADED,
+                |carrier| {
+                    carrier
+                        .ipc_table_map()
+                        .expect("retained map")
+                        .table_map()
+                        .withdraw_table(key)
+                        .expect("root binding");
+                },
+                dispatcher,
+            )
+            .expect("unpublished-table production runtime");
+            assert_eq!(
+                outcome.run.exit_code, 12,
+                "write result (218 = ENOSYS): {:?}",
+                outcome.run
+            );
+            assert_eq!(outcome.run.stdout, b"hello world\n");
+        },
+    );
+}
