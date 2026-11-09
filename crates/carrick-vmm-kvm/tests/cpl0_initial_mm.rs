@@ -607,7 +607,9 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
     native_runtime_exit_wake(false);
 }
 
-/// #1973: the production native process owner's exit wake
+/// Refactor guard for #1973, not a red-first host-work marking witness:
+/// begin_closing already marks exit debt before this wake.
+/// The production native process owner's exit wake
 /// (`publish_signal_channel` -> `native_process::Service::wake_effects`)
 /// finds the parent's home run queue busy (the host holds CPU 0's queue
 /// lock, as a contending CPU would), so the wake queues the parent on the
@@ -617,6 +619,73 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
 #[test]
 fn native_exit_wake_to_a_busy_home_is_misplaced_and_owes_the_host() {
     native_runtime_exit_wake(true);
+}
+
+/// A blocked, nonfatal signal still publishes the process channel enrolled by
+/// wait4. Neither task exits, so the waker has no pre-existing exit debt.
+#[test]
+fn native_kill_wake_to_a_busy_home_marks_fresh_host_work() {
+    use carrick_sched_core::Claim;
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    let elf = native_exit_fixture("native_kill_wait.S");
+    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut child = factory.claim(1).expect("sender executor");
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).expect("load root");
+    run_to_marker(&mut parent, task, 1, &factory);
+    factory
+        .fixture_place_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("place sender on peer");
+    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
+    let (claim, _, wakes_before) = factory
+        .fixture_native_wait_state(root_tid)
+        .expect("wait4 record");
+    assert!(matches!(claim, Claim::Parked { .. }));
+    let peer = carrick_guest_arch::CpuId::new(1);
+    let (misplaced_before, owed_before) =
+        factory.fixture_native_wake_debt(peer).expect("before kill");
+    assert!(!owed_before, "non-exit sender doorbell must start clear");
+    let (exit, owed) = factory
+        .fixture_with_slot_locked(carrick_guest_arch::CpuId::new(0), || {
+            let exit = child
+                .fixture_run_idle_peer()
+                .expect("native kill from child");
+            let owed = factory
+                .fixture_native_wake_debt(peer)
+                .expect("after kill")
+                .1;
+            (exit, owed)
+        })
+        .expect("hold parent's home queue");
+    let (claim, _, wakes) = factory
+        .fixture_native_wait_state(root_tid)
+        .expect("published parent");
+    let (misplaced, _) = factory
+        .fixture_native_wake_debt(peer)
+        .expect("misplaced wake");
+    assert_eq!(
+        wakes,
+        wakes_before + 1,
+        "kill publishes one wait4 channel wake"
+    );
+    assert_eq!(misplaced, misplaced_before + 1);
+    assert!(
+        owed,
+        "non-exit misplaced wake must mark fresh pending host work: exit {exit:?}, claim {claim:?}"
+    );
+    assert!(
+        matches!(claim, Claim::Queued { slot, .. } if slot == carrick_sched_core::SlotId::new(1))
+    );
+    assert!(matches!(
+        exit,
+        CarrierRunExit::PhysicalDoorbell {
+            port: carrick_x86::cpl0_entry::WORK_PORT,
+            ..
+        }
+    ));
 }
 
 fn native_runtime_exit_wake(hold_home: bool) {
