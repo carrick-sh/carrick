@@ -1169,7 +1169,7 @@ impl<
     }
 }
 
-fn signal_copy_outcome(
+pub(crate) fn signal_copy_outcome(
     outcome: LifecycleOutcome,
 ) -> carrick_personality_linux::signal::SignalOutcome {
     use carrick_personality_linux::signal::SignalOutcome;

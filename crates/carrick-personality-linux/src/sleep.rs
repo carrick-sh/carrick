@@ -6,23 +6,23 @@
 //! caller parks (releasing its execution lease), the scheduler's timer index
 //! retains the original deadline across executor departure, and a signal
 //! publication wakes the parked member. This module owns only the Linux
-//! argument contract: clock classification, `timespec` validation and the
-//! conversion of an absolute deadline into the guest counter's domain.
+//! argument contract: clock classification and `timespec` validation.
 //!
-//! Clock domains in ring: `CLOCK_MONOTONIC` is the guest counter divided by
-//! its frequency, exactly what the raw clock fast path and the vDSO report
-//! (on HVF that counter is the host's CLOCK_UPTIME_RAW, the host dispatcher's
-//! monotonic clock too).
-//! `CLOCK_REALTIME` is that plus the vvar realtime word the caller's own vDSO
-//! adds ([`crate::abi::vvar`]). A relative sleep measures the counter whatever
-//! its clock id, as POSIX requires for relative sleeps.
+//! Clock domains in ring: a relative sleep measures the guest counter whatever
+//! its clock id, as POSIX requires for relative sleeps. An absolute deadline is
+//! served only where the guest can observe the counter's epoch as its
+//! `CLOCK_MONOTONIC` ([`absolute_monotonic_epoch`]), and only for the
+//! monotonic clocks. An absolute `CLOCK_REALTIME`/`CLOCK_TAI` deadline needs a
+//! realtime authority that follows `clock_settime`; until one exists (#1981)
+//! it stays unserved: the call keeps its counted ENOSYS crossing refusal.
 
 use crate::abi::entry::SyscallResult;
 use crate::signal::{SignalNative, SignalOutcome};
 use carrick_core::user_copy::CopyOutcome;
-use carrick_guest_arch::UserVa;
+use carrick_guest_arch::{GuestIsa, UserVa};
 use carrick_syscall_abi::{
-    LINUX_CLOCK_BOOTTIME, LINUX_CLOCK_BOOTTIME_ALARM, LINUX_CLOCK_MONOTONIC,
+    LINUX_CLOCK_BOOTTIME, LINUX_CLOCK_BOOTTIME_ALARM, LINUX_CLOCK_CPU_PERTHREAD,
+    LINUX_CLOCK_CPU_WHICH_MASK, LINUX_CLOCK_FD, LINUX_CLOCK_MONOTONIC,
     LINUX_CLOCK_MONOTONIC_COARSE, LINUX_CLOCK_MONOTONIC_RAW, LINUX_CLOCK_PROCESS_CPUTIME_ID,
     LINUX_CLOCK_REALTIME, LINUX_CLOCK_REALTIME_ALARM, LINUX_CLOCK_REALTIME_COARSE, LINUX_CLOCK_TAI,
     LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_EFAULT, LINUX_EINVAL, LINUX_EOPNOTSUPP,
@@ -40,33 +40,79 @@ pub enum SleepCall {
 /// The time base an absolute deadline is expressed in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SleepClock {
+    /// `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`.
     Monotonic,
+    /// `CLOCK_REALTIME` and `CLOCK_TAI`: settable wall time.
     Realtime,
 }
 
-/// Classify a sleep clock exactly as the host dispatcher's
-/// `linux_clock_nanosleep_now` does, so the run root (host continuation) and
-/// a native child (ring) give one answer: CPU-time clocks are `EOPNOTSUPP`,
-/// unknown ids `EINVAL`. BOOTTIME is measured on the guest counter like
-/// MONOTONIC: after a host suspend the host's BOOTTIME runs ahead of it, so an
-/// absolute BOOTTIME deadline then fires late by the suspended time.
-pub fn sleep_clock(clock_id: u64) -> Result<SleepClock, LinuxErrno> {
-    match clock_id {
-        LINUX_CLOCK_REALTIME
-        | LINUX_CLOCK_REALTIME_COARSE
-        | LINUX_CLOCK_REALTIME_ALARM
-        | LINUX_CLOCK_TAI => Ok(SleepClock::Realtime),
-        LINUX_CLOCK_MONOTONIC
-        | LINUX_CLOCK_MONOTONIC_RAW
-        | LINUX_CLOCK_MONOTONIC_COARSE
-        | LINUX_CLOCK_BOOTTIME
-        | LINUX_CLOCK_BOOTTIME_ALARM => Ok(SleepClock::Monotonic),
-        LINUX_CLOCK_PROCESS_CPUTIME_ID | LINUX_CLOCK_THREAD_CPUTIME_ID => Err(LINUX_EOPNOTSUPP),
-        // A dynamic per-task CPU clock is a negative 32-bit id whose low two
-        // bits are not CPUCLOCK_FD (3).
-        id if (id as i32) < 0 && id & 0b11 != 0b11 => Err(LINUX_EOPNOTSUPP),
-        _ => Err(LINUX_EINVAL),
+/// What `clock_nanosleep(2)` does with one clock id on Linux.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClockClass {
+    /// Linux sleeps against this clock and the ring can measure it.
+    Sleeps(SleepClock),
+    /// Linux sleeps against this clock (or decides after reading the
+    /// request), but the ring has no authority for it: leave the call to its
+    /// counted crossing refusal, before any user access.
+    Unserved,
+    /// Linux refuses this clock before reading the request.
+    Refused(LinuxErrno),
+}
+
+/// Classify a sleep clock as Linux does. Source: clock_nanosleep(2) and a
+/// native Linux 6.12 probe (errno numbers): REALTIME, MONOTONIC, BOOTTIME and
+/// TAI sleep; MONOTONIC_RAW, the COARSE clocks, CLOCK_THREAD_CPUTIME_ID and
+/// posix-clock fds give 95 (EOPNOTSUPP) before the request is read; a dynamic
+/// per-thread CPU clock and an unknown id give 22 (EINVAL). Linux sleeps on a
+/// process CPU-time clock (the man page permits it) and the ALARM clocks
+/// decide (EPERM without CAP_WAKE_ALARM) only after reading the request; the
+/// ring measures neither, so they stay [`ClockClass::Unserved`].
+///
+/// BOOTTIME is measured on the guest counter like MONOTONIC: after a host
+/// suspend the host's BOOTTIME runs ahead of it, so an absolute BOOTTIME
+/// deadline then fires late by the suspended time.
+pub fn sleep_clock(clock_id: u64) -> ClockClass {
+    // `clockid_t` is a C int: Linux never sees the upper half of the register.
+    let id = clock_id as u32 as i32;
+    if id < 0 {
+        // A dynamic clock: `~pid << 3 | which`, or a posix-clock fd.
+        let low = id as u32 & (LINUX_CLOCK_CPU_PERTHREAD | LINUX_CLOCK_CPU_WHICH_MASK);
+        return if low == LINUX_CLOCK_FD {
+            ClockClass::Refused(LINUX_EOPNOTSUPP)
+        } else if low & LINUX_CLOCK_CPU_PERTHREAD != 0 {
+            ClockClass::Refused(LINUX_EINVAL)
+        } else {
+            ClockClass::Unserved
+        };
     }
+    match id as u64 {
+        LINUX_CLOCK_REALTIME | LINUX_CLOCK_TAI => ClockClass::Sleeps(SleepClock::Realtime),
+        LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_BOOTTIME => ClockClass::Sleeps(SleepClock::Monotonic),
+        LINUX_CLOCK_PROCESS_CPUTIME_ID
+        | LINUX_CLOCK_REALTIME_ALARM
+        | LINUX_CLOCK_BOOTTIME_ALARM => ClockClass::Unserved,
+        LINUX_CLOCK_THREAD_CPUTIME_ID
+        | LINUX_CLOCK_MONOTONIC_RAW
+        | LINUX_CLOCK_REALTIME_COARSE
+        | LINUX_CLOCK_MONOTONIC_COARSE => ClockClass::Refused(LINUX_EOPNOTSUPP),
+        _ => ClockClass::Refused(LINUX_EINVAL),
+    }
+}
+
+/// Whether `isa`'s guests can observe the counter epoch an absolute
+/// monotonic deadline is compared against.
+///
+/// ARM: the vDSO's `CLOCK_MONOTONIC` is the guest counter divided by its
+/// frequency, with no offset (`carrick-mem` vDSO), the same domain the ring
+/// sleep measures. x86 CPL0: the counter is raw RDTSC
+/// (`carrick-el1/src/isa/x86/interrupt.rs`, `X86Backend::counter`), the
+/// initial stack publishes no `AT_SYSINFO_EHDR`
+/// (`carrick-el1/src/isa/x86/initial_mm.rs`, `build_initial_stack`), and a
+/// child's `clock_gettime` is not served in ring, so no guest-visible
+/// monotonic epoch is tied to that counter. x86 absolute sleeps stay
+/// unserved until one is defined.
+pub const fn absolute_monotonic_epoch(isa: GuestIsa) -> bool {
+    matches!(isa, GuestIsa::Aarch64)
 }
 
 /// Validate one copied Linux 64-bit `timespec` and return its nanoseconds.
@@ -93,15 +139,6 @@ pub fn timespec_bytes(nanos: u64) -> [u8; 16] {
     bytes
 }
 
-/// Convert an absolute `CLOCK_REALTIME` deadline into the monotonic domain
-/// with the caller's vvar realtime word (`realtime = monotonic + word`,
-/// wrapping, as the vDSO computes it). A deadline before the counter's epoch
-/// has already passed.
-pub fn realtime_to_monotonic(realtime_nanos: u64, vvar_word: u64) -> u64 {
-    let monotonic = realtime_nanos.wrapping_sub(vvar_word);
-    if (monotonic as i64) < 0 { 0 } else { monotonic }
-}
-
 /// The deadline the process owner converts into guest counter ticks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SleepDeadline {
@@ -118,18 +155,15 @@ pub struct SleepRequest {
     pub remaining: Option<UserVa>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SleepOutcome {
-    /// The deadline had passed: return 0 without parking.
-    Elapsed,
-    /// The owner parked the caller and retains its wait; the result is
-    /// published when the deadline or a signal resumes it.
-    Pending,
-}
-
-/// Serve one routed sleep. `None` leaves the call to its host continuation
-/// (a caller whose owner does not sleep in ring), before any user access.
-pub fn invoke(call: SleepCall, native: &mut dyn SignalNative<'_>) -> Option<SignalOutcome> {
+/// Serve one routed sleep for a caller of `isa`. `None` leaves the call to
+/// its host continuation or counted crossing refusal, always before any user
+/// access: a caller whose owner does not sleep in ring, a clock the ring
+/// cannot measure, or an absolute deadline without a guest-visible epoch.
+pub fn invoke(
+    call: SleepCall,
+    isa: GuestIsa,
+    native: &mut dyn SignalNative<'_>,
+) -> Option<SignalOutcome> {
     let returned = |value: i64| {
         Some(SignalOutcome::Returned {
             result: SyscallResult::new(value),
@@ -137,6 +171,7 @@ pub fn invoke(call: SleepCall, native: &mut dyn SignalNative<'_>) -> Option<Sign
         })
     };
     let args = native.arguments();
+    // nanosleep(2) takes no flags and measures CLOCK_MONOTONIC.
     let (clock_id, flags, request, remaining) = match call {
         SleepCall::Nanosleep => (LINUX_CLOCK_MONOTONIC, 0, args[0], args[1]),
         SleepCall::ClockNanosleep => (args[0], args[1], args[2], args[3]),
@@ -144,14 +179,19 @@ pub fn invoke(call: SleepCall, native: &mut dyn SignalNative<'_>) -> Option<Sign
     if !native.process_signals()?.sleeps_in_ring() {
         return None;
     }
-    // Mirror the host dispatcher's flag and clock order.
-    if flags & !LINUX_TIMER_ABSTIME != 0 {
-        return returned(LINUX_EINVAL.guest_retval());
-    }
+    // Linux reads only TIMER_ABSTIME; every other flag bit is ignored
+    // (clock_nanosleep(2) defines no flag errno; native probe: flags 2,
+    // 0x100 and -1 all sleep). The run root's host dispatcher still answers
+    // EINVAL for unknown bits.
+    let absolute = flags & LINUX_TIMER_ABSTIME != 0;
     let clock = match sleep_clock(clock_id) {
-        Ok(clock) => clock,
-        Err(errno) => return returned(errno.guest_retval()),
+        ClockClass::Sleeps(clock) => clock,
+        ClockClass::Unserved => return None,
+        ClockClass::Refused(errno) => return returned(errno.guest_retval()),
     };
+    if absolute && (clock == SleepClock::Realtime || !absolute_monotonic_epoch(isa)) {
+        return None;
+    }
     // As the host dispatcher: page zero is never a guest timespec.
     if request == 0 {
         return returned(LINUX_EFAULT.guest_retval());
@@ -166,25 +206,10 @@ pub fn invoke(call: SleepCall, native: &mut dyn SignalNative<'_>) -> Option<Sign
         Ok(nanos) => nanos,
         Err(errno) => return returned(errno.guest_retval()),
     };
-    let absolute = flags & LINUX_TIMER_ABSTIME != 0;
-    let deadline = match (absolute, clock) {
-        (false, _) if nanos == 0 => return returned(0),
-        (false, _) => SleepDeadline::Relative(nanos),
-        (true, SleepClock::Monotonic) => SleepDeadline::Monotonic(nanos),
-        (true, SleepClock::Realtime) => {
-            let mut word = [0; 8];
-            match native.copy_in(
-                &mut word,
-                UserVa::new(crate::abi::vvar::LINUX_VVAR_BASE + crate::abi::vvar::REALTIME_OFF_NS),
-            ) {
-                CopyOutcome::Done => {}
-                CopyOutcome::NotYet(request) => return Some(native.wait_guest_copy(request)),
-                // No vDSO data page (vDSO disabled): there is no realtime
-                // base in this address space. Leave the call unserved.
-                CopyOutcome::Fault => return None,
-            }
-            SleepDeadline::Monotonic(realtime_to_monotonic(nanos, u64::from_le_bytes(word)))
-        }
+    let deadline = match absolute {
+        false if nanos == 0 => return returned(0),
+        false => SleepDeadline::Relative(nanos),
+        true => SleepDeadline::Monotonic(nanos),
     };
     // An absolute sleep never writes `rem` (clock_nanosleep(2)).
     let remaining = (!absolute && remaining != 0).then_some(UserVa::new(remaining));
@@ -192,11 +217,7 @@ pub fn invoke(call: SleepCall, native: &mut dyn SignalNative<'_>) -> Option<Sign
         deadline,
         remaining,
     }) {
-        Ok(SleepOutcome::Elapsed) => returned(0),
-        Ok(SleepOutcome::Pending) => Some(SignalOutcome::Transferred {
-            progress: carrick_core_abi::Served::Idle,
-            result: SyscallResult::new(0),
-        }),
+        Ok(outcome) => Some(outcome),
         Err(errno) => returned(errno.guest_retval()),
     }
 }
@@ -205,21 +226,46 @@ pub fn invoke(call: SleepCall, native: &mut dyn SignalNative<'_>) -> Option<Sign
 mod tests {
     use super::*;
 
+    /// Each row is a native Linux 6.12 `clock_nanosleep` errno number for a
+    /// clock given before an unreadable request.
     #[test]
-    fn sleep_clocks_match_the_host_classification() {
-        assert_eq!(sleep_clock(0), Ok(SleepClock::Realtime));
-        assert_eq!(sleep_clock(11), Ok(SleepClock::Realtime));
-        assert_eq!(sleep_clock(1), Ok(SleepClock::Monotonic));
-        assert_eq!(sleep_clock(7), Ok(SleepClock::Monotonic));
-        assert_eq!(sleep_clock(2), Err(LINUX_EOPNOTSUPP));
-        assert_eq!(sleep_clock(3), Err(LINUX_EOPNOTSUPP));
-        // clock_getcpuclockid(pid 1): ~(1 << 3) | CPUCLOCK_SCHED.
-        assert_eq!(
-            sleep_clock(((!1_u32 << 3) | 2) as u64),
-            Err(LINUX_EOPNOTSUPP)
-        );
-        assert_eq!(sleep_clock(10), Err(LINUX_EINVAL));
-        assert_eq!(sleep_clock(u64::from(u32::MAX)), Err(LINUX_EINVAL));
+    fn sleep_clocks_match_linux() {
+        use ClockClass::{Refused, Sleeps, Unserved};
+        let thread_cpu = |pid: u32| u64::from((!pid << 3) | 0b110);
+        let process_cpu = |pid: u32| u64::from((!pid << 3) | 0b010);
+        let fd = |fd: u32| u64::from((!fd << 3) | 0b011);
+        for (clock, class) in [
+            (0, Sleeps(SleepClock::Realtime)),
+            (1, Sleeps(SleepClock::Monotonic)),
+            (2, Unserved),
+            (3, Refused(LINUX_EOPNOTSUPP)),
+            (4, Refused(LINUX_EOPNOTSUPP)),
+            (5, Refused(LINUX_EOPNOTSUPP)),
+            (6, Refused(LINUX_EOPNOTSUPP)),
+            (7, Sleeps(SleepClock::Monotonic)),
+            (8, Unserved),
+            (9, Unserved),
+            (10, Refused(LINUX_EINVAL)),
+            (11, Sleeps(SleepClock::Realtime)),
+            (12, Refused(LINUX_EINVAL)),
+            (u64::from(i32::MAX as u32), Refused(LINUX_EINVAL)),
+            // The register's upper half is not part of `clockid_t`.
+            (0x1_0000_0001, Sleeps(SleepClock::Monotonic)),
+            (0x1_0000_0004, Refused(LINUX_EOPNOTSUPP)),
+            (process_cpu(1), Unserved),
+            (thread_cpu(1), Refused(LINUX_EINVAL)),
+            (fd(3), Refused(LINUX_EOPNOTSUPP)),
+            // CLOCKFD's low bits with the per-thread bit set are not an fd.
+            (u64::from((!1_u32 << 3) | 0b111), Refused(LINUX_EINVAL)),
+        ] {
+            assert_eq!(sleep_clock(clock), class, "clock {clock:#x}");
+        }
+    }
+
+    #[test]
+    fn absolute_monotonic_epoch_is_defined_only_on_arm() {
+        assert!(absolute_monotonic_epoch(GuestIsa::Aarch64));
+        assert!(!absolute_monotonic_epoch(GuestIsa::X86_64));
     }
 
     #[test]
@@ -236,13 +282,5 @@ mod tests {
         bytes[..8].copy_from_slice(&(-1_i64).to_le_bytes());
         bytes[8..].copy_from_slice(&0_i64.to_le_bytes());
         assert_eq!(timespec_nanos(bytes), Err(LINUX_EINVAL));
-    }
-
-    #[test]
-    fn realtime_deadlines_before_the_counter_epoch_have_passed() {
-        assert_eq!(realtime_to_monotonic(1_000, 400), 600);
-        assert_eq!(realtime_to_monotonic(400, 1_000), 0);
-        // A negative stored offset wraps exactly as the vDSO adds it.
-        assert_eq!(realtime_to_monotonic(100, (-50_i64) as u64), 150);
     }
 }
