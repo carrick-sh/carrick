@@ -495,9 +495,15 @@ impl Fixture {
         self.path.parent().unwrap().join("objects").join(digest)
     }
     fn rejected(&self, expected: &str) {
-        let error = fixtures::restore(self.repo.path(), &self.path, None, &private_gate().lease)
-            .unwrap_err()
-            .to_string();
+        let error = fixtures::restore(
+            self.repo.path(),
+            &self.path,
+            None,
+            None,
+            &private_gate().lease,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains(expected), "{error}");
         assert!(!self.repo.path().join(fixtures::INSTALLED_MANIFEST).exists());
         assert!(
@@ -564,7 +570,7 @@ fn roundtrip_restores_exact_paths_and_verifies_installed_bytes() {
     }
     let f = Fixture::new();
     fixtures::verify_bundle(f.repo.path(), &f.path, None).unwrap();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     let installed = fixtures::verify_installed(f.repo.path()).unwrap();
     // Four probe ELFs, one raw fixture, five embed fixtures and GNU startup.
     assert_eq!(installed.executables.len(), 11);
@@ -598,7 +604,8 @@ fn restore_durability_flush_budget_does_not_scale_with_executable_count() {
     }
     for probes in [1, 32] {
         let f = Fixture::with_probe_count(probes);
-        let work = fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+        let work =
+            fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
         assert_eq!(work.executable_publications, f.manifest.executables.len());
         assert_eq!(
             work.durability_flushes, 1,
@@ -633,7 +640,7 @@ fn bundle_source_head_is_provenance_not_an_admission_key() {
     let mut f = Fixture::new();
     f.manifest.source_head = "a".repeat(40).try_into().unwrap();
     f.republish();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     let validation = fixtures::verify_installed_receipt(f.repo.path()).unwrap();
     assert_eq!(String::from(validation.bundle_source_head), "a".repeat(40));
     assert_eq!(
@@ -650,6 +657,7 @@ fn expected_sha_must_match_checkout() {
     let error = fixtures::restore(
         f.repo.path(),
         &f.path,
+        None,
         Some(&"b".repeat(40)),
         &private_gate().lease,
     )
@@ -695,7 +703,7 @@ fn local_workspace_dependency_sources_are_verified() {
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     write(
         f.repo.path(),
         "crates/carrick-el1-abi/src/lib.rs",
@@ -719,7 +727,7 @@ fn clean_restore_then_unrelated_edit_preserves_fixtures() {
     f.manifest.sources =
         fixtures::source_hashes(f.repo.path(), &f.manifest.compiler_inputs).unwrap();
     f.republish();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     println!("clean restore succeeded before unrelated edit");
     write(
         f.repo.path(),
@@ -736,7 +744,7 @@ fn acceptance_rejects_untracked_host_test_even_with_valid_fixtures() {
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
     write(
         f.repo.path(),
@@ -772,7 +780,7 @@ fn fixture_verification_rejects_ambient_profile_override() {
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     for (name, value) in [
         ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0"),
         ("CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS", "true"),
@@ -826,7 +834,7 @@ fn cargo_home_and_parent_config_are_isolated() {
             "checkout",
         ],
     );
-    fixtures::restore(&checkout, &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(&checkout, &f.path, None, None, &private_gate().lease).unwrap();
     write(
         outside.path(),
         ".cargo/config.toml",
@@ -871,7 +879,7 @@ fn unrelated_workspace_edits_preserve_fixture_identity() {
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     write(
         f.repo.path(),
         "crates/carrick-runtime/src/lib.rs",
@@ -928,7 +936,7 @@ fn unrelated_workspace_edits_preserve_fixture_identity() {
         String::from(input_identity(&f.manifest))
     );
     assert!(carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).is_err());
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     let installed: serde_json::Value = serde_json::from_slice(
         &fs::read(f.repo.path().join(fixtures::INSTALLED_MANIFEST)).unwrap(),
     )
@@ -947,7 +955,7 @@ fn unresolved_fixture_closure_fails_closed() {
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     write(
         f.repo.path(),
         "fixtures/embed-el1-sched/Cargo.toml",
@@ -978,7 +986,7 @@ fn transitive_fixture_dependency_edits_are_rejected() {
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     write(
         f.repo.path(),
         "crates/fixture-transitive/src/lib.rs",
@@ -1046,7 +1054,7 @@ fn committed_unrelated_edit_keeps_bundle_admissible_by_input_identity() {
     );
     assert_ne!(head, built_at);
     fixtures::verify_bundle(root, &f.path, Some(&head)).unwrap();
-    fixtures::restore(root, &f.path, Some(&head), &private_gate().lease).unwrap();
+    fixtures::restore(root, &f.path, None, Some(&head), &private_gate().lease).unwrap();
     // Acceptance admission: clean checkout, matching input identity.
     let validation = carrick_xtask::accept::verify_signed_fixtures(root).unwrap();
     assert_eq!(String::from(validation.checkout_head), head);
@@ -1068,7 +1076,7 @@ fn workspace_lockfile_is_not_a_fixture_input() {
     // cannot change fixture bytes and churns with every host dependency.
     let f = Fixture::new();
     let root = f.repo.path();
-    fixtures::restore(root, &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(root, &f.path, None, None, &private_gate().lease).unwrap();
     write(root, "Cargo.lock", b"# host workspace lock\nversion = 4\n");
     fixtures::verify_installed(root).unwrap();
     commit(
@@ -1095,7 +1103,7 @@ fn committed_fixture_input_edits_refuse_by_input_identity() {
         "crates/fixture-builder/src/lib.rs",
     ] {
         let f = Fixture::new();
-        fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+        fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
         commit(
             f.repo.path(),
             path,
@@ -1113,7 +1121,7 @@ fn fixture_lockfile_change_refuses_by_input_identity() {
     }
     let f = Fixture::new();
     let root = f.repo.path();
-    fixtures::restore(root, &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(root, &f.path, None, None, &private_gate().lease).unwrap();
     let path = "fixtures/embed-el1-sched/Cargo.lock";
     let lock = fs::read_to_string(root.join(path)).unwrap();
     // A still-valid `--locked` lockfile with different bytes.
@@ -1130,7 +1138,7 @@ fn toolchain_pin_change_refuses() {
     }
     let f = Fixture::new();
     let root = f.repo.path();
-    fixtures::restore(root, &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(root, &f.path, None, None, &private_gate().lease).unwrap();
     commit(
         root,
         "rust-toolchain.toml",
@@ -1140,7 +1148,7 @@ fn toolchain_pin_change_refuses() {
     assert_identity_refusal(&f, "rust-toolchain.toml declaration");
     let f = Fixture::new();
     let root = f.repo.path();
-    fixtures::restore(root, &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(root, &f.path, None, None, &private_gate().lease).unwrap();
     commit(
         root,
         "rust-toolchain.toml",
@@ -1161,7 +1169,7 @@ fn compiler_input_outside_package_directories_refuses() {
     // `conformance-probes/src/lib.rs` include_str!s `shared/banner.txt`.
     let f = Fixture::new();
     let root = f.repo.path();
-    fixtures::restore(root, &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(root, &f.path, None, None, &private_gate().lease).unwrap();
     commit(
         root,
         "shared/banner.txt",
@@ -1180,7 +1188,7 @@ fn symlink_with_identical_link_text_refuses() {
     // symlink to `actual.txt` must not keep the same identity.
     let f = Fixture::new();
     let root = f.repo.path();
-    fixtures::restore(root, &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(root, &f.path, None, None, &private_gate().lease).unwrap();
     fs::remove_file(root.join("conformance-probes/alias.txt")).unwrap();
     std::os::unix::fs::symlink("actual.txt", root.join("conformance-probes/alias.txt")).unwrap();
     git(root, &["add", "--", "conformance-probes/alias.txt"]);
@@ -1199,7 +1207,7 @@ fn target_cfg_build_dependency_is_a_fixture_input() {
     // x86_64 compiles it, so it is an input whatever the verifier's host.
     let f = Fixture::new();
     let root = f.repo.path();
-    fixtures::restore(root, &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(root, &f.path, None, None, &private_gate().lease).unwrap();
     commit(
         root,
         "crates/fixture-host-helper/src/lib.rs",
@@ -1333,7 +1341,7 @@ fn installed_manifest_and_missing_installed_file_fail_closed() {
     }
     let f = Fixture::new();
     assert!(fixtures::verify_installed(f.repo.path()).is_err());
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     fs::remove_file(f.repo.path().join(&f.manifest.executables[0].path)).unwrap();
     assert!(fixtures::verify_installed(f.repo.path()).is_err());
     write(f.repo.path(), fixtures::INSTALLED_MANIFEST, b"{}");
@@ -1365,7 +1373,7 @@ fn signed_preflight_rehashes_restored_executables() {
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
     write(
         f.repo.path(),
@@ -1606,7 +1614,7 @@ fn remote_preparation_restores_raw_fixtures_after_same_sha_cleanup() {
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
-    fixtures::restore(&p.checkout, &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(&p.checkout, &f.path, None, None, &private_gate().lease).unwrap();
     p.setup(&f);
     // Reuse must reinstall missing ignored outputs even when HEAD is unchanged.
     fs::remove_dir_all(p.checkout.join("fixtures/linux-aarch64-hello/target")).unwrap();
@@ -2323,7 +2331,8 @@ fn fixture_artifact_is_immutable_and_retains_executable_modes() {
         artifact
     );
     assert_eq!(fs::read(&artifact).unwrap(), original);
-    fixtures::archive::restore(f.repo.path(), &artifact, None, &private_gate().lease).unwrap();
+    fixtures::archive::restore(f.repo.path(), &artifact, None, None, &private_gate().lease)
+        .unwrap();
     carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
     fs::write(&artifact, b"tampered artifact").unwrap();
     assert!(fixtures::archive::pack(&f.path, output.path()).is_err());
@@ -2350,7 +2359,7 @@ fn archived_missing_tampered_or_linked_objects_fail_before_publication() {
         let p = Preparation::new(&f);
         p.setup(&f);
         let error =
-            fixtures::archive::restore(&p.checkout, &p.archive, None, &private_gate().lease)
+            fixtures::archive::restore(&p.checkout, &p.archive, None, None, &private_gate().lease)
                 .unwrap_err();
         assert!(
             !p.checkout.join(fixtures::INSTALLED_MANIFEST).exists(),
@@ -2514,7 +2523,7 @@ fn check_gzip_transport(case: &str) {
     }
     fs::write(&p.archive, bytes).unwrap();
     let sha = git(&p.checkout, &["rev-parse", "HEAD"]);
-    let reason = fixtures::archive::verify(&p.checkout, &p.archive, &sha)
+    let reason = fixtures::archive::verify(&p.checkout, &p.archive, None, &sha)
         .unwrap_err()
         .to_string();
     let out = p
@@ -2646,14 +2655,21 @@ fn replacing_shared_archive_after_verification_restores_captured_bytes() {
     let output = CanonicalTempDir::new();
     let second = fixtures::archive::pack(&f.path, output.path()).unwrap();
     assert_ne!(
-        fixtures::archive::verify(&p.checkout, &second, &sha)
+        fixtures::archive::verify(&p.checkout, &second, None, &sha)
             .unwrap()
-            .1,
+            .2,
         identity
     );
     fs::rename(second, &p.archive).unwrap();
     assert_ne!(fs::read(&p.archive).unwrap(), original_archive);
-    fixtures::archive::restore(&p.checkout, &captured_path, None, &private_gate().lease).unwrap();
+    fixtures::archive::restore(
+        &p.checkout,
+        &captured_path,
+        None,
+        None,
+        &private_gate().lease,
+    )
+    .unwrap();
     assert_eq!(
         fs::read(p.checkout.join(&f.manifest.executables[0].path)).unwrap(),
         original
@@ -2983,7 +2999,7 @@ fn recorded_compiler_inputs_must_be_tracked_sources() {
     }
     // Deleting a recorded input is a dirty input, never a silent omission.
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     fs::remove_file(f.repo.path().join("shared/banner.txt")).unwrap();
     assert!(
         fixtures::verify_installed(f.repo.path())
@@ -3439,7 +3455,7 @@ fn verification_stamp_reuses_unchanged_files_and_refuses_restored_mtime_tamper()
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     fixtures::verify_installed(f.repo.path()).unwrap();
     let stamp = f.repo.path().join("target/fixtures/verified-stat-v1.json");
     let stamp_time = fs::metadata(&stamp).unwrap().modified().unwrap();
@@ -3469,7 +3485,7 @@ fn installed_receipts_distinguish_recomputed_hashes_from_stamp_reuse() {
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     // An installed historical receipt lacks work metadata; revalidation must
     // produce the concrete current mode rather than guessing historical work.
     let installed_path = f.repo.path().join(fixtures::INSTALLED_MANIFEST);
@@ -3514,7 +3530,7 @@ fn concurrent_installed_verification_tolerates_missing_stamps() {
         return;
     }
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     fs::remove_file(f.repo.path().join("target/fixtures/verified-stat-v1.json")).unwrap();
     let barrier = std::sync::Barrier::new(4);
     std::thread::scope(|scope| {
@@ -3577,7 +3593,7 @@ fn restore_never_waits_on_the_ambient_host_lease() {
 #[ignore = "child of restore_never_waits_on_the_ambient_host_lease"]
 fn restore_under_a_held_ambient_lease_child() {
     let f = Fixture::new();
-    fixtures::restore(f.repo.path(), &f.path, None, &private_gate().lease).unwrap();
+    fixtures::restore(f.repo.path(), &f.path, None, None, &private_gate().lease).unwrap();
     fixtures::verify_installed(f.repo.path()).unwrap();
 }
 
@@ -3593,7 +3609,7 @@ fn restore_refuses_a_shared_lease() {
         carrick_xtask::host_lease::HostLeaseMode::Carrick,
     )
     .unwrap();
-    let error = fixtures::restore(f.repo.path(), &f.path, None, &shared)
+    let error = fixtures::restore(f.repo.path(), &f.path, None, None, &shared)
         .unwrap_err()
         .to_string();
     assert!(
@@ -3611,10 +3627,16 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     let output = CanonicalTempDir::new();
     let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
     let artifact = fixtures::archive::pack(&f.path, output.path()).unwrap();
-    carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &sha, &sha)
+    carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, None, &sha, &sha)
         .unwrap();
-    fixtures::archive::restore(f.repo.path(), &artifact, Some(&sha), &private_gate().lease)
-        .unwrap();
+    fixtures::archive::restore(
+        f.repo.path(),
+        &artifact,
+        None,
+        Some(&sha),
+        &private_gate().lease,
+    )
+    .unwrap();
     fixtures::verify_installed(f.repo.path()).unwrap();
 
     // Equal input identity does not authorize an archive from another SHA
@@ -3622,9 +3644,14 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     f.manifest.source_head = "a".repeat(40).try_into().unwrap();
     f.republish();
     let wrong_sha = fixtures::archive::pack(&f.path, output.path()).unwrap();
-    let error =
-        carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &wrong_sha, &sha, &sha)
-            .unwrap_err();
+    let error = carrick_xtask::signed_gate::verify_fixture_artifact(
+        f.repo.path(),
+        &wrong_sha,
+        None,
+        &sha,
+        &sha,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("source SHA differs"), "{error}");
 
     f.manifest.source_head = sha.clone().try_into().unwrap();
@@ -3634,6 +3661,7 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     let error = carrick_xtask::signed_gate::verify_fixture_artifact(
         f.repo.path(),
         &wrong_inputs,
+        None,
         &sha,
         &sha,
     )
@@ -3649,12 +3677,19 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     );
     let candidate = git(f.repo.path(), &["rev-parse", "HEAD"]);
     assert_ne!(candidate, sha);
-    carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &candidate, &sha)
-        .unwrap();
+    carrick_xtask::signed_gate::verify_fixture_artifact(
+        f.repo.path(),
+        &artifact,
+        None,
+        &candidate,
+        &sha,
+    )
+    .unwrap();
     // The bundle still has to come from the merge base's exact SHA...
     let error = carrick_xtask::signed_gate::verify_fixture_artifact(
         f.repo.path(),
         &artifact,
+        None,
         &candidate,
         &candidate,
     )
@@ -3664,6 +3699,7 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     let error = carrick_xtask::signed_gate::verify_fixture_artifact(
         f.repo.path(),
         &wrong_inputs,
+        None,
         &candidate,
         &sha,
     )
