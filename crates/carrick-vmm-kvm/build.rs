@@ -52,12 +52,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("production CPL0 image build failed: {status}").into());
     }
     let built = target_dir.join("x86_64-unknown-none/release");
-    let production = out.join("carrick-x86-cpl0");
-    std::fs::copy(built.join("carrick-x86-cpl0"), &production)?;
-    println!(
-        "cargo:rustc-env=CARRICK_X86_CPL0_IMAGE={}",
-        production.display()
-    );
+    let publish_image = |bin: &str, output: &str, variable: &str| {
+        let image = out.join(output);
+        std::fs::copy(built.join(bin), &image)?;
+        println!("cargo:rustc-env={variable}={}", image.display());
+        Ok::<(), std::io::Error>(())
+    };
+    publish_image(
+        "carrick-x86-cpl0",
+        "carrick-x86-cpl0",
+        "CARRICK_X86_CPL0_IMAGE",
+    )?;
 
     // Injection witnesses use a second production entry artifact. Build it
     // only after preserving the feature-free production image above.
@@ -97,9 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "CARRICK_X86_CPL0_FIXTURE_IMAGE",
         ),
     ] {
-        let image = out.join(output);
-        std::fs::copy(built.join(bin), &image)?;
-        println!("cargo:rustc-env={variable}={}", image.display());
+        publish_image(bin, output, variable)?;
     }
     Ok(())
 }
