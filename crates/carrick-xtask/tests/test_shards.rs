@@ -108,15 +108,24 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
         shards.len()
     );
     // Only same-repo pull_request jobs and merge groups (whose code is
-    // already same-repo) may reach the self-hosted macOS runner; forks and
+    // already same-repo) may reach a self-hosted macOS runner; forks and
     // cache-saving push/schedule stay hosted (#650; merge groups moved by the
     // owner on 2026-11-04, #231, while hosted macos-15 starved them, #1603).
+    // Merge groups get their own label, carrick-macos-queue, which PR jobs
+    // never request, so PR CI can't starve the queue (owner, 2026-11-09:
+    // "the merge queue takes precedence", #231; #1975).
     let runner = jobs["changes"]["outputs"]["macos_runner"].as_str().unwrap();
+    assert_eq!(
+        runner,
+        "${{ github.event_name == 'merge_group' && '[\"self-hosted\",\"macOS\",\"ARM64\",\"carrick-macos-queue\"]' || ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '[\"self-hosted\",\"macOS\",\"ARM64\",\"carrick-macos-ci\"]' || '\"macos-15\"') }}",
+        "changes.outputs.macos_runner: merge groups -> carrick-macos-queue only; same-repo PRs -> carrick-macos-ci; everything else hosted macos-15"
+    );
     assert!(
-        runner.starts_with("${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'merge_group') && ")
-            && runner.contains("carrick-macos-ci")
-            && runner.ends_with("|| '\"macos-15\"' }}"),
-        "changes.outputs.macos_runner must route only same-repo PRs and merge groups to carrick-macos-ci: {runner}"
+        !runner
+            .split("carrick-macos-queue")
+            .nth(1)
+            .is_some_and(|rest| rest.contains("merge_group")),
+        "no other branch of macos_runner may send merge groups elsewhere: {runner}"
     );
     assert_eq!(
         jobs["macos-authority"]["runs-on"].as_str(),
