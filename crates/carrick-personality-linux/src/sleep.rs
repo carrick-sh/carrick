@@ -62,11 +62,14 @@ pub enum ClockClass {
 /// Classify a sleep clock as Linux does. Source: clock_nanosleep(2) and a
 /// native Linux 6.12 probe (errno numbers): REALTIME, MONOTONIC, BOOTTIME and
 /// TAI sleep; MONOTONIC_RAW, the COARSE clocks, CLOCK_THREAD_CPUTIME_ID and
-/// posix-clock fds give 95 (EOPNOTSUPP) before the request is read; a dynamic
-/// per-thread CPU clock and an unknown id give 22 (EINVAL). Linux sleeps on a
-/// process CPU-time clock (the man page permits it) and the ALARM clocks
-/// decide (EPERM without CAP_WAKE_ALARM) only after reading the request; the
-/// ring measures neither, so they stay [`ClockClass::Unserved`].
+/// posix-clock fds give 95 (EOPNOTSUPP) before the request is read; an
+/// unknown static id gives 22 (EINVAL). Linux sleeps on a process CPU-time
+/// clock (the man page permits it), and the ALARM clocks (EPERM without
+/// CAP_WAKE_ALARM) and dynamic CPU clocks decide only after reading the
+/// request: a raw `clock_nanosleep(0xfffffff6, 0, NULL, NULL)` gives 14
+/// (EFAULT), and a zero request on a live sibling's per-thread clock gives 0
+/// where the caller's own gives 22. The ring measures none of them, so they
+/// stay [`ClockClass::Unserved`].
 ///
 /// BOOTTIME is measured on the guest counter like MONOTONIC: after a host
 /// suspend the host's BOOTTIME runs ahead of it, so an absolute BOOTTIME
@@ -79,9 +82,9 @@ pub fn sleep_clock(clock_id: u64) -> ClockClass {
         let low = id as u32 & (LINUX_CLOCK_CPU_PERTHREAD | LINUX_CLOCK_CPU_WHICH_MASK);
         return if low == LINUX_CLOCK_FD {
             ClockClass::Refused(LINUX_EOPNOTSUPP)
-        } else if low & LINUX_CLOCK_CPU_PERTHREAD != 0 {
-            ClockClass::Refused(LINUX_EINVAL)
         } else {
+            // Process and per-thread CPU clocks: Linux reads the request
+            // first and the answer depends on the named task.
             ClockClass::Unserved
         };
     }
@@ -253,10 +256,11 @@ mod tests {
             (0x1_0000_0001, Sleeps(SleepClock::Monotonic)),
             (0x1_0000_0004, Refused(LINUX_EOPNOTSUPP)),
             (process_cpu(1), Unserved),
-            (thread_cpu(1), Refused(LINUX_EINVAL)),
+            (thread_cpu(1), Unserved),
             (fd(3), Refused(LINUX_EOPNOTSUPP)),
-            // CLOCKFD's low bits with the per-thread bit set are not an fd.
-            (u64::from((!1_u32 << 3) | 0b111), Refused(LINUX_EINVAL)),
+            // CLOCKFD's low bits with the per-thread bit set are not an fd;
+            // Linux reads the request before rejecting the clock.
+            (u64::from((!1_u32 << 3) | 0b111), Unserved),
         ] {
             assert_eq!(sleep_clock(clock), class, "clock {clock:#x}");
         }
