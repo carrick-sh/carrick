@@ -4,7 +4,8 @@ use std::{fs, path::Path};
 /// The Signed gate restores fixtures only from a trusted producer keyed by
 /// the merge base: main's own published `signed-fixtures-<base>` artifact,
 /// fetched by trusted main code that authenticates its producing run. No
-/// job builds fixtures from candidate code (#1889 review P1).
+/// job publishes a bundle from candidate code (#1889 review P1); trusted main
+/// code builds only added probes beside it (#1980).
 #[test]
 fn signed_gate_restores_the_trusted_base_fixture_artifact() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -58,7 +59,55 @@ fn signed_gate_restores_the_trusted_base_fixture_artifact() {
         download["uses"].as_str(),
         Some("actions/download-artifact@v4")
     );
-    // Candidate code is checked out only by the executor, never by a job.
+    // Owner decision #1980: one job builds added probes from candidate code.
+    // It runs main's code on the publisher's runner class, needs the trusted
+    // base bundle, and hands the gate a per-attempt artifact.
+    let probes = &jobs["candidate-probes"];
+    assert_eq!(probes["runs-on"].as_str(), Some("ubuntu-24.04-arm"));
+    let needs: Vec<_> = probes["needs"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s.as_str())
+        .collect();
+    assert_eq!(needs, ["authorize", "base-fixtures"]);
+    let steps = probes["steps"].as_vec().unwrap();
+    assert_eq!(steps[0]["with"]["ref"].as_str(), Some("main"));
+    assert_eq!(
+        steps[0]["with"]["persist-credentials"].as_bool(),
+        Some(false)
+    );
+    assert!(steps.iter().any(|s| {
+        s["run"]
+            .as_str()
+            .is_some_and(|r| r.contains("signed-gate candidate-probes"))
+    }));
+    assert!(
+        probes["permissions"]["contents"].as_str() == Some("read")
+            && probes["permissions"].as_hash().unwrap().len() == 2,
+        "the candidate probe builder holds no write permission"
+    );
+    let upload = steps
+        .iter()
+        .find(|s| s["uses"].as_str() == Some("actions/upload-artifact@v4"))
+        .unwrap();
+    let set = upload["with"]["name"].as_str().unwrap();
+    assert!(set.contains("github.run_attempt"), "{set}");
+    assert!(
+        gate["needs"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("candidate-probes"))
+    );
+    assert!(
+        gate["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .any(|s| s["with"]["name"].as_str() == Some(set))
+    );
+    // Candidate code is checked out only by trusted xtask code, never by a job.
     for (job, body) in jobs.as_hash().unwrap() {
         for step in body["steps"].as_vec().into_iter().flatten() {
             assert_ne!(
@@ -123,7 +172,13 @@ fn signed_queue_workflow_requires_published_group_pass_and_seeds_main() {
         Some("always() && github.event_name == 'merge_group'")
     );
     let required = check["needs"].as_vec().unwrap();
-    for job in ["authorize", "base-fixtures", "gate", "publish"] {
+    for job in [
+        "authorize",
+        "base-fixtures",
+        "candidate-probes",
+        "gate",
+        "publish",
+    ] {
         assert!(required.iter().any(|j| j.as_str() == Some(job)));
     }
     let command = check["steps"][0]["run"].as_str().unwrap();
@@ -132,6 +187,7 @@ fn signed_queue_workflow_requires_published_group_pass_and_seeds_main() {
     for (variable, job) in [
         ("AUTHORIZE", "authorize"),
         ("FIXTURES", "base-fixtures"),
+        ("PROBES", "candidate-probes"),
         ("GATE", "gate"),
         ("PUBLISH", "publish"),
     ] {
@@ -140,12 +196,12 @@ fn signed_queue_workflow_requires_published_group_pass_and_seeds_main() {
             format!("${{{{ needs.{job}.result }}}}")
         );
     }
-    for dependency in ["AUTHORIZE", "FIXTURES", "GATE", "PUBLISH"] {
+    for dependency in ["AUTHORIZE", "FIXTURES", "PROBES", "GATE", "PUBLISH"] {
         assert!(command.contains(&format!("test \"${dependency}\" = success")));
     }
     // Run the workflow's actual shell with GitHub's fail-fast behavior.
     // A failure in any dependency must not be hidden by a later success.
-    let dependencies = ["AUTHORIZE", "FIXTURES", "GATE", "PUBLISH"];
+    let dependencies = ["AUTHORIZE", "FIXTURES", "PROBES", "GATE", "PUBLISH"];
     let run_check = |refused: Option<(&str, &str)>| {
         let mut shell = std::process::Command::new("bash");
         shell.args(["-e", "-c", command]);
