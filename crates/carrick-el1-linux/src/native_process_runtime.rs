@@ -3756,7 +3756,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     /// Race one unrelated publication on `process`'s signal wake channel
     /// against the next signal-wait enrollment: the owner's pre-park check
     /// has passed, so enrollment must observe a stale generation and rescan.
-    #[cfg(test)]
+    // Its only caller, the native exec fixture, does not build on macOS.
+    #[cfg(all(test, not(target_os = "macos")))]
     pub(crate) fn publish_signal_channel_before_next_park(
         &self,
         process: TaskKey,

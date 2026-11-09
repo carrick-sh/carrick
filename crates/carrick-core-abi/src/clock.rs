@@ -13,7 +13,6 @@
 //! and atomic `timex` updates. Sleeps never cross: the ring's signal wait owner
 //! serves them (`carrick_personality_linux::sleep`).
 
-use carrick_syscall_abi::LinuxErrno;
 use core::num::NonZeroU64;
 
 /// Run-scoped capability naming the container's shared `ClockDomain` resource.
@@ -31,6 +30,25 @@ impl ClockCapabilityId {
     }
 
     pub const fn raw(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
+/// A personality-defined positive error number (1..=4095) carried by a
+/// failure reply. The neutral record does not interpret it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct ClockErrno(core::num::NonZeroU16);
+
+impl ClockErrno {
+    pub const fn new(raw: u16) -> Option<Self> {
+        match core::num::NonZeroU16::new(raw) {
+            Some(raw) if raw.get() <= 4095 => Some(Self(raw)),
+            _ => None,
+        }
+    }
+
+    pub const fn raw(self) -> core::num::NonZeroU16 {
         self.0
     }
 }
@@ -94,9 +112,9 @@ pub enum ClockRequest<'a> {
 /// Decoded reply from a completed clock-resource record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClockReply<'a> {
-    Sample(Result<(u64, u32), LinuxErrno>),
-    TimexPreflight(Result<(), LinuxErrno>),
-    TimexApply(Result<(i64, &'a [u8; CLOCK_TIMEX_BYTES]), LinuxErrno>),
+    Sample(Result<(u64, u32), ClockErrno>),
+    TimexPreflight(Result<(), ClockErrno>),
+    TimexApply(Result<(i64, &'a [u8; CLOCK_TIMEX_BYTES]), ClockErrno>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,10 +249,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<ClockRequest<'_>, ClockRecordError>
 }
 
 /// Write an errno failure reply in place.
-pub fn write_errno_reply(bytes: &mut [u8], errno: LinuxErrno) -> Result<(), ClockRecordError> {
+pub fn write_errno_reply(bytes: &mut [u8], errno: ClockErrno) -> Result<(), ClockRecordError> {
     let _ = validate_envelope(bytes)?;
     write_u32(bytes, 8, REPLY_ERRNO);
-    write_u32(bytes, 12, errno.get() as u32);
+    write_u32(bytes, 12, u32::from(errno.raw().get()));
     Ok(())
 }
 
@@ -291,11 +309,10 @@ pub fn parse_reply(bytes: &[u8]) -> Result<ClockReply<'_>, ClockRecordError> {
         return Err(ClockRecordError::Invalid);
     }
     if tag == REPLY_ERRNO {
-        let errno = i32::try_from(aux).map_err(|_| ClockRecordError::Invalid)?;
-        if !(1..=4095).contains(&errno) {
-            return Err(ClockRecordError::Invalid);
-        }
-        let errno = LinuxErrno::new(errno);
+        let errno = u16::try_from(aux)
+            .ok()
+            .and_then(ClockErrno::new)
+            .ok_or(ClockRecordError::Invalid)?;
         return match op {
             ClockResourceOp::Sample => Ok(ClockReply::Sample(Err(errno))),
             ClockResourceOp::TimexPreflight => Ok(ClockReply::TimexPreflight(Err(errno))),
@@ -363,12 +380,12 @@ mod tests {
         assert_eq!(parse_reply(&buf), Ok(ClockReply::TimexApply(Ok((5, &out)))));
 
         encode_timex_request(&mut buf, true, false, &input);
-        write_errno_reply(&mut buf, carrick_syscall_abi::LINUX_EINVAL).unwrap();
+        write_errno_reply(&mut buf, ClockErrno::new(22).unwrap()).unwrap();
         assert_eq!(
             parse_reply(&buf),
-            Ok(ClockReply::TimexPreflight(Err(
-                carrick_syscall_abi::LINUX_EINVAL
-            )))
+            Ok(ClockReply::TimexPreflight(
+                Err(ClockErrno::new(22).unwrap())
+            ))
         );
     }
 
@@ -376,7 +393,7 @@ mod tests {
     fn reply_rejects_errno_outside_linux_domain() {
         let mut buf = [0; CLOCK_RECORD_BYTES];
         encode_sample_request(&mut buf, 0);
-        write_errno_reply(&mut buf, carrick_syscall_abi::LINUX_EINVAL).unwrap();
+        write_errno_reply(&mut buf, ClockErrno::new(22).unwrap()).unwrap();
         for invalid in [0_u32, 4096, i32::MAX as u32, u32::MAX] {
             write_u32(&mut buf, 12, invalid);
             assert_eq!(parse_reply(&buf), Err(ClockRecordError::Invalid));
