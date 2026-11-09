@@ -28,6 +28,7 @@ semantic_authority = [
   "man 2 fork: parent and child hold independent descriptor tables over the same open descriptions",
   "man 7 signal / man 2 read: a caught signal interrupts a blocked pipe read with EINTR (4), or the read restarts after the handler under SA_RESTART; transferred bytes are returned",
   "man 7 signal / man 2 epoll_wait: an interrupted epoll wait returns EINTR regardless of SA_RESTART",
+  "man 2 pipe2: one call creates exactly one pipe and one descriptor pair or fails with EFAULT, EINVAL, EMFILE or ENFILE; it never fails with EINTR, so internal lock contention is neither an errno nor an interruption point",
 ]
 fixture = "embed:el1-sched ipc-processes pipe|eventfd 1|8|64 128"
 scale_points = [1, 8, 64]
@@ -67,6 +68,8 @@ vm_free = [
   "carrick-sched-core::object_wait::host_tests::legacy_bind_rechecks_live_source_after_waiting_for_the_lock (#1845: a legacy binder cannot rebind a source installed while it waited)",
   "carrick-sched-core::completion_queue::tests::source_admission_waits_for_an_inflight_handback_initializer (#1845: source admission waits for lock-free handback-chain initialization before mutating source custody)",
   "carrick-kernel::el1_zone::tests::serial_host::{legacy_release_completion_rings_mapped_doorbell_and_returns_exact_operation,host_completion_preserves_a_publishing_guests_own_slot} (#1845: production completion venues, mapped host-work doorbells, exact handback drain and publishing-guest own-slot reschedule; no physical host-kick claim)",
+  "carrick-kernel::dispatch::ipc_lock_contention_tests::{pipe2_held_lane_lock_retains_create_then_succeeds_once,pipe2_held_readable_lane_retains_unbound_create_then_succeeds_once,pipe2_lane_release_before_enrollment_reruns_now,pipe2_cancel_while_parked_leaks_no_object_or_binding,pipe2_lane_contention_does_not_exhaust_the_default_executor_pool} (#1845 pipe2 create, ARM: production threaded pipe2 entry with a live holder of a recycled slot's lane lock; retained create, exact-once completion, release-before-enrollment, cancellation rollback, and default single-CPU pool exhaustion with the release queued on the pool; docs/conformance-contracts/ipc-create-bind-contention.md; runtime park arm signed execution unclaimed)",
+  "carrick-runtime::vcpu_loop::zone::owner_copyout_policy_tests::ipc_lock_wait_is_killable_only_not_ordinary_signal_interruptible (#1845: a retained IPC create parks under the killable owner gate; pipe2 never returns EINTR)",
 ]
 # #1507: imported pipe writev uses the existing owned pipe operation.
 # The VM-free bounds are zero host calls and reclamation to the exact
