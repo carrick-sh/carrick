@@ -5245,6 +5245,80 @@ mod tests {
         );
     }
 
+    /// #1954: an ARM `write`/`writev` whose buffer is readable for 16 bytes
+    /// and then unmapped stages the readable prefix behind a supply of the
+    /// exact unmapped page, so a refused supply writes 16 bytes (Linux's
+    /// short write), never EFAULT.
+    #[test]
+    fn native_host_file_stage_keeps_a_readable_prefix_before_an_unmapped_page() {
+        use carrick_personality_linux::native_host_file::{DescriptionAccess, HostFileStage};
+        /// Readable up to `end`, unmapped from there on.
+        struct ReadableBelow(u64);
+        impl file::MemoryValidator for ReadableBelow {
+            fn writable_bytes(&self, _user_va: u64, _len: usize) -> usize {
+                0
+            }
+            fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+                (self.0.saturating_sub(user_va) as usize).min(len)
+            }
+        }
+        #[repr(C, align(4096))]
+        struct Page([u8; 4096]);
+        let mut page = Box::new(Page([0; 4096]));
+        page.0[4080..].copy_from_slice(b"0123456789abcdef");
+        let base = page.0.as_ptr().addr() as u64;
+        let unmapped = base + 4096;
+        // The vector array sits in the readable page too.
+        for (at, word) in [base + 4080, 8, base + 4088, 0x100001]
+            .into_iter()
+            .enumerate()
+        {
+            page.0[at * 8..at * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let task = CurrentTask::new();
+        let table = [3, 4, 5];
+        // aarch64 write(1, base + 4080, 0x100001) and writev(1, iov, 2).
+        for (nr, args) in [(64, [1, base + 4080, 0x100001]), (66, [1, base, 2])] {
+            let mut frame = TrapFrame {
+                esr: 0x15 << 26,
+                ..TrapFrame::default()
+            };
+            frame.x[8] = nr;
+            frame.x[..3].copy_from_slice(&args);
+            let staged = native_host_file_stage(
+                &frame,
+                &task,
+                &ReadableBelow(unmapped),
+                table,
+                carrick_core_abi::service::ServiceOrigin::Initial,
+                |_| {
+                    Some(NativeDescriptor::HostBacked {
+                        access: DescriptionAccess::ReadWrite,
+                    })
+                },
+                &mut |_| 0,
+            )
+            .expect("a host-backed write is staged");
+            assert_eq!(
+                staged.fault(),
+                Some((unmapped, carrick_guest_arch::Access::Read)),
+                "nr {nr}: supply the unmapped page, not the readable start: {staged:?}"
+            );
+            let HostFileStage::Request {
+                mut record,
+                output: None,
+                ..
+            } = staged.refused()
+            else {
+                panic!("nr {nr}: a refused supply writes the prefix");
+            };
+            let view =
+                carrick_core_abi::host_file::HostFileRequestView::parse(&mut record).unwrap();
+            assert_eq!(view.input(), b"0123456789abcdef", "nr {nr}");
+            assert_eq!(view.header().table, table);
+        }
+    }
+
     /// #894: Rust std's startup `ppoll` over host-bound fds 0-2 (no events,
     /// zero timeout) from a native child. Its in-ring owner leaves the set
     /// unrouted (only the carrier observes host descriptions); the native
