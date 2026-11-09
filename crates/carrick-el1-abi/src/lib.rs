@@ -2870,7 +2870,8 @@ pub enum IpcLeave {
     SigpipeHandback,
     /// A description replaced by a host-backed one since the snapshot.
     Restart,
-    /// `epoll_pwait` with a signal mask: the host swaps the mask.
+    /// `epoll_pwait` with a signal mask EL1 cannot honour (unreadable, or
+    /// the caller has no native signal owner): the host swaps the mask.
     EpollSigmask,
     /// `epoll_pwait` on a set with host-half items: the host harvests both.
     EpollHostItems,

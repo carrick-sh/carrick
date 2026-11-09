@@ -237,6 +237,16 @@ impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, 
             .as_deref_mut()
             .is_some_and(|owner| owner.interrupt_pending_wait())
     }
+    fn arm_wait_sigmask(&mut self, temporary: u64) -> bool {
+        self.owner
+            .as_deref_mut()
+            .is_some_and(|owner| owner.arm_wait_sigmask(temporary))
+    }
+    fn disarm_wait_sigmask(&mut self) {
+        if let Some(owner) = self.owner.as_deref_mut() {
+            owner.disarm_wait_sigmask();
+        }
+    }
 }
 
 #[cfg(test)]
