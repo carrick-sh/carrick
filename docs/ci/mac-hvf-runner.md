@@ -464,7 +464,11 @@ Disk admission now takes exclusive host custody before measuring free space.
 Shared builds drain before the floor is checked; a shortage on the admitted
 host still fails with free GiB and floor GiB. The HVF checkout bootstrap and
 PR bootstrap use the installed `/usr/local/bin/carrick-xtask` supervisor;
-install it before enabling this workflow on a gate host. The HVF checkout
+install it (setup step 3, "Root-owned `carrick-xtask`") before enabling
+this workflow on a gate host. The workflow's first step verifies the binary is
+installed, root-owned and has the `host-lease` subcommand, and otherwise fails
+naming that step; there is no unleased fallback, because measuring free space
+beside a running build is the race this closes. The HVF checkout
 xtask lives in `target/lease-tools` so the debug-tree prune cannot remove it.
 
 See [build admission and remaining direct-script limits](../host-lease-containment-follow-up.md#disk-admission-and-build-leases-1693)

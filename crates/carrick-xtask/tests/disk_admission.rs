@@ -72,10 +72,20 @@ fn hvf_bootstrap_and_disk_admission_use_installed_lease_runner() {
     let text = fs::read_to_string(root.join(".github/workflows/kernel-runtime.yml")).unwrap();
     let yaml = YamlLoader::load_from_str(&text).unwrap();
     let steps = yaml[0]["jobs"]["hvf-kernel"]["steps"].as_vec().unwrap();
-    let disk = steps
-        .iter()
-        .find(|s| s["name"].as_str() == Some("Disk admission"))
-        .unwrap();
+    let position = |name: &str| {
+        steps
+            .iter()
+            .position(|s| s["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing workflow step {name:?}"))
+    };
+    // A runner lacking the root-owned supervisor must fail with the runbook
+    // step before admission, never fall back to an unleased free-space read.
+    let verify = position("Verify installed host-lease supervisor");
+    assert!(verify < position("Disk admission"));
+    let verify_run = steps[verify]["run"].as_str().unwrap();
+    assert!(verify_run.contains("mac-hvf-runner.md, setup step 3"));
+    assert!(!verify_run.contains("host-lease --mode"));
+    let disk = &steps[position("Disk admission")];
     assert!(
         disk["run"]
             .as_str()
