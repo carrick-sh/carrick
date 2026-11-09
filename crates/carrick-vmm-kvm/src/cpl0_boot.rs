@@ -3935,6 +3935,19 @@ impl Cpl0Carrier {
                 .ok_or_else(|| fail("lane observation"))?
                 .cast::<LifecycleLane>()
         };
+        // SAFETY: boot_lifecycle owns initialized aligned retained zone RAM;
+        // CPUs are stopped while the host observes it.
+        let zone = unsafe {
+            &*self
+                .custody
+                .ram()
+                .host_ptr(
+                    crate::carrier_interrupts::PROGRESS_ZONE_GPA,
+                    size_of::<carrick_sched_core::ZoneTables>(),
+                )
+                .ok_or_else(|| fail("lifecycle zone"))?
+                .cast::<carrick_sched_core::ZoneTables>()
+        };
         let page: &ThreadLifecyclePage = self.metadata(index as u64 * 0x4000);
         let counters: &Counters = self.metadata(COUNTERS_OFFSET);
         let data = self
@@ -3959,6 +3972,7 @@ impl Cpl0Carrier {
             forwards: self.custody.host_forwards(),
             words,
             parked_parent_result: lane.contexts[0].frame.rax,
+            timer_nodes: zone.timer_node_count(),
         })
     }
 }
