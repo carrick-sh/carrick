@@ -541,15 +541,10 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         deliverable
     }
     /// Arm `hook` to run after the next deliverable check that finds nothing.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "macos")))]
     pub(crate) fn after_next_empty_check(&self, hook: EmptyCheckHook<'a, T>) {
-        assert!(
-            self.resources
-                .after_empty_check
-                .lock()
-                .replace(hook)
-                .is_none()
-        );
+        let previous = self.resources.after_empty_check.lock().replace(hook);
+        assert!(previous.is_none(), "one armed empty-check hook");
     }
     fn deliverable_now(&self, tid: carrick_sched_core::RecordRef, blocked: SigBlockMask) -> bool {
         let resources = self.resources.lock();
