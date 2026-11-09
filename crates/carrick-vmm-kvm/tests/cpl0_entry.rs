@@ -609,7 +609,7 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
 
 /// A real guest birth, handshake and nonfinal raw exit. No fixture-image
 /// ordinals, preseeded members or host-answered clone can satisfy this probe.
-fn production_thread_clone_probe() -> Vec<u8> {
+fn production_thread_clone_probe(probe_nonleader: bool) -> Vec<u8> {
     fn mov(code: &mut Vec<u8>, register: &[u8], value: u64) {
         code.extend_from_slice(register);
         code.extend_from_slice(&value.to_le_bytes());
@@ -667,6 +667,15 @@ fn production_thread_clone_probe() -> Vec<u8> {
     failures.push(branch(&mut code, 0x85));
     code.extend_from_slice(&[0x4c, 0x39, 0xf0]); // cmp rax,r14 (distinct tids)
     failures.push(branch(&mut code, 0x84));
+    if probe_nonleader {
+        // The child stays live behind the existing bounded handshake.
+        // kill(child_tid, 0) must accept a nonleader namespace TID.
+        code.extend_from_slice(&[0x4c, 0x89, 0xef]); // rdi = r13 (child tid)
+        mov(&mut code, &[0x48, 0xbe], 0);
+        mov(&mut code, &[0x48, 0xb8], 62);
+        code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0]);
+        failures.push(branch(&mut code, 0x85));
+    }
     // Parent ran after clone. Release the child's bounded handshake wait.
     code.extend_from_slice(&[0x41, 0xc7, 0x44, 0x24, 0x0c, 1, 0, 0, 0]);
     code.extend_from_slice(&[0x49, 0x8d, 0x7c, 0x24, 0x0c]);
@@ -721,7 +730,7 @@ fn production_thread_clone_probe() -> Vec<u8> {
 
 #[test]
 fn production_clone_thread_runs_and_exits_without_ending_parent() {
-    let outcome = run_pool_fixture(&production_thread_clone_probe(), 32);
+    let outcome = run_pool_fixture(&production_thread_clone_probe(false), 32);
     assert_eq!(
         outcome.run.exit_code, 7,
         "guest clone/lifecycle failed (clone errors are reported as errno numbers)"
@@ -736,6 +745,16 @@ fn production_clone_thread_runs_and_exits_without_ending_parent() {
         0,
         "clone must be served in ring"
     );
+}
+
+#[test]
+fn production_kill_probe_resolves_a_live_nonleader_tid() {
+    let outcome = run_pool_fixture(&production_thread_clone_probe(true), 32);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "kill(nonleader_tid, 0) must succeed"
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
 }
 
 /// A sole native thread must resume a timed futex with Linux ETIMEDOUT;
