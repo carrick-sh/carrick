@@ -28,7 +28,8 @@ pub(crate) fn admits(call: HostFileCall, origin: ServiceOrigin) -> bool {
 }
 
 /// Decode, admit and stage `call` against the caller's ring namespace.
-/// `None` keeps the call on its existing route.
+/// `None` keeps the call on its existing route, including when no ring
+/// namespace is published.
 pub(crate) fn stage_call<V, R>(
     call: &CanonicalCall,
     task: &CurrentTask,
@@ -47,10 +48,10 @@ where
     if !admits(decoded, origin) {
         return None;
     }
-    // No published ring namespace: an in-zone answer, never the host's.
-    let Some((table, mut resolve)) = namespace() else {
-        return Some(HostFileStage::InRing);
-    };
+    // No published ring namespace (venue or table unavailable): keep the
+    // existing route, as ARM's staging does, so an initial write keeps its
+    // stdout route and a strict refusal stays the crossing table's.
+    let (table, mut resolve) = namespace()?;
     let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
     Some(
         carrick_el1_linux::dispatch::stage_native_host_file(
@@ -121,6 +122,28 @@ mod tests {
                 matches!(writev, Some(HostFileStage::Request { .. })),
                 "{origin:?} writev {writev:?}"
             );
+        }
+    }
+
+    #[test]
+    fn unpublished_namespace_keeps_the_existing_route() {
+        // #1954 P0-2: an absent venue or table was staged InRing, so an
+        // initial write to stdout returned counted ENOSYS (-38).
+        let bytes = *b"hello\n";
+        let buf = bytes.as_ptr() as u64;
+        let iov = [buf, bytes.len() as u64];
+        let task = CurrentTask::new();
+        for origin in [INITIAL, CHILD] {
+            for (nr, args) in [
+                (1, [1, buf, bytes.len() as u64, 0, 0, 0]),
+                (20, [1, iov.as_ptr() as u64, 1, 0, 0, 0]),
+            ] {
+                let call = decode_x86_64(nr, args, 0x8000);
+                let staged = stage_call(&call, &task, &Resident, origin, || {
+                    None::<([u64; 3], fn(i32) -> Option<NativeDescriptor>)>
+                });
+                assert_eq!(staged, None, "{origin:?} nr {nr}");
+            }
         }
     }
 

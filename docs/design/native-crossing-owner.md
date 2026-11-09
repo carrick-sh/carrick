@@ -253,7 +253,19 @@ It was red with result -38 before the resource arm was added.
 This is not closure of #1335 or #1410. Writes still require the existing
 carrier-write admission (an unlimited caller file-size limit and no applicable
 watcher). The x86 CPL0 staging gate admits write/writev for both origins like ARM
-(`native_stage::admits`); a non-resident buffer answers EFAULT there, since
-CPL0 has no syscall-retry fault supply.
-Namespace mutation cores, real shell redirect-and-restore, decoded-x86 runtime
-coverage, and signed evidence remain unfinished.
+(`native_stage::admits`). The strict x86 crossing set still excludes writev,
+so the shared completion owner offers each unserved call to the venue's
+staging (`PendingFamilies::stage_native_host_file`) before that table can
+refuse it, as ARM stages ahead of its operation route. The crossing
+allowlist is unchanged and a call no venue stages is still counted ENOSYS,
+never a host replay. With no published ring namespace (venue or table)
+staging returns `None`, so the call keeps its existing route. A
+non-resident source buffer is supplied through the same owner fault path
+as the #PF entry and the syscall is retried at its `syscall` instruction;
+only a refused access (no mapping, wrong protection, backing past EOF)
+answers EFAULT. The KVM witnesses in `cpl0_initial_mm.rs`
+(`native_redirect_write.S`) check the result and destination bytes for a
+child writev, a child write from an untouched anonymous page, and an
+initial write with its ring table withdrawn.
+Namespace mutation cores, real shell redirect-and-restore, decoded-x86
+runtime coverage beyond write/writev, and signed evidence remain unfinished.
