@@ -48,3 +48,17 @@ stock slice. The zone ABI signature changes with the retained custody storage,
 so signed verification needs fixtures admitted against the new input identity.
 VM-free Linux tests do not prove the ARM HVC, hardware root switch, full process
 adoption, or native ARM runtime ratio. Those gates remain director-owned.
+
+Final entry recycling also belongs to the scheduler's notification retirement
+owner. A terminal reservation root can close its source while an earlier
+anonymous-edit observer still owns a counted lease. Closing prevents new
+admissions; the last borrower finishes destruction and only then makes the
+entry reusable. A terminal caller must not call raw `AddressSpaces::free`
+while such custody survives. The existing ARM in-ring wait4 wake binding now
+retains a child lease across the production fork-child `exit_group`, checks
+that terminal admission is closed, and requires entry removal after release.
+The same fixture covers a live sibling waiter and physical retirement. It
+reproduces `retire MM notification source before entry` before the correction.
+ARM and x86 use the same `retire_closed_space` drain and sched-core owner.
+This witness does not attribute the separate signed EntryBinding or tgkill
+failures, or replace the director's signed population comparison.
