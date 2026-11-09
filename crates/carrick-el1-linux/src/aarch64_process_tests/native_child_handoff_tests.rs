@@ -3,25 +3,49 @@ use super::*;
 
 #[test]
 fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
-    fork_child_service_ack(false, false, false);
+    fork_child_service_ack(false, false, false, false);
 }
 
 #[test]
 fn arm_native_fork_child_stdout_service_keeps_exact_entry() {
-    fork_child_service_ack(true, false, false);
+    fork_child_service_ack(true, false, false, false);
 }
 
 #[test]
 fn arm_native_fork_child_stdout_retains_capability_after_root_exit_publication() {
-    fork_child_service_ack(true, true, false);
+    fork_child_service_ack(true, true, false, false);
 }
 
 #[test]
 fn arm_native_fork_tree_releases_capability_after_last_exit() {
-    fork_child_service_ack(true, true, true);
+    fork_child_service_ack(true, true, true, false);
 }
 
-fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
+/// #1335/#1954: a fork child's `write` to its inherited host-backed stdout
+/// whose buffer is readable for 16 bytes and then unmapped returns Linux's
+/// short count after the carrier refuses the unmapped page. It runs the
+/// shipping ARM staging, owner-fault and begin bodies
+/// (`native_service_decision`, `begin_native_service`), not a re-staging.
+#[test]
+fn arm_native_fork_child_write_keeps_readable_prefix_before_unmapped_page() {
+    fork_child_service_ack(true, false, false, true);
+}
+
+const PREFIX_BYTES: &[u8; 16] = b"0123456789abcdef";
+
+/// Readable up to `end`, unmapped from there on.
+struct ReadableBelow(u64);
+
+impl crate::file::MemoryValidator for ReadableBelow {
+    fn writable_bytes(&self, _user_va: u64, _len: usize) -> usize {
+        0
+    }
+    fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+        (self.0.saturating_sub(user_va) as usize).min(len)
+    }
+}
+
+fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefix: bool) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
@@ -165,6 +189,13 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
     let mut saved = unsafe { *fixture.zone.record(child).ctx_mut() };
     let stdout_bytes = b"mask-storm role=child sends=2000 send_failures=0 ok=true\n";
     let stdout_user = carrick_test_support::GuestUserBuffer::from_bytes(stdout_bytes);
+    // The prefix witness's buffer: 16 readable bytes at the end of a page,
+    // then an unmapped page.
+    #[repr(C, align(4096))]
+    struct PrefixPage([u8; 4096]);
+    let mut prefix_page = Box::new(PrefixPage([0; 4096]));
+    prefix_page.0[4080..].copy_from_slice(PREFIX_BYTES);
+    let prefix_unmapped = prefix_page.0.as_ptr().addr() as u64 + 4096;
     if stdout {
         // Same SVC words as the signed sender's 57-byte stdout write.
         saved.native.x[0] = 1;
@@ -172,6 +203,12 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
         saved.native.x[2] = 0x39;
         saved.native.x[8] = 64;
         saved.native.pc = 0x2a6f20;
+    }
+    if prefix {
+        // write(1, page + 4080, 0x100001): the same SVC words as a libc
+        // write of a megabyte whose tail was never mapped.
+        saved.native.x[1] = prefix_page.0.as_ptr().addr() as u64 + 4080;
+        saved.native.x[2] = 0x100001;
     }
     let child_ttbr = cpu.ttbr;
     assert_eq!(fixture.zone.installed_space(fixture.slot), identity.mm);
@@ -187,7 +224,61 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
         child_control,
         &mut service,
         |entry| {
-            let result = if stdout {
+            let result = if prefix {
+                use carrick_personality_linux::native_host_file::{
+                    DescriptionAccess, NativeDescriptor,
+                };
+                let mut stage_frame = carrick_el1_abi::TrapFrame {
+                    x: saved.native.x,
+                    elr: saved.native.pc,
+                    esr: 0x15 << 26,
+                    slot: u64::from(fixture.slot.raw()),
+                    ..Default::default()
+                };
+                let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+                // The shipping decision body: stage the write, take the
+                // owner-fault path for the unmapped page, retain the prefix.
+                let super::super::dispatch::NativeServiceDecision::Begin(begin) =
+                    super::super::dispatch::native_service_decision(
+                        &mut stage_frame,
+                        task,
+                        carrick_el1_abi::Action::Forward,
+                        None,
+                        counters,
+                        || super::super::native_process_runtime::NativeThreadGroupOwner::ForkChild,
+                        |frame| {
+                            super::super::dispatch::native_host_file_stage(
+                                frame,
+                                task,
+                                &ReadableBelow(prefix_unmapped),
+                                [5, 1, 0],
+                                carrick_core_abi::service::ServiceOrigin::Descendant,
+                                |fd| {
+                                    assert_eq!(fd, 1);
+                                    Some(NativeDescriptor::HostBacked {
+                                        access: DescriptionAccess::WriteOnly,
+                                    })
+                                },
+                                &mut |_| panic!("a write releases no mapping sources"),
+                            )
+                        },
+                    )
+                else {
+                    panic!("an unmapped write tail must publish an owner-fault request");
+                };
+                // Begins and settles the request exactly as the bare-metal
+                // wrapper's process-entry closure does.
+                super::super::dispatch::begin_native_service(
+                    entry,
+                    saved.native.x[8],
+                    begin,
+                    None,
+                    counters,
+                    counters,
+                    || None,
+                )
+                .0
+            } else if stdout {
                 use carrick_personality_linux::native_host_file::{
                     DescriptionAccess, HostFileStage, NativeDescriptor,
                 };
@@ -271,6 +362,79 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
     assert_eq!(cpu.ttbr, (0x30000, 0x30000), "park left the child roots");
     assert_eq!(fixture.zone.installed_space(fixture.slot), 0);
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    if prefix {
+        // Round one: the carrier is asked to supply the unmapped page and
+        // refuses it. The retained prefix is then written, not EFAULT.
+        let selector = task.service_notice.take().unwrap().unwrap();
+        let ticket = unsafe {
+            carrick_core_abi::service::ServiceCell::claim_notice(
+                &child_control.service,
+                selector,
+                NonZeroU64::MIN,
+                identity,
+            )
+        }
+        .unwrap();
+        let carrick_core_abi::service::ServiceOperation::Fault(fault) = ticket.request().operation
+        else {
+            panic!("an unmapped write tail must ask the owner to supply the page");
+        };
+        assert_eq!(fault.address.raw(), prefix_unmapped, "the unmapped page");
+        assert_eq!(fault.access, carrick_guest_arch::Access::Read);
+        assert!(ticket.complete(false).is_ok(), "refuse the supply");
+        fixture
+            .zone
+            .object_wait(
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
+                    .unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            )
+            .unwrap()
+            .notify_object(fixture.slot, &mut Default::default())
+            .unwrap();
+        cpu.ttbr = (0x30000, 0x30000);
+        let mut handoff = None;
+        let mut zone = crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        };
+        assert_eq!(
+            super::super::dispatch::native_scheduler(
+                &mut zone,
+                task,
+                &counters,
+                fixture.slot,
+                &mut handoff,
+            )
+            .idle_entry(&mut frame, 0),
+            carrick_el1_abi::Action::Served
+        );
+        assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+        let refused = super::super::aarch64_process::resume_selected(
+            &owner,
+            registry(),
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            task,
+            child,
+            &mut service,
+        );
+        assert!(
+            matches!(
+                refused,
+                super::super::native_process_runtime::NativeResume::Left(None)
+            ),
+            "the refused supply must write the prefix, not fault"
+        );
+        assert_eq!(
+            super::super::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu),
+            carrick_el1_abi::Action::Idle
+        );
+    }
     let selector = task.service_notice.take().unwrap().unwrap();
     let ticket = unsafe {
         carrick_core_abi::service::ServiceCell::claim_notice(
@@ -298,8 +462,13 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
             )
         };
         let view = carrick_core_abi::host_file::HostFileRequestView::parse(record).unwrap();
-        assert_eq!(view.input(), stdout_bytes);
-        view.reply(57, &[]).unwrap();
+        if prefix {
+            assert_eq!(view.input(), PREFIX_BYTES, "the readable prefix only");
+            view.reply(PREFIX_BYTES.len() as i64, &[]).unwrap();
+        } else {
+            assert_eq!(view.input(), stdout_bytes);
+            view.reply(57, &[]).unwrap();
+        }
     }
     assert!(ticket.complete(true).is_ok());
     fixture
@@ -361,7 +530,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
     assert!(matches!(
         resumed,
         super::super::native_process_runtime::NativeResume::Returned(result)
-            if result.raw() as u64 == if stdout { 57 } else { saved.native.x[0] }
+            if result.raw() as u64 == if prefix { 16 } else if stdout { 57 } else { saved.native.x[0] }
     ));
     drop(owner);
     assert_eq!(child_page.claimed_count(), 0);
