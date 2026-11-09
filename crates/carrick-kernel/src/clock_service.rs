@@ -69,7 +69,8 @@ pub fn wake_sleep_channel_in_zone<C>(
             incarnation: channel.record_generation,
         };
         if let Some(key) = ObjectWaitKey::native_service(record)
-            && let Ok(queue) = zone.object_wait(key, wait)
+            && let Ok(queue) =
+            zone.object_wait(key, wait, &|owned| wait.complete_object_wake(owned.zone(), owned))
         {
             let _ = queue.notify_object_host(handed, placed);
         }
@@ -91,7 +92,9 @@ pub fn wake_sleep_channel_in_zone<C>(
         );
     }
     for transfer in transfers {
-        if let Some(record) = transfer.finish(wait) {
+        if let Some(record) =
+            transfer.finish(wait, &|owned| wait.complete_object_wake(owned.zone(), owned))
+        {
             handed(record);
         }
     }
