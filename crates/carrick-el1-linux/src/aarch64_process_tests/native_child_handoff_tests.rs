@@ -1832,3 +1832,166 @@ fn namespace_baseline(
         assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 2);
     }
 }
+
+/// #1941: a ring-owned fork child's `FUTEX_WAKE` finishes in ring even when
+/// its waiter may run only on a vCPU that is busy running another thread.
+/// The wake used to be refused as `Unplaceable`, the futex family forwarded
+/// it, and a fork child has no host task to serve a forward: the vector
+/// answered a counted ENOSYS, the guest ignored the wake's result and both
+/// processes parked forever (`el1_sched_two_processes_share_vcpus`, 10 of
+/// 10 hangs). Driven through the production ARM entry and its final
+/// capture (`native_unstaged_exit`), with the root and the real fork child
+/// both live.
+#[test]
+fn forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_sched_core::{Claim, ShortLockSpin};
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+        ]),
+    )
+    .with_words(words);
+    let mut cpu = crate::sched::FakeCpu::default();
+    // The root forks one child (SIGCHLD).
+    let mut fork = carrick_el1_abi::TrapFrame::default();
+    fork.x[8] = 220;
+    fork.x[0] = 17;
+    arm_call_with_cpu(fixture, fixture.control, &mut service, &mut fork, &mut cpu).unwrap();
+    assert!((fork.x[0] as i64) > 0, "fork: {}", fork.x[0] as i64);
+    let child_record = fixture.zone.runnable_head(fixture.slot).unwrap();
+    let runtime = registry()
+        .for_record(fixture.zone, fixture.zone.record_ref(child_record))
+        .expect("the fork child is registered with the tree's process owner");
+    // SAFETY: the real fork publication retained this live child's record.
+    let binding = unsafe { runtime.record_binding(fixture.zone.record_ref(child_record)) }.unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let task = Box::leak(Box::new(CurrentTask::new()));
+    service.task = task;
+    activate_target(source, task, &binding);
+    let identity = fixture.zone.record(binding.record.id).identity();
+    let child_mm = identity.mm;
+
+    // Guest CPU 1's vCPU is in the guest, busy running a thread of the
+    // child's address space (not idle).
+    let other = SlotId::new(1);
+    assert!(fixture.zone.reset_slot(other));
+    fixture.zone.drive(other, 2);
+    fixture.zone.publish_slot(other, child_mm, Some(1), 1 << 1);
+    fixture.zone.enter_guest(other);
+    fixture.zone.install_space(other, child_mm).unwrap();
+    fixture.zone.slot(other).set_sgi_target(0x77);
+
+    // The child's partner thread, pinned to CPU 1, parks on the word.
+    let word = 0x2d9e18u64;
+    let waiter = fixture
+        .zone
+        .alloc_record(carrick_sched_core::ThreadIdentity {
+            tid: identity.tid + 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1 << 1,
+            ..identity
+        })
+        .unwrap();
+    assert!(fixture.zone.mark_native_owned(waiter));
+    let seq = {
+        let guard = fixture.zone.short_lock(
+            ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(child_mm, word),
+            &ShortLockSpin,
+        );
+        let seq = fixture.zone.next_seq(waiter);
+        fixture
+            .zone
+            .enqueue(&guard, waiter, seq, child_mm, word, u32::MAX, 0)
+            .unwrap();
+        fixture.zone.publish_park(waiter, seq);
+        seq
+    };
+
+    // The child wakes it: FUTEX_WAKE_PRIVATE, one waiter.
+    // SAFETY: the real fork owner retains both lifecycle allocations.
+    let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        slot: fixture.slot.index() as u64,
+        ..Default::default()
+    };
+    frame.x[8] = 98;
+    frame.x[0] = word;
+    frame.x[1] = carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE;
+    frame.x[2] = 1;
+    let counters = carrick_el1_abi::Counters::new();
+    let names = carrick_el1_abi::InotifyNameCache::new();
+    let mut child_cpu = crate::sched::FakeCpu::default();
+    let grant = fixture
+        .zone
+        .spaces
+        .grant(fixture.zone.spaces.find(child_mm).unwrap(), child_mm)
+        .unwrap();
+    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut child_cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        page,
+        control,
+        &ThreadCtx::ZERO,
+        grant.ttbr0,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    let action = match route {
+        CompletionRoute::Forward => carrick_el1_abi::Action::Forward,
+        _ => carrick_el1_abi::Action::Served,
+    };
+    let exit = super::super::dispatch::native_unstaged_exit(
+        &mut frame,
+        &task.linux,
+        action,
+        || super::super::dispatch::arm_thread_group_owner(fixture.zone, task, page),
+        &counters,
+    );
+    assert_ne!(
+        route,
+        CompletionRoute::Forward,
+        "a ring-owned wake never forwards (exit {exit:?}, x0 {})",
+        frame.x[0] as i64
+    );
+    assert_eq!(frame.x[0], 1, "one waiter woken, not ENOSYS");
+    assert_eq!(counters.refused[98].load(Ordering::Relaxed), 0);
+    assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 0);
+    assert_eq!(
+        fixture.zone.record(waiter).claim(),
+        Claim::Queued { slot: other, seq },
+        "queued on the busy vCPU its affinity allows"
+    );
+    assert_eq!(
+        child_cpu.sgis.len(),
+        1,
+        "the busy vCPU is told to reschedule"
+    );
+}
