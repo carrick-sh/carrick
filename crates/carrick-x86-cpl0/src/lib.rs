@@ -13,6 +13,7 @@ pub mod native_execution;
 mod native_host_file;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod native_process;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 mod native_stage;
 
 use carrick_el1_abi::Action;
