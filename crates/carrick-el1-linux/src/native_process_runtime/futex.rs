@@ -299,12 +299,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 );
                 drop(guard);
                 for transfer in pending {
-                    if let Some(record) = transfer.finish(
-                        &carrick_sched_core::ShortLockSpin,
-                        &|owned| {
+                    if let Some(record) =
+                        transfer.finish(&carrick_sched_core::ShortLockSpin, &|owned| {
                             crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                        },
-                    ) {
+                        })
+                    {
                         let Some(placement) = zone.place_native_handback(record) else {
                             return Err(carrick_core_abi::NativeRunFailureReason::NativeStale);
                         };

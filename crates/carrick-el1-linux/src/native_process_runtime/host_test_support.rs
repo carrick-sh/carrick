@@ -8496,14 +8496,11 @@ fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
     drop(guard);
     assert_eq!(fixture.zone.timer_deadline(fixture.slot), Some(2000));
     assert_eq!(
-        fixture.zone.expire_timer(
-            fixture.slot,
-            2000,
-            ETIMEDOUT_RESULT,
-            &|owned| {
+        fixture
+            .zone
+            .expire_timer(fixture.slot, 2000, ETIMEDOUT_RESULT, &|owned| {
                 crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            },
-        ),
+            },),
         Ok(true)
     );
     assert_eq!(
