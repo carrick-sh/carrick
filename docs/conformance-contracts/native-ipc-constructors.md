@@ -602,3 +602,13 @@ returned 0 instead of -23. The corresponding root constructor witness uses
 the same configured population and requires the same errno. Shared ABI tests
 exercise both object and description growth and a stale observation at the
 configured ceiling. These prove bounded admission, not signed execution.
+
+## Host `pipe2` under lane-lock contention (#1845)
+
+The host `pipe2` constructor no longer spins when another party holds a
+readiness-lane lock of the recycled slot it popped. It retains the create
+across the holder's release, parks under the killable owner gate and never
+returns EINTR. Native-child constructors in the ring keep their own
+short-lock policy (`native-short-lock.md`). Details, witnesses and the parts
+not yet converted (`eventfd2`, `epoll_create1`, the object data lock, pipe
+I/O): [`ipc-create-bind-contention.md`](ipc-create-bind-contention.md).

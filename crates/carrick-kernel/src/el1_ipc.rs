@@ -942,7 +942,7 @@ impl HostIpc {
     ) -> Result<bool, carrick_sched_core::object_wait::ObjectWaitError> {
         while *bound < PIPE_LANES.len() {
             let key = pipe_lane_key(object, PIPE_LANES[*bound]);
-            match zone.bind_object_wait(key, &HostLockWait, &|owned| {
+            match zone.bind_object_wait(key, &IpcCreateLockWait, &|owned| {
                 crate::el1_zone::complete_object_wake(owned.zone(), owned)
             }) {
                 Ok(()) => *bound += 1,
