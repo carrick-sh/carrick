@@ -87,6 +87,9 @@ enum SleepCase {
     ExpiredAbsolute,
     /// A zero relative interval is 0 without a timer lease.
     ZeroRelative,
+    /// An unrelated wake publication races enrollment once: the owner
+    /// rescans and parks with the same deadline (no errno, no second lease).
+    RacedPublication,
     InvalidTimespec,
 }
 
@@ -186,6 +189,17 @@ fn serial_host_native_child_zero_nanosleep_returns_zero() {
         true,
         None,
         Some(TimerDeparture::Nanosleep(SleepCase::ZeroRelative)),
+    );
+}
+
+#[test]
+fn serial_host_native_child_nanosleep_rescans_a_raced_publication() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_PRIVATE),
+        u32::MAX as u64,
+        false,
+        true,
+        Some(TimerDeparture::Nanosleep(SleepCase::RacedPublication)),
     );
 }
 
@@ -1680,7 +1694,10 @@ fn child_futex<'a>(
             SleepCase::ExpiredAbsolute => {
                 user.as_mut_bytes()[..16].copy_from_slice(&timespec_bytes(500));
             }
-            SleepCase::Expiry | SleepCase::Interrupted | SleepCase::PendingSignal => {
+            SleepCase::Expiry
+            | SleepCase::Interrupted
+            | SleepCase::PendingSignal
+            | SleepCase::RacedPublication => {
                 user.as_mut_bytes()[..16].copy_from_slice(&timespec_bytes(100));
             }
         }
@@ -1710,6 +1727,8 @@ fn child_futex<'a>(
                     .unwrap()
             );
         }
+        let raced = (case == SleepCase::RacedPublication)
+            .then(|| runtime.publish_signal_channel_before_next_park(child));
         let _ = crate::native_process_runtime::host_test_support::take_signal_copies();
         let nodes = fixture.zone.timer_node_count();
         let mut entry = runtime
@@ -1762,7 +1781,7 @@ fn child_futex<'a>(
             SleepCase::ZeroRelative | SleepCase::ExpiredAbsolute => Some(0),
             SleepCase::InvalidTimespec => Some(-22),
             SleepCase::PendingSignal => Some(-4),
-            SleepCase::Expiry | SleepCase::Interrupted => None,
+            SleepCase::Expiry | SleepCase::Interrupted | SleepCase::RacedPublication => None,
         };
         if let Some(result) = immediate {
             assert!(matches!(
@@ -1788,6 +1807,12 @@ fn child_futex<'a>(
             }
             return;
         }
+        if let Some(raced) = raced {
+            assert!(
+                raced.load(Ordering::Acquire),
+                "the publication raced enrollment"
+            );
+        }
         // Parked: the clone released its execution lease and its timer lease
         // holds the original deadline.
         assert!(fixture.zone.slot(fixture.slot).current().is_none());
@@ -1797,7 +1822,7 @@ fn child_futex<'a>(
         ));
         assert_eq!(sleeper.deadline(), Some(1100));
         assert_eq!(fixture.zone.timer_node_count(), nodes + 1);
-        let expected = if case == SleepCase::Expiry {
+        let expected = if matches!(case, SleepCase::Expiry | SleepCase::RacedPublication) {
             // The executor departs; the deadline survives on the carrier
             // driver's heap and expires exactly once at its original tick.
             fixture.zone.leave_guest(fixture.slot, &ShortLockSpin);

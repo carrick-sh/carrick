@@ -3753,6 +3753,32 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         }
     }
 
+    /// Race one unrelated publication on `process`'s signal wake channel
+    /// against the next signal-wait enrollment: the owner's pre-park check
+    /// has passed, so enrollment must observe a stale generation and rescan.
+    #[cfg(test)]
+    pub(crate) fn publish_signal_channel_before_next_park(
+        &self,
+        process: TaskKey,
+    ) -> Arc<core::sync::atomic::AtomicBool> {
+        let fired = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let channel = self
+            .graph
+            .lock()
+            .owner
+            .task(process)
+            .ok()
+            .and_then(|row| row.native().resources().channel.clone());
+        if let Some(channel) = channel {
+            let witness = fired.clone();
+            *self.signal_check_hook.lock() = Some(Box::new(move || {
+                let _ = channel.generation.publish();
+                witness.store(true, Ordering::Release);
+            }));
+        }
+        fired
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
         source: BornInZoneSource<'a, C>,
