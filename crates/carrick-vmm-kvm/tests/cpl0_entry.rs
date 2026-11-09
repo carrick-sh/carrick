@@ -1200,6 +1200,15 @@ fn production_anonymous_metadata_required_provisions_without_park() {
 
 #[test]
 fn production_anonymous_contention_then_metadata_provisions_without_second_park() {
+    anonymous_metadata_reprobe(false);
+}
+
+#[test]
+fn production_anonymous_release_to_idle_peer_preserves_wake() {
+    anonymous_metadata_reprobe(true);
+}
+
+fn anonymous_metadata_reprobe(order_peer_idle: bool) {
     const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
     const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
     const INJECT_WAIT_HANDBACK_CENSUS: u64 = 0xffff_ffff_ffff_fe15;
@@ -1207,6 +1216,11 @@ fn production_anonymous_contention_then_metadata_provisions_without_second_park(
 
     let mut code = Vec::new();
     let mut failures = Vec::new();
+    if order_peer_idle {
+        append_mov(&mut code, &[0x48, 0xb8], 0xffff_ffff_ffff_fe18);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        append_result_check(&mut code, &mut failures, 0);
+    }
     for ordinal in [INJECT_EDITOR_BUSY_ONCE, INJECT_METADATA_ON_REPROBE_ONCE] {
         append_mov(&mut code, &[0x48, 0xb8], ordinal);
         code.extend_from_slice(&[0x0f, 0x05]);

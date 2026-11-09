@@ -94,6 +94,9 @@ pub(super) fn release_injected_edit_wait(
     source: BornInZoneSource<'static, ParkedContextWords>,
     task: &'static CurrentTask,
 ) {
+    if crate::test_support::defer_release_to_peer(source.slot) {
+        return;
+    }
     let cause = if carrick_core::mm::reservation::release_injected_root_busy() {
         Some(SpaceWaitCause::Reservations)
     } else if carrick_sched_core::spaces::release_injected_editor_busy() {

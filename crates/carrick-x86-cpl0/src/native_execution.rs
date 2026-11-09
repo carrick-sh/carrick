@@ -25,6 +25,10 @@ pub fn schedule(slot: SlotId) -> ! {
     crate::anonymous::release_injected_edit_wait(source, current);
     settle_current_work(current);
     loop {
+        #[cfg(feature = "test-support")]
+        if crate::test_support::peer_release_pending(slot) {
+            crate::anonymous::release_injected_edit_wait(source, current);
+        }
         expire_signal_timer(slot);
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
