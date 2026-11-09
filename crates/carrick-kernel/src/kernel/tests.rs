@@ -1868,7 +1868,6 @@ mod futex_queue_authority {
                 &mut [],
                 &mut effects,
             )
-            .expect("EL1 wake")
         }
 
         pub(super) fn parked(&self, record: RecordId) -> bool {

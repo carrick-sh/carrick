@@ -326,7 +326,7 @@ impl<'a, M: CarrierMemoryIo> HostCowWake<'a, M> {
                 fail("native COW release produced unsupported host-home completion custody")
             });
         });
-        if effects.misplaced || effects.queued_own {
+        if effects.owes_host_boundary() || effects.queued_own {
             self.error
                 .borrow_mut()
                 .get_or_insert_with(|| fail("host COW release produced guest-own wake effects"));

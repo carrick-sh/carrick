@@ -10589,7 +10589,7 @@ fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
             &mut [],
             &mut effects
         ),
-        Ok(0),
+        0,
         "a shared wake cannot release a PRIVATE waiter"
     );
     drop(guard);
@@ -10617,7 +10617,7 @@ fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
 #[cfg(test)]
 fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
     use carrick_personality_linux::sched::FutexCall;
-    use carrick_sched_core::{Claim, ShortLockSpin, WakeRefusal};
+    use carrick_sched_core::{Claim, ShortLockSpin};
     let fixture = native_exec_fixture();
     let zone = fixture.zone;
     let away = SlotId::new(1);
@@ -10643,24 +10643,6 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
         records.push(record);
     }
     zone.step_back(away, 2);
-    let guard = zone.short_lock(
-        ZoneTables::<ParkedContextWords>::bucket_of_with_context(1, 0x1000),
-        &ShortLockSpin,
-    );
-    assert_eq!(
-        zone.wake_placed(
-            &guard,
-            1,
-            0x1000,
-            1,
-            1,
-            Waker::El1 { slot: fixture.slot },
-            &mut [],
-            &mut WakeEffects::default()
-        ),
-        Err(WakeRefusal::Unplaceable)
-    );
-    drop(guard);
     let mut service = fixture.service();
     let saved = words(fixture.address);
     let mut entry = fixture
@@ -10690,10 +10672,16 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
         matches!(entry.native_futex(FutexCall { args: [0x1000, 138, 1, 0, 0, 1] }, &mut NoCopy), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == 1)
     );
     assert!(entry.take_run_failure().is_none());
+    // The waiter's only allowed slot is busy: the wake still finished in
+    // the ring (#1941), queuing it there with a reschedule rather than
+    // refusing it to a second placement pass.
     assert_eq!(
         records
             .iter()
-            .filter(|r| matches!(zone.record(r.id).claim(), Claim::Queued { .. }))
+            .filter(|r| matches!(
+                zone.record(r.id).claim(),
+                Claim::Queued { slot, .. } if slot == away
+            ))
             .count(),
         1
     );

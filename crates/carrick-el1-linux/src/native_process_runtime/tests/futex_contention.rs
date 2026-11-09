@@ -408,7 +408,7 @@ fn clear_tid_stopped_join_driver<C, B>(
 {
     use carrick_el1_abi::{BornRecord, EntryIdentity, Lifecycle, ThreadIdentity};
     use carrick_personality_linux::dispatch::{CompletionRoute, dispatch};
-    use carrick_sched_core::{Claim, WakeRefusal};
+    use carrick_sched_core::Claim;
     let fixture = Fixture::<C>::new::<B>(&make);
     let zone = fixture.zone;
     // Publish an actual Born lifecycle member, then authenticate it through
@@ -570,28 +570,6 @@ fn clear_tid_stopped_join_driver<C, B>(
         &mut |_| panic!("no ready records"),
         &mut |_| panic!("no placement")
     ));
-    let key = carrick_personality_linux::sched::MmFutexKey::shared_private(UserVa::new(0x1000))
-        .unwrap()
-        .scheduler_address();
-    let guard = zone.short_lock(
-        ZoneTables::<C>::bucket_of_with_context(1, key),
-        &ShortLockSpin,
-    );
-    assert_eq!(
-        zone.wake_placed(
-            &guard,
-            1,
-            key,
-            u32::MAX,
-            1,
-            Waker::El1 { slot: child_slot },
-            &mut [],
-            &mut WakeEffects::default()
-        ),
-        Err(WakeRefusal::Unplaceable),
-        "schedule must actually withhold the only eligible driver"
-    );
-    drop(guard);
     struct Venue<'a> {
         page: &'a ThreadLifecyclePage,
         control: &'a ThreadControlSlot,
@@ -682,10 +660,28 @@ fn clear_tid_stopped_join_driver<C, B>(
     assert_eq!(fixture.page.live(), 1);
     assert_eq!(control.clear_child_tid(), 0);
     assert_eq!(service.tid_writes, [(1, 0x1000, 0)]);
-    assert!(matches!(
-        zone.record(fixture.record.id).claim(),
-        Claim::Queued { .. }
-    ));
+    // The joiner's only driver is away: the wake still finished in the ring
+    // (#1941), queuing it on the exiting member's slot, misplaced.
+    assert!(
+        matches!(
+            zone.record(fixture.record.id).claim(),
+            Claim::Queued { slot, .. } if slot == child_slot
+        ),
+        "schedule must actually withhold the only eligible driver"
+    );
+    // The waker owes the host a boundary for that misplaced joiner. Model it
+    // with the shipping owners: the waker's executor relocates its queue, and
+    // the host routes the native handback (`route_native_handback_in_zone`
+    // calls `place_native_handback`), retaining the ring owner.
+    zone.relocate(
+        child_slot,
+        None,
+        &mut |record, discard| {
+            assert!(!discard);
+            assert!(zone.place_native_handback(record).is_some());
+        },
+        &mut |_| {},
+    );
     // Fixed scheduler steps only: no polling or host blocking waits. The guest
     // wait above is timed, and returning the driver consumes one completion.
     zone.step_back(fixture.slot, 1);
