@@ -10487,10 +10487,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let caller_pid = caller_row.metadata().namespace_pid;
 
         let mut targets = alloc::vec::Vec::new();
+        let mut preferred_member = None;
         if pid > 0 {
             let target_pid = pid as u32;
             for (&_id, task) in graph.owner.tasks() {
-                if task.metadata().namespace_pid == target_pid {
+                if task.metadata().namespace_pid == target_pid || task.has_thread(target_pid) {
+                    // Logical membership licenses kill even while a host
+                    // member has no live zone record. Use the exact physical
+                    // member only as a preference for signal interruption.
+                    if task.metadata().namespace_pid != target_pid {
+                        preferred_member = task
+                            .native()
+                            .resources()
+                            .live_signal_member(
+                                task.key(),
+                                task.metadata().namespace_pid,
+                                self.source.zone,
+                                target_pid,
+                            )
+                            .map(|(record, _)| record);
+                    }
                     targets.push((
                         task.key(),
                         task.native().resources().signals().clone(),
@@ -10595,11 +10611,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         let mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                             carrick_signal_core::SignalSet::from_bits(control.blocked().0),
                         );
-                        if target_signals.has_deliverable(record, mask) {
+                        if (preferred_member.is_none() || !mask.contains(signal))
+                            && target_signals.has_deliverable(record, mask)
+                        {
                             interrupts.push(record);
                         }
                     },
                 );
+            }
+            if let Some(preferred) = preferred_member {
+                // Prefer the named member when eligible, otherwise another
+                // unblocked member. The signal stays in the process inbox:
+                // a later mask change cannot turn kill into thread-only work.
+                let recipient = interrupts[before..]
+                    .iter()
+                    .copied()
+                    .find(|record| *record == preferred)
+                    .or_else(|| interrupts.get(before).copied());
+                interrupts.truncate(before);
+                if let Some(recipient) = recipient {
+                    interrupts.push(recipient);
+                }
             }
             if interrupts.len() != before
                 && let Some(PendingContinuation::Ipc(pending)) = graph.pending.get(&target_key)
