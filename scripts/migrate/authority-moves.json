@@ -80,6 +80,21 @@
       "from": "carrick_vmm_hvf::trap::sparse_materialization::<PendingTransferGrant as Drop>::drop",
       "to": "carrick_vmm_hvf::trap::sparse_materialization::PendingTransferGrant::rollback",
       "issue": 1677
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::pipe::FsView<'a>::pipe2",
+      "to": "carrick_kernel::dispatch::fs::pipe::FsView<'a>::pipe2_create",
+      "issue": 1845
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::pipe::PipeInner::create",
+      "to": "carrick_kernel::dispatch::fs::pipe::PipeInner::from_created",
+      "issue": 1845
+    },
+    {
+      "from": "carrick_kernel::el1_ipc::HostIpc::bind_waits",
+      "to": "carrick_kernel::el1_ipc::pipe_lane_key",
+      "issue": 1845
     }
   ],
   "terminal_custody": []

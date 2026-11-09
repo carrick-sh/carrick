@@ -138,8 +138,10 @@ pub enum PipeCreation {
     /// The unpublished pipe with every readiness lane bound; the caller owns
     /// it exactly as a handle from a completed create.
     Created(IpcObjectHandle),
-    /// A lane lock is held: the create is retained, not failed.
-    Contended(PendingPipeCreate),
+    /// A lane lock is held by another party: the create's progress is
+    /// retained, not refused. It parks on that lock's physical custody
+    /// ([`PendingPipeCreate::readiness_custody`]), not a refusal ticket.
+    Retained(PendingPipeCreate),
 }
 
 /// An unpublished pipe whose readiness binding met a held lane lock: the
@@ -176,7 +178,7 @@ impl PendingPipeCreate {
                 self.object = None;
                 Ok(PipeCreation::Created(object))
             }
-            Ok(false) => Ok(PipeCreation::Contended(self)),
+            Ok(false) => Ok(PipeCreation::Retained(self)),
             Err(error) => {
                 self.object = None;
                 self.owner
@@ -241,10 +243,9 @@ impl Drop for PendingPipeCreate {
             self.owner
                 .rollback_unpublished_pipe(Some(self.zone), object, self.bound)
         {
-            carrick_fatal::carrick_fatal!(
-                "ipc::admission",
-                "retained pipe create rollback failed: {error:?}"
-            );
+            // A failed rollback is an authority invariant: the one
+            // admission classifier fails closed (never an errno).
+            let _ = CreateError::from_admission(error);
         }
     }
 }
@@ -986,7 +987,7 @@ impl HostIpc {
     /// demand.
     ///
     /// Binding its readiness lanes never waits for a held lane lock: the
-    /// partially bound object is returned as [`PipeCreation::Contended`] for
+    /// partially bound object is returned as [`PipeCreation::Retained`] for
     /// its caller to park on that lock's release ([`PendingPipeCreate`]), so
     /// no host executor is pinned by another party's critical section (#1845).
     /// Contention is never an errno or an invariant failure.
