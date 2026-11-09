@@ -525,6 +525,9 @@ fn fork_exec_probe_copy(
                     carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
                         .unwrap(),
                     &ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
                 )
                 .unwrap()
                 .notify_object(fixture.slot, &mut Default::default())
@@ -578,6 +581,9 @@ fn fork_exec_probe_copy(
                         )
                         .unwrap(),
                         &ShortLockSpin,
+                        &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                        },
                     )
                     .unwrap()
                     .notify_object(fixture.slot, &mut Default::default())
