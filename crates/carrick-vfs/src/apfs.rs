@@ -349,32 +349,66 @@ fn scratch_volume_verdict(
     no_progress_bound: std::time::Duration,
     query: impl FnOnce() -> std::io::Result<bool> + Send + 'static,
 ) -> bool {
-    scratch_volume_verdict_observed(no_progress_bound, query, || {})
+    scratch_volume_verdict_observed(no_progress_bound, query, || {}, &RealVerdictSource::new())
+}
+
+/// The two observations the no-progress decision is made from: a monotonic
+/// reading and the worker's progress counter. Production reads the real
+/// ones; tests inject a clock and counter they advance themselves, so the
+/// decision never depends on how fast the host scheduled the test.
+#[cfg(any(target_os = "macos", test))]
+trait VerdictSource {
+    /// Monotonic time since an arbitrary fixed origin.
+    fn now(&self) -> std::time::Duration;
+    /// Count of items the scratch worker has started or finished.
+    fn progress(&self) -> u64;
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct RealVerdictSource(std::time::Instant);
+
+#[cfg(any(target_os = "macos", test))]
+impl RealVerdictSource {
+    fn new() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl VerdictSource for RealVerdictSource {
+    fn now(&self) -> std::time::Duration {
+        self.0.elapsed()
+    }
+
+    fn progress(&self) -> u64 {
+        crate::fs_backend::host::scratch_worker_progress()
+    }
 }
 
 /// `scratch_volume_verdict` with `on_full` invoked each time the worker
-/// queue is observed full, so tests can acknowledge the retry branch.
+/// queue is observed full, so tests can acknowledge the retry branch, and
+/// with the elapsed-time and progress observations taken from `source`.
 #[cfg(any(target_os = "macos", test))]
 fn scratch_volume_verdict_observed(
     no_progress_bound: std::time::Duration,
     query: impl FnOnce() -> std::io::Result<bool> + Send + 'static,
     mut on_full: impl FnMut(),
+    source: &impl VerdictSource,
 ) -> bool {
-    use crate::fs_backend::host::{
-        ScratchVolumeEnqueue, enqueue_scratch_volume_query, scratch_worker_progress,
-    };
+    use crate::fs_backend::host::{ScratchVolumeEnqueue, enqueue_scratch_volume_query};
     use std::sync::mpsc::RecvTimeoutError;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let poll = (no_progress_bound / 4).clamp(Duration::from_millis(5), Duration::from_millis(250));
-    let mut last_progress = scratch_worker_progress();
-    let mut last_change = Instant::now();
+    let mut last_progress = source.progress();
+    let mut last_change = source.now();
     let mut note_progress = || {
-        let now = scratch_worker_progress();
-        if now != last_progress {
-            last_progress = now;
-            last_change = Instant::now();
+        let progress = source.progress();
+        let now = source.now();
+        if progress != last_progress {
+            last_progress = progress;
+            last_change = now;
         }
-        last_change.elapsed() >= no_progress_bound
+        now.saturating_sub(last_change) >= no_progress_bound
     };
     let mut query: crate::fs_backend::host::ScratchVolumeQuery = Box::new(query);
     let receiver = loop {
@@ -687,6 +721,9 @@ mod tests {
     /// deadline answer is witnessed serially.
     mod serial_host_scratch_worker {
         use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::Duration;
 
         #[test]
         fn volume_verdict_known_answers_and_wedge_is_only_timeout_refusal() {
@@ -795,6 +832,7 @@ mod tests {
                     move || {
                         let _ = full_seen.try_send(());
                     },
+                    &RealVerdictSource::new(),
                 );
                 done.send(verdict).unwrap();
             });
@@ -816,19 +854,46 @@ mod tests {
             }
         }
 
+        /// Test-driven clock and progress counter. `now_calls` counts the
+        /// caller's samples so the test can step in lockstep with them.
+        #[derive(Clone, Default)]
+        struct FakeSource {
+            clock_ms: Arc<AtomicU64>,
+            progress: Arc<AtomicU64>,
+            now_calls: Arc<AtomicU64>,
+            /// Virtual milliseconds added on every `now()` reading.
+            auto_step_ms: u64,
+        }
+
+        impl VerdictSource for FakeSource {
+            fn now(&self) -> Duration {
+                self.now_calls.fetch_add(1, Ordering::SeqCst);
+                let ms = self.clock_ms.fetch_add(self.auto_step_ms, Ordering::SeqCst);
+                Duration::from_millis(ms)
+            }
+
+            fn progress(&self) -> u64 {
+                self.progress.load(Ordering::SeqCst)
+            }
+        }
+
         /// Queue delay is not wedge time: the worker is occupied by nine
-        /// items released one at a time, totalling several times the bound
-        /// while progress advances between releases. The real answer wins.
+        /// items released one at a time. Virtual time advances 400 ms per
+        /// step (bound 500 ms) and progress advances in every step, so the
+        /// total is several bounds while no window is without progress. The
+        /// test advances both and waits for two caller samples per step, so
+        /// every step is observed; real time never enters the decision.
         #[test]
         fn queue_delay_does_not_consume_the_no_progress_budget() {
             use std::sync::mpsc::sync_channel;
-            use std::time::Duration;
 
             let bound = Duration::from_millis(500);
-            let gap = Duration::from_millis(150);
+            let source = FakeSource::default();
             let (mut releases, receivers) = fill_worker_queue(Duration::from_secs(60));
             let (full_seen, observed) = sync_channel::<()>(1);
-            let (done, answer) = sync_channel(1);
+            let finished = Arc::new(AtomicBool::new(false));
+            let caller_finished = Arc::clone(&finished);
+            let caller_source = source.clone();
             let caller = std::thread::spawn(move || {
                 let verdict = scratch_volume_verdict_observed(
                     bound,
@@ -836,23 +901,35 @@ mod tests {
                     move || {
                         let _ = full_seen.try_send(());
                     },
+                    &caller_source,
                 );
-                done.send(verdict).unwrap();
+                caller_finished.store(true, Ordering::SeqCst);
+                verdict
             });
             observed
                 .recv_timeout(Duration::from_secs(60))
                 .expect("caller never observed a full queue");
-            let started = std::time::Instant::now();
+            let steps = releases.len();
             for release in releases.drain(..) {
                 release.send(()).unwrap();
-                std::thread::sleep(gap);
+                source.progress.fetch_add(1, Ordering::SeqCst);
+                source.clock_ms.fetch_add(400, Ordering::SeqCst);
+                // The first sample after the step may have read the old
+                // progress; the second began after it.
+                let seen = source.now_calls.load(Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while source.now_calls.load(Ordering::SeqCst) < seen + 2
+                    && !finished.load(Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
-            assert!(answer.recv_timeout(Duration::from_secs(60)).unwrap());
             assert!(
-                started.elapsed() > bound * 2,
-                "delay did not exceed the bound"
+                source.clock_ms.load(Ordering::SeqCst) >= 400 * steps as u64,
+                "virtual delay did not exceed the bound"
             );
-            caller.join().unwrap();
+            assert!(caller.join().unwrap(), "queue delay was read as a wedge");
             for receiver in receivers {
                 receiver
                     .recv_timeout(Duration::from_secs(60))
@@ -862,11 +939,12 @@ mod tests {
         }
 
         /// A first item that makes no progress at all is the one refusal.
+        /// The virtual clock advances 100 ms per reading with a constant
+        /// progress counter; the 300 ms bound is crossed by the clock alone.
         #[test]
         fn stuck_first_item_is_refused_without_progress() {
             use crate::fs_backend::host::{ScratchVolumeEnqueue, enqueue_scratch_volume_query};
             use std::sync::mpsc::sync_channel;
-            use std::time::Duration;
 
             let (release, blocked) = sync_channel::<()>(1);
             let query: crate::fs_backend::host::ScratchVolumeQuery = Box::new(move || {
@@ -876,9 +954,16 @@ mod tests {
             let ScratchVolumeEnqueue::Queued(stuck) = enqueue_scratch_volume_query(query) else {
                 panic!("scratch worker did not accept the stuck item");
             };
-            assert!(!scratch_volume_verdict(Duration::from_millis(300), || Ok(
-                true
-            )));
+            let source = FakeSource {
+                auto_step_ms: 100,
+                ..FakeSource::default()
+            };
+            assert!(!scratch_volume_verdict_observed(
+                Duration::from_millis(300),
+                || Ok(true),
+                || {},
+                &source,
+            ));
             release.send(()).unwrap();
             stuck
                 .recv_timeout(Duration::from_secs(60))
