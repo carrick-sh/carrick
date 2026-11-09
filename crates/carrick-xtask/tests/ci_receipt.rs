@@ -1929,6 +1929,13 @@ mod ancestor_selection {
             "{missing:?}"
         );
     }
+    #[test]
+    fn serial_host_group_ahead_with_more_than_50_commits_still_finds_mains_receipt() {
+        // main commit 0 (receipted), 55 commits of the group ahead, 2 candidate commits.
+        let h = History::new(58);
+        let selected = h.select(&h.commits[55], &[0]).unwrap();
+        assert_eq!(selected.baseline_sha, h.commits[0]);
+    }
     fn invoke_selector(
         h: &History,
         lane: &str,
