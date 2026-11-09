@@ -1,4 +1,69 @@
-# Native namespace mutation baseline (#1335, slice 1)
+# Native namespace mutations (#1335, #1933)
+
+## Round 2: shared mutation cores
+
+Native descendants now stage mkdirat, unlinkat/rmdir, symlinkat, linkat,
+renameat/renameat2, utimensat, truncate and ftruncate through the existing
+host-file venue. Initial tasks retain their existing host-task syscall route.
+Both routes reuse the same path or description core; native calls carry their
+own stamped filesystem authority and never manufacture a PID-1 `SyscallCtx`.
+The crossing allowlist and round-1 redirected-Write admission are unchanged.
+
+The nearest existing authorities are `NativeFsAuthority`/`with_native_fs_scope`,
+the root filesystem's namespace transaction and the HostIpc physical-description
+hold. They are reused; this round adds no lock, lifetime owner or name index.
+Wire operations 13-21 extend the existing record without changing its header or
+older operation values. Paired names are NUL-delimited; timestamp records retain
+explicit times, NOW/OMIT, NULL pathname and NULL-times distinctions. The latter
+uses one container-clock sample for both times. Truncation records retain signed
+length and stamp the exact caller's file-size limit through the existing helper.
+
+Each family has a committed, compiled red-first witness (`-38`, required `0`)
+followed by a passing public-venue witness. These tests perform real ring fork,
+shared production staging and carrier serving; the native scope guard rejects
+host-file-table escapes. They check names, contents, inode identity, exact times,
+caller umask, inherited physical descriptions after parent host close and errno
+matrices. The 48-test venue suite also checks preserved Write/listing behavior,
+zero effects for watched mutations and finite/unstamped truncation limits, and
+composed filesystem sequences. It does not execute a shell or ELF, or prove the
+whole service-notice/cancellation lifecycle.
+
+At path lengths 1 and 4095, aligned and mixed-alignment paired-path staging has
+at most four page-bounded copies, 8192 copied bytes, 8191 encoded input bytes
+and no output preparation. This is a deterministic staging budget, not a
+versioned signed WorkObservation or a bound for the whole VFS algorithm.
+
+### Deliberate boundaries
+
+Native rename serves cheaply proven physical Host-rootfs regular files and
+symlinks, including same-inode no-op and supported exchange behavior. The director
+approved refusing directory, Memory and mount-local publication rather than
+silently skipping `rename_open_paths` or native `TaskFs` updates. Those cases
+need a shared named-description index and filesystem-context publication follow-up.
+
+Watched and task-relative synthetic mutations refuse before effects. Existing
+host-backed relative dirfds remain refused; absent and in-zone relative dirfds
+retain EBADF/ENOTDIR. Truncation with finite or unstamped RLIMIT_FSIZE remains
+refused rather than approximating per-task SIGXFSZ/EFBIG. Memory path truncate
+retains EROFS; descriptor resize retains access, seals and sparse-data behavior.
+Rootfs timestamp failures deliberately retain the root wrapper's best-effort
+success (mount failures still propagate); this inherited Linux divergence needs
+separate follow-up. Readlink belongs to #1900; fchmodat is not served by this round.
+CPL0's existing staging-Fault refusal rather than supply/retry is also unchanged.
+
+The director still owns signed artifact identity, Mac execution, full mutation
+service settlement, native ARM Docker comparison and paired runtime ratios.
+Expected restored Mac cases are mkdir (05/14), hardlink (08), truncate (10),
+touch/listing (16), regular physical rename (17) and mkdir/rmdir (21); redirected
+and append Write (12/20) must stay preserved. Case 07 additionally needs #1900,
+09 still needs fchmodat, and actual `cp` metadata behavior in 19 is unproved.
+These are predictions, not signed acceptance.
+
+## Slice 1: retained no-IPC defect census
+
+The following historical evidence describes a fixture without an installed
+guest IPC venue. Its refusal expectations remain a diagnostic negative control,
+not the shipping round-2 mutation behavior.
 
 `kernel.native.namespace-mutation` binds the missing typed namespace service
 before any behavior change. Linux owns the semantics; a forward allowlist
