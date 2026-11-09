@@ -213,7 +213,10 @@ pub fn retire_closed_space<
         })?
         .retire_final()
         .map_err(|_| NativeProcessError::Busy)?;
-    owner.spaces.free(index);
+    owner
+        .space_access(worker)
+        .map_err(|_| NativeProcessError::Stale)?
+        .retire_entry(index);
     Ok(())
 }
 
