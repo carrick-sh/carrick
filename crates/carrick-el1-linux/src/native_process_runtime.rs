@@ -3561,6 +3561,32 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         fired
     }
 
+    /// Publish `signal` to `record` of `process` right after its next
+    /// deliverable check finds nothing: queue it on the thread and publish the
+    /// process's signal wake channel, as an ingress publication does.
+    // Its only caller, the native exec fixture, does not build on macOS.
+    #[cfg(all(test, not(target_os = "macos")))]
+    pub(crate) fn publish_signal_after_next_empty_check(
+        &self,
+        process: TaskKey,
+        record: carrick_sched_core::RecordRef,
+        signal: carrick_signal_core::policy::Signal,
+    ) -> Arc<core::sync::atomic::AtomicBool> {
+        let fired = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let graph = self.graph.lock();
+        let resources = graph.owner.task(process).unwrap().native().resources();
+        let channel = resources.channel.clone().unwrap();
+        let witness = fired.clone();
+        resources
+            .signals()
+            .after_next_empty_check(Box::new(move |signals| {
+                signals.enqueue_thread(record, signal, None);
+                let _ = channel.generation.publish();
+                witness.store(true, Ordering::Release);
+            }));
+        fired
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
         source: BornInZoneSource<'a, C>,

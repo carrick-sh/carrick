@@ -8,6 +8,12 @@ std::thread_local! {
     static SIGNAL_COPIES: std::cell::RefCell<Vec<(UserVa, Vec<u8>)>> = const {
         std::cell::RefCell::new(Vec::new())
     };
+    static SIGNAL_CLOCK_SCRIPT: std::cell::RefCell<std::collections::VecDeque<u64>> = const {
+        std::cell::RefCell::new(std::collections::VecDeque::new())
+    };
+    static SIGNAL_COPY_ERRORS: std::cell::RefCell<std::collections::VecDeque<NativeProcessError>> = const {
+        std::cell::RefCell::new(std::collections::VecDeque::new())
+    };
     static EXEC_CANCELLATIONS: std::cell::RefCell<Vec<u64>> = const {
         std::cell::RefCell::new(Vec::new())
     };
@@ -64,6 +70,18 @@ pub(crate) fn record_return_copyout(address: UserVa, len: usize) {
 #[cfg(test)]
 pub(crate) fn take_return_copyouts() -> Vec<(UserVa, usize)> {
     RETURN_COPYOUTS.with(|copies| copies.borrow_mut().take().unwrap())
+}
+
+/// The next Physical signal clock reads, in order, before its default
+/// 1000-then-2000 clock resumes.
+pub(crate) fn script_signal_clock(reads: &[u64]) {
+    SIGNAL_CLOCK_SCRIPT.with(|script| *script.borrow_mut() = reads.iter().copied().collect());
+}
+
+/// Fail the next exact-MM user copies (direct or page-admitted owned
+/// copies), in order: `Unsupported` is a not-yet-backed page.
+pub(crate) fn fail_signal_copies(errors: &[NativeProcessError]) {
+    SIGNAL_COPY_ERRORS.with(|queue| *queue.borrow_mut() = errors.iter().copied().collect());
 }
 
 pub fn take_signal_copies() -> Vec<(UserVa, Vec<u8>)> {
@@ -374,6 +392,9 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         if address.raw() == 1 {
             return Err(NativeProcessError::Fault);
         }
+        if let Some(error) = SIGNAL_COPY_ERRORS.with(|errors| errors.borrow_mut().pop_front()) {
+            return Err(error);
+        }
         if let Some(error) = self.child_copy_error
             && self
                 .child_copy_error_at
@@ -533,6 +554,9 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
         if let Some(mut hook) = self.on_signal_clock.take() {
             hook();
+        }
+        if let Some(now) = SIGNAL_CLOCK_SCRIPT.with(|script| script.borrow_mut().pop_front()) {
+            return Ok(carrick_guest_arch::CounterTick::new(now));
         }
         let now = if self.zone.counters.el1_timeouts.load(Ordering::Acquire) == 0 {
             1000
@@ -8311,6 +8335,13 @@ fn entropy_service_preparation_busy_retries_before_generation() {
 std::thread_local! {
     static ENTROPY_PREPARE_BUSY_ONCE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static ENTROPY_DOORBELL: core::cell::RefCell<Option<Box<dyn FnMut()>>> = const { core::cell::RefCell::new(None) };
+}
+
+/// Answer the Physical carrier's native-service doorbell with `hook`, or
+/// restore the unanswered doorbell with `None`.
+#[cfg(test)]
+pub(crate) fn on_service_doorbell(hook: Option<Box<dyn FnMut()>>) {
+    ENTROPY_DOORBELL.with(|slot| *slot.borrow_mut() = hook);
 }
 
 /// The synchronous CPL0 crossing ACKs before enrollment. Drive the same

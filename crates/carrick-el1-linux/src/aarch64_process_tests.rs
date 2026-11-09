@@ -2098,6 +2098,23 @@ fn native_fork_child_time_handler(number: carrick_abi::CanonicalNr) {
 
 #[cfg(test)]
 fn native_fork_child_time_handler_with_flags(number: carrick_abi::CanonicalNr, flags: u64) {
+    assert_eq!(
+        native_fork_child_time_result(number, 0, flags),
+        (-14, 0),
+        "native child time syscall {}",
+        number.raw()
+    );
+}
+
+/// Route one time call with null user pointers from a production native fork
+/// child: `(x0, counted refusals)`. A call the ring leaves unserved reaches
+/// the crossing's counted ENOSYS refusal.
+#[cfg(test)]
+fn native_fork_child_time_result(
+    number: carrick_abi::CanonicalNr,
+    argument0: u64,
+    argument1: u64,
+) -> (i64, u64) {
     use super::native_process_runtime::NativeThreadGroupOwner;
     use carrick_personality_linux::dispatch::CompletionRoute;
 
@@ -2182,10 +2199,10 @@ fn native_fork_child_time_handler_with_flags(number: carrick_abi::CanonicalNr, f
         slot: fixture.slot.index() as u64,
         ..Default::default()
     };
-    // CLOCK_REALTIME = 0; all user pointers are null. The expected Linux
-    // result for each of these calls is EFAULT (14), never ENOSYS (38).
+    // All user pointers are null.
     frame.x[8] = number.raw();
-    frame.x[1] = flags;
+    frame.x[0] = argument0;
+    frame.x[1] = argument1;
     let route = super::dispatch::dispatch_syscall_with_native(
         &mut frame,
         &counters,
@@ -2217,15 +2234,73 @@ fn native_fork_child_time_handler_with_flags(number: carrick_abi::CanonicalNr, f
     }
     assert!(runtime.task_binding(parent_key).is_some());
     assert!(runtime.task_binding(child_key).is_some());
-    assert_eq!(
+    (
         frame.x[0] as i64,
-        -14,
-        "native child time syscall {}",
-        number.raw()
-    );
-    assert_eq!(
         counters.refused[number.raw() as usize].load(Ordering::Acquire),
-        0
+    )
+}
+
+/// #1808: the routed child `clock_nanosleep` answers each clock and flag
+/// class as Linux does (clock_nanosleep(2); errno numbers from a native Linux
+/// 6.12 probe), with a null request so no sleep starts. Served clocks reach
+/// request validation (EFAULT 14). Clocks the ring cannot measure and
+/// absolute deadlines without an epoch authority keep the counted ENOSYS
+/// refusal (38), before any user access.
+#[test]
+fn native_fork_child_clock_nanosleep_clocks_and_flags_match_linux() {
+    const SERVED: (i64, u64) = (-14, 0);
+    const REFUSED: (i64, u64) = (-38, 1);
+    const EOPNOTSUPP: (i64, u64) = (-95, 0);
+    const EINVAL: (i64, u64) = (-22, 0);
+    let process_cpu = |pid: u32| u64::from((!pid << 3) | 0b010);
+    let thread_cpu = |pid: u32| u64::from((!pid << 3) | 0b110);
+    let clock_fd = |fd: u32| u64::from((!fd << 3) | 0b011);
+    let rows = [
+        // (clock, flags, expected)
+        (0, 0, SERVED),
+        (1, 0, SERVED),
+        (7, 0, SERVED),
+        (11, 0, SERVED),
+        // `clockid_t` is an int: the register's upper half is not read.
+        (0x1_0000_0001, 0, SERVED),
+        // Linux reads only TIMER_ABSTIME; other flag bits are ignored.
+        (1, 2, SERVED),
+        (1, 0xffff_fffe, SERVED),
+        // Absolute monotonic deadlines on ARM (guest counter epoch).
+        (1, 1, SERVED),
+        (7, 1, SERVED),
+        (1, 3, SERVED),
+        // Absolute REALTIME/TAI: no realtime authority yet (#1981).
+        (0, 1, REFUSED),
+        (11, 1, REFUSED),
+        // Linux sleeps on process CPU time and decides ALARM clocks after
+        // reading the request; the ring measures neither.
+        (2, 0, REFUSED),
+        (process_cpu(1), 0, REFUSED),
+        (8, 0, REFUSED),
+        (9, 0, REFUSED),
+        (3, 0, EOPNOTSUPP),
+        (4, 0, EOPNOTSUPP),
+        (5, 0, EOPNOTSUPP),
+        (6, 0, EOPNOTSUPP),
+        (0x1_0000_0004, 0, EOPNOTSUPP),
+        (clock_fd(3), 0, EOPNOTSUPP),
+        (thread_cpu(1), 0, EINVAL),
+        (10, 0, EINVAL),
+        (12, 0, EINVAL),
+        (u64::from(i32::MAX as u32), 0, EINVAL),
+    ];
+    let mut wrong = Vec::new();
+    for (clock, flags, expected) in rows {
+        let observed =
+            native_fork_child_time_result(carrick_abi::syscall::nr::CLOCK_NANOSLEEP, clock, flags);
+        if observed != expected {
+            wrong.push((clock, flags, observed, expected));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "(clock, flags, observed, expected): {wrong:#x?}"
     );
 }
 
@@ -2259,9 +2334,13 @@ fn native_fork_child_clock_nanosleep_reaches_time_handler() {
 
 #[test]
 fn native_fork_child_absolute_clock_nanosleep_reaches_time_handler() {
-    // TIMER_ABSTIME still requires a readable request timespec. A null
-    // request must reach Linux validation rather than child-route refusal.
-    native_fork_child_time_handler_with_flags(carrick_abi::syscall::nr::CLOCK_NANOSLEEP, 1);
+    // TIMER_ABSTIME on CLOCK_MONOTONIC still requires a readable request
+    // timespec. A null request must reach Linux validation rather than
+    // child-route refusal.
+    assert_eq!(
+        native_fork_child_time_result(carrick_abi::syscall::nr::CLOCK_NANOSLEEP, 1, 1),
+        (-14, 0)
+    );
 }
 
 /// #1808: only a process without a host continuation sleeps in ring. The
