@@ -3706,3 +3706,468 @@ fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
     .unwrap_err();
     assert!(error.to_string().contains("input identity"), "{error}");
 }
+
+// ---- Added probes built from candidate code (#1980) ----
+
+use carrick_xtask::fixtures::candidate_probes::{
+    self, AddedProbe, CandidateBuild, CandidateProbeSet, InputDifference, ProbeName,
+};
+
+const INVENTORY: &str = "conformance-probes/probe-inventory.json";
+
+/// Insert one inventory row the way a probe author does: edit the JSON text.
+fn inventory_with_row(text: &str, name: &str, row: serde_json::Value) -> Vec<u8> {
+    let mut inventory: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(text).unwrap();
+    inventory.insert(name.to_owned(), row);
+    serde_json::to_vec(&inventory).unwrap()
+}
+
+fn built_row() -> serde_json::Value {
+    serde_json::json!({"class":"conformance","runner":"generic","excluded":false})
+}
+
+/// Commit a new probe source and its inventory row on the checkout.
+fn commit_added_probe(root: &Path, name: &str, row: serde_json::Value) -> String {
+    let inventory = fs::read_to_string(root.join(INVENTORY)).unwrap();
+    write(root, INVENTORY, &inventory_with_row(&inventory, name, row));
+    write(
+        root,
+        &format!("conformance-probes/src/bin/{name}.rs"),
+        format!("// added probe {name}\n").as_bytes(),
+    );
+    git(root, &["add", "--", "conformance-probes"]);
+    git(root, &["commit", "-qm", "add probe"]);
+    git(root, &["rev-parse", "HEAD"])
+}
+
+/// Publish a content-addressed candidate probe set for `names` beside the
+/// fixture's bundle, the shape `fixtures build-candidate-probes` writes.
+fn publish_candidate_set(f: &Fixture, names: &[&str], store: &Path) -> PathBuf {
+    let root = f.repo.path();
+    let base_inventory = git(
+        root,
+        &[
+            "show",
+            &format!(
+                "{}:{INVENTORY}",
+                String::from(f.manifest.source_head.clone())
+            ),
+        ],
+    );
+    let mut probes = Vec::new();
+    let mut executables = Vec::new();
+    let objects = store.join("objects");
+    fs::create_dir_all(&objects).unwrap();
+    for (index, name) in names.iter().enumerate() {
+        let name = ProbeName::try_from((*name).to_owned()).unwrap();
+        probes.push(AddedProbe {
+            source_sha256: source_hash(&fs::read(root.join(name.source())).unwrap()),
+            name: name.clone(),
+        });
+        for target in [GuestTarget::Musl, GuestTarget::Gnu] {
+            let data = elf(target, 100 + index as u8);
+            let digest = hash(&data);
+            let object = objects.join(String::from(digest.clone()));
+            fs::write(&object, &data).unwrap();
+            fs::set_permissions(&object, fs::Permissions::from_mode(0o755)).unwrap();
+            executables.push(Executable {
+                path: name.executable(target),
+                target,
+                sha256: digest,
+            });
+        }
+    }
+    probes.sort();
+    let set = CandidateProbeSet {
+        schema: "carrick.fixtures.candidate-probes.v1".into(),
+        candidate_head: git(root, &["rev-parse", "HEAD"]).try_into().unwrap(),
+        base_content_sha256: f.manifest.content_identity().unwrap(),
+        // `git` trims; the inventory file has no trailing newline here.
+        base_inventory,
+        probes,
+        toolchain: f.manifest.toolchain.clone(),
+        executables,
+    };
+    let bytes = serde_json::to_vec_pretty(&set).unwrap();
+    let directory = store.join(String::from(hash(&bytes)));
+    fs::create_dir_all(directory.join("objects")).unwrap();
+    for executable in &set.executables {
+        let name = String::from(executable.sha256.clone());
+        fs::copy(objects.join(&name), directory.join("objects").join(&name)).unwrap();
+    }
+    let path = directory.join("manifest.json");
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// Acceptance 1: a candidate that adds one probe (and its inventory row) is
+/// admitted beside main's bundle through the production restore, installed
+/// verification and acceptance entry points; the build plan names exactly
+/// that probe for both ARM libc sets; the receipt lists its source hash.
+#[test]
+fn added_probe_is_admitted_beside_the_trusted_bundle() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.repo.path();
+    let base = git(root, &["rev-parse", "HEAD"]);
+    let candidate = commit_added_probe(root, "newprobe", built_row());
+    // Today's refusal without the candidate-built probes, unchanged.
+    f.rejected("fixture input identity mismatch");
+
+    let CandidateBuild::Build(plan) = candidate_probes::plan(root, &f.path).unwrap() else {
+        panic!("added probe was not planned for a candidate build");
+    };
+    let name = ProbeName::try_from("newprobe".to_owned()).unwrap();
+    assert_eq!(
+        plan.bins(),
+        [
+            (GuestTarget::Musl, name.clone()),
+            (GuestTarget::Gnu, name.clone())
+        ]
+    );
+    let source_sha256 = source_hash(b"// added probe newprobe\n");
+    assert_eq!(
+        plan.probes,
+        [AddedProbe {
+            name: name.clone(),
+            source_sha256: source_sha256.clone()
+        }]
+    );
+
+    let store = CanonicalTempDir::new();
+    let set = publish_candidate_set(&f, &["newprobe"], store.path());
+    fixtures::restore(root, &f.path, Some(&set), None, &private_gate().lease).unwrap();
+    for target in [GuestTarget::Musl, GuestTarget::Gnu] {
+        assert!(root.join(name.executable(target)).is_file());
+    }
+    let validation = fixtures::verify_installed_receipt(root).unwrap();
+    // The rest of the identity still names main's bundle...
+    assert_eq!(validation.inputs_sha256, input_identity(&f.manifest));
+    assert_eq!(
+        validation.content_sha256,
+        Some(f.manifest.content_identity().unwrap())
+    );
+    // ...and the receipt records which probes were candidate-built.
+    let evidence = validation.candidate_probes.clone().unwrap();
+    assert_eq!(
+        evidence.probes,
+        [AddedProbe {
+            name: name.clone(),
+            source_sha256
+        }]
+    );
+    assert_eq!(evidence.set_sha256, hash(&fs::read(&set).unwrap()));
+    let accepted = carrick_xtask::accept::verify_signed_fixtures(root).unwrap();
+    assert_eq!(accepted.candidate_probes, validation.candidate_probes);
+    // A served executable is verified like every bundle executable.
+    write(
+        root,
+        &name.executable(GuestTarget::Gnu),
+        b"stale executable",
+    );
+    assert!(
+        fixtures::verify_installed(root)
+            .unwrap_err()
+            .to_string()
+            .contains("hash mismatch")
+    );
+
+    // The gate's own admission: exact candidate SHA for the set, base SHA for
+    // the bundle, both over the archive transport.
+    let output = CanonicalTempDir::new();
+    let bundle = fixtures::archive::pack(&f.path, output.path()).unwrap();
+    let packed = fixtures::archive::pack_candidate(&set, output.path()).unwrap();
+    carrick_xtask::signed_gate::verify_fixture_artifact(
+        root,
+        &bundle,
+        Some(&packed),
+        &candidate,
+        &base,
+    )
+    .unwrap();
+    fixtures::archive::restore(
+        root,
+        &bundle,
+        Some(&packed),
+        Some(&candidate),
+        &private_gate().lease,
+    )
+    .unwrap();
+    fixtures::verify_installed(root).unwrap();
+    // The set names the commit it was built from.
+    git(root, &["commit", "--allow-empty", "-qm", "later candidate"]);
+    let later = git(root, &["rev-parse", "HEAD"]);
+    let error = carrick_xtask::signed_gate::verify_fixture_artifact(
+        root,
+        &bundle,
+        Some(&packed),
+        &later,
+        &base,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("other than the checkout"),
+        "{error}"
+    );
+}
+
+/// Assert both the build plan and admission of `set` refuse with today's
+/// input identity message, and nothing is installed.
+fn assert_candidate_refusal(f: &Fixture, set: &Path, case: &str) {
+    let root = f.repo.path();
+    match candidate_probes::plan(root, &f.path) {
+        Ok(CandidateBuild::Refused(error)) => assert!(
+            error
+                .to_string()
+                .contains("fixture input identity mismatch"),
+            "{case}: {error}"
+        ),
+        Ok(other) => panic!("{case}: planned {other:?}"),
+        // A pin the host cannot resolve fails before hashing; still refused.
+        Err(error) => assert!(case.contains("toolchain"), "{case}: {error}"),
+    }
+    let error = fixtures::restore(root, &f.path, Some(set), None, &private_gate().lease)
+        .unwrap_err()
+        .to_string();
+    if !case.contains("toolchain channel") {
+        assert!(
+            error.contains("fixture input identity mismatch"),
+            "{case}: {error}"
+        );
+    }
+    assert!(!root.join(fixtures::INSTALLED_MANIFEST).exists(), "{case}");
+}
+
+/// Acceptance 2: an edit to an existing probe is refused even when the
+/// candidate also adds a probe and supplies its candidate-built set.
+#[test]
+fn existing_probe_edit_is_still_refused() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.repo.path();
+    commit(
+        root,
+        "conformance-probes/src/bin/hello.rs",
+        b"// edited existing probe\n",
+        "edit probe",
+    );
+    match candidate_probes::plan(root, &f.path).unwrap() {
+        CandidateBuild::Refused(error) => assert!(
+            error
+                .to_string()
+                .contains("fixture input identity mismatch"),
+            "{error}"
+        ),
+        other => panic!("planned {other:?}"),
+    }
+    f.rejected("fixture input identity mismatch");
+    commit_added_probe(root, "newprobe", built_row());
+    let store = CanonicalTempDir::new();
+    let set = publish_candidate_set(&f, &["newprobe"], store.path());
+    assert_candidate_refusal(&f, &set, "existing probe edit plus added probe");
+}
+
+/// Acceptance 3: a fixture lockfile change, or a toolchain pin change, is
+/// refused even beside an added probe.
+#[test]
+fn lockfile_and_toolchain_changes_are_still_refused() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    let cases: [(&str, &str, &[u8]); 3] = [
+        (
+            "conformance-probes/Cargo.lock lockfile",
+            "conformance-probes/Cargo.lock",
+            b"version = 3\n\n[[package]]\nname = \"conformance-probes\"\nversion = \"0.0.0\"\n",
+        ),
+        (
+            "toolchain pin declaration",
+            "rust-toolchain.toml",
+            b"[toolchain]\nchannel = \"1.96.0\"\ntargets = [\"aarch64-unknown-linux-musl\"]\n",
+        ),
+        (
+            "toolchain channel bump",
+            "rust-toolchain.toml",
+            b"[toolchain]\nchannel = \"1.97.0\"\n",
+        ),
+    ];
+    for (case, path, bytes) in cases {
+        let f = Fixture::new();
+        let root = f.repo.path();
+        commit_added_probe(root, "newprobe", built_row());
+        let store = CanonicalTempDir::new();
+        let set = publish_candidate_set(&f, &["newprobe"], store.path());
+        commit(root, path, bytes, case);
+        assert_candidate_refusal(&f, &set, case);
+    }
+}
+
+/// Acceptance 4 (and the predicate's edges): an added probe together with
+/// any other difference is refused.
+#[test]
+fn added_probe_with_any_other_difference_is_refused() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    type Change = fn(&Path);
+    let cases: [(&str, Change); 5] = [
+        ("modified inventory row", |root| {
+            let text = fs::read_to_string(root.join(INVENTORY)).unwrap();
+            let bytes = inventory_with_row(
+                &text,
+                "hello",
+                serde_json::json!({"class":"conformance","runner":"generic","excluded":true}),
+            );
+            commit(root, INVENTORY, &bytes, "modify row");
+        }),
+        ("unrelated fixture input", |root| {
+            commit(
+                root,
+                "crates/carrick-el1-abi/src/lib.rs",
+                b"// changed\n",
+                "dependency edit",
+            );
+        }),
+        ("added non-probe source", |root| {
+            commit(
+                root,
+                "conformance-probes/src/bin/helper/mod.rs",
+                b"// shared module\n",
+                "add module",
+            );
+        }),
+        ("removed probe source", |root| {
+            git(root, &["rm", "-q", "conformance-probes/actual.txt"]);
+            git(root, &["commit", "-qm", "remove input"]);
+        }),
+        ("fixture publisher code", |root| {
+            commit(
+                root,
+                "fixtures/reviewed-build-code.json",
+                b"{\"schema\":\"carrick.fixtures.reviewed-build-code.v2\",\"entries\":[]}\n",
+                "builder change",
+            );
+        }),
+    ];
+    for (case, change) in cases {
+        let f = Fixture::new();
+        let root = f.repo.path();
+        commit_added_probe(root, "newprobe", built_row());
+        let store = CanonicalTempDir::new();
+        let set = publish_candidate_set(&f, &["newprobe"], store.path());
+        change(root);
+        assert_candidate_refusal(&f, &set, case);
+    }
+    // An added row the publisher would not build (excluded) is refused too.
+    let f = Fixture::new();
+    commit_added_probe(
+        f.repo.path(),
+        "newprobe",
+        serde_json::json!({"class":"conformance","runner":"generic","excluded":true}),
+    );
+    let store = CanonicalTempDir::new();
+    let set = publish_candidate_set(&f, &["newprobe"], store.path());
+    assert_candidate_refusal(&f, &set, "excluded added row");
+    // A set that does not match the checkout's added probes is an error.
+    let f = Fixture::new();
+    commit_added_probe(f.repo.path(), "newprobe", built_row());
+    commit_added_probe(f.repo.path(), "otherprobe", built_row());
+    let store = CanonicalTempDir::new();
+    let set = publish_candidate_set(&f, &["newprobe"], store.path());
+    let error = fixtures::restore(
+        f.repo.path(),
+        &f.path,
+        Some(&set),
+        None,
+        &private_gate().lease,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the checkout's added probes"),
+        "{error}"
+    );
+}
+
+/// Acceptance 5, reproduced: #1935 (head `12b8b059c5`) adds
+/// `nativeprefixwrite` with one inventory row. Over main's real inventory,
+/// that difference is admissible; the same head's edit to the fixture
+/// publisher input `probe_inventory.rs` (its dedicated-runner row, which now
+/// lives in the non-input `probe_runners.rs`) is not.
+#[test]
+fn pr_1935_shape_is_admissible() {
+    let inventory = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance-probes/probe-inventory.json"),
+    )
+    .unwrap();
+    // #1935's textual insertion, verbatim, ahead of `nativex18`.
+    let anchor = "  \"nativex18\": {";
+    assert_eq!(inventory.matches(anchor).count(), 1);
+    let candidate_inventory = inventory.replacen(
+        anchor,
+        "  \"nativeprefixwrite\": {\n    \"class\": \"conformance\",\n    \"excluded\": false,\n    \"runner\": \"case_native_prefix_write_child_inherited_file\"\n  },\n  \"nativex18\": {",
+        1,
+    );
+    let mut base = BTreeMap::new();
+    base.insert(INVENTORY.to_owned(), source_hash(inventory.as_bytes()));
+    base.insert(
+        "conformance-probes/src/bin/nativex18.rs".to_owned(),
+        source_hash(b"existing probe\n"),
+    );
+    base.insert(
+        "crates/carrick-xtask/src/probe_inventory.rs".to_owned(),
+        source_hash(b"publisher input\n"),
+    );
+    let mut current = base.clone();
+    current.insert(
+        INVENTORY.to_owned(),
+        source_hash(candidate_inventory.as_bytes()),
+    );
+    let source = source_hash(b"nativeprefixwrite source\n");
+    current.insert(
+        "conformance-probes/src/bin/nativeprefixwrite.rs".to_owned(),
+        source.clone(),
+    );
+    assert_eq!(
+        candidate_probes::classify_inputs(
+            &base,
+            &current,
+            inventory.as_bytes(),
+            candidate_inventory.as_bytes()
+        ),
+        InputDifference::AddedProbes(vec![AddedProbe {
+            name: ProbeName::try_from("nativeprefixwrite".to_owned()).unwrap(),
+            source_sha256: source,
+        }])
+    );
+    // Inventory bytes that do not authenticate against the manifest refuse.
+    assert_eq!(
+        candidate_probes::classify_inputs(
+            &base,
+            &current,
+            candidate_inventory.as_bytes(),
+            candidate_inventory.as_bytes()
+        ),
+        InputDifference::Other
+    );
+    let mut literal_head = current.clone();
+    literal_head.insert(
+        "crates/carrick-xtask/src/probe_inventory.rs".to_owned(),
+        source_hash(b"publisher input plus a runner row\n"),
+    );
+    assert_eq!(
+        candidate_probes::classify_inputs(
+            &base,
+            &literal_head,
+            inventory.as_bytes(),
+            candidate_inventory.as_bytes()
+        ),
+        InputDifference::Other
+    );
+}
