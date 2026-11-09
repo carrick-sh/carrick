@@ -1553,21 +1553,27 @@ fn cloudmac_hvf_workflow_enforces_disk_admission_before_checkout_and_signed_gate
             .as_str()
             .is_some_and(|u| u.starts_with("actions/checkout@"))
     });
-    assert_eq!(steps[0]["name"].as_str(), Some("Disk admission"));
+    // The supervisor check comes first so a runner lacking it fails with the
+    // runbook step; admission itself must still precede actions/checkout.
+    assert_eq!(
+        steps[0]["name"].as_str(),
+        Some("Verify installed host-lease supervisor")
+    );
+    assert_eq!(steps[1]["name"].as_str(), Some("Disk admission"));
     assert!(
-        checkout_idx > 0,
+        checkout_idx > 1,
         "Disk admission must run before actions/checkout"
     );
-    let floor = steps[0]["env"]["HVF_DISK_FLOOR_GIB"]
+    let floor = steps[1]["env"]["HVF_DISK_FLOOR_GIB"]
         .as_str()
         .map(str::to_owned)
         .or_else(|| {
-            steps[0]["env"]["HVF_DISK_FLOOR_GIB"]
+            steps[1]["env"]["HVF_DISK_FLOOR_GIB"]
                 .as_i64()
                 .map(|n| n.to_string())
         });
     assert_eq!(floor.as_deref(), Some("60"));
-    let admission_script = steps[0]["run"].as_str().unwrap();
+    let admission_script = steps[1]["run"].as_str().unwrap();
     assert!(admission_script.contains("df -Pk \"$RUNNER_WORKSPACE\""));
     assert!(admission_script.contains("::error"));
 
