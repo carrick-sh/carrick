@@ -34,8 +34,18 @@ impl FutexVenue for ClockVenue {
     fn invalid(&mut self, _: carrick_personality_linux::entry::SyscallResult) -> Option<FutexWait> {
         None
     }
-    fn wake(&mut self, _: ReservationMm, _: UserVa, _: u32, _: u32) -> Option<FutexWait> {
-        None
+    /// A wake always finishes in the venue (#1941); this deadline fixture
+    /// echoes it as a zero-deadline record, which its tests never request.
+    fn wake(&mut self, mm: ReservationMm, address: UserVa, bitset: u32, limit: u32) -> FutexWait {
+        FutexWait {
+            mm,
+            address,
+            bitset,
+            expected: limit,
+            deadline: None,
+            mismatch_result: carrick_personality_linux::entry::SyscallResult::new(0),
+            timeout_result: carrick_personality_linux::entry::SyscallResult::new(0),
+        }
     }
     fn wait(&mut self, wait: FutexWait) -> Option<FutexWait> {
         self.waits += 1;
