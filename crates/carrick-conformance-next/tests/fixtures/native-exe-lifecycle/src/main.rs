@@ -33,6 +33,45 @@ fn link_matches(expected: &[u8]) -> Result<(), i32> {
     }
 }
 
+// Failure record after an `X` byte on a report pipe: holder pid (i32 LE),
+// kind (`e` errno payload i32 LE, `l` link bytes), payload length (u16 LE),
+// payload. The observer prints it; the participant's stderr is not captured.
+const FAILURE_HEADER: usize = 7;
+const FAILURE_PAYLOAD_MAX: usize = 4096;
+
+// Allocation-free; also used between vfork and _exit.
+fn send_failure(fd: i32, kind: u8, payload: &[u8]) {
+    let mut record = [0u8; FAILURE_HEADER + FAILURE_PAYLOAD_MAX];
+    let len = payload.len().min(FAILURE_PAYLOAD_MAX);
+    record[..4].copy_from_slice(&unsafe { libc::getpid() }.to_le_bytes());
+    record[4] = kind;
+    record[5..7].copy_from_slice(&(len as u16).to_le_bytes());
+    record[FAILURE_HEADER..FAILURE_HEADER + len].copy_from_slice(&payload[..len]);
+    unsafe {
+        libc::write(fd, (&b'X' as *const u8).cast(), 1);
+        libc::write(fd, record.as_ptr().cast(), FAILURE_HEADER + len);
+    }
+}
+
+// Re-reads the link and sends what was actually observed.
+fn send_link_failure(fd: i32) {
+    let mut bytes = [0u8; 4096];
+    let n = unsafe {
+        libc::syscall(
+            libc::SYS_readlinkat,
+            libc::AT_FDCWD,
+            c"/proc/self/exe".as_ptr(),
+            bytes.as_mut_ptr(),
+            bytes.len(),
+        )
+    };
+    if n < 0 {
+        send_failure(fd, b'e', &errno().to_le_bytes());
+    } else {
+        send_failure(fd, b'l', &bytes[..n as usize]);
+    }
+}
+
 // Allocation-free stderr writer, safe between vfork and _exit.
 fn err_bytes(bytes: &[u8]) {
     unsafe {
@@ -99,9 +138,8 @@ fn check_link(expected: &str) {
 fn holder_check(expected: &str, output: i32) {
     if link_matches(expected.as_bytes()).is_err() {
         report_link(b"holder", expected.as_bytes());
-        let byte = b'X';
+        send_link_failure(output);
         unsafe {
-            libc::write(output, (&byte as *const u8).cast(), 1);
             libc::_exit(121);
         }
     }
@@ -139,11 +177,59 @@ fn receive(fd: i32, role: &str) -> u8 {
         "{role} (fd={fd}): participant exited before its observation (read={n} errno={})",
         errno()
     );
-    assert_ne!(
-        byte, b'X',
-        "{role} (fd={fd}): participant reported failure; see stderr"
-    );
+    if byte == b'X' {
+        panic!(
+            "{role} (fd={fd}): participant reported failure: {}",
+            read_failure(fd)
+        );
+    }
     byte
+}
+
+fn read_exact_bounded(fd: i32, out: &mut [u8]) -> bool {
+    let mut got = 0;
+    while got < out.len() {
+        let mut ready = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut ready, 1, 5000) } != 1 {
+            return false;
+        }
+        let n = unsafe { libc::read(fd, out[got..].as_mut_ptr().cast(), out.len() - got) };
+        if n <= 0 {
+            return false;
+        }
+        got += n as usize;
+    }
+    true
+}
+
+// Describes the record `send_failure` wrote after an `X` byte.
+fn read_failure(fd: i32) -> String {
+    let mut header = [0u8; FAILURE_HEADER];
+    if !read_exact_bounded(fd, &mut header) {
+        return "no failure detail followed the report".to_owned();
+    }
+    let pid = i32::from_le_bytes(header[..4].try_into().unwrap());
+    let len = u16::from_le_bytes(header[5..7].try_into().unwrap()) as usize;
+    let mut payload = vec![0u8; len.min(FAILURE_PAYLOAD_MAX)];
+    if !read_exact_bounded(fd, &mut payload) {
+        return format!("holder pid={pid}: truncated failure detail");
+    }
+    match header[4] {
+        b'e' if payload.len() == 4 => format!(
+            "participant pid={pid} errno={}",
+            i32::from_le_bytes(payload[..4].try_into().unwrap())
+        ),
+        b'l' => format!(
+            "holder pid={pid} actual link=[{}] (len {})",
+            String::from_utf8_lossy(&payload),
+            payload.len()
+        ),
+        kind => format!("holder pid={pid}: unknown detail kind {kind}"),
+    }
 }
 
 fn kill_and_reap(pid: i32) {
@@ -343,8 +429,7 @@ fn start(path: &CStr, expected: &str) -> (i32, i32, i32) {
             err_bytes(b"holder execve failed errno=");
             err_number(errno() as i64);
             err_bytes(b"\n");
-            let byte = b'X';
-            libc::write(output[1], (&byte as *const u8).cast(), 1);
+            send_failure(output[1], b'e', &errno().to_le_bytes());
             libc::_exit(120);
         }
     }
@@ -417,8 +502,9 @@ fn main() {
         b.to_str().unwrap(),
     );
     population.0.push(second);
-    for child in [first, second] {
-        assert_eq!(receive(child.2, "holder report"), b'I');
+    for (child, expected) in [(first, &a), (second, &b)] {
+        let role = format!("holder report expected link=[{}]", expected.display());
+        assert_eq!(receive(child.2, &role), b'I');
     }
     println!("two_live_distinct_relative_symlink=ok");
     let commands: &[u8] = match mode.as_str() {
