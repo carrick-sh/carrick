@@ -6,22 +6,48 @@
 schema_version = 1
 id = "kernel.native.namespace-mutation"
 title = "Native descendants retain ownership of host namespace mutations"
-guest_surfaces = ["syscall:mkdirat", "syscall:unlinkat", "syscall:renameat", "syscall:symlinkat", "syscall:readlinkat", "syscall:fchmodat"]
-semantic_authority = ["man 2 mkdirat", "man 2 unlinkat", "man 2 renameat", "man 2 symlinkat", "man 2 readlinkat", "man 2 fchmodat"]
+guest_surfaces = ["syscall:mkdirat", "syscall:unlinkat", "syscall:renameat", "syscall:renameat2", "syscall:symlinkat", "syscall:linkat", "syscall:utimensat", "syscall:truncate", "syscall:ftruncate", "syscall:readlinkat", "syscall:fchmodat"]
+semantic_authority = ["man 2 mkdirat", "man 2 unlinkat", "man 2 renameat", "man 2 renameat2", "man 2 symlinkat", "man 2 linkat", "man 2 utimensat", "man 2 truncate", "man 2 readlinkat", "man 2 fchmodat"]
 fixture = "unit:native_namespace_mutation_baseline_two_live_children"
 scale_points = [1, 2]
 structural_budgets = []
-rationale = "A native child has no host task. Typed operations must retain its exact task, execution, file-table generation, fs context and credentials. One admitted operation may commit at most one mutation and one terminal reply, with zero effects before admission. Busy retains that same operation on the existing release notification. Slice 1 measures the missing service: each of two real fork children receives errno 38 once per ordinal, counted once as served and refused in the descendant ring population, with zero carrier refusals and no carrier notice. Those assertions describe a defect baseline, not Linux conformance or a numerical budget for a future implementation."
+rationale = """
+A native child has no host task. Typed operations must retain its exact task,
+execution, file-table generation, fs context and credentials. One admitted
+operation may commit at most one mutation and one terminal reply, with zero
+effects before admission. Busy retains that same operation on the existing
+release notification. The retained slice-1 census deliberately installs no
+guest IPC venue: its errno 38 and zero-notice assertions diagnose the
+unclaimed route, not current mutation service semantics.
+Round 2 adds red-first real ring-fork, production staging/public-venue
+witnesses for mkdir, unlink/rmdir, symlink, hardlink, timestamps, truncation
+and physical non-directory rename. Both initial-task syscall wrappers and
+the native venue use the same cores without constructing child SyscallCtx.
+Native directory/memory rename publication stays refused by director
+decision; it needs a shared named-description index and TaskFs publication.
+The existing host-relative-dirfd boundary, watched/synthetic refusals and
+root timestamp best-effort behavior are preserved. Readlink and fchmodat
+are not added by this round. Staging copy budgets bind under
+kernel.native.host-file-venue; signed service settlement remains unproved.
+"""
 
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::native_namespace_mutation_baseline_two_live_children",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_namespace_mutation_baseline_exec_successor (six namespace refusals after successful real owner exec adoption, then exit/reap and slot reuse)",
   "carrick-el1-linux::dispatch::tests::native_fork_child_unclaimed_syscall_is_refused_before_any_crossing (negative control remains authoritative for genuinely unclaimed calls)",
+  "carrick-kernel::dispatch::native_files::tests::native_child_mkdir_dispatches_with_its_cwd_umask_and_errno_matrix",
+  "carrick-kernel::dispatch::native_files::tests::native_child_unlink_and_rmdir_dispatch_with_errno_matrix",
+  "carrick-kernel::dispatch::native_files::tests::native_child_symlink_dispatch_preserves_target_and_errno_matrix",
+  "carrick-kernel::dispatch::native_files::tests::native_child_link_dispatch_preserves_inode_and_errno_matrix",
+  "carrick-kernel::dispatch::native_files::tests::native_child_utimens_dispatch_preserves_times_null_and_errno_matrix",
+  "carrick-kernel::dispatch::native_files::tests::native_child_truncate_dispatch_preserves_resize_access_and_errno_matrix",
+  "carrick-kernel::dispatch::native_files::tests::native_child_rename_dispatch_preserves_moves_noreplace_and_errno_matrix",
+  "carrick-kernel::dispatch::native_files::tests::native_child_rename_refuses_directory_and_memory_name_publication_before_effects",
 ]
 
 [bindings.unresolved]
-semantics = "Baseline only: all six ordinals return errno 38. Slice 2 must first assert successful mkdirat through this production entry and retain its red result, then add the typed service. No mutation is implemented by slice 1."
+semantics = "The old no-IPC fixture remains a refusal census. New public-venue bindings prove each round-2 family's production core after compiled red-first failures. Whole service-notice cancellation/replay settlement, readlink, fchmodat, directory/memory rename publication and finite-limit SIGXFSZ/EFBIG semantics remain open."
 exec_successor = "The successful exec binding uses the shared VM-free x86 process owner and production dispatcher with an ARM syscall frame; real ELF execution and ARM hardware MM installation remain signed evidence."
 embed = "Director Mac reference: fork-child mkdirat, unlinkat, renameat, symlinkat, readlinkat and fchmodat return ENOSYS; statx, getdents64, openat O_CREAT and write work. This worker has not repeated the signed observation."
 embed_structural = "No registered signed WorkObservation binding measures namespace mutation work yet. The VM-free refusal census is a defect baseline, not signed structural evidence; exact-artifact signed population and venue attribution remain director-owned."

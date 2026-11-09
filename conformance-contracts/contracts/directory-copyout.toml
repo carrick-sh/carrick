@@ -11,10 +11,11 @@
 # terminal suspension. Zone saves retain their existing context/origin;
 # ordinary guest dispatch, exec drains and this contract's budgets and primary
 # bindings are unchanged. Native signed stress qualification remains required.
-# Inherited redirected-write service changes only HostFileOp::Write.
+# Round-1 inherited redirected-write service changed only HostFileOp::Write.
 # native_files::tests::native_directory_listing_and_unserved_opens remains
-# green in the complete 36-test venue suite; directory copyout and budgets
-# are unchanged. No signed directory result is claimed.
+# green in the complete 48-test round-2 venue suite; shared mutation cores
+# and child-only admission do not change directory copyout or its budgets.
+# No signed directory result is claimed.
 schema_version = 1
 id = "kernel.fs.directory-copyout"
 title = "Directory streams commit complete records into private destinations"
