@@ -440,6 +440,13 @@ pub enum HostFileStage {
     /// A user page must be supplied before staging can continue; the ring
     /// retries the exact call afterwards.
     Fault { address: u64, access: Access },
+    /// A write gathered `prefix`'s bytes before the user read at `address`
+    /// stopped it. The ring supplies `address` and retries the exact call,
+    /// as for [`HostFileStage::Fault`]; if the supply is refused, the call
+    /// completes as the staged `prefix` write instead, the short count
+    /// Linux returns when its user copy faults after some bytes
+    /// ([`HostFileStage::refused`]).
+    FaultAfterPrefix { address: u64, prefix: Box<[u8]> },
     /// A host crossing: the staged record and where its output goes.
     Request {
         record: Box<[u8]>,
@@ -454,6 +461,34 @@ pub enum HostFileStage {
         /// spelling as the caller's cwd ([`chdir_target`]).
         chdir: bool,
     },
+}
+
+impl HostFileStage {
+    /// The user access the ring must supply before this call can stage.
+    pub fn fault(&self) -> Option<(u64, Access)> {
+        match self {
+            Self::Fault { address, access } => Some((*address, *access)),
+            Self::FaultAfterPrefix { address, .. } => Some((*address, Access::Read)),
+            _ => None,
+        }
+    }
+
+    /// What the call completes as when the owner refuses [`Self::fault`]'s
+    /// supply: Linux's user copy reports EFAULT only when no byte was
+    /// copied, and a write that copied a prefix returns that short count.
+    pub fn refused(self) -> Self {
+        match self {
+            Self::Fault { .. } => errno(carrick_syscall_abi::LINUX_EFAULT),
+            Self::FaultAfterPrefix { prefix, .. } => Self::Request {
+                record: prefix,
+                output: None,
+                resolves_path: false,
+                map: None,
+                chdir: false,
+            },
+            stage => stage,
+        }
+    }
 }
 
 /// `fstat`/`statx` of an in-zone object, answered in ring with the record
@@ -649,7 +684,7 @@ impl Staging<'_, '_> {
         &mut self,
         fd: i32,
         user: &mut dyn HostFileUser,
-        gather: impl FnOnce(&mut dyn HostFileUser) -> Result<Vec<u8>, HostFileStage>,
+        gather: impl FnOnce(&mut dyn HostFileUser) -> Result<Vec<u8>, Gathered>,
     ) -> Option<HostFileStage> {
         Some(match self.descriptor(fd)? {
             NativeDescriptor::InZone(_) => HostFileStage::InRing,
@@ -660,10 +695,59 @@ impl Staging<'_, '_> {
             NativeDescriptor::HostBacked { .. } => match gather(user) {
                 Ok(input) if input.is_empty() => HostFileStage::Returned(SyscallResult::new(0)),
                 Ok(input) => self.request(HostFileOp::Write, fd, 0, [0; 4], &input, None),
-                Err(stage) => stage,
+                Err(Gathered::Answer(stage)) => stage,
+                // Nothing copied: supply first, EFAULT if refused.
+                Err(Gathered::Fault { prefix, address }) if prefix.is_empty() => {
+                    HostFileStage::Fault {
+                        address,
+                        access: Access::Read,
+                    }
+                }
+                // Supply first; a refused supply writes the prefix.
+                Err(Gathered::Fault { prefix, address }) => {
+                    match self.request(HostFileOp::Write, fd, 0, [0; 4], &prefix, None) {
+                        HostFileStage::Request { record, .. } => HostFileStage::FaultAfterPrefix {
+                            address,
+                            prefix: record,
+                        },
+                        stage => stage,
+                    }
+                }
             },
         })
     }
+}
+
+/// Where a write's user gather stopped short of its whole input.
+enum Gathered {
+    /// The call is answered before any byte (a bad vector count or total).
+    Answer(HostFileStage),
+    /// The user read at `address` failed after `prefix` was copied.
+    Fault { prefix: Vec<u8>, address: u64 },
+}
+
+/// Append `len` user bytes from `base` to `input` one page at a time, so a
+/// fault keeps every byte before it. `Err` names the first page the user
+/// could not read; `input` then ends just before it.
+fn gather_user(
+    user: &mut dyn HostFileUser,
+    input: &mut Vec<u8>,
+    base: u64,
+    len: usize,
+) -> Result<(), u64> {
+    let mut done = 0;
+    while done < len {
+        let address = base.checked_add(done as u64).ok_or(base)?;
+        let take = ((PAGE_BYTES - address % PAGE_BYTES) as usize).min(len - done);
+        let start = input.len();
+        input.resize(start + take, 0);
+        if !user.copy_in(&mut input[start..], address) {
+            input.truncate(start);
+            return Err(address);
+        }
+        done += take;
+    }
+    Ok(())
 }
 
 fn chunk(count: u64) -> usize {
@@ -678,22 +762,21 @@ fn path_pair(first: &[u8], second: &[u8]) -> Vec<u8> {
     input
 }
 
-/// Gather `writev` vectors into one bounded chunk, in order.
-fn gather_vectors(
-    user: &mut dyn HostFileUser,
-    iov: u64,
-    iovcnt: u64,
-) -> Result<Vec<u8>, HostFileStage> {
+/// Gather `writev` vectors into one bounded chunk, in order. A fault in a
+/// later vector keeps every byte the earlier ones (and its own readable
+/// head) supplied, as Linux's `writev` returns the bytes before the fault.
+fn gather_vectors(user: &mut dyn HostFileUser, iov: u64, iovcnt: u64) -> Result<Vec<u8>, Gathered> {
     if iovcnt > LINUX_UIO_MAXIOV {
-        return Err(errno(carrick_syscall_abi::LINUX_EINVAL));
+        return Err(Gathered::Answer(errno(carrick_syscall_abi::LINUX_EINVAL)));
     }
-    let mut vectors = vec![0u8; iovcnt as usize * IOVEC_BYTES];
-    if !vectors.is_empty() && !user.copy_in(&mut vectors, iov) {
-        return Err(HostFileStage::Fault {
-            address: iov,
-            access: Access::Read,
-        });
-    }
+    let mut vectors = Vec::with_capacity(iovcnt as usize * IOVEC_BYTES);
+    // An unreadable vector array copies no byte: supply, else EFAULT.
+    gather_user(user, &mut vectors, iov, iovcnt as usize * IOVEC_BYTES).map_err(|address| {
+        Gathered::Fault {
+            prefix: Vec::new(),
+            address,
+        }
+    })?;
     // Linux rejects a negative total before any transfer.
     let mut total: u64 = 0;
     let mut segments = Vec::with_capacity(iovcnt as usize);
@@ -702,7 +785,7 @@ fn gather_vectors(
         let len = u64::from_le_bytes(vector[8..16].try_into().unwrap_or([0; 8]));
         total = match total.checked_add(len) {
             Some(total) if total <= i64::MAX as u64 => total,
-            _ => return Err(errno(carrick_syscall_abi::LINUX_EINVAL)),
+            _ => return Err(Gathered::Answer(errno(carrick_syscall_abi::LINUX_EINVAL))),
         };
         segments.push((base, len));
     }
@@ -713,14 +796,10 @@ fn gather_vectors(
             break;
         }
         let take = (len as usize).min(room);
-        let start = input.len();
-        input.resize(start + take, 0);
-        if !user.copy_in(&mut input[start..], base) {
-            // Supply first and retry the exact call; a refused supply
-            // completes as EFAULT.
-            return Err(HostFileStage::Fault {
-                address: base,
-                access: Access::Read,
+        if let Err(address) = gather_user(user, &mut input, base, take) {
+            return Err(Gathered::Fault {
+                prefix: input,
+                address,
             });
         }
     }
@@ -762,14 +841,14 @@ fn stage_call(
     Some(match call {
         HostFileCall::Write { fd, buf, count } => {
             return staging.write(fd, user, |user| {
-                let mut input = vec![0u8; chunk(count)];
-                if !input.is_empty() && !user.copy_in(&mut input, buf) {
-                    return Err(HostFileStage::Fault {
-                        address: buf,
-                        access: Access::Read,
-                    });
+                let mut input = Vec::with_capacity(chunk(count));
+                match gather_user(user, &mut input, buf, chunk(count)) {
+                    Ok(()) => Ok(input),
+                    Err(address) => Err(Gathered::Fault {
+                        prefix: input,
+                        address,
+                    }),
                 }
-                Ok(input)
             });
         }
         HostFileCall::Writev { fd, iov, iovcnt } => {

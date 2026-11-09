@@ -1155,15 +1155,39 @@ impl Personality for LinuxPersonality {
                 let counters: &'static Counters =
                     unsafe { &*(binding.counters_address as *const Counters) };
                 use carrick_personality_linux::native_host_file::HostFileStage;
+                // Staging made no descriptor/IPC effect. Feed the exact
+                // access through the owner fault path #PF entry uses, then
+                // retry the same syscall, as ARM re-enters its SVC. Only a
+                // refused access (no mapping, wrong protection, backing past
+                // EOF) completes without it: EFAULT, or the short write of
+                // the bytes gathered before it, as Linux's user copy does.
                 let mut retry = false;
+                let stage = match stage.fault() {
+                    Some((address, access)) => {
+                        match supply_syscall_fault(binding, task, counters, slot, address, access) {
+                            UserFaultSupply::Served => {
+                                retry = true;
+                                None
+                            }
+                            // The owner refused or could not supply the
+                            // access (no reservation names it): never a
+                            // carrier abort.
+                            UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
+                                Some(stage.refused())
+                            }
+                        }
+                    }
+                    None => Some(stage),
+                };
                 let result = match stage {
-                    HostFileStage::Request {
+                    None => None,
+                    Some(HostFileStage::Request {
                         record,
                         output,
                         resolves_path,
                         map,
                         chdir,
-                    } => {
+                    }) => {
                         match process.begin_host_file_call(
                             record,
                             output,
@@ -1180,8 +1204,8 @@ impl Personality for LinuxPersonality {
                             _ => fatal_boot(),
                         }
                     }
-                    HostFileStage::Returned(result) => Some(result.raw()),
-                    HostFileStage::InRingReply { output, bytes } => {
+                    Some(HostFileStage::Returned(result)) => Some(result.raw()),
+                    Some(HostFileStage::InRingReply { output, bytes }) => {
                         let mut copy = carrick_el1_linux::file::ValidatedCopy {
                             task,
                             validator: &carrick_el1_linux::file::HardwareValidator,
@@ -1198,27 +1222,11 @@ impl Personality for LinuxPersonality {
                             },
                         )
                     }
-                    // Staging made no descriptor/IPC effect. Feed the exact
-                    // access through the owner fault path #PF entry uses, then
-                    // retry the same syscall, as ARM re-enters its SVC. Only a
-                    // refused access (no mapping, wrong protection, backing
-                    // past EOF) answers EFAULT, as Linux's user copy does.
-                    HostFileStage::Fault { address, access } => {
-                        match supply_syscall_fault(binding, task, counters, slot, address, access) {
-                            UserFaultSupply::Served => {
-                                retry = true;
-                                None
-                            }
-                            // The owner refused or could not supply the
-                            // access (no reservation names it). The staged
-                            // copy made no effect, so this is the user
-                            // copy's EFAULT, never a carrier abort.
-                            UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
-                                Some(carrick_syscall_abi::LINUX_EFAULT.guest_retval())
-                            }
-                        }
+                    // `refused` answers every fault it is given.
+                    Some(HostFileStage::Fault { .. } | HostFileStage::FaultAfterPrefix { .. }) => {
+                        fatal_boot()
                     }
-                    HostFileStage::InRing => {
+                    Some(HostFileStage::InRing) => {
                         counters.record_refusal(
                             carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
                             origin,

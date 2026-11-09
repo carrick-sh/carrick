@@ -161,10 +161,18 @@ struct EntropyPreparation {
     requested: carrick_guest_arch::GuestLen,
 }
 
+/// A staged host-file write's gathered prefix, written instead if the
+/// stage fault that stopped its gather is refused (Linux's short write).
+struct RefusedStagePrefix<'a> {
+    record: Box<[u8]>,
+    call: NativeServiceCall<'a>,
+}
+
 enum ServicePayload<'a> {
     None,
     Copyin,
     EntropyPreparation(EntropyPreparation),
+    StagePrefix(RefusedStagePrefix<'a>),
     Copyout(OwnedCopyout<'a>),
     Adapter,
     Exec(Box<[u8]>),
@@ -185,6 +193,7 @@ pub(super) struct PendingService<'a> {
     host_file: Option<PendingHostFile<'a>>,
     entropy: Option<(Box<[u8]>, UserVa, bool)>,
     entropy_preparation: Option<EntropyPreparation>,
+    stage_prefix: Option<RefusedStagePrefix<'a>>,
     fault_reply_cancelling: bool,
     copyout: Option<Box<OwnedCopyout<'a>>>,
     copyin: bool,
@@ -918,17 +927,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
+    /// Supply user memory a staged call needs, then retry its exact SVC. A
+    /// refused supply is EFAULT, unless the stage gathered a write `prefix`
+    /// first: that prefix is then written and its count returned.
     pub fn begin_exec_stage_fault_service(
         &mut self,
         fault: carrick_guest_arch::FaultInfo,
         fault_sequence: Option<core::num::NonZeroU64>,
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
+        prefix: Option<(Box<[u8]>, NativeServiceCall<'a>)>,
     ) -> Result<NativeResume, NativeProcessError> {
         self.begin_service_inner(
             ServiceOperation::Fault(fault),
             fault_sequence,
             owner_wait,
-            ServicePayload::None,
+            match prefix {
+                Some((record, call)) => {
+                    ServicePayload::StagePrefix(RefusedStagePrefix { record, call })
+                }
+                None => ServicePayload::None,
+            },
             ServiceCompletion::RetrySyscall,
         )
     }
@@ -1394,11 +1412,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         retry_syscall_after_supply: bool,
     ) -> Result<PreparedService, NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
-        let (payload, entropy_preparation) = match payload {
+        let (payload, entropy_preparation, stage_prefix) = match payload {
             ServicePayload::EntropyPreparation(preparation) => {
-                (ServicePayload::Copyin, Some(preparation))
+                (ServicePayload::Copyin, Some(preparation), None)
             }
-            payload => (payload, None),
+            ServicePayload::StagePrefix(prefix) => (ServicePayload::None, None, Some(prefix)),
+            payload => (payload, None, None),
         };
         let copyin = matches!(&payload, ServicePayload::Copyin);
         let (payload, copyout, adapter) = match payload {
@@ -1448,7 +1467,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ServicePayload::Copyout(_)
                 | ServicePayload::Copyin
                 | ServicePayload::Adapter
-                | ServicePayload::EntropyPreparation(_),
+                | ServicePayload::EntropyPreparation(_)
+                | ServicePayload::StagePrefix(_),
             ) => {
                 return Err(NativeProcessError::Stale);
             }
@@ -1660,6 +1680,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 host_file,
                 entropy,
                 entropy_preparation,
+                stage_prefix,
                 fault_reply_cancelling: false,
                 copyout,
                 copyin,
@@ -2981,6 +3002,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 preparation.prepared,
                 preparation.flags,
                 preparation.requested,
+            );
+        }
+        if retry_syscall_after_supply
+            && matches!(
+                result,
+                ServiceResult::Refused | ServiceResult::BackingFault | ServiceResult::Failed(_)
+            )
+            && let Some(prefix) = pending.stage_prefix.take()
+        {
+            // The staged write made no effect before its fault: write the
+            // gathered prefix now, as Linux returns the bytes before a fault.
+            self.release_service_claim(pending.claim)?;
+            return self.begin_host_file_service(
+                prefix.record,
+                None,
+                false,
+                None,
+                false,
+                prefix.call,
             );
         }
         let mut output = pending.copyout.take();
