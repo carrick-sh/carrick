@@ -96,6 +96,7 @@ class ClosureProbeScenarioTest(unittest.TestCase):
             "conformance",
             "cargo",
             ("bridge_publish_tcp",),
+            False,
         )
         completed = subprocess.CompletedProcess(
             args=[],
@@ -153,6 +154,56 @@ class ClosureProbeScenarioTest(unittest.TestCase):
         )
         self.assertEqual(
             run.call_args.kwargs["env"]["CARRICK_PROBE_SCENARIO_LIBC"], "gnu"
+        )
+
+    def test_non_ignored_signed_scenarios_omit_the_ignored_selector(self):
+        plan = scenarios.build_plan(self.inventory)
+        for name in (
+            "case_native_prefix_write_child_inherited_file",
+            "case_sched_affinity_threads_mask_reflection",
+        ):
+            command = next(c for c in plan.commands if c.runner == name)
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr=""
+            )
+            with mock.patch.object(
+                scenarios.subprocess, "run", return_value=completed
+            ) as run:
+                scenarios._run_command(ROOT, command, "gnu")
+            self.assertEqual(
+                run.call_args.args[0],
+                [
+                    "scripts/test-signed.sh",
+                    "carrick-conformance-next",
+                    name,
+                    "--exact",
+                    "--nocapture",
+                ],
+            )
+
+    def test_cargo_transport_command_is_unchanged(self):
+        command = scenarios.RunnerCommand(
+            "conformance_bridge_publish_tcp",
+            "carrick-cli",
+            "conformance",
+            "cargo",
+            ("bridge_publish_tcp",),
+            False,
+        )
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr=""
+        )
+        with mock.patch.object(
+            scenarios.subprocess, "run", return_value=completed
+        ) as run:
+            scenarios._run_command(ROOT, command, "gnu")
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "cargo", "test", "--locked", "-p", "carrick-cli", "--test",
+                "conformance", "conformance_bridge_publish_tcp", "--",
+                "--exact", "--nocapture",
+            ],
         )
 
     def test_ptrace_runner_rejects_green_test_without_signed_transport_receipt(self):
