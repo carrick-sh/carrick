@@ -1,3 +1,9 @@
+# #1845: ReadinessLockCustody types the physical readiness-lock handoff in
+# sched-core::object_wait and the zone accessor in el1_zone.rs. This family's
+# operations and budgets are unchanged. The change is witnessed under
+# kernel.el1.ipc-two-process by object_wait::host_tests::
+# readiness_lock_custody_{rejects_foreign_domains_before_transfer,
+# two_live_threads_aarch64,two_live_threads_cpl0}.
 # #1709: retained terminal memory waits now bind the captured MM through
 # core::terminal::TerminalMemoryWait before portal enrollment. Ordinary guest
 # scheduling, futex handoff, shutdown entry and their work budgets are unchanged.

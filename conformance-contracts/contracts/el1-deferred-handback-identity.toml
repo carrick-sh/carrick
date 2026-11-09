@@ -1,3 +1,9 @@
+# #1845: ReadinessLockCustody types the physical readiness-lock handoff in
+# sched-core::object_wait and the zone accessor in el1_zone.rs. This family's
+# operations and budgets are unchanged. The change is witnessed under
+# kernel.el1.ipc-two-process by object_wait::host_tests::
+# readiness_lock_custody_{rejects_foreign_domains_before_transfer,
+# two_live_threads_aarch64,two_live_threads_cpl0}.
 # #1881: shared thread registration prepares custody before publication.
 # This family's operations and budgets are unchanged. Atomicity is witnessed by
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable
