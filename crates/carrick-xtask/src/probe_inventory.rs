@@ -63,6 +63,11 @@ pub const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
         "ptracepoketext",
         "production_rx_poketext_executes_warm_patched_instruction",
     ),
+    // Signed fork-child witness for native write prefix completion (#1954).
+    (
+        "nativeprefixwrite",
+        "case_native_prefix_write_child_inherited_file",
+    ),
     ("bridge_compose_client", "conformance_bridge_compose_pair"),
     ("bridge_compose_server", "conformance_bridge_compose_pair"),
     ("bridge_dns_epoll_wake", "conformance_bridge_dns_epoll_wake"),
