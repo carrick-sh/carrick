@@ -830,7 +830,7 @@ fn native_sigign_blocks_until_every_child_mm_retires() {
 fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture("native_peer_birth.S");
-    let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
+    let (parts, root_tid, dispatcher) = native_exit_workers(&elf);
     let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let newborn_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
@@ -869,21 +869,33 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
         stock_crossings, 2,
         "loan and commit must both occur on CPU 1"
     );
-    let peer_marker = (0..128)
-        .find_map(|_| {
-            let exit = peer.fixture_run_idle_peer().expect("peer fork completion");
-            if exit == CarrierRunExit::SyscallTrap {
-                Some(exit)
-            } else {
-                assert!(
-                    peer.service_idle_peer_doorbell(&exit, |_, _| {})
-                        .expect("peer physical completion")
-                        .is_none()
-                );
-                None
-            }
-        })
-        .expect("peer parent marker");
+    let mut served_marker = false;
+    for _ in 0..128 {
+        let exit = peer.fixture_run_idle_peer().expect("peer fork completion");
+        assert!(
+            peer.service_idle_peer_doorbell_with_host_file(
+                &exit,
+                |_, _| {},
+                &mut |origin, record| {
+                    assert_eq!(origin, carrick_core_abi::service::ServiceOrigin::Descendant);
+                    let served = dispatcher
+                        .serve_native_host_file(record)
+                        .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
+                    served_marker = true;
+                    Ok(served.retained_source)
+                },
+            )
+            .expect("peer authenticated host-file completion")
+            .is_none()
+        );
+        if served_marker {
+            break;
+        }
+    }
+    assert!(
+        served_marker,
+        "peer parent marker must use the host-file venue"
+    );
     let peer_task = peer.idle_peer_task().expect("idle peer child task");
     assert_ne!(peer_task, task);
     assert!(
@@ -891,9 +903,9 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
         "idle peer forward must refuse a mismatched task generation"
     );
     assert_eq!(
-        peer.fixture_idle_peer_write(&peer_marker)
-            .expect("peer stdout"),
-        [2]
+        dispatcher.stdout(),
+        [2],
+        "marker reached its destination once"
     );
     factory
         .fixture_place_native_thread(newborn_tid, carrick_guest_arch::CpuId::new(0))
