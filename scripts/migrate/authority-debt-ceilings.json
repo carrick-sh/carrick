@@ -32974,7 +32974,7 @@
     {
       "family": "k1_create_install",
       "operation": "write_for_io",
-      "owner": "carrick_kernel::dispatch::fs::FsView<'a>::ftruncate",
+      "owner": "carrick_kernel::dispatch::fs::FsView<'a>::truncate_description",
       "lane": "shared",
       "ceiling": 1
     },
@@ -34241,7 +34241,7 @@
     {
       "family": "k1_slot_description_mutation",
       "operation": "read_for_io",
-      "owner": "carrick_kernel::dispatch::fs::attr::FsView<'a>::set_fd_times",
+      "owner": "carrick_kernel::dispatch::fs::attr::FsView<'a>::set_description_times",
       "lane": "shared",
       "ceiling": 1
     },

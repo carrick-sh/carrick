@@ -585,8 +585,8 @@ impl<'a> FsView<'a> {
         if old.is_empty() || new_path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
-        let resolved_old = self.resolve_at_path(olddirfd, &old)?;
-        let resolved_new = self.resolve_at_path(newdirfd, &new_path)?;
+        let resolved_old = self.resolve_at_path(olddirfd, old)?;
+        let resolved_new = self.resolve_at_path(newdirfd, new_path)?;
         if self.mutation_path_needs_task(context, &resolved_old)
             || self.mutation_path_needs_task(context, &resolved_new)
         {
