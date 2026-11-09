@@ -54,6 +54,19 @@ pub enum SignedGateAction {
         #[arg(long, default_value_t = 75)]
         wait_minutes: u64,
     },
+    /// On Linux ARM64, build only the probes the candidate adds relative to
+    /// the merge base's trusted bundle, from candidate code with main's
+    /// publisher build code (#1980). Writes `candidate-probes.json` and, when
+    /// probes were built, one candidate probe set archive.
+    CandidateProbes {
+        #[arg(long)]
+        request: PathBuf,
+        /// The merge base's trusted archive (`base-fixtures`).
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Run the merge base and the candidate on macOS, each in a new detached
     /// worktree, under one exclusive host lease and one fixture bundle.
     Execute {
@@ -65,6 +78,10 @@ pub enum SignedGateAction {
         /// its publishing SHA and each checkout's fixture input identity.
         #[arg(long, env = "CARRICK_SIGNED_FIXTURE_BUNDLE")]
         fixture_bundle: PathBuf,
+        /// The candidate's added probes (`candidate-probes`), served beside
+        /// the bundle to the candidate run only.
+        #[arg(long)]
+        candidate_probes: Option<PathBuf>,
     },
     /// Compare on a hosted runner and publish a PR comment and commit status.
     Publish {
@@ -966,15 +983,25 @@ fn download_base_fixtures(
 /// paired runs restore the bundle main published for the merge base
 /// (`publisher`): the base checkout must match it exactly, and the candidate
 /// checkout (`checkout`) must have equal fixture inputs, or the pair is
-/// refused rather than served by a candidate-built bundle (#1889).
+/// refused rather than served by a candidate-built bundle (#1889). The one
+/// exception (#1980): a candidate that only adds probes is served those
+/// probes from `candidate`, a set built from exactly `checkout`.
 pub fn verify_fixture_artifact(
     root: &Path,
     bundle: &Path,
+    candidate: Option<&Path>,
     checkout: &str,
     publisher: &str,
 ) -> Result<(), ReceiptError> {
-    let (manifest, _) = crate::fixtures::archive::verify(root, bundle, checkout)
+    let (manifest, set, _) = crate::fixtures::archive::verify(root, bundle, candidate, checkout)
         .map_err(|e| fail(e.to_string()))?;
+    if let Some(set) = set
+        && String::from(set.candidate_head) != checkout
+    {
+        return Err(fail(
+            "candidate probe set was built from a commit other than the checkout",
+        ));
+    }
     let publisher = crate::fixtures::CommitSha::try_from(publisher.to_owned())
         .map_err(|e| fail(e.to_string()))?;
     if manifest.source_head != publisher {
@@ -983,6 +1010,106 @@ pub fn verify_fixture_artifact(
         ));
     }
     Ok(())
+}
+
+/// What the candidate probe build decided, for the gate job and its readers.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateProbesOutcome {
+    pub sha: String,
+    pub base: String,
+    pub outcome: CandidateProbesVerdict,
+    /// The refusal the Mac will report again, when `refused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// The set archive's file name in the output directory, when `built`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateProbesVerdict {
+    /// Fixture inputs equal the bundle's: nothing to build.
+    Equal,
+    /// A difference other than added probes: nothing built.
+    Refused,
+    /// The added probes were built into `archive`.
+    Built,
+}
+
+/// Build the candidate's added probes beside the merge base's trusted bundle
+/// (#1980), in a detached worktree of the candidate, with this (main's)
+/// publisher build code. A refusal is recorded, not raised: the Mac admits
+/// fixtures independently and reports the same input identity refusal on the
+/// PR, as it does today.
+fn candidate_probes(
+    root: &Path,
+    request_path: &Path,
+    bundle: &Path,
+    output: &Path,
+) -> Result<(), ReceiptError> {
+    use crate::fixtures::candidate_probes::CandidateBuild;
+    let request: Request =
+        serde_json::from_value(read_json(request_path)?).map_err(|e| fail(e.to_string()))?;
+    sha(&request.sha)?;
+    sha(&request.base)?;
+    fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
+    let output = fs::canonicalize(output).map_err(|e| fail(e.to_string()))?;
+    let bundle = fs::canonicalize(bundle).map_err(|e| fail(e.to_string()))?;
+    let mut outcome = CandidateProbesOutcome {
+        sha: request.sha.clone(),
+        base: request.base.clone(),
+        outcome: CandidateProbesVerdict::Equal,
+        refusal: None,
+        archive: None,
+    };
+    if request.kind != RequestKind::Main && request.sha != request.base {
+        checked(
+            "git",
+            &["fetch", "--no-tags", "origin", &request.base, &request.sha],
+            Some(root),
+        )?;
+        let temp = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
+        let tree = temp.path().join("checkout");
+        checked(
+            "git",
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &tree.to_string_lossy(),
+                &request.sha,
+            ],
+            Some(root),
+        )?;
+        let tree = fs::canonicalize(&tree).map_err(|e| fail(e.to_string()))?;
+        let built = crate::fixtures::build_candidate_probes(&tree, &bundle, &request.sha, &output);
+        let removed = checked(
+            "git",
+            &["worktree", "remove", "--force", &tree.to_string_lossy()],
+            Some(root),
+        );
+        match built.map_err(|e| fail(e.to_string()))? {
+            CandidateBuild::Equal => {}
+            CandidateBuild::Refused(error) => {
+                outcome.outcome = CandidateProbesVerdict::Refused;
+                outcome.refusal = Some(error.to_string());
+            }
+            CandidateBuild::Build(archive) => {
+                outcome.outcome = CandidateProbesVerdict::Built;
+                outcome.archive = archive
+                    .strip_prefix(&output)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+            }
+        }
+        removed?;
+    }
+    write(
+        &output.join("candidate-probes.json"),
+        serde_json::to_vec_pretty(&outcome).map_err(|e| fail(e.to_string()))?,
+    )
 }
 
 /// The acceptance exit status `execute_one` recorded beside a receipt.
@@ -1040,9 +1167,17 @@ const ACCEPT_EXIT: &str = "accept-exit.json";
 /// Sealed record of the base evidence, written after the candidate run.
 const BASE_SEAL: &str = "base-seal.json";
 
+/// Which side of the pair a run is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairSide {
+    Base,
+    Candidate,
+}
+
 /// One side of a paired execution, as the pairing hands it to the runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairedRun {
+    pub side: PairSide,
     /// Exact commit checked out, built and accepted.
     pub commit: String,
     /// Commit whose published fixture bundle this run must restore.
@@ -1062,6 +1197,7 @@ fn execute(
     request_path: &Path,
     output: &Path,
     bundle: &Path,
+    candidate_probes: Option<&Path>,
 ) -> Result<(), ReceiptError> {
     if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
         return Err(fail("requires macOS ARM64"));
@@ -1073,6 +1209,10 @@ fn execute(
     fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
     let output = fs::canonicalize(output).map_err(|e| fail(e.to_string()))?;
     let bundle = fs::canonicalize(bundle).map_err(|e| fail(e.to_string()))?;
+    let candidate_probes = candidate_probes
+        .map(fs::canonicalize)
+        .transpose()
+        .map_err(|e| fail(e.to_string()))?;
     let lease = (|| {
         crate::host_load::check().map_err(|e| fail(e.to_string()))?;
         HostLease::acquire(HostLeaseMode::Gate).map_err(|e| fail(e.to_string()))
@@ -1091,6 +1231,10 @@ fn execute(
             &run.commit,
             &run.fixture_publisher,
             &bundle,
+            match run.side {
+                PairSide::Base => None,
+                PairSide::Candidate => candidate_probes.as_deref(),
+            },
             &run.output,
             run.receipt_name,
         )
@@ -1112,6 +1256,7 @@ pub fn execute_pair(
             let base_dir = output.join(BASE_DIR);
             fs::create_dir_all(&base_dir).map_err(|e| fail(e.to_string()))?;
             run(&PairedRun {
+                side: PairSide::Base,
                 commit: request.base.clone(),
                 fixture_publisher: request.base.clone(),
                 output: base_dir.clone(),
@@ -1127,6 +1272,7 @@ pub fn execute_pair(
             sealed = Some((base_dir.clone(), evidence_inventory(&base_dir)?));
         }
         run(&PairedRun {
+            side: PairSide::Candidate,
             commit: request.sha.clone(),
             fixture_publisher: request.base.clone(),
             output: output.to_path_buf(),
@@ -1278,6 +1424,7 @@ fn execute_one(
     commit: &str,
     publisher: &str,
     bundle: &Path,
+    candidate_probes: Option<&Path>,
     output: &Path,
     receipt_name: &str,
 ) -> Result<(), ReceiptError> {
@@ -1311,7 +1458,7 @@ fn execute_one(
         if !logged(&mut fetch, lease, &output.join("fixture-fetch.log"))? {
             return Err(fail("fixture dependency fetch failed"));
         }
-        verify_fixture_artifact(&tree, bundle, commit, publisher)?;
+        verify_fixture_artifact(&tree, bundle, candidate_probes, commit, publisher)?;
         let mut restore = Command::new(&xtask);
         restore.current_dir(&tree).args([
             "--root",
@@ -1321,6 +1468,9 @@ fn execute_one(
             "--bundle",
             &bundle.to_string_lossy(),
         ]);
+        if let Some(set) = candidate_probes {
+            restore.arg("--candidate-probes").arg(set);
+        }
         if !logged(&mut restore, lease, &output.join("fixture-restore.log"))? {
             return Err(fail(
                 "fixture restore failed for the authorized exact-SHA artifact",
@@ -1601,11 +1751,23 @@ pub fn run(root: &Path, args: SignedGateArgs) -> Result<(), ReceiptError> {
             output,
             wait_minutes,
         } => base_fixtures(&request, &output, wait_minutes),
+        SignedGateAction::CandidateProbes {
+            request,
+            bundle,
+            output,
+        } => candidate_probes(root, &request, &bundle, &output),
         SignedGateAction::Execute {
             request,
             output,
             fixture_bundle,
-        } => execute(root, &request, &output, &fixture_bundle),
+            candidate_probes,
+        } => execute(
+            root,
+            &request,
+            &output,
+            &fixture_bundle,
+            candidate_probes.as_deref(),
+        ),
         SignedGateAction::Publish {
             request,
             results,

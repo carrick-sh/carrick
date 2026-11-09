@@ -1,4 +1,5 @@
 //! Mode-preserving transport; only declared regular bundle files may unpack.
+use super::candidate_probes::{CandidateProbeSet, inspect_set};
 use super::{ContentHash, RestoreWork, Result, fail, hash_file, inspect_bundle, safe_path};
 use flate2::{Compression, read::MultiGzDecoder, write::GzEncoder};
 use std::collections::BTreeSet;
@@ -9,19 +10,49 @@ use std::path::{Component, Path, PathBuf};
 
 pub fn pack(manifest: &Path, output: &Path) -> Result<PathBuf> {
     let identity = inspect_bundle(manifest)?;
+    let objects = identity.executables.into_iter().map(|e| e.sha256).collect();
+    pack_objects(
+        manifest,
+        &String::from(identity.source_head),
+        objects,
+        output,
+        |unpacked| inspect_bundle(unpacked).map(drop),
+    )
+}
+
+/// Pack a candidate probe set (#1980) in the bundle transport format.
+pub fn pack_candidate(manifest: &Path, output: &Path) -> Result<PathBuf> {
+    let set = inspect_set(manifest)?;
+    let objects = set.executables.into_iter().map(|e| e.sha256).collect();
+    pack_objects(
+        manifest,
+        &String::from(set.candidate_head),
+        objects,
+        output,
+        |unpacked| inspect_set(unpacked).map(drop),
+    )
+}
+
+fn pack_objects(
+    manifest: &Path,
+    label: &str,
+    objects: Vec<ContentHash>,
+    output: &Path,
+    inspect: impl Fn(&Path) -> Result<()>,
+) -> Result<PathBuf> {
     let bundle = manifest
         .parent()
         .ok_or_else(|| fail("manifest has no parent"))?;
     let digest = hash_file(manifest)?;
-    let destination = output.join(String::from(identity.source_head.clone()));
+    let destination = output.join(label);
     fs::create_dir_all(&destination)?;
     let mut temp = tempfile::NamedTempFile::new_in(&destination)?;
     {
         let gzip = GzEncoder::new(temp.as_file_mut(), Compression::fast());
         let mut archive = tar::Builder::new(gzip);
         let mut files = BTreeSet::from(["manifest.json".to_owned()]);
-        for executable in identity.executables {
-            files.insert(format!("objects/{}", String::from(executable.sha256)));
+        for object in objects {
+            files.insert(format!("objects/{}", String::from(object)));
         }
         for relative in files {
             let mut file = File::open(safe_path(bundle, &relative)?)?;
@@ -47,7 +78,7 @@ pub fn pack(manifest: &Path, output: &Path) -> Result<PathBuf> {
     // Packing validates transport and object bytes without a receiver checkout.
     // Admission below additionally validates scoped inputs and build policy.
     let unpacked = unpack(temp.path())?;
-    inspect_bundle(&unpacked.manifest)?;
+    inspect(&unpacked.manifest)?;
     let artifact = destination.join(format!("{}.tar.gz", String::from(digest)));
     if artifact.exists() {
         if hash_file(&artifact)? != hash_file(temp.path())? {
@@ -61,9 +92,21 @@ pub fn pack(manifest: &Path, output: &Path) -> Result<PathBuf> {
     Ok(artifact)
 }
 
-struct Unpacked {
+pub struct Unpacked {
     _directory: tempfile::TempDir,
     manifest: PathBuf,
+}
+
+impl Unpacked {
+    /// The unpacked `manifest.json`, valid while `self` lives.
+    pub fn manifest(&self) -> &Path {
+        &self.manifest
+    }
+}
+
+/// Unpack a transport archive into a private directory.
+pub fn unpack_bundle(bundle: &Path) -> Result<Unpacked> {
+    unpack(bundle)
 }
 
 fn unpack(bundle: &Path) -> Result<Unpacked> {
@@ -137,21 +180,42 @@ fn unpack(bundle: &Path) -> Result<Unpacked> {
     })
 }
 
+/// Restore a bundle archive and, when given, a candidate probe set archive.
 pub fn restore(
     root: &Path,
     bundle: &Path,
+    candidate: Option<&Path>,
     sha: Option<&str>,
     gate: &crate::host_lease::HostLease,
 ) -> Result<RestoreWork> {
     let unpacked = unpack(bundle)?;
-    super::restore(root, &unpacked.manifest, sha, gate)
+    let set = candidate.map(unpack).transpose()?;
+    super::restore(
+        root,
+        &unpacked.manifest,
+        set.as_ref().map(|set| set.manifest.as_path()),
+        sha,
+        gate,
+    )
 }
 
-/// Verify complete transport and scoped input identity against the receiver.
+/// Verify complete transport and scoped input identity against the receiver,
+/// with an optional candidate probe set archive admitted beside the bundle.
 /// The caller must capture shared-store bytes before invoking this admission.
-pub fn verify(root: &Path, bundle: &Path, sha: &str) -> Result<(super::Manifest, String)> {
+pub fn verify(
+    root: &Path,
+    bundle: &Path,
+    candidate: Option<&Path>,
+    sha: &str,
+) -> Result<(super::Manifest, Option<CandidateProbeSet>, String)> {
     let unpacked = unpack(bundle)?;
-    let manifest = super::verify_bundle(root, &unpacked.manifest, Some(sha))?;
+    let set = candidate.map(unpack).transpose()?;
+    let (manifest, set) = super::verify_bundle_with(
+        root,
+        &unpacked.manifest,
+        set.as_ref().map(|set| set.manifest.as_path()),
+        Some(sha),
+    )?;
     let identity = unpacked
         .manifest
         .parent()
@@ -159,5 +223,5 @@ pub fn verify(root: &Path, bundle: &Path, sha: &str) -> Result<(super::Manifest,
         .and_then(|n| n.to_str())
         .ok_or_else(|| fail("manifest has no parent directory"))?
         .to_string();
-    Ok((manifest, identity))
+    Ok((manifest, set, identity))
 }
