@@ -10830,6 +10830,7 @@ fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
 fn native_descriptor_witness(
     constructor: Option<u64>,
     root_constructor: bool,
@@ -10847,6 +10848,7 @@ fn native_descriptor_witness(
         netpoll,
         zone_ceiling,
         ofd_ceiling,
+        epoll_sigmask,
         poll_inherited_pipe,
         None,
     );
@@ -10862,6 +10864,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_prepared_pollfd() {
         false,
         false,
         false,
+        false,
         true,
         Some(PreparedPollArgument::Pollfd),
     );
@@ -10873,6 +10876,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_prepared_timeout() {
     native_descriptor_argument_witness(
         None,
         true,
+        false,
         false,
         false,
         false,
@@ -10902,6 +10906,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_unmapped_argument() {
         false,
         false,
         false,
+        false,
         true,
         Some(PreparedPollArgument::Unmapped),
     );
@@ -10917,6 +10922,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_forbidden_argument() {
         false,
         false,
         false,
+        false,
         true,
         Some(PreparedPollArgument::Forbidden),
     );
@@ -10928,6 +10934,7 @@ fn serial_host_native_prepared_fork_parent_ppoll_shared_eventfd_input() {
     native_descriptor_argument_witness(
         None,
         true,
+        false,
         false,
         false,
         false,
@@ -11049,6 +11056,7 @@ fn native_descriptor_argument_witness(
     netpoll: bool,
     zone_ceiling: bool,
     ofd_ceiling: bool,
+    epoll_sigmask: bool,
     poll_inherited_pipe: bool,
     prepared_timeout: Option<PreparedPollArgument>,
 ) {
@@ -11312,7 +11320,7 @@ fn native_descriptor_argument_witness(
             }
             assert_eq!(frame.x[8], nr);
             assert_eq!(
-                &frame.x[..4],
+                &frame.x[..6],
                 &args,
                 "preparation preserves original arguments"
             );
