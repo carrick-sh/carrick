@@ -1833,19 +1833,25 @@ fn namespace_baseline(
     }
 }
 
-/// #1941: a ring-owned fork child's `FUTEX_WAKE` finishes in ring even when
-/// its waiter may run only on a vCPU that is busy running another thread.
-/// The wake used to be refused as `Unplaceable`, the futex family forwarded
-/// it, and a fork child has no host task to serve a forward: the vector
-/// answered a counted ENOSYS, the guest ignored the wake's result and both
-/// processes parked forever (`el1_sched_two_processes_share_vcpus`, 10 of
-/// 10 hangs). Driven through the production ARM entry and its final
-/// capture (`native_unstaged_exit`), with the root and the real fork child
-/// both live.
-#[test]
-fn forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu() {
+struct ForkedChildFutex<T> {
+    fixture: &'static Fixture,
+    route: carrick_personality_linux::dispatch::CompletionRoute,
+    exit: super::super::dispatch::NativeUnstagedExit,
+    frame: carrick_el1_abi::TrapFrame,
+    counters: carrick_el1_abi::Counters,
+    child_cpu: crate::sched::FakeCpu,
+    prepared: T,
+}
+
+/// One futex call of a ring-owned fork child, driven through the
+/// production ARM entry and its final capture (`native_unstaged_exit`),
+/// with the root and the real fork child both live. `prepare` sees the
+/// child's identity before the call and returns its argument registers
+/// `x0..x5` plus whatever the caller wants back.
+fn forked_child_futex<T>(
+    prepare: impl FnOnce(&'static Fixture, carrick_sched_core::ThreadIdentity) -> ([u64; 6], T),
+) -> ForkedChildFutex<T> {
     use carrick_personality_linux::dispatch::CompletionRoute;
-    use carrick_sched_core::{Claim, ShortLockSpin};
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -1882,44 +1888,8 @@ fn forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu() {
     activate_target(source, task, &binding);
     let identity = fixture.zone.record(binding.record.id).identity();
     let child_mm = identity.mm;
+    let (args, prepared) = prepare(fixture, identity);
 
-    // Guest CPU 1's vCPU is in the guest, busy running a thread of the
-    // child's address space (not idle).
-    let other = SlotId::new(1);
-    assert!(fixture.zone.reset_slot(other));
-    fixture.zone.drive(other, 2);
-    fixture.zone.publish_slot(other, child_mm, Some(1), 1 << 1);
-    fixture.zone.enter_guest(other);
-    fixture.zone.install_space(other, child_mm).unwrap();
-    fixture.zone.slot(other).set_sgi_target(0x77);
-
-    // The child's partner thread, pinned to CPU 1, parks on the word.
-    let word = 0x2d9e18u64;
-    let waiter = fixture
-        .zone
-        .alloc_record(carrick_sched_core::ThreadIdentity {
-            tid: identity.tid + 1,
-            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
-            affinity: 1 << 1,
-            ..identity
-        })
-        .unwrap();
-    assert!(fixture.zone.mark_native_owned(waiter));
-    let seq = {
-        let guard = fixture.zone.short_lock(
-            ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(child_mm, word),
-            &ShortLockSpin,
-        );
-        let seq = fixture.zone.next_seq(waiter);
-        fixture
-            .zone
-            .enqueue(&guard, waiter, seq, child_mm, word, u32::MAX, 0)
-            .unwrap();
-        fixture.zone.publish_park(waiter, seq);
-        seq
-    };
-
-    // The child wakes it: FUTEX_WAKE_PRIVATE, one waiter.
     // SAFETY: the real fork owner retains both lifecycle allocations.
     let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
     let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
@@ -1929,9 +1899,7 @@ fn forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu() {
         ..Default::default()
     };
     frame.x[8] = 98;
-    frame.x[0] = word;
-    frame.x[1] = carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE;
-    frame.x[2] = 1;
+    frame.x[..6].copy_from_slice(&args);
     let counters = carrick_el1_abi::Counters::new();
     let names = carrick_el1_abi::InotifyNameCache::new();
     let mut child_cpu = crate::sched::FakeCpu::default();
@@ -1975,6 +1943,82 @@ fn forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu() {
         || super::super::dispatch::arm_thread_group_owner(fixture.zone, task, page),
         &counters,
     );
+    ForkedChildFutex {
+        fixture,
+        route,
+        exit,
+        frame,
+        counters,
+        child_cpu,
+        prepared,
+    }
+}
+
+/// #1941: a ring-owned fork child's `FUTEX_WAKE` finishes in ring even when
+/// its waiter may run only on a vCPU that is busy running another thread.
+/// The wake used to be refused as `Unplaceable`, the futex family forwarded
+/// it, and a fork child has no host task to serve a forward: the vector
+/// answered a counted ENOSYS, the guest ignored the wake's result and both
+/// processes parked forever (`el1_sched_two_processes_share_vcpus`, 10 of
+/// 10 hangs).
+#[test]
+fn forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_sched_core::{Claim, ShortLockSpin};
+    let word = 0x2d9e18u64;
+    let other = SlotId::new(1);
+    let ForkedChildFutex {
+        fixture,
+        route,
+        exit,
+        frame,
+        counters,
+        child_cpu,
+        prepared: (waiter, seq),
+    } = forked_child_futex(|fixture, identity| {
+        let child_mm = identity.mm;
+        // Guest CPU 1's vCPU is in the guest, busy running a thread of
+        // the child's address space (not idle).
+        assert!(fixture.zone.reset_slot(other));
+        fixture.zone.drive(other, 2);
+        fixture.zone.publish_slot(other, child_mm, Some(1), 1 << 1);
+        fixture.zone.enter_guest(other);
+        fixture.zone.install_space(other, child_mm).unwrap();
+        fixture.zone.slot(other).set_sgi_target(0x77);
+
+        // The child's partner thread, pinned to CPU 1, parks on the word.
+        let waiter = fixture
+            .zone
+            .alloc_record(carrick_sched_core::ThreadIdentity {
+                tid: identity.tid + 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1 << 1,
+                ..identity
+            })
+            .unwrap();
+        assert!(fixture.zone.mark_native_owned(waiter));
+        let guard = fixture.zone.short_lock(
+            ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(child_mm, word),
+            &ShortLockSpin,
+        );
+        let seq = fixture.zone.next_seq(waiter);
+        fixture
+            .zone
+            .enqueue(&guard, waiter, seq, child_mm, word, u32::MAX, 0)
+            .unwrap();
+        fixture.zone.publish_park(waiter, seq);
+        drop(guard);
+        // The child wakes it: FUTEX_WAKE_PRIVATE, one waiter.
+        let wake = [
+            word,
+            carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE,
+            1,
+            0,
+            0,
+            0,
+        ];
+        (wake, (waiter, seq))
+    });
     assert_ne!(
         route,
         CompletionRoute::Forward,
@@ -1994,4 +2038,102 @@ fn forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu() {
         1,
         "the busy vCPU is told to reschedule"
     );
+}
+
+/// #1941 review: only an admitted wake is guaranteed to finish in ring.
+/// A fork child's `FUTEX_WAIT_PRIVATE` with a timeout declines while the
+/// child is switched in (its timed wait is not admitted there), and that
+/// decline keeps main's counted refusal; it is not an owned-family fatal.
+#[test]
+fn forked_child_timed_futex_wait_decline_stays_a_counted_refusal() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    let word: &'static core::sync::atomic::AtomicU32 =
+        Box::leak(Box::new(core::sync::atomic::AtomicU32::new(7)));
+    let timeout: &'static [u64; 2] = Box::leak(Box::new([1, 0]));
+    let ForkedChildFutex {
+        route,
+        exit,
+        frame,
+        counters,
+        ..
+    } = forked_child_futex(|_, _| {
+        let wait = [
+            word.as_ptr() as u64,
+            carrick_personality_linux::sched::FUTEX_WAIT_PRIVATE,
+            7,
+            timeout.as_ptr() as u64,
+            0,
+            0,
+        ];
+        (wait, ())
+    });
+    assert_eq!(route, CompletionRoute::Forward);
+    assert_eq!(
+        exit,
+        super::super::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -38);
+    assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 1);
+}
+
+/// #1941 review: an untimed `FUTEX_WAIT_PRIVATE` whose word matches but
+/// finds the futex-entry pool exhausted declines (`wait_word_with` returns
+/// no completion). That decline keeps main's counted refusal for a fork
+/// child; it is not an owned-family fatal.
+#[test]
+fn forked_child_futex_wait_on_an_exhausted_entry_pool_stays_a_counted_refusal() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_sched_core::ShortLockSpin;
+    let word: &'static core::sync::atomic::AtomicU32 =
+        Box::leak(Box::new(core::sync::atomic::AtomicU32::new(7)));
+    let ForkedChildFutex {
+        route,
+        exit,
+        frame,
+        counters,
+        prepared: filled,
+        ..
+    } = forked_child_futex(|fixture, identity| {
+        // Another thread of the child holds every futex entry on an
+        // unrelated word.
+        let filler = fixture
+            .zone
+            .alloc_record(carrick_sched_core::ThreadIdentity {
+                tid: identity.tid + 1,
+                ..identity
+            })
+            .unwrap();
+        let guard = fixture.zone.short_lock(
+            ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(identity.mm, 0x7000),
+            &ShortLockSpin,
+        );
+        let seq = fixture.zone.next_seq(filler);
+        let mut filled = 0;
+        while fixture
+            .zone
+            .enqueue(&guard, filler, seq, identity.mm, 0x7000, u32::MAX, filled)
+            .is_ok()
+        {
+            filled += 1;
+        }
+        drop(guard);
+        let wait = [
+            word.as_ptr() as u64,
+            carrick_personality_linux::sched::FUTEX_WAIT_PRIVATE,
+            7,
+            0,
+            0,
+            0,
+        ];
+        (wait, filled)
+    });
+    // Entry 0 is reserved as "none".
+    assert_eq!(filled as usize, carrick_sched_core::ZONE_ENTRIES - 1);
+    assert_eq!(route, CompletionRoute::Forward);
+    assert_eq!(
+        exit,
+        super::super::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -38);
+    assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 1);
 }
