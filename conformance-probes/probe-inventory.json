@@ -1438,6 +1438,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "nativeprefixwrite": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "case_native_prefix_write_child_inherited_file"
+  },
   "nativex18": {
     "class": "conformance",
     "excluded": false,
