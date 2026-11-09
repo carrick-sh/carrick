@@ -182,6 +182,40 @@ impl SyscallDispatcher {
     /// request supplies syscall identity; the captured target supplies the
     /// description, so the numeric fd is never resolved again.
     #[allow(clippy::too_many_arguments)]
+    /// Resume an IPC operation retained across another party's held IPC
+    /// lock ([`DispatchOutcome::IpcLockContended`]) once its release handed
+    /// the waiting record back. It continues from its retained progress; it
+    /// may meet a held lock again and return the same outcome.
+    pub fn resume_ipc_lock_operation<M: CurrentMmMemory>(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        pending: Box<crate::kernel::continuation::ipc_lock::RetainedIpcLockOperation>,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx<'_>>,
+        route: OrdinaryDispatchRoute<'_, '_>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if request.number != pending.syscall() {
+            tracing::error!("IPC lock continuation belongs to a different syscall");
+            return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
+        }
+        let Some(pipe2) = pending.into_pipe2() else {
+            return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
+        };
+        let mut cx = SyscallCtx {
+            host_wait: route.host_wait,
+            kernel,
+            request,
+            memory,
+            reporter,
+            thread,
+            execution_lease: route.lease,
+            mm_executor: route.mm_executor,
+        };
+        resources::with_captured_resources(kernel, || self.fs_view().resume_pipe2(&mut cx, pipe2))
+    }
+
     pub fn resume_owned_write_copy_in<M: CurrentMmMemory>(
         &self,
         kernel: &crate::kernel::KernelContext,

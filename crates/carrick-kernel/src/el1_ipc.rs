@@ -81,6 +81,174 @@ impl CreateError {
     }
 }
 
+/// The readiness lanes every pipe, eventfd and epoll object binds, in order.
+const PIPE_LANES: [pipe::WaitFor; 2] = [pipe::WaitFor::Readable, pipe::WaitFor::Writable];
+
+/// An admitted object's readiness wait key. Every object index has both
+/// keys, so a missing one is an authority invariant, never an errno.
+fn pipe_lane_key(
+    object: IpcObjectHandle,
+    direction: pipe::WaitFor,
+) -> carrick_sched_core::object_wait::ObjectWaitKey {
+    #[cfg(test)]
+    let key = if INJECT_OBJECT_WAIT_KEY_OUT_OF_RANGE.swap(false, Ordering::AcqRel) {
+        None
+    } else {
+        carrick_el1_abi::ipc::object_wait_key(object, direction)
+    };
+    #[cfg(not(test))]
+    let key = carrick_el1_abi::ipc::object_wait_key(object, direction);
+    let Some(key) = key else {
+        carrick_fatal::carrick_fatal!(
+            "ipc::admission",
+            "admitted object has no readiness wait key: {object:?}"
+        );
+    };
+    key
+}
+
+/// The IPC create path's lock policy: a held lock is refused at once,
+/// never spun on. The caller retains its owned operation and parks on the
+/// holder's release ([`PendingPipeCreate`]). Unlike the short-section
+/// [`HostLockWait`], this never pins a host executor behind another party's
+/// critical section (#1845). Used only by operations that can retain their
+/// progress across that park; x86/CPL0 venues keep their own policy (#1059).
+pub struct IpcCreateLockWait;
+
+impl carrick_el1_abi::LockWait<carrick_el1_abi::Aarch64ParkedContext> for IpcCreateLockWait {
+    fn wait(&self, _attempt: u32) -> bool {
+        false
+    }
+
+    fn complete_object_wake(
+        &self,
+        zone: &carrick_el1_abi::ZoneTables,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    ) {
+        crate::el1_zone::complete_object_wake(zone, owned);
+    }
+}
+
+/// How [`HostIpc::begin_pipe`] (or a resumed [`PendingPipeCreate`]) ended.
+#[derive(Debug)]
+pub enum PipeCreation {
+    /// The unpublished pipe with every readiness lane bound; the caller owns
+    /// it exactly as a handle from a completed create.
+    Created(IpcObjectHandle),
+    /// A lane lock is held: the create is retained, not failed.
+    Contended(PendingPipeCreate),
+}
+
+/// An unpublished pipe whose readiness binding met a held lane lock: the
+/// object, and the lanes already bound to its incarnation, owned until the
+/// create completes or is dropped. It owns no descriptor, guest output
+/// permit or execution lease, so it can wait across a park. Dropping it
+/// unbinds the owned lanes, then frees the object.
+#[must_use = "park on the held lane and resume, or drop to roll the create back"]
+pub struct PendingPipeCreate {
+    owner: std::sync::Arc<HostIpc>,
+    zone: &'static carrick_el1_abi::ZoneTables,
+    /// `None` once ownership passed to [`PipeCreation::Created`].
+    object: Option<IpcObjectHandle>,
+    /// Lanes `PIPE_LANES[..bound]` are bound to this incarnation.
+    bound: usize,
+}
+
+impl std::fmt::Debug for PendingPipeCreate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPipeCreate")
+            .field("object", &self.object)
+            .field("bound", &self.bound)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingPipeCreate {
+    fn bind(mut self) -> Result<PipeCreation, AdmissionError> {
+        let Some(object) = self.object else {
+            return Err(AdmissionError::Shared(IpcError::Stale));
+        };
+        match HostIpc::bind_pipe_lanes(self.zone, object, &mut self.bound) {
+            Ok(true) => {
+                self.object = None;
+                Ok(PipeCreation::Created(object))
+            }
+            Ok(false) => Ok(PipeCreation::Contended(self)),
+            Err(error) => {
+                self.object = None;
+                self.owner
+                    .rollback_unpublished_pipe(Some(self.zone), object, self.bound)?;
+                Err(HostIpc::wait_bind_error(error))
+            }
+        }
+    }
+
+    /// Run the create again after the held lane lock was released. It
+    /// continues at the first unbound lane; nothing already bound is redone.
+    pub fn resume(self) -> Result<PipeCreation, AdmissionError> {
+        self.bind()
+    }
+
+    /// The owner this create belongs to.
+    pub fn owner(&self) -> &std::sync::Arc<HostIpc> {
+        &self.owner
+    }
+
+    /// The unpublished object this create owns.
+    pub fn object(&self) -> Option<IpcObjectHandle> {
+        self.object
+    }
+
+    /// How many readiness lanes are already bound to this incarnation.
+    pub fn bound_lanes(&self) -> usize {
+        self.bound
+    }
+
+    /// The physical readiness lock this create waits for, with its zone.
+    /// Its release hands an enrolled operation back
+    /// ([`carrick_sched_core::object_wait::ReadinessLockCustody::defer`]).
+    pub fn readiness_custody(
+        &self,
+    ) -> Result<
+        carrick_sched_core::object_wait::ReadinessLockCustody<
+            'static,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+        carrick_sched_core::object_wait::ObjectWaitError,
+    > {
+        let (Some(object), Some(lane)) = (self.object, PIPE_LANES.get(self.bound)) else {
+            return Err(carrick_sched_core::object_wait::ObjectWaitError::Stale);
+        };
+        self.zone
+            .readiness_lock_custody(pipe_lane_key(object, *lane))
+    }
+
+    /// The zone whose lane lock this create waits for.
+    pub fn zone(&self) -> &'static carrick_el1_abi::ZoneTables {
+        self.zone
+    }
+}
+
+impl Drop for PendingPipeCreate {
+    fn drop(&mut self) {
+        let Some(object) = self.object.take() else {
+            return;
+        };
+        if let Err(error) =
+            self.owner
+                .rollback_unpublished_pipe(Some(self.zone), object, self.bound)
+        {
+            carrick_fatal::carrick_fatal!(
+                "ipc::admission",
+                "retained pipe create rollback failed: {error:?}"
+            );
+        }
+    }
+}
+
 /// An owned, zero-filled, shared mapping. Only the synchronized IPC views
 /// access its contents; no slice of mutable shared memory escapes.
 struct Mapping {
@@ -698,20 +866,7 @@ impl HostIpc {
                 [None, None];
             let mut bound_count = 0;
             for direction in [pipe::WaitFor::Readable, pipe::WaitFor::Writable] {
-                #[cfg(test)]
-                let key = if INJECT_OBJECT_WAIT_KEY_OUT_OF_RANGE.swap(false, Ordering::AcqRel) {
-                    None
-                } else {
-                    carrick_el1_abi::ipc::object_wait_key(object, direction)
-                };
-                #[cfg(not(test))]
-                let key = carrick_el1_abi::ipc::object_wait_key(object, direction);
-                let Some(key) = key else {
-                    carrick_fatal::carrick_fatal!(
-                        "ipc::admission",
-                        "admitted object has no readiness wait key: {object:?}"
-                    );
-                };
+                let key = pipe_lane_key(object, direction);
                 let result = zone.bind_object_wait(key, &HostLockWait, &|owned| {
                     crate::el1_zone::complete_object_wake(owned.zone(), owned)
                 });
@@ -775,19 +930,109 @@ impl HostIpc {
                 error => error.into(),
             })
     }
-    /// A new pipe costs its object record only: its ring is provided at its
-    /// first write ([`HostIpc::ensure_pipe_storage`]), as Linux allocates
-    /// pipe pages on demand.
+    /// Bind `object`'s readiness lanes from `*bound` on, under the create
+    /// path's refusing lock policy. `Ok(true)`: every lane is bound.
+    /// `Ok(false)`: lane `*bound` is held by another party (a late holder of
+    /// a recycled slot's previous incarnation); lanes before it stay bound
+    /// and owned by the caller. Any other refusal is returned unchanged.
+    fn bind_pipe_lanes(
+        zone: &carrick_el1_abi::ZoneTables,
+        object: IpcObjectHandle,
+        bound: &mut usize,
+    ) -> Result<bool, carrick_sched_core::object_wait::ObjectWaitError> {
+        while *bound < PIPE_LANES.len() {
+            let key = pipe_lane_key(object, PIPE_LANES[*bound]);
+            match zone.bind_object_wait(key, &HostLockWait, &|owned| {
+                crate::el1_zone::complete_object_wake(owned.zone(), owned)
+            }) {
+                Ok(()) => *bound += 1,
+                Err(carrick_sched_core::object_wait::ObjectWaitError::Busy) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Undo an unpublished pipe: unbind its owned lanes, newest first,
+    /// BEFORE its record returns to the free list (a recycled index must
+    /// never meet a lane still bound to this incarnation), then free it.
+    ///
+    /// Runs only once no guest operation or execution lease retains the
+    /// create (failure, test helper, or a dropped continuation), so it keeps
+    /// the short-section [`HostLockWait`]: a lane or object lock holder is a
+    /// host thread in a short section or an EL1 vCPU its executor resumes to
+    /// completion, and a rollback that refused would leak the object.
+    fn rollback_unpublished_pipe(
+        &self,
+        zone: Option<&carrick_el1_abi::ZoneTables>,
+        object: IpcObjectHandle,
+        bound: usize,
+    ) -> Result<(), AdmissionError> {
+        if let Some(zone) = zone {
+            for lane in PIPE_LANES[..bound].iter().rev() {
+                zone.unbind_object_wait(pipe_lane_key(object, *lane), &HostLockWait, &|owned| {
+                    crate::el1_zone::complete_object_wake(owned.zone(), owned)
+                })
+                .map_err(AdmissionError::ObjectWaitInvariant)?;
+            }
+        }
+        self.discard_unpublished_pipe(object)
+            .map_err(AdmissionError::ObjectRollbackInvariant)
+    }
+
+    /// Create an unpublished pipe for `pipe2`. A new pipe costs its object
+    /// record only: its ring is provided at its first write
+    /// ([`HostIpc::ensure_pipe_storage`]), as Linux allocates pipe pages on
+    /// demand.
+    ///
+    /// Binding its readiness lanes never waits for a held lane lock: the
+    /// partially bound object is returned as [`PipeCreation::Contended`] for
+    /// its caller to park on that lock's release ([`PendingPipeCreate`]), so
+    /// no host executor is pinned by another party's critical section (#1845).
+    /// Contention is never an errno or an invariant failure.
+    pub fn begin_pipe(
+        self: &std::sync::Arc<Self>,
+        capacity: usize,
+    ) -> Result<PipeCreation, AdmissionError> {
+        self.top_up_ring_stock()?;
+        let object = self.with_object(|region| region.create_pipe(capacity, &HostLockWait))?;
+        let Some(zone) = crate::el1_zone::zone() else {
+            return Ok(PipeCreation::Created(object));
+        };
+        PendingPipeCreate {
+            owner: std::sync::Arc::clone(self),
+            zone,
+            object: Some(object),
+            bound: 0,
+        }
+        .bind()
+    }
+
+    /// Test helper: create a pipe whose lanes no other party holds. A held
+    /// lane rolls the object back and reports `Busy`; production `pipe2`
+    /// retains it instead ([`HostIpc::begin_pipe`]).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_pipe(&self, capacity: usize) -> Result<IpcObjectHandle, AdmissionError> {
         self.top_up_ring_stock()?;
         let object = self.with_object(|region| region.create_pipe(capacity, &HostLockWait))?;
-        if let Err(error) = self.bind_waits(object) {
-            if let Err(rollback) = self.discard_unpublished_pipe(object) {
-                return Err(AdmissionError::ObjectRollbackInvariant(rollback));
+        let Some(zone) = crate::el1_zone::zone() else {
+            return Ok(object);
+        };
+        let mut bound = 0;
+        let result = Self::bind_pipe_lanes(zone, object, &mut bound);
+        match result {
+            Ok(true) => Ok(object),
+            Ok(false) => {
+                self.rollback_unpublished_pipe(Some(zone), object, bound)?;
+                Err(AdmissionError::ObjectWaitInvariant(
+                    carrick_sched_core::object_wait::ObjectWaitError::Busy,
+                ))
             }
-            return Err(Self::wait_bind_error(error));
+            Err(error) => {
+                self.rollback_unpublished_pipe(Some(zone), object, bound)?;
+                Err(Self::wait_bind_error(error))
+            }
         }
-        Ok(object)
     }
 
     /// Add one default-capacity ring to the shared stock if it has room: one

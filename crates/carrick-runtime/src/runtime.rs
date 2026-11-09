@@ -1114,6 +1114,7 @@ where
         match outcome {
             DispatchOutcome::WriteCopyInSuspended(_) | DispatchOutcome::SleepCopyInSuspended(_)
             | DispatchOutcome::PipeReadSuspended(_)
+            | DispatchOutcome::IpcLockContended(_)
             | DispatchOutcome::OutputSuspended(_) => {
                 return Err(RuntimeError::Configuration(
                     "owned copy-in reached the retired single-thread loop".into(),
