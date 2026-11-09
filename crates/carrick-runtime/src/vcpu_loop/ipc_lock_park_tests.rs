@@ -942,3 +942,307 @@ fn serial_host_pipe2_lane_park_sigkill_reclaims_the_retained_create() {
 fn serial_host_pipe2_lane_resume_output_refusal_rolls_back_and_reruns_once() {
     exercise_ipc_lock_park(IpcLockCase::OutputRefusedOnResume);
 }
+
+/// The runtime's default executor pool for a single-CPU guest, configured
+/// exactly as the production HVPatch pool start does (`wait_wake.rs`:
+/// `configured_bound_executors` / `configured_spare_executors` of the
+/// scheduler's CPU count), with a backend ceiling that does not cap it.
+fn default_single_cpu_pool() -> usize {
+    executor::ExecutorPoolConfig {
+        bound_workers: executor::configured_bound_executors(1),
+        spare_executors: executor::configured_spare_executors(1),
+        vcpu_ceiling: 64,
+        reserve: 0,
+    }
+    .executor_count()
+    .unwrap()
+}
+
+fn lane_waiter_identity(tid: u64) -> carrick_sched_core::ThreadIdentity {
+    carrick_sched_core::ThreadIdentity {
+        tid,
+        serial: tid,
+        mm: 7,
+        file_table: 1,
+        generation: 1,
+        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+        affinity: 1,
+        lifecycle_page: 0,
+        control_slot: 0,
+    }
+}
+
+enum PoolJob {
+    Pipe2(usize),
+    Resume(
+        usize,
+        Box<carrick_kernel::kernel::continuation::ipc_lock::RetainedIpcLockOperation>,
+    ),
+    /// The holder's own progress needs an executor too (a guest vCPU that
+    /// holds the lane lock runs only when an executor serves it).
+    Release,
+}
+
+/// W2: more `pipe2` waiters than the default executor pool has workers,
+/// each meeting a held lane lock, and the holder's release queued behind
+/// them on the same pool. A create that pins its worker leaves no worker
+/// for the release: the pool wedges. A retained create frees its worker at
+/// once, and every waiter completes exactly once.
+#[test]
+fn pipe2_lane_contention_does_not_exhaust_the_default_executor_pool() {
+    use carrick_kernel::dispatch::LinearMemory;
+    use carrick_kernel::kernel::continuation::ipc_lock::RetainedIpcLockOperation;
+    use carrick_sched_core::object_wait::OperationToken;
+    const PINNED: Duration = Duration::from_secs(3);
+    let workers = default_single_cpu_pool();
+    let waiters = workers + 1;
+    let zone = Box::leak(Box::new(Region::new())).zone();
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner = context.kernel().ipc().unwrap();
+    // Free `waiters` pipes: the creates pop their slots (LIFO) as new
+    // incarnations whose lanes the holder holds for the old ones.
+    let slots: Vec<_> = carrick_kernel::el1_zone::with_test_zone(zone, || {
+        let objects: Vec<_> = (0..waiters)
+            .map(|_| owner.create_pipe(PIPE_CAPACITY).unwrap())
+            .collect();
+        for object in &objects {
+            for end in [End::Reader, End::Writer] {
+                owner
+                    .release(
+                        IpcBacking::Pipe {
+                            object: *object,
+                            end,
+                        }
+                        .encode(),
+                    )
+                    .unwrap();
+            }
+        }
+        objects
+    });
+    let dispatch = |memory: &mut LinearMemory| {
+        let tid = ThreadId::synthetic_for_tests(71_606);
+        let registry = ThreadRegistry::new(tid);
+        let futex = FutexTable::new();
+        dispatcher
+            .dispatch_threaded(
+                &context,
+                SyscallRequest::new(
+                    nr::PIPE2.raw(),
+                    carrick_kernel::compat::SyscallArgs::from([OUT, 0, 0, 0, 0, 0]),
+                ),
+                memory,
+                &carrick_kernel::compat::CompatReporter::default(),
+                ThreadCtx::new(tid, &registry, &futex),
+            )
+            .unwrap()
+    };
+    let resume = |memory: &mut LinearMemory, op: RetainedIpcLockOperation| {
+        dispatcher
+            .resume_ipc_lock_operation(
+                &context,
+                SyscallRequest::new(
+                    nr::PIPE2.raw(),
+                    carrick_kernel::compat::SyscallArgs::from([OUT, 0, 0, 0, 0, 0]),
+                ),
+                op,
+                memory,
+                &carrick_kernel::compat::CompatReporter::default(),
+                None,
+                carrick_kernel::dispatch::routing::OrdinaryDispatchRoute {
+                    host_wait: None,
+                    lease: None,
+                    mm_executor: None,
+                },
+            )
+            .unwrap()
+    };
+    let handed_back = |record: carrick_sched_core::RecordId| {
+        matches!(
+            zone.record(record).claim(),
+            carrick_el1_abi::Claim::Host { .. }
+        )
+    };
+    let jobs = std::sync::Mutex::new(std::collections::VecDeque::new());
+    let ready = std::sync::Condvar::new();
+    let push = |job| {
+        jobs.lock().unwrap().push_back(Some(job));
+        ready.notify_one();
+    };
+    let (events_tx, events) = mpsc::channel();
+    let enrolled = std::sync::atomic::AtomicUsize::new(0);
+    let memories: Vec<_> = (0..waiters)
+        .map(|_| std::sync::Mutex::new(LinearMemory::new(0x71_0000, vec![0xa5; 0x2000])))
+        .collect();
+    let holders: Vec<_> = std::thread::scope(|scope| {
+        let holders: Vec<_> = slots
+            .iter()
+            .map(|slot| {
+                std::sync::Mutex::new(LaneHolder::hold(scope, zone, *slot, WaitFor::Writable))
+            })
+            .collect();
+        let release_all = || {
+            for holder in &holders {
+                holder.lock().unwrap().release();
+            }
+        };
+        let verdict = std::thread::scope(|pool| {
+            for _ in 0..workers {
+                let (jobs, ready, events_tx, memories, enrolled, dispatch, resume, release_all) = (
+                    &jobs,
+                    &ready,
+                    events_tx.clone(),
+                    &memories,
+                    &enrolled,
+                    &dispatch,
+                    &resume,
+                    &release_all,
+                );
+                pool.spawn(move || {
+                    carrick_kernel::el1_zone::with_test_zone(zone, || {
+                        loop {
+                            let job = {
+                                let mut queue = jobs.lock().unwrap();
+                                loop {
+                                    if let Some(job) = queue.pop_front() {
+                                        break job;
+                                    }
+                                    queue = ready.wait(queue).unwrap();
+                                }
+                            };
+                            let Some(job) = job else { return };
+                            match job {
+                                PoolJob::Pipe2(i) => {
+                                    match dispatch(&mut memories[i].lock().unwrap()) {
+                                        DispatchOutcome::IpcLockContended(op) => {
+                                            // What `ipc_lock_park` does: one zone
+                                            // record holding the owner-wait receipt,
+                                            // enrolled on the held lock's release.
+                                            let tid = 2000 + i as u64;
+                                            let record = zone
+                                                .alloc_record(lane_waiter_identity(tid))
+                                                .unwrap();
+                                            op.defer(
+                                                record,
+                                                OperationToken::metadata_request(tid).unwrap(),
+                                            )
+                                            .unwrap();
+                                            enrolled
+                                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                                            events_tx.send(Ok((i, Some((record, op))))).unwrap();
+                                        }
+                                        other => events_tx.send(Err((i, other))).unwrap(),
+                                    }
+                                }
+                                PoolJob::Resume(i, op) => {
+                                    match resume(&mut memories[i].lock().unwrap(), *op) {
+                                        DispatchOutcome::Returned { value: 0 } => {
+                                            events_tx.send(Ok((i, None))).unwrap()
+                                        }
+                                        other => events_tx.send(Err((i, other))).unwrap(),
+                                    }
+                                }
+                                PoolJob::Release => {
+                                    // Release only once every waiter enrolled, so
+                                    // no waiter can run uncontended after it.
+                                    let deadline = std::time::Instant::now() + PINNED;
+                                    while enrolled.load(std::sync::atomic::Ordering::Acquire)
+                                        < waiters
+                                        && std::time::Instant::now() < deadline
+                                    {
+                                        std::thread::yield_now();
+                                    }
+                                    release_all();
+                                }
+                            }
+                        }
+                    })
+                });
+            }
+            for i in 0..waiters {
+                push(PoolJob::Pipe2(i));
+            }
+            push(PoolJob::Release);
+            // Every waiter must give its worker back while the lock is held.
+            let mut parked = Vec::new();
+            let mut verdict = Ok(());
+            for _ in 0..waiters {
+                match events.recv_timeout(PINNED) {
+                    Ok(Ok((i, Some(parked_op)))) => parked.push((i, parked_op)),
+                    Ok(other) => {
+                        verdict = Err(format!(
+                            "a contended pipe2 did not retain its create: {other:?}"
+                        ));
+                        break;
+                    }
+                    Err(_) => {
+                        verdict = Err(format!(
+                            "pool wedged: {} of {waiters} pipe2 waiters returned their worker \
+                             ({workers} workers), so the holder's queued release never ran",
+                            parked.len()
+                        ));
+                        break;
+                    }
+                }
+            }
+            if verdict.is_ok() {
+                for (i, (record, op)) in parked.drain(..) {
+                    // The queued release ran on a freed worker and handed back.
+                    let deadline = std::time::Instant::now() + PINNED;
+                    while !handed_back(record) {
+                        assert!(std::time::Instant::now() < deadline, "release never ran");
+                        std::thread::yield_now();
+                    }
+                    // SAFETY: the host owns this handed-back record.
+                    let token = unsafe { zone.record(record).take_object_operation() };
+                    assert_eq!(
+                        token.and_then(|token| token.metadata_generation()),
+                        Some(2000 + i as u64)
+                    );
+                    zone.free_record(record);
+                    push(PoolJob::Resume(i, op));
+                }
+                for _ in 0..waiters {
+                    match events.recv_timeout(PINNED) {
+                        Ok(Ok((_, None))) => {}
+                        other => {
+                            verdict = Err(format!("resumed pipe2 did not complete: {other:?}"));
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // Unwedge so the pool can join; the verdict is already red.
+                release_all();
+            }
+            drop(parked);
+            for _ in 0..workers {
+                jobs.lock().unwrap().push_back(None);
+                ready.notify_all();
+            }
+            verdict
+        });
+        release_all();
+        verdict.unwrap();
+        holders
+    });
+    drop(holders);
+    let mut fds = std::collections::BTreeSet::new();
+    for memory in &memories {
+        let memory = memory.lock().unwrap();
+        let bytes = carrick_guest_mem::GuestMemory::read_bytes(&*memory, OUT, 8).unwrap();
+        let read = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
+        let write = i32::from_ne_bytes(bytes[4..].try_into().unwrap());
+        assert!(
+            fds.insert(read) && fds.insert(write),
+            "distinct descriptors"
+        );
+    }
+    assert_eq!(fds.len(), 2 * waiters, "one pipe per waiter");
+    assert_eq!(
+        context.resources().files().slot_count(),
+        2 * waiters,
+        "every descriptor is installed, none twice"
+    );
+}
