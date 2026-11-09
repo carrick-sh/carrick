@@ -639,6 +639,8 @@ impl<'a> FsView<'a> {
         flags: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         let this = self;
+        let nofollow = carrick_abi::LinuxAtFlags::from_bits_retain(flags)
+            .contains(carrick_abi::LinuxAtFlags::SYMLINK_NOFOLLOW);
         if path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
@@ -655,7 +657,7 @@ impl<'a> FsView<'a> {
         // the final component is genuinely a symlink — plain paths and
         // synthetic /proc entries are left untouched for the checks below,
         // and resolve_at_path already leaves the final component unfollowed.
-        let path = if flags & LINUX_AT_SYMLINK_NOFOLLOW == 0
+        let path = if !nofollow
             && matches!(
                 this.layered_lstat(&path),
                 Ok(md) if md.kind == RootFsEntryKind::Symlink
@@ -673,7 +675,7 @@ impl<'a> FsView<'a> {
         if this.mutation_path_needs_task(context, &path) {
             return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS));
         }
-        let exists = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+        let exists = if nofollow {
             this.layered_lstat(&path).map(|_| ())
         } else {
             this.layered_metadata(&path).map(|_| ())
@@ -693,12 +695,10 @@ impl<'a> FsView<'a> {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
-            return match m.vfs.set_times(
-                &m.full_path,
-                atime_set,
-                mtime_set,
-                flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
-            ) {
+            return match m
+                .vfs
+                .set_times(&m.full_path, atime_set, mtime_set, nofollow)
+            {
                 Ok(()) => {
                     this.fs.rootfs_vfs.notify_inode_changed(&path, None);
                     Ok(DispatchOutcome::Returned { value: 0 })
@@ -710,12 +710,11 @@ impl<'a> FsView<'a> {
         // overlay). A subsequent stat reads real disk metadata via
         // real_stat and will report the set mtime. MemoryBackend returns
         // Unsupported; accept as a no-op so in-memory guests don't fail.
-        match this.fs.rootfs_vfs.set_times(
-            &path,
-            atime_set,
-            mtime_set,
-            flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
-        ) {
+        match this
+            .fs
+            .rootfs_vfs
+            .set_times(&path, atime_set, mtime_set, nofollow)
+        {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
             Err(carrick_vfs::fs_backend::BackendError::Unsupported) => {
                 Ok(DispatchOutcome::Returned { value: 0 })
