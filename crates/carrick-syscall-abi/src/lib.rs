@@ -135,9 +135,6 @@ pub mod nr {
     pub const PRLIMIT64: CanonicalNr = CanonicalNr(261);
 }
 
-/// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
-/// From include/uapi/linux/sched.h. Value 4 is intentionally skipped
-/// (reserved for the never-merged SCHED_ISO).
 /// Linux `clockid_t` values (`include/uapi/linux/time.h`). Shared by the
 /// host dispatcher and the ring sleep owner so both classify one clock set.
 pub const LINUX_CLOCK_REALTIME: u64 = 0;
@@ -151,9 +148,18 @@ pub const LINUX_CLOCK_BOOTTIME: u64 = 7;
 pub const LINUX_CLOCK_REALTIME_ALARM: u64 = 8;
 pub const LINUX_CLOCK_BOOTTIME_ALARM: u64 = 9;
 pub const LINUX_CLOCK_TAI: u64 = 11;
+/// A negative (dynamic) `clockid_t` is `~pid << 3 | bits`: the low two bits
+/// select the CPU clock (`CPUCLOCK_WHICH`), bit 2 makes it per-thread, and
+/// the low three bits equal to `CLOCKFD` name a posix-clock file descriptor.
+pub const LINUX_CLOCK_CPU_WHICH_MASK: u32 = 0b011;
+pub const LINUX_CLOCK_CPU_PERTHREAD: u32 = 0b100;
+pub const LINUX_CLOCK_FD: u32 = 0b011;
 /// `clock_nanosleep`/`timer_settime` absolute-deadline flag.
 pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
 
+/// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
+/// From include/uapi/linux/sched.h. Value 4 is intentionally skipped
+/// (reserved for the never-merged SCHED_ISO).
 pub const LINUX_SCHED_OTHER: i32 = 0; // a.k.a. SCHED_NORMAL
 pub const LINUX_SCHED_FIFO: i32 = 1;
 pub const LINUX_SCHED_RR: i32 = 2;
