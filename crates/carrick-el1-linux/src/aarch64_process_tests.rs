@@ -10797,6 +10797,7 @@ fn native_descriptor_witness(
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
 fn native_descriptor_metadata_witness(
     constructor: Option<u64>,
     root_constructor: bool,
