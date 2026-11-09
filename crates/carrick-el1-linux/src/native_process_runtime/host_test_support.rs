@@ -74,12 +74,14 @@ pub(crate) fn take_return_copyouts() -> Vec<(UserVa, usize)> {
 
 /// The next Physical signal clock reads, in order, before its default
 /// 1000-then-2000 clock resumes.
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn script_signal_clock(reads: &[u64]) {
     SIGNAL_CLOCK_SCRIPT.with(|script| *script.borrow_mut() = reads.iter().copied().collect());
 }
 
 /// Fail the next exact-MM user copies (direct or page-admitted owned
 /// copies), in order: `Unsupported` is a not-yet-backed page.
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn fail_signal_copies(errors: &[NativeProcessError]) {
     SIGNAL_COPY_ERRORS.with(|queue| *queue.borrow_mut() = errors.iter().copied().collect());
 }
@@ -8339,7 +8341,7 @@ std::thread_local! {
 
 /// Answer the Physical carrier's native-service doorbell with `hook`, or
 /// restore the unanswered doorbell with `None`.
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn on_service_doorbell(hook: Option<Box<dyn FnMut()>>) {
     ENTROPY_DOORBELL.with(|slot| *slot.borrow_mut() = hook);
 }
