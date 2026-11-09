@@ -33,12 +33,78 @@ fn link_matches(expected: &[u8]) -> Result<(), i32> {
     }
 }
 
+// Allocation-free stderr writer, safe between vfork and _exit.
+fn err_bytes(bytes: &[u8]) {
+    unsafe {
+        libc::write(2, bytes.as_ptr().cast(), bytes.len());
+    }
+}
+
+fn err_number(value: i64) {
+    let mut digits = [0u8; 21];
+    let mut at = digits.len();
+    let mut rest = value.unsigned_abs();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        at -= 1;
+        digits[at] = b'-';
+    }
+    err_bytes(&digits[at..]);
+}
+
+/// One-line diagnostic: the expected link, the bytes (or errno) actually read.
+fn report_link(role: &[u8], expected: &[u8]) {
+    let mut bytes = [0u8; 4096];
+    let n = unsafe {
+        libc::syscall(
+            libc::SYS_readlinkat,
+            libc::AT_FDCWD,
+            c"/proc/self/exe".as_ptr(),
+            bytes.as_mut_ptr(),
+            bytes.len(),
+        )
+    };
+    err_bytes(role);
+    err_bytes(b": readlinkat(/proc/self/exe) pid=");
+    err_number(unsafe { libc::getpid() } as i64);
+    err_bytes(b" expected=[");
+    err_bytes(expected);
+    if n < 0 {
+        err_bytes(b"] errno=");
+        err_number(errno() as i64);
+    } else {
+        err_bytes(b"] actual=[");
+        err_bytes(&bytes[..n as usize]);
+        err_bytes(b"]");
+    }
+    err_bytes(b"\n");
+}
+
 fn check_link(expected: &str) {
-    assert_eq!(
-        link_matches(expected.as_bytes()),
-        Ok(()),
-        "running caller readlinkat(/proc/self/exe), expected {expected}; positive error is Linux errno"
-    );
+    if link_matches(expected.as_bytes()).is_err() {
+        report_link(b"check_link", expected.as_bytes());
+        panic!("running caller readlinkat(/proc/self/exe) did not name {expected}");
+    }
+}
+
+/// Holder's first observation: on failure tell the observer (`X`) before the
+/// pipe closes, so EOF is never the only symptom.
+fn holder_check(expected: &str, output: i32) {
+    if link_matches(expected.as_bytes()).is_err() {
+        report_link(b"holder", expected.as_bytes());
+        let byte = b'X';
+        unsafe {
+            libc::write(output, (&byte as *const u8).cast(), 1);
+            libc::_exit(121);
+        }
+    }
 }
 
 fn pipe() -> [i32; 2] {
@@ -54,7 +120,7 @@ fn send(fd: i32, byte: u8) {
     );
 }
 
-fn receive(fd: i32) -> u8 {
+fn receive(fd: i32, role: &str) -> u8 {
     let mut ready = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -63,13 +129,19 @@ fn receive(fd: i32) -> u8 {
     assert_eq!(
         unsafe { libc::poll(&mut ready, 1, 5000) },
         1,
-        "bounded handshake fd={fd}"
+        "bounded handshake {role} fd={fd}"
     );
     let mut byte = 0;
+    let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
     assert_eq!(
-        unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) },
+        n,
         1,
-        "participant exited before its observation"
+        "{role} (fd={fd}): participant exited before its observation (read={n} errno={})",
+        errno()
+    );
+    assert_ne!(
+        byte, b'X',
+        "{role} (fd={fd}): participant reported failure; see stderr"
     );
     byte
 }
@@ -119,7 +191,7 @@ fn fork_read(expected: &str) {
         send(result[1], b'F');
         unsafe { libc::_exit(0) }
     }
-    assert_eq!(receive(result[0]), b'F');
+    assert_eq!(receive(result[0], "fork child result"), b'F');
     check_link(expected);
     reap(pid);
     for fd in result {
@@ -160,7 +232,11 @@ fn vfork_read(expected: &str) {
         )
     };
     assert!(pid >= 0);
-    assert_eq!(receive(result[0]), 0, "vfork caller readlink errno");
+    assert_eq!(
+        receive(result[0], "vfork child result"),
+        0,
+        "vfork caller readlink errno"
+    );
     check_link(expected);
     reap(pid);
     for fd in result {
@@ -178,10 +254,10 @@ fn thread_read(expected: &str) {
     let worker = std::thread::spawn(move || {
         check_link(&worker_expected);
         send(ready[1], b'T');
-        assert_eq!(receive(release[0]), b'Q');
+        assert_eq!(receive(release[0], "thread release"), b'Q');
         check_link(&worker_expected);
     });
-    assert_eq!(receive(ready[0]), b'T');
+    assert_eq!(receive(ready[0], "thread ready"), b'T');
     check_link(&expected); // Worker is live, waiting for this leader.
     send(release[1], b'Q');
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -218,10 +294,10 @@ fn holder(args: &[String]) {
     let mut expected = args[2].clone();
     let input: i32 = args[3].parse().unwrap();
     let output: i32 = args[4].parse().unwrap();
-    check_link(&expected); // First syscall observation after real exec/adoption.
+    holder_check(&expected, output); // First syscall observation after real exec/adoption.
     send(output, b'I');
     loop {
-        let command = receive(input);
+        let command = receive(input, "holder command");
         match command {
             b'F' => fork_read(&expected),
             b'V' => vfork_read(&expected),
@@ -264,6 +340,11 @@ fn start(path: &CStr, expected: &str) -> (i32, i32, i32) {
             libc::close(input[1]);
             libc::close(output[0]);
             libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            err_bytes(b"holder execve failed errno=");
+            err_number(errno() as i64);
+            err_bytes(b"\n");
+            let byte = b'X';
+            libc::write(output[1], (&byte as *const u8).cast(), 1);
             libc::_exit(120);
         }
     }
@@ -337,7 +418,7 @@ fn main() {
     );
     population.0.push(second);
     for child in [first, second] {
-        assert_eq!(receive(child.2), b'I');
+        assert_eq!(receive(child.2, "holder report"), b'I');
     }
     println!("two_live_distinct_relative_symlink=ok");
     let commands: &[u8] = match mode.as_str() {
@@ -364,7 +445,7 @@ fn main() {
             send(child.1, *command);
         }
         for child in [first, second] {
-            assert_eq!(receive(child.2), *command);
+            assert_eq!(receive(child.2, "holder report"), *command);
         }
         println!("{}_both_live=ok", char::from(*command));
     }
