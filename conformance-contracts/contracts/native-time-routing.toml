@@ -20,6 +20,7 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_zero_nanosleep_returns_zero",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_nanosleep_rejects_invalid_timespec",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_nanosleep_rescans_a_raced_publication",
   "carrick-el1-linux::aarch64_process_tests::native_root_nanosleep_keeps_its_host_continuation",
   "carrick-personality-linux::sleep::tests::sleep_clocks_match_the_host_classification",
   "carrick-personality-linux::sleep::tests::timespecs_validate_and_round_trip",
