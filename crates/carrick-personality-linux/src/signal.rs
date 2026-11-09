@@ -419,11 +419,13 @@ pub trait ProcessSignals {
     }
 
     /// Sleep in this owner's signal-interruptible member wait until the
-    /// deadline. `EINTR` has already written any relative `remaining`.
+    /// deadline. The outcome is the call's: 0 once the deadline has passed,
+    /// a transferred park, or `EINTR` whose relative `remaining` output the
+    /// owner retains until it is written.
     fn clock_sleep(
         &mut self,
         request: crate::sleep::SleepRequest,
-    ) -> Result<crate::sleep::SleepOutcome, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<SignalOutcome, carrick_syscall_abi::LinuxErrno> {
         let _ = request;
         Err(carrick_syscall_abi::LINUX_ENOSYS)
     }

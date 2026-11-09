@@ -5422,6 +5422,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         pending: PendingSignalWait,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
+        if let PendingSignalKind::Sleep { remaining } = pending.kind {
+            // A sleep is its own complete decision. It never reaches the
+            // rt_sigtimedwait result path below, whose deadline answer is
+            // EAGAIN.
+            let deadline = pending.deadline.ok_or(NativeProcessError::Stale)?;
+            return self.sleep_until(remaining, deadline, pending.channel);
+        }
         loop {
             // A publication after this snapshot must invalidate enrollment.
             let observed = pending.channel.generation.generation();
@@ -5437,21 +5444,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
             );
             drop(graph);
-            if let PendingSignalKind::Sleep { remaining } = pending.kind {
-                // The timer winning ends a sleep even with a signal pending;
-                // that signal is delivered at this same return.
-                let deadline = pending.deadline.ok_or(NativeProcessError::Stale)?;
-                let now = self.service.signal_now()?;
-                if now.raw() >= deadline.0.raw() {
-                    return Ok(returned(0));
-                }
-                if signals.has_deliverable(self.record, blocked) {
-                    self.copy_sleep_remaining(&mm, remaining, deadline, now)?;
-                    return Ok(returned(
-                        carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
-                    ));
-                }
-            }
             if let PendingSignalKind::Wait { set, info } = pending.kind
                 && let Some((signal, payload)) = signals.take_timedwait(self.record, set)
             {
@@ -5493,27 +5485,91 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
     }
-    /// Write a relative sleep's unslept interval for `EINTR`. The exact-MM
-    /// copy is the one `rt_sigtimedwait` uses for its siginfo output.
-    fn copy_sleep_remaining(
+    /// One complete nanosleep/clock_nanosleep decision, shared by the entry
+    /// and every resume of the same sleep. In order: a passed deadline returns
+    /// 0 (a pending signal is then delivered at this same return); a
+    /// deliverable signal returns `EINTR` with the relative `remaining`
+    /// output; anything else parks on the same deadline. A publication after
+    /// the observed channel generation refuses enrollment, and the decision
+    /// runs again from the top. Every arm returns or parks: none falls
+    /// through into another wait's result path.
+    fn sleep_until(
         &mut self,
-        mm: &M,
+        remaining: Option<UserVa>,
+        deadline: carrick_guest_arch::Deadline,
+        channel: Arc<WaitChannel>,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        loop {
+            // A publication after this snapshot must invalidate enrollment.
+            let observed = channel.generation.generation();
+            let signals = self
+                .runtime
+                .graph
+                .lock()
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native()
+                .resources()
+                .signals()
+                .clone();
+            let now = self.service.signal_now()?;
+            if now.raw() >= deadline.0.raw() {
+                return Ok(returned(0));
+            }
+            let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+            );
+            if signals.has_deliverable(self.record, blocked) {
+                return Ok(self.sleep_interrupted(remaining, deadline, now));
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.runtime.signal_check_hook.lock().take() {
+                hook();
+            }
+            if self.park_signal_wait(
+                PendingSignalKind::Sleep { remaining },
+                channel.clone(),
+                observed,
+                Some(deadline),
+            )? {
+                return Ok(LifecycleOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    result: SyscallResult::new(0),
+                });
+            }
+        }
+    }
+    /// `EINTR` for a sleep. A relative sleep's unslept interval is a retained
+    /// output: a Busy or owner-wait copy keeps it and the `EINTR` result in
+    /// the service row and reruns the copy, a lazy page is prepared first,
+    /// and only a real fault answers `EFAULT`.
+    fn sleep_interrupted(
+        &mut self,
         remaining: Option<UserVa>,
         deadline: carrick_guest_arch::Deadline,
         now: carrick_guest_arch::CounterTick,
-    ) -> Result<(), NativeProcessError> {
+    ) -> LifecycleOutcome {
+        let interrupted = SyscallResult::from_errno(carrick_syscall_abi::LINUX_EINTR);
         let Some(address) = remaining else {
-            return Ok(());
+            return returned(interrupted.raw());
         };
-        let frequency = self.service.signal_frequency()?.raw().get();
+        let frequency = match self.service.signal_frequency() {
+            Ok(frequency) => frequency.raw().get(),
+            Err(error) => return self.fail(error),
+        };
         let ticks = deadline.0.raw().saturating_sub(now.raw());
         let nanos = u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(frequency))
             .unwrap_or(u64::MAX);
-        self.service.copy_signal_bytes(
-            mm,
+        let result = self.finish_copyout(service::OwnedCopyout {
             address,
-            &carrick_personality_linux::sleep::timespec_bytes(nanos),
-        )
+            bytes: carrick_personality_linux::sleep::timespec_bytes(nanos).to_vec(),
+            offset: 0,
+            result: interrupted,
+            prefix_on_fault: false,
+            effect: None,
+        });
+        self.finish_output_outcome(result)
     }
     /// The execution lane calls this before returning a woken saved syscall to
     /// userspace. It consumes the retained wait operation instead of replaying it.
@@ -10439,12 +10495,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn clock_sleep(
         &mut self,
         request: carrick_personality_linux::sleep::SleepRequest,
-    ) -> Result<carrick_personality_linux::sleep::SleepOutcome, carrick_syscall_abi::LinuxErrno>
+    ) -> Result<carrick_personality_linux::signal::SignalOutcome, carrick_syscall_abi::LinuxErrno>
     {
-        use carrick_personality_linux::sleep::{SleepDeadline, SleepOutcome};
+        use carrick_personality_linux::sleep::SleepDeadline;
         let errno =
             |error: NativeProcessError| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32);
-        // Convert once: a re-park after a spurious wake keeps this deadline.
+        // Convert once: every re-park of this sleep keeps this deadline.
         let deadline = match request.deadline {
             SleepDeadline::Relative(nanos) => self.service.signal_deadline(nanos).map_err(errno)?,
             SleepDeadline::Monotonic(nanos) => {
@@ -10455,48 +10511,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ))
             }
         };
-        let kind = PendingSignalKind::Sleep {
-            remaining: request.remaining,
-        };
-        loop {
-            let graph = self.runtime.graph.lock();
-            let row = graph
-                .owner
-                .task(self.key)
-                .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
-            let resources = row.native().resources();
-            let signals = resources.signals().clone();
-            let mm = resources.mm.clone();
-            let channel = resources
-                .channel
-                .clone()
-                .ok_or(carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
-            let generation = channel.generation.generation();
-            drop(graph);
-            let now = self.service.signal_now().map_err(errno)?;
-            if now.raw() >= deadline.0.raw() {
-                return Ok(SleepOutcome::Elapsed);
-            }
-            let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
-            );
-            if signals.has_deliverable(self.record, blocked) {
-                self.copy_sleep_remaining(&mm, request.remaining, deadline, now)
-                    .map_err(errno)?;
-                return Err(carrick_personality_linux::abi::signal::LINUX_EINTR);
-            }
-            #[cfg(test)]
-            if let Some(hook) = self.runtime.signal_check_hook.lock().take() {
-                hook();
-            }
-            // A publication after `generation` refuses enrollment: rescan.
-            if self
-                .park_signal_wait(kind, channel, generation, Some(deadline))
-                .map_err(errno)?
-            {
-                return Ok(SleepOutcome::Pending);
-            }
-        }
+        let channel = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .ok()
+            .and_then(|row| row.native().resources().channel.clone())
+            .ok_or(carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
+        let outcome = self
+            .sleep_until(request.remaining, deadline, channel)
+            .unwrap_or_else(|error| self.fail(error));
+        Ok(crate::lifecycle::signal_copy_outcome(outcome))
     }
     fn rt_sigsuspend(
         &mut self,
