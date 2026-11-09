@@ -252,8 +252,11 @@ It was red with result -38 before the resource arm was added.
 
 This is not closure of #1335 or #1410. Writes still require the existing
 carrier-write admission (an unlimited caller file-size limit and no applicable
-watcher). The x86 CPL0 staging gate admits write/writev for both origins like ARM
-(`native_stage::admits`). The strict x86 crossing set still excludes writev,
+watcher). The x86 CPL0 staging gate admits write/writev for descendants only
+(`native_stage::admits`): x86 completes a staged request through
+`begin_host_file_call`, which refuses an initial root's staged write as
+counted ENOSYS while the carrier retains the root's filesystem, so the
+initial task's write keeps its host route. The strict x86 crossing set still excludes writev,
 so the shared completion owner offers each unserved call to the venue's
 staging (`PendingFamilies::stage_native_host_file`) before that table can
 refuse it, as ARM stages ahead of its operation route. The crossing
@@ -263,9 +266,15 @@ staging returns `None`, so the call keeps its existing route. A
 non-resident source buffer is supplied through the same owner fault path
 as the #PF entry and the syscall is retried at its `syscall` instruction;
 only a refused access (no mapping, wrong protection, backing past EOF)
-answers EFAULT. The KVM witnesses in `cpl0_initial_mm.rs`
-(`native_redirect_write.S`) check the result and destination bytes for a
-child writev, a child write from an untouched anonymous page, and an
-initial write with its ring table withdrawn.
+completes without it. The shared gather copies a page at a time and names
+the first unreadable page; a refused supply answers EFAULT when nothing was
+copied and otherwise writes the copied prefix and returns its count
+(`HostFileStage::FaultAfterPrefix`), as Linux's short write does. ARM's
+forwarded stage fault carries the same prefix. The KVM witnesses in
+`cpl0_initial_mm.rs` (`native_redirect_write.S`) check the result and
+destination bytes for a child writev, a child write from an untouched
+anonymous page, a child write and writev that run into an unmapped page
+after a readable prefix, and an initial write with its ring table
+withdrawn.
 Namespace mutation cores, real shell redirect-and-restore, decoded-x86
 runtime coverage beyond write/writev, and signed evidence remain unfinished.
