@@ -425,6 +425,125 @@ mod process_exit_tests {
         assert_eq!(completion, FamilyCompletion::Complete(-22));
         assert_eq!(native.frame.rax as i64, -22);
     }
+
+    /// #1941 x86 parity: the lane's `FUTEX_WAKE_PRIVATE`
+    /// (`PendingFamilies::futex` -> `serve_futex` -> `FutexVenue::wake` ->
+    /// `wake_word` -> `ZoneTables::wake_placed`) reaches a waiter pinned to a
+    /// busy vCPU and finishes in the ring: the waiter is queued on its busy
+    /// allowed slot, the reschedule kick is published, nothing forwards.
+    #[test]
+    fn native_futex_wake_queues_a_waiter_pinned_to_a_busy_cpu_in_ring() {
+        use super::*;
+
+        const MM: u64 = 77;
+        const UADDR: u64 = 0x5_0040;
+        let zone = unsafe {
+            // SAFETY: aligned zeroed allocation is the empty ZoneTables representation.
+            let pointer = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>())
+                .cast::<ZoneTables>();
+            assert!(!pointer.is_null());
+            std::boxed::Box::from_raw(pointer)
+        };
+        let identity = |tid: u64, affinity: u64| ThreadIdentity {
+            tid,
+            serial: tid + 60,
+            mm: MM,
+            file_table: 5,
+            generation: 11,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        // The waker runs on slot 0 (CPU 0); slot 1 (CPU 1) runs another
+        // thread of the same process, in the guest and not idle.
+        let (waker_slot, busy_slot) = (SlotId::new(0), SlotId::new(1));
+        for (slot, cpu) in [(waker_slot, 0), (busy_slot, 1)] {
+            assert!(zone.reset_slot(slot));
+            zone.drive(slot, u64::from(cpu) + 1);
+            zone.publish_slot(slot, MM, Some(cpu), 0);
+            assert!(
+                zone.occupancy
+                    .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, MM)
+            );
+            zone.enter_guest(slot);
+        }
+        // A waiter parked on the word whose affinity allows only CPU 1.
+        let waiter = zone.alloc_record(identity(43, 1 << 1)).expect("waiter");
+        let seq = zone.next_seq(waiter);
+        {
+            let guard = zone
+                .lock(ZoneTables::bucket_of(MM, UADDR), &BoundedSpin(0))
+                .expect("bucket");
+            zone.enqueue(&guard, waiter, seq, MM, UADDR, u32::MAX, 0)
+                .expect("park");
+            zone.publish_park(waiter, seq);
+        }
+
+        let task = CurrentTask::new();
+        task.mm.key.store(MM, Ordering::Release);
+        let counters = Counters::new();
+        let page = ThreadLifecyclePage::new();
+        let controls = core::array::from_fn(|_| ThreadControlSlot::new());
+        let mut lane = LifecycleLane {
+            contexts: [const { NativeBirthContext::EMPTY }; 2],
+            parent: identity(41, 0),
+            slot: waker_slot,
+            maintenance_root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x1000))
+                .expect("maintenance root"),
+            data_start: LIFECYCLE_DATA,
+            data_end: LIFECYCLE_DATA + 0x1000,
+            wakes: 0,
+            births: 0,
+            retirements: 0,
+        };
+        let mut frame = NativeFrame::default();
+        let mut xsave = XsaveArea::ZERO;
+        #[allow(clippy::panic)]
+        fn terminal_failure(
+            _: carrick_core_abi::ExecutionBinding,
+            reason: carrick_core_abi::NativeRunFailureReason,
+        ) -> ! {
+            std::panic::panic_any(reason)
+        }
+        let mut native = NativeLane {
+            terminal_failure,
+            handoff: None,
+            frame: &mut frame,
+            xsave: &mut xsave,
+            task: &task,
+            counters: &counters,
+            zone: &zone,
+            lane: &mut lane,
+            page: &page,
+            controls: &controls,
+            // FUTEX_WAKE | FUTEX_PRIVATE_FLAG, one waiter.
+            args: [UADDR, 129, 1, 0, 0, 0],
+        };
+
+        let completion = PendingFamilies::futex(&mut native);
+
+        assert_eq!(
+            completion,
+            FamilyCompletion::Complete(1),
+            "the wake finishes in the ring, never a host forward"
+        );
+        assert_eq!(native.frame.rax, 1);
+        assert_eq!(native.lane.wakes, 1);
+        assert_eq!(
+            zone.record(waiter).claim(),
+            Claim::Queued {
+                slot: busy_slot,
+                seq
+            },
+            "queued on its busy allowed slot"
+        );
+        assert_eq!(
+            zone.counters.el1_sgis.load(Ordering::Relaxed),
+            1,
+            "the busy slot is sent its reschedule kick"
+        );
+    }
 }
 
 pub const LIFECYCLE_ZONE: u64 = 0xffff_ffff_b000_0000;
