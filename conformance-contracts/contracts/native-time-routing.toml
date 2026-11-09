@@ -6,7 +6,7 @@ semantic_authority = ["man 2 clock_gettime", "man 2 clock_adjtime", "man 2 adjti
 fixture = "native-fork-child-time-handler"
 scale_points = [2]
 structural_budgets = []
-rationale = "One production native fork leaves the parent and child alive with distinct MMs. Each child call must reach time argument validation, returning EFAULT for null pointers and counting zero ENOSYS refusals. The sleep routing binding is deliberately red and does not prove successful reads, sleep semantics, work scaling or runtime ratios. See docs/conformance-contracts/native-time-routing.md."
+rationale = "One production native fork leaves the parent and child alive with distinct MMs. Each child call must reach time argument validation, returning EFAULT for null pointers and counting zero ENOSYS refusals. Child nanosleep/clock_nanosleep sleep in ring on the signal wait owner: with the exec leader parked in a timed futex, the sleeping clone parks, keeps its original deadline across executor departure, expires once, and EINTR writes rem; an expired absolute deadline or a zero interval returns 0 without a timer lease. The run root keeps its host sleep. This does not prove successful clock reads, timex sharing, work scaling or runtime ratios. See docs/conformance-contracts/native-time-routing.md."
 
 [bindings]
 vm_free = [
@@ -14,8 +14,17 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_nanosleep_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_absolute_clock_nanosleep_reaches_time_handler",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_clock_requires_retained_payload_before_service_publication",
-  "carrick-kernel::clock_service::tests::sample_and_deterministic_sleep_wake_through_service",
-  "carrick-kernel::clock_service::tests::absolute_realtime_sleep_wakes_on_timex_step",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_nanosleep_is_routed",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_nanosleep_eintr_writes_remaining",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_nanosleep_pending_signal_is_eintr",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_zero_nanosleep_returns_zero",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_child_nanosleep_rejects_invalid_timespec",
+  "carrick-el1-linux::aarch64_process_tests::native_root_nanosleep_keeps_its_host_continuation",
+  "carrick-personality-linux::sleep::tests::sleep_clocks_match_the_host_classification",
+  "carrick-personality-linux::sleep::tests::timespecs_validate_and_round_trip",
+  "carrick-personality-linux::sleep::tests::realtime_deadlines_before_the_counter_epoch_have_passed",
+  "carrick-kernel::clock_service::tests::sample_reads_the_container_clock",
   "carrick-kernel::dispatch::container_clock_tests::root_timex_aliases_preserve_discipline_and_output_ordering",
   "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_privileged_roundtrips_all_adj_modes",
   "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_setoffset_moves_realtime",
@@ -28,7 +37,8 @@ vm_free = [
 
 [bindings.unresolved]
 # Slice 3 witnesses remain in source with an explicit #1808 ignore reason.
-vm_free = "Successful realtime read, x86 entry binding, retained copy, sleep continuation and timex state remain unimplemented. Null-pointer routing evidence alone does not satisfy #1808."
-embed_structural = "UNRUN: retained clock-output and sleep work meters have no signed binding yet."
-embed = "UNRUN (director): original pipeline syscall census, signed pipeline reproduction and paired signed populations."
+vm_free = "Successful child clock_gettime/adjtimex/clock_adjtime routing (slice 3) remains unimplemented. Absolute CLOCK_REALTIME child sleeps read the vvar page, which host fixtures cannot map; only the conversion is unit-tested."
+kvm = "Executing x86 binding: carrick-vmm-kvm::cpl0_initial_mm::{serial_host_native_child_nanosleep_returns_zero, serial_host_native_child_zero_nanosleep_returns_zero, serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero}. Requires real KVM; the contract evaluator has no registered KVM observation layer."
+embed_structural = "UNRUN: retained clock-output work meters have no signed binding yet. Sleep does no per-tick work: one timer node per parked sleeper."
+embed = "UNRUN (director): carrick-conformance-next forkexecstorm_witness case_forkexecstorm_ready_child_at_expired_deadline under the signed recipe, original pipeline syscall census and paired signed populations."
 docker = "UNRUN: native Linux x86_64 null-pointer checks are supplementary evidence, not the declared ARM64 Docker oracle."

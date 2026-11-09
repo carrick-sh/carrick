@@ -324,3 +324,36 @@ found in this branch, and this continuation does not invent a new type.
 root production dispatch entry points as alternating discipline writers and
 readers, checking tick/status and TIME_ERROR plus EFAULT without mutation for
 an unreadable input. It covers host behavior, not native-child routing.
+
+## Sleep slice: native children sleep in ring (#1808, stacked on #1894)
+
+`nanosleep` (101) and `clock_nanosleep` (115) now route to
+`Family::Sleep` on both ISAs. `carrick_personality_linux::sleep` owns the
+Linux argument contract (flags and clock ids as the host dispatcher
+classifies them, EFAULT, EINVAL, zero interval, no `rem` for
+TIMER_ABSTIME). The native process owner serves the call only for a
+process without a host continuation (`ProcessSignals::sleeps_in_ring`):
+every fork/exec child. The run root keeps its Permanent host crossing,
+which also applies an embedder-controlled `ClockDomain`.
+
+The child parks in the member wait `rt_sigtimedwait` already uses
+(`park_signal_wait`, `PendingSignalKind::Sleep`). That reuses, rather than
+adds, the timer owner: `arm_park_timer` leases the record's timer-index
+node, which #1894 moves to the carrier deadline driver when the executor
+departs, and the signal wake channel. On resume the deadline wins first
+(0); a deliverable signal returns EINTR after the exact-MM `rem` copy;
+anything else re-parks on the same deadline.
+
+Clock domains in ring: MONOTONIC/BOOTTIME are the guest counter (the raw
+clock fast path's domain). REALTIME/TAI absolute deadlines subtract the
+caller's own vvar realtime word, the value its vDSO adds. Known divergences:
+a later `clock_settime` does not move an armed absolute REALTIME sleep, and
+a scaled, frozen or deterministic `ClockDomain` is not applied to child
+sleeps (native futex and `rt_sigtimedwait` timeouts already share that
+limit). With the vDSO disabled there is no vvar page; an absolute REALTIME
+child sleep then stays unserved (counted ENOSYS).
+
+The earlier clock-resource sleep subscription (`NativeSleep`, the
+`SleepArm`/`SleepCancel` wire operations and the host `TimerHub` thread) is
+removed: it was a second timer owner with no production caller. The clock
+record keeps its sample and timex operations for slice 3.
