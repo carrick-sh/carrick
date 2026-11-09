@@ -8009,6 +8009,78 @@ fn retained_write_owner_park_ignores_two_signals_until_release_but_kill_wakes() 
     }
 }
 
+/// #1845: a `pipe2` create retained across a held IPC lane lock parks
+/// under the same killable owner gate (the runtime's `ipc_lock_park` uses
+/// `settle_into_zone(KillableOwnerMemory)` with `RestartClass::Never`).
+/// `pipe2(2)` never fails with EINTR: a caught signal stays pending, the
+/// release completes the park, and only SIGKILL cancels it.
+#[test]
+fn retained_pipe2_lock_park_keeps_caught_signal_pending_until_release() {
+    for (case, fatal) in [(15_464, false), (15_465, true)] {
+        let (kernel, context) = bootstrap(case);
+        let generation = publish(&context, case as u64);
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
+        let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+        let capture = ContinuationCapture::new(
+            &context,
+            generation,
+            request(carrick_abi::syscall::nr::PIPE2.raw()),
+            RestartClass::Never,
+        )
+        .expect("capture pipe2");
+        let mut create = BlockedContinuation::from_killable_owner_zone_park(capture, wait);
+        let mut registration = service.prepare_registration(&create);
+        service
+            .enroll(&mut registration)
+            .expect("park retained create");
+        let token = registration.wake_token();
+        context.signal_authority().enqueue_thread_standard(
+            crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGUSR1).unwrap(),
+            None,
+        );
+        context.task().wake();
+        service.publish_signal_for_thread(context.thread().key());
+        assert!(
+            await_event_timeout(&service, token, Duration::from_millis(20)).is_none(),
+            "a caught signal must not interrupt a retained pipe2 create"
+        );
+        if fatal {
+            context.signal_authority().enqueue_thread_standard(
+                crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL).unwrap(),
+                None,
+            );
+            context.task().wake();
+            service.publish_signal_for_thread(context.thread().key());
+            let event = await_event_timeout(&service, token, Duration::from_secs(1))
+                .expect("SIGKILL must wake")
+                .expect("kill event");
+            create.attach_registration(registration).unwrap();
+            let result = create.resume(event, &context).unwrap();
+            assert_eq!(
+                result.completion,
+                ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::Carrier)
+            );
+        } else {
+            service.publish_ready(token);
+            let event = await_event_timeout(&service, token, Duration::from_secs(1))
+                .expect("lock release must wake")
+                .expect("release event");
+            create.zone_wait().unwrap().mark_consumed();
+            create.attach_registration(registration).unwrap();
+            let result = create.resume(event, &context).unwrap();
+            assert_eq!(result.completion, ContinuationCompletion::Return(0));
+            assert_eq!(result.restart(), RestartDecision::NoRestart);
+            assert!(
+                context
+                    .signal_authority()
+                    .thread_pending()
+                    .contains(carrick_abi::LINUX_SIGUSR1),
+                "the caught signal is delivered after pipe2 completes"
+            );
+        }
+    }
+}
+
 #[test]
 fn serial_host_native_owner_wait_defers_bridge_sigstop() {
     let (_kernel, context) = bootstrap(15_463);
