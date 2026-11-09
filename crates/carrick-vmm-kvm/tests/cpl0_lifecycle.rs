@@ -13,6 +13,8 @@ use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
 use carrick_x86::cpl0_lifecycle::LIFECYCLE_DATA;
 use std::path::PathBuf;
 
+const TIMESPEC: u64 = LIFECYCLE_DATA + 0x40;
+
 fn image() -> PathBuf {
     PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"))
 }
@@ -21,6 +23,11 @@ fn mov(bytes: &mut Vec<u8>, opcode: &[u8], value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 fn program(index: u64) -> Vec<u8> {
+    program_with_timeout(index, None)
+}
+/// `timeout`: seconds of a relative FUTEX_WAIT timespec the parent's join
+/// wait carries; `None` joins with no timeout.
+fn program_with_timeout(index: u64, timeout: Option<u64>) -> Vec<u8> {
     let mut p = Vec::new();
     mov(&mut p, &[0x48, 0xbb], LIFECYCLE_DATA + 0x180);
     p.extend_from_slice(&[0xf3, 0x44, 0x0f, 0x6f, 0x3b]); // parent's XMM15
@@ -35,9 +42,19 @@ fn program(index: u64) -> Vec<u8> {
     p.extend_from_slice(&0i32.to_le_bytes());
     p.extend_from_slice(&[0x48, 0x89, 0xc2]); // RDX clone result, expected tid
     mov(&mut p, &[0x48, 0xbf], LIFECYCLE_DATA + 8);
-    p.extend_from_slice(&[
-        0xbe, 128, 0, 0, 0, 0x45, 0x31, 0xd2, 0xb8, 202, 0, 0, 0, 0x0f, 0x05,
-    ]);
+    p.extend_from_slice(&[0xbe, 128, 0, 0, 0]); // ESI FUTEX_WAIT_PRIVATE
+    match timeout {
+        None => p.extend_from_slice(&[0x45, 0x31, 0xd2]), // R10 no timeout
+        Some(secs) => {
+            // The parent's own timespec {secs, 0}, outside the observed words.
+            mov(&mut p, &[0x48, 0xbb], TIMESPEC);
+            p.extend_from_slice(&[0x48, 0xc7, 0x03]); // mov qword [rbx], secs
+            p.extend_from_slice(&u32::try_from(secs).unwrap().to_le_bytes());
+            p.extend_from_slice(&[0x48, 0xc7, 0x43, 0x08, 0, 0, 0, 0]); // tv_nsec
+            mov(&mut p, &[0x49, 0xba], TIMESPEC); // R10 relative timeout
+        }
+    }
+    p.extend_from_slice(&[0xb8, 202, 0, 0, 0, 0x0f, 0x05]);
     mov(&mut p, &[0x48, 0xbb], LIFECYCLE_DATA + 0x30);
     p.extend_from_slice(&[0xf3, 0x44, 0x0f, 0x7f, 0x3b]); // resumed parent's extended context
     p.extend_from_slice(&[0x48, 0x89, 0xc7]);
@@ -120,5 +137,40 @@ fn x5_shared_clone_exit() {
             6 * births,
             6 * births
         );
+    }
+}
+
+/// #1899 / #1862: a native thread's timed futex wait is served by the shared
+/// record-owned timer lease on x86 too. The parent's join wait on the
+/// CLONE_CHILD_CLEARTID word carries a 30 s relative timeout; the child's
+/// in-ring exit wake must win the park, resume the parent with 0 (no host
+/// forward) and release the timer lease. Before x86 admitted timed waits it
+/// forwarded the whole call, which this bounded fixture has no host task for.
+#[test]
+fn x5_timed_join_wait_is_woken_in_ring_and_releases_its_timer() {
+    let a = program_with_timeout(0, Some(30));
+    let b = program_with_timeout(1, Some(30));
+    let mut carrier = Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&a, &b])
+        .expect("real CPL0 lifecycle binding");
+    for round in 0..4 {
+        for index in 0..2 {
+            let entry = carrier.stock_lifecycle(index).unwrap();
+            let observation = carrier.observe(index).unwrap_or_else(|error| {
+                panic!(
+                    "timed join wait: {error:?}; lifecycle {:?}",
+                    carrier.lifecycle_state(index)
+                )
+            });
+            let state = carrier.lifecycle_state(index).unwrap();
+            assert_eq!(state.forwards, 0, "timed futex wait must not forward");
+            assert_eq!(observation.result, 0, "the exit wake, not a timeout");
+            assert_eq!(state.wakes, round + 1);
+            assert_eq!(state.births, round + 1);
+            assert_eq!(state.retirements, round + 1);
+            assert_eq!(state.words[1], 0, "CLONE_CHILD_CLEARTID cleared");
+            assert_eq!(state.words[2], 0xf500 + index as u64);
+            assert_eq!(state.timer_nodes, 0, "the woken park's timer lease");
+            carrier.reap_lifecycle(index, entry).unwrap();
+        }
     }
 }
