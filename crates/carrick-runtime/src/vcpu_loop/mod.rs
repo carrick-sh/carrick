@@ -2939,6 +2939,10 @@ mod cow_refault_watch_tests {
 }
 
 #[cfg(test)]
+#[path = "ipc_lock_park_tests.rs"]
+mod ipc_lock_park_tests;
+
+#[cfg(test)]
 #[allow(dead_code)]
 #[path = "../../../carrick-vmm-hvf/src/trap/code_content.rs"]
 mod code_content_test;

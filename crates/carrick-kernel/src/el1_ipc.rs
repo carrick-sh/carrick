@@ -958,11 +958,16 @@ impl HostIpc {
     /// BEFORE its record returns to the free list (a recycled index must
     /// never meet a lane still bound to this incarnation), then free it.
     ///
-    /// Runs only once no guest operation or execution lease retains the
-    /// create (failure, test helper, or a dropped continuation), so it keeps
-    /// the short-section [`HostLockWait`]: a lane or object lock holder is a
-    /// host thread in a short section or an EL1 vCPU its executor resumes to
-    /// completion, and a rollback that refused would leak the object.
+    /// Runs when the create fails, from the test helper, when a parked
+    /// continuation is dropped (terminal cancellation), and on the resumed
+    /// `pipe2` dispatcher when its `pipefd` output is owner-refused. In the
+    /// last case the executor still runs it, but holds no output permit, no
+    /// descriptor and no IPC lock: each lane bind released its lock before
+    /// returning. It keeps the short-section [`HostLockWait`]: a lane or
+    /// object lock holder is a host thread in a short section or an EL1 vCPU
+    /// its executor resumes to completion, and a rollback that refused would
+    /// leak the object (witness: `carrick-runtime`
+    /// `serial_host_pipe2_lane_resume_output_refusal_rolls_back_and_reruns_once`).
     fn rollback_unpublished_pipe(
         &self,
         zone: Option<&carrick_el1_abi::ZoneTables>,

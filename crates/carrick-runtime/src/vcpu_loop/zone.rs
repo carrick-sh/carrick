@@ -72,25 +72,12 @@ mod owner_copyout_policy_tests {
     /// cancellation ends it.
     #[test]
     fn ipc_lock_wait_is_killable_only_not_ordinary_signal_interruptible() {
-        let policy = |resume: &OwnedSyscallResume| ZoneWaitPolicy::for_owner_resume(resume);
+        // A real create retained across another party's held lane lock.
+        let pending = super::super::ipc_lock_park_tests::contended_pipe2();
         assert!(matches!(
-            policy(&OwnedSyscallResume::CopyoutRedispatch),
+            ZoneWaitPolicy::for_owner_resume(&OwnedSyscallResume::IpcLock(pending)),
             ZoneWaitPolicy::KillableOwnerMemory
         ));
-        // Exhaustive: a new resume arm must choose its policy here.
-        let _ = |resume: OwnedSyscallResume| match resume {
-            OwnedSyscallResume::IpcLock(pending) => {
-                assert!(matches!(
-                    ZoneWaitPolicy::for_owner_resume(&OwnedSyscallResume::IpcLock(pending)),
-                    ZoneWaitPolicy::KillableOwnerMemory
-                ));
-            }
-            OwnedSyscallResume::Output(_)
-            | OwnedSyscallResume::CopyoutRedispatch
-            | OwnedSyscallResume::Ipc(_)
-            | OwnedSyscallResume::Io(_)
-            | OwnedSyscallResume::Sleep(_) => {}
-        };
     }
 
     #[test]
