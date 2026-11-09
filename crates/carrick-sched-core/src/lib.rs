@@ -1705,6 +1705,105 @@ impl WakeEffects {
     }
 }
 
+/// The waker's own run queue as it was before a wake, read before the
+/// bucket lock: whether a thread the wake queues there starts the
+/// queue's wait ([`ZoneSlot::queued_since`]).
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum WakerQueue {
+    /// It was empty: a thread queued on it starts the wait now.
+    WasEmpty,
+    /// It already held a thread, whose wait keeps its stamp.
+    WasOccupied,
+    /// Not read (an object-wait completion): a thread queued on it
+    /// restamps the wait.
+    Unobserved,
+}
+
+impl WakerQueue {
+    /// Read `slot`'s run queue before the wake.
+    pub fn observe<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        zone: &ZoneTables<C>,
+        slot: SlotId,
+    ) -> Self {
+        if zone.slot(slot).queued() == 0 {
+            Self::WasEmpty
+        } else {
+            Self::WasOccupied
+        }
+    }
+
+    fn stamps(self) -> bool {
+        !matches!(self, Self::WasOccupied)
+    }
+}
+
+/// The ISA mechanics a waker's CPU lends [`WakeEffects::apply`]. Everything
+/// else about consuming a wake's effects is shared by every ISA.
+pub trait WakeMechanics {
+    /// Send `slot` a reschedule kick. `false` when the slot has no route
+    /// published yet (an ARM slot whose SGI target is still 0), so nothing
+    /// was sent.
+    fn send_resched(&mut self, slot: SlotId) -> bool;
+    /// The waker CPU's counter now, the start of its run queue's wait.
+    fn queue_tick(&self) -> u64;
+    /// The waker's own run queue gained a thread: arm the deadline that
+    /// makes the waker give way to it.
+    fn arm_slice_timer(&mut self);
+    /// Ring the waker's pending-host-work doorbell: it owes the host a
+    /// boundary ([`WakeEffects::owes_host_boundary`]).
+    fn mark_pending_host_work(&mut self);
+}
+
+impl WakeEffects {
+    /// Send the reschedule kicks a wake owes other slots, counting each one
+    /// sent in [`ZoneCounters::el1_sgis`].
+    pub fn send_kicks<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        &self,
+        zone: &ZoneTables<C>,
+        mechanics: &mut impl WakeMechanics,
+    ) {
+        for slot in self.sgi_slots() {
+            if mechanics.send_resched(slot) {
+                zone.counters.el1_sgis.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Consume a finished wake's effects on the waker's slot `waker`, after
+    /// it released the bucket lock: kick the slots owed a reschedule, start
+    /// the wait of a run queue that gained its first thread
+    /// ([`WakerQueue`]), owe the host its boundary for a misplaced or
+    /// host-handed waiter, and arm the slice for a thread queued here. The
+    /// one consumer every ISA's EL1/CPL0 waker uses (#1941).
+    pub fn apply<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        &self,
+        zone: &ZoneTables<C>,
+        waker: SlotId,
+        before: WakerQueue,
+        mechanics: &mut impl WakeMechanics,
+    ) {
+        self.send_kicks(zone, mechanics);
+        if self.queued_own && before.stamps() {
+            zone.note_queued_since(waker, mechanics.queue_tick());
+        }
+        if self.owes_host_boundary() {
+            // A woken thread sits here but may not run here, or a waitv
+            // waiter is on the completion chain: the exit this causes hands
+            // it to the host, which places or resumes it.
+            mechanics.mark_pending_host_work();
+        }
+        if self.queued_own {
+            mechanics.arm_slice_timer();
+        }
+    }
+}
+
 /// A thread EL1 switched in on its slot ([`ZoneTables::switch_in`]).
 #[derive(
     ::core::clone::Clone,

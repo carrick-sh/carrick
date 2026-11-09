@@ -363,6 +363,32 @@ Witnesses:
   `el1_hands_a_multi_entry_waiter_to_its_host_continuation` and
   `unplaceable_parent_is_woken_once_in_ring`.
 
+A wake's placement reports what the waker still owes in `WakeEffects`:
+reschedule kicks for busy slots that took a waiter, a queue stamp and slice
+for a thread queued on its own slot, and a host boundary for a misplaced or
+host-handed waiter. One ISA-neutral applier, `WakeEffects::apply` in
+`carrick-sched-core`, consumes them for every waker. ISAs lend only their
+mechanics through `WakeMechanics`. ARM's `Sched` lends an SGI by the slot's
+target, the virtual counter, its slice timer and the task's host-work
+doorbell. The x86 CPL0 lifecycle lane's `NativeLane` lends a reschedule IPI
+by the slot's APIC route, the TSC and the same doorbell. x86 CPL0 has no
+run-queue slice timer, so a thread queued on the waker's own slot gets a
+reschedule kick to that slot, as the production process owner already does.
+ARM's `Sched::wake_word`, `Sched::finish_object_wake`, x86
+`NativeLane::wake_word` and the lane's child-exit `CHILD_WAIT_KEY` wake all
+call it. The x86 lane used to drop its effects: a waiter queued on a busy
+slot was never kicked, and a misplaced waiter owed the host nothing.
+
+x86 witnesses (host tests of `PendingFamilies::futex` for `NativeLane`, red
+on PR head `adb6aec667`):
+
+- `native_futex_wake_queues_a_waiter_pinned_to_a_busy_cpu_in_ring`: the wake
+  completes in ring, queues the waiter on its busy slot and sends one kick
+  (`el1_sgis`, was 0).
+- `native_futex_wake_of_a_waiter_on_a_stopped_cpu_owes_a_host_boundary`: the
+  waiter's only CPU is stopped; it is queued misplaced on the waker's slot
+  and the waker has pending host work (was false).
+
 The lifecycle wait-channel wake crossing (`cross_wait_channel_wake`, HVC
 `GRANT_OP_WAIT_CHANNEL_WAKE`) has no guest caller left; retiring its host
 handler is follow-up work. The signed end-to-end check (the two-process test
