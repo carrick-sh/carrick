@@ -1340,6 +1340,7 @@ surfaces = [
   { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.wait.process-group" },
   { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.x86.file-region" },
   { path = "crates/carrick-x86-cpl0/src/native_process/user_copy.rs", contract = "kernel.native.entropy" },
+  { path = "crates/carrick-x86-cpl0/src/native_stage.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-x86-cpl0/src/process.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-x86-cpl0/src/process.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-x86-cpl0/tests/file_region.rs", contract = "kernel.native.entropy" },
