@@ -238,33 +238,41 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefi
                 let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
                 // The shipping decision body: stage the write, take the
                 // owner-fault path for the unmapped page, retain the prefix.
-                let super::super::dispatch::NativeServiceDecision::Begin(begin) =
-                    super::super::dispatch::native_service_decision(
-                        &mut stage_frame,
-                        task,
-                        carrick_el1_abi::Action::Forward,
-                        None,
-                        counters,
-                        || super::super::native_process_runtime::NativeThreadGroupOwner::ForkChild,
-                        |frame| {
-                            super::super::dispatch::native_host_file_stage(
-                                frame,
-                                task,
-                                &ReadableBelow(prefix_unmapped),
-                                [5, 1, 0],
-                                carrick_core_abi::service::ServiceOrigin::Descendant,
-                                |fd| {
-                                    assert_eq!(fd, 1);
-                                    Some(NativeDescriptor::HostBacked {
-                                        access: DescriptionAccess::WriteOnly,
-                                    })
-                                },
-                                &mut |_| panic!("a write releases no mapping sources"),
-                            )
-                        },
-                    )
-                else {
-                    panic!("an unmapped write tail must publish an owner-fault request");
+                let decision = super::super::dispatch::native_service_decision(
+                    &mut stage_frame,
+                    task,
+                    carrick_el1_abi::Action::Forward,
+                    None,
+                    counters,
+                    || super::super::native_process_runtime::NativeThreadGroupOwner::ForkChild,
+                    |frame| {
+                        super::super::dispatch::native_host_file_stage(
+                            frame,
+                            task,
+                            &ReadableBelow(prefix_unmapped),
+                            [5, 1, 0],
+                            carrick_core_abi::service::ServiceOrigin::Descendant,
+                            |fd| {
+                                assert_eq!(fd, 1);
+                                Some(NativeDescriptor::HostBacked {
+                                    access: DescriptionAccess::WriteOnly,
+                                })
+                            },
+                            &mut |_| panic!("a write releases no mapping sources"),
+                        )
+                    },
+                );
+                let begin = match decision {
+                    super::super::dispatch::NativeServiceDecision::Begin(begin) => begin,
+                    super::super::dispatch::NativeServiceDecision::Reply(result) => {
+                        panic!("the ring answered {result} instead of publishing a fault request")
+                    }
+                    super::super::dispatch::NativeServiceDecision::Action(action) => {
+                        panic!("the ring finished with {action:?} instead of a fault request")
+                    }
+                    super::super::dispatch::NativeServiceDecision::Decline => {
+                        panic!("an unmapped write tail must publish an owner-fault request")
+                    }
                 };
                 // Begins and settles the request exactly as the bare-metal
                 // wrapper's process-entry closure does.

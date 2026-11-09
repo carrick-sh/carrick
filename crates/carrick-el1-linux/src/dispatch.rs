@@ -1446,7 +1446,7 @@ pub(super) fn native_service_decision(
             }
         }
         NativeServiceStage::Operation => {
-            match native_unstaged_exit(frame, &task.linux, action, || owner(), counters) {
+            match native_unstaged_exit(frame, &task.linux, action, owner, counters) {
                 NativeUnstagedExit::Refused(refused) => {
                     return NativeServiceDecision::Action(refused);
                 }
@@ -1472,6 +1472,9 @@ pub(super) fn native_service_decision(
 /// `service_counters` outlives every continuation of the request.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[inline(never)]
+// The request stays boxed from staging to here: the exit chain's EL1 stack
+// frames are budgeted (see frame_budget.rs), so it is never moved by value.
+#[allow(clippy::boxed_local)]
 pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>(
     process: &mut super::native_process_runtime::NativeProcessEntry<
         '_,
