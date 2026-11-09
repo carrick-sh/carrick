@@ -49,12 +49,24 @@ fn serial_host_native_fork_exec_child_readlink_exe() {
 
 #[test]
 fn serial_host_native_readlink_copyout_busy_once_then_success() {
-    fork_exec_probe_copy(None, u32::MAX as u64, None, true, Some(NativeProcessError::Busy));
+    fork_exec_probe_copy(
+        None,
+        u32::MAX as u64,
+        None,
+        true,
+        Some(NativeProcessError::Busy),
+    );
 }
 
 #[test]
 fn serial_host_native_readlink_copyout_fault_returns_errno_14() {
-    fork_exec_probe_copy(None, u32::MAX as u64, None, true, Some(NativeProcessError::Fault));
+    fork_exec_probe_copy(
+        None,
+        u32::MAX as u64,
+        None,
+        true,
+        Some(NativeProcessError::Fault),
+    );
 }
 
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
