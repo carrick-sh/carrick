@@ -6528,6 +6528,38 @@ fn leader_sees_thread(
         .unwrap()
 }
 
+/// The tgkill-after-clone fixture's peer probes a nonleader tid with kill(2).
+/// Linux accepts that tid even though it is not a process group leader.
+#[test]
+fn arm_kill_probe_resolves_a_live_nonleader_tid() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let control = host_born_sibling(fixture, 42);
+    // Adopt the host-issued sibling through its real first syscall entry.
+    let mut first = carrick_el1_abi::TrapFrame::default();
+    first.x[8] = 178;
+    arm_call(fixture, control, &mut service, &mut first).unwrap();
+    assert_eq!(first.x[0], 42);
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    assert!(leader_sees_thread(fixture, &mut service, 42));
+    let mut probe = carrick_el1_abi::TrapFrame::default();
+    probe.x[8] = 129; // kill(nonleader_tid, 0)
+    probe.x[0] = 42;
+    arm_call(fixture, fixture.control, &mut service, &mut probe).unwrap();
+    assert_eq!(
+        probe.x[0] as i64, 0,
+        "kill must resolve a live nonleader tid"
+    );
+}
+
 #[test]
 fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
