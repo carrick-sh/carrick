@@ -1,0 +1,15 @@
+schema = "carrick.conformance-exemption.v1"
+base = "cfad80dc1df50ebffc4c8227965112dca8f78029"
+head = "6e59dac9a81d9beb71cd4cc5d75cb156b90aaf66"
+contracts = [
+  "kernel.el1.ipc-two-process",
+  "kernel.el1.thread-lifecycle",
+  "kernel.x86.file-region",
+  "x86.cpuid.v3",
+  "x86.mm.initial-image",
+  "x86.vmx.segment-entry",
+]
+paths = [
+  "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
+]
+rationale = "The diff in crates/carrick-vmm-kvm/src/cpl0_boot.rs only adds #[cfg(feature = \"test-fixtures\")] to FixtureReadinessLaneHold, its impls and Cpl0Carrier::fixture_hold_ipc_readiness_lanes, a test-only host-thread fixture (#1991). Production builds drop that code and no cpl0_boot.rs boot, CPUID, segment-entry, memory-image or IPC path changes; guest-visible behaviour and work units are unchanged. cargo tree -e normal,build,features shows no test-fixtures in the production graph; cpl0_initial_mm (46 passed) and cpl0_entry (58 passed) run under CARRICK_REQUIRE_KVM=1 at the reviewed head, which still enables the fixture via the self dev-dependency."
