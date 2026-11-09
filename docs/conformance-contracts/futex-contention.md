@@ -494,11 +494,23 @@ x86 production owner guard (real KVM production image,
 child's exit wake on CPU 1 reaches `Service::wake_effects` while the host
 holds the parent's home queue, so the parent is queued misplaced on slot 1
 and the waker leaves at the WORK doorbell with its doorbell rung. It is not
-red before the migration: the exit path rings that doorbell itself. No
-guest-driven production path today shows the old owner's missing doorbell:
-x86 slots never leave the guest, so a home slot always takes its waiter
-unless its queue lock is busy, and the production root's `FUTEX_WAIT` is
-ENOSYS, so no in-ring futex park exists for a signal to interrupt.
+red before the migration: `begin_closing` rings that doorbell itself. It
+remains a refactor guard, not evidence for the added host-work marking.
+
+`native_kill_wake_to_a_busy_home_marks_fresh_host_work` supplies the non-exit
+production-entry witness. The parent blocks SIGWINCH, forks a live child,
+and enrolls its real `wait4` continuation. With CPU 0's home queue locked,
+the child on CPU 1 calls native `kill(parent, SIGWINCH)`. The blocked signal
+cannot interrupt a futex or cancel a service; kill nevertheless publishes
+the parent's process channel through `Service::wake_effects`. The test reads
+and asserts a clear sender doorbell before the call, then requires exactly
+one channel wake, one misplaced placement on slot 1, fresh pending host work,
+and the WORK boundary. Neither process exits, and no genuine debt is cleared.
+The witness fails on pre-migration `725967082` at the fresh host-work
+assertion, after the wake and misplaced placement assertions pass; the
+shared applier passes it. It reuses the existing KVM production factory,
+wait-enrollment observer, queue-lock fixture and read-only debt snapshot;
+it adds no production owner, queue or wake mechanism.
 
 The lifecycle wait-channel wake crossing (`cross_wait_channel_wake`, HVC
 `GRANT_OP_WAIT_CHANNEL_WAKE`) has no guest caller left; retiring its host
