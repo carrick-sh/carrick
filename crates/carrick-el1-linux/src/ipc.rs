@@ -76,7 +76,7 @@ mod execution;
 pub use execution::IpcExecution;
 
 /// One Linux syscall argument word from the shared frame.
-fn arg(frame: &impl GuestDispatchFrame, index: usize) -> u64 {
+fn argument_word(frame: &impl GuestDispatchFrame, index: usize) -> u64 {
     frame.argument(index).unwrap_or_else(|| {
         crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
     })
@@ -990,7 +990,7 @@ fn admit<E: IpcExecution, M: UserCopy>(
         return refuse(sched, IpcLeave::NoTable);
     };
     let table = TableId::from_raw(table);
-    let fd = Fd(arg(frame, 0) as i32);
+    let fd = Fd(argument_word(frame, 0) as i32);
     let reading = ordinal(frame) == SYS_READ;
     let fda = region.fd(EL1_WAIT);
     // A snapshot first (no retention): host-backed descriptions are never
@@ -1006,8 +1006,8 @@ fn admit<E: IpcExecution, M: UserCopy>(
         pin,
         task: task_key(task),
         mm: mm_key(task),
-        buf: IpcUserVa(arg(frame, 1)),
-        orig_x0: arg(frame, 0),
+        buf: IpcUserVa(argument_word(frame, 1)),
+        orig_x0: argument_word(frame, 0),
         nr: frame.native_number().raw() as u32,
         ..IpcOperation::EMPTY
     };
@@ -1054,14 +1054,17 @@ fn admit<E: IpcExecution, M: UserCopy>(
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Forward;
     }
-    if vectored && permitted && arg(frame, 2) > carrick_el1_abi::ipc::IPC_MAX_IOVECS as u64 {
+    if vectored
+        && permitted
+        && argument_word(frame, 2) > carrick_el1_abi::ipc::IPC_MAX_IOVECS as u64
+    {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Immediate(linux::EINVAL);
     }
     let count = if vectored {
         1
     } else {
-        arg(frame, 2).min(linux::MAX_RW_COUNT)
+        argument_word(frame, 2).min(linux::MAX_RW_COUNT)
     };
     let eventfd = matches!(kind, IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite);
     let immediate = if !permitted {
@@ -1080,7 +1083,7 @@ fn admit<E: IpcExecution, M: UserCopy>(
     // eventfd(2): a write copies its value once, before it can block.
     let mut value = [0u8; linux::EVENTFD_WORD as usize];
     if kind == IpcOpKind::EventFdWrite
-        && PrefixCopy::new(user).copy_in(&mut value, arg(frame, 1)) != value.len()
+        && PrefixCopy::new(user).copy_in(&mut value, argument_word(frame, 1)) != value.len()
     {
         // No effect yet: retain preparable input through the owner, or
         // complete a genuine bad address through explicit fault admission.
@@ -1096,17 +1099,19 @@ fn admit<E: IpcExecution, M: UserCopy>(
         Ok(token) => {
             if vectored {
                 let mut header_copy_refused = false;
-                let imported =
-                    region.import_vectors(&token, arg(frame, 2) as usize, |index, header| {
-                        let copied =
-                            arg(frame, 1)
-                                .checked_add(index as u64 * 16)
-                                .is_some_and(|address| {
-                                    PrefixCopy::new(user).copy_in(header, address) == header.len()
-                                });
+                let imported = region.import_vectors(
+                    &token,
+                    argument_word(frame, 2) as usize,
+                    |index, header| {
+                        let copied = argument_word(frame, 1)
+                            .checked_add(index as u64 * 16)
+                            .is_some_and(|address| {
+                                PrefixCopy::new(user).copy_in(header, address) == header.len()
+                            });
                         header_copy_refused |= !copied;
                         copied
-                    });
+                    },
+                );
                 let total = match imported {
                     Ok(total) => total.min(linux::MAX_RW_COUNT),
                     Err(error) => {
@@ -2031,7 +2036,7 @@ fn handback<E: IpcExecution>(
     op.result = result;
     if op.nr == 0 {
         // A resumed operation: the re-executed SVC carries its registers.
-        op.orig_x0 = arg(frame, 0);
+        op.orig_x0 = argument_word(frame, 0);
         op.nr = frame.native_number().raw() as u32;
     }
     let _ = venue.region.update_operation(&token, op);
