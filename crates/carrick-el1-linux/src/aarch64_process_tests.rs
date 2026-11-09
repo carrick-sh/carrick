@@ -11387,7 +11387,8 @@ fn native_descriptor_witness(
         let sigmask_leaves =
             || counters.ipc_leaves[IpcLeave::EpollSigmask as usize].load(Ordering::Relaxed);
         let sigprof = 1u64 << (27 - 1);
-        let mask = carrick_test_support::GuestUserBuffer::from_bytes(&sigprof.to_le_bytes());
+        let mut mask = carrick_test_support::GuestUserBuffer::from_bytes(&sigprof.to_le_bytes());
+        let mask_arg = mask.arg();
         let cookie = 0x1671_0000_0000_0001u64;
         let mut interest = [0u8; 16];
         interest[..4].copy_from_slice(&carrick_abi::LINUX_EPOLLIN.to_ne_bytes());
@@ -11436,7 +11437,7 @@ fn native_descriptor_witness(
             in_ring(run_binding6(
                 waiter,
                 pwait,
-                [6, events.arg(), 1, forever, mask.arg(), 4]
+                [6, events.arg(), 1, forever, mask_arg, 4]
             )),
             -22
         );
@@ -11445,7 +11446,7 @@ fn native_descriptor_witness(
             in_ring(run_binding6(
                 waiter,
                 pwait,
-                [6, events.arg(), 1, 0, mask.arg(), 8]
+                [6, events.arg(), 1, 0, mask_arg, 8]
             )),
             0
         );
@@ -11454,7 +11455,7 @@ fn native_descriptor_witness(
 
         // Nothing ready, no timeout: the wait parks in ring under the mask.
         task.linux.mark_pending_host_work();
-        let (route, _) = run_binding6(waiter, pwait, [6, events.arg(), 1, forever, mask.arg(), 8]);
+        let (route, _) = run_binding6(waiter, pwait, [6, events.arg(), 1, forever, mask_arg, 8]);
         assert_eq!(
             route,
             CompletionRoute::Suspended,
@@ -11466,6 +11467,48 @@ fn native_descriptor_witness(
         assert_eq!(sigmask_leaves(), 0);
         assert!(waiter_control.forwarded_wait_mask_armed());
         assert_eq!(waiter_control.blocked().0, sigprof);
+
+        // Wake then drain before re-entry: first preserve the user buffer as
+        // a control, then overwrite it while the original call is parked.
+        for overwrite in [false, true] {
+            if overwrite {
+                mask.as_mut_bytes().fill(0);
+            }
+            activate_target(source, &task, writer);
+            let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"peer");
+            let drained = carrick_test_support::GuestUserBuffer::zeroed(4);
+            assert_eq!(
+                in_ring(run_binding(
+                    writer,
+                    sys::WRITE.raw(),
+                    [4, payload.arg(), 4, 0]
+                )),
+                4
+            );
+            assert_eq!(
+                in_ring(run_binding(
+                    writer,
+                    sys::READ.raw(),
+                    [3, drained.arg(), 4, 0]
+                )),
+                4
+            );
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, writer.record.id)
+                    .is_queued()
+            );
+            activate_target(source, &task, waiter);
+            task.linux.mark_pending_host_work();
+            let (route, _) =
+                run_binding6(waiter, pwait, [6, events.arg(), 1, forever, mask_arg, 8]);
+            assert_eq!(route, CompletionRoute::Suspended);
+            assert_eq!(waiter_control.blocked().0, sigprof);
+            assert!(waiter_control.forwarded_wait_mask_armed());
+        }
+        // The accepted snapshot also survives an unreadable original buffer.
+        drop(mask);
 
         // The peer task makes the member readable; the waiter re-enters the
         // same call, harvests the event and has its own mask back.
@@ -11490,7 +11533,7 @@ fn native_descriptor_witness(
             in_ring(run_binding6(
                 waiter,
                 pwait,
-                [6, events.arg(), 1, forever, mask.arg(), 8]
+                [6, events.arg(), 1, forever, mask_arg, 8]
             )),
             1
         );
