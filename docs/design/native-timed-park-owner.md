@@ -167,8 +167,10 @@ Implemented by #1836 on this owner. A native child's sleep is the
 `PendingSignalKind::Sleep`, leases its record's timer node through
 `arm_park_timer`, and therefore uses this note's departure transfer and
 carrier deadline driver unchanged. The scalar timeout result is 0; the
-resumed owner re-checks the deadline, then a deliverable signal (EINTR with
-the exact-MM `rem` copy), then re-parks. The clock-resource sleep
+resumed owner runs the sleep's own complete decision (`sleep_until`): the
+deadline, then a deliverable signal (EINTR, with `rem` written as a retained
+`OwnedCopyout`), then a re-park on the same deadline. It never reaches the
+`rt_sigtimedwait` result path. The clock-resource sleep
 subscription and its host worker were removed, so one owner serves every
 native timed park. `crossing.rs` keeps nanosleep/clock_nanosleep as
 Permanent crossings for the run root only; children never reach them.
