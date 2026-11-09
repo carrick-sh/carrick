@@ -97,6 +97,11 @@ pub(super) fn release_injected_edit_wait(
     if crate::test_support::defer_release_to_peer(source.slot) {
         return;
     }
+    // Either physical scheduler can arrive here. The synthetic holder may
+    // release only after the actual waiter has published its park.
+    if !crate::test_support::take_edit_park() {
+        return;
+    }
     let cause = if carrick_core::mm::reservation::release_injected_root_busy() {
         Some(SpaceWaitCause::Reservations)
     } else if carrick_sched_core::spaces::release_injected_editor_busy() {
@@ -371,6 +376,8 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         );
         match outcome {
             EditWaitOutcome::Parked(mut parked) => {
+                #[cfg(feature = "test-support")]
+                crate::test_support::publish_edit_park();
                 self.handoff = parked.take_receipt();
                 Some(FamilyCompletion::AccountedSuspended)
             }
