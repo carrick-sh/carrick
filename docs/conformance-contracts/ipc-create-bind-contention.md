@@ -69,8 +69,34 @@ validated arguments, pipe id and pending create.
   short-section wait.
 - Pipe `read`/`write` (`dispatch/fs/pipe.rs`) and the host handback route's
   lazy lane bind (`continuation::ipc::lane_snapshots`) are the next slice.
-- x86/CPL0 have no host zone (`el1_zone::zone()` is `None` off HVF): their
-  `pipe2` binds no lanes and never meets this outcome (seam #1059).
+- The in-ring constructor (`carrick-el1-linux` `dispatch.rs`, the `PIPE2`
+  arm) is shared by ARM native processes and every x86 task. It still waits
+  on the descriptor-table and object data locks with `NativeFdWait`, a spin,
+  on both ISAs. On ARM it also binds the new pipe's lanes in EL1 with
+  `ShortLockSpin`. Converting those in-ring waits is the data-lock slice.
+
+## x86
+
+x86 `pipe2` never meets the lock this slice converts. On the production CPL0
+lane every task is a native process with the ring IPC venue published, so
+`pipe2` is served in ring by the shared constructor, never by the host
+dispatcher's `pipe2_create`. The x86 native dispatch supplies no scheduler
+zone (`carrick-x86-cpl0` `linux_personality.rs`, `zone: None`), so that
+constructor binds no readiness lane on x86. The host side has no zone on KVM
+either: only the HVF pool start calls `el1_zone::enable`, so a host `pipe2`
+there would bind nothing and could not return `IpcLockContended`.
+
+Witness, real KVM through the production CPL0 pool:
+`carrick-vmm-kvm::cpl0_initial_mm::native_pipe2_takes_no_readiness_lane_lock_held_by_a_previous_incarnation`.
+A live host thread binds and holds both readiness-lane queue locks of the
+recycled slot's previous incarnation in the production native zone for the
+whole run. The guest's `pipe2` pops that slot (checked by the next host
+create landing on the same index two incarnations on) and returns (3, 4)
+without waiting for the holder. It goes red, with the holder giving up at
+its 20 s bound, when x86 is made to bind the new pipe's lanes with a spin.
+When x86 gains in-ring lane binding (with its blocking read and write,
+#1756 and #1059), that binding must retain the operation as ARM's does, and
+this witness becomes its Busy-once-then-success case.
 
 ## Witnesses
 

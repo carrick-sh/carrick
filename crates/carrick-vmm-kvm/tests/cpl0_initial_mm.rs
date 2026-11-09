@@ -225,6 +225,74 @@ fn native_child_entropy_witness(test: &str, flags: &[&str]) {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// #1845 single-lane check for x86 `pipe2`. The production CPL0 lane serves
+/// a native `pipe2` in ring, through the shared constructor in
+/// `carrick-el1-linux`, and that constructor binds no readiness lane on x86
+/// (the native dispatch has no scheduler zone). So the readiness-lane lock
+/// whose contention #1952 turns into a retained host create is never taken
+/// by x86 `pipe2`: a live host party of the recycled slot's previous
+/// incarnation holds both of its lanes in the production native zone for
+/// the whole run, and `pipe2` still returns the pair (3, 4) on the popped
+/// slot without waiting for it. Write/read on that pair is #1756.
+#[test]
+fn native_pipe2_takes_no_readiness_lane_lock_held_by_a_previous_incarnation() {
+    use carrick_el1_abi::ipc::{IpcBacking, pipe::End};
+    const HOLD_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+    let elf = native_exit_fixture("native_pipe2.S");
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let owner = dispatcher
+        .capture_one_task_context()
+        .expect("issued root")
+        .kernel()
+        .ipc()
+        .expect("IPC owner");
+    // Free one pipe so the guest's create pops its slot (LIFO) as the next
+    // incarnation, exactly as a released pipe's slot is recycled.
+    let old = owner.create_pipe(65536).expect("previous incarnation");
+    for end in [End::Reader, End::Writer] {
+        owner
+            .release(IpcBacking::Pipe { object: old, end }.encode())
+            .expect("release previous incarnation");
+    }
+    let hold = std::sync::Mutex::new(None);
+    let started = std::time::Instant::now();
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        128,
+        ROOT_AFFINITY_LOADED,
+        |carrier| {
+            *hold.lock().unwrap() = Some(
+                carrier
+                    .fixture_hold_ipc_readiness_lanes(old, HOLD_BOUND)
+                    .expect("hold both lanes of the previous incarnation"),
+            );
+        },
+        dispatcher,
+    )
+    .map_err(|failure| failure.error)
+    .expect("native pipe2 run");
+    let elapsed = started.elapsed();
+    let hold = hold.lock().unwrap().take().expect("holder started");
+    assert!(
+        hold.release(),
+        "the holder gave up at its {HOLD_BOUND:?} bound before pipe2 returned \
+         (run took {elapsed:?}): x86 pipe2 waited on a held readiness-lane lock"
+    );
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "pipe2 fixture status (38 is ENOSYS, 90 a pair other than (3, 4))"
+    );
+    // The guest's pipe popped the recycled slot: closing both ends freed it
+    // again, so the next create pops the same index two incarnations on.
+    let next = owner.create_pipe(65536).expect("next incarnation");
+    assert_eq!(
+        (next.index(), next.generation()),
+        (old.index(), old.generation().wrapping_add(2)),
+        "the guest's pipe2 used the recycled slot whose lanes were held"
+    );
+}
+
 fn native_exit_fixture(name: &str) -> Vec<u8> {
     native_exit_fixture_with_flags(name, &[])
 }

@@ -289,6 +289,37 @@ pub struct Cpl0Carrier {
     pub(crate) custody: KvmBootstrapCustody,
 }
 
+/// A live holder of two production-zone readiness-lane locks, from
+/// [`Cpl0Carrier::fixture_hold_ipc_readiness_lanes`]. Dropping it releases.
+pub struct FixtureReadinessLaneHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<bool>>,
+}
+
+impl FixtureReadinessLaneHold {
+    /// Release both locks. `true` when this request released them, `false`
+    /// when the holder had already given up at its bound.
+    pub fn release(mut self) -> bool {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        self.thread
+            .take()
+            .is_some_and(|thread| thread.join().unwrap_or(false))
+    }
+}
+
+impl Drop for FixtureReadinessLaneHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl Cpl0Carrier {
     fn initial_mm_key(&self) -> u64 {
         self.custody
@@ -2677,6 +2708,72 @@ impl Cpl0Carrier {
         let table: &ShootdownTable = self.metadata(SHOOTDOWN_OFFSET);
         table.members[index].publish(root, 1, 1);
         Ok(())
+    }
+
+    /// A live host party of `object`'s previous incarnation: it binds both
+    /// readiness lanes of `object` in the production native zone, then holds
+    /// their real queue locks on its own thread until told to release, or
+    /// until `bound`. The hold retains the carrier RAM, so it may outlive a
+    /// run that consumed this carrier.
+    pub fn fixture_hold_ipc_readiness_lanes(
+        &self,
+        object: carrick_el1_abi::ipc::IpcObjectHandle,
+        bound: Duration,
+    ) -> Result<FixtureReadinessLaneHold, TrapError> {
+        use carrick_el1_abi::ipc::{object_wait_key, pipe::WaitFor};
+        let keys = [WaitFor::Readable, WaitFor::Writable]
+            .map(|lane| object_wait_key(object, lane).ok_or_else(|| fail("IPC lane key")));
+        let [readable, writable] = keys;
+        let keys = [readable?, writable?];
+        let ram = Arc::clone(self.custody.ram());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let complete = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_sched_core::ParkedContextWords,
+            >| {
+                let _ = owned.into_parts();
+            };
+            let Some(zone) = ram.host_ptr(
+                PRODUCTION_METADATA_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            ) else {
+                let _ = held_tx.send(Err("production zone backing"));
+                return false;
+            };
+            // SAFETY: boot initialized the aligned production zone in this
+            // retained window, and `ram` keeps it mapped; every access is
+            // through the zone's own atomic lock protocol.
+            let zone = unsafe { &*zone.cast::<X86Cpl0Zone>() };
+            let spin = carrick_sched_core::BoundedSpin(1 << 20);
+            let mut guards = Vec::new();
+            for key in keys {
+                if zone.bind_object_wait(key, &spin, &complete).is_err() {
+                    let _ = held_tx.send(Err("bind previous incarnation lane"));
+                    return false;
+                }
+                match zone.object_wait(key, &spin, &complete) {
+                    Ok(guard) => guards.push(guard),
+                    Err(_) => {
+                        let _ = held_tx.send(Err("hold previous incarnation lane"));
+                        return false;
+                    }
+                }
+            }
+            let _ = held_tx.send(Ok(()));
+            let requested = release_rx.recv_timeout(bound).is_ok();
+            drop(guards);
+            requested
+        });
+        match held_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => Ok(FixtureReadinessLaneHold {
+                release: Some(release),
+                thread: Some(thread),
+            }),
+            Ok(Err(reason)) => Err(fail(reason)),
+            Err(_) => Err(fail("readiness lane holder did not report")),
+        }
     }
 
     /// Stage an exact byte in a stopped fixture's retained backing.

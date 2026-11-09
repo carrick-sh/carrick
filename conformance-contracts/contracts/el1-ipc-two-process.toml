@@ -20,6 +20,7 @@ guest_surfaces = [
   "syscall:epoll_pwait",
   "kernel:continuation",
   "vmm:hvf",
+  "vmm:kvm",
 ]
 semantic_authority = [
   "man 2 writev: vectors are consumed in order as one write; pipe atomicity applies to their aggregate length, and imported vector headers survive suspension",
@@ -78,6 +79,7 @@ vm_free = [
 # pre-import allocation count after completion or failure.
 embed = [
   "carrick-embed::el1_sched::el1_ipc_two_processes_blocking",
+  "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::native_pipe2_takes_no_readiness_lane_lock_held_by_a_previous_incarnation (#1845 x86 single-lane check: x86 pipe2 is served by the shared in-ring constructor, which binds no readiness lane on x86; a live host holder of both lanes of the recycled slot's previous incarnation in the production native zone does not delay it; red when x86 binds the lanes with a spin; requires real KVM)",
 ]
 
 [bindings.unresolved]
