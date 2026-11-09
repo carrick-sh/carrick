@@ -110,9 +110,13 @@ pub(super) fn checkout_configs(root: &Path, directory: &Path) -> Result<Vec<Path
     Ok(configs)
 }
 
-/// Parent of the per-SHA fixture build directories on this host.
+/// Parent of the per-SHA fixture build directories: one fixed path on every
+/// (Linux) publisher, deliberately not `$TMPDIR`. Path remapping covers
+/// embedded paths, but Cargo hashes the checkout's absolute location into
+/// `-C metadata` for a path dependency outside the fixture workspace, so a
+/// `$TMPDIR`-relative root changed `el1-sched-aarch64` between publishers.
 pub(super) fn default_isolation_root() -> PathBuf {
-    std::env::temp_dir().join("carrick-fixture-builds")
+    PathBuf::from("/tmp/carrick-fixture-builds")
 }
 
 /// One fixture build's private directory, `<isolation root>/<sha>`, held
@@ -133,6 +137,20 @@ pub(super) struct IsolatedBuild {
 impl IsolatedBuild {
     pub(super) fn acquire(isolation_root: &Path, sha: &CommitSha) -> Result<Self> {
         fs::create_dir_all(isolation_root)?;
+        // A shared parent such as /tmp lets anyone pre-create the root: use
+        // it only as our own real directory, never through a link.
+        let metadata = fs::symlink_metadata(isolation_root)?;
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            if !metadata.is_dir() || metadata.uid() != euid {
+                return Err(fail(format!(
+                    "fixture isolation root must be a directory owned by uid {euid}, not a link: {}",
+                    isolation_root.display()
+                )));
+            }
+        }
         let isolation_root = isolation_root.canonicalize()?;
         // The lock file sits beside the directory, so removing a stale
         // directory never unlinks a live lock.
@@ -460,6 +478,14 @@ mod tests {
     /// builds got `.tmpO0UOwQ/cargo` and `.tmpKg3rs5/cargo`.
     #[test]
     fn isolated_build_paths_derive_from_the_sha() {
+        // The publisher's root is fixed, never relative to `$TMPDIR`: Cargo
+        // hashes the checkout location into `-C metadata` (#1891).
+        assert_eq!(
+            default_isolation_root(),
+            Path::new("/tmp/carrick-fixture-builds"),
+            "isolation root follows TMPDIR={:?}",
+            std::env::var_os("TMPDIR")
+        );
         let isolation = tempfile::tempdir().unwrap();
         let base = isolation.path().canonicalize().unwrap();
         let first =
@@ -553,6 +579,18 @@ mod tests {
     }
 
     #[test]
+    fn linked_isolation_root_is_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = parent.path().join("carrick-fixture-builds");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = IsolatedBuild::acquire(&link, &sha('f')).err().unwrap();
+        assert!(error.to_string().contains("not a link"), "{error}");
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
+    }
+
+    #[test]
     fn executable_naming_its_build_directory_is_refused() {
         let directory = Path::new("/scratch/carrick-fixture-builds/abc");
         let mut bytes = b"\x7fELF...".to_vec();
@@ -560,5 +598,33 @@ mod tests {
         bytes.extend_from_slice(b"/scratch/carrick-fixture-builds/abc/cargo/registry/src/libc");
         let error = reject_embedded_path("probe", &bytes, directory).unwrap_err();
         assert!(error.to_string().contains("embeds its isolated build path"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod serial_host {
+    use super::*;
+
+    /// Mutates `TMPDIR`, so it runs in the serial partition.
+    #[test]
+    fn isolation_root_ignores_tmpdir() {
+        let before = default_isolation_root();
+        let other = tempfile::tempdir().unwrap();
+        let saved = std::env::var_os("TMPDIR");
+        // SAFETY: serial_host tests run with RUST_TEST_THREADS=1.
+        unsafe { std::env::set_var("TMPDIR", other.path()) };
+        let during = default_isolation_root();
+        match saved {
+            // SAFETY: as above.
+            Some(value) => unsafe { std::env::set_var("TMPDIR", value) },
+            None => unsafe { std::env::remove_var("TMPDIR") },
+        }
+        assert!(
+            !during.starts_with(other.path()),
+            "isolation root followed TMPDIR: {}",
+            during.display()
+        );
+        assert_eq!(before, during);
     }
 }

@@ -241,8 +241,10 @@ are absent from compiler and build-script processes.
 Metadata reads only explicitly selected tracked checkout configs, from a
 private scratch directory. Builds run in the fresh archive snapshot inside a
 **stable, commit-derived build directory**,
-`$TMPDIR/carrick-fixture-builds/<sha>/` (`home`, `cargo` and `checkout`
-beneath it), whose ancestors must contain no Cargo config. An exclusive
+`/tmp/carrick-fixture-builds/<sha>/` (`home`, `cargo` and `checkout`
+beneath it), whose ancestors must contain no Cargo config. The root is fixed
+on every publisher and deliberately ignores `$TMPDIR` (below). It must be a
+real directory owned by the publishing user, never a link. An exclusive
 `flock` on `carrick-fixture-builds/<sha>.lock` admits one build of a commit
 at a time; a second build of the same commit waits, and builds of different
 commits proceed independently. A directory left by a crashed build is removed
@@ -285,9 +287,9 @@ Use the manifest paths printed by the build commands. The publisher rejects
 ambient compiler wrappers and Cargo build overrides; remove those from the
 publisher's environment if necessary.
 
-**Two clean builds on one publisher are byte-identical** (#1891). Builds of
-the same commit with the same `$TMPDIR` produce the same 1,195 executables,
-and therefore the same manifest content address.
+**Clean builds of one commit are byte-identical** (#1891). Builds of the
+same commit produce the same 1,195 executables, and therefore the same
+manifest content address, whatever the publisher's `$TMPDIR`.
 
 Before the stable build directory, two clean x86_64 Linux builds of the same
 inputs differed in 19 of 1,195 executables: `connrefused`, `eventwaitmatrix`,
@@ -301,10 +303,11 @@ dependency outside the fixture workspace (`carrick-el1-control-abi`) into
 `-C metadata`, changing symbol names and code. The commit-derived directory
 holds that location fixed.
 
-Remapping does not reach Cargo's crate identity. Publishers with different
-isolation roots (another `$TMPDIR`) still differ in `el1-sched-aarch64` alone;
-the 1,194 other executables match. Byte equality across publishers needs the
-same `$TMPDIR`. Keep using one authenticated bundle for paired gates.
+Remapping does not reach Cargo's crate identity, which is why the root is a
+fixed path rather than `$TMPDIR`-relative. With the root under `$TMPDIR`, a
+build with another `$TMPDIR` still differed in `el1-sched-aarch64` alone (the
+1,194 other executables matched). Keep using one authenticated bundle for
+paired gates.
 
 ## Scoped tests and red-first work
 
