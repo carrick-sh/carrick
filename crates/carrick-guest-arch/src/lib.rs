@@ -822,6 +822,11 @@ pub struct FatalReport {
     pub detail: FatalCode,
 }
 
+/// Bytes from an AArch64 `SVC` to the return PC its trap saves (ELR).
+pub const AARCH64_SVC_LEN: u64 = 4;
+/// Bytes from an x86-64 `SYSCALL` to the return PC it saves (RCX).
+pub const X86_64_SYSCALL_LEN: u64 = 2;
+
 /// Where a saved PC sits relative to its owning syscall instruction.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SavedSyscallPc {

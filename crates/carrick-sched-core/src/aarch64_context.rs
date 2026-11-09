@@ -171,7 +171,10 @@ impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
         Aarch64ParkedContext::syscall_return(self)
     }
     fn restart_syscall(&mut self) {
-        self.native.pc = self.native.pc.wrapping_sub(4);
+        self.native.pc = self
+            .native
+            .pc
+            .wrapping_sub(carrick_guest_arch::AARCH64_SVC_LEN);
     }
     fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
         Aarch64ParkedContext::saved_syscall_pc(self)
