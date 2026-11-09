@@ -62,3 +62,18 @@ contention-then-metadata witness with an unexpected idle-peer physical doorbell;
 it is not evidence of a clean full suite at that revision. The range-diff's
 changed contexts in patches 5 and 14 do not explain the lost replay. The
 regression follows the later introduction of typed anonymous tokens.
+
+Owed physical returns preserve the shared reservation API's `Busy` refusal.
+The delegated anonymous dispatcher inspects `pending()` and `fork_pending()`
+under its existing root guard before selecting `PendingEdit`: only those
+states have that release producer. A host-owned return instead reaches the
+host acknowledgement boundary, then the original operation can rerun. This
+reuses the existing root state and notifications without a new refusal type,
+queue or owner. The unchanged kernel binding
+`delegated_el1_resident_munmap_reconciles_at_the_next_host_boundary` requires
+Busy before acknowledgement and successful reuse afterwards. Its failure was
+isolated to the proposal refusal change in `98c3b9941`; restoring just that
+line on the PR head makes it pass. The complementary production ring binding
+`delegated_owed_return_forwards_until_ack_then_completes` requires Forward
+before acknowledgement and Served afterwards. Pending-edit and prepared-edit
+contention bindings still require in-ring replay, without polling.

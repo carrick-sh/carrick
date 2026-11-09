@@ -367,7 +367,6 @@ pub fn decide_reservation_syscall<
         Err(Refusal::ForeignMapping) => ReservationDisposition::Forward,
         Err(
             error @ (Refusal::Busy
-            | Refusal::DeferredReturn
             | Refusal::PreparedConflict
             | Refusal::Stale
             | Refusal::MetadataRequired),
@@ -1076,10 +1075,16 @@ pub fn serve_delegated_anonymous<
         }
         ReservationDisposition::Unavailable(refusal) => {
             return match refusal {
-                reservations::Refusal::Busy => {
+                // Busy is shared by live edits/forks and host-owned physical
+                // returns. Only an actual pending edit has a PendingEdit
+                // release producer. Inspect it under this same root guard;
+                // owed returns must reach the host acknowledgement boundary.
+                reservations::Refusal::Busy
+                    if model.pending().is_some() || model.fork_pending() =>
+                {
                     DelegatedAnonymous::Contended(SpaceWaitCause::PendingEdit)
                 }
-                reservations::Refusal::DeferredReturn => forward(Leave::RootUnavailableBusy),
+                reservations::Refusal::Busy => forward(Leave::RootUnavailableBusy),
                 reservations::Refusal::MetadataRequired => {
                     forward(Leave::RootUnavailableMetadataRequired)
                 }
@@ -3138,7 +3143,7 @@ mod tests {
                         0x1000,
                         ReservationProtection::READ_WRITE
                     ),
-                    Err(Refusal::DeferredReturn)
+                    Err(Refusal::Busy)
                 );
                 // Fork inherits live memory; owed physical returns stay on parent.
                 let mut child_root = root(&spaces, &table, &child);

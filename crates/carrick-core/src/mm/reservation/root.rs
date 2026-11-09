@@ -2106,7 +2106,7 @@ impl<
                 | ReservationOperation::Decommit
         ) && self.return_owed_within(range)
         {
-            return Err(Refusal::DeferredReturn);
+            return Err(Refusal::Busy);
         }
         let mut cursor = range.start();
         let mut bytes = 0;
@@ -3870,11 +3870,10 @@ mod tests {
     }
 
     /// `MAP_FIXED` and `MAP_FIXED_NOREPLACE` name the address: over an owed
-    /// return they keep the host-owned deferred-return route (the host venue
-    /// settles first);
+    /// return they keep `Busy` (the host venue settles first);
     /// settling for a ring-owned MM is #1369's later slices.
     #[test]
-    fn fixed_placement_over_owed_return_keeps_deferred_return() {
+    fn fixed_placement_over_owed_return_keeps_busy() {
         let table = table();
         let mm = ReservationMm::new(1480).unwrap();
         table.publish(0, mm, layout()).unwrap();
@@ -3887,15 +3886,15 @@ mod tests {
         retire_owed(&mut root, owed);
         assert_eq!(
             root.mmap(Placement::Fixed(0x200000), 0x4000, rw),
-            Err(Refusal::DeferredReturn)
+            Err(Refusal::Busy)
         );
         assert_eq!(
             root.mmap(Placement::Fixed(0x203000), 0x2000, rw),
-            Err(Refusal::DeferredReturn)
+            Err(Refusal::Busy)
         );
         assert_eq!(
             root.mmap(Placement::NoReplace(0x201000), 0x1000, rw),
-            Err(Refusal::DeferredReturn)
+            Err(Refusal::Busy)
         );
         assert!(root.pending().is_none());
         // Adjacent to, not over, the owed extent: fixed placement proceeds.
@@ -6673,7 +6672,7 @@ mod tests {
         // Physical return is still owed; this is not lock contention.
         assert_eq!(
             g.commit_range(commit_span, ReservationProtection::READ_WRITE),
-            Err(Refusal::DeferredReturn)
+            Err(Refusal::Busy)
         );
         assert_eq!(g.acknowledge_deferred_returns(request.sequence).unwrap(), 1);
         assert!(g.is_reserved(reserve_span));
