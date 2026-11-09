@@ -286,6 +286,8 @@ host_crossings! {
     Accept4 = nr::ACCEPT4, false, Permanent;
     Recvmmsg = nr::RECVMMSG, false, Permanent;
     Sendmmsg = nr::SENDMMSG, false, Permanent;
+    // The run root's host continuation only: native fork/exec children are
+    // routed to `crate::sleep` and sleep in ring (#1808).
     Nanosleep = nr::NANOSLEEP, false, Permanent;
     ClockGettime = nr::CLOCK_GETTIME, false, Permanent;
     ClockGetres = nr::CLOCK_GETRES, false, Permanent;
