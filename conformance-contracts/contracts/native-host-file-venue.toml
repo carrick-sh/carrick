@@ -38,7 +38,7 @@ best-effort success; Memory path truncate retains EROFS.
 
 [bindings]
 vm_free = [
-  "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit}",
+  "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit,arm_native_fork_child_write_keeps_readable_prefix_before_unmapped_page}",
   "carrick-el1-linux::x86_production_forward::at_empty_path_* (#1901: ARM and x86 production dispatch hand cwd/absolute path forms to the existing path stager without descriptor lookup; empty-path zone pipes complete in ring)",
   "carrick-el1-linux::x86_production_forward::at_empty_path_{arm,x86}_{relative_bad_fd,relative_pipe} (#1927: production dispatcher forwards relative paths; existing Newfstatat stager resolves the live fixture table once and returns EBADF(9) or ENOTDIR(20) without a host request)",
   "carrick-kernel::dispatch::native_files::tests::native_child_write_serves_parent_redirected_stdout_after_host_close",
