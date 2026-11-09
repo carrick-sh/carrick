@@ -1009,6 +1009,21 @@ pub(crate) struct ScratchDiscoveryObserver {
     pub(crate) cleanup_complete: std::sync::Arc<std::sync::Barrier>,
 }
 
+/// Progress of the scratch worker: bumped when it starts an item and again
+/// when it finishes one, so a reader can tell "busy" from "hung".
+static SCRATCH_WORKER_PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current scratch worker progress; changes whenever the worker starts or
+/// finishes an item.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn scratch_worker_progress() -> u64 {
+    SCRATCH_WORKER_PROGRESS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn note_scratch_worker_progress() {
+    SCRATCH_WORKER_PROGRESS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<ScratchCleanupWork>> {
     static SENDER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<ScratchCleanupWork>>> =
         std::sync::OnceLock::new();
@@ -1018,6 +1033,7 @@ fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<Scrat
             .name("carrick-fs-cleanup".to_string())
             .spawn(move || {
                 while let Ok(work) = receiver.recv() {
+                    note_scratch_worker_progress();
                     match work {
                         ScratchCleanupWork::Remove { path, completion } => {
                             let _ = std::fs::remove_dir_all(&path);
@@ -1051,6 +1067,7 @@ fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<Scrat
                             let _ = reply.try_send(query());
                         }
                     }
+                    note_scratch_worker_progress();
                 }
             })
             .ok()
