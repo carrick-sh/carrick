@@ -2264,6 +2264,81 @@ fn native_fork_child_absolute_clock_nanosleep_reaches_time_handler() {
     native_fork_child_time_handler_with_flags(carrick_abi::syscall::nr::CLOCK_NANOSLEEP, 1);
 }
 
+/// #1808: only a process without a host continuation sleeps in ring. The
+/// run root keeps its host sleep, which honours a controlled ClockDomain.
+#[test]
+fn native_root_nanosleep_keeps_its_host_continuation() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let crossing = TestStockCrossing::new(&[0x20000, 0x21000]);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let mut entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+    assert!(entry.is_root_process());
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    for number in [
+        carrick_abi::syscall::nr::NANOSLEEP,
+        carrick_abi::syscall::nr::CLOCK_NANOSLEEP,
+    ] {
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            slot: fixture.slot.index() as u64,
+            ..Default::default()
+        };
+        frame.x[8] = number.raw();
+        frame.x[0] = 0x55;
+        let route = super::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            Some(&fixture),
+            Some(&mut entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(route, CompletionRoute::Forward, "root {}", number.raw());
+        assert_eq!(
+            frame.x[0], 0x55,
+            "the root's arguments reach its host sleep"
+        );
+    }
+}
+
 #[test]
 fn plain_fork_owns_an_independent_fd_table() {
     let fixture = Fixture::new(0x10000, asid(1));
