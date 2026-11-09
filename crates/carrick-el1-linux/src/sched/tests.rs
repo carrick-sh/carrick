@@ -653,6 +653,72 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
     );
 }
 
+/// #1941: a waiter pinned to a vCPU that is busy running another thread is
+/// still woken in the ring. EL1 queues it on that vCPU's run queue with a
+/// reschedule SGI, as the host's placement does. A refused wake forwards,
+/// and a native process has no host lane to forward to: its `FUTEX_WAKE`
+/// answers ENOSYS, the guest ignores the result and the waiter sleeps
+/// forever (two forked processes sharing pinned vCPUs hung 10 of 10).
+#[test]
+fn a_wake_queues_a_pinned_native_thread_on_its_busy_vcpu() {
+    const OTHER: SlotId = SlotId::new(4);
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let counters = counters();
+    // SLOT runs guest CPU 0 and OTHER guest CPU 1; both are busy in the
+    // guest running a loaded thread (neither is idle).
+    for (slot, cpu) in [(SLOT, 0), (OTHER, 1)] {
+        assert!(zone.reset_slot(slot));
+        host_publish(&zone, slot, MM, Some(cpu), 0);
+        zone.enter_guest(slot);
+    }
+    zone.slot(OTHER).set_sgi_target(0x77);
+    // B: a native thread pinned to CPU 1, parked on the word.
+    let guard = zone
+        .lock(ZoneTables::bucket_of_with_context(MM, uaddr), &HostWait)
+        .unwrap();
+    let b = zone
+        .alloc_record(ThreadIdentity {
+            affinity: 1 << 1,
+            ..identity(202)
+        })
+        .unwrap();
+    assert!(zone.mark_native_owned(b));
+    // SAFETY: freshly allocated and unpublished.
+    unsafe {
+        *zone.record(b).ctx_mut() =
+            Aarch64ParkedContext::from_register(thread_ctx(0xB, uaddr), TTBR_MM, MM, 1)
+    };
+    let seq = zone.next_seq(b);
+    zone.enqueue(&guard, b, seq, MM, uaddr, u32::MAX, 0)
+        .unwrap();
+    zone.publish_park(b, seq);
+    drop(guard);
+
+    // A on SLOT (CPU 0) wakes B: served in the ring, never forwarded.
+    let task_a = task_for(101);
+    let (mut frame_a, mut cpu_a) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
+    assert_eq!(
+        serve_on(SLOT, &mut frame_a, &task_a, &zone, &mut cpu_a, counters),
+        RETURNED,
+        "a wake whose waiter's only CPU is busy must not forward"
+    );
+    assert_eq!(frame_a.x[0], 1);
+    assert_eq!(
+        zone.record(b).claim(),
+        Claim::Queued { slot: OTHER, seq },
+        "queued where its affinity lets it run"
+    );
+    assert_eq!(
+        cpu_a.sgis,
+        [0x77 | (u64::from(GIC_RESCHED_INTID) << 24)],
+        "the busy vCPU is told to reschedule"
+    );
+    assert_eq!(zone.slot(SLOT).queued(), 0, "nothing queued on the waker");
+    assert_eq!(zone.counters.el1_misplaced.load(Ordering::Relaxed), 0);
+}
+
 /// Timer preemption at EL0: a thread queued behind a compute loop runs once
 /// its slice has passed, and the preempted loop later resumes with exactly
 /// its registers (no syscall result applied); neither ever left the guest.
