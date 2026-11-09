@@ -6192,6 +6192,145 @@ fn leader_sees_thread(
         .unwrap()
 }
 
+/// `tgkill(tgid, tid, 0)` issued by the leader through the production
+/// process entry (`with_process_entry`, the same entry a real syscall
+/// binds), not through a raw syscall frame.
+#[cfg(test)]
+fn leader_tgkill_probe(
+    fixture: &'static Fixture,
+    service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    tgid: u32,
+    tid: u32,
+) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalRequest, SignalThreadSelector,
+    };
+    run_as_leader(fixture);
+    super::aarch64_process::with_process_entry(
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: service.slot,
+        },
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        service,
+        |process| {
+            process.tgkill(
+                SignalThreadSelector::from_abi(u64::from(tgid)),
+                SignalThreadSelector::from_abi(u64::from(tid)),
+                SignalRequest::Probe,
+                SignalInfo::Generated(None),
+            )
+        },
+    )
+    .unwrap()
+}
+
+/// #1974: the tgkill-after-clone fixture signals the child the instant
+/// `clone` returns, before the host-issued child has made its first syscall.
+/// Linux accepts that tid: the thread exists from clone onward. Red on main
+/// 935a1c0b75 with `LinuxErrno(-3)` (ESRCH).
+#[test]
+fn arm_tgkill_reaches_a_host_issued_sibling_before_its_first_syscall() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    // Issued and published, never entered: no gettid, no registration.
+    let _control = host_born_sibling(fixture, 42);
+    assert_eq!(leader_tgkill_probe(fixture, &mut service, 41, 42), Ok(()));
+}
+
+/// Registers the host-issued sibling the way its first entry does: its own
+/// bound task on its own zone slot and record, then the production
+/// `register_thread`. The sibling must not share the leader's slot: the
+/// slot's host record is recycled by the leader's next entry, which stales
+/// the sibling's `RecordRef` (first draft's control got ESRCH for that
+/// reason: `live` was false, incarnation 6 against 3).
+#[cfg(test)]
+fn register_sibling_on_own_slot(fixture: &'static Fixture, control: &'static ThreadControlSlot) {
+    let sibling_task: &'static CurrentTask = Box::leak(Box::new(CurrentTask::new()));
+    sibling_task.set(
+        El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+        5,
+    );
+    sibling_task.mm.key.store(1, Ordering::Release);
+    sibling_task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    sibling_task.publish_visible_pid(41);
+    sibling_task.publish_root_generation(fixture.address.generation);
+    sibling_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 2);
+    fixture.zone.publish_slot(slot, 1, Some(0), 1);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, 1).unwrap();
+    let record = fixture
+        .zone
+        .current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 42,
+                serial: 102,
+                mm: 1,
+                file_table: 5,
+                generation: 12,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: fixture.page as *const _ as u64,
+                control_slot: control as *const _ as u64,
+            },
+        )
+        .unwrap();
+    control.bind_zone_record(fixture.zone.record_ref(record));
+    registry()
+        .register_thread(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            sibling_task,
+            fixture.address,
+            fixture.page,
+            control,
+        )
+        .unwrap();
+    assert!(fixture.zone.requeue_preempted(slot, record).is_queued());
+    assert_eq!(fixture.zone.switch_in_full(slot).unwrap().record, record);
+}
+
+/// Control for the witness above: the same sibling, the same entry and the
+/// same call, after `register_thread` adopted it. Passes on main, so the red
+/// above is the missing registration and nothing else.
+#[test]
+fn arm_tgkill_reaches_an_adopted_sibling_control() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let control = host_born_sibling(fixture, 42);
+    register_sibling_on_own_slot(fixture, control);
+    assert_eq!(leader_tgkill_probe(fixture, &mut service, 41, 42), Ok(()));
+}
+
 #[test]
 fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
