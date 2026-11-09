@@ -1213,3 +1213,129 @@ fn ppoll_arrays_need_readable_input_and_writable_output_before_crossing() {
         })
     );
 }
+
+/// The input bytes a staged write request carries.
+fn write_input(mut record: Box<[u8]>) -> Vec<u8> {
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Write);
+    view.input().to_vec()
+}
+
+/// The staged prefix of a write the user read stopped at `address`.
+fn prefix_at(stage: Option<HostFileStage>, address: u64) -> Vec<u8> {
+    let stage = stage.expect("a host-backed write is staged");
+    assert_eq!(stage.fault(), Some((address, Access::Read)), "{stage:?}");
+    match stage.refused() {
+        HostFileStage::Request {
+            record,
+            output: None,
+            resolves_path: false,
+            map: None,
+            chdir: false,
+        } => write_input(record),
+        other => panic!("a refused supply writes the prefix, got {other:?}"),
+    }
+}
+
+#[test]
+fn write_fault_after_a_readable_prefix_keeps_the_prefix() {
+    // #1954: a buffer readable for 16 bytes, then unmapped. Linux's write
+    // returns 16; the gather must not discard the copied prefix.
+    let mut bytes = vec![0u8; 4096];
+    bytes[4080..].copy_from_slice(b"0123456789abcdef");
+    let mut user = memory(&bytes);
+    let staged = run(
+        HostFileCall::Write {
+            fd: 1,
+            buf: BASE + 4080,
+            count: 0x100001,
+        },
+        &mut user,
+    );
+    assert_eq!(prefix_at(staged, BASE + 4096), b"0123456789abcdef");
+}
+
+#[test]
+fn write_fault_with_no_readable_byte_is_efault_after_refused_supply() {
+    let mut user = memory(b"");
+    let staged = run(
+        HostFileCall::Write {
+            fd: 1,
+            buf: BASE + 4096,
+            count: 8,
+        },
+        &mut user,
+    )
+    .unwrap();
+    assert_eq!(
+        staged,
+        HostFileStage::Fault {
+            address: BASE + 4096,
+            access: Access::Read
+        }
+    );
+    assert_eq!(
+        Some(staged.refused()),
+        returned(carrick_syscall_abi::LINUX_EFAULT)
+    );
+}
+
+#[test]
+fn write_fault_supplied_then_retried_writes_every_byte() {
+    // A valid but non-resident page: the ring supplies the exact faulting
+    // page and retries the call, which then gathers the whole buffer.
+    let mut user = memory(&[b'a'; 4096]);
+    let call = HostFileCall::Write {
+        fd: 1,
+        buf: BASE + 4088,
+        count: 16,
+    };
+    assert_eq!(prefix_at(run(call, &mut user), BASE + 4096), b"aaaaaaaa");
+    user.bytes.extend_from_slice(&[b'b'; 4096]);
+    let (record, ..) = request(run(call, &mut user));
+    assert_eq!(write_input(record), b"aaaaaaaabbbbbbbb");
+}
+
+#[test]
+fn writev_fault_in_a_later_vector_keeps_the_earlier_bytes() {
+    // iov[0] "abcde" is readable; iov[1] starts 3 bytes before the end of
+    // the resident page and runs past it; iov[2] is never reached.
+    let mut bytes = vec![0u8; 4096];
+    let vector = |bytes: &mut Vec<u8>, at: usize, base: u64, len: u64| {
+        bytes[at..at + 8].copy_from_slice(&base.to_le_bytes());
+        bytes[at + 8..at + 16].copy_from_slice(&len.to_le_bytes());
+    };
+    vector(&mut bytes, 0, BASE + 0x100, 5);
+    vector(&mut bytes, 16, BASE + 4093, 8);
+    vector(&mut bytes, 32, BASE + 0x100, 5);
+    bytes[0x100..0x105].copy_from_slice(b"abcde");
+    bytes[4093..].copy_from_slice(b"xyz");
+    let mut user = memory(&bytes);
+    let writev = |iov, iovcnt| HostFileCall::Writev { fd: 1, iov, iovcnt };
+    assert_eq!(
+        prefix_at(run(writev(BASE, 3), &mut user), BASE + 4096),
+        b"abcdexyz"
+    );
+    // A fault at the start of a later vector keeps every earlier vector.
+    vector(&mut user.bytes, 16, 0x900000, 4);
+    assert_eq!(
+        prefix_at(run(writev(BASE, 3), &mut user), 0x900000),
+        b"abcde"
+    );
+    // An unreadable first vector or vector array copies nothing: EFAULT.
+    vector(&mut user.bytes, 0, 0x900000, 4);
+    assert_eq!(
+        run(writev(BASE, 3), &mut user),
+        Some(HostFileStage::Fault {
+            address: 0x900000,
+            access: Access::Read
+        })
+    );
+    assert_eq!(
+        run(writev(BASE + 4096 - 16, 2), &mut user),
+        Some(HostFileStage::Fault {
+            address: BASE + 4096,
+            access: Access::Read
+        })
+    );
+}

@@ -1037,7 +1037,12 @@ enum NativeServiceStage {
         flags: crate::native_process_runtime::NativeEntropyFlags,
         requested: carrick_guest_arch::GuestLen,
     },
-    Fault(carrick_guest_arch::FaultInfo),
+    /// Supply `fault`, then retry the SVC. A refused supply writes the
+    /// staged `prefix` record (a short write) when staging gathered one.
+    Fault {
+        fault: carrick_guest_arch::FaultInfo,
+        prefix: Option<alloc::boxed::Box<[u8]>>,
+    },
     Return(i64),
     Operation,
 }
@@ -1067,6 +1072,21 @@ pub fn stage_native_host_file<V: file::MemoryValidator>(
 ) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
     let mut user = HostFileCopy(file::ValidatedCopy { task, validator });
     carrick_personality_linux::native_host_file::stage(call, namespace, &mut user)
+}
+
+/// The owner fault a host-file stage needs supplied before it can retry.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn native_host_file_fault(
+    address: u64,
+    access: carrick_guest_arch::Access,
+) -> carrick_guest_arch::FaultInfo {
+    carrick_guest_arch::FaultInfo {
+        address: carrick_guest_arch::UserVa::new(address),
+        access,
+        // A write to a readable page is a permission (COW) fault.
+        present: access == carrick_guest_arch::Access::Write
+            && file::MemoryValidator::readable_bytes(&file::HardwareValidator, address, 1) == 1,
+    }
 }
 
 /// Route a native SVC through the host-file venue. `None` keeps the call on
@@ -1285,13 +1305,16 @@ fn arm_native_service_exit(
         return Some(arm_signal_user_return(frame));
     }
     let mut service_wait = wait;
-    let (operation, exec_payload, host_file, entropy, retry_exec_stage) = {
+    let (operation, exec_payload, host_file, entropy, retry_exec_stage, stage_prefix) = {
         let staged = match native_exec_stage(frame, task) {
             Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
             Some(NativeExecStage::Failed(errno)) => {
                 NativeServiceStage::Return(errno.guest_retval())
             }
-            Some(NativeExecStage::Fault(fault)) => NativeServiceStage::Fault(fault),
+            Some(NativeExecStage::Fault(fault)) => NativeServiceStage::Fault {
+                fault,
+                prefix: None,
+            },
             // Only an unserved call crosses. A call served with owed host
             // work first settles that work (CarrierWork) and is replayed;
             // staging it here would pre-empt the settlement forever.
@@ -1365,17 +1388,19 @@ fn arm_native_service_exit(
                 Some(carrick_personality_linux::native_host_file::HostFileStage::Fault {
                     address,
                     access,
-                }) => NativeServiceStage::Fault(carrick_guest_arch::FaultInfo {
-                    address: carrick_guest_arch::UserVa::new(address),
-                    access,
-                    // A write to a readable page is a permission (COW) fault.
-                    present: access == carrick_guest_arch::Access::Write
-                        && file::MemoryValidator::readable_bytes(
-                            &file::HardwareValidator,
-                            address,
-                            1,
-                        ) == 1,
-                }),
+                }) => NativeServiceStage::Fault {
+                    fault: native_host_file_fault(address, access),
+                    prefix: None,
+                },
+                Some(
+                    carrick_personality_linux::native_host_file::HostFileStage::FaultAfterPrefix {
+                        address,
+                        prefix,
+                    },
+                ) => NativeServiceStage::Fault {
+                    fault: native_host_file_fault(address, carrick_guest_arch::Access::Read),
+                    prefix: Some(prefix),
+                },
                 Some(carrick_personality_linux::native_host_file::HostFileStage::InRing) => {
                     // An in-zone object the ring does not serve yet never
                     // exits to the host: counted ENOSYS here, in ring.
@@ -1390,8 +1415,8 @@ fn arm_native_service_exit(
             },
         };
         match staged {
-            NativeServiceStage::Exec(payload) => (None, Some(payload), None, None, false),
-            NativeServiceStage::HostFile(staged) => (None, None, Some(staged), None, false),
+            NativeServiceStage::Exec(payload) => (None, Some(payload), None, None, false, None),
+            NativeServiceStage::HostFile(staged) => (None, None, Some(staged), None, false, None),
             NativeServiceStage::Entropy {
                 address,
                 capacity,
@@ -1403,12 +1428,13 @@ fn arm_native_service_exit(
                 None,
                 Some((address, capacity, flags, requested)),
                 false,
+                None,
             ),
             NativeServiceStage::Return(result) => {
                 frame.x[0] = result as u64;
                 return Some(arm_signal_user_return(frame));
             }
-            NativeServiceStage::Fault(fault) => {
+            NativeServiceStage::Fault { fault, prefix } => {
                 // `AT S1E0R` reports an inherited sparse page without taking
                 // an EL0 abort. Feed that exact read through the ordinary
                 // owner fault selector, retaining the syscall frame for retry.
@@ -1433,6 +1459,7 @@ fn arm_native_service_exit(
                             None,
                             None,
                             true,
+                            prefix,
                         )
                     }
                     Action::Idle | Action::HostCustody => {
@@ -1449,7 +1476,7 @@ fn arm_native_service_exit(
             ) {
                 NativeUnstagedExit::Refused(refused) => return Some(refused),
                 NativeUnstagedExit::Operation(operation) => {
-                    (Some(operation), None, None, None, false)
+                    (Some(operation), None, None, None, false, None)
                 }
                 NativeUnstagedExit::Declined => return None,
             },
@@ -1544,7 +1571,25 @@ fn arm_native_service_exit(
             } else if retry_exec_stage {
                 match operation {
                     Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) => {
-                        process.begin_exec_stage_fault_service(fault, fault_sequence, service_wait)
+                        process.begin_exec_stage_fault_service(
+                            fault,
+                            fault_sequence,
+                            service_wait,
+                            stage_prefix.map(|record| {
+                                (
+                                    record,
+                                    crate::native_process_runtime::NativeServiceCall::new(
+                                        carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                                        // SAFETY: this in-ring path retains the
+                                        // fixed ABI mapping for every continuation.
+                                        unsafe {
+                                            &*(carrick_el1_abi::EL1_COUNTERS_BASE
+                                                as *const Counters)
+                                        },
+                                    ),
+                                )
+                            }),
+                        )
                     }
                     _ => Err(super::native_process_runtime::NativeProcessError::Quarantined),
                 }
