@@ -11,7 +11,10 @@
  *                      EINTR with the unslept interval in rem. By default
  *                      rem is an anonymous page the parent mapped before
  *                      fork and the child wrote before sleeping.
- *   SLEEP_BUSY         with SLEEP_EINTR: that rem copy is Busy once
+ *   SLEEP_BUSY         with SLEEP_EINTR: the next exact-MM write (that rem
+ *                      copy) is Busy once; the injected-copy census must
+ *                      then show one refusal and one owned rerun, which a
+ *                      direct (unretained) rem copy cannot produce
  *   SLEEP_REM_LAZY     with SLEEP_EINTR: nobody touched the rem page (#1984)
  *   SLEEP_REM_COW      with SLEEP_EINTR: rem is a .data page the parent
  *                      wrote before fork; the parent's copy must survive
@@ -19,6 +22,7 @@
 #define INJECT_SIGNAL_CLOCK_LAG_ON_SECOND_READ -487 /* 0x...fe19 */
 #define INJECT_CAUGHT_SIGNAL_ON_NEXT_PARK -486      /* 0x...fe1a */
 #define INJECT_OWNED_COPY_BUSY_ONCE -485            /* 0x...fe1b */
+#define INJECT_OWNED_COPY_CENSUS -484               /* 0x...fe1c */
 .global _start
 .text
 _start:
@@ -144,6 +148,15 @@ row_failed:
     jl failure
     cmp $1000000000, %rax
     jge failure
+#ifdef SLEEP_BUSY
+    /* The injected Busy refused the rem copy once, and the retained owned
+     * copy then completed: refusals 1 (high half), owned reruns 1 (low). */
+    mov $INJECT_OWNED_COPY_CENSUS, %rax
+    syscall
+    mov $0x100000001, %rcx
+    cmp %rcx, %rax
+    jne census_failure
+#endif
     jmp success
 handler:
     movb $1, handled(%rip)
@@ -166,6 +179,11 @@ errno_exit:
 success:
     mov $8, %edi
     jmp exit
+#ifdef SLEEP_BUSY
+census_failure:
+    mov $92, %edi
+    jmp exit
+#endif
 failure:
     mov $91, %edi
 exit:
