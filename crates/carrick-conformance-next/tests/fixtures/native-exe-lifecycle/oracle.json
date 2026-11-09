@@ -1,6 +1,6 @@
 {
   "status": "pending-native-arm64-bless",
-  "source_sha256": "8183c6c1f3b4fadf15f619601878a652d1e37021e8f9205766aac217b49990b4",
+  "source_sha256": "5b9fef317290341a2b87ff7d37f112cf815b2c8fe2d4f05f738fc6a1c7074504",
   "known_answer_host": "Linux-6.12.115+deb13.1-cloud-amd64-x86_64-with-glibc2.41",
   "scope": "Native Linux x86_64 known-answer fixture runs only; not HVF evidence or the required native arm64 Docker bless.",
   "stdout": {
