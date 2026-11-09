@@ -29,23 +29,28 @@ mod test_support {
     pub const INJECT_METADATA_ON_REPROBE_ONCE: u64 = 0xffff_ffff_ffff_fe16;
     pub const INJECT_CAUGHT_SIGNAL_ON_PARK: u64 = 0xffff_ffff_ffff_fe17;
     pub const INJECT_PEER_IDLE_RELEASE_ONCE: u64 = 0xffff_ffff_ffff_fe18;
+    // Test-only actor ordering: armed by CPU0's fixture syscall; CPU0
+    // publishes Parked before requesting CPU1's scheduler to release it.
+    // The production object-wait queue and notification choose the wake target.
+    const RELEASE_ARMED: u64 = 1;
+    const RELEASE_ON_PEER: u64 = 2;
     static PEER_IDLE_RELEASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
     pub fn peer_release_pending(slot: carrick_sched_core::SlotId) -> bool {
-        slot.raw() == 1 && PEER_IDLE_RELEASE.load(Ordering::Acquire) == 2
+        slot.raw() == 1 && PEER_IDLE_RELEASE.load(Ordering::Acquire) == RELEASE_ON_PEER
     }
 
     pub fn defer_release_to_peer(slot: carrick_sched_core::SlotId) -> bool {
         match PEER_IDLE_RELEASE.load(Ordering::Acquire) {
-            1 if slot.raw() == 0 => {
-                PEER_IDLE_RELEASE.store(2, Ordering::Release);
+            RELEASE_ARMED if slot.raw() == 0 => {
+                PEER_IDLE_RELEASE.store(RELEASE_ON_PEER, Ordering::Release);
                 carrick_el1::isa::x86::interrupt::send_resched(carrick_sched_core::SlotId::new(1))
                     .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
                 true
             }
-            1 => true,
-            2 if slot.raw() == 0 => true,
-            2 => {
+            RELEASE_ARMED => true,
+            RELEASE_ON_PEER if slot.raw() == 0 => true,
+            RELEASE_ON_PEER => {
                 PEER_IDLE_RELEASE.store(0, Ordering::Release);
                 false
             }
@@ -82,7 +87,7 @@ mod test_support {
     ) -> Option<u64> {
         match native {
             INJECT_PEER_IDLE_RELEASE_ONCE => PEER_IDLE_RELEASE
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(0, RELEASE_ARMED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
                 .then_some(0),
             INJECT_ROOT_BUSY_ONCE => {
