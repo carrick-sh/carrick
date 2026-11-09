@@ -3,6 +3,7 @@ use super::*;
 use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest, UserCopy};
 use carrick_guest_arch::{Access, GuestLen};
 use carrick_personality_linux::sched::FutexCall;
+use carrick_sched_core::process::identity_allocator::ClaimKind;
 use carrick_sched_core::{ShortLockSpin, spaces::notification::SpaceWaitCause};
 
 struct Fixture<C: ProcessContext + 'static> {
@@ -69,6 +70,7 @@ impl<C: ProcessContext + 'static> Fixture<C> {
             generation: ContextGeneration::new(NonZeroU64::MIN),
         };
         zone.mm_issuer().observe_existing(address.mm);
+        seed_fixture_namespace(zone, task, page);
         let space = zone.spaces.publish_closed(mm, root, 0).unwrap();
         zone.spaces.open(space);
         zone.drive(slot, 1);
@@ -470,6 +472,9 @@ fn clear_tid_stopped_join_driver<C, B>(
     task.publish_visible_pid(41);
     task.publish_root_generation(fixture.address.generation);
     task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    zone.namespace().with_view(&ShortLockSpin, |ns| {
+        ns.reserve_exact(42, ClaimKind::Thread).unwrap();
+    });
     let child_slot = SlotId::new(1);
     zone.drive(child_slot, 2);
     zone.publish_slot(child_slot, 1, Some(1), 2);
@@ -694,9 +699,7 @@ fn clear_tid_stopped_join_driver<C, B>(
             fixture.slot,
             2000,
             carrick_personality_linux::sched::ETIMEDOUT_RESULT,
-            &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            },
+            &|owned| { crate::sched::object_wait::deliver_host_completion(owned.zone(), owned) },
         ),
         Ok(false),
         "the old timed wait must not complete a second time",
