@@ -411,6 +411,23 @@ pub trait ProcessSignals {
         info: carrick_guest_arch::UserVa,
     ) -> Result<SignalWaitOutcome, carrick_syscall_abi::LinuxErrno>;
 
+    /// Whether this owner serves `nanosleep`/`clock_nanosleep` in ring. An
+    /// owner with a host continuation (the run root) keeps that continuation,
+    /// which also honours an embedder-controlled clock domain.
+    fn sleeps_in_ring(&self) -> bool {
+        false
+    }
+
+    /// Sleep in this owner's signal-interruptible member wait until the
+    /// deadline. `EINTR` has already written any relative `remaining`.
+    fn clock_sleep(
+        &mut self,
+        request: crate::sleep::SleepRequest,
+    ) -> Result<crate::sleep::SleepOutcome, carrick_syscall_abi::LinuxErrno> {
+        let _ = request;
+        Err(carrick_syscall_abi::LINUX_ENOSYS)
+    }
+
     /// true means this entry transferred its owned continuation to the scheduler.
     fn rt_sigsuspend(
         &mut self,
