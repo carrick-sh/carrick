@@ -37,8 +37,9 @@ pub enum LifecycleInvariant {
     WaitPublication,
     WaitSwitch,
     ExitPublication,
-    ExitWake,
-    ExitReap,
+    // 0x108 was `ExitWake`: the child-exit wake can no longer be refused
+    // (#1941). Later codes keep their values.
+    ExitReap = 0x109,
     ExitRecord,
     ExitRetirement,
     ExitSwitch,
