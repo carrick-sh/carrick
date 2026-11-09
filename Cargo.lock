@@ -491,7 +491,6 @@ dependencies = [
  "carrick-guest-arch",
  "carrick-mmu-core",
  "carrick-sched-core",
- "carrick-syscall-abi",
  "zerocopy",
 ]
 
