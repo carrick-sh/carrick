@@ -6548,7 +6548,8 @@ fn arm_kill_probe_resolves_a_live_nonleader_tid() {
     first.x[8] = 178;
     arm_call(fixture, control, &mut service, &mut first).unwrap();
     assert_eq!(first.x[0], 42);
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    let live_members = carrick_el1_abi::Lifecycle::live(fixture.page);
+    assert_eq!(live_members, 2);
     assert!(leader_sees_thread(fixture, &mut service, 42));
     let mut probe = carrick_el1_abi::TrapFrame::default();
     probe.x[8] = 129; // kill(nonleader_tid, 0)
@@ -14790,7 +14791,8 @@ fn arm_kill_nonleader_recipient(blocked: bool) {
         fixture.zone.switch_in_full(sender_slot).unwrap().record,
         sender_record
     );
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    let live_members = carrick_el1_abi::Lifecycle::live(fixture.page);
+    assert_eq!(live_members, 2);
 
     let signal = Signal::from_number(10).unwrap();
     if blocked {
