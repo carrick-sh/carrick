@@ -372,6 +372,16 @@ preserves command argument boundaries and accept inherits its existing gate
 descriptor, without reacquiring or upgrading a shared lease. Upload the
 fixture artifact separately from acceptance logs and receipts.
 
+A checkout that only adds probes relative to a bundle (#1980; the exact rule
+is in [the Signed gate doc](ci/signed-gate.md#owner-exception-prs-that-change-fixture-inputs))
+can be served by that bundle plus a candidate probe set. On Linux, `xtask
+fixtures build-candidate-probes --bundle <base archive> --sha <sha> --output
+<dir>` builds only the added probes through the publisher's snapshot and
+commands. Then `xtask fixtures restore --bundle <base archive>
+--candidate-probes <set archive>` admits and installs both. The installed
+record and every later verification re-check the checkout against the pair,
+and receipts list the candidate-built probes with their source hashes.
+
 `just remote-accept --ref <sha> --phase signed` selects the unique local
 `target/fixtures/bundles/<sha>/<digest>/manifest.json`, packages and transfers
 it to that run's directory, and restores it after checkout cleanup. With no
