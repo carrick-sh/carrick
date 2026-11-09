@@ -234,7 +234,7 @@ enum Release {
 /// the held writable lane, and returns the retained operation (no errno, no
 /// fatal, no spin); the holder's release hands the enrolled record back and
 /// the rerun completes the same pipe exactly once.
-fn busy_once_then_success(order: Release) {
+fn busy_once_then_success(order: Release, lane: WaitFor) {
     let zone = leaked_zone();
     crate::el1_zone::with_test_zone(zone, || {
         let dispatcher = SyscallDispatcher::new();
@@ -247,7 +247,7 @@ fn busy_once_then_success(order: Release) {
         let old = recycled_slot(&owner);
         let mut memory = LinearMemory::new(BASE, vec![0xa5; 0x1000]);
         std::thread::scope(|scope| {
-            let holder = Holder::hold(scope, zone, vec![old], WaitFor::Writable);
+            let holder = Holder::hold(scope, zone, vec![old], lane);
             let (done_tx, done_rx) = mpsc::channel();
             let dispatcher = &dispatcher;
             let refused = std::thread::scope(|inner| {
@@ -279,7 +279,11 @@ fn busy_once_then_success(order: Release) {
             let (object, bound) = op.pipe2_progress().unwrap();
             assert_eq!(object.index(), old.index(), "the recycled slot was popped");
             assert_ne!(object, old, "a new incarnation");
-            assert_eq!(bound, 1, "the readable lane is bound and retained");
+            let expected = match lane {
+                WaitFor::Readable => 0,
+                WaitFor::Writable => 1,
+            };
+            assert_eq!(bound, expected, "lanes before the held one stay bound");
             assert_eq!(memory.read_bytes(OUT, 8).unwrap(), [0xa5; 8]);
             assert!(dispatcher.open_file(3).is_none() && dispatcher.open_file(4).is_none());
             if order == Release::BeforeEnrollment {
@@ -315,12 +319,17 @@ fn busy_once_then_success(order: Release) {
 
 #[test]
 fn pipe2_held_lane_lock_retains_create_then_succeeds_once() {
-    busy_once_then_success(Release::AfterEnrollment);
+    busy_once_then_success(Release::AfterEnrollment, WaitFor::Writable);
+}
+
+#[test]
+fn pipe2_held_readable_lane_retains_unbound_create_then_succeeds_once() {
+    busy_once_then_success(Release::AfterEnrollment, WaitFor::Readable);
 }
 
 #[test]
 fn pipe2_lane_release_before_enrollment_reruns_now() {
-    busy_once_then_success(Release::BeforeEnrollment);
+    busy_once_then_success(Release::BeforeEnrollment, WaitFor::Writable);
 }
 
 /// Cancellation while parked (SIGKILL, exit, exec drop the continuation):
@@ -349,6 +358,7 @@ fn pipe2_cancel_while_parked_leaks_no_object_or_binding() {
             };
             let (object, _) = op.pipe2_progress().unwrap();
             let record = enroll(zone, &op, 1846);
+            let exact = zone.record_ref(record);
             // Terminal cancellation: the continuation is dropped, then the
             // parked record is cancelled through its exact claim.
             drop(op);
@@ -358,7 +368,7 @@ fn pipe2_cancel_while_parked_leaks_no_object_or_binding() {
             );
             assert!(matches!(
                 zone.claim_for_host(
-                    zone.record_ref(record),
+                    exact,
                     None,
                     carrick_el1_abi::Handback::Cancelled,
                     &crate::el1_zone::HostLockWait,
@@ -368,8 +378,7 @@ fn pipe2_cancel_while_parked_leaks_no_object_or_binding() {
             ));
             holder.release();
             assert!(
-                zone.live(zone.record_ref(record)).is_none()
-                    || !matches!(zone.record(record).claim(), Claim::Transferring { .. }),
+                zone.live(exact).is_none(),
                 "the release retires the cancelled record"
             );
             assert_eq!(memory.read_bytes(OUT, 8).unwrap(), [0xa5; 8]);
