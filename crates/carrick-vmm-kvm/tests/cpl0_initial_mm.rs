@@ -208,17 +208,37 @@ fn serial_host_native_child_zero_nanosleep_returns_zero() {
     );
 }
 
-/// forkexecstorm's ready-child shape on x86: an already expired absolute
-/// CLOCK_MONOTONIC deadline returns 0 at once.
+/// x86 CPL0 defines no guest-visible monotonic epoch (no vDSO, a raw RDTSC
+/// counter), so even forkexecstorm's already expired absolute
+/// CLOCK_MONOTONIC deadline keeps the counted ENOSYS refusal (#1808).
 #[test]
-fn serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero() {
-    native_child_sleep_witness(
-        "serial_host_native_child_expired_absolute_clock_nanosleep_returns_zero",
+fn serial_host_native_child_absolute_clock_nanosleep_is_refused() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_absolute_clock_nanosleep_is_refused",
+        "native_child_sleep.S",
         &["-DSLEEP_ABSOLUTE=1"],
+        218,
+    );
+}
+
+/// The routed x86 child `clock_nanosleep` answers each clock and flag class
+/// with the errno number Linux gives (or the counted refusal where the ring
+/// has no authority); the fixture's table lists the rows.
+#[test]
+fn serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux",
+        "native_child_sleep_witness.S",
+        &["-DSLEEP_CLOCK_TABLE=1"],
+        8,
     );
 }
 
 fn native_child_sleep_witness(test: &str, flags: &[&str]) {
+    native_child_sleep_witness_with_exit(test, "native_child_sleep.S", flags, 8);
+}
+
+fn native_child_sleep_witness_with_exit(test: &str, fixture: &str, flags: &[&str], exit: i32) {
     // Bounded in a child test process like the entropy witness: a lost timer
     // wake must fail, never hang CI.
     const CHILD: &str = "CARRICK_SLEEP_WITNESS_CHILD";
@@ -226,12 +246,20 @@ fn native_child_sleep_witness(test: &str, flags: &[&str]) {
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "10"])
             .arg(std::env::current_exe().expect("current test executable"))
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .args([
+                "--exact",
+                test,
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env(CHILD, test)
             .output()
             .expect("bounded native sleep witness");
+        // The child must have run exactly this witness, not filtered it out.
         assert!(
-            output.status.success(),
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
             "bounded child witness: {:?}\n{}\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
@@ -239,11 +267,11 @@ fn native_child_sleep_witness(test: &str, flags: &[&str]) {
         );
         return;
     }
-    let elf = native_exit_fixture_with_flags("native_child_sleep.S", flags);
+    let elf = native_exit_fixture_with_flags(fixture, flags);
     let outcome = run_pool_fixture(&elf, 128);
     assert_eq!(
-        outcome.run.exit_code, 8,
-        "child sleep result (218 means ENOSYS)"
+        outcome.run.exit_code, exit,
+        "child sleep result (218 means ENOSYS; 100 + n is errno n or table row n)"
     );
     assert!(outcome.run.stdout.is_empty());
     assert!(outcome.run.stderr.is_empty());
@@ -286,32 +314,7 @@ fn native_exit_fixture(name: &str) -> Vec<u8> {
 }
 
 fn native_exit_fixture_with_flags(name: &str, flags: &[&str]) -> Vec<u8> {
-    let dir = tempfile::tempdir().expect("fixture directory");
-    let output = dir.path().join("guest");
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
-    let compiled = std::process::Command::new("timeout")
-        .args([
-            "10",
-            "cc",
-            "-nostdlib",
-            "-static",
-            "-no-pie",
-            "-Wl,--build-id=none",
-        ])
-        .args(flags)
-        .arg(source)
-        .arg("-o")
-        .arg(&output)
-        .output()
-        .expect("assemble native witness");
-    assert!(
-        compiled.status.success(),
-        "{}",
-        String::from_utf8_lossy(&compiled.stderr)
-    );
-    std::fs::read(output).expect("fixture ELF")
+    kvm_pool_fixture::assemble_fixture(name, flags)
 }
 
 fn native_exit_workers(

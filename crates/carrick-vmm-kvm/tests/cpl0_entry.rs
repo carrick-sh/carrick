@@ -743,6 +743,106 @@ fn production_anonymous_editor_busy_once_parks_and_completes() {
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
 
+/// #1808 finding 1 on x86 CPL0: a production fork child's 1 ms nanosleep
+/// parks; when its timer wakes it, the injected second clock read still lags
+/// behind the deadline and every later read is real. The sleep's one complete
+/// decision re-parks on the same deadline and returns 0, never the
+/// rt_sigtimedwait EAGAIN (-11, exit 111).
+#[test]
+fn serial_host_native_child_sleep_deadline_crossing_between_checks_returns_zero() {
+    instrumented_sleep_witness(
+        "serial_host_native_child_sleep_deadline_crossing_between_checks_returns_zero",
+        &["-DSLEEP_CROSSING=1"],
+    );
+}
+
+/// #1808 finding 2 on x86 CPL0: SIGUSR1 (caught) is published through the
+/// production ingress owner once the child's 1 s nanosleep has parked. The
+/// resumed sleep's decision (deadline not passed, signal deliverable) returns
+/// EINTR through the retained output, the handler runs, and the unslept
+/// interval is in rem (a private anonymous page the child wrote).
+#[test]
+fn serial_host_native_child_sleep_eintr_writes_the_remainder() {
+    instrumented_sleep_witness(
+        "serial_host_native_child_sleep_eintr_writes_the_remainder",
+        &["-DSLEEP_EINTR=1"],
+    );
+}
+
+/// #1808 finding 2 on x86 CPL0: as above, with that rem copy Busy once. The
+/// EINTR answer and its bytes stay retained across the carrier crossing and
+/// are written afterwards.
+#[test]
+fn serial_host_native_child_sleep_eintr_retains_a_busy_remainder() {
+    instrumented_sleep_witness(
+        "serial_host_native_child_sleep_eintr_retains_a_busy_remainder",
+        &["-DSLEEP_EINTR=1", "-DSLEEP_BUSY=1"],
+    );
+}
+
+/// As above with an untouched (lazy) anonymous rem page. It also fails with
+/// the pre-#1836 direct copy: the x86 carrier cannot back a lazy page for a
+/// kernel write after a signal wakes the child.
+#[test]
+#[ignore = "#1984: x86 kernel write to a lazy page after a signal wake"]
+fn serial_host_native_child_sleep_eintr_writes_a_lazy_remainder() {
+    instrumented_sleep_witness(
+        "serial_host_native_child_sleep_eintr_writes_a_lazy_remainder",
+        &["-DSLEEP_EINTR=1", "-DSLEEP_REM_LAZY=1"],
+    );
+}
+
+/// As above with a copy-on-write `.data` rem page the parent wrote before
+/// fork: the child's EINTR remainder breaks COW and the parent's page keeps
+/// its bytes.
+#[test]
+fn serial_host_native_child_sleep_eintr_writes_a_cow_remainder() {
+    instrumented_sleep_witness(
+        "serial_host_native_child_sleep_eintr_writes_a_cow_remainder",
+        &["-DSLEEP_EINTR=1", "-DSLEEP_REM_COW=1"],
+    );
+}
+
+fn instrumented_sleep_witness(test: &str, flags: &[&str]) {
+    // Bounded in a child test process: a lost wake must fail, never hang CI.
+    const CHILD: &str = "CARRICK_SLEEP_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "20"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                test,
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, test)
+            .output()
+            .expect("bounded native sleep witness");
+        // The child must have run exactly this witness, not filtered it out.
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture("native_child_sleep_witness.S", flags);
+    let outcome = run_instrumented_pool_fixture(&elf, 128);
+    assert_eq!(
+        outcome.run.exit_code,
+        8,
+        "child sleep result (100 + n is errno n): {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert!(outcome.run.stdout.is_empty());
+}
+
 /// A caught signal enters through the production x86 signal owner after the
 /// real anonymous munmap has parked.  The guest handler returns through
 /// rt_sigreturn, the saved syscall instruction re-executes, and munmap

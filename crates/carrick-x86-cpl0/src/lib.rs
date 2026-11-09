@@ -28,12 +28,63 @@ mod test_support {
     pub const INJECT_WAIT_HANDBACK_CENSUS: u64 = 0xffff_ffff_ffff_fe15;
     pub const INJECT_METADATA_ON_REPROBE_ONCE: u64 = 0xffff_ffff_ffff_fe16;
     pub const INJECT_CAUGHT_SIGNAL_ON_PARK: u64 = 0xffff_ffff_ffff_fe17;
+    /// The second native signal-clock read from now reports tick 0: a sleep
+    /// woken at its deadline first sees the clock before it, and every later
+    /// read is real again.
+    pub const INJECT_SIGNAL_CLOCK_LAG_ON_SECOND_READ: u64 = 0xffff_ffff_ffff_fe18;
+    /// Once the calling member next parks, publish a caught SIGUSR1 to it
+    /// through the production ingress owner.
+    pub const INJECT_CAUGHT_SIGNAL_ON_NEXT_PARK: u64 = 0xffff_ffff_ffff_fe19;
+    /// The next owned (exact-MM, retained-output) user copy is Busy once.
+    pub const INJECT_OWNED_COPY_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe1a;
     static ANONYMOUS_WAIT_HANDBACKS: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
     static METADATA_ON_REPROBE: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
     static CAUGHT_SIGNAL_ON_PARK: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+    static SIGNAL_CLOCK_LAG: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    static OWNED_COPY_BUSY: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    type ArmedSignal = (
+        carrick_sched_core::RecordRef,
+        carrick_core_abi::ExecutionBinding,
+    );
+    static SIGNAL_ON_NEXT_PARK: carrick_el1::lock::SpinLock<Option<ArmedSignal>> =
+        carrick_el1::lock::SpinLock::new(None);
+
+    pub fn signal_clock_read_lags() -> bool {
+        SIGNAL_CLOCK_LAG
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok_and(|left| left == 1)
+    }
+
+    /// Called on each scheduler entry: deliver an armed signal once its member
+    /// has parked, from the executor that parked it (whose current task is
+    /// still that member's), as `INJECT_CAUGHT_SIGNAL_ON_PARK` does.
+    pub fn signal_parked_member(
+        source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+        task: &'static carrick_el1_abi::CurrentTask,
+    ) {
+        let mut slot = SIGNAL_ON_NEXT_PARK.lock();
+        let armed = slot.take_if(|(_, binding)| {
+            *binding == carrick_el1_linux::common_entry::execution_binding(task)
+        });
+        drop(slot);
+        if let Some((record, binding)) = armed
+            && !crate::native_process::inject_caught_signal_once_parked(
+                source, task, record, binding,
+            )
+        {
+            *SIGNAL_ON_NEXT_PARK.lock() = Some((record, binding));
+        }
+    }
+
+    pub fn take_owned_copy_busy() -> bool {
+        OWNED_COPY_BUSY.swap(false, Ordering::AcqRel)
+    }
 
     pub fn take_caught_signal_on_park() -> bool {
         CAUGHT_SIGNAL_ON_PARK.swap(false, Ordering::AcqRel)
@@ -85,6 +136,28 @@ mod test_support {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
                 .then_some(0),
+            INJECT_SIGNAL_CLOCK_LAG_ON_SECOND_READ => SIGNAL_CLOCK_LAG
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
+            INJECT_CAUGHT_SIGNAL_ON_NEXT_PARK => {
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                let zone = carrick_x86_carrier::native_execution::source(slot).zone;
+                let record = zone.record_ref(zone.slot(slot).current()?);
+                let execution = carrick_el1_linux::common_entry::execution_binding(
+                    carrick_x86_carrier::native_execution::task(),
+                );
+                let mut armed = SIGNAL_ON_NEXT_PARK.lock();
+                armed.is_none().then(|| {
+                    *armed = Some((record, execution));
+                    0
+                })
+            }
+            INJECT_OWNED_COPY_BUSY_ONCE => {
+                (!OWNED_COPY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
+            }
             INJECT_CAUGHT_SIGNAL_ON_PARK => {
                 if !CAUGHT_SIGNAL_ON_PARK.swap(true, Ordering::AcqRel)
                     && carrick_sched_core::spaces::inject_editor_busy_once()
