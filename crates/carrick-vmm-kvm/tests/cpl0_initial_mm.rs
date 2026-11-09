@@ -2179,6 +2179,25 @@ fn serial_host_native_child_write_from_untouched_page_supplies_zeros() {
     );
 }
 
+/// #1954: a native child's write whose buffer is readable for 16 bytes and
+/// then unmapped returns that prefix and writes it, as Linux's short write;
+/// a writev whose second vector starts on the unmapped page returns the
+/// first vector's 5 bytes. The refused supply never discards the prefix.
+#[test]
+fn serial_host_native_child_write_prefix_before_unmapped_page_is_short() {
+    bounded_witness(
+        "serial_host_native_child_write_prefix_before_unmapped_page_is_short",
+        || {
+            let (exit, bytes) = redirected_stdout_fixture(&["-DPREFIX"]);
+            assert_eq!(exit, 16, "write result (218 = ENOSYS, 242 = EFAULT)");
+            assert_eq!(bytes, b"0123456789abcdef");
+            let (exit, bytes) = redirected_stdout_fixture(&["-DPREFIXV"]);
+            assert_eq!(exit, 5, "writev result (218 = ENOSYS, 242 = EFAULT)");
+            assert_eq!(bytes, b"hello");
+        },
+    );
+}
+
 /// #1954 P0-2: with no ring descriptor table published for the initial task,
 /// its stdout write keeps the existing route instead of counted ENOSYS (-38).
 #[test]
