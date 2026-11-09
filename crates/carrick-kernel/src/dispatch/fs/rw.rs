@@ -178,19 +178,16 @@ impl OwnedWriteCopyIn {
 }
 
 impl SyscallDispatcher {
-    /// Resume only this retained write's copy-in and completion. The saved
-    /// request supplies syscall identity; the captured target supplies the
-    /// description, so the numeric fd is never resolved again.
-    #[allow(clippy::too_many_arguments)]
     /// Resume an IPC operation retained across another party's held IPC
     /// lock ([`DispatchOutcome::IpcLockContended`]) once its release handed
     /// the waiting record back. It continues from its retained progress; it
     /// may meet a held lock again and return the same outcome.
+    #[allow(clippy::too_many_arguments)]
     pub fn resume_ipc_lock_operation<M: CurrentMmMemory>(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
-        pending: Box<crate::kernel::continuation::ipc_lock::RetainedIpcLockOperation>,
+        pending: crate::kernel::continuation::ipc_lock::RetainedIpcLockOperation,
         memory: &mut M,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx<'_>>,
@@ -216,6 +213,10 @@ impl SyscallDispatcher {
         resources::with_captured_resources(kernel, || self.fs_view().resume_pipe2(&mut cx, pipe2))
     }
 
+    /// Resume only this retained write's copy-in and completion. The saved
+    /// request supplies syscall identity; the captured target supplies the
+    /// description, so the numeric fd is never resolved again.
+    #[allow(clippy::too_many_arguments)]
     pub fn resume_owned_write_copy_in<M: CurrentMmMemory>(
         &self,
         kernel: &crate::kernel::KernelContext,
