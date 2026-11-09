@@ -280,7 +280,11 @@ jobs:
       # schedule stay hosted. Merge groups moved off hosted macos-15 because
       # its jobs got no runner and were cancelled after ~20 min, ejecting
       # every group (owner, 2026-11-04, #231; cause tracked in #1603).
-      macos_runner: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'merge_group') && '["self-hosted","macOS","ARM64","carrick-macos-ci"]' || '"macos-15"' }}
+      # Merge groups get their own label, carrick-macos-queue, which PR jobs
+      # never request: the self-hosted runners don't pick jobs in order, so
+      # PR jobs starved group jobs for 24-50 min on 2026-11-09 (owner: "the
+      # merge queue takes precedence", #231; #1975).
+      macos_runner: ${{ github.event_name == 'merge_group' && '["self-hosted","macOS","ARM64","carrick-macos-queue"]' || ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","carrick-macos-ci"]' || '"macos-15"') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
