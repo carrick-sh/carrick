@@ -474,6 +474,22 @@ fn run_idle_peer_until_kick(peer: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpu
 
 #[test]
 fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
+    native_runtime_exit_wake(false);
+}
+
+/// #1973: the production native process owner's exit wake
+/// (`publish_signal_channel` -> `native_process::Service::wake_effects`)
+/// finds the parent's home run queue busy (the host holds CPU 0's queue
+/// lock, as a contending CPU would), so the wake queues the parent on the
+/// waker's own slot where it may not run (`misplaced`). The waker must leave
+/// for the host at its next boundary with its doorbell rung, so the host
+/// relocates the parent. Driven through the shared `WakeEffects::apply`.
+#[test]
+fn native_exit_wake_to_a_busy_home_is_misplaced_and_owes_the_host() {
+    native_runtime_exit_wake(true);
+}
+
+fn native_runtime_exit_wake(hold_home: bool) {
     use carrick_sched_core::Claim;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture("native_exit_order.S");
@@ -545,6 +561,47 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
             .expect("retire physical MM")
             .is_none()
     );
+    if hold_home {
+        let peer_cpu = carrick_guest_arch::CpuId::new(1);
+        let (misplaced_before, _) = factory
+            .fixture_native_wake_debt(peer_cpu)
+            .expect("waker debt before the exit wake");
+        let (exit, owed) = factory
+            .fixture_with_slot_locked(carrick_guest_arch::CpuId::new(0), || {
+                let exit = child.fixture_run_idle_peer().expect("finish child exit");
+                let owed = factory
+                    .fixture_native_wake_debt(peer_cpu)
+                    .expect("waker debt at its boundary")
+                    .1;
+                (exit, owed)
+            })
+            .expect("host holds the parent's home queue");
+        let (claim, _, wakes) = factory
+            .fixture_native_wait_state(root_tid)
+            .expect("woken wait");
+        let (misplaced, _) = factory
+            .fixture_native_wake_debt(peer_cpu)
+            .expect("waker debt after the exit wake");
+        assert_eq!(wakes, wakes_before + 1, "one exit publishes one wake");
+        assert!(
+            misplaced == misplaced_before + 1
+                && matches!(claim, Claim::Queued { slot, .. }
+                    if slot == carrick_sched_core::SlotId::new(1)),
+            "the waiter is queued, misplaced, on the waker's slot: {claim:?}, \
+             misplaced {misplaced_before} -> {misplaced}"
+        );
+        assert!(
+            matches!(
+                exit,
+                CarrierRunExit::PhysicalDoorbell {
+                    port: carrick_x86::cpl0_entry::WORK_PORT,
+                    ..
+                }
+            ) && owed,
+            "the misplaced waiter owes the host a boundary: exit {exit:?}, doorbell {owed}"
+        );
+        return;
+    }
     // Resume retire_mm to publish slot absence, then runtime readiness/channel.
     // Stop at the next sibling retirement, which has not published a wake.
     let next_retire = (0..128)

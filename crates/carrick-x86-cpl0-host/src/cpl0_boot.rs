@@ -2199,6 +2199,73 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         ))
     }
 
+    /// Fixture census of a stopped waker's host debt: the zone's misplaced
+    /// wake count and whether `cpu`'s task rang its pending-host-work
+    /// doorbell (`WakeEffects::owes_host_boundary`). Changes nothing.
+    pub fn fixture_native_wake_debt(
+        &self,
+        cpu: carrick_guest_arch::CpuId,
+    ) -> Result<(u64, bool), TrapError> {
+        if cpu.raw() >= 2 {
+            return Err(fail("unknown native fixture CPU"));
+        }
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let pointer = custody
+            .ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("fixture native zone backing"))?;
+        // SAFETY: boot initialized the aligned zone in this retained window.
+        let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
+        Ok((
+            zone.counters.el1_misplaced.load(Ordering::Acquire),
+            custody.task(cpu).linux.has_pending_host_work(),
+        ))
+    }
+
+    /// Run `body` while the host holds `cpu`'s run-queue lock, so a guest
+    /// wake that targets that slot finds it busy (its bounded spin gives up)
+    /// and falls back to the waker's own queue. Changes no claim itself.
+    pub fn fixture_with_slot_locked<R>(
+        &self,
+        cpu: carrick_guest_arch::CpuId,
+        body: impl FnOnce() -> R,
+    ) -> Result<R, TrapError> {
+        if cpu.raw() >= 2 {
+            return Err(fail("unknown native fixture CPU"));
+        }
+        let pointer = {
+            let custody = self
+                .custody
+                .lock()
+                .map_err(|_| fail("physical custody poisoned"))?;
+            custody
+                .ram
+                .host_ptr(
+                    META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                    size_of::<X86Cpl0Zone>(),
+                )
+                .ok_or_else(|| fail("fixture native zone backing"))?
+        };
+        // SAFETY: boot initialized the aligned zone in this retained window,
+        // and this factory (borrowed for the whole call) retains the RAM.
+        let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
+        let guard = zone
+            .slot_lock(
+                SlotId::new(cpu.raw() as u8),
+                &carrick_sched_core::BoundedSpin(0),
+            )
+            .ok_or_else(|| fail("fixture slot lock busy"))?;
+        let result = body();
+        drop(guard);
+        Ok(result)
+    }
+
     /// Snapshot while this factory still retains the carrier metadata mapping.
     pub fn syscall_counters(&self) -> Result<Counters, TrapError> {
         let custody = self
