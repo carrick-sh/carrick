@@ -1636,7 +1636,7 @@ impl<'a> FsView<'a> {
         if path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
-        let resolved = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
+        let resolved = self.resolve_at_path(LINUX_AT_FDCWD, path)?;
         let resolved = match self.canonicalize_following(&resolved) {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
