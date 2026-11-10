@@ -15,12 +15,11 @@ pub(super) struct NativeThreadStock<'a, C: ProcessContext> {
     namespace_exhausted: bool,
 }
 /// The retained state of one post-Born registration continuation: the
-/// parked clone caller, its Born child and the caller's clone result.
-#[derive(Clone, Copy)]
+/// parked clone caller and its Born child (whose control holds the tid).
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 struct BornRegistrationWait {
     caller: carrick_el1_abi::RecordRef,
     child: carrick_el1_abi::RecordRef,
-    result: SyscallResult,
 }
 struct ControlRelease<'a, C: ProcessContext> {
     zone: &'a ZoneTables<C>,
@@ -299,7 +298,7 @@ pub(super) fn admission_settled<M: Clone, C: ProcessContext>(
             .task(key)
             .ok()
             .and_then(|task| task.native().resources().thread_stock.as_ref())
-            .filter(|stock| !stock.waiters.is_empty() || !stock.born_waiters.is_empty())
+            .filter(|stock| !stock.waiters.is_empty())
             .map(|stock| stock.release.clone())
     };
     if let Some(release) = release {
@@ -490,7 +489,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub(super) fn await_born_registration(
         &mut self,
         child: RecordRef,
-        result: SyscallResult,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
         use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
         let (release, control) = {
@@ -510,6 +508,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .ok_or(NativeProcessError::Stale)?;
             (stock.release.clone(), control)
         };
+        // The clone result is the child's visible tid, published once already.
+        let result = SyscallResult::new(i64::from(
+            control.visible_tid().ok_or(NativeProcessError::Stale)?,
+        ));
         let key = release.source.key();
         let zone = self.source.zone;
         let caller = self.record;
@@ -574,11 +576,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     {
                         return Err(ObjectWaitError::Stale);
                     }
-                    stock.born_waiters.push(BornRegistrationWait {
-                        caller,
-                        child,
-                        result,
-                    });
+                    stock
+                        .born_waiters
+                        .push(BornRegistrationWait { caller, child });
                     // The queue is enrolled before this final probe. Only the
                     // release notification wakes the retained continuation.
                     unsafe {
@@ -671,12 +671,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         // The clone already committed: rerun only its birth's registration,
         // then complete the caller with its retained result (never a retry).
-        Ok(Some(
-            match self.await_born_registration(born.child, born.result)? {
-                LifecycleOutcome::Returned { result, .. } => NativeResume::Returned(result),
-                _ => NativeResume::Left(None),
-            },
-        ))
+        Ok(Some(match self.await_born_registration(born.child)? {
+            LifecycleOutcome::Returned { result, .. } => NativeResume::Returned(result),
+            _ => NativeResume::Left(None),
+        }))
     }
 }
 

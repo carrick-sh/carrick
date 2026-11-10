@@ -8509,17 +8509,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         match self.register_born(record) {
             Ok(closing) => self.queue_registered_birth(record, closing),
             // Contention is not a refusal: the birth stays Born, unqueued
-            // and record-keyed; its clone caller awaits the registration.
-            Err(NativeProcessError::Busy) => BornEnqueue::Busy,
+            // and record-keyed while its clone caller awaits registration.
+            Err(NativeProcessError::Busy) => match self.await_born_registration(record) {
+                Ok(LifecycleOutcome::Returned { .. }) => BornEnqueue::Queued,
+                Ok(_) => BornEnqueue::Parked,
+                Err(_) => BornEnqueue::Refused,
+            },
             Err(_) => BornEnqueue::Refused,
         }
-    }
-    fn await_thread_registration(
-        &mut self,
-        record: RecordRef,
-        result: SyscallResult,
-    ) -> Option<LifecycleOutcome> {
-        self.await_born_registration(record, result).ok()
     }
     fn wake_thread_join(&mut self, mm: carrick_core_abi::EntryMmKey, address: UserVa) -> bool {
         if mm != self.binding.mm {

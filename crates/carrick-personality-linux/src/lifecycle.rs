@@ -278,17 +278,6 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn enqueue_thread(&mut self, _record: RecordRef) -> BornEnqueue {
         BornEnqueue::Refused
     }
-    /// Finish a [`BornEnqueue::Busy`] birth as the clone caller's owned
-    /// post-Born continuation: register and queue `record` when its
-    /// contention releases, then return `result` to the caller. `None` is a
-    /// broken invariant.
-    fn await_thread_registration(
-        &mut self,
-        _record: RecordRef,
-        _result: SyscallResult,
-    ) -> Option<LifecycleOutcome> {
-        None
-    }
     fn wake_thread_join(&mut self, _mm: carrick_core_abi::EntryMmKey, _address: UserVa) -> bool {
         false
     }
@@ -552,11 +541,11 @@ pub struct ExitRecord {
 pub enum BornEnqueue {
     Queued,
     Refused,
-    /// The birth's native registration met contention ("not now"). The
-    /// child stays Born, unqueued and retained by its process owner, with its
-    /// record-keyed pending signals; the clone caller completes it through
-    /// [`LifecycleNative::await_born_registration`] (#1974).
-    Busy,
+    /// The birth's registration had to wait (#1974). Its process owner kept
+    /// the birth (Born, unqueued, record-keyed) and parked this clone caller
+    /// as the birth's owned continuation, which registers and queues it and
+    /// then completes the caller with the child's tid. Not a failure.
+    Parked,
 }
 
 impl From<carrick_sched_core::Requeue> for BornEnqueue {
@@ -641,16 +630,6 @@ pub trait LifecycleNative<'a>: UserCopy {
     /// Make a committed birth runnable. A refusal is returned, never
     /// dropped: the caller fails closed (#1100).
     fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue;
-    /// Complete a [`BornEnqueue::Busy`] birth for its clone caller, whose
-    /// syscall result is `result`. Busy is contention, never a failure: the
-    /// owner keeps the birth and parks the caller until it can register it.
-    fn await_born_registration(
-        &mut self,
-        _record: RecordRef,
-        _result: SyscallResult,
-    ) -> LifecycleOutcome {
-        self.fail_lifecycle(NativeRunFailureReason::BornEnqueueRefused)
-    }
     fn exit_record(&self) -> Option<ExitRecord>;
     fn wake_child_tid(&mut self, mm: EntryMmKey, address: UserVa) -> bool;
     fn release_current(
@@ -690,8 +669,8 @@ pub trait LifecycleNative<'a>: UserCopy {
         None
     }
 
-    /// `Ok(BornEnqueue::Busy)`: Born is published and the caller owes
-    /// [`Self::await_born_registration`]; a refusal has already failed closed.
+    /// `Ok(BornEnqueue::Parked)`: Born is published and the owner parked the
+    /// caller as the birth's continuation; a refusal has already failed closed.
     fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<BornEnqueue, i64> {
         birth.record()?;
         let enqueued = self.enqueue_born(birth.record);
@@ -1521,13 +1500,15 @@ fn serve_clone<'a>(
     if native.lifecycle_admission_settled().is_err() {
         native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
     }
-    let result = SyscallResult::new(visible as i64);
-    if enqueued == BornEnqueue::Busy {
+    if enqueued == BornEnqueue::Parked {
         // Born and the tid outputs are published exactly once already; the
-        // owner finishes registration as this caller's continuation.
-        return Some(native.await_born_registration(record, result));
+        // owner's continuation completes this caller after registration.
+        return Some(LifecycleOutcome::Transferred {
+            progress: carrick_core_abi::Served::Idle,
+            result: SyscallResult::new(0),
+        });
     }
-    Some(returned(result, false))
+    Some(returned(SyscallResult::new(visible as i64), false))
 }
 
 /// `exit(status)` of a non-leader thread that EL1 switched in, when it is

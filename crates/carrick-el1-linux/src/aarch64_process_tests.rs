@@ -7025,7 +7025,7 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
     ));
     assert_eq!(
         // SAFETY: the handed-back record's context is quiescent here.
-        unsafe { (*fixture.zone.record(selected.record).ctx_mut()).native.x[0] },
+        unsafe { fixture.zone.record(selected.record).ctx_mut().native.x[0] },
         u64::from(tid),
         "the clone caller completes with the child tid"
     );

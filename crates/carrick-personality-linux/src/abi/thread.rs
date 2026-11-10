@@ -1545,9 +1545,9 @@ impl ThreadLifecycleSlot {
     /// # Safety
     ///
     /// `page` must be the [`ThreadLifecycleSlot::page`] field of a live slot
-    /// whose storage stays mapped for `'a`, as the ARM carrier guarantees for
+    /// whose storage stays mapped as long as `page`, as the ARM carrier guarantees for
     /// every lifecycle page it publishes.
-    pub unsafe fn controls_of<'a>(page: &'a ThreadLifecyclePage) -> &'a [ThreadControlSlot] {
+    pub unsafe fn controls_of(page: &ThreadLifecyclePage) -> &[ThreadControlSlot] {
         // SAFETY: the caller guarantees `page` heads a whole retained slot.
         unsafe { &(*core::ptr::from_ref(page).cast::<ThreadLifecycleSlot>()).controls }
     }

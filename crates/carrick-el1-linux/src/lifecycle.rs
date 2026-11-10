@@ -425,35 +425,12 @@ impl<
         // under the graph guard; that caller instead rolls back live/claim
         // custody before publishing the settlement wake. Born is published,
         // so a refused enqueue is not a clone failure: fail closed (#1100).
-        // Busy registration is contention: the clone caller awaits it.
+        // A parked caller is the birth's continuation, not a failure.
         let enqueued = self.enqueue_born(birth.record);
         if enqueued == BornEnqueue::Refused {
             self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BornEnqueueRefused);
         }
         Ok(enqueued)
-    }
-    fn await_born_registration(
-        &mut self,
-        record: RecordRef,
-        result: SyscallResult,
-    ) -> LifecycleOutcome {
-        let outcome = self
-            .process_venue()
-            .and_then(|venue| venue.await_thread_registration(record, result));
-        match outcome {
-            Some(outcome) => {
-                if self.frame.arm_scheduler()
-                    && matches!(outcome, LifecycleOutcome::Returned { .. })
-                {
-                    // Registered and queued without parking the caller.
-                    self.arm_born_runnable();
-                }
-                outcome
-            }
-            None => {
-                self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BornEnqueueRefused)
-            }
-        }
     }
     fn thread_exited(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         if let Some(venue) = self.process_venue() {
