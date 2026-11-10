@@ -1124,42 +1124,52 @@ fn accept_exit(dir: &Path) -> Result<bool, ReceiptError> {
         .ok_or_else(|| fail(format!("{ACCEPT_EXIT} lacks a boolean success")))
 }
 
-/// A paired base is a baseline only when it ran to completion. Completed
-/// tests with known failures stay comparable: the gate is differential. A
-/// step that did not run (a killed or unfinished binary, a build failure,
-/// zero tests selected), tests skipped after a budget expired, or a failing
-/// acceptance exit that no completed failure explains is refused before any
-/// comparison, so a missing base result can never read as FIXED.
-pub fn admit_paired_base(receipt: &AcceptReceipt, accepted: bool) -> Result<(), ReceiptError> {
-    let refuse =
-        |why: String| ReceiptError::IncomparableBase(format!("paired base incomplete: {why}"));
-    let mut completed_failure = !receipt.probe_diffs.is_empty();
+/// The gaps in one side's evidence: a step that did not run to completion (a
+/// killed or unfinished binary, a build failure, zero tests selected) or tests
+/// skipped after a budget expired. Completed tests with known failures are
+/// not gaps: the gate is differential.
+pub fn receipt_gaps(receipt: &AcceptReceipt) -> Vec<String> {
+    let mut gaps = Vec::new();
     for step in &receipt.steps {
-        match step.execution_outcome() {
-            crate::accept::StepOutcome::NotRun { reason } => {
-                return Err(refuse(format!(
-                    "step {} did not run to completion: {reason}",
-                    step.name
-                )));
-            }
-            crate::accept::StepOutcome::Failed { .. } => completed_failure = true,
-            crate::accept::StepOutcome::Passed => {}
+        if let crate::accept::StepOutcome::NotRun { reason } = step.execution_outcome() {
+            gaps.push(format!(
+                "step {} did not run to completion: {reason}",
+                step.name
+            ));
         }
         if !step.not_run_tests.is_empty() {
-            return Err(refuse(format!(
-                "step {} was interrupted before {} test(s) ran",
+            gaps.push(format!(
+                "step {} interrupted before {} test(s) ran",
                 step.name,
                 step.not_run_tests.len()
-            )));
+            ));
         }
     }
+    gaps
+}
+
+/// What keeps the paired base from being a complete baseline: its own
+/// `receipt_gaps`, plus a failing acceptance exit that no completed failure
+/// explains. An incomplete base is advisory when the candidate completed
+/// (owner, 2026-11-10, #231, #2045): its un-run tests are never read as FIXED
+/// (`compare` classifies against what the base started) and the candidate is
+/// still checked for its own gaps and introduced failures.
+pub fn paired_base_gaps(receipt: &AcceptReceipt, accepted: bool) -> Vec<String> {
+    let mut gaps = receipt_gaps(receipt);
+    let completed_failure = !receipt.probe_diffs.is_empty()
+        || receipt.steps.iter().any(|step| {
+            matches!(
+                step.execution_outcome(),
+                crate::accept::StepOutcome::Failed { .. }
+            )
+        });
     if !accepted && !completed_failure {
-        return Err(refuse(
+        gaps.push(
             "acceptance exited nonzero with no completed failure to explain it (infrastructure failure)"
                 .into(),
-        ));
+        );
     }
-    Ok(())
+    gaps
 }
 
 /// Receipt file names inside one execution's output directory.
@@ -1270,10 +1280,8 @@ pub fn execute_pair(
                 receipt_name: BASE_RECEIPT,
             })
             .map_err(|error| fail(format!("paired base {}: {error}", request.base)))?;
-            // An incomplete base cannot serve as a baseline; refuse before
-            // spending a candidate run on a comparison that cannot pass.
-            let receipt = load(&base_dir.join(BASE_RECEIPT))?;
-            admit_paired_base(&receipt, accept_exit(&base_dir)?)?;
+            // An incomplete base is advisory (#2045): the candidate still
+            // runs, and `publish` derives the base gap again from the receipt.
             // Seal the base now, before any candidate code runs. The
             // expected inventory lives only in this process's memory.
             sealed = Some((base_dir.clone(), evidence_inventory(&base_dir)?));
@@ -1643,6 +1651,7 @@ fn publish(
             Err(error) => return Err(fail(format!("cannot clear stale comparison: {error}"))),
         }
         let candidate = load(&results.join(CANDIDATE_RECEIPT))?;
+        let mut base_gaps = Vec::new();
         // Compare only with the base executed in this run, on the same Mac and
         // with the same fixture bundle. A stored receipt from another host is
         // never a substitute; comparability is still checked below.
@@ -1652,7 +1661,7 @@ fn publish(
             let dir = results.join(BASE_DIR);
             verify_base_seal(results, &request.base)?;
             let base = load(&dir.join(BASE_RECEIPT))?;
-            admit_paired_base(&base, accept_exit(&dir)?)?;
+            base_gaps = paired_base_gaps(&base, accept_exit(&dir)?);
             let evidence = admit_evidence(&dir, &base).map(|_| ());
             (base, evidence)
         };
@@ -1688,17 +1697,51 @@ fn publish(
                 serde_json::to_string_pretty(identity).map_err(|e| fail(e.to_string()))?
             )),
         }
+        // With a base gap the candidate must itself be complete: its
+        // interruption is not visible in the advisory EL1 set differences.
+        let candidate_gaps = if base_gaps.is_empty() {
+            Vec::new()
+        } else {
+            receipt_gaps(&candidate)
+        };
+        if !base_gaps.is_empty() {
+            body.push_str(&format!(
+                "\n**Advisory: the paired base is incomplete.** {}. Base failures it never ran cannot be compared, so they are not read as fixed; the candidate completed, so this does not block.\n",
+                base_gaps.join("; ")
+            ));
+        }
+        if !candidate_gaps.is_empty() {
+            body.push_str(&format!(
+                "\n**Candidate is incomplete — BLOCKED:** {}\n",
+                candidate_gaps.join("; ")
+            ));
+        }
         let passed = !diff.blocks()
+            && candidate_gaps.is_empty()
             && valid.is_ok()
             && identity.is_ok()
             && base_evidence.is_ok()
             && execution_result == "success";
-        let blocking = diff.blocks().then(|| diff.blocking_summary());
-        Ok::<_, ReceiptError>((passed, body, blocking))
+        let blocking = if let Some(gap) = candidate_gaps.first() {
+            Some(format!("Candidate incomplete: {gap}"))
+        } else {
+            diff.blocks().then(|| diff.blocking_summary())
+        };
+        let advisory = base_gaps.first().map(|gap| {
+            let more = base_gaps.len() - 1;
+            if more == 0 {
+                format!("Advisory, base incomplete: {gap}")
+            } else {
+                format!("Advisory, base incomplete: {gap} (+{more} more)")
+            }
+        });
+        Ok::<_, ReceiptError>((passed, body, blocking, advisory))
     })();
     let candidate_path = results.join(CANDIDATE_RECEIPT);
-    let (passed, mut body, outcome, blocking) = match comparison {
-        Ok((passed, body, blocking)) => (passed, body, PublishOutcome::Compared, blocking),
+    let (passed, mut body, outcome, blocking, advisory) = match comparison {
+        Ok((passed, body, blocking, advisory)) => {
+            (passed, body, PublishOutcome::Compared, blocking, advisory)
+        }
         // A cancelled job that never wrote a candidate has no verdict to
         // report; it still fails the required check, only the text differs.
         Err(ReceiptError::Io { path, source })
@@ -1714,6 +1757,7 @@ fn publish(
                 ),
                 PublishOutcome::Cancelled,
                 None,
+                None,
             )
         }
         Err(error @ ReceiptError::IncomparableBase(_)) => (
@@ -1724,6 +1768,7 @@ fn publish(
             ),
             PublishOutcome::IncomparableBase,
             None,
+            None,
         ),
         Err(error) => (
             false,
@@ -1732,6 +1777,7 @@ fn publish(
                 request.sha, request.base
             ),
             PublishOutcome::Compared,
+            None,
             None,
         ),
     };
@@ -1767,6 +1813,13 @@ fn publish(
         "Incomparable base: host, fixture or incomplete base run; blocked".to_string()
     } else if outcome == PublishOutcome::Cancelled {
         "Gate run cancelled before producing a result; no verdict".to_string()
+    } else if let (true, Some(advisory)) = (passed, &advisory) {
+        // GitHub rejects commit status descriptions over 140 characters.
+        let mut text: String = advisory.chars().take(137).collect();
+        if text.len() < advisory.len() {
+            text.push_str("...");
+        }
+        text
     } else if passed {
         "No introduced failures; populations and completion preserved".to_string()
     } else if let Some(blocking) = &blocking {
