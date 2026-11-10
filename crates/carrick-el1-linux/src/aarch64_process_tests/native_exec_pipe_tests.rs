@@ -3,14 +3,14 @@
 //! physical custody; real executable population witnesses are in
 //! carrick-conformance-next/tests/native_exe_lifecycle.rs.
 use super::*;
-use crate::native_process_runtime::{host_test_support::Physical, NativeResume, NativeServiceCall};
+use crate::native_process_runtime::{NativeResume, NativeServiceCall, host_test_support::Physical};
 use crate::sched::LinuxSchedEntry;
 use carrick_core_abi::service::{
     ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
     ServiceCell,
 };
-use carrick_el1_abi::ipc::{fd, pipe::End, IpcBacking};
 use carrick_el1_abi::Lifecycle;
+use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
 use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
 use carrick_sched_core::{ShortLockSpin, WakeEffects};
 use std::{collections::BTreeMap, sync::Arc};
@@ -306,10 +306,12 @@ fn fork_exec_probe_copy(
         ));
         assert!(entry.take_handoff_receipt().is_some());
     } else {
-        assert!(fixture
-            .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
-            .is_queued());
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, parent_binding.record.id)
+                .is_queued()
+        );
     }
     activate_target(source, &fixture.task, &child_binding);
     let child_table = fixture.task.linux.file_table.load(Ordering::Acquire);
@@ -389,9 +391,11 @@ fn fork_exec_probe_copy(
             },
         )
         .unwrap();
-    assert!(ticket
-        .publish_exec_prepared(receipt, (), |_, ()| {})
-        .is_ok());
+    assert!(
+        ticket
+            .publish_exec_prepared(receipt, (), |_, ()| {})
+            .is_ok()
+    );
     let queue = fixture
         .zone
         .object_wait(
@@ -479,7 +483,6 @@ fn fork_exec_probe_copy(
         let mut frame = carrick_el1_abi::TrapFrame {
             esr: 0x15 << 26,
             elr: 0x400004,
-            esr: 0x15 << 26,
             slot: u64::from(fixture.slot.raw()),
             ..Default::default()
         };
@@ -869,11 +872,13 @@ fn fork_exec_probe_copy(
         super::pipe_metadata_tests::exercise(case, |nr, args| {
             call_full(nr, args[0], args[1], args[2], args[3]) as i64
         });
-        assert!(owner
-            .region()
-            .fd(carrick_sched_core::ShortLockSpin)
-            .getfd(table.id(), fd::Fd(6))
-            .unwrap());
+        assert!(
+            owner
+                .region()
+                .fd(carrick_sched_core::ShortLockSpin)
+                .getfd(table.id(), fd::Fd(6))
+                .unwrap()
+        );
         registry.unregister_root_for_test(&runtime);
         return;
     }
@@ -973,10 +978,12 @@ fn fork_exec_probe_copy(
         );
     }
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
-    assert!(fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_binding.record.id)
-        .is_queued());
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .is_queued()
+    );
     activate_target(source, &fixture.task, &parent_binding);
     assert_eq!(call_full(63, 3, memory.arg() + 512, 8, 0), 8);
     assert_eq!(&memory.as_mut_bytes()[512..520], b"1\n1\n2\n3\n");
@@ -1103,10 +1110,12 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     unsafe {
         *fixture.zone.record(parent_binding.record.id).ctx_mut() = parent_binding.words;
     }
-    assert!(fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent_binding.record.id)
-        .is_queued());
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
     activate_target(source, &fixture.task, &child_binding);
     let child_table = fixture.task.linux.file_table.load(Ordering::Acquire);
     assert_ne!(child_table, 5, "production fork owns an inherited table");
@@ -1154,7 +1163,6 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
         let mut frame = carrick_el1_abi::TrapFrame {
             esr: 0x15 << 26,
             elr: 0x400004,
-            esr: 0x15 << 26,
             slot: u64::from(fixture.slot.raw()),
             ..Default::default()
         };
@@ -1186,25 +1194,31 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
         (route, frame.x[0])
     };
     // Both real fork participants stay alive throughout the reader's park.
-    assert!(fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_binding.record.id)
-        .is_queued());
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .is_queued()
+    );
     activate_target(source, &fixture.task, &parent_binding);
-    assert!(fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent_binding.record.id)
-        .is_queued());
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
     activate_target(source, &fixture.task, &child_binding);
     let parked = dispatch(63, 3);
     assert_eq!(
         parked.0,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
-    assert!(fixture
-        .zone
-        .record(child_binding.record.id)
-        .has_object_operation());
+    assert!(
+        fixture
+            .zone
+            .record(child_binding.record.id)
+            .has_object_operation()
+    );
     // SAFETY: the reader is parked and this fixture owns its record.
     assert_eq!(
         unsafe { fixture.zone.record(child_binding.record.id).ctx_mut() }
@@ -1312,10 +1326,12 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
             break;
         }
         let other = fixture.zone.slot(fixture.slot).current().unwrap();
-        assert!(fixture
-            .zone
-            .requeue_preempted(fixture.slot, other)
-            .is_queued());
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, other)
+                .is_queued()
+        );
     }
     assert_eq!(
         fixture.zone.slot(fixture.slot).current(),
@@ -1331,10 +1347,12 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     // Preempt before the SVC executes and select the same reader again. The
     // retry position belongs to the saved context, so selection is idempotent
     // until a later architectural save replaces that context.
-    assert!(fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_binding.record.id)
-        .is_queued());
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .is_queued()
+    );
     let mut resume_cpu = ResumeCpu {
         inner: crate::sched::FakeCpu::default(),
         runtime: &runtime,
@@ -1362,10 +1380,12 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
             break;
         }
         let other = fixture.zone.slot(fixture.slot).current().unwrap();
-        assert!(fixture
-            .zone
-            .requeue_preempted(fixture.slot, other)
-            .is_queued());
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, other)
+                .is_queued()
+        );
     }
     assert_eq!(
         fixture.zone.slot(fixture.slot).current(),
@@ -1902,10 +1922,12 @@ fn child_futex<'a>(
         // Model the stopped carrier boundary using the same public entry
         // points as reconcile_zone_exit and executor slot reuse.
         fixture.zone.leave_guest(fixture.slot, &ShortLockSpin);
-        assert!(fixture
-            .zone
-            .requeue_preempted(fixture.slot, worker.record.id)
-            .is_queued());
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, worker.record.id)
+                .is_queued()
+        );
         carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
             carrick_kernel::el1_zone::hand_back_foreign_timer(fixture.slot);
         });
@@ -1945,39 +1967,45 @@ fn child_futex<'a>(
             );
         } else {
             // No timeout before the original deadline, then exactly one timeout.
-            assert!(fixture
-                .zone
-                .expire_native_timer(
-                    carrick_guest_arch::CounterTick::new(deadline - 1),
-                    &ShortLockSpin,
-                    &|owned| crate::sched::object_wait::deliver_host_completion(
-                        owned.zone(),
-                        owned
+            assert!(
+                fixture
+                    .zone
+                    .expire_native_timer(
+                        carrick_guest_arch::CounterTick::new(deadline - 1),
+                        &ShortLockSpin,
+                        &|owned| crate::sched::object_wait::deliver_host_completion(
+                            owned.zone(),
+                            owned
+                        )
                     )
-                )
-                .is_none());
-            assert!(fixture
-                .zone
-                .expire_native_timer(
-                    carrick_guest_arch::CounterTick::new(deadline),
-                    &ShortLockSpin,
-                    &|owned| crate::sched::object_wait::deliver_host_completion(
-                        owned.zone(),
-                        owned
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .zone
+                    .expire_native_timer(
+                        carrick_guest_arch::CounterTick::new(deadline),
+                        &ShortLockSpin,
+                        &|owned| crate::sched::object_wait::deliver_host_completion(
+                            owned.zone(),
+                            owned
+                        )
                     )
-                )
-                .is_some());
-            assert!(fixture
-                .zone
-                .expire_native_timer(
-                    carrick_guest_arch::CounterTick::new(deadline),
-                    &ShortLockSpin,
-                    &|owned| crate::sched::object_wait::deliver_host_completion(
-                        owned.zone(),
-                        owned
+                    .is_some()
+            );
+            assert!(
+                fixture
+                    .zone
+                    .expire_native_timer(
+                        carrick_guest_arch::CounterTick::new(deadline),
+                        &ShortLockSpin,
+                        &|owned| crate::sched::object_wait::deliver_host_completion(
+                            owned.zone(),
+                            owned
+                        )
                     )
-                )
-                .is_none());
+                    .is_none()
+            );
             assert_eq!(fixture.zone.timer_node_count(), 0);
             assert_eq!(waiter.result() as i64, -110);
             assert_eq!(waiter.entry_count(), 0);
@@ -2051,10 +2079,12 @@ fn child_futex<'a>(
                 .is_none(),
             "the later timeout must not resolve the wake winner again"
         );
-        assert!(fixture
-            .zone
-            .requeue_preempted(fixture.slot, worker.record.id)
-            .is_queued());
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, worker.record.id)
+                .is_queued()
+        );
         let selected = activate_target(source, &fixture.task, &binding);
         assert_eq!(
             selected.result,
