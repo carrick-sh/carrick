@@ -639,3 +639,142 @@ fn arm_host_loaded_root_signal_checkpoint_after_another_process_on_the_vcpu() {
 fn arm_host_loaded_root_delivers_pending_signal_once_after_another_process_on_the_vcpu() {
     host_loaded_root_returns_after_foreign_occupant(true);
 }
+
+/// The signal checkpoint's refusal is returned, never served (#1958 review).
+/// A recorded host-loaded root has SIGUSR1 pending when its slot carries a
+/// foreign namespace PID: admission refuses the binding as `Stale`, and
+/// `arm_signal_user_return_entry` must hand that refusal to the vector
+/// (`entry_binding`) without delivering the signal or touching the frame.
+/// With its own PID back, the same checkpoint delivers SIGUSR1 once.
+#[test]
+fn arm_signal_checkpoint_returns_a_stale_admission_refusal() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    let task: &'static CurrentTask = &fixture.task;
+    let root_pid = fixture.leader.tid as u32;
+    let action = carrick_test_support::GuestUserBuffer::from_values(&[
+        0x70_0000_u64,
+        0x0400_0000,
+        0x71_0000,
+        0,
+    ]);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 134;
+    frame.x[0] = 10;
+    frame.x[1] = action.arg();
+    frame.x[3] = 8;
+    arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+    assert_eq!(frame.x[0], 0, "rt_sigaction(SIGUSR1)");
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 131;
+    frame.x[..3].copy_from_slice(&[u64::from(root_pid), u64::from(root_pid), 10]);
+    arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+    assert_eq!(frame.x[0], 0, "tgkill(self, SIGUSR1)");
+    assert!(
+        fixture.control.zone_record().is_some(),
+        "the root's admission recorded it in the zone"
+    );
+
+    // Another process's PID and root incarnation are live on the slot: the
+    // binding is stale.
+    let root_generation = task.root_generation().unwrap();
+    task.publish_visible_pid(41);
+    task.publish_root_generation(ContextGeneration::new(NonZeroU64::new(202).unwrap()));
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let mut checkpoint = carrick_el1_abi::TrapFrame {
+        esr: 0xfffe,
+        slot: u64::from(fixture.slot.raw()),
+        elr: 0x40_0004,
+        ..Default::default()
+    };
+    checkpoint.x[0] = 3;
+    checkpoint.x[8] = 63;
+    let before = checkpoint;
+    let mut delivered = 0;
+    assert_eq!(
+        signal_checkpoint(fixture, &mut checkpoint, &stack, &mut delivered),
+        Err(NativeProcessError::Stale),
+        "a stale admission is returned to the vector, never served"
+    );
+    assert_eq!(delivered, 0, "a refused admission delivers no signal");
+    assert_eq!(checkpoint, before, "a refused admission leaves the frame");
+
+    // Its own binding restored, the same checkpoint delivers SIGUSR1 once.
+    task.publish_visible_pid(root_pid);
+    task.publish_root_generation(root_generation);
+    assert_eq!(
+        signal_checkpoint(fixture, &mut checkpoint, &stack, &mut delivered),
+        Ok(carrick_el1_abi::Action::Served)
+    );
+    assert_eq!(delivered, 1);
+    assert_eq!(checkpoint.elr, 0x70_0000, "the handler runs next");
+    assert_eq!(checkpoint.x[0], 10);
+}
+
+/// `Quarantined` cannot be forced through the signal checkpoint's admission:
+/// for a registered entry every refusal there is `Stale`
+/// (`admit_entry_runtime`, `authenticate_registered`), and its delivery
+/// closure returns a route, not an error. The nearest production seam over
+/// the same admitted delivery that raises it is the declined-fault entry
+/// (`deliver_declined_fault_signal_with`): an unexpected completion route is
+/// `Quarantined`, and the vector's adapter returns it rather than serving.
+#[test]
+fn arm_declined_fault_returns_a_quarantined_delivery_refusal() {
+    use carrick_signal_core::policy::{Action, Disposition, Signal};
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let ignore = Action {
+        disposition: Disposition::Ignore,
+        ..Default::default()
+    };
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(Signal::PIPE, Some(ignore))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        esr: 0x9200_004f,
+        far: crate::mm_portal::test_support::VA,
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let before = frame;
+    let mut owner_wait = None;
+    assert_eq!(
+        super::super::dispatch::arm_deliver_declined_fault_signal_with(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.page,
+            fixture.control,
+            &mut service,
+            &mut frame,
+            &mut owner_wait,
+            |_, _| Some(carrick_personality_linux::dispatch::CompletionRoute::Forward),
+        ),
+        Err(NativeProcessError::Quarantined),
+        "an unexpected delivery route is returned as Quarantined, never served"
+    );
+    assert!(owner_wait.is_none());
+    assert_eq!(frame, before, "a refused delivery leaves the frame");
+}
