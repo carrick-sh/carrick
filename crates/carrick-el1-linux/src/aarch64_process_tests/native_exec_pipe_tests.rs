@@ -563,7 +563,7 @@ fn fork_exec_probe_with_scenario(
             entry.begin_exec_service(
                 payload.into_boxed_slice(),
                 None,
-                NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), &counters)
+                NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), counters)
             ),
             Ok(NativeResume::Left(None))
         ));
@@ -899,7 +899,7 @@ fn fork_exec_probe_with_scenario(
         });
         let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
-            &counters,
+            counters,
             core::slice::from_ref(&fixture.task),
             if metadata.is_some() {
                 crossing.fd_map()
