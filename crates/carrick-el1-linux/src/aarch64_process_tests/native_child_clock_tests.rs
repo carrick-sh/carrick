@@ -400,5 +400,9 @@ fn child_gettimeofday_invalid_timeval_is_efault() {
 fn child_gettimeofday_faulting_timezone_is_efault_after_timeval() {
     let tv = carrick_test_support::GuestUserBuffer::from_bytes(&[0xaa; 16]);
     assert_eq!(child_gettimeofday(tv.arg(), u64::MAX, &mut 0), -14);
-    assert_eq!(pair(tv.as_bytes()), (1_234, 0), "timeval was already written");
+    assert_eq!(
+        pair(tv.as_bytes()),
+        (1_234, 0),
+        "timeval was already written"
+    );
 }
