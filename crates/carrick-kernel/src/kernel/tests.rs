@@ -2285,3 +2285,75 @@ fn production_namespaced_roots_grow_local_identity_storage() {
     }
     assert_eq!(kernel.ids().counts().task_claims, 9);
 }
+
+/// #1900/#936, x86 CPL0 owner MMU: the ring admits a host-served root that
+/// already exec'd (`sh -c "exec driver"`) with the exec capability the run
+/// installed at launch. Its host exec replaced the root's descriptor table,
+/// which named a capability no carrier service held on main, so every native
+/// child's exec and root fork seed was refused with counted ENOSYS. The
+/// x86 lane does not yet route a native child's `execve` to the service
+/// (seam #1093); this pins the shared admission both lanes use.
+#[test]
+fn execed_production_root_admits_with_its_launch_exec_capability() {
+    use super::{Container, LaunchContext, RunId};
+    use crate::namespace::pid::NsSharedRegion;
+    use carrick_core_abi::{
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
+    };
+    use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
+    use carrick_hal::birth_serial::test_support::OwnedBirthZone;
+    use carrick_kernel_arena::arena::KernelArena;
+    let arena = Box::leak(Box::new(KernelArena::create().unwrap()));
+    let region = NsSharedRegion::allocate(arena).unwrap();
+    let container = Arc::new(Container::new(LaunchContext::unmanaged(RunId::new(
+        "execed-root",
+    ))));
+    container.install_pid_ns(region).unwrap();
+    let bootstrap = RootBootstrap::for_prepared_launch(
+        41,
+        ThreadId::synthetic_for_tests(41),
+        "execed-root".into(),
+        container,
+        Arc::new(carrick_hal::NullHostSignalBridge::default()),
+    )
+    .unwrap();
+    let mut launched = None;
+    let native = NativeSignalFixture::from_bootstrap_with_file_table(|zone| {
+        let source = Arc::new(OwnedBirthZone::from_static(zone));
+        let (kernel, root) = Kernel::bootstrap_root(bootstrap.with_birth_source(source)).unwrap();
+        // Launch: the run installs its exec service under this capability.
+        let installed = crate::dispatch::exec_files::native_exec_capability(&root)
+            .expect("launch root mints a capability");
+        // The root's own exec takes the host route before its first fork.
+        let prepared = kernel.prepare_exec(&root, None).unwrap();
+        let execed = kernel.commit_exec(prepared, None).unwrap();
+        assert_ne!(
+            execed.resources().files().id(),
+            root.resources().files().id(),
+            "exec gives the root a fresh descriptor table"
+        );
+        let task = execed.task().key();
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(task.id.raw() as u64),
+            generation: SnapshotGeneration::INITIAL,
+            mm: EntryMmKey::from_raw(execed.shared().mm().id().raw()),
+            thread_generation: EntryThreadGeneration::from_raw(execed.thread().key().serial.raw()),
+        };
+        let visible = crate::namespace::pid::ns_self_pid_for(&execed, task.id.raw() as u32);
+        let file_table = execed.resources().files().id().raw();
+        launched = Some((kernel, installed, execed));
+        (
+            binding,
+            EntryTaskKey::from_raw(u64::from(visible)),
+            BirthSerial::of_task(task.serial),
+            file_table,
+        )
+    });
+    let (_kernel, installed, _execed) = launched.unwrap();
+    assert_eq!(
+        native.exec_capability(),
+        Some(installed),
+        "the post-exec root's tree names the service installed at launch"
+    );
+}

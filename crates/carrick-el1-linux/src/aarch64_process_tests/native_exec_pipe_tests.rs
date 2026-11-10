@@ -1786,3 +1786,221 @@ fn child_futex<'a>(
     );
     assert!(runtime.task_binding(parent).is_some());
 }
+
+/// #1900/#936: `sh -c "exec driver"`. The host-served root's own exec takes
+/// the host route and gives it a fresh descriptor table. A native child the
+/// post-exec root then forks must still name the exec capability the run
+/// installed at launch: the root fork seed (the child's cwd) and the child's
+/// own `execve` both resolve through it. Red on main: the ring re-derived
+/// the capability from the post-exec table, the carrier refused the seed and
+/// the child's `execve` of a file the driver wrote to `/tmp` returned
+/// counted ENOSYS (errno 38) before any carrier request existed.
+#[test]
+fn serial_host_child_of_an_execed_root_execs_through_the_installed_capability() {
+    // Launch: the run mints its exec capability from its host-served root.
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    let launch_root = dispatcher.capture_one_task_context().unwrap();
+    let installed = carrick_kernel::dispatch::exec_files::native_exec_capability(&launch_root)
+        .expect("launch root mints a capability");
+    // The root execs on the host route before it forks.
+    let prepared = dispatcher
+        .prepare_one_task_kernel_exec(&launch_root)
+        .unwrap();
+    drop(launch_root);
+    let root = dispatcher.commit_one_task_kernel_exec(prepared).unwrap();
+    // The carrier publishes the post-exec root exactly as production does:
+    // its current descriptor table and its task's birth serial.
+    let task_serial = root.task().key().serial.raw();
+    let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let fixture = Box::leak(Box::new(Fixture::with_identity(
+        0x10000,
+        asid(1),
+        page,
+        control,
+        ThreadIdentity {
+            tid: 41,
+            serial: 101,
+            mm: 1,
+            file_table: root.resources().files().id().raw(),
+            generation: task_serial,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: page as *const _ as u64,
+            control_slot: control as *const _ as u64,
+        },
+    )));
+    let counters = carrick_el1_abi::Counters::new();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.installed_exec_capability = Some(installed);
+    *crossing.root_cwd.lock().unwrap() = b"/tmp/native-exe-lifecycle-1".to_vec();
+    let words = fixture.tables.live(&fixture.maintenance);
+    // Production admission: no fixture cwd is given to the root's row.
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            parked,
+        )
+        .unwrap(),
+    );
+    let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+    registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let mut fork_service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(task_serial).unwrap(),
+    };
+    let child = {
+        let mut entry = runtime
+            .enter(source, &fixture.task, parked, &mut fork_service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("fork must return");
+        };
+        assert!(result.raw() > 0, "the post-exec root forks");
+        runtime
+            .namespace_child_key(parent, result.raw() as u32)
+            .unwrap()
+    };
+    assert_eq!(
+        crossing.root_seeds.load(Ordering::Acquire),
+        1,
+        "the root fork seed names the installed capability and is served"
+    );
+    let child_binding = runtime.task_binding(child).unwrap();
+    let parent_binding = runtime.task_binding(parent).unwrap();
+    // SAFETY: the stopped fixture exclusively owns the parent's current
+    // record; supply the context save normally performed before preemption.
+    unsafe {
+        *fixture.zone.record(parent_binding.record.id).ctx_mut() = parent_binding.words;
+    }
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
+    activate_target(source, &fixture.task, &child_binding);
+    let mut service = Physical {
+        zone: fixture.zone,
+        page: fixture.page,
+        controls: &[],
+        copies: Vec::new(),
+        tid_words: BTreeMap::new(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        on_signal_clock: None,
+    };
+    // The driver's relative spelling of the executable it wrote to /tmp.
+    let path = b"bin/a\0";
+    let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
+    payload.extend_from_slice(path);
+    carrick_core_abi::service::encode_exec_payload_header(
+        &mut payload,
+        carrick_core_abi::service::ExecCall::Execve,
+        path.len(),
+        0,
+        0,
+    )
+    .unwrap();
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                child_binding.address,
+                &child_binding.words,
+                &mut service,
+            )
+            .unwrap();
+        let resumed = entry
+            .begin_exec_service(
+                payload.into_boxed_slice(),
+                None,
+                NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), &counters),
+            )
+            .unwrap();
+        if let NativeResume::Returned(result) = resumed {
+            panic!(
+                "the child's execve returned {} instead of reaching the exec service",
+                result.raw()
+            );
+        }
+        assert!(
+            matches!(resumed, NativeResume::Left(None)),
+            "the child's execve reaches the carrier's exec service"
+        );
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    assert_eq!(
+        counters.refused[221].load(Ordering::Relaxed),
+        0,
+        "no counted refusal"
+    );
+    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+    let member = fixture.zone.record(selector.record.id).identity();
+    // SAFETY: the production fork's live record retains its control slot.
+    let child_control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
+    // SAFETY: this fixture consumes the exact published service ticket once.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(&child_control.service, selector, NonZeroU64::MIN, member)
+    }
+    .unwrap();
+    let carrick_core_abi::service::ServiceOperation::Exec {
+        capability,
+        payload,
+    } = ticket.request().operation
+    else {
+        panic!("exec ticket");
+    };
+    assert_eq!(
+        capability, installed,
+        "the child's exec names the service the run installed at launch"
+    );
+    // SAFETY: the ticket retains the exact sealed payload until completion.
+    let sealed = unsafe {
+        core::slice::from_raw_parts(
+            payload.address().raw() as *const u8,
+            payload.length().raw() as usize,
+        )
+    };
+    let view = carrick_core_abi::service::ExecPayloadView::parse(sealed).unwrap();
+    assert_eq!(view.path(), b"bin/a");
+    assert_eq!(
+        view.access().map(|access| access.cwd),
+        Some(&b"/tmp/native-exe-lifecycle-1"[..]),
+        "the child resolves from the root's live cwd at its fork"
+    );
+    assert!(ticket.complete(false).is_ok());
+    drop(root);
+    drop(dispatcher);
+}

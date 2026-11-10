@@ -649,7 +649,7 @@ impl NativeSignalFixture {
         process: carrick_core_abi::EntryTaskKey,
         process_birth: carrick_core_abi::BirthSerial,
     ) -> Self {
-        Self::with_identity(true, |_| (binding, process, process_birth))
+        Self::with_identity(true, |_| (binding, process, process_birth, 5))
     }
 
     /// Admit the identities established by production bootstrap without seeding
@@ -663,7 +663,32 @@ impl NativeSignalFixture {
             carrick_core_abi::BirthSerial,
         ),
     ) -> Self {
+        Self::with_identity(false, |zone| {
+            let (binding, process, birth) = identity(zone);
+            (binding, process, birth, 5)
+        })
+    }
+
+    /// [`Self::from_bootstrap`] that also names the root's published
+    /// descriptor table, as the carrier publishes it for the root's current
+    /// image (an exec replaces it).
+    pub fn from_bootstrap_with_file_table(
+        identity: impl FnOnce(
+            &'static ZoneTables<ParkedContextWords>,
+        ) -> (
+            ExecutionBinding,
+            carrick_core_abi::EntryTaskKey,
+            carrick_core_abi::BirthSerial,
+            u64,
+        ),
+    ) -> Self {
         Self::with_identity(false, identity)
+    }
+
+    /// The exec capability every exec and root fork seed of this admitted
+    /// tree names.
+    pub fn exec_capability(&self) -> Option<carrick_core_abi::service::ExecCapabilityId> {
+        self.runtime.exec_capability()
     }
 
     fn with_identity(
@@ -674,6 +699,7 @@ impl NativeSignalFixture {
             ExecutionBinding,
             carrick_core_abi::EntryTaskKey,
             carrick_core_abi::BirthSerial,
+            u64,
         ),
     ) -> Self {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
@@ -684,7 +710,7 @@ impl NativeSignalFixture {
             assert!(!ptr.is_null());
             Box::leak(Box::from_raw(ptr))
         };
-        let (binding, process, process_birth) = identity(zone);
+        let (binding, process, process_birth, file_table) = identity(zone);
         let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
         let control = Box::leak(Box::new(ThreadControlSlot::new()));
         let child_page = Box::leak(Box::new(ThreadLifecyclePage::new()));
@@ -698,7 +724,7 @@ impl NativeSignalFixture {
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(tid as i32),
             binding.generation,
-            5,
+            file_table,
         );
         task.mm.key.store(mm, Ordering::Release);
         task.mm
@@ -732,7 +758,7 @@ impl NativeSignalFixture {
                 tid,
                 serial: binding.thread_generation.raw(),
                 mm,
-                file_table: 5,
+                file_table,
                 generation: binding.generation.raw(),
                 affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
