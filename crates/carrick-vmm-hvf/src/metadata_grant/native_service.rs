@@ -36,12 +36,14 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
         &self,
         request: ServiceRequest,
         record: &mut [u8],
+        executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     ) -> Result<Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>, NativeHostFileRefused>;
 
     /// Serve the root fork seed crossing: write the host-served root's live
     /// cwd and root into `record` once ([`carrick_core_abi::service::RootForkSeed::serve`]).
     /// `false` refuses it; the fork then fails without a child.
     fn root_fork_seed(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool;
+    fn root_executable_seed(&self) -> Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>;
 }
 
 pub use carrick_hal::fork_stock::NativeHostFileRefused;
@@ -58,6 +60,7 @@ pub struct NativeExecParts {
     pub plan: crate::trap::GuestMappingPlan,
     pub lazy_regions: Vec<(u64, u64)>,
     pub sources: Vec<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+    pub executable: Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>,
 }
 
 /// Exact carrier registration for a retained exec service.
@@ -114,7 +117,7 @@ impl NativeExecServiceDirectory {
 
     /// The service a guest exec request names, or the counted ENOSYS a
     /// request receives when no live service holds that capability (for
-    /// example a fork child of a root whose image the host replaced). A
+    /// example a request that outlived its run's registration). A
     /// guest-selected capability is never carrier custody to fail on.
     pub(crate) fn resolve(
         &self,
@@ -181,6 +184,7 @@ mod native_exec_service_registration_tests {
             &self,
             _request: ServiceRequest,
             _record: &mut [u8],
+            _executable: Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
         ) -> Result<
             Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
             NativeHostFileRefused,
@@ -188,14 +192,20 @@ mod native_exec_service_registration_tests {
             Err(NativeHostFileRefused)
         }
 
+        fn root_executable_seed(
+            &self,
+        ) -> Option<Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>> {
+            None
+        }
+
         fn root_fork_seed(&self, _record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
             false
         }
     }
 
-    /// #936: a native child of a post-exec root names the root's original
-    /// exec capability, which the host exec retired. The request must be a
-    /// counted ENOSYS (as on main), never a carrier custody fatal.
+    /// #936: a request naming a capability no live service holds (unknown,
+    /// or retired with its run) must be a counted ENOSYS, never a carrier
+    /// custody fatal.
     #[test]
     fn retired_or_unknown_exec_capability_is_a_counted_enosys() {
         let directory = Arc::new(NativeExecServiceDirectory::default());
@@ -480,12 +490,18 @@ impl NativeService {
         let Some(record) = self.exec_payload.as_mut() else {
             return Err(stale());
         };
-        let is_mapping =
+        let operation =
             match carrick_core_abi::host_file::HostFileRequestView::parse(record.bytes_mut()) {
-                Ok(view) => view.header().op == carrick_core_abi::host_file::HostFileOp::MapPrivate,
+                Ok(view) => view.header().op,
                 Err(_) => return self.refuse_host_file(),
             };
-        if is_mapping {
+        let executable = if operation == carrick_core_abi::host_file::HostFileOp::Readlinkat {
+            self.with_native_sources(|sources| sources.executable())
+                .flatten()
+        } else {
+            None
+        };
+        if operation == carrick_core_abi::host_file::HostFileOp::MapPrivate {
             // The shared source owner handles retirements and writes ENOMEM at
             // the bound before either ISA invokes the host file service.
             let mut record = self.exec_payload.take().ok_or_else(stale)?;
@@ -505,7 +521,7 @@ impl NativeService {
         let Some(record) = self.exec_payload.as_mut() else {
             return Err(stale());
         };
-        let served = service.serve_host_file(request, record.bytes_mut());
+        let served = service.serve_host_file(request, record.bytes_mut(), executable);
         match served {
             Ok(None) => {
                 self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))

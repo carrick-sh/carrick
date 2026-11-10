@@ -393,6 +393,7 @@ impl PreparedNativeExecSuccessor {
     #[cfg(test)]
     pub(crate) fn installed_cancel_fixture(
         custody: &std::sync::Arc<CarrierVmCustody>,
+        executable: std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>,
     ) -> Result<Self, TrapError> {
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x20_0000)?;
         let ipa = lease.key().0;
@@ -412,8 +413,10 @@ impl PreparedNativeExecSuccessor {
             .asid_allocator()
             .allocate_unpublished()
             .map_err(|error| TrapError::Hypervisor(format!("test exec ASID: {error}")))?;
+        let mut physical = crate::fork_stock::NativeChildPhysical::default();
+        physical.sources.bind_executable(executable);
         Ok(Self {
-            physical: Default::default(),
+            physical,
             asid,
             root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
                 0x90_0000,
@@ -441,6 +444,7 @@ pub(crate) fn prepare_native_exec_successor(
         mut plan,
         lazy_regions,
         sources,
+        executable,
     } = parts;
     // The successor's ring owner supplies its ELF pages from `sources`; the
     // carrier builds no leaf and no frame for them.
@@ -488,6 +492,7 @@ pub(crate) fn prepare_native_exec_successor(
         TrapError::Hypervisor("native exec successor has no initial stack".to_owned())
     })?;
     let mut physical = install_native_exec_physical(backing, root_slot)?;
+    physical.sources.bind_executable(executable);
     for source in sources {
         physical.sources.inherit(source);
     }

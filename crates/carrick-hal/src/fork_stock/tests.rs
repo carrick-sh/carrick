@@ -14,8 +14,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Debug)]
-    struct PhysicalPin(Arc<AtomicUsize>);
+    struct PhysicalPin(Arc<AtomicUsize>, ForkHostBackingCustody);
     impl Drop for PhysicalPin {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -23,6 +22,17 @@ fn committed_child_retains_physical_custody_through_quarantine() {
     }
 
     let dropped = Arc::new(AtomicUsize::new(0));
+    #[derive(Debug)]
+    struct Executable;
+    impl ExecutableIdentity for Executable {
+        fn display_path(&self) -> String {
+            "/fork-parent".into()
+        }
+    }
+    let executable: Arc<dyn ExecutableIdentity> = Arc::new(Executable);
+    let live_executable = Arc::downgrade(&executable);
+    let mut sources = ForkHostBackingCustody::default();
+    sources.bind_executable(executable);
     let mut stock: ForkStock<UntaggedRoots, PhysicalPin> = ForkStock::new(
         CARRIER,
         ForkControlCapacity::exclusive(0x1_0000_0000),
@@ -58,7 +68,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
             &mut reserve,
             |_| true,
             |_| true,
-            |_, _, _| Ok(PhysicalPin(Arc::clone(&dropped))),
+            |_, _, _| Ok(PhysicalPin(Arc::clone(&dropped), sources.clone())),
         )
         .unwrap();
     let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
@@ -73,10 +83,24 @@ fn committed_child_retains_physical_custody_through_quarantine() {
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(live_executable.strong_count(), 2);
+    drop(sources);
+    assert_eq!(live_executable.strong_count(), 1);
+    assert_eq!(
+        stock
+            .child_physical_mut(loan.request.child_mm, child_of(loan, 43).context.root)
+            .unwrap()
+            .1
+            .executable()
+            .unwrap()
+            .display_path(),
+        "/fork-parent"
+    );
     let child = child_of(loan, 43);
     let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
     stock.retire_child(child, &mut retire).unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(live_executable.strong_count(), 1);
     stock
         .reclaim(
             &mut NoTableLedger,
@@ -88,6 +112,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(live_executable.strong_count(), 0);
 }
 
 #[test]

@@ -6468,6 +6468,22 @@ mod tests {
         assert!(dispatcher.requires_syscall_traps());
     }
 
+    /// `TestContainer::run_with_audit` installs this observer. It strips the
+    /// vDSO clock exports (`with_optional_vdso_for_clock_with_visibility`),
+    /// so every guest clock read becomes syscall 113 (#1900).
+    #[test]
+    fn fast_path_audit_observer_requires_syscall_traps() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(crate::observe::audit::AuditObserver::new()));
+        assert!(!dispatcher.requires_syscall_traps());
+
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(
+            crate::observe::audit::AuditObserver::new().require_fast_path_visibility(),
+        ));
+        assert!(dispatcher.requires_syscall_traps());
+    }
+
     #[test]
     fn interceptor_chain_arc_is_inherited_by_fork() {
         let mut parent = SyscallDispatcher::new();

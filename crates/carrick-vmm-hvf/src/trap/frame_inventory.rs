@@ -3176,7 +3176,7 @@ impl HvfVmState {
             .cow_identity
             .and_then(|identity| carrick_el1_abi::ReservationMm::new(identity.mm))
         {
-            custody.fork_stock.lock().owner.retire_exited_root(mm);
+            custody.fork_stock.lock().retire_root(mm);
         }
         let authority = task.cow_authority.as_ref().cloned().ok_or_else(|| {
             TrapError::Hypervisor(

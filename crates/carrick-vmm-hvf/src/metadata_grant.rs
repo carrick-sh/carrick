@@ -1784,7 +1784,7 @@ pub(crate) fn service_native_fork_stock(
                 // sources it acquired after birth (an exec image, a native
                 // private file mapping), not only the rows its own fork
                 // inherited.
-                let inherited = stock
+                let mut inherited = stock
                     .owner
                     .pending(execution.cpu)
                     .and_then(|pending| {
@@ -1794,6 +1794,13 @@ pub(crate) fn service_native_fork_stock(
                     })
                     .map(crate::fork_stock::NativeChildPhysical::fork_sources)
                     .unwrap_or_default();
+                if let Some((seed, executable)) = stock.root_executables.get(&execution.cpu)
+                    && *seed == execution
+                    && inherited.executable().is_none()
+                {
+                    inherited.bind_executable(Arc::clone(executable));
+                }
+                let executable = inherited.executable();
                 let result = stock.owner.reserve_custody(
                     execution,
                     settlement,
@@ -1817,13 +1824,23 @@ pub(crate) fn service_native_fork_stock(
                             count,
                             inherited,
                         )
-                        .map(crate::fork_stock::NativeChildPhysical::new)
+                        .map(|rows| {
+                            let mut physical = crate::fork_stock::NativeChildPhysical::new(rows);
+                            if let Some(executable) = executable {
+                                physical.sources.bind_executable(executable);
+                            }
+                            physical
+                        })
                     },
                 );
                 if let Err(refusal) = &result {
                     report_stock_refusal(None, Some(execution), &format!("Reserve: {refusal:?}"));
                 }
-                result.is_ok()
+                let accepted = result.is_ok();
+                if accepted {
+                    stock.root_executables.remove(&execution.cpu);
+                }
+                accepted
             } else {
                 let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                 match stock.owner.settle(
@@ -1842,7 +1859,10 @@ pub(crate) fn service_native_fork_stock(
                     |pages| ForkStockHostCustody::tables_clean(custody, pages),
                     |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
                 ) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        stock.root_executables.remove(&execution.cpu);
+                        true
+                    }
                     Err(error) => {
                         settlement.refuse(
                             if error
@@ -2006,7 +2026,18 @@ fn service_root_fork_seed(
         return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
     };
     match custody.native_exec_services.resolve(capability) {
-        Ok(service) if service.root_fork_seed(record) => [METADATA_GRANT_SUCCESS, 0, 0, 0],
+        Ok(service) if service.root_fork_seed(record) => {
+            let executable = service.root_executable_seed();
+            let Some(execution) = stopped_execution(region, cpu, ttbr0) else {
+                return refused;
+            };
+            let mut stock = custody.fork_stock.lock();
+            stock.root_executables.remove(&cpu);
+            if let Some(executable) = executable {
+                stock.root_executables.insert(cpu, (execution, executable));
+            }
+            [METADATA_GRANT_SUCCESS, 0, 0, 0]
+        }
         _ => refused,
     }
 }
@@ -2870,8 +2901,20 @@ mod tests {
         let ipa_baseline = crate::trap::exec_ipa_lease_count_for_tests();
         let frame_baseline = custody.native_frame_backings.lock().len();
         let preparation_baseline = custody.native_exec_preparations.lock().len();
-        let prepared =
-            crate::trap::PreparedNativeExecSuccessor::installed_cancel_fixture(&custody).unwrap();
+        #[derive(Debug)]
+        struct Executable;
+        impl carrick_hal::fork_stock::ExecutableIdentity for Executable {
+            fn display_path(&self) -> String {
+                "/cancelled-successor".into()
+            }
+        }
+        let executable: Arc<dyn carrick_hal::fork_stock::ExecutableIdentity> = Arc::new(Executable);
+        let live_executable = Arc::downgrade(&executable);
+        let prepared = crate::trap::PreparedNativeExecSuccessor::installed_cancel_fixture(
+            &custody, executable,
+        )
+        .unwrap();
+        assert_eq!(live_executable.strong_count(), 1);
         let prepared_asid = prepared.prepared_asid();
         let execution = stopped_execution(
             unsafe {
@@ -2948,6 +2991,7 @@ mod tests {
             preparation_baseline
         );
         assert_eq!(custody.native_frame_backings.lock().len(), frame_baseline);
+        assert_eq!(live_executable.strong_count(), 0);
         assert_eq!(crate::trap::exec_ipa_lease_count_for_tests(), ipa_baseline);
         // The cancelled ASID left the live set without a TLB proof; the
         // allocator decides when its numeric identity is reused (fresh first).

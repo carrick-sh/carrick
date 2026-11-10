@@ -783,7 +783,7 @@ pub struct CopyProgress {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Deadline(pub CounterTick);
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CpuId(u32);
 impl CpuId {
     pub const fn new(index: u32) -> Self {

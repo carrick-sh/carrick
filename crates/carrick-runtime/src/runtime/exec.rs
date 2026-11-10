@@ -185,6 +185,7 @@ struct NativePreparedExecImage {
     _request: carrick_core_abi::service::ServiceIdentity,
     plan: carrick_vmm_hvf::trap::GuestMappingPlan,
     successor: carrick_kernel::dispatch::NativeSuccessorImage,
+    executable: std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -205,6 +206,7 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecPreparation for NativePreparedEx
             plan: self.plan,
             lazy_regions: self.successor.lazy_regions,
             sources: self.successor.sources,
+            executable: self.executable,
         }
     }
 }
@@ -242,6 +244,7 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             .prepare_native_successor(&loaded.image, successor)
             .map_err(fail)?;
         Ok(Box::new(NativePreparedExecImage {
+            executable: run.dispatcher.retain_native_executable(loaded.source),
             _request: request.identity,
             plan,
             successor,
@@ -252,6 +255,7 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
         &self,
         _request: carrick_core_abi::service::ServiceRequest,
         record: &mut [u8],
+        executable: Option<std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>>,
     ) -> Result<
         Option<std::sync::Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
         carrick_vmm_hvf::metadata_grant::NativeHostFileRefused,
@@ -264,15 +268,24 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             .and_then(std::sync::Weak::upgrade)
             .ok_or(carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)?;
         run.dispatcher
-            .serve_native_host_file(record)
+            .serve_native_host_file(record, executable)
             .map(|served| served.retained_source)
             .map_err(|_| carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)
     }
 
+    /// Retain the root's current object for its new child's MM custody.
+    fn root_executable_seed(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>> {
+        self.run
+            .get()
+            .and_then(std::sync::Weak::upgrade)?
+            .dispatcher
+            .root_executable_seed()
+    }
+
     /// The host-served root's live cwd and root, read once for a child the
-    /// stopped root is forking (#1392). The root's chdir and chroot are
-    /// served by this run's dispatcher, so its filesystem context is the
-    /// one authority; the child's ring row owns the copy from here on.
+    /// stopped root is forking (#1392). The child's ring row owns the copy.
     fn root_fork_seed(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
         let Some(run) = self.run.get().and_then(std::sync::Weak::upgrade) else {
             return false;
@@ -292,10 +305,7 @@ pub(crate) fn capture_native_exec_capability(
     let context = dispatcher
         .capture_one_task_context()
         .map_err(|_| crate::linux_abi::LINUX_ESRCH)?;
-    let raw = context.resources().files().id().raw();
-    let id = carrick_core_abi::service::ExecCapabilityId::new(
-        core::num::NonZeroU64::new(raw).ok_or(crate::linux_abi::LINUX_ESRCH)?,
-    );
+    let id = carrick_kernel::dispatch::exec_files::native_exec_capability(&context);
     Ok(NativeExecCapability {
         id,
         files: dispatcher.capture_exec_files(&context)?,
@@ -1338,6 +1348,7 @@ mod tests {
     /// usrmerge rootfs (`/lib -> usr/lib`) must resolve its PT_INTERP through
     /// the layered rootfs, exactly as the host-owned exec does.
     #[test]
+    /// Loader control only; the local custody checks are not live MM observations.
     fn native_child_exec_prepares_a_dynamic_binary_through_a_usrmerge_rootfs() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1357,6 +1368,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("usr/bin/true", root.join("launch")).unwrap();
         let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(root).unwrap();
         let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
@@ -1365,13 +1377,13 @@ mod tests {
         let files = dispatcher.capture_exec_files(&context).unwrap();
         let loader = ExecLoaderCapabilities::capture(&dispatcher);
         drop(context);
-        for spelling in ["/usr/bin/true", "/bin/true"] {
+        for spelling in ["/usr/bin/true", "/bin/true", "usr/bin/true", "/launch"] {
             load_execve_image(&loader, &files, spelling, vec![], vec![], false)
                 .unwrap_or_else(|errno| panic!("host-owned exec of {spelling}: errno {errno:?}"));
         }
 
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
-        for spelling in ["/usr/bin/true", "/bin/true"] {
+        for spelling in ["/usr/bin/true", "/bin/true", "usr/bin/true", "/launch"] {
             let payload = sealed(
                 native_exec_payload(carrick_core_abi::service::ExecCall::Execve, spelling),
                 0,
@@ -1380,6 +1392,24 @@ mod tests {
             let loaded = prepare_native_exec_image(&capability, &payload, no_descriptors)
                 .unwrap_or_else(|errno| panic!("native exec of {spelling}: errno {errno:?}"));
             assert_ne!(loaded.image.entry(), 0x400000, "entered the interpreter");
+            let mut custody = carrick_hal::fork_stock::ForkHostBackingCustody::default();
+            custody.bind_executable(dispatcher.retain_native_executable(loaded.source));
+            assert_eq!(
+                custody.executable().unwrap().display_path(),
+                "/usr/bin/true"
+            );
+            let failed = sealed(
+                native_exec_payload(carrick_core_abi::service::ExecCall::Execve, "/missing"),
+                0,
+                "/",
+            );
+            assert!(
+                matches!(prepare_native_exec_image(&capability, &failed, no_descriptors), Err(errno) if errno.get() == 2)
+            );
+            assert_eq!(
+                custody.executable().unwrap().display_path(),
+                "/usr/bin/true"
+            );
         }
         drop(dispatcher);
     }
@@ -1388,9 +1418,7 @@ mod tests {
     fn native_exec_capability_outlives_context_without_host_task_lookup() {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();
-        let id = carrick_core_abi::service::ExecCapabilityId::new(
-            core::num::NonZeroU64::new(context.resources().files().id().raw()).unwrap(),
-        );
+        let id = carrick_kernel::dispatch::exec_files::native_exec_capability(&context);
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
         drop(context);
 
