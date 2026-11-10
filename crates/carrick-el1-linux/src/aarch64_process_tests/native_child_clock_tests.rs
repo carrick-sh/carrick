@@ -477,7 +477,7 @@ fn child_clock_copyout_repark_leaves_the_slot_before_another_process_runs() {
     let out = carrick_test_support::GuestUserBuffer::zeroed(16);
     let target = out.arg();
     let ChildClock::Served(mut call) =
-        serve_child_clock(CLOCK_GETTIME, 1, target, &deterministic(1_234), &mut 0)
+        serve_child_clock(CLOCK_GETTIME, 0, target, &deterministic(1_234), &mut 0)
     else {
         panic!("a child clock reading crosses");
     };
@@ -522,16 +522,20 @@ fn child_clock_copyout_repark_leaves_the_slot_before_another_process_runs() {
     };
     let counters = carrick_el1_abi::Counters::new();
     let mut frame = carrick_el1_abi::TrapFrame::default();
-    let served = (crate::sched::Sched {
-        handoff: None,
-        zone,
-        slot,
-        task: call.child_task,
-        cpu: &mut cpu,
-        user: &crate::sched::HardwareUserWord,
-        counters: &counters,
-    })
-    .run_next(&mut frame, 0);
+    let mut run_next = |cpu: &mut ChildResumeCpu<'_, '_>,
+                        frame: &mut carrick_el1_abi::TrapFrame| {
+        (crate::sched::Sched {
+            handoff: None,
+            zone,
+            slot,
+            task: call.child_task,
+            cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .run_next(frame, 0)
+    };
+    let served = run_next(&mut cpu, &mut frame);
     assert_eq!(
         busy.load(Ordering::Acquire),
         1,
@@ -558,6 +562,59 @@ fn child_clock_copyout_repark_leaves_the_slot_before_another_process_runs() {
         ),
         "the other process stays queued for the next entry"
     );
+    assert_eq!(out.as_bytes(), &[0; 16], "nothing was written yet");
+
+    // The carrier takes the notice at that exit and acknowledges the owed
+    // work; the child's next resume finishes the same copyout: Busy once,
+    // then success.
+    // SAFETY: the live child retains this control slot in fixture-owned stock.
+    let child_control = unsafe {
+        &*(call
+            .child_task
+            .metadata
+            .control_slot
+            .load(Ordering::Acquire) as *const ThreadControlSlot)
+    };
+    let queue = zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(call.child.record)
+                .unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        )
+        .unwrap();
+    // SAFETY: this fixture owns the parked member and its service queue.
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &child_control.service,
+            notice.unwrap(),
+            NonZeroU64::MIN,
+            zone.record(call.child.record.id).identity(),
+        )
+    }
+    .unwrap();
+    assert!(matches!(
+        ticket.request().operation,
+        carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+    ));
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(slot, &mut carrick_sched_core::WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    // Run the child ahead of the parent queued before it.
+    assert_eq!(zone.switch_in_full(slot).unwrap().record, call.parent);
+    assert!(zone.requeue_preempted(slot, call.parent).is_queued());
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        run_next(&mut cpu, &mut frame),
+        crate::sched::Served::Returned { switched: true }
+    );
+    assert_eq!(zone.slot(slot).current(), Some(call.child.record.id));
+    assert_eq!(frame.x[0], 0, "clock_gettime returns 0");
+    assert_eq!(pair(out.as_bytes()), (1_234, 0));
+    assert_eq!(busy.load(Ordering::Acquire), 2, "one retry, no more");
+    assert!(call.child_task.service_notice.take().unwrap().is_none());
 }
 
 /// The production ARM resume checkpoint for the clock child's record. The
