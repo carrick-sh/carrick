@@ -947,7 +947,7 @@ pub const fn descriptor_ordinal(ordinal: CanonicalNr) -> bool {
 }
 
 /// Retirement ceiling, checked against the PR base by authority-debt.
-pub const ISA_WIRING_GAP_CEILING: usize = 12;
+pub const ISA_WIRING_GAP_CEILING: usize = 10;
 
 /// Today's ISA wiring, explicit even when the shared owner owes a ring family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
