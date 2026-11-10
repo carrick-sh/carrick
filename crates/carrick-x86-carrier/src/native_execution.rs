@@ -83,9 +83,10 @@ pub fn publish_root_exit(
     halt();
 }
 
-/// Leave the installed process root for the carrier's maintenance root, then
-/// publish the slot's absence.
-pub fn leave_space(source: BornInZoneSource<'static, ParkedContextWords>) -> bool {
+/// Switch CR3 to the carrier's maintenance root unless it is already live.
+/// Returns whether the carrier published one. The slot's occupancy is left to
+/// the caller, which names the next space (exec) or its absence (exit).
+pub fn park_on_maintenance_root(source: BornInZoneSource<'static, ParkedContextWords>) -> bool {
     let maintenance = source.zone.spaces.idle_ttbr();
     if maintenance != 0 {
         let Some(root) = carrick_guest_arch::RootGpa::page_aligned(
@@ -100,6 +101,13 @@ pub fn leave_space(source: BornInZoneSource<'static, ParkedContextWords>) -> boo
             fatal_boot();
         }
     }
-    source.zone.release_space(source.slot);
     maintenance != 0
+}
+
+/// Leave the installed process root for the carrier's maintenance root, then
+/// publish the slot's absence.
+pub fn leave_space(source: BornInZoneSource<'static, ParkedContextWords>) -> bool {
+    let parked = park_on_maintenance_root(source);
+    source.zone.release_space(source.slot);
+    parked
 }

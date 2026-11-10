@@ -359,7 +359,7 @@ impl<'a> FileTables<'a> {
                 .cast()
         }
     }
-    pub fn opens(&self) -> &[DelegatedOpenFile; MAX_ZONE_OPEN_FILES] {
+    pub fn opens(&self) -> &'a [DelegatedOpenFile; MAX_ZONE_OPEN_FILES] {
         // SAFETY: attached initialized venue; fixed ABI extent/alignment.
         unsafe {
             &*self
@@ -369,7 +369,7 @@ impl<'a> FileTables<'a> {
                 .cast()
         }
     }
-    pub fn fd_map(&self) -> &[FdMapSlot; FD_MAP_CAPACITY] {
+    pub fn fd_map(&self) -> &'a [FdMapSlot; FD_MAP_CAPACITY] {
         // SAFETY: attached initialized venue; fixed ABI extent/alignment.
         unsafe { &*self.mapped.as_ptr().add(EL1_FD_MAP_OFFSET as usize).cast() }
     }
