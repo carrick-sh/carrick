@@ -59,7 +59,7 @@ const FAILED_MSI_CHILD: &str = "CARRICK_TEST_FAILED_MSI_CHILD";
 /// A reschedule MSI the carrier cannot deliver must surface as a carrier
 /// error, not strand the parked parent behind a sleeping CPU. The child
 /// process arms the test-support seam and runs the idle-peer wake; the
-/// carrier's fatal sink must end it promptly, naming the undelivered wake.
+/// table owner must fail the carrier closed promptly.
 #[test]
 fn failed_resched_msi_is_a_carrier_error_not_a_hang() {
     if std::env::var_os(FAILED_MSI_CHILD).is_some() {
@@ -87,7 +87,7 @@ fn failed_resched_msi_is_a_carrier_error_not_a_hang() {
         started.elapsed()
     );
     assert!(
-        !output.status.success() && stderr.contains("carrier zone wake undelivered"),
+        !output.status.success() && stderr.contains("ipc::table"),
         "the failed MSI must surface a carrier error: {:?} {stderr}",
         output.status
     );
