@@ -1415,6 +1415,195 @@ mod tests {
     use super::*;
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
 
+    /// #2031: a carrier-scoped zone (x86 CPL0) for the host release path.
+    mod carrier_zone_release {
+        use super::*;
+        use carrick_sched_core::object_wait::OperationToken;
+        use carrick_sched_core::{
+            CarrierZoneWake, ParkedContextWords, RecordId, ShortLockSpin, SlotId, ThreadIdentity,
+            ZoneTables,
+        };
+
+        const MM: u64 = 0x2031;
+
+        struct TestCarrier {
+            zone: &'static ZoneTables<ParkedContextWords>,
+            rescheds: Mutex<Vec<SlotId>>,
+        }
+        impl CarrierZoneWake<ParkedContextWords> for TestCarrier {
+            fn zone(&self) -> &ZoneTables<ParkedContextWords> {
+                self.zone
+            }
+            fn resched(&self, slot: SlotId) {
+                self.rescheds.lock().push(slot);
+            }
+        }
+
+        fn carrier() -> std::sync::Arc<TestCarrier> {
+            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+            // SAFETY: the shared zone ABI's empty state is all-zero; the
+            // fixture leaks it for the 'static carrier binding.
+            let zone = unsafe {
+                &*std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>()
+            };
+            std::sync::Arc::new(TestCarrier {
+                zone,
+                rescheds: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// A native task parked on `object`'s readable lane, as the ring's
+        /// zone poll leaves it (#2032), allowed on guest CPU 1 only.
+        fn park_reader(carrier: &TestCarrier, object: IpcObjectHandle) -> RecordId {
+            let zone = carrier.zone;
+            let key = carrick_el1_abi::ipc::object_wait_key(object, pipe::WaitFor::Readable)
+                .expect("lane key");
+            let discard = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                ParkedContextWords,
+            >| {
+                let _ = owned.into_parts();
+            };
+            zone.bind_object_wait(key, &ShortLockSpin, &discard)
+                .expect("ring binds the lane");
+            let record = zone
+                .alloc_record(ThreadIdentity {
+                    tid: 77,
+                    serial: 77,
+                    mm: MM,
+                    file_table: 77,
+                    generation: 1,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1 << 1,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .expect("record");
+            assert!(zone.mark_native_owned(record));
+            let queue = zone
+                .object_wait(key, &ShortLockSpin, &discard)
+                .expect("lane");
+            queue
+                .park(
+                    queue.snapshot(),
+                    record,
+                    OperationToken::new(77, 1).expect("token"),
+                )
+                .expect("park");
+            record
+        }
+
+        fn release_last_writer(owner: &HostIpc, object: IpcObjectHandle) {
+            let released = owner
+                .release(
+                    IpcBacking::Pipe {
+                        object,
+                        end: pipe::End::Writer,
+                    }
+                    .encode(),
+                )
+                .expect("release");
+            assert!(
+                matches!(released, IpcReleased::Object { wake, freed: false } if wake.readers),
+                "{released:?}"
+            );
+        }
+
+        fn queued_on(carrier: &TestCarrier, record: RecordId) -> Option<SlotId> {
+            match carrier.zone.record(record).claim() {
+                carrick_sched_core::Claim::Queued { slot, .. } => Some(slot),
+                _ => None,
+            }
+        }
+
+        /// The peer CPU idles in the guest: the drain places the parked
+        /// reader there and reschedules exactly that CPU.
+        #[test]
+        fn release_places_parked_reader_on_idle_guest_cpu() {
+            let carrier = carrier();
+            let peer = SlotId::new(1);
+            carrier.zone.drive(peer, 1);
+            carrier.zone.publish_slot(peer, MM, Some(1), 1 << 1);
+            let here = carrick_sched_core::ExecutionSlot::zone(peer);
+            carrier.zone.occupancy.vacate_any(here);
+            assert!(carrier.zone.occupancy.replace(here, 0, MM));
+            carrier.zone.enter_guest(peer);
+            let owner = HostIpc::new(1 << 20).expect("region");
+            owner
+                .bind_carrier_zone(carrier.clone())
+                .unwrap_or_else(|_| panic!("first binding"));
+            let object = owner.create_pipe(65536).expect("pipe");
+            let record = park_reader(&carrier, object);
+            release_last_writer(&owner, object);
+            assert_eq!(queued_on(&carrier, record), Some(peer));
+            assert_eq!(*carrier.rescheds.lock(), [peer]);
+        }
+
+        /// No guest CPU can take the woken reader (every one is stopped,
+        /// like the CPU serving the exit). The host never completes or
+        /// drops it: its readiness is retained on its owner's queue for
+        /// the stopped driver to take on entry.
+        #[test]
+        fn release_retains_reader_no_guest_cpu_can_take() {
+            let carrier = carrier();
+            let owner = HostIpc::new(1 << 20).expect("region");
+            owner
+                .bind_carrier_zone(carrier.clone())
+                .unwrap_or_else(|_| panic!("first binding"));
+            let object = owner.create_pipe(65536).expect("pipe");
+            let record = park_reader(&carrier, object);
+            release_last_writer(&owner, object);
+            let slot = queued_on(&carrier, record).expect("retained on a queue");
+            assert_eq!(carrier.zone.slot(slot).queued(), 1);
+        }
+
+        /// Contention is "not now": a drain that finds the lane's queue
+        /// held waits for the holder's release and then delivers (Busy
+        /// once, then success), never dropping the wake.
+        #[test]
+        fn release_waits_out_a_held_lane_then_delivers() {
+            let carrier = carrier();
+            let owner = HostIpc::new(1 << 20).expect("region");
+            owner
+                .bind_carrier_zone(carrier.clone())
+                .unwrap_or_else(|_| panic!("first binding"));
+            let object = owner.create_pipe(65536).expect("pipe");
+            let record = park_reader(&carrier, object);
+            let key = carrick_el1_abi::ipc::object_wait_key(object, pipe::WaitFor::Readable)
+                .expect("lane key");
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let zone = carrier.zone;
+            let holder = std::thread::spawn(move || {
+                let discard = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                    '_,
+                    ParkedContextWords,
+                >| {
+                    let _ = owned.into_parts();
+                };
+                let guard = zone
+                    .object_wait(key, &ShortLockSpin, &discard)
+                    .expect("hold lane");
+                held_tx.send(()).expect("held");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(guard);
+            });
+            held_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("holder took the lane");
+            release_last_writer(&owner, object);
+            holder.join().expect("holder");
+            assert!(queued_on(&carrier, record).is_some());
+        }
+
+        /// A carrier binds its zone once; a second binding is refused.
+        #[test]
+        fn carrier_zone_binds_once() {
+            let owner = HostIpc::new(1 << 20).expect("region");
+            assert!(owner.bind_carrier_zone(carrier()).is_ok());
+            assert!(owner.bind_carrier_zone(carrier()).is_err());
+        }
+    }
+
     #[test]
     fn serial_host_el1_ipc_host_subscription_lifetime_is_exact() {
         let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
