@@ -4285,7 +4285,7 @@ mod tests {
                 ..FakeCpu::default()
             };
             let counters = Box::leak(Box::new(Counters::default()));
-            let mut sched = |frame: &mut TrapFrame, cpu: &mut FakeCpu, wake: bool| {
+            let sched = |frame: &mut TrapFrame, cpu: &mut FakeCpu, wake: bool| {
                 let mut sched = Sched {
                     handoff: None,
                     zone: &zone,
