@@ -229,13 +229,17 @@ base's archive from that authenticated run; the Mac verifies its producing
 SHA and each checkout's fixture input identity before restoration. No
 manually provisioned archive or Docker is needed on the Mac.
 
-GitHub assigns one job at a time to a runner. The Rust executor also holds
-the machine's exclusive `gate` lease across both runs' fixture restore, `just
-build`, `cargo run -p carrick-xtask -- accept --profile no-docker --phase
-signed`, and independent artifact inspection. A paired job takes about twice
-a single run (roughly 45-70 minutes; the job timeout is 240). Nested acceptance reuses that
-lease. Both runners must share their local lease path with all other gate
-participants on that host. A per-SHA Actions concurrency group with
+GitHub assigns one job at a time to a runner. The Rust executor takes the
+host lease per step rather than across the pair (#2013): fixture fetch and
+the commit's xtask build under shared `carrick`, fixture restoration under
+exclusive `gate`, then `just build` and `cargo run -p carrick-xtask --
+accept --profile no-docker --phase signed` admit themselves (`carrick` for
+their builds, `gate` only while guests execute), and the independent reap
+and artifact inspection run under `carrick`. No two leases are held at
+once. A paired job takes about twice a single run (roughly 45-70 minutes;
+the job timeout is 240), but holds `gate` only for restoration and guest
+execution. Both runners must share their local lease path with all other
+gate participants on that host. A per-SHA Actions concurrency group with
 `cancel-in-progress: false` queues duplicate requests. GitHub does not expose
 `runner.name` when job concurrency is evaluated, so host serialization uses
 the lease rather than an invalid runner-name expression (director ruling on
@@ -253,8 +257,9 @@ on that machine.
 
 `accept` performs its own signed build before testing and records the exact
 artifact's SHA-256, CDHash, LC_UUID, hypervisor entitlement and
-`__dof_carrick`. The executor verifies the post-gate artifact against that
-receipt before releasing the lease. It independently reaps every recorded
+`__dof_carrick`. Accept captures that identity at the end of its build
+phase and re-verifies it after gate admission (`signed_admission`). The
+executor verifies the post-gate artifact against the receipt. It independently reaps every recorded
 run ID and requires an explicit zero remaining count, retaining `cleanup.json`
 and per-reap logs. This avoids treating an older receipt's unknown-cleanup
 zero as evidence. Missing fixture validation, required steps or scoped
