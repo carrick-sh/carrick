@@ -531,7 +531,6 @@ impl Frames {
                     + self.maximum("::yield_service_checkpoint::").max(
                         self.sum(&[
                             "::retire_adapter_result::",
-                            "::retire_adapter_operation::",
                             "::retire_native_operation::",
                             "::unpin_filtered::",
                         ]) + fd_storage.max(fd_references)
