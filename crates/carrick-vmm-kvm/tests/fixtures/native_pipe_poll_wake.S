@@ -74,11 +74,13 @@ _start:
     mov $7, %edi
     jmp exit
 child:
+#ifndef NO_CHILD_SLEEP
     /* nanosleep({0, 50ms}) so the parent is parked before the write. */
     lea delay(%rip), %rdi
     xor %esi, %esi
     mov $35, %eax
     syscall
+#endif
     mov fds+4(%rip), %edi
 #ifdef WAKE_BY_CLOSE
     mov $3, %eax                   /* close(fds[1]): the last writer */

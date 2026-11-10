@@ -5441,6 +5441,7 @@ mod tests {
     /// query and reports every queried entry writable.
     struct X86PollFrame {
         frame: TrapFrame,
+        canonical: carrick_syscall_abi::CanonicalNr,
         native: u64,
         queries: Vec<(usize, i32)>,
     }
@@ -5448,16 +5449,30 @@ mod tests {
         fn new(native: u64, args: [u64; 5]) -> Self {
             let mut frame = TrapFrame::default();
             frame.x[..5].copy_from_slice(&args);
+            frame.elr = A_SVC;
             Self {
                 frame,
+                canonical: carrick_syscall_abi::nr::PPOLL,
                 native,
+                queries: Vec::new(),
+            }
+        }
+        fn close(slot: SlotId, fd: i32) -> Self {
+            let mut frame = TrapFrame::default();
+            frame.slot = u64::from(slot.raw());
+            frame.x[0] = fd as u64;
+            frame.elr = B_SVC;
+            Self {
+                frame,
+                canonical: carrick_personality_linux::crossing::nr::CLOSE,
+                native: 3,
                 queries: Vec::new(),
             }
         }
     }
     impl carrick_personality_linux::dispatch::SyscallFrame for X86PollFrame {
         fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
-            carrick_syscall_abi::nr::PPOLL
+            self.canonical
         }
         fn argument(&self, index: usize) -> Option<u64> {
             carrick_personality_linux::dispatch::SyscallFrame::argument(&self.frame, index)
@@ -5471,6 +5486,9 @@ mod tests {
         fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
             carrick_personality_linux::dispatch::SyscallFrame::slot(&self.frame)
         }
+        fn task_index(&self) -> usize {
+            if self.slot().is_some() { 0 } else { usize::MAX }
+        }
         fn user_sp(&self) -> Option<carrick_guest_arch::UserVa> {
             carrick_personality_linux::dispatch::SyscallFrame::user_sp(&self.frame)
         }
@@ -5482,8 +5500,21 @@ mod tests {
         fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
             carrick_personality_linux::crossing::HostCrossingSet::X86
         }
-        fn may_serve_poll(&self) -> bool {
+        fn settles_owed_work_at_continuation_boundary(&self) -> bool {
             true
+        }
+        fn may_serve_descriptor(&self) -> bool {
+            self.canonical == carrick_personality_linux::crossing::nr::CLOSE
+        }
+        fn may_serve_poll(&self) -> bool {
+            self.canonical == carrick_syscall_abi::nr::PPOLL
+        }
+        fn operation_resume_pc(
+            &self,
+        ) -> Option<carrick_el1::substrate::sched::object_wait::OperationResumePc> {
+            carrick_el1::substrate::sched::object_wait::OperationResumePc::from_raw(
+                self.frame.elr.wrapping_sub(2),
+            )
         }
         fn poll_timeout_kind(&self) -> crate::dispatch::PollTimeoutKind {
             if self.native == carrick_syscall_abi::syscall_x86_64::X86_POLL.raw() {
@@ -5706,6 +5737,170 @@ mod tests {
             revents(&fds, 0) & super::super::file_table::LINUX_POLLHUP,
             0
         );
+    }
+
+    #[test]
+    fn x86_cpl0_zone_poll_parks_until_last_writer_closes() {
+        for (native, timeout) in [
+            (carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw(), 0u64),
+            (
+                carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
+                (-1i32 as u32) as u64,
+            ),
+        ] {
+            let w = world();
+            let layout =
+                Layout::new::<carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>>();
+            // SAFETY: all-zero is a valid empty zone table.
+            let x86_zone: &carrick_sched_core::ZoneTables<
+                carrick_sched_core::ParkedContextWords,
+            > = unsafe {
+                &*std::alloc::alloc_zeroed(layout)
+                    .cast::<carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>>()
+            };
+            x86_zone
+                .bind_ipc_operation_slots(
+                    w.region.operation_slot_generation(),
+                    &HostWait,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    },
+                )
+                .unwrap();
+            x86_zone.spaces.set_idle_ttbr(IDLE_TTBR);
+            let mm_index = x86_zone
+                .spaces
+                .publish_closed(MM, TTBR_MM, TTBR_MM)
+                .unwrap();
+            x86_zone.spaces.open(mm_index);
+            let peer_slot = SlotId::new(1);
+            for (slot, tid, serial) in [(SLOT, w.a_tid, 1101u64), (peer_slot, 202u64, 1202u64)] {
+                x86_zone.drive(slot, 1);
+                x86_zone.publish_slot(slot, MM, Some(u32::from(slot.raw())), 3);
+                let here = carrick_sched_core::ExecutionSlot::zone(slot);
+                x86_zone.occupancy.vacate_any(here);
+                assert!(x86_zone.occupancy.replace(here, 0, MM));
+                x86_zone.enter_guest(slot);
+                let rec = x86_zone
+                    .alloc_record(carrick_el1_abi::ThreadIdentity {
+                        tid,
+                        serial,
+                        mm: MM,
+                        file_table: tid,
+                        generation: 1,
+                        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                        affinity: 3,
+                        lifecycle_page: 0,
+                        control_slot: 0,
+                    })
+                    .unwrap();
+                assert!(x86_zone.mark_native_owned(rec));
+                assert!(x86_zone.requeue_preempted(slot, rec).is_queued());
+            }
+            let parent_record = x86_zone.switch_in_full(SLOT).unwrap().record;
+            let _child_record = x86_zone.switch_in_full(peer_slot).unwrap().record;
+
+            let parent_table = w
+                .host()
+                .create_table(1024, &mut w.descriptor_extent(64))
+                .unwrap();
+            let (read, write, _) = w.pipe(parent_table, BLOCK);
+            let child_table = w
+                .host()
+                .fork(parent_table, &mut w.descriptor_extent(64))
+                .unwrap();
+            w.map.publish_owned(w.a_tid, parent_table.to_raw()).unwrap();
+            w.map.publish_owned(202, child_table.to_raw()).unwrap();
+
+            let tables = delegated();
+            let venue = IpcVenue {
+                region: *w.region,
+                tables: &w.tables,
+            };
+            let dispatch_x86 = |slot: SlotId, tid: u64, serial: u64, frame: &mut X86PollFrame| {
+                let task = CurrentTask::new();
+                task.set(
+                    El1TaskId::from_linux_tid(tid as i32),
+                    carrick_el1_abi::SnapshotGeneration::from_raw(1),
+                    tid,
+                );
+                task.mm.key.store(MM, Ordering::Relaxed);
+                task.mm.thread_generation.store(serial, Ordering::Relaxed);
+                crate::dispatch::dispatch_syscall_with_native::<
+                    _,
+                    FakeCpu,
+                    HardwareUserWord,
+                    _,
+                    carrick_sched_core::ParkedContextWords,
+                >(
+                    frame,
+                    w.counters,
+                    core::slice::from_ref(&task),
+                    &tables.fd_map,
+                    &tables.objects,
+                    &tables.opens,
+                    &[],
+                    &tables.names,
+                    None,
+                    Some(&venue),
+                    None,
+                    None,
+                    Some(carrick_el1_abi::BornInZoneSource {
+                        zone: x86_zone,
+                        slot,
+                    }),
+                    None,
+                    |_| core::ptr::null_mut(),
+                )
+            };
+
+            // Parent closes its own write end; child still holds one writer.
+            let mut parent_close = X86PollFrame::close(SLOT, write);
+            assert_eq!(
+                dispatch_x86(SLOT, w.a_tid, 1101, &mut parent_close),
+                CompletionRoute::Served
+            );
+            assert_eq!(parent_close.frame.x[0], 0);
+
+            let mut fds = GuestUserBuffer::from_value(PollFd {
+                fd: read,
+                events: LINUX_POLLIN,
+                revents: 0x5a5a,
+            });
+            let mut poll_frame = X86PollFrame::new(native, [fds.arg(), 1, timeout, 0, 8]);
+            assert_eq!(
+                dispatch_x86(SLOT, w.a_tid, 1101, &mut poll_frame),
+                CompletionRoute::Suspended,
+                "native {native}: x86 zone poll must park when writer is still open"
+            );
+            assert!(x86_zone.record(parent_record).has_object_operation());
+            assert_eq!(revents(&fds, 0), 0x5a5a);
+            fds.write(0, 12345i32);
+            fds.write(4, 0x1234i16);
+
+            // Child closes the last writer on peer_slot; parent must wake on SLOT.
+            let mut child_close = X86PollFrame::close(peer_slot, write);
+            assert_eq!(
+                dispatch_x86(peer_slot, 202, 1202, &mut child_close),
+                CompletionRoute::Served
+            );
+            assert_eq!(child_close.frame.x[0], 0);
+            assert_eq!(
+                x86_zone.switch_in_full(SLOT).map(|s| s.record),
+                Some(parent_record),
+                "native {native}: last writer close on x86 must wake the parked poll record"
+            );
+
+            let mut resume_frame = X86PollFrame::new(native, [fds.arg(), 1, timeout, 0, 8]);
+            assert_eq!(
+                dispatch_x86(SLOT, w.a_tid, 1101, &mut resume_frame),
+                CompletionRoute::Served
+            );
+            assert_eq!(resume_frame.frame.x[0], 1);
+            assert_eq!(fds.get::<PollFd>(0).fd, 12345);
+            assert_eq!(fds.get::<PollFd>(0).events, 0x1234);
+            assert_eq!(revents(&fds, 0), super::super::file_table::LINUX_POLLHUP);
+        }
     }
 
     #[test]
