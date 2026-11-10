@@ -1442,6 +1442,10 @@ fn serve_clone<'a>(
         return None;
     }
 
+    if !managed {
+        child_slot.bind_zone_record(record);
+    }
+
     // Native context installation happens only while the new record is unpublished.
     native.prepare_child(
         record,
