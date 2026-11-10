@@ -1069,11 +1069,18 @@ conformance-probes: build
         env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-dedicated-signed-artifacts.jsonl
-        {{_admit}} {{_cargo}} test -p carrick-cli --test conformance_cli_contract \
-          conformance_default_run_contract -- --exact --nocapture
+        # These CLI suites boot guests: compile them under carrick, then run
+        # them under gate; the run step only re-checks Cargo fingerprints.
+        {{_lease_runner}} host-lease --mode carrick -- {{_admit}} {{_cargo}} test -p carrick-cli \
+          --test conformance_cli_contract --no-run
+        {{_lease_runner}} host-lease --mode carrick -- {{_admit}} {{_cargo}} test -p carrick-cli \
+          --test conformance {{_platform_features}} --no-run
+        {{_lease_runner}} host-lease --mode gate -- {{_admit}} {{_cargo}} test -p carrick-cli \
+          --test conformance_cli_contract conformance_default_run_contract -- --exact --nocapture
         retained_filter="$(paste -sd, scripts/conformance/retained-generic-probes.txt)"
         CARRICK_PROBE_LANE=arm64 CARRICK_PROBE_FILTER="$retained_filter" \
-          {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+          {{_lease_runner}} host-lease --mode gate -- {{_admit}} {{_cargo}} test -p carrick-cli \
+          --test conformance {{_platform_features}} -- --nocapture
     else
         {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
     fi
