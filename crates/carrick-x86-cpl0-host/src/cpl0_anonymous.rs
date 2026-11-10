@@ -332,24 +332,83 @@ impl<'a, M: CarrierMemoryIo> HostCowWake<'a, M> {
                 .get_or_insert_with(|| fail("host COW release produced guest-own wake effects"));
         }
         for slot in effects.sgi_slots() {
-            let result = self
-                .routes
-                .destination(carrick_guest_arch::CpuId::new(u32::from(slot.raw())))
-                .ok_or_else(|| fail("owner COW wake APIC route absent"))
-                .and_then(|apic| {
-                    let address_lo = 0xfee0_0000 | (u32::from(apic.0) << 12);
-                    let data = u32::from(carrick_x86::interrupts::RESCHED_VECTOR);
-                    self.vm
-                        .signal_msi(address_lo, data)
-                        .map_err(|error| fail(format!("owner COW wake MSI: {error}")))
-                });
-            if let Err(error) = result {
+            if let Err(error) = signal_resched(self.routes, &*self.vm, slot) {
                 self.error.borrow_mut().get_or_insert(error);
             }
         }
     }
     fn finish(&self) -> Result<(), TrapError> {
         self.error.borrow_mut().take().map_or(Ok(()), Err)
+    }
+}
+
+/// The x86 ISA mechanic of a host reschedule: an APIC MSI carrying the
+/// reschedule vector to `slot`'s published APIC destination. A halted CPU
+/// wakes; a stopped one takes it when it next enters the guest.
+fn signal_resched<M: CarrierMemoryIo>(
+    routes: &PublishedApicIds,
+    vm: &M,
+    slot: SlotId,
+) -> Result<(), TrapError> {
+    let apic = routes
+        .destination(carrick_guest_arch::CpuId::new(u32::from(slot.raw())))
+        .ok_or_else(|| fail("host wake APIC route absent"))?;
+    let address_lo = 0xfee0_0000 | (u32::from(apic.0) << 12);
+    let data = u32::from(carrick_x86::interrupts::RESCHED_VECTOR);
+    vm.signal_msi(address_lo, data)
+        .map_err(|error| fail(format!("host wake MSI: {error}")))
+}
+
+/// The carrier-scoped zone host IPC releases wake into (#2031). The zone
+/// and APIC routes live in guest RAM this sink retains; the host IPC owner
+/// delivers through it when no process-global zone serves.
+struct CarrierZoneWakeSink<M: CarrierMemoryIo> {
+    ram: Arc<GuestRam>,
+    vm: Arc<M>,
+}
+impl<M: CarrierMemoryIo> CarrierZoneWakeSink<M> {
+    fn routes(&self) -> &PublishedApicIds {
+        let pointer = self
+            .ram
+            .host_ptr(META_GPA + ROUTES_OFFSET, size_of::<PublishedApicIds>())
+            .unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!("cpl0::wake", "retained APIC routes absent")
+            });
+        // SAFETY: bootstrap initialized this retained aligned atomic record;
+        // `ram` retains it for this sink's lifetime (checked at creation).
+        unsafe { &*pointer.cast::<PublishedApicIds>() }
+    }
+}
+impl<M: CarrierMemoryIo> carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>
+    for CarrierZoneWakeSink<M>
+{
+    fn zone(&self) -> &X86Cpl0Zone {
+        retained_cow_zone(&self.ram).unwrap_or_else(|_| {
+            carrick_fatal::carrick_fatal!("cpl0::wake", "retained carrier zone absent")
+        })
+    }
+    fn resched(&self, slot: SlotId) {
+        // A route or MSI failure is a broken carrier, not contention.
+        if let Err(error) = signal_resched(self.routes(), &*self.vm, slot) {
+            carrick_fatal::carrick_fatal!("cpl0::wake", "carrier zone reschedule: {error}");
+        }
+    }
+}
+
+impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
+    /// The carrier zone wake sink this carrier's host IPC owner binds.
+    pub(crate) fn carrier_zone_wake(
+        &self,
+    ) -> Result<
+        Arc<dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>>,
+        TrapError,
+    > {
+        retained_cow_zone(&self.ram)?;
+        HostCowWake::new(&self.ram, self._vm.clone_vm())?;
+        Ok(Arc::new(CarrierZoneWakeSink {
+            ram: Arc::clone(&self.ram),
+            vm: self._vm.clone_vm(),
+        }))
     }
 }
 struct CowPause<'a> {

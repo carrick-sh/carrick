@@ -4159,6 +4159,15 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         self.0.ipc_table_map()
     }
 
+    pub fn carrier_zone_wake(
+        &self,
+    ) -> Result<
+        Arc<dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>>,
+        TrapError,
+    > {
+        self.0.carrier_zone_wake()
+    }
+
     pub fn file_tables(
         &self,
         binding: carrick_el1_abi::FileRegionBinding,
