@@ -248,6 +248,40 @@ fn serial_host_native_child_clock_reads_match_linux() {
     );
 }
 
+/// A served clock sample whose guest destination faults is the call's
+/// `-EFAULT` (Linux), never a carrier failure: invalid `clock_gettime`
+/// timespec, invalid `gettimeofday` timeval, and a valid timeval followed by a
+/// faulting timezone.
+#[test]
+fn serial_host_native_child_clock_gettime_invalid_output_is_efault() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_clock_gettime_invalid_output_is_efault",
+        "native_child_clock.S",
+        &["-DFAULT_ROW=8"],
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_child_gettimeofday_invalid_timeval_is_efault() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_gettimeofday_invalid_timeval_is_efault",
+        "native_child_clock.S",
+        &["-DFAULT_ROW=9"],
+        8,
+    );
+}
+
+#[test]
+fn serial_host_native_child_gettimeofday_faulting_timezone_is_efault() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_gettimeofday_faulting_timezone_is_efault",
+        "native_child_clock.S",
+        &["-DFAULT_ROW=10"],
+        8,
+    );
+}
+
 fn native_child_sleep_witness(test: &str, flags: &[&str]) {
     native_child_sleep_witness_with_exit(test, "native_child_sleep.S", flags, 8);
 }
