@@ -5885,12 +5885,11 @@ fn x86_registered_claim_free_birth_before_requeue_sibling_tgkill() {
             .unwrap();
         leader.lifecycle_admission_settled().unwrap();
         let process = fixture.runtime.graph.lock().root_key;
-        assert_eq!(
-            fixture
+        assert!(
+            !fixture
                 .registry
                 .register_native_birth(&fixture.runtime, process, leader_source, record)
-                .unwrap(),
-            false
+                .unwrap()
         );
         assert_eq!(
             fixture.zone.record(record_id).claim(),
