@@ -684,6 +684,13 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // SAFETY: switch_in_full made the record OnCpu on this slot.
         let ctx = unsafe { rec.ctx_mut() };
         publish_identity(self.task, rec.identity());
+        if switched.home {
+            // The record identity names the thread; its namespace PID and
+            // root incarnation are the host's binding, which another
+            // process's record may have overwritten on this slot (#1958).
+            // A registered owner's resume below republishes its own.
+            self.task.restore_host_loaded();
+        }
         let resumed = self
             .cpu
             .resume_lifecycle(zone, self.task, slot, switched.record);

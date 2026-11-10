@@ -99,7 +99,9 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     >,
     frame: &mut TrapFrame,
 ) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
-    deliver_on_user_return_at(task, process, frame, |frame, fp| {
+    // The vector admitted this entry with the loaded task's lifecycle.
+    let (_, control) = task.lifecycle_refs()?;
+    deliver_on_user_return_at(task, control, process, frame, |frame, fp| {
         use crate::sched::ThreadCpu;
         let mut saved =
             crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
@@ -117,6 +119,7 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) fn deliver_on_user_return_at<'a, X: super::aarch64_process::ForkStockCrossing>(
     task: &carrick_el1_abi::CurrentTask,
+    control: &carrick_el1_abi::ThreadControlSlot,
     process: &mut super::native_process_runtime::NativeProcessEntry<
         '_,
         'a,
@@ -146,7 +149,6 @@ pub(crate) fn deliver_on_user_return_at<'a, X: super::aarch64_process::ForkStock
     }
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     let sp = live(frame, &mut fp);
-    let (_, control) = task.lifecycle_refs()?;
     deliver_on_user_return_with(
         task,
         control,

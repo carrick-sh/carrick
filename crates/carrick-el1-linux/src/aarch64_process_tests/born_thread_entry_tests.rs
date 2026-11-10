@@ -418,6 +418,12 @@ fn signal_checkpoint(
     stack: &carrick_test_support::GuestUserBuffer,
     delivered: &mut usize,
 ) -> Result<carrick_el1_abi::Action, NativeProcessError> {
+    // The host served the forwarded call, settling its boundary's work.
+    let task: &'static CurrentTask = &fixture.task;
+    if let Some(work) = task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    let _ = task.linux.take_served_boundary();
     let mut service = fixture.process_service();
     let ttbr0 = fixture_ttbr0(fixture);
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
@@ -427,7 +433,6 @@ fn signal_checkpoint(
         &mut saved,
         crate::sched::CpuExitCause::Svc,
     );
-    let task: &'static CurrentTask = &fixture.task;
     super::super::dispatch::arm_signal_user_return_entry(
         BornInZoneSource {
             zone: fixture.zone,
@@ -440,10 +445,16 @@ fn signal_checkpoint(
         fixture.control,
         &mut service,
         |process| {
-            super::super::arm_signal::deliver_on_user_return_at(task, process, frame, |_, _| {
-                *delivered += 1;
-                stack.va_at(stack.len())
-            })
+            super::super::arm_signal::deliver_on_user_return_at(
+                task,
+                fixture.control,
+                process,
+                frame,
+                |_, _| {
+                    *delivered += 1;
+                    stack.va_at(stack.len())
+                },
+            )
         },
     )
 }

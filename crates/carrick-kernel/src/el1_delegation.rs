@@ -169,9 +169,8 @@ pub fn publish_current_task(
         .linux
         .file_table
         .store(file_table, Ordering::Relaxed);
-    current_task.publish_visible_pid(visible_pid);
+    current_task.publish_host_loaded(visible_pid, root_generation);
     current_task.publish_ptrace_traced(ptrace_traced);
-    current_task.publish_root_generation(root_generation);
     current_task
         .execution
         .generation
