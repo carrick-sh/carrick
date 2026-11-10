@@ -117,7 +117,7 @@ impl NativeExecServiceDirectory {
 
     /// The service a guest exec request names, or the counted ENOSYS a
     /// request receives when no live service holds that capability (for
-    /// example a fork child of a root whose image the host replaced). A
+    /// example a request that outlived its run's registration). A
     /// guest-selected capability is never carrier custody to fail on.
     pub(crate) fn resolve(
         &self,
@@ -203,9 +203,9 @@ mod native_exec_service_registration_tests {
         }
     }
 
-    /// #936: a native child of a post-exec root names the root's original
-    /// exec capability, which the host exec retired. The request must be a
-    /// counted ENOSYS (as on main), never a carrier custody fatal.
+    /// #936: a request naming a capability no live service holds (unknown,
+    /// or retired with its run) must be a counted ENOSYS, never a carrier
+    /// custody fatal.
     #[test]
     fn retired_or_unknown_exec_capability_is_a_counted_enosys() {
         let directory = Arc::new(NativeExecServiceDirectory::default());

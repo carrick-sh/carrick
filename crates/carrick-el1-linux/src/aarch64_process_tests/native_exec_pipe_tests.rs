@@ -2080,8 +2080,7 @@ fn serial_host_child_of_an_execed_root_execs_through_the_installed_capability() 
     // Launch: the run mints its exec capability from its host-served root.
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
     let launch_root = dispatcher.capture_one_task_context().unwrap();
-    let installed = carrick_kernel::dispatch::exec_files::native_exec_capability(&launch_root)
-        .expect("launch root mints a capability");
+    let installed = carrick_kernel::dispatch::exec_files::native_exec_capability(&launch_root);
     // The root execs on the host route before it forks.
     let prepared = dispatcher
         .prepare_one_task_kernel_exec(&launch_root)
