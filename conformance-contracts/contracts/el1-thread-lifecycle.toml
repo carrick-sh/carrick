@@ -22,7 +22,7 @@
 # carrick-mem::memory::syscall_mailbox_tests::served_native_frame_with_late_host_work_reenters_irq_boundary
 # #1733 (core capture reads under its own exclusion): binding.rs parks a
 # Busy core capture of the won process-terminal owner on the retained-
-# memory wait and reruns it (an own-gate read is a named fatal); HVF
+# memory wait and reruns it (an own-gate read logs a named error); HVF
 # implements translated_read_excluded. Only core capture's read path
 # changes; this contract's semantics and work budgets are unchanged and
 # its existing bindings remain the evidence.

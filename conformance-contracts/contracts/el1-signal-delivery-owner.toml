@@ -27,7 +27,7 @@
 # output, backing copy, untouched-zero leaf check); carrick-hal
 # registers the core_read module; binding.rs parks a Busy core capture
 # of the won process-terminal owner on the retained-memory wait and
-# reruns it (an own-gate read is a named fatal); the x86 engine
+# reruns it (an own-gate read logs a named error); the x86 engine
 # implements CoreMemorySource mechanics. Only core capture's read path
 # changes; this contract's semantics and work budgets are unchanged and
 # its existing bindings remain the evidence.
