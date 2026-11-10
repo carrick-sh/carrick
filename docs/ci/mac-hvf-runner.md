@@ -284,11 +284,13 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
   dispatch queues beside a scheduled run instead of displacing it. Per-merge HVF attribution comes
   from each merge group's own Signed queue gate.
 - **Host-lease serialization (`/tmp/carrick-host-lease.lock`):**
-  - `hvf-kernel` builds its checkout xtask under the **shared** `just lease carrick` and acquires an
-    **exclusive** `just lease gate` across fixture restoration, `just accept --phase signed`, and
-    `Signed embedded guest tests`. It no longer runs `just ci` (hosted CI covers it, #2057).
-  - Director gates (`just accept`, `just remote-accept` on `/Volumes/carrick-gate`) also
-    acquire exclusive `gate` mode.
+  - `hvf-kernel` builds its checkout xtask under the **shared** `just lease carrick` (it no
+    longer runs `just ci`; hosted CI covers it, #2057). Fixture restoration takes **exclusive**
+    `just lease gate`; `just accept --phase signed` and `Signed embedded guest tests` then build
+    and sign under shared `carrick` and take exclusive `gate` themselves only while guests
+    execute (#2013).
+  - Director gates (`just accept`, `just remote-accept` on `/Volumes/carrick-gate`) take
+    exclusive `gate` mode for guest execution and shared `carrick` for their builds.
   - `ci.yml`'s `carrick-macos-ci` PR jobs (`macos-clippy`, `macos-build`, `macos-unit-a`,
     `macos-unit-b`, `macos-integration`) prebuild `carrick-xtask` (`just ci-prebuild-xtask`)
     and run every compile, lint, rustdoc, and test step under **shared** `just lease carrick`.
