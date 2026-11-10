@@ -1,11 +1,16 @@
 //! Signed runs build under the shared `carrick` lease and execute under
 //! `gate` (#2013). The driver runs one command twice: first as the build
-//! phase under `carrick`, which lists the artifacts it produced, then, after
-//! that lease is fully released, as the execution phase under `gate`.
+//! phase under `carrick`, which lists every artifact the execution phase
+//! will run, then, after that lease is fully released, as the execution
+//! phase under `gate`. `accept --phase signed` is its one production caller.
 //!
 //! The artifact identity is captured inside the build lease and checked
 //! again inside the gate lease before the execution phase starts. A changed
-//! artifact is a broken invariant and refuses execution. There is no lock
+//! artifact is a broken invariant and refuses execution. Each listed
+//! artifact names its kind: a signed host executable is identified by
+//! SHA-256 plus, on macOS, its CDHash and LC_UUID; any other input the
+//! guests run (Linux ELF fixtures, manifests) by its SHA-256 content hash,
+//! because a code signature cannot describe it. There is no lock
 //! upgrade: each phase is a separate supervised run, and the build lease is
 //! closed before the gate lease is requested. Waiting for `gate` uses the
 //! ordinary lease wait (`HOST_LEASE_WAIT_LIMIT`).
@@ -29,7 +34,7 @@ use thiserror::Error;
 pub const PHASE_ENV: &str = "CARRICK_SIGNED_PHASE";
 /// Directory the phases share; the build phase writes [`ARTIFACTS_FILE`] here.
 pub const STATE_ENV: &str = "CARRICK_SIGNED_STATE";
-/// Newline-separated absolute paths of every artifact the execution phase runs.
+/// One `<kind>\t<absolute path>` line per artifact the execution phase runs.
 pub const ARTIFACTS_FILE: &str = "artifacts";
 /// Identity captured at the end of the build phase, inside its lease.
 pub const IDENTITY_FILE: &str = "identity.json";
@@ -93,11 +98,42 @@ pub enum SignedPhaseError {
     Stage(String),
 }
 
+/// How an artifact's identity is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactKind {
+    /// A host executable this run signed: SHA-256, plus CDHash and LC_UUID
+    /// on macOS, where an unsigned file is refused.
+    Signed,
+    /// Bytes the guests run or the run reads (Linux ELF fixtures, their
+    /// manifest): SHA-256 content hash only.
+    Content,
+}
+
+impl ArtifactKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Signed => "signed",
+            Self::Content => "content",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "signed" => Some(Self::Signed),
+            "content" => Some(Self::Content),
+            _ => None,
+        }
+    }
+}
+
 /// Identity of one artifact the execution phase runs. CDHash and LC_UUID
-/// are read where the host signs (macOS); SHA-256 is always present.
+/// are read for signed artifacts where the host signs (macOS); SHA-256 is
+/// always present.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmittedArtifact {
     pub path: PathBuf,
+    pub kind: ArtifactKind,
     pub sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdhash: Option<String>,
@@ -216,7 +252,7 @@ pub fn run_stage(
     phase: SignedPhase,
     state: &Path,
     command: &[OsString],
-    probe: &dyn Fn(&Path) -> Result<AdmittedArtifact, String>,
+    probe: &dyn Fn(ArtifactKind, &Path) -> Result<AdmittedArtifact, String>,
 ) -> Result<i32, SignedPhaseError> {
     if !HostLease::inherited() {
         return Err(SignedPhaseError::Stage(
@@ -231,19 +267,23 @@ pub fn run_stage(
             if code != 0 {
                 return Ok(code);
             }
-            let paths = read_artifact_list(state)?;
+            let listed = read_artifact_list(state)?;
             let identity = SignedAdmission {
                 build_lease: lease.mode(),
                 execute_lease: None,
-                artifacts: capture(&paths, probe)?,
+                artifacts: capture(&listed, probe)?,
             };
             write_json(&state.join(IDENTITY_FILE), &identity)?;
             Ok(0)
         }
         SignedPhase::Execute => {
             let built: SignedAdmission = read_json(&state.join(IDENTITY_FILE))?;
-            let paths: Vec<PathBuf> = built.artifacts.iter().map(|a| a.path.clone()).collect();
-            let now = capture(&paths, probe)?;
+            let listed: Vec<(ArtifactKind, PathBuf)> = built
+                .artifacts
+                .iter()
+                .map(|artifact| (artifact.kind, artifact.path.clone()))
+                .collect();
+            let now = capture(&listed, probe)?;
             if now != built.artifacts {
                 return Err(SignedPhaseError::IdentityChanged {
                     built: built.artifacts,
@@ -270,8 +310,12 @@ pub fn read_admission(state: &Path) -> Result<SignedAdmission, SignedPhaseError>
     read_json(&state.join(ADMISSION_FILE))
 }
 
-/// Record artifacts for admission. Paths must be absolute.
-pub fn append_artifacts(state: &Path, paths: &[PathBuf]) -> Result<(), SignedPhaseError> {
+/// Record artifacts of one kind for admission. Paths must be absolute.
+pub fn append_artifacts(
+    state: &Path,
+    kind: ArtifactKind,
+    paths: &[PathBuf],
+) -> Result<(), SignedPhaseError> {
     use std::io::Write;
     let path = state.join(ARTIFACTS_FILE);
     let mut file = fs::OpenOptions::new()
@@ -283,9 +327,11 @@ pub fn append_artifacts(state: &Path, paths: &[PathBuf]) -> Result<(), SignedPha
             source,
         })?;
     for artifact in paths {
-        writeln!(file, "{}", artifact.display()).map_err(|source| SignedPhaseError::Io {
-            path: path.clone(),
-            source,
+        writeln!(file, "{}\t{}", kind.as_str(), artifact.display()).map_err(|source| {
+            SignedPhaseError::Io {
+                path: path.clone(),
+                source,
+            }
         })?;
     }
     Ok(())
@@ -313,18 +359,25 @@ fn run_phase_command(
     Ok(extract_exit_code(&status))
 }
 
-fn read_artifact_list(state: &Path) -> Result<Vec<PathBuf>, SignedPhaseError> {
+fn read_artifact_list(state: &Path) -> Result<Vec<(ArtifactKind, PathBuf)>, SignedPhaseError> {
     let path = state.join(ARTIFACTS_FILE);
     let text = fs::read_to_string(&path).map_err(|source| SignedPhaseError::Io {
         path: path.clone(),
         source,
     })?;
-    let mut paths: Vec<PathBuf> = text
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect();
-    if let Some(relative) = paths.iter().find(|path| !path.is_absolute()) {
+    let mut paths = Vec::new();
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let parsed = line
+            .split_once('\t')
+            .and_then(|(kind, path)| Some((ArtifactKind::parse(kind)?, PathBuf::from(path))));
+        let Some(entry) = parsed else {
+            return Err(SignedPhaseError::Probe(format!(
+                "malformed artifact line '{line}'"
+            )));
+        };
+        paths.push(entry);
+    }
+    if let Some((_, relative)) = paths.iter().find(|(_, path)| !path.is_absolute()) {
         return Err(SignedPhaseError::Probe(format!(
             "artifact path '{}' is not absolute",
             relative.display()
@@ -332,6 +385,14 @@ fn read_artifact_list(state: &Path) -> Result<Vec<PathBuf>, SignedPhaseError> {
     }
     paths.sort();
     paths.dedup();
+    if let Some(pair) = paths.windows(2).find(|pair| pair[0].1 == pair[1].1) {
+        return Err(SignedPhaseError::Probe(format!(
+            "artifact '{}' listed as both {} and {}",
+            pair[0].1.display(),
+            pair[0].0.as_str(),
+            pair[1].0.as_str()
+        )));
+    }
     if paths.is_empty() {
         return Err(SignedPhaseError::Probe(
             "the build phase listed no artifacts to admit".into(),
@@ -341,21 +402,22 @@ fn read_artifact_list(state: &Path) -> Result<Vec<PathBuf>, SignedPhaseError> {
 }
 
 fn capture(
-    paths: &[PathBuf],
-    probe: &dyn Fn(&Path) -> Result<AdmittedArtifact, String>,
+    listed: &[(ArtifactKind, PathBuf)],
+    probe: &dyn Fn(ArtifactKind, &Path) -> Result<AdmittedArtifact, String>,
 ) -> Result<Vec<AdmittedArtifact>, SignedPhaseError> {
-    paths
+    listed
         .iter()
-        .map(|path| probe(path).map_err(SignedPhaseError::Probe))
+        .map(|(kind, path)| probe(*kind, path).map_err(SignedPhaseError::Probe))
         .collect()
 }
 
-/// SHA-256 everywhere; CDHash and LC_UUID from the signed Mach-O on macOS.
-pub fn host_identity(path: &Path) -> Result<AdmittedArtifact, String> {
-    if cfg!(target_os = "macos") {
+/// SHA-256 everywhere; CDHash and LC_UUID from a signed Mach-O on macOS.
+pub fn host_identity(kind: ArtifactKind, path: &Path) -> Result<AdmittedArtifact, String> {
+    if kind == ArtifactKind::Signed && cfg!(target_os = "macos") {
         let identity = crate::accept::inspect_executable(path)?;
         return Ok(AdmittedArtifact {
             path: identity.path,
+            kind,
             sha256: identity.sha256,
             cdhash: Some(identity.cdhash),
             lc_uuid: Some(identity.lc_uuid),
@@ -365,6 +427,7 @@ pub fn host_identity(path: &Path) -> Result<AdmittedArtifact, String> {
         fs::read(path).map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
     Ok(AdmittedArtifact {
         path: path.to_path_buf(),
+        kind,
         sha256: format!("{:x}", Sha256::digest(&bytes)),
         cdhash: None,
         lc_uuid: None,
