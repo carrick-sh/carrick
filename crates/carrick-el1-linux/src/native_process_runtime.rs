@@ -3582,6 +3582,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             && thread.control_slot == control as *const _ as u64)
             .then(|| resources.signals().clone())
     }
+    /// Whether the root's process holds the shared native thread stock.
+    #[cfg(test)]
+    pub(crate) fn holds_native_thread_stock(&self) -> bool {
+        let graph = self.graph.lock();
+        graph
+            .owner
+            .task(graph.root_key)
+            .is_ok_and(|task| task.native().resources().thread_stock.is_some())
+    }
     /// Admit carrier-retained control storage for a fresh native root. No
     /// identity is preseeded: the shared stock owner issues and reclaims it at
     /// clone admission, under the same limits as native fork children.

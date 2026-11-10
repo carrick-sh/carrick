@@ -6646,6 +6646,23 @@ fn arm_tgkill_reaches_an_adopted_sibling_control() {
     assert_eq!(leader_tgkill_probe(fixture, &mut service, 41, 42), Ok(()));
 }
 
+/// Whether the root's native owner holds the shared thread stock. One stocker
+/// per page: the host ledger stocks a root page only when it does not.
+#[cfg(test)]
+fn root_holds_native_stock(fixture: &Fixture) -> bool {
+    registry()
+        .for_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            fixture.address,
+        )
+        .unwrap()
+        .holds_native_thread_stock()
+}
+
 /// Stock one ring pool identity (visible 42) for the root, the way the host
 /// ledger does after the process's first thread clone: a published pool
 /// entry and its retained control address, never claimed or born.
@@ -6691,13 +6708,15 @@ fn stock_ring_identity(fixture: &Fixture) -> &'static ThreadControlSlot {
 }
 
 /// #1974, the ARM ring-birth path: a production `clone(CLONE_THREAD)` served
-/// in ring by the root process (which on ARM holds no native thread stock),
-/// then the leader's immediate `tgkill(tgid, child, 0)` while the child is
-/// queued and has never been selected. Linux accepts the tid from the moment
-/// clone returns. Red on main 128ecb65a1 with ESRCH: the ARM `enqueue_born`
-/// arm queues the record without registering a native member, and the
-/// unmanaged birth leaves the child control without a zone record, so
-/// `live_signal_member`'s pool arm skips it.
+/// in ring by the root process, then the leader's immediate
+/// `tgkill(tgid, child, 0)` while the child is queued and has never been
+/// selected. Linux accepts the tid from the moment clone returns. The page's
+/// pool is stocked by its one stocker: the host ledger (modelled by
+/// `stock_ring_identity`) only while the root holds no native stock.
+/// Red on main 90e5a68ed3 with ESRCH: an ARM root holds no native stock, the
+/// ARM `enqueue_born` arm queues the record without registering a native
+/// member, and the unmanaged birth leaves the child control without a zone
+/// record, so `live_signal_member`'s pool arm skips it.
 #[test]
 fn arm_tgkill_reaches_a_ring_born_sibling_before_its_first_selection() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -6710,7 +6729,9 @@ fn arm_tgkill_reaches_a_ring_born_sibling_before_its_first_selection() {
             |_| (),
         )
         .unwrap();
-    let child = stock_ring_identity(fixture);
+    if !root_holds_native_stock(fixture) {
+        stock_ring_identity(fixture);
+    }
     run_as_leader(fixture);
     // Go's newosproc flag set: a CLONE_THREAD clone with no tid outputs.
     let mut frame = carrick_el1_abi::TrapFrame::default();
@@ -6724,13 +6745,27 @@ fn arm_tgkill_reaches_a_ring_born_sibling_before_its_first_selection() {
         carrick_personality_linux::dispatch::CompletionRoute::Served
             | carrick_personality_linux::dispatch::CompletionRoute::WithWork
     ));
-    assert_eq!(
-        frame.x[0], 42,
-        "clone was served in ring and returned the child tid"
+    let tid = frame.x[0] as i64;
+    assert!(
+        tid > 41,
+        "clone was served in ring and returned the child tid: {tid}"
     );
-    let entry = child.entry().expect("child holds the claimed pool entry");
+    let tid = tid as u32;
+    let entry = (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
+        .find(|&index| {
+            fixture
+                .page
+                .identity(carrick_el1_abi::EntryRef::new(
+                    index as u32,
+                    carrick_el1_abi::Lifecycle::state(fixture.page, index)
+                        .unwrap()
+                        .0,
+                ))
+                .is_some_and(|identity| identity.visible_tid == tid)
+        })
+        .expect("the child's pool entry");
     assert_eq!(
-        carrick_el1_abi::Lifecycle::state(fixture.page, entry.index())
+        carrick_el1_abi::Lifecycle::state(fixture.page, entry)
             .unwrap()
             .1,
         carrick_el1_abi::EntryState::Born
@@ -6738,10 +6773,10 @@ fn arm_tgkill_reaches_a_ring_born_sibling_before_its_first_selection() {
     // Held before its first selection: queued on the parent's vCPU only.
     assert_eq!(fixture.zone.slot(fixture.slot).queued(), 1);
     assert!(
-        leader_sees_thread(fixture, &mut service, 42),
+        leader_sees_thread(fixture, &mut service, tid),
         "the graph already lists the tid"
     );
-    assert_eq!(leader_tgkill_probe(fixture, &mut service, 41, 42), Ok(()));
+    assert_eq!(leader_tgkill_probe(fixture, &mut service, 41, tid), Ok(()));
 }
 
 /// Control for the ring-birth witness above: the same production clone and
@@ -6762,24 +6797,27 @@ fn arm_tgkill_reaches_a_managed_ring_born_sibling_control() {
             |_| (),
         )
         .unwrap();
-    let controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
-        ThreadControlSlot::new()
-    })));
-    registry()
-        .for_entry(
-            BornInZoneSource {
-                zone: fixture.zone,
-                slot: fixture.slot,
-            },
-            &fixture.task,
-            fixture.address,
-        )
-        .unwrap()
-        .admit_thread_stock(super::native_process_runtime::NativeLifecycleResources {
-            page: fixture.page,
-            controls,
-        })
-        .unwrap();
+    if !root_holds_native_stock(fixture) {
+        let controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        })));
+        registry()
+            .for_entry(
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                &fixture.task,
+                fixture.address,
+            )
+            .unwrap()
+            .admit_thread_stock(super::native_process_runtime::NativeLifecycleResources {
+                page: fixture.page,
+                controls,
+            })
+            .unwrap();
+    }
+    assert!(root_holds_native_stock(fixture));
     run_as_leader(fixture);
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[8] = 220;
