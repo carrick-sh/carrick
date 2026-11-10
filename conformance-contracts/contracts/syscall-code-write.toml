@@ -1,3 +1,11 @@
+# #1733 (core capture reads under its own exclusion): the AArch64 engine
+# replaces read_core_bytes with CoreMemorySource mechanics (stage-1
+# output, backing copy, untouched-zero leaf check); Aarch64Vmm gains
+# translated_read_excluded for capture's backing read; HVF implements
+# translated_read_excluded; HVF adds the excluded backing read capture
+# uses. Only core capture's read path changes; this contract's semantics
+# and work budgets are unchanged and its existing bindings remain the
+# evidence.
 schema_version = 1
 id = "kernel.mm.syscall-code-write"
 title = "Ordinary syscall destinations retain and revoke exact physical backing"

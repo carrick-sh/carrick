@@ -19,6 +19,10 @@
 # #1394: additional ABI bookkeeping witness only; existing semantic and
 # work-budget bindings remain authoritative. Census publication reads counters
 # after executor join and does not alter this contract's guest operation.
+# #1733 (core capture reads under its own exclusion): carrick-hal
+# registers the core_read module. Only core capture's read path changes;
+# this contract's semantics and work budgets are unchanged and its
+# existing bindings remain the evidence.
 schema_version = 1
 id = "kernel.vcpu.shutdown-entry"
 title = "Carrier shutdown remains visible across every physical vCPU entry"

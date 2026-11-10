@@ -6,6 +6,11 @@
 # terminal suspension. Zone saves retain their existing context/origin;
 # ordinary guest dispatch, exec drains and this contract's budgets and primary
 # bindings are unchanged. Native signed stress qualification remains required.
+# #1733 (core capture reads under its own exclusion): the AArch64 engine
+# replaces read_core_bytes with CoreMemorySource mechanics (stage-1
+# output, backing copy, untouched-zero leaf check). Only core capture's
+# read path changes; this contract's semantics and work budgets are
+# unchanged and its existing bindings remain the evidence.
 schema_version = 1
 id = "kernel.el1.task-load-entry"
 title = "Loading a task on a persistent executor costs no host round trip of its own"

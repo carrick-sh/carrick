@@ -27,6 +27,11 @@
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
 # carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue
+# #1733: binding.rs changes only the process-terminal core-capture
+# continuation (a Busy core read parks the won terminal owner and reruns
+# its capture); ARM admission, set_tid_address and clear-child-tid paths
+# are unchanged. Rerun the existing control:
+# carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue
 schema_version = 1
 id = "process.native.arm-admission"
 title = "ARM root setup and process calls share one authenticated native owner"

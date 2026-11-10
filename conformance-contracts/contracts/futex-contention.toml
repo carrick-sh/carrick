@@ -3,6 +3,13 @@
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable
 # under process.native.arm-admission; the full VM-free native suite passes.
 # No additional signed, Docker or runtime-ratio evidence is claimed here.
+# #1733 (core capture reads under its own exclusion): binding.rs parks a
+# Busy core capture of the won process-terminal owner on the retained-
+# memory wait and reruns it (an own-gate read is a named fatal);
+# vcpu_loop/mod.rs adds only test-engine fixtures and re-exports for the
+# capture witnesses. Only core capture's read path changes; this
+# contract's semantics and work budgets are unchanged and its existing
+# bindings remain the evidence.
 schema_version = 1
 id = "kernel.futex.contention"
 title = "Futex contention"

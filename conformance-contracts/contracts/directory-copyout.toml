@@ -11,6 +11,13 @@
 # terminal suspension. Zone saves retain their existing context/origin;
 # ordinary guest dispatch, exec drains and this contract's budgets and primary
 # bindings are unchanged. Native signed stress qualification remains required.
+# #1733 (core capture reads under its own exclusion): binding.rs parks a
+# Busy core capture of the won process-terminal owner on the retained-
+# memory wait and reruns it (an own-gate read is a named fatal);
+# vcpu_loop/mod.rs adds only test-engine fixtures and re-exports for the
+# capture witnesses. Only core capture's read path changes; this
+# contract's semantics and work budgets are unchanged and its existing
+# bindings remain the evidence.
 schema_version = 1
 id = "kernel.fs.directory-copyout"
 title = "Directory streams commit complete records into private destinations"

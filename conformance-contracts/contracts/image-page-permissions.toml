@@ -10,6 +10,13 @@
 # terminal suspension. Zone saves retain their existing context/origin;
 # ordinary guest dispatch, exec drains and this contract's budgets and primary
 # bindings are unchanged. Native signed stress qualification remains required.
+# #1733 (core capture reads under its own exclusion): the AArch64 engine
+# replaces read_core_bytes with CoreMemorySource mechanics (stage-1
+# output, backing copy, untouched-zero leaf check); vcpu_loop/mod.rs
+# adds only test-engine fixtures and re-exports for the capture
+# witnesses. Only core capture's read path changes; this contract's
+# semantics and work budgets are unchanged and its existing bindings
+# remain the evidence.
 schema_version = 1
 id = "kernel.mm.image-page-permissions"
 title = "Writable memory never executes unless mapped PROT_EXEC"

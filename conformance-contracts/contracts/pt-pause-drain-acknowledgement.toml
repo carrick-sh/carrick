@@ -1,3 +1,6 @@
+# #1733: mm_occupancy.rs adds core capture's exclusion proof, a nested
+# counted raise of the gate the capture's page-table pause already holds,
+# lowered before the pause. The pause and its drain are unchanged.
 schema_version = 1
 id = "kernel.mm.pt-pause-drain-acknowledgement"
 title = "A stage-1 page-table pause waits for sibling acknowledgement, never a wall-clock budget"
@@ -13,6 +16,7 @@ vm_free = [
   "carrick-runtime::vcpu_loop::quiesce::pt_pause_tests::pt_pause_drain_waits_for_late_sibling_acknowledgement",
   "carrick-core::x86_acceleration::x3_shared_protocol (orders 3a/3b components only: both descriptor ISAs at 16/64/256 pages, exact grant generation and rollback; 4 KiB/16 KiB backing, logical leaf references and pin-before-return; dirty-load closure/drain, stale invalidation refusal, exact root nonce, failed arena retirement quarantine, and 20000-mapping retirement receipt authentication; no signed physical mapping census, production pool-exhaustion, exec/clear-tid or order-4 wait acceptance)",
   "carrick-runtime::vcpu_loop::quiesce::pt_pause_tests::pt_pause_drain_sees_a_sibling_that_reregistered_after_a_block",
+  "carrick-runtime::vcpu_loop::crash::tests::capture_core_reads_through_its_own_pause_gate (#1733: core reads run while the capture pause holds the gate, through the nested exclusion; every raised gate is lowered on return)",
 ]
 embed = [
   "carrick-embed::pt_pause_drain_pressure",

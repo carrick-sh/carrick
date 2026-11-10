@@ -1,3 +1,6 @@
+# #1733: mm_occupancy.rs adds core capture's exclusion proof
+# (`exclude_el1_editor_for_core_capture`); executor admission and slot
+# occupancy are unchanged. Rerun the existing mm_occupancy controls.
 schema_version = 1
 id = "kernel.mm.executor-admission"
 title = "A rejected install on an occupied vCPU slot preserves the live occupant and its quiescence endpoint"

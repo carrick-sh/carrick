@@ -8,6 +8,12 @@
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
 # carrick-runtime::vcpu_loop::lifecycle::tests::fork_child_tid_bootstrap_preserves_cow_supply_before_copyout
+# #1733 (core capture reads under its own exclusion): the AArch64 engine
+# replaces read_core_bytes with CoreMemorySource mechanics (stage-1
+# output, backing copy, untouched-zero leaf check); HVF implements
+# translated_read_excluded. Only core capture's read path changes; this
+# contract's semantics and work budgets are unchanged and its existing
+# bindings remain the evidence.
 schema_version = 1
 id = "kernel.fork.stage1-image"
 title = "Fork stage-1 image recycling"

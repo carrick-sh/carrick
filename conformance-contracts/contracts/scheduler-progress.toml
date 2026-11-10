@@ -121,6 +121,7 @@ vm_free = [
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
+  "carrick-runtime::vcpu_loop::binding::tests::terminal_core_capture_parks_on_another_holder_then_publishes (#1733: the terminal owner returns its execution lease while a core read waits on another holder, instead of parking a pool worker)",
 ]
 embed = [
   "carrick-conformance-next::sched_affinity_threads (kernel cpumask return-size rule; raw diagnostic retained)",

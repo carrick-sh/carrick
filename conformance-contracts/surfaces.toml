@@ -467,6 +467,7 @@ surfaces = [
   # Preservation evidence for the unsolicited-exit hook, not guest semantic proof.
   { path = "crates/carrick-hal/src/birth_serial.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-hal/src/birth_serial.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-hal/src/core_read.rs", contract = "kernel.mm.address-space-occupancy" },
   { path = "crates/carrick-hal/src/diagnostic_capture.rs", contracts = [] },
   { path = "crates/carrick-hal/src/diagnostic_capture_tests.rs", contract = "kernel.el1.gic" },
   { path = "crates/carrick-hal/src/diagnostic_capture_tests.rs", contract = "kernel.el1.guest-run-queue" },
