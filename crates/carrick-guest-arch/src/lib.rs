@@ -224,6 +224,18 @@ impl Asid {
         Self(core::num::NonZeroU16::MIN)
     }
 
+    /// The identifier an x86 successor manifest seals. x86 runs with PCID off
+    /// (every CR3 write flushes), so there is no tag to allocate: the manifest
+    /// still requires a nonzero ASID, and this named value stands for "none".
+    /// An x86 adopter refuses every other value ([`Self::is_x86_untagged`]).
+    pub const fn x86_untagged() -> Self {
+        Self(core::num::NonZeroU16::MAX)
+    }
+
+    pub const fn is_x86_untagged(self) -> bool {
+        self.0.get() == core::num::NonZeroU16::MAX.get()
+    }
+
     pub const fn raw(self) -> u16 {
         self.0.get()
     }

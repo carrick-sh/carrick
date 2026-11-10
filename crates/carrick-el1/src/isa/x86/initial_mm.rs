@@ -12,7 +12,7 @@ use carrick_mmu_core::x86::descriptor_txn::{
     DescriptorOutcome, DescriptorTxn, InlineJournal, LiveDescriptorWords, PRESENT, USER,
     execute_descriptor_txn,
 };
-use carrick_sched_core::{ParkedContextWords, X86_XSAVE_BYTES};
+use carrick_sched_core::ParkedContextWords;
 use core::num::NonZeroU64;
 use image_alloc::{collections::BTreeSet, vec::Vec};
 
@@ -550,15 +550,9 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     #[cfg(target_os = "none")]
     super::x86::mmu::register_shared_supervisor_tables(words, source_root)
         .map_err(|_| InitialMmError::DescriptorRefused)?;
-    let mut frame = [0; 20];
-    frame[15] = image.entry.raw();
-    frame[16] = 0x23; // user 64-bit code selector in the CPL0 GDT
-    frame[17] = 0x202; // fixed bit plus interrupt enable
-    frame[18] = stack.rsp;
-    frame[19] = 0x1b; // user data selector in the CPL0 GDT
     Ok(InitialMmImage {
         address,
-        context: ParkedContextWords::from_parts(frame, address, 0, 0, [0; X86_XSAVE_BYTES]),
+        context: ParkedContextWords::user_entry(address, image.entry.raw(), stack.rsp),
         stack_pointer: stack.rsp,
         initial_break,
         publications,
