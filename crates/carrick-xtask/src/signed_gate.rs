@@ -1449,6 +1449,16 @@ fn admit_evidence(dir: &Path, receipt: &AcceptReceipt) -> Result<ArtifactIdentit
     Ok(identity)
 }
 
+/// How `publish` reached its comment, so the text never depends on string
+/// sniffing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublishOutcome {
+    Compared,
+    IncomparableBase,
+    /// Cancelled before a candidate result existed.
+    Cancelled,
+}
+
 fn publish(
     request_path: &Path,
     results: &Path,
@@ -1517,15 +1527,32 @@ fn publish(
             && execution_result == "success";
         Ok::<_, ReceiptError>((passed, body))
     })();
-    let (passed, mut body, incomparable) = match comparison {
-        Ok((passed, body)) => (passed, body, false),
+    let candidate_path = results.join(CANDIDATE_RECEIPT);
+    let (passed, mut body, outcome) = match comparison {
+        Ok((passed, body)) => (passed, body, PublishOutcome::Compared),
+        // A cancelled job that never wrote a candidate has no verdict to
+        // report; it still fails the required check, only the text differs.
+        Err(ReceiptError::Io { path, source })
+            if execution_result == "cancelled"
+                && path == candidate_path
+                && source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            (
+                false,
+                format!(
+                    "Signed gate: **CANCELLED — no verdict**\n\nThe gate run was cancelled before producing a candidate result ([run]({run_url})).\n\nCandidate `{}`; base `{}`\n",
+                    request.sha, request.base
+                ),
+                PublishOutcome::Cancelled,
+            )
+        }
         Err(error @ ReceiptError::IncomparableBase(_)) => (
             false,
             format!(
                 "Signed gate: **INCOMPARABLE BASE — BLOCKED**\n\nCandidate `{}`; base `{}`\n\n{error}\n",
                 request.sha, request.base
             ),
-            true,
+            PublishOutcome::IncomparableBase,
         ),
         Err(error) => (
             false,
@@ -1533,10 +1560,11 @@ fn publish(
                 "Signed gate: **FAIL**\n\nCandidate `{}`; base `{}`\n\nNo valid comparison: {error}\n",
                 request.sha, request.base
             ),
-            false,
+            PublishOutcome::Compared,
         ),
     };
-    if !passed && !body.starts_with("Signed gate: **FAIL**") && !incomparable {
+    if !passed && !body.starts_with("Signed gate: **FAIL**") && outcome == PublishOutcome::Compared
+    {
         body.insert_str(
             0,
             "Signed gate: **FAIL** (receipt or execution admission)\n\n",
@@ -1563,8 +1591,10 @@ fn publish(
         write(Path::new(&summary), &body)?;
     }
     // Status is written even if comment publication fails.
-    let description = if incomparable {
+    let description = if outcome == PublishOutcome::IncomparableBase {
         "Incomparable base: host, fixture or incomplete base run; blocked"
+    } else if outcome == PublishOutcome::Cancelled {
+        "Gate run cancelled before producing a result; no verdict"
     } else if passed {
         "No new failures; populations and completion preserved"
     } else {
@@ -1582,7 +1612,7 @@ fn publish(
     });
     status?;
     comment?;
-    if incomparable {
+    if outcome == PublishOutcome::IncomparableBase {
         return Err(ReceiptError::IncomparableBase(
             "see comment and artifacts".into(),
         ));
