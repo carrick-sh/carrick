@@ -1990,6 +1990,9 @@ fn drive_signed(
     let root = crate::cli::resolve_repo_info(root_arg)
         .map_err(|e| AcceptError::Git(e.to_string()))?
         .repository_root;
+    // Refuse a dirty checkout before any admission or work, as each stage
+    // does again under its own lease.
+    verify_clean_checkout(&root)?;
     // Disk admission takes gate itself, so it cannot run inside the shared
     // build phase. Admit once here; the build phase then runs `just _build`,
     // the body `just build` runs after its own disk admission.

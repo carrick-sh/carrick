@@ -186,8 +186,7 @@ lease MODE +CMD:
 # Run the host and/or signed landing gate (no Docker). Host work, the release
 # build and signing hold the shared carrick lease; signed guest execution alone
 # holds exclusive gate (#2013). xtask is built under the shared lease first.
-accept *ARGS:
-    just --justfile {{justfile()}} ci-prebuild-xtask
+accept *ARGS: ci-prebuild-xtask
     {{_admit}} {{_xtask}} accept --profile no-docker {{ARGS}}
 
 # Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt.
@@ -1051,7 +1050,7 @@ check-kernel-portable:
 el1-gate: build
     {{_admit}} {{_xtask}} accept --phase signed --profile full
 
-conformance-probes: build
+conformance-probes: build ci-prebuild-xtask
     #!/usr/bin/env bash
     set -euo pipefail
     case "$(uname -m)" in
@@ -1062,7 +1061,6 @@ conformance-probes: build
         # oracles. Only live-oracle and process-poisoning exceptions retain the
         # old signed-binary harness while their embed blockers remain open.
         # test-signed takes carrick for its build and gate for its guests (#2013).
-        just --justfile {{justfile()}} ci-prebuild-xtask
         env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-generic-signed-artifacts.jsonl
@@ -1127,8 +1125,7 @@ gate-containers: build
 # target/release/carrick. Needs HVF + the docker.io/library/ubuntu:24.04
 # image, so it is an opt-in guest lane like conformance-quick — deliberately
 # NOT part of `just ci`.
-test-embed *ARGS: build
-    just --justfile {{justfile()}} ci-prebuild-xtask
+test-embed *ARGS: build ci-prebuild-xtask
     env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-embed {{ARGS}}
 
 # Signed first-boot smoke (#893), about 30 s on a warm build: builds only the
@@ -1146,8 +1143,7 @@ smoke-signed *ARGS:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask --features smoke-signed -- smoke-signed {{ARGS}}
 
 # Guest-running tests of carrick-vmm-hvf from SIGNED cargo test executables.
-test-hvf *ARGS:
-    just --justfile {{justfile()}} ci-prebuild-xtask
+test-hvf *ARGS: ci-prebuild-xtask
     env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
 
 # HVF trap-engine tests (`crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs`):
@@ -1161,19 +1157,16 @@ test-hvf *ARGS:
 # `trap_engine_hvf_` set with `--ignored` (each test re-execs itself in a
 # fresh process: one VM per process), then runs the package's UNENTITLED
 # negative control (`unsigned_executable_maps_hv_denied_to_entitlement`).
-test-hvf-trap-engine:
-    just --justfile {{justfile()}} ci-prebuild-xtask
+test-hvf-trap-engine: ci-prebuild-xtask
     env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
 
 # Raw one-shot cancellation qualification for #978, including pre-entry WFI.
 # A missing cancellation is killed/reaped by the test's process watchdog.
-test-hvf-shutdown-kick:
-    just --justfile {{justfile()}} ci-prebuild-xtask
+test-hvf-shutdown-kick: ci-prebuild-xtask
     CARRICK_TEST_TARGET=trap_engine_hvf ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_shutdown_kick_ --ignored --nocapture
 
 # Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
-test-conformance-next *ARGS: build
-    just --justfile {{justfile()}} ci-prebuild-xtask
+test-conformance-next *ARGS: build ci-prebuild-xtask
     env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
 
 # Re-sign an already-built release binary (rarely needed on its own).
