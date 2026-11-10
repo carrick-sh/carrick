@@ -2,6 +2,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[cfg(test)]
+mod born_thread_entry_tests;
+#[cfg(test)]
 mod native_child_handoff_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 mod native_exec_pipe_tests;
