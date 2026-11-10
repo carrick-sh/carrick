@@ -151,6 +151,14 @@ fn signal_record_exists<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordR
         return true;
     }
     let retained = zone.record(record.id);
+    if retained.incarnation() == record.incarnation
+        && retained.claim() == carrick_sched_core::Claim::Free
+        && retained.home().is_none()
+        && retained.has_native_execution_owner()
+        && !retained.is_cancelled()
+    {
+        return true;
+    }
     retained.incarnation() == record.incarnation
         && retained.claim() == carrick_sched_core::Claim::Free
         && retained.home().is_some_and(|slot| {
