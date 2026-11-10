@@ -88,6 +88,8 @@ pub enum HostFileOp {
     /// out as [`HostFileOp::Newfstatat`]'s chdir lookup: `struct stat`, then
     /// the cwd spelling.
     Fchdir = 22,
+    /// Read the staged link path into the bounded output, without a NUL.
+    Readlinkat = 23,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -215,6 +217,7 @@ impl HostFileOp {
             20 => Self::Ftruncate,
             21 => Self::Renameat,
             22 => Self::Fchdir,
+            23 => Self::Readlinkat,
             _ => return None,
         })
     }
@@ -238,6 +241,7 @@ impl HostFileOp {
                 | Self::Truncate
                 | Self::Renameat
                 | Self::Fchdir
+                | Self::Readlinkat
         )
     }
 }

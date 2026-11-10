@@ -1,0 +1,37 @@
+schema_version = 1
+id = "process.exec.native-exe-link"
+title = "Native exec successors read their own executable link"
+guest_surfaces = ["syscall:execve", "syscall:readlinkat", "proc:self/exe"]
+semantic_authority = ["proc_pid_exe(5): /proc/pid/exe names the executed program", "readlinkat(2): truncate without a terminating NUL"]
+fixture = "Real native fork and exec service adoption, then production readlinkat dispatch while the parent remains live"
+scale_points = [1]
+structural_budgets = []
+rationale = "One bounded pathname read and one retained owner copyout; no host-task fallback and no retries or polling. The native harness asserts zero forwarded calls."
+
+[bindings]
+embed = [
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_two_live_relative_and_symlink_exec",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_real_fork_inheritance",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_real_vfork_shared_mm",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_two_live_threads",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_failed_exec_preserves_running_caller",
+  "carrick-conformance-next::native_exe_lifecycle::case_native_exe_lifecycle_root_rename_unlink_live_holders",
+]
+vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_readlink_exe",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_readlink_copyout_busy_once_then_success",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_readlink_copyout_fault_returns_errno_14",
+  "carrick-personality-linux::native_host_file::tests::readlink_decodes_and_bounds_the_output_without_a_nul",
+  "carrick-personality-linux::native_host_file::tests::readlink_validates_only_the_bytes_returned_by_the_link",
+  "carrick-kernel::dispatch::native_files::tests::native_readlink_uses_live_mm_executable_custody",
+  "carrick-kernel::dispatch::native_files::tests::native_readlink_serves_ordinary_links_and_refuses_foreign_magic",
+  "carrick-runtime::runtime::exec::tests::native_child_exec_prepares_a_dynamic_binary_through_a_usrmerge_rootfs",
+  "carrick-hal::fork_stock::tests::committed_child_retains_physical_custody_through_quarantine",
+  "carrick-vmm-hvf::fork_stock::tests::root_seed_retirement_releases_only_matching_mm",
+]
+
+[bindings.unresolved]
+embed_structural = "Director: exact signed artifact must demonstrate one retained readlink service and no host syscall replay."
+observation = "The VM-free dispatch witness asserts zero forwarded calls; no WorkObservation schema exists for executable custody."
+ecosystem = "Director: signed real go-build row on this exact head; this worker has no HVF"
+docker = "Director: native arm64 go-build differential"

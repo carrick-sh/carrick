@@ -323,6 +323,16 @@ impl ExecFilesystem {
     }
 }
 
+/// The capability under which a run's carrier installs the native exec
+/// service for the process tree its host-served root leads. The runtime
+/// mints it from the root at launch; the ring derives the same value when it
+/// admits that root, and every native child's exec and root fork seed names it.
+pub fn native_exec_capability(
+    root: &crate::kernel::KernelContext,
+) -> carrick_core_abi::service::ExecCapabilityId {
+    carrick_core_abi::service::ExecCapabilityId::of_root_task(root.task().key().serial)
+}
+
 impl SyscallDispatcher {
     pub fn exec_filesystem(&self) -> ExecFilesystem {
         ExecFilesystem {
