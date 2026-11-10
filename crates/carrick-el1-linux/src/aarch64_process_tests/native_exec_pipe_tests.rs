@@ -62,6 +62,8 @@ fn serial_host_native_readlink_copyout_busy_once_then_success() {
     fork_exec_probe_copy(
         None,
         u32::MAX as u64,
+        false,
+        None,
         None,
         true,
         Some(NativeProcessError::Busy),
@@ -73,6 +75,8 @@ fn serial_host_native_readlink_copyout_fault_returns_errno_14() {
     fork_exec_probe_copy(
         None,
         u32::MAX as u64,
+        false,
+        None,
         None,
         true,
         Some(NativeProcessError::Fault),
@@ -160,13 +164,15 @@ fn fork_exec_probe_with_departure(
     departure: Option<TimerDeparture>,
     readlink: bool,
 ) {
-    fork_exec_probe_copy(futex, bitset, metadata, readlink, None);
+    fork_exec_probe_copy(futex, bitset, timed, metadata, departure, readlink, None);
 }
 
 fn fork_exec_probe_copy(
     futex: Option<u64>,
     bitset: u64,
+    timed: bool,
     metadata: Option<super::pipe_metadata_tests::Case>,
+    departure: Option<TimerDeparture>,
     readlink: bool,
     copy_error: Option<NativeProcessError>,
 ) {
@@ -477,7 +483,6 @@ fn fork_exec_probe_copy(
         let mut frame = carrick_el1_abi::TrapFrame {
             esr: 0x15 << 26,
             elr: 0x400004,
-            esr: 0x15 << 26,
             slot: u64::from(fixture.slot.raw()),
             ..Default::default()
         };
@@ -1158,7 +1163,6 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
         let mut frame = carrick_el1_abi::TrapFrame {
             esr: 0x15 << 26,
             elr: 0x400004,
-            esr: 0x15 << 26,
             slot: u64::from(fixture.slot.raw()),
             ..Default::default()
         };
