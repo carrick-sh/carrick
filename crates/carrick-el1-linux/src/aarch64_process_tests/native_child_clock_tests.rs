@@ -522,8 +522,7 @@ fn child_clock_copyout_repark_leaves_the_slot_before_another_process_runs() {
     };
     let counters = carrick_el1_abi::Counters::new();
     let mut frame = carrick_el1_abi::TrapFrame::default();
-    let mut run_next = |cpu: &mut ChildResumeCpu<'_, '_>,
-                        frame: &mut carrick_el1_abi::TrapFrame| {
+    let run_next = |cpu: &mut ChildResumeCpu<'_, '_>, frame: &mut carrick_el1_abi::TrapFrame| {
         (crate::sched::Sched {
             handoff: None,
             zone,
