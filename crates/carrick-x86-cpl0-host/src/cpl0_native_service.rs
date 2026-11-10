@@ -203,6 +203,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         lease: &StoppedCpuLease<'_, I>,
         file: Option<anonymous_owner::FileSupply>,
         native_entropy: NativeEntropyService,
+        native_clock: &NativeClockService,
     ) -> Result<NativeNoticeStep, TrapError> {
         let (mut ticket, execution, key) = self.claim_native_notice(lease)?;
         let zone_pointer = self
@@ -257,6 +258,22 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     std::slice::from_raw_parts_mut(pointer, payload.length().raw() as usize)
                 };
                 native_entropy(record).map_err(|_| fail("native entropy record invalid"))?;
+                true
+            }
+            ServiceOperation::Clock { payload, .. } => {
+                let pointer = self.native_service_pointer(
+                    execution.context,
+                    KernelVa::new(payload.address().raw()),
+                    payload.length().raw() as usize,
+                    1,
+                )?;
+                // SAFETY: the exact ticket retains the ring's bounded clock
+                // record until ACK, as for entropy; the stopped entry cannot
+                // touch it during service. Its length is the fixed record size.
+                let record = unsafe {
+                    &mut *pointer.cast::<[u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES]>()
+                };
+                native_clock(record).map_err(|_| fail("native clock record invalid"))?;
                 true
             }
             // The shared owner retains the operation and reruns preparation

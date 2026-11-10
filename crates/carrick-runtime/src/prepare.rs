@@ -328,7 +328,13 @@ fn run_prepared_kvm_pool_with_debug(
             RuntimeError::Configuration("x86 IPC authority already bound a carrier zone".into())
         })?;
     let parts = machine.into_worker_parts(max_traps)?;
-    let (root_cpu, physical) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let (root_cpu, physical) = parts.into_factory(
+        carrick_kernel::dispatch::serve_native_entropy,
+        carrick_kernel::clock_service::ClockResourceService::new(Arc::clone(
+            dispatcher.container().clock(),
+        ))
+        .into_record_service(),
+    );
     let physical = Arc::new(physical);
     let reporter = Arc::new(carrick_kernel::compat::CompatReporter::default());
     let stats = Arc::new(executor::cpl0::Cpl0ForwardStats::default());

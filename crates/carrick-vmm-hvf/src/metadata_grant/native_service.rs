@@ -216,6 +216,38 @@ impl NativeService {
         self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))
     }
 
+    /// Serve one ring-staged clock sample against the container clock domain
+    /// the request's capability names, and publish the reply before
+    /// acknowledging. An unresolvable capability or an unanswerable record is
+    /// answered ENOSYS in the record itself: the ring turns a refused clock
+    /// request into a quarantine, never a soft errno.
+    pub fn serve_clock(mut self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let carrick_core_abi::service::ServiceOperation::Clock { capability, .. } =
+            self.request().operation
+        else {
+            return Err(stale());
+        };
+        let service = self
+            .custody
+            .native_exec_services
+            .resolve(carrick_core_abi::service::ExecCapabilityId::new(
+                capability.raw(),
+            ))
+            .ok();
+        let record = self.exec_payload.as_mut().ok_or_else(stale)?;
+        let record: &mut [u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES] =
+            record.bytes_mut().try_into().map_err(|_| stale())?;
+        if service.is_none_or(|service| service.serve_clock(record).is_err()) {
+            const ENOSYS: carrick_core_abi::clock::ClockErrno =
+                match carrick_core_abi::clock::ClockErrno::new(38) {
+                    Some(errno) => errno,
+                    None => unreachable!(),
+                };
+            carrick_core_abi::clock::write_errno_reply(record, ENOSYS).map_err(|_| stale())?;
+        }
+        self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))
+    }
+
     /// Serve the ring-staged host-file record through the retained file
     /// capability the request names. The reply is written before the ticket
     /// completes; a refusal leaves no reply and answers counted ENOSYS.
@@ -1457,6 +1489,15 @@ pub(super) fn take(
                         )?)
                     }
                     carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } => {
+                        Some(retain_exec_payload(
+                            custody,
+                            region,
+                            ticket.request().identity.birth.mm,
+                            payload.address().raw(),
+                            payload.length().raw(),
+                        )?)
+                    }
+                    carrick_core_abi::service::ServiceOperation::Clock { payload, .. } => {
                         Some(retain_exec_payload(
                             custody,
                             region,

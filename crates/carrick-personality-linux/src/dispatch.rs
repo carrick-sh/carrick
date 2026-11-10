@@ -62,6 +62,9 @@ pub enum Family {
     Signal(crate::signal::SignalCall),
     /// Signal-interruptible sleeps, served by the signal wait owner.
     Sleep(crate::sleep::SleepCall),
+    /// Clock reads: the ring answers what it can alone (errno, resolution),
+    /// and a process owner stages the sample for the container's clock domain.
+    Clock(crate::clock::ClockCall),
     Futex,
     InotifyAdd,
     InotifyRemove,
@@ -570,6 +573,30 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 }
             });
     }
+    if let Family::Clock(call) = family {
+        let original = pending.original_argument0();
+        let served = pending
+            .signal_native()
+            .and_then(|native| crate::clock::invoke(call, CanonicalNr::new(ordinal), native));
+        return match served {
+            None => FamilyCompletion::Forward.into(),
+            Some(crate::clock::ClockServed::Sample) => FamilyCompletion::NativeService.into(),
+            Some(crate::clock::ClockServed::Outcome(outcome)) => {
+                let returned = match outcome {
+                    crate::signal::SignalOutcome::Returned { result, .. } => {
+                        Some((result, original))
+                    }
+                    crate::signal::SignalOutcome::Transferred { .. }
+                    | crate::signal::SignalOutcome::Restored => None,
+                };
+                FamilyRun {
+                    completion: crate::signal::signal_effect(&outcome),
+                    returned,
+                    forward_reason: ForwardReason::FamilyFallback,
+                }
+            }
+        };
+    }
     let mut returned = None;
     let completion = match family {
         Family::Anonymous(call) => {
@@ -620,7 +647,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Sysinfo(_) => FamilyCompletion::Forward,
         Family::Ipc(_) => FamilyCompletion::Forward,
         Family::NativeService => FamilyCompletion::NativeService,
-        Family::Signal(_) | Family::Sleep(_) => FamilyCompletion::Forward,
+        Family::Signal(_) | Family::Sleep(_) | Family::Clock(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),
@@ -713,6 +740,15 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         }
         nr if nr == crate::crossing::nr::CLOCK_NANOSLEEP.raw() => {
             Family::Sleep(crate::sleep::SleepCall::ClockNanosleep)
+        }
+        nr if nr == crate::crossing::nr::CLOCK_GETTIME.raw() => {
+            Family::Clock(crate::clock::ClockCall::Gettime)
+        }
+        nr if nr == crate::crossing::nr::CLOCK_GETRES.raw() => {
+            Family::Clock(crate::clock::ClockCall::Getres)
+        }
+        nr if nr == crate::crossing::nr::GETTIMEOFDAY.raw() => {
+            Family::Clock(crate::clock::ClockCall::Gettimeofday)
         }
         124 => Family::Sched(SchedCall::Yield),
         93 => Family::Lifecycle(LifecycleCall::Exit),
@@ -1017,6 +1053,7 @@ pub const fn service_owner(ordinal: CanonicalNr, allocator_control: u64) -> Serv
         | Family::Sched(_)
         | Family::Signal(_)
         | Family::Sleep(_)
+        | Family::Clock(_)
         | Family::Futex
         | Family::InotifyAdd
         | Family::InotifyRemove

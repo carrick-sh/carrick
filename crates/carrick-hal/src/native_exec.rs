@@ -39,6 +39,14 @@ pub trait NativeExecHostService<Plan: Send + 'static>:
         record: &mut [u8],
     ) -> Result<Option<Arc<dyn HostBackingRetention>>, NativeHostFileRefused>;
 
+    /// Answer one ring-staged clock record against this capability's
+    /// container `ClockDomain`, in place ([`carrick_core_abi::clock`]).
+    /// `Err` leaves the record unanswered; the carrier then replies ENOSYS.
+    fn serve_clock(
+        &self,
+        record: &mut [u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES],
+    ) -> Result<(), carrick_core_abi::clock::ClockRecordError>;
+
     /// Serve the root fork seed crossing: write the host-served root's live
     /// cwd and root into `record` once ([`carrick_core_abi::service::RootForkSeed::serve`]).
     /// `false` refuses it; the fork then fails without a child.
@@ -201,6 +209,13 @@ mod native_exec_service_registration_tests {
             _record: &mut [u8],
         ) -> Result<Option<Arc<dyn HostBackingRetention>>, NativeHostFileRefused> {
             Err(NativeHostFileRefused)
+        }
+
+        fn serve_clock(
+            &self,
+            _record: &mut [u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES],
+        ) -> Result<(), carrick_core_abi::clock::ClockRecordError> {
+            Err(carrick_core_abi::clock::ClockRecordError::Invalid)
         }
 
         fn root_fork_seed(&self, _record: &mut carrick_core_abi::service::RootForkSeed) -> bool {

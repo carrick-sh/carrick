@@ -387,3 +387,37 @@ The earlier clock-resource sleep subscription (`NativeSleep`, the
 `SleepArm`/`SleepCancel` wire operations and the host `TimerHub` thread) is
 removed: it was a second timer owner with no production caller. The clock
 record keeps its sample and timex operations for slice 3.
+
+## Child clock reads are served in ring (#2028)
+
+`clock_gettime`, `clock_getres` and `gettimeofday` now route through
+`Family::Clock` (`carrick-personality-linux::clock`, canonical 113, 114, 169;
+x86 228, 229, 96) on both ISAs. Argument checking is one pure `plan`, so the
+ring's own answer and the staged request cannot drift:
+
+- A bad clock id is EINVAL before the output is touched, a null `timespec` is
+  EFAULT only for a clock that would be read, a null `res` only validates and
+  `gettimeofday` with two null outputs returns 0.
+- `clock_getres` writes its constant resolution in ring; nothing crosses.
+- A reading stages one typed `ClockResourceOp::Sample` on the existing #1836
+  mechanism (`begin_clock_sample`, `ServiceOperation::Clock`). The capability
+  is the process tree's run capability (the same raw value as its exec
+  capability, so fork and exec keep it). ARM EL1 serves it through the HVF
+  native-service finish (`NativeService::serve_clock`, resolving the run's
+  retained `ClockDomain`); x86 CPL0 serves it in
+  `service_native_notice` through the runtime-supplied
+  `NativeClockService`. The sample honours the frozen, scaled, offset and
+  deterministic policies; the exact-MM copyout retains the answer across
+  memory-owner waits without resampling.
+- CPU-time clocks and dynamic per-task or posix-clock-fd ids stay unserved:
+  they keep the counted ENOSYS refusal.
+- The run root keeps its host continuation (`sleeps_in_ring` is false for it).
+  On x86 the root's strict refusal is unchanged.
+
+Witnesses: `native_child_clock_tests` (ARM, two live processes through the
+shipping staging and begin bodies and a host `ClockResourceService`),
+`native_fork_child_clock_*` null-pointer rows, and
+`serial_host_native_child_clock_reads_match_linux` (KVM, x86 CPL0). All fail
+with ENOSYS (38 on ARM, exit 218 on x86) when the `Family::Clock` routes are
+removed. Absolute CLOCK_MONOTONIC sleeps on x86 still wait on a guest-visible
+monotonic epoch.
