@@ -1,0 +1,915 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling zerocopy v0.8.48
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling cfg-if v1.0.4
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling memchr v2.8.0
+   Compiling syn v2.0.117
+   Compiling itoa v1.0.18
+   Compiling bitflags v2.11.1
+   Compiling syn v3.0.3
+   Compiling thiserror v2.0.20
+   Compiling zmij v1.0.21
+   Compiling smallvec v1.15.1
+   Compiling serde_json v1.0.149
+   Compiling portable-atomic v1.13.1
+   Compiling carrick-signal-core v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-signal-core)
+   Compiling stable_deref_trait v1.2.1
+   Compiling critical-section v1.2.0
+   Compiling once_cell v1.21.4
+   Compiling carrick-pipe-core v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-pipe-core)
+   Compiling log v0.4.29
+   Compiling carrick-inotify-core v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-inotify-core)
+   Compiling carrick-el1-control-abi v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-control-abi)
+   Compiling pin-project-lite v0.2.17
+   Compiling version_check v0.9.5
+   Compiling ucd-trie v0.1.7
+   Compiling subtle v2.6.1
+   Compiling generic-array v0.14.7
+   Compiling pest v2.8.6
+   Compiling synstructure v0.13.2
+   Compiling typenum v1.20.0
+   Compiling bytes v1.11.1
+   Compiling pest_meta v2.8.6
+   Compiling futures-core v0.3.32
+   Compiling parking_lot_core v0.9.12
+   Compiling find-msvc-tools v0.1.9
+   Compiling litemap v0.8.2
+   Compiling pest_generator v2.8.6
+   Compiling shlex v1.3.0
+   Compiling writeable v0.6.3
+   Compiling cc v1.2.62
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling carrick-fatal v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-fatal)
+   Compiling socket2 v0.6.3
+   Compiling mio v1.2.0
+   Compiling icu_normalizer_data v2.2.0
+   Compiling getrandom v0.4.2
+   Compiling rand_core v0.10.1
+   Compiling icu_properties_data v2.2.0
+   Compiling utf8_iter v1.0.4
+   Compiling scopeguard v1.2.0
+   Compiling ring v0.17.14
+   Compiling lock_api v0.4.14
+   Compiling digest v0.10.7
+   Compiling thread-id v5.1.0
+   Compiling percent-encoding v2.3.2
+   Compiling plain v0.2.3
+   Compiling rustix v1.1.4
+   Compiling usdt-impl v0.6.0
+   Compiling byteorder v1.5.0
+   Compiling parking_lot v0.12.5
+   Compiling http v1.4.0
+   Compiling cpufeatures v0.2.17
+   Compiling linux-raw-sys v0.12.1
+   Compiling zeroize v1.8.2
+   Compiling ident_case v1.0.1
+   Compiling strsim v0.11.1
+   Compiling fnv v1.0.7
+   Compiling rustls-pki-types v1.14.1
+   Compiling darling_core v0.20.11
+   Compiling thiserror-impl v2.0.20
+   Compiling sha2 v0.10.9
+   Compiling http-body v1.0.1
+   Compiling tracing-core v0.1.36
+   Compiling getrandom v0.2.17
+   Compiling futures-task v0.3.32
+   Compiling httparse v1.10.1
+   Compiling untrusted v0.9.0
+   Compiling pretty-hex v0.4.2
+   Compiling slab v0.4.12
+   Compiling form_urlencoded v1.2.2
+   Compiling try-lock v0.2.5
+   Compiling tower-service v0.3.3
+   Compiling rustls v0.23.46
+   Compiling fastrand v2.4.1
+   Compiling tempfile v3.27.0
+   Compiling rustls-webpki v0.103.16
+   Compiling want v0.3.1
+   Compiling futures-channel v0.3.32
+   Compiling memmap2 v0.9.10
+   Compiling tinyvec_macros v0.1.1
+   Compiling autocfg v1.5.0
+   Compiling carrick-observability v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-observability)
+   Compiling atomic-waker v1.1.2
+   Compiling ipnet v2.12.0
+   Compiling num-traits v0.2.19
+   Compiling tinyvec v1.11.0
+   Compiling sync_wrapper v1.0.2
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling carrick-kernel-arena v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-kernel-arena)
+   Compiling aho-corasick v1.1.4
+   Compiling konst_macro_rules v0.2.19
+   Compiling tower-layer v0.3.3
+   Compiling unicode-xid v0.2.6
+   Compiling base64 v0.22.1
+   Compiling regex-syntax v0.8.10
+   Compiling regex-automata v0.4.14
+   Compiling const_format_proc_macros v0.2.34
+   Compiling konst v0.2.20
+   Compiling proc-macro-error2 v2.0.1
+   Compiling webpki-roots v1.0.7
+   Compiling crc32fast v1.5.0
+   Compiling heck v0.5.0
+   Compiling carrick-timer-core v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-timer-core)
+   Compiling futures-sink v0.3.32
+   Compiling ryu v1.0.23
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling zerofrom-derive v0.1.7
+   Compiling zerofrom v0.1.8
+   Compiling yoke-derive v0.8.2
+   Compiling yoke v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling zerotrie v0.2.4
+   Compiling pest_derive v2.8.6
+   Compiling zerovec v0.11.6
+   Compiling carrick-guest-arch v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-guest-arch)
+   Compiling carrick-syscall-abi v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-syscall-abi)
+   Compiling carrick-mmu-core v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-mmu-core)
+   Compiling carrick-sched-core v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-sched-core)
+   Compiling carrick-core-abi v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-core-abi)
+   Compiling carrick-core v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-core)
+   Compiling carrick-fd-core v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-fd-core)
+   Compiling tinystr v0.8.3
+   Compiling icu_locale_core v2.2.0
+   Compiling carrick-personality-api v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-personality-api)
+   Compiling carrick-personality-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-personality-linux)
+   Compiling potential_utf v0.1.5
+   Compiling tokio-macros v2.7.0
+   Compiling carrick-el1-abi v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-abi)
+   Compiling scroll_derive v0.13.1
+   Compiling tokio v1.52.3
+   Compiling scroll v0.13.0
+   Compiling icu_collections v2.2.0
+   Compiling icu_provider v2.2.0
+   Compiling carrick-abi v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-abi)
+   Compiling dtrace-parser v0.3.0
+   Compiling goblin v0.10.5
+   Compiling dof v0.4.0
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling carrick-guest-mem v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-guest-mem)
+   Compiling serde_tokenstream v0.2.3
+   Compiling futures-macro v0.3.32
+   Compiling tracing-attributes v0.1.31
+   Compiling futures-util v0.3.32
+   Compiling tracing v0.1.44
+   Compiling idna_adapter v1.2.2
+   Compiling carrick-el1-image v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-image)
+   Compiling darling_macro v0.20.11
+   Compiling darling v0.20.11
+   Compiling idna v1.1.0
+   Compiling usdt-macro v0.6.0
+   Compiling usdt-attr-macro v0.6.0
+   Compiling url v2.5.8
+   Compiling usdt v0.6.0
+   Compiling derive_builder_core v0.20.2
+   Compiling hyper v1.9.0
+   Compiling derive_builder_macro v0.20.2
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling carrick-host v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-host)
+   Compiling carrick-signal-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-signal-linux)
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling tower-http v0.6.10
+   Compiling derive_builder v0.20.2
+   Compiling tokio-util v0.7.18
+   Compiling serde_urlencoded v0.7.1
+   Compiling getset v0.1.6
+   Compiling strum_macros v0.27.2
+   Compiling regex v1.12.3
+   Compiling const_format v0.2.36
+   Compiling unicode-normalization v0.1.25
+   Compiling http-body-util v0.1.3
+   Compiling hmac v0.12.1
+   Compiling strum v0.27.2
+   Compiling iana-time-zone v0.1.65
+   Compiling simd-adler32 v0.3.9
+   Compiling camino v1.2.2
+   Compiling adler2 v2.0.1
+   Compiling base64 v0.13.1
+   Compiling miniz_oxide v0.8.9
+   Compiling jwt v0.16.0
+   Compiling oci-spec v0.8.4
+   Compiling chrono v0.4.44
+   Compiling olpc-cjson v0.1.4
+   Compiling reqwest v0.12.28
+   Compiling http-auth v0.1.10
+   Compiling filetime v0.2.29
+   Compiling cpufeatures v0.3.0
+   Compiling unicase v2.9.0
+   Compiling lazy_static v1.5.0
+   Compiling rustversion v1.0.22
+   Compiling chacha20 v0.10.1
+   Compiling tar v0.4.46
+   Compiling oci-client v0.15.0
+   Compiling flate2 v1.1.9
+   Compiling carrick-el1-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-linux)
+   Compiling anyhow v1.0.102
+   Compiling getrandom v0.3.4
+   Compiling rand v0.10.1
+   Compiling carrick-el1 v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1)
+   Compiling carrick-spec v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-spec)
+   Compiling fd-lock v4.0.4
+   Compiling carrick-portable v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-portable)
+   Compiling carrick-kernel v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-kernel)
+   Compiling data-encoding v2.11.0
+   Compiling arc-swap v1.9.2
+   Compiling hickory-proto v0.26.1
+   Compiling carrick-time-core v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-time-core)
+   Compiling carrick-test-support v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-test-support)
+   Compiling wait-timeout v0.2.1
+warning: carrick-el1-image@0.1.0: EL1 stack unregistered native retirement: 4927 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring vector input: 4736 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native admission: 7936 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork publication: 10142 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork descriptors: 10286 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd inheritance: 4783 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd retirement: 7952 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork context: 3215 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork settlement: 3534 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service admission: 4895 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack host-owned return work: 7726 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service continuation: 5550 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service refusal: 5808 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native backing reply: 9870 / 11311 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring completed copyout: 10751 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring poll readiness: 4224 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe copyout: 9280 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe backing preparation: 5295 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native wait copy: 10847 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack declined fault signal: 11488 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal delivery copy: 10848 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service signal delivery: 11008 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack resumed signal delivery copy: 11183 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal terminal exit: 9263 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal return: 5520 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack anonymous munmap: 6912 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack metadata grant: 7120 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack backing retirement: 10352 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack descriptor drain: 6544 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 image budget: 1491232 bytes loaded / 1572864 bytes; 81632 bytes headroom
+   Compiling carrick-mem v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-hal)
+   Compiling carrick-host-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-host-linux)
+   Compiling carrick-thread v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-vfs)
+error[E0433]: cannot find `CloneDeclineReason` in `carrick_el1_abi`
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:772:50
+    |
+772 | ...d[carrick_el1_abi::CloneDeclineReason::ClonePoolEmpty as usize]
+    |                       ^^^^^^^^^^^^^^^^^^ could not find `CloneDeclineReason` in `carrick_el1_abi`
+
+error[E0433]: cannot find `CloneDeclineReason` in `carrick_el1_abi`
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1328:50
+     |
+1328 | ...d[carrick_el1_abi::CloneDeclineReason::ClonePoolEmpty as usize]
+     |                       ^^^^^^^^^^^^^^^^^^ could not find `CloneDeclineReason` in `carrick_el1_abi`
+
+error[E0433]: cannot find `CloneDeclineReason` in `carrick_el1_abi`
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1454:50
+     |
+1454 | ...d[carrick_el1_abi::CloneDeclineReason::ClonePoolEmpty as usize]
+     |                       ^^^^^^^^^^^^^^^^^^ could not find `CloneDeclineReason` in `carrick_el1_abi`
+
+error[E0425]: cannot find type `LiveTableWords` in module `carrick_mmu_core::aarch64`
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:524:48
+    |
+524 |     words: &'static carrick_mmu_core::aarch64::LiveTableWords<'static>,
+    |                                                ^^^^^^^^^^^^^^ not found in `carrick_mmu_core::aarch64`
+
+error[E0422]: cannot find struct, variant or union type `PoolIdentity` in crate `carrick_el1_abi`
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1034:30
+     |
+1034 |             carrick_el1_abi::PoolIdentity {
+     |                              ^^^^^^^^^^^^ not found in `carrick_el1_abi`
+
+error[E0425]: cannot find type `LiveTableWords` in module `carrick_mmu_core::aarch64`
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1061:41
+     |
+1061 |     &'static carrick_mmu_core::aarch64::LiveTableWords<'static>,
+     |                                         ^^^^^^^^^^^^^^ not found in `carrick_mmu_core::aarch64`
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:645:9
+    |
+639 |     install_noop_handler_on_slot(
+    |     ---------------------------- arguments to this function are incorrect
+...
+645 |         &mut leader_service,
+    |         ^^^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:494:4
+    |
+494 | fn install_noop_handler_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+500 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:655:9
+    |
+649 |     install_noop_handler_on_slot(
+    |     ---------------------------- arguments to this function are incorrect
+...
+655 |         &mut leader_service,
+    |         ^^^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:494:4
+    |
+494 | fn install_noop_handler_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+500 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:681:9
+    |
+675 |     loaded_call_on_slot(
+    |     ------------------- arguments to this function are incorrect
+...
+681 |         &mut leader_service,
+    |         ^^^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+    |
+421 | fn loaded_call_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^
+...
+427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:727:9
+    |
+721 |     loaded_call_on_slot(
+    |     ------------------- arguments to this function are incorrect
+...
+727 |         &mut sib_service,
+    |         ^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+    |
+421 | fn loaded_call_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^
+...
+427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:755:9
+    |
+749 |     loaded_call_on_slot(
+    |     ------------------- arguments to this function are incorrect
+...
+755 |         &mut leader_service,
+    |         ^^^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+    |
+421 | fn loaded_call_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^
+...
+427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0599]: no method named `read_value` found for struct `GuestUserBuffer` in the current scope
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:763:22
+    |
+763 |     assert_eq!(ptid2.read_value::<u32>(), born_tid as u32);
+    |                      ^^^^^^^^^^ method not found in `GuestUserBuffer`
+
+error[E0609]: no field `clone_declined` on type `carrick_el1_abi::Counters`
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:772:18
+    |
+772 | ...   counters.clone_declined[carrick_el1_abi::CloneDeclineReason::Clon...
+    |                ^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `served`, `forwarded`, `irq_taken`, `fault_taken`, `exit_reasons` ... and 11 others
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:828:9
+    |
+822 |     loaded_call_on_slot(
+    |     ------------------- arguments to this function are incorrect
+...
+828 |         &mut leader_service,
+    |         ^^^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+    |
+421 | fn loaded_call_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^
+...
+427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:847:13
+    |
+841 |         poll_signal_once_on_slot(
+    |         ------------------------ arguments to this function are incorrect
+...
+847 |             &mut leader_service,
+    |             ^^^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:467:4
+    |
+467 | fn poll_signal_once_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+473 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:869:13
+    |
+863 |         poll_signal_once_on_slot(
+    |         ------------------------ arguments to this function are incorrect
+...
+869 |             &mut sib_service,
+    |             ^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:467:4
+    |
+467 | fn poll_signal_once_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+473 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:911:13
+    |
+905 |         poll_signal_once_on_slot(
+    |         ------------------------ arguments to this function are incorrect
+...
+911 |             &mut born_service,
+    |             ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:467:4
+    |
+467 | fn poll_signal_once_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+473 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:925:13
+    |
+919 |         poll_signal_once_on_slot(
+    |         ------------------------ arguments to this function are incorrect
+...
+925 |             &mut born_service,
+    |             ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:467:4
+    |
+467 | fn poll_signal_once_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+473 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:965:9
+    |
+959 |     loaded_call_on_slot(
+    |     ------------------- arguments to this function are incorrect
+...
+965 |         &mut leader_service,
+    |         ^^^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+    |
+421 | fn loaded_call_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^
+...
+427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:994:9
+    |
+988 |     loaded_call_on_slot(
+    |     ------------------- arguments to this function are incorrect
+...
+994 |         &mut peer_service,
+    |         ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+    |
+    = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+               found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+    |
+421 | fn loaded_call_on_slot(
+    |    ^^^^^^^^^^^^^^^^^^^
+...
+427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1018:39
+     |
+1018 |             if !ns.is_reserved_number(visible_tid) {
+     |                    ------------------ ^^^^^^^^^^^ expected `i32`, found `u32`
+     |                    |
+     |                    arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/carrick-sched-core/src/process/identity_allocator.rs:625:12
+     |
+ 625 |     pub fn is_reserved_number(&self, raw: i32) -> bool {
+     |            ^^^^^^^^^^^^^^^^^^
+help: you can convert a `u32` to an `i32` and panic if the converted value doesn't fit
+     |
+1018 |             if !ns.is_reserved_number(visible_tid.try_into().unwrap()) {
+     |                                                  ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1019:34
+     |
+1019 | ...   ns.reserve_exact(visible_tid, ClaimKind::Thread).unwrap();
+     |          ------------- ^^^^^^^^^^^ expected `i32`, found `u32`
+     |          |
+     |          arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/carrick-sched-core/src/process/identity_allocator.rs:547:12
+     |
+ 547 |     pub fn reserve_exact(
+     |            ^^^^^^^^^^^^^
+help: you can convert a `u32` to an `i32` and panic if the converted value doesn't fit
+     |
+1019 |                 ns.reserve_exact(visible_tid.try_into().unwrap(), ClaimKind::Thread).unwrap();
+     |                                             ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1022:44
+     |
+1022 |             let _ = ns.bind_visible_domain(visible_tid, domain);
+     |                        ------------------- ^^^^^^^^^^^ expected `i32`, found `u32`
+     |                        |
+     |                        arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/carrick-sched-core/src/process/identity_allocator.rs:465:12
+     |
+ 465 |     pub fn bind_visible_domain(
+     |            ^^^^^^^^^^^^^^^^^^^
+help: you can convert a `u32` to an `i32` and panic if the converted value doesn't fit
+     |
+1022 |             let _ = ns.bind_visible_domain(visible_tid.try_into().unwrap(), domain);
+     |                                                       ++++++++++++++++++++
+
+error[E0599]: no method named `task_serial` found for struct `ThreadBirthIdentity` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1154:68
+     |
+1154 | ...entity.task_serial().raw()),
+     |           ^^^^^^^^^^^ method not found in `ThreadBirthIdentity`
+
+error[E0599]: no method named `task_serial` found for struct `ThreadBirthIdentity` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1183:42
+     |
+1183 |                 generation: sib_identity.task_serial().raw(),
+     |                                          ^^^^^^^^^^^ method not found in `ThreadBirthIdentity`
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1214:9
+     |
+1208 |     loaded_call_on_slot(
+     |     ------------------- arguments to this function are incorrect
+...
+1214 |         &mut sib_service,
+     |         ^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+     |
+ 421 | fn loaded_call_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^
+...
+ 427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1238:9
+     |
+1232 |     install_noop_handler_on_slot(
+     |     ---------------------------- arguments to this function are incorrect
+...
+1238 |         &mut root_service,
+     |         ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:494:4
+     |
+ 494 | fn install_noop_handler_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 500 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1248:9
+     |
+1242 |     install_noop_handler_on_slot(
+     |     ---------------------------- arguments to this function are incorrect
+...
+1248 |         &mut root_service,
+     |         ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:494:4
+     |
+ 494 | fn install_noop_handler_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 500 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1319:9
+     |
+1313 |     loaded_call_on_slot(
+     |     ------------------- arguments to this function are incorrect
+...
+1319 |         &mut root_service,
+     |         ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+     |
+ 421 | fn loaded_call_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^
+...
+ 427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+error[E0599]: no method named `read_value` found for struct `GuestUserBuffer` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1326:21
+     |
+1326 |     assert_eq!(ptid.read_value::<u32>(), 44);
+     |                     ^^^^^^^^^^ method not found in `GuestUserBuffer`
+
+error[E0609]: no field `clone_declined` on type `carrick_el1_abi::Counters`
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1328:18
+     |
+1328 | ...   counters.clone_declined[carrick_el1_abi::CloneDeclineReason::Clo...
+     |                ^^^^^^^^^^^^^^ unknown field
+     |
+     = note: available fields are: `served`, `forwarded`, `irq_taken`, `fault_taken`, `exit_reasons` ... and 11 others
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1350:9
+     |
+1344 |     loaded_call_on_slot(
+     |     ------------------- arguments to this function are incorrect
+...
+1350 |         &mut root_service,
+     |         ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+     |
+ 421 | fn loaded_call_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^
+...
+ 427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1377:9
+     |
+1371 |     loaded_call_on_slot(
+     |     ------------------- arguments to this function are incorrect
+...
+1377 |         &mut peer_service,
+     |         ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+     |
+ 421 | fn loaded_call_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^
+...
+ 427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1442:9
+     |
+1436 |     let route = loaded_call_on_slot(
+     |                 ------------------- arguments to this function are incorrect
+...
+1442 |         &mut root_service,
+     |         ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+     |
+ 421 | fn loaded_call_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^
+...
+ 427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+error[E0609]: no field `clone_declined` on type `carrick_el1_abi::Counters`
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1454:18
+     |
+1454 | ...   counters.clone_declined[carrick_el1_abi::CloneDeclineReason::Clo...
+     |                ^^^^^^^^^^^^^^ unknown field
+     |
+     = note: available fields are: `served`, `forwarded`, `irq_taken`, `fault_taken`, `exit_reasons` ... and 11 others
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1475:9
+     |
+1469 |     loaded_call_on_slot(
+     |     ------------------- arguments to this function are incorrect
+...
+1475 |         &mut root_service,
+     |         ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+     |
+ 421 | fn loaded_call_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^
+...
+ 427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1502:9
+     |
+1496 |     loaded_call_on_slot(
+     |     ------------------- arguments to this function are incorrect
+...
+1502 |         &mut peer_service,
+     |         ^^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+     |
+ 421 | fn loaded_call_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^
+...
+ 427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+error[E0599]: no method named `claim_thread_stock` found for mutable reference `&mut ...` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1555:18
+     |
+1554 |               let claimed = process
+     |  ___________________________-
+1555 | |                 .claim_thread_stock()
+     | |_________________-^^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `has_thread` with a similar name, but with different arguments
+    --> crates/carrick-personality-linux/src/lifecycle.rs:457:5
+     |
+ 457 |     fn has_thread(&self, _tid: u32) -> bool {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: the full name for the type has been written to '/var/lib/carrick-conductor/repo/target/debug/deps/carrick_el1_linux-3aaaac1239b2345a.long-type-15477319106912303075.txt'
+     = note: consider using `--verbose` to print the full type name to the console
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1578:67
+     |
+1578 | ...    .reset_for_birth(carrick_el1_abi::BlockedMask(0), None, entry)
+     |         ---------------                                  ^^^^ expected `u64`, found `Option<_>`
+     |         |
+     |         arguments to this method are incorrect
+     |
+     = note: expected type `u64`
+                found enum `Option<_>`
+note: method defined here
+    --> crates/carrick-personality-linux/src/abi/thread.rs:717:12
+     |
+ 717 |     pub fn reset_for_birth(
+     |            ^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `retain_native_birth` found for mutable reference `&mut ...` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1580:29
+     |
+1580 |             assert!(process.retain_native_birth(record, child_slot));
+     |                             ^^^^^^^^^^^^^^^^^^^ method not found in `&mut ...`
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `retain_native_birth`, perhaps you need to implement it:
+             candidate #1: `carrick_personality_linux::lifecycle::LifecycleNative`
+     = note: the full name for the type has been written to '/var/lib/carrick-conductor/repo/target/debug/deps/carrick_el1_linux-3aaaac1239b2345a.long-type-15477319106912303075.txt'
+     = note: consider using `--verbose` to print the full type name to the console
+
+error[E0599]: no method named `thread_born` found for reference `&'static carrick_el1_abi::ThreadLifecyclePage` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1581:27
+     |
+1581 |             h.target_page.thread_born().unwrap();
+     |                           ^^^^^^^^^^^ method not found in `&'static carrick_el1_abi::ThreadLifecyclePage`
+     |
+     = help: items from traits can only be used if the trait is in scope
+help: trait `Lifecycle` which provides `thread_born` is implemented but not in scope; perhaps you want to import it
+     |
+   6 + use carrick_el1_abi::Lifecycle;
+     |
+
+error[E0599]: no method named `publish_born` found for reference `&'static carrick_el1_abi::ThreadLifecyclePage` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1582:27
+     |
+1582 |             h.target_page.publish_born(claimed).unwrap();
+     |                           ^^^^^^^^^^^^
+     |
+help: there is a method `publish` with a similar name
+     |
+1582 -             h.target_page.publish_born(claimed).unwrap();
+1582 +             h.target_page.publish(claimed).unwrap();
+     |
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1615:9
+     |
+1609 |     loaded_call_on_slot(
+     |     ------------------- arguments to this function are incorrect
+...
+1615 |         &mut sib_service,
+     |         ^^^^^^^^^^^^^^^^ expected `aarch64_process_tests::TestStockCrossing`, found `&TestStockCrossing`
+     |
+     = note: expected mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'static, aarch64_process_tests::TestStockCrossing>`
+                found mutable reference `&mut aarch64_process::Aarch64NativeProcessService<'_, &aarch64_process_tests::TestStockCrossing>`
+note: function defined here
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:421:4
+     |
+ 421 | fn loaded_call_on_slot(
+     |    ^^^^^^^^^^^^^^^^^^^
+...
+ 427 |     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+     |     ---------------------------------------------------------------------
+
+Some errors have detailed explanations: E0308, E0422, E0425, E0433, E0599, E0609.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `carrick-el1-linux` (lib test) due to 43 previous errors

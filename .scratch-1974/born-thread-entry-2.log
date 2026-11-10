@@ -1,0 +1,290 @@
+   Compiling carrick-el1-image v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-image)
+warning: carrick-el1-image@0.1.0: EL1 stack unregistered native retirement: 4927 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring vector input: 4736 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native admission: 7936 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork publication: 10142 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork descriptors: 10286 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd inheritance: 4783 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd retirement: 7952 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork context: 3215 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork settlement: 3534 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service admission: 4895 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack host-owned return work: 7726 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service continuation: 5550 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service refusal: 5808 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native backing reply: 9870 / 11311 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring completed copyout: 10751 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring poll readiness: 4224 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe copyout: 9280 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe backing preparation: 5295 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native wait copy: 10847 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack declined fault signal: 11488 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal delivery copy: 10848 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service signal delivery: 11008 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack resumed signal delivery copy: 11183 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal terminal exit: 9263 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal return: 5520 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack anonymous munmap: 6912 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack metadata grant: 7120 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack backing retirement: 10352 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack descriptor drain: 6544 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 image budget: 1491232 bytes loaded / 1572864 bytes; 81632 bytes headroom
+   Compiling carrick-mem v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-hal)
+   Compiling carrick-host-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-host-linux)
+   Compiling carrick-thread v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-vfs)
+   Compiling carrick-kernel v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-kernel)
+   Compiling carrick-el1-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-linux)
+error[E0599]: no method named `read_value` found for struct `GuestUserBuffer` in the current scope
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:762:22
+    |
+762 |     assert_eq!(ptid2.read_value::<u32>(), born_tid as u32);
+    |                      ^^^^^^^^^^ method not found in `GuestUserBuffer`
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1018:39
+     |
+1018 |             if !ns.is_reserved_number(visible_tid) {
+     |                    ------------------ ^^^^^^^^^^^ expected `i32`, found `u32`
+     |                    |
+     |                    arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/carrick-sched-core/src/process/identity_allocator.rs:625:12
+     |
+ 625 |     pub fn is_reserved_number(&self, raw: i32) -> bool {
+     |            ^^^^^^^^^^^^^^^^^^
+help: you can convert a `u32` to an `i32` and panic if the converted value doesn't fit
+     |
+1018 |             if !ns.is_reserved_number(visible_tid.try_into().unwrap()) {
+     |                                                  ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1019:34
+     |
+1019 | ...   ns.reserve_exact(visible_tid, ClaimKind::Thread).unwrap();
+     |          ------------- ^^^^^^^^^^^ expected `i32`, found `u32`
+     |          |
+     |          arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/carrick-sched-core/src/process/identity_allocator.rs:547:12
+     |
+ 547 |     pub fn reserve_exact(
+     |            ^^^^^^^^^^^^^
+help: you can convert a `u32` to an `i32` and panic if the converted value doesn't fit
+     |
+1019 |                 ns.reserve_exact(visible_tid.try_into().unwrap(), ClaimKind::Thread).unwrap();
+     |                                             ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1022:44
+     |
+1022 |             let _ = ns.bind_visible_domain(visible_tid, domain);
+     |                        ------------------- ^^^^^^^^^^^ expected `i32`, found `u32`
+     |                        |
+     |                        arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/carrick-sched-core/src/process/identity_allocator.rs:465:12
+     |
+ 465 |     pub fn bind_visible_domain(
+     |            ^^^^^^^^^^^^^^^^^^^
+help: you can convert a `u32` to an `i32` and panic if the converted value doesn't fit
+     |
+1022 |             let _ = ns.bind_visible_domain(visible_tid.try_into().unwrap(), domain);
+     |                                                       ++++++++++++++++++++
+
+error[E0560]: struct `carrick_el1_abi::EntryIdentity` has no field named `task_serial`
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1038:17
+     |
+1038 |                 task_serial: carrick_core_abi::entry::BirthSerial::of_...
+     |                 ^^^^^^^^^^^ `carrick_el1_abi::EntryIdentity` does not have this field
+     |
+     = note: available fields are: `birth`
+
+error[E0599]: no method named `task_serial` found for struct `ThreadBirthIdentity` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1153:68
+     |
+1153 | ...entity.task_serial().raw()),
+     |           ^^^^^^^^^^^ method not found in `ThreadBirthIdentity`
+
+error[E0599]: no method named `task_serial` found for struct `ThreadBirthIdentity` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1182:42
+     |
+1182 |                 generation: sib_identity.task_serial().raw(),
+     |                                          ^^^^^^^^^^^ method not found in `ThreadBirthIdentity`
+
+error[E0599]: no method named `read_value` found for struct `GuestUserBuffer` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1324:21
+     |
+1324 |     assert_eq!(ptid.read_value::<u32>(), 44);
+     |                     ^^^^^^^^^^ method not found in `GuestUserBuffer`
+
+error[E0308]: mismatched types
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1589:35
+     |
+1589 |             h.target_page.publish(claimed).unwrap();
+     |                           ------- ^^^^^^^ expected `EntryRef`, found `ClaimedEntry`
+     |                           |
+     |                           arguments to this method are incorrect
+     |
+note: method defined here
+    --> crates/carrick-core/src/lifecycle.rs:1144:8
+     |
+1144 |     fn publish(&self, r: EntryRef) -> Result<(), TransitionError> {
+     |        ^^^^^^^
+
+error[E0597]: `words` does not live long enough
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:814:17
+    |
+804 |       let words = h.fixture.tables.live(&h.fixture.maintenance);
+    |           ----- binding `words` declared here
+...
+814 |       .with_words(&words);
+    |                   ^^^^^^ borrowed value does not live long enough
+...
+821 | /     loaded_call_on_slot(
+822 | |         h.fixture,
+823 | |         h.tasks,
+824 | |         SlotId::new(0),
+...   |
+830 | |         &mut h.leader_cpu,
+831 | |     )
+    | |_____- argument requires that `words` is borrowed for `'static`
+...
+931 |   }
+    |   - `words` dropped here while still borrowed
+
+error[E0597]: `words` does not live long enough
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:860:17
+    |
+804 |       let words = h.fixture.tables.live(&h.fixture.maintenance);
+    |           ----- binding `words` declared here
+...
+860 |       .with_words(&words);
+    |                   ^^^^^^ borrowed value does not live long enough
+861 |       assert_eq!(
+862 | /         poll_signal_once_on_slot(
+863 | |             h.fixture,
+864 | |             h.tasks,
+865 | |             SlotId::new(1),
+...   |
+870 | |             LINUX_SIGUSR1,
+871 | |         ),
+    | |_________- argument requires that `words` is borrowed for `'static`
+...
+931 |   }
+    |   - `words` dropped here while still borrowed
+
+error[E0597]: `words` does not live long enough
+   --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:902:17
+    |
+804 |       let words = h.fixture.tables.live(&h.fixture.maintenance);
+    |           ----- binding `words` declared here
+...
+902 |       .with_words(&words);
+    |                   ^^^^^^ borrowed value does not live long enough
+903 |       assert_eq!(
+904 | /         poll_signal_once_on_slot(
+905 | |             h.fixture,
+906 | |             h.tasks,
+907 | |             SlotId::new(3),
+...   |
+912 | |             LINUX_SIGUSR1,
+913 | |         ),
+    | |_________- argument requires that `words` is borrowed for `'static`
+...
+931 |   }
+    |   - `words` dropped here while still borrowed
+
+error[E0597]: `words` does not live long enough
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:953:17
+     |
+ 943 |       let words = h.fixture.tables.live(&h.fixture.maintenance);
+     |           ----- binding `words` declared here
+...
+ 953 |       .with_words(&words);
+     |                   ^^^^^^ borrowed value does not live long enough
+...
+ 959 | /     loaded_call_on_slot(
+ 960 | |         h.fixture,
+ 961 | |         h.tasks,
+ 962 | |         SlotId::new(0),
+...    |
+ 968 | |         &mut h.leader_cpu,
+ 969 | |     )
+     | |_____- argument requires that `words` is borrowed for `'static`
+...
+1004 |   }
+     |   - `words` dropped here while still borrowed
+
+error[E0597]: `words` does not live long enough
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:983:17
+     |
+ 943 |       let words = h.fixture.tables.live(&h.fixture.maintenance);
+     |           ----- binding `words` declared here
+...
+ 983 |       .with_words(&words);
+     |                   ^^^^^^ borrowed value does not live long enough
+...
+ 988 | /     loaded_call_on_slot(
+ 989 | |         h.fixture,
+ 990 | |         h.tasks,
+ 991 | |         SlotId::new(2),
+...    |
+ 997 | |         &mut h.peer_cpu,
+ 998 | |     )
+     | |_____- argument requires that `words` is borrowed for `'static`
+...
+1004 |   }
+     |   - `words` dropped here while still borrowed
+
+error[E0597]: `words` does not live long enough
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1421:17
+     |
+1410 |       let words = fixture.tables.live(&fixture.maintenance);
+     |           ----- binding `words` declared here
+...
+1421 |       .with_words(&words);
+     |                   ^^^^^^ borrowed value does not live long enough
+...
+1434 |       let route = loaded_call_on_slot(
+     |  _________________-
+1435 | |         fixture,
+1436 | |         tasks,
+1437 | |         SlotId::new(0),
+...    |
+1443 | |         &mut root_cpu,
+1444 | |     )
+     | |_____- argument requires that `words` is borrowed for `'static`
+...
+1513 |   }
+     |   - `words` dropped here while still borrowed
+
+error[E0597]: `words` does not live long enough
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1489:17
+     |
+1410 |       let words = fixture.tables.live(&fixture.maintenance);
+     |           ----- binding `words` declared here
+...
+1489 |       .with_words(&words);
+     |                   ^^^^^^ borrowed value does not live long enough
+...
+1494 | /     loaded_call_on_slot(
+1495 | |         fixture,
+1496 | |         tasks,
+1497 | |         SlotId::new(2),
+...    |
+1503 | |         &mut peer_cpu,
+1504 | |     )
+     | |_____- argument requires that `words` is borrowed for `'static`
+...
+1513 |   }
+     |   - `words` dropped here while still borrowed
+
+Some errors have detailed explanations: E0308, E0560, E0597, E0599.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `carrick-el1-linux` (lib test) due to 16 previous errors

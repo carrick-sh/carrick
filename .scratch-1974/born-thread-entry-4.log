@@ -1,0 +1,57 @@
+   Compiling carrick-el1-image v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-image)
+warning: carrick-el1-image@0.1.0: EL1 stack unregistered native retirement: 4927 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring vector input: 4736 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native admission: 7936 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork publication: 10142 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork descriptors: 10286 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd inheritance: 4783 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd retirement: 7952 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork context: 3215 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork settlement: 3534 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service admission: 4895 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack host-owned return work: 7726 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service continuation: 5550 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service refusal: 5808 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native backing reply: 9870 / 11311 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring completed copyout: 10751 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring poll readiness: 4224 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe copyout: 9280 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe backing preparation: 5295 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native wait copy: 10847 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack declined fault signal: 11488 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal delivery copy: 10848 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service signal delivery: 11008 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack resumed signal delivery copy: 11183 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal terminal exit: 9263 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal return: 5520 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack anonymous munmap: 6912 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack metadata grant: 7120 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack backing retirement: 10352 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack descriptor drain: 6544 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 image budget: 1491232 bytes loaded / 1572864 bytes; 81632 bytes headroom
+   Compiling carrick-mem v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-hal)
+   Compiling carrick-host-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-host-linux)
+   Compiling carrick-thread v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-vfs)
+   Compiling carrick-kernel v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-kernel)
+   Compiling carrick-el1-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-linux)
+error[E0599]: no method named `set_address_context` found for mutable reference `&mut carrick_sched_core::Aarch64ParkedContext` in the current scope
+    --> crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1105:14
+     |
+1101 | /         fixture
+1102 | |             .zone
+1103 | |             .record(root_record)
+1104 | |             .ctx_mut()
+1105 | |             .set_address_context(fixture.address);
+     | |_____________-^^^^^^^^^^^^^^^^^^^
+     |
+help: there is a method `address_context` with a similar name, but with different arguments
+    --> crates/carrick-sched-core/src/aarch64_context.rs:44:5
+     |
+  44 |     pub fn address_context(&self) -> Option<AddressContext<RootGpa>> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `carrick-el1-linux` (lib test) due to 1 previous error

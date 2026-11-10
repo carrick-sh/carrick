@@ -1,0 +1,88 @@
+   Compiling carrick-el1-image v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-image)
+warning: carrick-el1-image@0.1.0: EL1 stack unregistered native retirement: 4927 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring vector input: 4736 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native admission: 7936 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork publication: 10142 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork descriptors: 10286 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd inheritance: 4783 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fd retirement: 7952 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork context: 3215 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native fork settlement: 3534 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service admission: 4895 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack host-owned return work: 7726 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service continuation: 5550 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service refusal: 5808 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native backing reply: 9870 / 11311 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring completed copyout: 10751 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring poll readiness: 4224 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe copyout: 9280 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack ring pipe backing preparation: 5295 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native wait copy: 10847 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack declined fault signal: 11488 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal delivery copy: 10848 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack native service signal delivery: 11008 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack resumed signal delivery copy: 11183 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal terminal exit: 9263 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack signal return: 5520 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack anonymous munmap: 6912 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack metadata grant: 7120 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack backing retirement: 10352 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 stack descriptor drain: 6544 / 12288 bytes (stack 16384, vector included)
+warning: carrick-el1-image@0.1.0: EL1 image budget: 1491232 bytes loaded / 1572864 bytes; 81632 bytes headroom
+   Compiling carrick-mem v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-hal)
+   Compiling carrick-host-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-host-linux)
+   Compiling carrick-thread v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-vfs)
+   Compiling carrick-kernel v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-kernel)
+   Compiling carrick-el1-linux v0.1.0 (/var/lib/carrick-conductor/repo/crates/carrick-el1-linux)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 47.33s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1_linux-3aaaac1239b2345a)
+
+running 7 tests
+test aarch64_process_tests::born_thread_entry_tests::arm_born_thread_first_entry_on_a_detached_executor ... ok
+test aarch64_process_tests::born_thread_entry_tests::arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry ... FAILED
+test aarch64_process_tests::born_thread_entry_tests::arm_root_ring_born_tgkill_and_peer_kill_before_first_entry ... FAILED
+test aarch64_process_tests::born_thread_entry_tests::arm_born_thread_first_entry_after_another_process_on_the_vcpu ... ok
+test aarch64_process_tests::born_thread_entry_tests::arm_native_owned_ring_born_tgkill_before_first_entry_queues_signal_once ... ok
+test aarch64_process_tests::born_thread_entry_tests::arm_native_owned_ring_born_peer_kill_before_first_entry ... FAILED
+test aarch64_process_tests::born_thread_entry_tests::arm_mid_clone_claim_free_birth_before_requeue_fails_sibling_tgkill ... FAILED
+
+failures:
+
+---- aarch64_process_tests::born_thread_entry_tests::arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry stdout ----
+
+thread 'aarch64_process_tests::born_thread_entry_tests::arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry' (11662) panicked at crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:428:53:
+called `Option::unwrap()` on a `None` value
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- aarch64_process_tests::born_thread_entry_tests::arm_root_ring_born_tgkill_and_peer_kill_before_first_entry stdout ----
+
+thread 'aarch64_process_tests::born_thread_entry_tests::arm_root_ring_born_tgkill_and_peer_kill_before_first_entry' (11666) panicked at crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:428:53:
+called `Option::unwrap()` on a `None` value
+
+---- aarch64_process_tests::born_thread_entry_tests::arm_native_owned_ring_born_peer_kill_before_first_entry stdout ----
+
+thread 'aarch64_process_tests::born_thread_entry_tests::arm_native_owned_ring_born_peer_kill_before_first_entry' (11664) panicked at crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1015:5:
+assertion `left == right` failed: peer kill(born_tid, SIGUSR2) before first entry must return 0
+  left: -3
+ right: 0
+
+---- aarch64_process_tests::born_thread_entry_tests::arm_mid_clone_claim_free_birth_before_requeue_fails_sibling_tgkill stdout ----
+
+thread 'aarch64_process_tests::born_thread_entry_tests::arm_mid_clone_claim_free_birth_before_requeue_fails_sibling_tgkill' (11663) panicked at crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs:1663:5:
+assertion `left == right` failed: sibling tgkill during pre-requeue Claim::Free window must resolve
+  left: -3
+ right: 0
+
+
+failures:
+    aarch64_process_tests::born_thread_entry_tests::arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry
+    aarch64_process_tests::born_thread_entry_tests::arm_mid_clone_claim_free_birth_before_requeue_fails_sibling_tgkill
+    aarch64_process_tests::born_thread_entry_tests::arm_native_owned_ring_born_peer_kill_before_first_entry
+    aarch64_process_tests::born_thread_entry_tests::arm_root_ring_born_tgkill_and_peer_kill_before_first_entry
+
+test result: FAILED. 3 passed; 4 failed; 0 ignored; 0 measured; 919 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p carrick-el1-linux --lib`
