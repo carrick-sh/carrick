@@ -54,6 +54,45 @@ fn exit_drain_wake(flags: &[&str], affinity: u64) {
     );
 }
 
+const FAILED_MSI_CHILD: &str = "CARRICK_TEST_FAILED_MSI_CHILD";
+
+/// A reschedule MSI the carrier cannot deliver must surface as a carrier
+/// error, not strand the parked parent behind a sleeping CPU. The child
+/// process arms the test-support seam and runs the idle-peer wake; the
+/// carrier's fatal sink must end it promptly, naming the undelivered wake.
+#[test]
+fn failed_resched_msi_is_a_carrier_error_not_a_hang() {
+    if std::env::var_os(FAILED_MSI_CHILD).is_some() {
+        carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::fail_carrier_resched_for_test();
+        exit_drain_wake(&["-DUSE_POLL"], ROOT_AFFINITY_IDLE_PEER);
+        return;
+    }
+    let started = std::time::Instant::now();
+    let output = std::process::Command::new("timeout")
+        .args(["--signal=KILL", "30"])
+        .arg(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "failed_resched_msi_is_a_carrier_error_not_a_hang",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(FAILED_MSI_CHILD, "1")
+        .output()
+        .expect("bounded failed-MSI child");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "the failed MSI must settle in bounded time ({:?}): {stderr}",
+        started.elapsed()
+    );
+    assert!(
+        !output.status.success() && stderr.contains("carrier zone wake undelivered"),
+        "the failed MSI must surface a carrier error: {:?} {stderr}",
+        output.status
+    );
+}
+
 #[test]
 fn child_exit_closing_last_writer_wakes_parked_ppoll() {
     exit_drain_wake(&[], ROOT_AFFINITY_LOADED);

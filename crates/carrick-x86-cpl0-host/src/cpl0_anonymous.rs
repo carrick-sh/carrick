@@ -359,6 +359,18 @@ fn signal_resched<M: CarrierMemoryIo>(
         .map_err(|error| fail(format!("host wake MSI: {error}")))
 }
 
+/// Test-support seam over the carrier sink's MSI delivery: every carrier
+/// reschedule fails once armed. The production sink has no such toggle.
+#[cfg(feature = "test-support")]
+static FAIL_CARRIER_RESCHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the failed-MSI seam for the rest of this process (test-support only).
+#[cfg(feature = "test-support")]
+pub fn fail_carrier_resched_for_test() {
+    FAIL_CARRIER_RESCHED.store(true, std::sync::atomic::Ordering::Release);
+}
+
 /// The carrier-scoped zone host IPC releases wake into (#2031). The zone
 /// and APIC routes live in guest RAM this sink retains; the host IPC owner
 /// delivers through it when no process-global zone serves.
@@ -387,7 +399,15 @@ impl<M: CarrierMemoryIo> carrick_sched_core::CarrierZoneWake<carrick_sched_core:
     fn resched(&self, slot: SlotId) {
         // SAFETY: validated at creation; retained by `_ram`.
         let routes = unsafe { self.routes.as_ref() };
-        if let Err(error) = signal_resched(routes, &*self.vm, slot) {
+        #[cfg(feature = "test-support")]
+        let delivered = if FAIL_CARRIER_RESCHED.load(std::sync::atomic::Ordering::Acquire) {
+            Err(fail("injected carrier reschedule failure"))
+        } else {
+            signal_resched(routes, &*self.vm, slot)
+        };
+        #[cfg(not(feature = "test-support"))]
+        let delivered = signal_resched(routes, &*self.vm, slot);
+        if let Err(error) = delivered {
             let _ = self.resched_fault.set(error);
         }
     }
