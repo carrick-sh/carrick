@@ -31,6 +31,13 @@ fn arm_native_fork_child_write_keeps_readable_prefix_before_unmapped_page() {
     fork_child_service_ack(true, false, false, true);
 }
 
+/// #2034: a carrier `Supplied` that leaves the write's page unreadable
+/// replays the SVC through whole service rounds, bounded here.
+#[test]
+fn arm_native_fork_child_write_supplied_but_unreadable_replays_whole_rounds() {
+    fork_child_service(true, false, false, true, true);
+}
+
 const PREFIX_BYTES: &[u8; 16] = b"0123456789abcdef";
 
 /// Readable up to `end`, unmapped from there on.
@@ -46,6 +53,16 @@ impl crate::file::MemoryValidator for ReadableBelow {
 }
 
 fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefix: bool) {
+    fork_child_service(stdout, root_exit, child_exit, prefix, false);
+}
+
+fn fork_child_service(
+    stdout: bool,
+    root_exit: bool,
+    child_exit: bool,
+    prefix: bool,
+    unreadable_supply: bool,
+) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
@@ -209,6 +226,11 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefi
         // write of a megabyte whose tail was never mapped.
         saved.native.x[1] = prefix_page.0.as_ptr().addr() as u64 + 4080;
         saved.native.x[2] = 0x100001;
+        if unreadable_supply {
+            // The probe's fourth write: a whole page that was never readable.
+            saved.native.x[1] = prefix_unmapped;
+            saved.native.x[2] = 4096;
+        }
     }
     let child_ttbr = cpu.ttbr;
     assert_eq!(fixture.zone.installed_space(fixture.slot), identity.mm);
@@ -370,6 +392,162 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefi
     assert_eq!(cpu.ttbr, (0x30000, 0x30000), "park left the child roots");
     assert_eq!(fixture.zone.installed_space(fixture.slot), 0);
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    if unreadable_supply {
+        // #2034 suspect: the carrier answers `Supplied` but the validator
+        // still sees the page unreadable. Every round must be a whole
+        // service round (park, claim, supply, scheduler resume, SVC replay)
+        // that re-asks for the same page; none may spin inside one entry.
+        const ROUNDS: usize = 64;
+        let selector_round = |first: bool| {
+            let selector = task.service_notice.take().unwrap().unwrap();
+            let ticket = unsafe {
+                carrick_core_abi::service::ServiceCell::claim_notice(
+                    &child_control.service,
+                    selector,
+                    NonZeroU64::MIN,
+                    identity,
+                )
+            }
+            .unwrap();
+            let carrick_core_abi::service::ServiceOperation::Fault(fault) =
+                ticket.request().operation
+            else {
+                panic!("an unreadable write page must ask the owner to supply it");
+            };
+            assert_eq!(fault.address.raw(), prefix_unmapped, "round {first}");
+            assert!(ticket.complete(true).is_ok(), "the carrier supplies");
+            fixture
+                .zone
+                .object_wait(
+                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
+                        .unwrap(),
+                    &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                )
+                .unwrap()
+                .notify_object(fixture.slot, &mut Default::default())
+                .unwrap();
+        };
+        for round in 0..ROUNDS {
+            selector_round(round == 0);
+            cpu.ttbr = (0x30000, 0x30000);
+            let mut handoff = None;
+            let mut zone = crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            };
+            assert_eq!(
+                super::super::dispatch::native_scheduler(
+                    &mut zone,
+                    task,
+                    &counters,
+                    fixture.slot,
+                    &mut handoff,
+                )
+                .idle_entry(&mut frame, 0),
+                carrick_el1_abi::Action::Served
+            );
+            let owner = registry()
+                .for_record(fixture.zone, fixture.zone.record_ref(child))
+                .unwrap();
+            let resumed = super::super::aarch64_process::resume_selected(
+                &owner,
+                registry(),
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                task,
+                child,
+                &mut service,
+            );
+            assert!(
+                matches!(
+                    resumed,
+                    super::super::native_process_runtime::NativeResume::RetrySyscall
+                ),
+                "round {round}: a supplied page replays the SVC"
+            );
+            drop(owner);
+            // The replayed SVC: stage and begin the same write again.
+            let again = with_process_entry(
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                task,
+                &saved.native,
+                cpu.ttbr.0,
+                child_page,
+                child_control,
+                &mut service,
+                |entry| {
+                    use carrick_personality_linux::native_host_file::{
+                        DescriptionAccess, NativeDescriptor,
+                    };
+                    let mut stage_frame = carrick_el1_abi::TrapFrame {
+                        x: saved.native.x,
+                        elr: saved.native.pc,
+                        esr: 0x15 << 26,
+                        slot: u64::from(fixture.slot.raw()),
+                        ..Default::default()
+                    };
+                    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+                    let decision = super::super::dispatch::native_service_decision(
+                        &mut stage_frame,
+                        task,
+                        carrick_el1_abi::Action::Forward,
+                        None,
+                        counters,
+                        || super::super::native_process_runtime::NativeThreadGroupOwner::ForkChild,
+                        |frame| {
+                            super::super::dispatch::native_host_file_stage(
+                                frame,
+                                task,
+                                &ReadableBelow(prefix_unmapped),
+                                [5, 1, 0],
+                                carrick_core_abi::service::ServiceOrigin::Descendant,
+                                |_| {
+                                    Some(NativeDescriptor::HostBacked {
+                                        access: DescriptionAccess::WriteOnly,
+                                    })
+                                },
+                                &mut |_| panic!("a write releases no mapping sources"),
+                            )
+                        },
+                    );
+                    let super::super::dispatch::NativeServiceDecision::Begin(begin) = decision
+                    else {
+                        panic!("round {round}: the replay must publish another fault request");
+                    };
+                    super::super::dispatch::begin_native_service(
+                        entry,
+                        saved.native.x[8],
+                        begin,
+                        None,
+                        counters,
+                        counters,
+                        || None,
+                    )
+                    .0
+                    .unwrap()
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                again,
+                super::super::native_process_runtime::NativeResume::Left(None)
+            ));
+            assert_eq!(
+                super::super::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu),
+                carrick_el1_abi::Action::Idle
+            );
+        }
+        return;
+    }
     if prefix {
         // Round one: the carrier is asked to supply the unmapped page and
         // refuses it. The retained prefix is then written, not EFAULT.
