@@ -5784,6 +5784,439 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
     );
 }
 
+/// #1974: in `NativeProcessEntry::enqueue_thread` (shared by x86 CPL0 and ARM),
+/// `register_native_birth` commits the child into `resources.members` and drops
+/// `graph.lock()` while the child's `ZoneRecord` is still `Claim::Free` with
+/// `home() == None` (before `requeue_preempted` moves it to `Claim::Queued`).
+/// With two live threads running in an x86 CPL0 process (`ParkedContextWords` +
+/// `X86Mmu`), a sibling's `tgkill` during that window must hold the signal on
+/// the registered-but-unqueued child and deliver it once at the child's first
+/// entry (not dropped, not doubled), keep a blocked-at-clone mask pending
+/// across first entry, and reject a freed record incarnation with `ESRCH`.
+#[test]
+#[cfg(test)]
+fn x86_registered_claim_free_birth_before_requeue_sibling_tgkill() {
+    use carrick_el1_abi::Lifecycle;
+    use carrick_personality_linux::lifecycle::{ProcessNative, ThreadBirthAdmission};
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalRequest, SignalThreadSelector,
+    };
+    use carrick_signal_core::policy::{SigBlockMask, Signal};
+    use zerocopy::IntoBytes;
+
+    let fixture = native_exec_fixture();
+    fixture.install_handler(10, false);
+
+    let controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+        ThreadControlSlot::new()
+    })));
+    fixture
+        .runtime
+        .admit_thread_stock(NativeLifecycleResources {
+            page: fixture.page,
+            controls,
+        })
+        .unwrap();
+
+    let register_x86_claim_free_birth = |blocked: carrick_el1_abi::BlockedMask| {
+        let leader_source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        let mut leader_service = fixture.service();
+        let leader_saved = words(fixture.address);
+        let mut leader = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                leader_source,
+                fixture.task,
+                fixture.address,
+                &leader_saved,
+                &mut leader_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            leader.prepare_thread_birth(),
+            ThreadBirthAdmission::Ready
+        ));
+        let mut claimed = Some(fixture.page.claim_any().expect("x86 root stock entry"));
+        let entry = claimed.as_ref().unwrap().entry();
+        let identity = fixture.page.identity(entry).unwrap();
+        let control_address = fixture.page.control_address(entry).unwrap();
+        let child_slot = unsafe { &*(control_address as *const ThreadControlSlot) };
+        assert!(child_slot.publish_visible_tid(identity.visible_tid));
+        let record_id = fixture
+            .zone
+            .alloc_record(carrick_sched_core::ThreadIdentity {
+                tid: u64::from(identity.tid),
+                serial: identity.thread_serial,
+                mm: fixture.address.mm.raw().get(),
+                file_table: 5,
+                generation: 0,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: core::ptr::from_ref(fixture.page).addr() as u64,
+                control_slot: control_address,
+            })
+            .unwrap();
+        let record = fixture.zone.record_ref(record_id);
+        child_slot.reset_for_birth(blocked, 0, entry).unwrap();
+        leader.bind_thread_birth(record, child_slot).unwrap();
+        assert!(fixture.zone.issue_native_birth(record_id));
+        leader
+            .thread_spawned(41, identity.visible_tid, &mut || {
+                Lifecycle::thread_born(fixture.page).ok_or(-11)?;
+                fixture
+                    .page
+                    .record_born(
+                        claimed.take().unwrap(),
+                        carrick_el1_abi::BornRecord {
+                            caller_task: 41,
+                            caller_serial: 101,
+                            clone_flags: 0x0035_0f00,
+                            clear_child_tid: 0,
+                            blocked,
+                        },
+                    )
+                    .map_err(|_| -11)?;
+                Ok(())
+            })
+            .unwrap();
+        leader.lifecycle_admission_settled().unwrap();
+        let process = fixture.runtime.graph.lock().root_key;
+        assert_eq!(
+            fixture
+                .registry
+                .register_native_birth(&fixture.runtime, process, leader_source, record)
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            fixture.zone.record(record_id).claim(),
+            carrick_sched_core::Claim::Free
+        );
+        assert_eq!(fixture.zone.record(record_id).home(), None);
+        (record, identity.visible_tid, child_slot)
+    };
+
+    let deliver_x86_user_return =
+        |slot: SlotId,
+         record: RecordRef,
+         control: &'static ThreadControlSlot,
+         frame: &mut carrick_el1_abi::TrapFrame| {
+            let identity = fixture.zone.record(record.id).identity();
+            let child_task = Box::leak(Box::new(CurrentTask::new()));
+            child_task.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(identity.tid as i32),
+                carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+                identity.file_table,
+            );
+            child_task
+                .mm
+                .key
+                .store(fixture.address.mm.raw().get(), Ordering::Release);
+            child_task
+                .mm
+                .thread_generation
+                .store(identity.serial, Ordering::Release);
+            child_task.publish_visible_pid(41);
+            child_task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+            let mut child_service = fixture.service();
+            let child_saved = words(fixture.address);
+            let mut entry = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    BornInZoneSource {
+                        zone: fixture.zone,
+                        slot,
+                    },
+                    child_task,
+                    fixture.address,
+                    &child_saved,
+                    &mut child_service,
+                )
+                .unwrap();
+            let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+            let mut machine = HostArmSignalMachine {
+                backend: HostArmBackend,
+            };
+            crate::signal_delivery::deliver_signal_on_syscall_return(
+                child_task,
+                control,
+                &mut entry,
+                frame,
+                fp.as_bytes(),
+                &mut machine,
+            )
+        };
+
+    let sib_slot_id = SlotId::new(1);
+    fixture.zone.drive(sib_slot_id, 1);
+    fixture.zone.publish_slot(sib_slot_id, 1, Some(0), 1);
+    fixture.zone.enter_guest(sib_slot_id);
+    fixture
+        .zone
+        .install_space(sib_slot_id, fixture.address.mm.raw().get())
+        .unwrap();
+    let (sib_record, _, _) = register_x86_claim_free_birth(carrick_el1_abi::BlockedMask(0));
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(sib_slot_id, sib_record.id)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(sib_slot_id).unwrap().record,
+        sib_record.id
+    );
+    let sib_id = fixture.zone.record(sib_record.id).identity();
+    let sib_task = Box::leak(Box::new(CurrentTask::new()));
+    sib_task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(sib_id.tid as i32),
+        carrick_el1_abi::SnapshotGeneration::from_raw(sib_id.generation),
+        sib_id.file_table,
+    );
+    sib_task
+        .mm
+        .key
+        .store(fixture.address.mm.raw().get(), Ordering::Release);
+    sib_task
+        .mm
+        .thread_generation
+        .store(sib_id.serial, Ordering::Release);
+    sib_task.publish_visible_pid(41);
+    sib_task.publish_lifecycle(sib_id.lifecycle_page, sib_id.control_slot);
+    assert_eq!(fixture.page.live(), 2);
+
+    let child_slot_id = SlotId::new(2);
+    fixture.zone.drive(child_slot_id, 1);
+    fixture.zone.publish_slot(child_slot_id, 1, Some(0), 1);
+    fixture.zone.enter_guest(child_slot_id);
+    fixture
+        .zone
+        .install_space(child_slot_id, fixture.address.mm.raw().get())
+        .unwrap();
+
+    // Case A: unmasked at clone (`BlockedMask(0)`). Held while registered in
+    // `Claim::Free`, delivered once at first entry, and not doubled.
+    let (child_record, child_tid, child_control) =
+        register_x86_claim_free_birth(carrick_el1_abi::BlockedMask(0));
+
+    let mut sib_service = fixture.service();
+    let sib_saved = words(fixture.address);
+    let mut sender = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sib_slot_id,
+            },
+            sib_task,
+            fixture.address,
+            &sib_saved,
+            &mut sib_service,
+        )
+        .unwrap();
+    let sigusr1 = Signal::from_number(10).unwrap();
+    assert_eq!(
+        sender.tgkill(
+            SignalThreadSelector::from_abi(41),
+            SignalThreadSelector::from_abi(u64::from(child_tid)),
+            SignalRequest::Deliver(sigusr1),
+            SignalInfo::Generated(None),
+        ),
+        Ok(()),
+        "x86 sibling tgkill during pre-requeue Claim::Free window must resolve"
+    );
+    drop(sender);
+
+    let signals = fixture.runtime.current_signals(fixture.task).unwrap();
+    assert!(
+        signals
+            .take_deliverable(fixture.record, SigBlockMask::NONE)
+            .is_none(),
+        "leader must not steal child's thread-directed signal"
+    );
+    assert!(
+        signals
+            .take_deliverable(sib_record, SigBlockMask::NONE)
+            .is_none(),
+        "sending sibling must not steal child's thread-directed signal"
+    );
+
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(child_slot_id, child_record.id)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(child_slot_id).unwrap().record,
+        child_record.id
+    );
+    let mut first_frame = carrick_el1_abi::TrapFrame {
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    assert_eq!(
+        deliver_x86_user_return(child_slot_id, child_record, child_control, &mut first_frame),
+        None,
+        "handler setup completes in-place for user return"
+    );
+    assert_eq!(
+        first_frame.elr, 0x7000,
+        "first entry must redirect PC to installed SIGUSR1 handler"
+    );
+    assert_eq!(first_frame.x[0], 10);
+
+    let mut second_frame = carrick_el1_abi::TrapFrame {
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    assert_eq!(
+        deliver_x86_user_return(
+            child_slot_id,
+            child_record,
+            child_control,
+            &mut second_frame
+        ),
+        None
+    );
+    assert_eq!(
+        second_frame.elr, 0x40_0200,
+        "SIGUSR1 must not deliver a second time"
+    );
+
+    // Negative control: once the record incarnation advances on retirement,
+    // `signal_record_exists` must reject the stale `RecordRef`.
+    let _ = fixture.zone.release_current(
+        child_slot_id,
+        child_record.id,
+        &carrick_sched_core::ShortLockSpin,
+    );
+    fixture.zone.free_record(child_record.id);
+    let mut sender = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sib_slot_id,
+            },
+            sib_task,
+            fixture.address,
+            &sib_saved,
+            &mut sib_service,
+        )
+        .unwrap();
+    assert_eq!(
+        sender.tgkill(
+            SignalThreadSelector::from_abi(41),
+            SignalThreadSelector::from_abi(u64::from(child_tid)),
+            SignalRequest::Probe,
+            SignalInfo::Generated(None),
+        ),
+        Err(carrick_syscall_abi::LINUX_ESRCH),
+        "freed record incarnation must never resolve as live"
+    );
+    drop(sender);
+
+    // Case B: SIGUSR1 blocked in the inherited clone mask (`BlockedMask(1 << 9)`).
+    // `tgkill` while registered-but-unqueued succeeds, first entry keeps PC at
+    // `0x40_0200`, and SIGUSR1 stays pending until unmasked.
+    let (masked_record, masked_tid, masked_control) =
+        register_x86_claim_free_birth(carrick_el1_abi::BlockedMask(sigusr1.bit()));
+    let mut sender = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sib_slot_id,
+            },
+            sib_task,
+            fixture.address,
+            &sib_saved,
+            &mut sib_service,
+        )
+        .unwrap();
+    assert_eq!(
+        sender.tgkill(
+            SignalThreadSelector::from_abi(41),
+            SignalThreadSelector::from_abi(u64::from(masked_tid)),
+            SignalRequest::Deliver(sigusr1),
+            SignalInfo::Generated(None),
+        ),
+        Ok(()),
+        "blocked-at-clone Claim::Free x86 birth must accept tgkill"
+    );
+    drop(sender);
+
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(child_slot_id, masked_record.id)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(child_slot_id).unwrap().record,
+        masked_record.id
+    );
+    let mut masked_frame = carrick_el1_abi::TrapFrame {
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    assert_eq!(
+        deliver_x86_user_return(
+            child_slot_id,
+            masked_record,
+            masked_control,
+            &mut masked_frame
+        ),
+        None
+    );
+    assert_eq!(
+        masked_frame.elr, 0x40_0200,
+        "blocked-at-clone SIGUSR1 must stay pending across x86 first entry"
+    );
+
+    masked_control.init_blocked(carrick_el1_abi::BlockedMask(0));
+    assert_eq!(
+        deliver_x86_user_return(
+            child_slot_id,
+            masked_record,
+            masked_control,
+            &mut masked_frame
+        ),
+        None
+    );
+    assert_eq!(
+        masked_frame.elr, 0x7000,
+        "unmasking must deliver the held SIGUSR1 once on x86"
+    );
+    let mut after_unmask = carrick_el1_abi::TrapFrame {
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    assert_eq!(
+        deliver_x86_user_return(
+            child_slot_id,
+            masked_record,
+            masked_control,
+            &mut after_unmask
+        ),
+        None
+    );
+    assert_eq!(after_unmask.elr, 0x40_0200);
+}
+
 #[test]
 #[cfg(test)]
 fn entropy_service_requires_retained_ring_payload_before_notice() {
