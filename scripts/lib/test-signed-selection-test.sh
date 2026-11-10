@@ -47,6 +47,25 @@ if run_case wanted 1 3 2; then exit 1; fi
 unset SAME_TEST
 if run_case absent 1 2 1; then exit 1; fi
 
+# Stderr witness: one `test-signed: selected <name>` line per selected test,
+# in census order, before any execution; a zero-match refusal prints none.
+run_stderr_case() (
+    requested_filter=$1 has_exact=$2 ignored_only=0 include_ignored=0
+    negative_test=unsigned_executable_maps_hv_denied_to_entitlement
+    scratch=()
+    exes=("$root/alpha" "$root/beta" "$root/entitlement_negative")
+    test_signed_select_executables 2>"$root/stderr"
+)
+export SAME_TEST=1
+run_stderr_case wanted 0
+printf '%s\n' 'test-signed: selected module::wanted' 'test-signed: selected other::wanted' >"$root/expected"
+grep '^test-signed: selected ' "$root/stderr" >"$root/actual"
+cmp -s "$root/expected" "$root/actual"
+unset SAME_TEST
+if run_stderr_case absent 0; then exit 1; fi
+grep -Fq 'test-signed: filter absent resolved zero tests' "$root/stderr"
+if grep -q '^test-signed: selected ' "$root/stderr"; then exit 1; fi
+
 for target in '' guest_smoke test-target test_123; do
     test_signed_validate_target "$target"
 done
