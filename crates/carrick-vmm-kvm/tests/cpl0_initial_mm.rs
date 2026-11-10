@@ -234,6 +234,20 @@ fn serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux() {
     );
 }
 
+/// #2028: a production x86 fork child's clock reads are served in ring: the
+/// reading crosses once as a typed sample for the run's clock domain, and the
+/// errno rows match Linux. Exit 218 is the counted ENOSYS this retires; the
+/// fixture's header lists the rows (`40 + n` names the first one that failed).
+#[test]
+fn serial_host_native_child_clock_reads_match_linux() {
+    native_child_sleep_witness_with_exit(
+        "serial_host_native_child_clock_reads_match_linux",
+        "native_child_clock.S",
+        &[],
+        8,
+    );
+}
+
 fn native_child_sleep_witness(test: &str, flags: &[&str]) {
     native_child_sleep_witness_with_exit(test, "native_child_sleep.S", flags, 8);
 }
@@ -386,6 +400,16 @@ fn native_exit_fixture(name: &str) -> Vec<u8> {
 
 fn native_exit_fixture_with_flags(name: &str, flags: &[&str]) -> Vec<u8> {
     kvm_pool_fixture::assemble_fixture(name, flags)
+}
+
+/// The run's clock domain, served to ring-owned processes as a carrier handler.
+fn native_clock_service(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+) -> carrick_vmm_kvm::cpl0_boot::NativeClockService {
+    carrick_kernel::clock_service::ClockResourceService::new(std::sync::Arc::clone(
+        dispatcher.container().clock(),
+    ))
+    .into_record_service()
 }
 
 fn native_exit_workers(
@@ -608,7 +632,10 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture("native_exit_order.S");
     let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
-    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let (root, factory) = parts.into_factory(
+        carrick_kernel::dispatch::serve_native_entropy,
+        native_clock_service(&_dispatcher),
+    );
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let newborn_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
     let mut parent = factory.claim(0).expect("root executor");
@@ -727,7 +754,10 @@ fn work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes() {
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture("native_exit_order.S");
     let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
-    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let (root, factory) = parts.into_factory(
+        carrick_kernel::dispatch::serve_native_entropy,
+        native_clock_service(&_dispatcher),
+    );
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let mut parent = factory.claim(0).expect("root executor");
     let mut peer = factory.claim(1).expect("idle peer executor");
@@ -831,7 +861,10 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
     use carrick_sched_core::Claim;
     let elf = native_exit_fixture_with_flags("native_autoreap_exit.S", flags);
     let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
-    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let (root, factory) = parts.into_factory(
+        carrick_kernel::dispatch::serve_native_entropy,
+        native_clock_service(&_dispatcher),
+    );
     let first_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let second_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
     let mut parent = factory.claim(0).expect("root executor");
@@ -961,7 +994,10 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture("native_peer_birth.S");
     let (parts, root_tid, dispatcher) = native_exit_workers(&elf);
-    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let (root, factory) = parts.into_factory(
+        carrick_kernel::dispatch::serve_native_entropy,
+        native_clock_service(&dispatcher),
+    );
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let newborn_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
     let mut parent = factory.claim(0).expect("root executor");
@@ -1151,7 +1187,10 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
     let workers = carrier.into_worker_parts(8).expect("worker handoff");
     assert_eq!(workers.root_state().binding().task().task.raw().get(), 700);
     assert_eq!(workers.root_state().state().mm_generation(), 911);
-    let (root, factory) = workers.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let (root, factory) = workers.into_factory(
+        carrick_kernel::dispatch::serve_native_entropy,
+        native_clock_service(&carrick_kernel::dispatch::SyscallDispatcher::default()),
+    );
     let factory = std::sync::Arc::new(factory);
     let root_factory = std::sync::Arc::clone(&factory);
     std::thread::spawn(move || {
@@ -1542,7 +1581,10 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
     use std::sync::atomic::Ordering;
     let elf = native_exit_fixture("native_file_fork.S");
     let (parts, root_tid, _dispatcher) = native_exit_workers(&elf);
-    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let (root, factory) = parts.into_factory(
+        carrick_kernel::dispatch::serve_native_entropy,
+        native_clock_service(&_dispatcher),
+    );
     let task = root.binding().task();
     let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
     let mut parent = factory.claim(0).expect("root executor");

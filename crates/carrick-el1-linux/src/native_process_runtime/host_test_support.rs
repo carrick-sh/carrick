@@ -2115,7 +2115,7 @@ fn native_clock_sample_retains_reply_across_copyout_busy() {
                 .begin_clock_sample(
                     ClockCapabilityId::new(NonZeroU64::MIN),
                     carrick_abi::LINUX_CLOCK_REALTIME,
-                    UserVa::new(0x10000),
+                    carrick_personality_linux::clock::ClockOutput::Timespec(UserVa::new(0x10000)),
                     carrick_guest_arch::NativeOrdinal::new(113),
                 )
                 .unwrap(),
@@ -6294,6 +6294,7 @@ fn completed_output_busy_yields(in_preparation: bool) {
             offset: 0,
             result: SyscallResult::new(37),
             prefix_on_fault: false,
+            then: None,
         });
         assert!(
             matches!(result, Ok(NativeResume::Left(None))),
@@ -6401,6 +6402,7 @@ fn poll_revents_crossing_a_page_retains_partial_copy_and_fault() {
             .unwrap();
         let output = service::OwnedCopyout {
             effect: None,
+            then: None,
             data: service::CopyoutData::Poll(vec![carrick_syscall_abi::PollReventsOutput::new(
                 carrick_guest_arch::GuestVa::new(0x10ff9),
                 0x1234,
