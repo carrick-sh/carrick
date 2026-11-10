@@ -310,6 +310,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.copyout.owner-refusal" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.deferred-handback-identity" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.poll-select-owner" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.memory.owner-wait" },

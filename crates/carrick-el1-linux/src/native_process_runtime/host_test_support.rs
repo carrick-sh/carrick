@@ -10099,3 +10099,393 @@ fn owner_copyout_invariant_is_a_run_failure() {
     );
     assert!(service.copies.is_empty());
 }
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[test]
+fn native_zone_poll_signal_before_enrolment_completes_eintr_and_delivers_once() {
+    use crate::file_table::{LINUX_POLLIN, PollFd};
+    use carrick_el1_abi::ipc::{IpcBacking, IpcLimits, fd, pipe::End, pipe::WaitFor};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable};
+    use carrick_personality_linux::dispatch::{CompletionRoute, SyscallFrame};
+    use carrick_test_support::GuestUserBuffer;
+    use zerocopy::IntoBytes;
+
+    struct NativePollTrapFrame(carrick_el1_abi::TrapFrame);
+
+    impl SyscallFrame for NativePollTrapFrame {
+        fn task_index(&self) -> usize {
+            self.0.task_index()
+        }
+        fn slot(&self) -> Option<SlotId> {
+            self.0.slot()
+        }
+        fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+            carrick_syscall_abi::nr::PPOLL
+        }
+        fn argument(&self, index: usize) -> Option<u64> {
+            self.0.argument(index)
+        }
+        fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+            self.0.result()
+        }
+        fn set_result(&mut self, word: carrick_guest_arch::NativeReturnWord) {
+            self.0.set_result(word);
+        }
+        fn user_sp(&self) -> Option<carrick_core_abi::UserVa> {
+            self.0.user_sp()
+        }
+    }
+
+    impl crate::dispatch::GuestDispatchFrame for NativePollTrapFrame {
+        fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+            carrick_guest_arch::NativeOrdinal::new(
+                carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw(),
+            )
+        }
+        fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+            carrick_personality_linux::crossing::HostCrossingSet::X86
+        }
+        fn settles_owed_work_at_continuation_boundary(&self) -> bool {
+            true
+        }
+        fn may_serve_poll(&self) -> bool {
+            true
+        }
+        fn operation_resume_pc(
+            &self,
+        ) -> Option<carrick_el1::substrate::sched::object_wait::OperationResumePc> {
+            carrick_el1::substrate::sched::object_wait::OperationResumePc::from_raw(
+                self.0.elr.wrapping_sub(2),
+            )
+        }
+        fn poll_timeout_kind(&self) -> crate::dispatch::PollTimeoutKind {
+            crate::dispatch::PollTimeoutKind::Timespec
+        }
+        fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> {
+            None
+        }
+        fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> {
+            None
+        }
+        fn arm_scheduler(&self) -> bool {
+            false
+        }
+        fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+            None
+        }
+    }
+
+    let fixture = native_exec_fixture();
+    fixture.install_sigint_handler(false);
+
+    let host: &'static Arc<HostIpc> = Box::leak(Box::new(Arc::new(
+        HostIpc::with_limits(1 << 20, IpcLimits::ZONE).unwrap(),
+    )));
+    fixture
+        .zone
+        .bind_ipc_operation_slots(
+            host.region().operation_slot_generation(),
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+        )
+        .unwrap();
+
+    let table = HostTable::create(host.clone(), 64, 8).unwrap();
+    let pipe = host.create_pipe(65536).unwrap();
+    for lane in [WaitFor::Readable, WaitFor::Writable] {
+        let key = carrick_el1_abi::ipc::object_wait_key(pipe, lane).unwrap();
+        fixture
+            .zone
+            .bind_object_wait(key, &carrick_sched_core::ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            })
+            .unwrap();
+    }
+    let reader = host
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object: pipe,
+                end: End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    reader.install(table.id(), fd::Fd(3), false).unwrap();
+    drop(reader);
+    let writer = host
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object: pipe,
+                end: End::Writer,
+            }
+            .encode(),
+            fd::AccessMode::WriteOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    writer.install(table.id(), fd::Fd(4), false).unwrap();
+    drop(writer);
+
+    let map = Box::leak(Box::new(unsafe {
+        core::mem::zeroed::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    }));
+    map.publish_owned(5, table.id().to_raw()).unwrap();
+    let tables = Box::leak(Box::new(crate::ipc::MapTables(map)));
+    let venue = crate::ipc::IpcVenue {
+        region: host.region(),
+        tables,
+    };
+
+    let pollfd_buf = GuestUserBuffer::from_value(PollFd {
+        fd: 3,
+        events: LINUX_POLLIN,
+        revents: 0x5a5a,
+    });
+
+    // 1. Deliverable signal is pending before object-wait enrolment.
+    let sigint = carrick_signal_core::policy::Signal::from_number(2).unwrap();
+    fixture
+        .runtime
+        .current_signals(fixture.task)
+        .unwrap()
+        .enqueue_thread(fixture.record, sigint, None);
+    assert!(fixture.registry_signal_checkpoint_needed());
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    service.native_ipc = Some(host.region());
+    let mut frame = NativePollTrapFrame(carrick_el1_abi::TrapFrame {
+        elr: 0x4004,
+        ..Default::default()
+    });
+    frame.0.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+    frame.0.x[0] = pollfd_buf.arg();
+    frame.0.x[1] = 1;
+    frame.0.x[2] = 0;
+    frame.0.x[3] = 0;
+
+    // 2. First poll entry enrols on the empty pipe and runs the post-enrolment
+    // interrupt() probe, which immediately wakes the waiter with Handback::Signal.
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native::<
+            _,
+            crate::sched::FakeCpu,
+            crate::sched::HardwareUserWord,
+            _,
+            carrick_sched_core::ParkedContextWords,
+        >(
+            &mut frame,
+            &carrick_el1_abi::Counters::new(),
+            core::slice::from_ref(fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &carrick_el1_abi::InotifyNameCache::new(),
+            None,
+            Some(&venue),
+            None,
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(route, CompletionRoute::Suspended);
+        assert!(entry.take_handoff_receipt().is_none());
+    }
+    assert_eq!(
+        fixture.zone.record(fixture.record.id).handback(),
+        Some(carrick_sched_core::Handback::Signal),
+        "post-enrolment interrupt probe must wake the parked poll with Handback::Signal"
+    );
+    assert!(
+        fixture
+            .zone
+            .record(fixture.record.id)
+            .has_adapter_operation(),
+        "adapter operation token remains attached until the retried poll consumes Handback::Signal"
+    );
+    fixture
+        .task
+        .linux
+        .take_host_work_doorbell()
+        .expect("post-enrolment interrupt probe must raise the host-work doorbell")
+        .settled();
+    let mut handed_back = Vec::new();
+    fixture
+        .zone
+        .take_completion_handbacks(&carrick_sched_core::ShortLockSpin, &mut |record| {
+            assert!(fixture.zone.place_native_handback(record).is_some());
+            handed_back.push(record);
+        });
+    assert_eq!(handed_back, [fixture.record]);
+
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot)
+        .expect("post-enrolment signal wake must requeue the parked poll record");
+    assert_eq!(selected.record, fixture.record.id);
+
+    // 3. On resume_checkpoint (RetrySyscall), the adapter token is still attached,
+    // so matches_signal_return is false and deliver_signal_on_syscall_return is a no-op.
+    take_signal_copies();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::RetrySyscall)
+        ));
+        assert!(
+            fixture
+                .zone
+                .record(fixture.record.id)
+                .has_adapter_operation()
+        );
+        assert!(
+            !entry.matches_signal_return(fixture.task, fixture.control),
+            "matches_signal_return must refuse signal delivery while the adapter operation token is attached"
+        );
+        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+        let mut machine = HostArmSignalMachine {
+            backend: HostArmBackend,
+        };
+        assert_eq!(
+            crate::signal_delivery::deliver_signal_on_syscall_return(
+                fixture.task,
+                fixture.control,
+                &mut entry,
+                &mut frame.0,
+                fp.as_bytes(),
+                &mut machine,
+            ),
+            None
+        );
+        assert_eq!(
+            frame.0.elr, 0x4004,
+            "handler must not run before the retried poll retires its adapter token"
+        );
+        assert!(take_signal_copies().is_empty());
+        assert!(entry.signal_checkpoint_needed());
+
+        // 4. Retried poll consumes Handback::Signal, retires the adapter token,
+        // and completes with -EINTR (-4).
+        let route = crate::dispatch::dispatch_syscall_with_native::<
+            _,
+            crate::sched::FakeCpu,
+            crate::sched::HardwareUserWord,
+            _,
+            carrick_sched_core::ParkedContextWords,
+        >(
+            &mut frame,
+            &carrick_el1_abi::Counters::new(),
+            core::slice::from_ref(fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &carrick_el1_abi::InotifyNameCache::new(),
+            None,
+            Some(&venue),
+            None,
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(route, CompletionRoute::Served);
+        assert_eq!(frame.0.x[0] as i64, -4);
+        assert!(
+            !fixture
+                .zone
+                .record(fixture.record.id)
+                .has_object_operation()
+        );
+        assert!(
+            !fixture
+                .zone
+                .record(fixture.record.id)
+                .has_adapter_operation(),
+            "retried poll must retire the adapter operation token on EINTR"
+        );
+        assert!(
+            entry.matches_signal_return(fixture.task, fixture.control),
+            "matches_signal_return must allow signal delivery once the adapter token is retired"
+        );
+
+        // 5. Signal checkpoint on syscall return now runs the handler exactly once.
+        assert_eq!(
+            crate::signal_delivery::deliver_signal_on_syscall_return(
+                fixture.task,
+                fixture.control,
+                &mut entry,
+                &mut frame.0,
+                fp.as_bytes(),
+                &mut machine,
+            ),
+            None
+        );
+        assert_eq!(frame.0.elr, 0x7000);
+        assert_eq!(frame.0.x[0], 2);
+        assert_eq!(frame.0.x[30], 0x8000);
+        let copies = take_signal_copies();
+        assert_eq!(copies.len(), 1);
+        assert!(!entry.signal_checkpoint_needed());
+        assert!(!fixture.registry_signal_checkpoint_needed());
+
+        // A second checkpoint does not deliver again.
+        assert_eq!(
+            crate::signal_delivery::deliver_signal_on_syscall_return(
+                fixture.task,
+                fixture.control,
+                &mut entry,
+                &mut frame.0,
+                fp.as_bytes(),
+                &mut machine,
+            ),
+            None
+        );
+        assert!(take_signal_copies().is_empty());
+    }
+
+    assert_eq!(
+        pollfd_buf.get::<PollFd>(0).revents,
+        0x5a5a,
+        "EINTR must not overwrite revents"
+    );
+    assert!(
+        host.region()
+            .fd(carrick_sched_core::ShortLockSpin)
+            .close(table.id(), fd::Fd(3))
+            .unwrap()
+            .is_some(),
+        "retiring the adapter token must release the pinned reader description"
+    );
+}
