@@ -28,86 +28,224 @@ use carrick_el1_abi::{
 /// which its executor always resumes to completion.
 pub struct HostLockWait;
 
+/// A carrier-scoped zone (the x86 CPL0 zone in its carrier's guest RAM).
+pub type CarrierZone =
+    std::sync::Arc<dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>>;
+type CarrierZoneRef<'a> =
+    &'a dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>;
+
 /// Effects collected while an IPC object and its waiter queue are locked.
 /// Storage is uninitialized until a waiter is affected: no population scan,
 /// per-transfer heap allocation, or delivery while shared locks are held.
-pub(crate) struct ObjectWakeDelivery {
+///
+/// The process-global zone ([`zone`]) serves when present (ARM). Otherwise
+/// a host release reaches the carrier-scoped zone it was built for, if any
+/// (#2031: x86 exit-drain releases otherwise lost every zone wake).
+pub(crate) struct ObjectWakeDelivery<'a> {
     handed: [std::mem::MaybeUninit<RecordRef>; carrick_sched_core::ZONE_RECORDS],
     len: usize,
     slots: [u64; carrick_el1_abi::ZONE_SLOTS / 64],
+    carrier: Option<CarrierZoneRef<'a>>,
+    /// The venue that collected: `handed` and `slots` belong to it.
+    collected_in_carrier: bool,
 }
-impl ObjectWakeDelivery {
+impl<'a> ObjectWakeDelivery<'a> {
     pub(crate) fn new() -> Self {
+        Self::for_carrier(None)
+    }
+    pub(crate) fn for_carrier(carrier: Option<CarrierZoneRef<'a>>) -> Self {
         Self {
             handed: [const { std::mem::MaybeUninit::uninit() }; carrick_sched_core::ZONE_RECORDS],
             len: 0,
             slots: [0; carrick_el1_abi::ZONE_SLOTS / 64],
+            carrier,
+            collected_in_carrier: false,
         }
     }
     pub(crate) fn collect(&mut self, wake: carrick_el1_abi::ipc::IpcWake) {
-        let Some(zone) = zone() else {
-            return;
-        };
-        // The object's own lanes, then the readable lane of every zone
-        // epoll the change queued an item on.
-        let lanes = [
-            (wake.readers, carrick_el1_abi::ipc::pipe::WaitFor::Readable),
-            (wake.writers, carrick_el1_abi::ipc::pipe::WaitFor::Writable),
-        ]
-        .into_iter()
-        .filter(|(active, _)| *active)
-        .map(|(_, direction)| (wake.object, direction))
-        .chain(
-            wake.epolls
-                .iter()
-                .map(|epoll| (epoll, carrick_el1_abi::ipc::pipe::WaitFor::Readable)),
-        );
-        for (object, direction) in lanes {
-            let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, direction) else {
-                continue;
-            };
-            let Ok(queue) = zone.object_wait(key, &HostLockWait, &|owned| {
-                crate::el1_zone::complete_object_wake(owned.zone(), owned)
-            }) else {
-                continue;
-            };
-            let Self { handed, len, slots } = self;
-            queue
-                .notify_object_host(
-                    &mut |record| {
-                        let Some(slot) = handed.get_mut(*len) else {
-                            carrick_fatal::carrick_fatal!(
-                                "ipc::wake",
-                                "duplicate object waiter delivery"
-                            );
-                        };
-                        slot.write(record);
-                        *len += 1;
-                    },
-                    &mut |placed| {
-                        if placed.resched {
-                            let index = usize::from(placed.slot.raw());
-                            slots[index / 64] |= 1 << (index % 64);
-                        }
-                    },
-                )
-                .unwrap_or_else(|_| {
-                    carrick_fatal::carrick_fatal!("ipc::wake", "object wake ownership failed")
-                });
+        let Self {
+            handed,
+            len,
+            slots,
+            carrier,
+            collected_in_carrier,
+        } = self;
+        if let Some(zone) = zone() {
+            collect_object_wake(
+                zone,
+                &HostLockWait,
+                &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
+                wake,
+                handed,
+                len,
+                slots,
+            );
+        } else if let Some(carrier) = *carrier {
+            *collected_in_carrier = true;
+            collect_object_wake(
+                carrier.zone(),
+                &CarrierLockWait(carrier),
+                &|owned| complete_carrier_object_wake(carrier, owned),
+                wake,
+                handed,
+                len,
+                slots,
+            );
         }
     }
     pub(crate) fn deliver(self) {
+        let carrier = self.carrier.filter(|_| self.collected_in_carrier);
         for record in &self.handed[..self.len] {
             // SAFETY: collect initialized precisely this prefix.
-            publish_handback(unsafe { record.assume_init() });
+            let record = unsafe { record.assume_init() };
+            match carrier {
+                Some(carrier) => hand_back_in_carrier(carrier, record),
+                None => publish_handback(record),
+            }
         }
         for (word, mut bits) in self.slots.into_iter().enumerate() {
             while bits != 0 {
                 let index = word * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 if let Some(slot) = SlotId::from_index(index) {
-                    resched_slot(slot);
+                    match carrier {
+                        Some(carrier) => carrier.resched(slot),
+                        None => resched_slot(slot),
+                    }
                 }
+            }
+        }
+    }
+}
+
+/// Notify the object's own lanes, then the readable lane of every zone
+/// epoll the change queued an item on, collecting into preallocated storage.
+fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    wait: &impl LockWait<C>,
+    completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
+    wake: carrick_el1_abi::ipc::IpcWake,
+    handed: &mut [std::mem::MaybeUninit<RecordRef>; carrick_sched_core::ZONE_RECORDS],
+    len: &mut usize,
+    slots: &mut [u64; carrick_el1_abi::ZONE_SLOTS / 64],
+) {
+    let lanes = [
+        (wake.readers, carrick_el1_abi::ipc::pipe::WaitFor::Readable),
+        (wake.writers, carrick_el1_abi::ipc::pipe::WaitFor::Writable),
+    ]
+    .into_iter()
+    .filter(|(active, _)| *active)
+    .map(|(_, direction)| (wake.object, direction))
+    .chain(
+        wake.epolls
+            .iter()
+            .map(|epoll| (epoll, carrick_el1_abi::ipc::pipe::WaitFor::Readable)),
+    );
+    for (object, direction) in lanes {
+        let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, direction) else {
+            continue;
+        };
+        let Ok(queue) = zone.object_wait(key, wait, completion) else {
+            continue;
+        };
+        queue
+            .notify_object_host(
+                &mut |record| {
+                    let Some(slot) = handed.get_mut(*len) else {
+                        carrick_fatal::carrick_fatal!(
+                            "ipc::wake",
+                            "duplicate object waiter delivery"
+                        );
+                    };
+                    slot.write(record);
+                    *len += 1;
+                },
+                &mut |placed| {
+                    if placed.resched {
+                        let index = usize::from(placed.slot.raw());
+                        slots[index / 64] |= 1 << (index % 64);
+                    }
+                },
+            )
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::wake", "object wake ownership failed")
+            });
+    }
+}
+
+/// A host thread waiting for a carrier zone's bucket lock. A holder that
+/// leaves completion effects to the waiter delivers them to the carrier.
+struct CarrierLockWait<'a>(CarrierZoneRef<'a>);
+
+impl LockWait<carrick_sched_core::ParkedContextWords> for CarrierLockWait<'_> {
+    fn complete_object_wake(
+        &self,
+        _: &carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >,
+    ) {
+        complete_carrier_object_wake(self.0, owned);
+    }
+
+    fn wait(&self, attempt: u32) -> bool {
+        <HostLockWait as LockWait>::wait(&HostLockWait, attempt)
+    }
+}
+
+/// [`complete_object_wake`] for a carrier zone, on a host thread: there is
+/// no stopped CPU to defer to, so completed records go straight back to
+/// their native ring owner ([`hand_back_in_carrier`]).
+fn complete_carrier_object_wake(
+    carrier: CarrierZoneRef<'_>,
+    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_sched_core::ParkedContextWords,
+    >,
+) {
+    let zone = owned.zone();
+    let (waker, effects) =
+        owned.deliver_handbacks(&mut |record| hand_back_in_carrier(carrier, record));
+    let own = match waker {
+        carrick_sched_core::Waker::El1 { slot } => Some(slot),
+        carrick_sched_core::Waker::Host => None,
+    };
+    for slot in effects
+        .sgi_slots()
+        .chain(own.filter(|_| effects.queued_own || effects.misplaced))
+    {
+        zone.owe_resched(slot);
+        carrier.resched(slot);
+    }
+}
+
+/// A record a carrier-zone wake handed to the host (no guest slot could
+/// take it: every eligible CPU was stopped, e.g. the one serving the exit
+/// whose drain woke it). A native thread has no host continuation, so its
+/// readiness completion is retained on its owner's queue, exactly like
+/// [`route_native_handback_in_zone`]; a stopped driver takes it on entry.
+fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
+    let zone = carrier.zone();
+    let Some(rec) = zone.live(record) else {
+        // Retired between publication and handback: its owner settled it.
+        return;
+    };
+    let Some(placement) = zone.place_native_handback(record) else {
+        carrick_fatal::carrick_fatal!(
+            "ipc::wake",
+            "carrier zone handed back a record without native custody"
+        );
+    };
+    if placement.resched {
+        carrier.resched(placement.slot);
+    }
+    if !zone.slot(placement.slot).is_live() && rec.home().is_none() {
+        for index in 0..carrick_sched_core::ZONE_SLOTS {
+            let slot = SlotId::new(index as u8);
+            if zone.slot(slot).is_live() && zone.record_allows_slot(record.id, slot) {
+                zone.owe_resched(slot);
+                carrier.resched(slot);
             }
         }
     }
@@ -145,7 +283,9 @@ impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
         };
         let mut delivery = ObjectWakeDelivery::new();
         publish();
-        let ObjectWakeDelivery { handed, len, slots } = &mut delivery;
+        let ObjectWakeDelivery {
+            handed, len, slots, ..
+        } = &mut delivery;
         queue
             .notify_object_host(
                 &mut |record| {

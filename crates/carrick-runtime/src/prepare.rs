@@ -317,6 +317,16 @@ fn run_prepared_kvm_pool_with_debug(
     use carrick_hal::threaded::GuestCpuState;
     use carrick_kernel::kernel::objects::MigratableTaskState;
     use carrick_kernel::kernel::scheduler::{CpuAffinity, GuestCpuId, GuestCpuPolicy};
+    // Host IPC releases (exit drains) wake tasks parked in this carrier's
+    // zone, which lives in its guest RAM rather than a process-global table.
+    root_context
+        .kernel()
+        .ipc()
+        .map_err(|error| RuntimeError::Configuration(format!("x86 IPC authority: {error:?}")))?
+        .bind_carrier_zone(machine.carrier_zone_wake()?)
+        .map_err(|_| {
+            RuntimeError::Configuration("x86 IPC authority already bound a carrier zone".into())
+        })?;
     let parts = machine.into_worker_parts(max_traps)?;
     let (root_cpu, physical) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let physical = Arc::new(physical);
