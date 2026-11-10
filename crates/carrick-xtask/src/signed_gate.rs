@@ -55,7 +55,7 @@ pub enum SignedGateAction {
         wait_minutes: u64,
     },
     /// Run the merge base and the candidate on macOS, each in a new detached
-    /// worktree, under one exclusive host lease and one fixture bundle.
+    /// worktree, with one fixture bundle; gate only for restoration and guests.
     Execute {
         #[arg(long)]
         request: PathBuf,
@@ -818,12 +818,28 @@ pub fn validate_receipt(receipt: &AcceptReceipt, expected: &str) -> Result<(), R
     Ok(())
 }
 
-fn logged(command: &mut Command, lease: &HostLease, log: &Path) -> Result<bool, ReceiptError> {
+/// Run one executor step with its output in `log`. `Some(lease)` runs it
+/// inside that scoped lease; `None` runs a step that admits itself (#2013:
+/// `just build` and `accept` take carrick to build and gate to execute, and
+/// gate cannot nest under an outer shared lease).
+fn logged(
+    command: &mut Command,
+    lease: Option<&HostLease>,
+    log: &Path,
+) -> Result<bool, ReceiptError> {
     let stdout = fs::File::create(log).map_err(|e| fail(e.to_string()))?;
     let stderr = stdout.try_clone().map_err(|e| fail(e.to_string()))?;
-    lease
-        .configure_command(command)
-        .map_err(|e| fail(e.to_string()))?;
+    match lease {
+        Some(lease) => lease
+            .configure_command(command)
+            .map_err(|e| fail(e.to_string()))?,
+        None => {
+            command
+                .env_remove("CARRICK_HOST_LEASE_SOCKET")
+                .env_remove(crate::signed_phase::PHASE_ENV)
+                .env_remove(crate::signed_phase::STATE_ENV);
+        }
+    }
     let status = command
         .stdin(Stdio::null())
         .stdout(stdout)
@@ -1054,8 +1070,10 @@ pub struct PairedRun {
 }
 
 /// Run the merge base (unless this is a main baseline) and then the candidate
-/// on this Mac, under one exclusive host lease and with the merge base's
-/// trusted fixture bundle. Publication compares the candidate only with this paired
+/// on this Mac with the merge base's trusted fixture bundle. No lease spans
+/// the pair: each step takes the lease its work needs (#2013), so builds
+/// share the Mac and only guest execution and fixture restoration are
+/// exclusive. Publication compares the candidate only with this paired
 /// base, so host or fixture differences cannot surface as NEW failures (#1884).
 fn execute(
     root: &Path,
@@ -1073,21 +1091,13 @@ fn execute(
     fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
     let output = fs::canonicalize(output).map_err(|e| fail(e.to_string()))?;
     let bundle = fs::canonicalize(bundle).map_err(|e| fail(e.to_string()))?;
-    let lease = (|| {
-        crate::host_load::check().map_err(|e| fail(e.to_string()))?;
-        HostLease::acquire(HostLeaseMode::Gate).map_err(|e| fail(e.to_string()))
-    })();
-    let lease = match lease {
-        Ok(lease) => lease,
-        Err(error) => {
-            write(&output.join("execution-error.txt"), error.to_string())?;
-            return Err(error);
-        }
-    };
+    if let Err(error) = crate::host_load::check().map_err(|e| fail(e.to_string())) {
+        write(&output.join("execution-error.txt"), error.to_string())?;
+        return Err(error);
+    }
     execute_pair(&request, &output, |run| {
         execute_one(
             root,
-            &lease,
             &run.commit,
             &run.fixture_publisher,
             &bundle,
@@ -1099,7 +1109,7 @@ fn execute(
 
 /// The pairing itself: the base (unless this is a main baseline) and then the
 /// candidate, each handed to `run`, which builds, accepts and inspects one
-/// commit. `execute` supplies the real runner under one exclusive lease.
+/// commit. `execute` supplies the real runner, which takes per-step leases.
 /// Any error is recorded in `execution-error.txt` for publication.
 pub fn execute_pair(
     request: &Request,
@@ -1271,10 +1281,12 @@ fn write_fresh(path: &Path, data: impl AsRef<[u8]>) -> Result<(), ReceiptError> 
 }
 
 /// Build, accept and independently inspect one commit in a fresh detached
-/// worktree. The caller holds the exclusive gate lease for the whole pair.
+/// worktree. Fixture fetch holds carrick and restoration gate; building the
+/// commit's xtask holds carrick; `just build` and `accept` admit themselves (carrick for
+/// their builds, gate for guest execution); the independent reap and
+/// inspection hold carrick. No two leases are ever held at once (#2013).
 fn execute_one(
     root: &Path,
-    lease: &HostLease,
     commit: &str,
     publisher: &str,
     bundle: &Path,
@@ -1302,16 +1314,24 @@ fn execute_one(
     // repository's physical path for exact artifact-path comparisons.
     let tree = fs::canonicalize(&tree).map_err(|e| fail(e.to_string()))?;
     let receipt_path = output.join(receipt_name);
+    let lease = |mode| HostLease::acquire(mode).map_err(|e| fail(e.to_string()));
     let result = (|| {
         let xtask = std::env::current_exe().map_err(|e| fail(e.to_string()))?;
+        let fetch_lease = lease(HostLeaseMode::Carrick)?;
         let mut fetch = Command::new(&xtask);
         fetch
             .current_dir(&tree)
             .args(["--root", &tree.to_string_lossy(), "fixtures", "fetch"]);
-        if !logged(&mut fetch, lease, &output.join("fixture-fetch.log"))? {
+        if !logged(
+            &mut fetch,
+            Some(&fetch_lease),
+            &output.join("fixture-fetch.log"),
+        )? {
             return Err(fail("fixture dependency fetch failed"));
         }
+        drop(fetch_lease);
         verify_fixture_artifact(&tree, bundle, commit, publisher)?;
+        let restore_lease = lease(HostLeaseMode::Gate)?;
         let mut restore = Command::new(&xtask);
         restore.current_dir(&tree).args([
             "--root",
@@ -1321,14 +1341,34 @@ fn execute_one(
             "--bundle",
             &bundle.to_string_lossy(),
         ]);
-        if !logged(&mut restore, lease, &output.join("fixture-restore.log"))? {
+        if !logged(
+            &mut restore,
+            Some(&restore_lease),
+            &output.join("fixture-restore.log"),
+        )? {
             return Err(fail(
                 "fixture restore failed for the authorized exact-SHA artifact",
             ));
         }
+        drop(restore_lease);
+        // Compile the commit's xtask under the shared lease, so `cargo run`
+        // below starts accept without compiling outside any admission.
+        let build_lease = lease(HostLeaseMode::Carrick)?;
+        let mut prebuild = crate::command::locked_cargo();
+        prebuild
+            .current_dir(&tree)
+            .args(["build", "--locked", "-p", "carrick-xtask"]);
+        if !logged(
+            &mut prebuild,
+            Some(&build_lease),
+            &output.join("xtask-build.log"),
+        )? {
+            return Err(fail("carrick-xtask build failed"));
+        }
+        drop(build_lease);
         let mut build = Command::new("just");
         build.current_dir(&tree).arg("build");
-        if !logged(&mut build, lease, &output.join("build.log"))? {
+        if !logged(&mut build, None, &output.join("build.log"))? {
             return Err(fail("just build failed"));
         }
         let mut accept = crate::command::locked_cargo();
@@ -1346,13 +1386,14 @@ fn execute_one(
             "--receipt",
             &receipt_path.to_string_lossy(),
         ]);
-        let accepted = logged(&mut accept, lease, &output.join("accept.log"))?;
+        let accepted = logged(&mut accept, None, &output.join("accept.log"))?;
         write(
             &output.join(ACCEPT_EXIT),
             json!({"success": accepted}).to_string(),
         )?;
-        // accept rebuilds once under the same lease before testing. Its receipt
-        // names that artifact; inspect it independently before releasing the lease.
+        // accept rebuilds once before testing. Its receipt names that artifact;
+        // inspect it independently. The detached worktree is this job's alone.
+        let inspect_lease = lease(HostLeaseMode::Carrick)?;
         let mut receipt = load(&receipt_path)?;
         // Capture on the execution Mac, including when the commit predates
         // host-aware accept receipts. Never infer identity on the hosted publisher.
@@ -1381,7 +1422,7 @@ fn execute_one(
             let log = output.join(format!("cleanup-{index}.log"));
             let mut reap = Command::new(tree.join("scripts/sudo/kill.sh"));
             reap.current_dir(&tree).arg(&count.run_id);
-            if !logged(&mut reap, lease, &log)?
+            if !logged(&mut reap, Some(&inspect_lease), &log)?
                 || parse_cleanup_count(&fs::read_to_string(&log).map_err(|e| fail(e.to_string()))?)
                     != Some(0)
             {
