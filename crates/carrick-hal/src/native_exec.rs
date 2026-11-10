@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use carrick_core_abi::service::{ExecCapabilityId, ServiceFailureCode, ServiceRequest};
 
-use crate::fork_stock::{HostBackingRetention, NativeHostFileRefused};
+use crate::fork_stock::{ExecutableIdentity, HostBackingRetention, NativeHostFileRefused};
 
 /// Counted ENOSYS for an exec request whose capability names no live service.
 pub const UNROUTED_EXEC: ServiceFailureCode = match ServiceFailureCode::new(38) {
@@ -32,17 +32,26 @@ pub trait NativeExecHostService<Plan: Send + 'static>:
     /// place. `Err` refuses the exact request
     /// (the ring answers counted ENOSYS); no reply may have been written. A
     /// private-mapping record returns the retained byte source, which the
-    /// carrier registers for the caller's MM before acknowledging.
+    /// carrier registers for the caller's MM before acknowledging. A
+    /// readlink record receives the caller MM's retained `executable`, or
+    /// `None` when that MM's custody holds none; the service then refuses
+    /// an executable-link lookup.
     fn serve_host_file(
         &self,
         request: ServiceRequest,
         record: &mut [u8],
+        executable: Option<Arc<dyn ExecutableIdentity>>,
     ) -> Result<Option<Arc<dyn HostBackingRetention>>, NativeHostFileRefused>;
 
     /// Serve the root fork seed crossing: write the host-served root's live
     /// cwd and root into `record` once ([`carrick_core_abi::service::RootForkSeed::serve`]).
     /// `false` refuses it; the fork then fails without a child.
     fn root_fork_seed(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool;
+
+    /// Retain the host-served root's current executable for the MM custody
+    /// of the child its fork is about to create. `None` when the root holds
+    /// no retained executable; the child's executable link is then refused.
+    fn root_executable_seed(&self) -> Option<Arc<dyn ExecutableIdentity>>;
 }
 
 /// Opaque fallibly prepared image. Exact carrier custody retains this result
@@ -57,6 +66,8 @@ pub struct NativeExecParts<Plan> {
     pub plan: Plan,
     pub lazy_regions: Vec<(u64, u64)>,
     pub sources: Vec<Arc<dyn HostBackingRetention>>,
+    /// The successor's executable, retained by its MM custody.
+    pub executable: Arc<dyn ExecutableIdentity>,
 }
 
 type RegisteredExecService<Plan> = (ExecCapabilityId, Arc<dyn NativeExecHostService<Plan>>);
@@ -131,7 +142,7 @@ impl<Plan: Send + 'static> NativeExecServiceDirectory<Plan> {
 
     /// The service a guest exec request names, or the counted ENOSYS a
     /// request receives when no live service holds that capability (for
-    /// example a fork child of a root whose image the host replaced). A
+    /// example a request that outlived its run's registration). A
     /// guest-selected capability is never carrier custody to fail on.
     pub fn resolve(
         &self,
@@ -199,8 +210,13 @@ mod native_exec_service_registration_tests {
             &self,
             _request: ServiceRequest,
             _record: &mut [u8],
+            _executable: Option<Arc<dyn ExecutableIdentity>>,
         ) -> Result<Option<Arc<dyn HostBackingRetention>>, NativeHostFileRefused> {
             Err(NativeHostFileRefused)
+        }
+
+        fn root_executable_seed(&self) -> Option<Arc<dyn ExecutableIdentity>> {
+            None
         }
 
         fn root_fork_seed(&self, _record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
@@ -208,9 +224,9 @@ mod native_exec_service_registration_tests {
         }
     }
 
-    /// #936: a native child of a post-exec root names the root's original
-    /// exec capability, which the host exec retired. The request must be a
-    /// counted ENOSYS (as on main), never a carrier custody fatal.
+    /// #936: a request naming a capability no live service holds (unknown,
+    /// or retired with its run) must be a counted ENOSYS, never a carrier
+    /// custody fatal.
     #[test]
     fn retired_or_unknown_exec_capability_is_a_counted_enosys() {
         let directory = Arc::new(NativeExecServiceDirectory::<()>::default());

@@ -90,10 +90,20 @@ pub struct NativeNamespace<'a> {
     pub releases: &'a mut dyn FnMut(&mut [host_file::MapSourceReply]) -> usize,
 }
 
+/// Signed Linux readlink buffer size, decoded from the syscall int argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadlinkSize(pub i32);
+
 /// A host-file call the native venue knows, decoded from canonical
 /// arguments. Pointers are still untrusted user addresses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostFileCall {
+    Readlinkat {
+        dirfd: carrick_fd_core::Fd,
+        path: carrick_guest_arch::UserVa,
+        buf: carrick_guest_arch::UserVa,
+        bufsiz: ReadlinkSize,
+    },
     Write {
         fd: i32,
         buf: u64,
@@ -324,6 +334,12 @@ impl HostFileCall {
         use crate::crossing::nr;
         let fd = args[0] as i32;
         Some(match canonical {
+            c if c == nr::READLINKAT => Self::Readlinkat {
+                dirfd: carrick_fd_core::Fd(args[0] as i32),
+                path: carrick_guest_arch::UserVa::new(args[1]),
+                buf: carrick_guest_arch::UserVa::new(args[2]),
+                bufsiz: ReadlinkSize(args[3] as i32),
+            },
             c if c == nr::WRITE => Self::Write {
                 fd,
                 buf: args[1],
@@ -975,6 +991,11 @@ pub fn stage(
     user: &mut dyn HostFileUser,
 ) -> Option<HostFileStage> {
     let staged = stage_call(call, namespace, user)?;
+    // readlink has no consumptive effect. Its reply length, not bufsiz,
+    // determines which pages the retained ring copyout must prepare.
+    if matches!(call, HostFileCall::Readlinkat { .. }) {
+        return Some(staged);
+    }
     if let HostFileStage::Request {
         output: Some(output),
         ..
@@ -1293,6 +1314,36 @@ fn stage_call(
                 [0; 4],
                 &path_pair(&old, &new),
                 None,
+            )
+        }
+        HostFileCall::Readlinkat {
+            dirfd,
+            path,
+            buf,
+            bufsiz,
+        } => {
+            // Linux takes an int, including on the 64-bit syscall ABI.
+            let size = bufsiz.0;
+            if size <= 0 {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            let path = match copy_path(user, path.raw()) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            if let Some(answer) = staging.path_base(dirfd.0, &path)? {
+                return Some(answer);
+            }
+            staging.request(
+                HostFileOp::Readlinkat,
+                LINUX_AT_FDCWD,
+                0,
+                [0; 4],
+                &path,
+                Some(HostFileOutput {
+                    address: buf.raw(),
+                    len: (size as usize).min(HOST_FILE_CHUNK_BYTES),
+                }),
             )
         }
         HostFileCall::Openat {
