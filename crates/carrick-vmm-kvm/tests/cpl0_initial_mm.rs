@@ -1923,20 +1923,17 @@ fn in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle() {
     assert!(outcome.run.stderr.is_empty());
 }
 
-/// #1877 on x86: the shared poll/select owner must park a blocked `ppoll`
-/// or `poll` on a not-ready zone pipe and wake it on another task's write.
-/// The child sleeps 50 ms, then writes one byte; the parent must return 1
-/// with `revents == POLLIN` and its `fd`/`events` intact, then reap the
-/// child. The same source runs natively first as the oracle. Exit codes
-/// name the failed stage (see `native_pipe_poll_wake.S`).
-///
-/// x86 does not reach #1877's retained zone poll owner: CPL0 dispatches
-/// without a `Zone` or ARM frame, so `ipc_poll_transfer` leaves the call
-/// unrouted. The writer-close variants pass on main and on #1880 alike
-/// and guard that path. The write variants are red on both: the child's
-/// `write` on a zone pipe has no x86 ring IPC venue (#1756) and is refused
-/// for lacking a host task context.
+/// #1877 / #2019 on x86: the shared poll/select owner must park a blocked
+/// `ppoll` or `poll` on a not-ready zone pipe and wake it when the last
+/// writer closes (or on a peer write once #1756 lands). The parent must
+/// return 1 with `revents == POLLHUP` (or `POLLIN`) and its `fd`/`events`
+/// intact, then reap the child. The same source runs natively first as the
+/// oracle. Exit codes name the failed stage (see `native_pipe_poll_wake.S`).
 fn zone_pipe_poll_wake(flags: &[&str]) {
+    zone_pipe_poll_wake_with_affinity(flags, ROOT_AFFINITY_IDLE_PEER);
+}
+
+fn zone_pipe_poll_wake_with_affinity(flags: &[&str], affinity: u64) {
     let elf = native_exit_fixture_with_flags("native_pipe_poll_wake.S", flags);
     let dir = tempfile::tempdir().expect("oracle directory");
     let oracle = dir.path().join("oracle");
@@ -1955,7 +1952,7 @@ fn zone_pipe_poll_wake(flags: &[&str]) {
         let _ = tx.send(try_run_pool_fixture_with_root_affinity(
             &elf,
             256,
-            ROOT_AFFINITY_IDLE_PEER,
+            affinity,
         ));
     });
     let outcome = rx
@@ -1989,6 +1986,25 @@ fn zone_pipe_ppoll_blocks_until_last_writer_closes() {
 #[test]
 fn zone_pipe_poll_blocks_until_last_writer_closes() {
     zone_pipe_poll_wake(&["-DUSE_POLL", "-DWAKE_BY_CLOSE"]);
+}
+
+/// Pinning parent and child to CPU 0 (`ROOT_AFFINITY_LOADED`) keeps the forked
+/// child queued behind the running parent until the parent parks in `ppoll`,
+/// deterministically forcing the parent-first interleaving without any sleep.
+#[test]
+fn zone_pipe_ppoll_loaded_affinity_parks_before_last_writer_closes() {
+    zone_pipe_poll_wake_with_affinity(
+        &["-DWAKE_BY_CLOSE", "-DNO_CHILD_SLEEP"],
+        ROOT_AFFINITY_LOADED,
+    );
+}
+
+#[test]
+fn zone_pipe_poll_loaded_affinity_parks_before_last_writer_closes() {
+    zone_pipe_poll_wake_with_affinity(
+        &["-DUSE_POLL", "-DWAKE_BY_CLOSE", "-DNO_CHILD_SLEEP"],
+        ROOT_AFFINITY_LOADED,
+    );
 }
 
 fn private_file_fixture(cow: bool) {
