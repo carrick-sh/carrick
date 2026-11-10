@@ -472,7 +472,7 @@ impl MultiSlotEnv {
         let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
         let saved_native = match self.fixture.zone.slot(slot).current() {
             // SAFETY: `slot` exclusively owns `current` while OnCpu.
-            Some(current) => unsafe { (*self.fixture.zone.record(current).ctx_mut()).native },
+            Some(current) => unsafe { self.fixture.zone.record(current).ctx_mut().native },
             None => ThreadCtx::ZERO,
         };
         let ttbr0 = cpu.ttbr.0;
@@ -511,8 +511,7 @@ impl MultiSlotEnv {
         page: &'static ThreadLifecyclePage,
         control: &'static ThreadControlSlot,
         cpu: &mut crate::sched::FakeCpu,
-        tgid: u32,
-        tid: u32,
+        (tgid, tid): (u32, u32),
         sig: u64,
     ) -> i64 {
         let counters = carrick_el1_abi::Counters::new();
@@ -1173,8 +1172,7 @@ fn arm_registered_queued_sibling_tgkill_control() {
             f.page,
             f.control,
             &mut h.root_cpu,
-            41,
-            44,
+            (41, 44),
             SIGUSR1_NUM
         ),
         0,
@@ -1237,8 +1235,7 @@ fn arm_native_owned_ring_born_tgkill_before_first_entry_queues_signal_once() {
             h.target_page,
             h.leader_control,
             &mut h.leader_cpu,
-            h.target_pid,
-            h.born_tid,
+            (h.target_pid, h.born_tid),
             SIGUSR1_NUM,
         ),
         0,
@@ -1298,7 +1295,7 @@ fn arm_native_owned_ring_born_tgkill_before_first_entry_queues_signal_once() {
 }
 
 #[test]
-#[ignore = "red on main: kill(nonleader) is #1994 (assert_eq! at born_thread_entry_tests.rs:1324)"]
+#[ignore = "red on main: kill(nonleader) is #1994 (assert_eq! at born_thread_entry_tests.rs:1320)"]
 fn arm_native_owned_ring_born_peer_kill_before_first_entry() {
     let mut h = setup_native_owned_ring_birth_before_first_entry();
     assert_eq!(
@@ -1307,8 +1304,7 @@ fn arm_native_owned_ring_born_peer_kill_before_first_entry() {
             h.target_page,
             h.leader_control,
             &mut h.leader_cpu,
-            h.target_pid,
-            h.born_tid,
+            (h.target_pid, h.born_tid),
             SIGUSR1_NUM,
         ),
         0
@@ -1354,8 +1350,7 @@ fn arm_root_ring_born_tgkill_before_first_entry_queues_signal_once() {
         f.page,
         f.control,
         &mut h.root_cpu,
-        41,
-        44,
+        (41, 44),
         SIGUSR1_NUM,
     );
     assert_eq!(
@@ -1422,7 +1417,7 @@ fn arm_root_ring_born_tgkill_before_first_entry_queues_signal_once() {
 }
 
 #[test]
-#[ignore = "red on main: host-issued first clone, paused slice 2 of #1974 (assert_eq! at born_thread_entry_tests.rs:1462)"]
+#[ignore = "red on main: host-issued first clone, paused slice 2 of #1974 (assert_eq! at born_thread_entry_tests.rs:1460)"]
 fn arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry() {
     let mut h = setup_arm_root_two_live_threads_and_peer();
     let f = h.env.fixture;
@@ -1451,8 +1446,7 @@ fn arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry() {
         f.page,
         f.control,
         &mut h.root_cpu,
-        41,
-        44,
+        (41, 44),
         SIGUSR1_NUM,
     );
     let peer_kill_rc = h.env.peer_kill(
@@ -1547,11 +1541,10 @@ fn register_arm_claim_free_birth(
                 })
                 .unwrap();
             process.lifecycle_admission_settled().unwrap();
-            assert_eq!(
-                process
+            assert!(
+                !process
                     .register_born_before_requeue_for_test(record)
-                    .unwrap(),
-                false
+                    .unwrap()
             );
             assert_eq!(
                 h.env.fixture.zone.record(record_id).claim(),
@@ -1598,8 +1591,7 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
         h.target_page,
         h.sibling_control,
         &mut h.sibling_cpu,
-        h.target_pid,
-        unmasked_tid,
+        (h.target_pid, unmasked_tid),
         SIGUSR1_NUM,
     );
     assert_eq!(
@@ -1717,8 +1709,7 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
             h.target_page,
             h.sibling_control,
             &mut h.sibling_cpu,
-            h.target_pid,
-            unmasked_tid,
+            (h.target_pid, unmasked_tid),
             0,
         ),
         -3,
@@ -1741,8 +1732,7 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
             h.target_page,
             h.sibling_control,
             &mut h.sibling_cpu,
-            h.target_pid,
-            masked_tid,
+            (h.target_pid, masked_tid),
             SIGUSR1_NUM,
         ),
         0,
