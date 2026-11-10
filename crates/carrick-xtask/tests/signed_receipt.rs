@@ -2219,6 +2219,18 @@ else:
         self.write_side(&self.results(), "candidate.json", receipt, accepted);
     }
 
+    /// Description of the last `signed-gate` status the stub recorded.
+    fn status_description(&self) -> String {
+        let posts = std::fs::read_to_string(self.dir.path().join("posts.jsonl")).unwrap();
+        let last = posts
+            .lines()
+            .rev()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|post| post["endpoint"].as_str().unwrap().contains("/statuses/"))
+            .unwrap();
+        last["body"]["description"].as_str().unwrap().to_string()
+    }
+
     fn publish(&self) -> (bool, String) {
         let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .env(
@@ -2248,17 +2260,16 @@ else:
     }
 }
 
-/// Review P1 on #1889: an interrupted paired base must block before any
-/// comparison. Its killed binary would otherwise read as FIXED and let a
-/// complete candidate PASS. Completed known failures stay comparable.
+/// #2045: an incomplete paired base is advisory when the candidate completed
+/// (owner, 2026-11-10, #231). Completed known failures stay comparable.
 #[cfg(unix)]
 #[test]
-fn incomplete_paired_base_blocks_publication_but_known_failures_compare() {
+fn incomplete_paired_base_is_advisory_but_known_failures_compare() {
     let bench = PublishBench::new();
     let candidate = admitted(&bench.head);
     bench.write_candidate(&candidate, false);
 
-    // Completed base with the same itemized failures: differential PASS.
+    // (d) Completed base with the same itemized failures: differential PASS.
     let complete = admitted(&bench.base);
     bench.write_base(&complete, false);
     let (passed, body) = bench.publish();
@@ -2266,37 +2277,35 @@ fn incomplete_paired_base_blocks_publication_but_known_failures_compare() {
         passed,
         "completed known failures must stay comparable: {body}"
     );
+    assert!(!body.contains("paired base is incomplete"), "{body}");
+    assert!(
+        bench
+            .status_description()
+            .starts_with("No introduced failures"),
+        "{}",
+        bench.status_description()
+    );
 
-    // The reviewer's case: an unfinished base binary, complete candidate.
+    // An unfinished base binary, complete candidate: PASS with a warning.
     let mut unfinished = complete.clone();
     unfinished.steps[2].unfinished_binaries.push("embed".into());
     bench.write_base(&unfinished, false);
     let (passed, body) = bench.publish();
-    assert!(!passed, "unfinished base binary published PASS: {body}");
-    assert!(body.contains("paired base incomplete"), "{body}");
+    assert!(passed, "unfinished base binary blocked: {body}");
+    assert!(body.contains("paired base is incomplete"), "{body}");
+    assert!(body.contains("step el1-embed did not run"), "{body}");
 
-    // A base that never reported a step (NotRun) cannot be admitted either.
+    // A base that never reported a step (NotRun).
     let mut not_run = complete.clone();
     not_run.steps[3].passed = false;
     not_run.steps[3].exit_code = None;
     not_run.steps[3].failed_tests.clear();
     bench.write_base(&not_run, false);
     let (passed, body) = bench.publish();
-    assert!(!passed, "NotRun base step published PASS: {body}");
-    assert!(body.contains("paired base incomplete"), "{body}");
+    assert!(passed, "NotRun base step blocked: {body}");
+    assert!(body.contains("paired base is incomplete"), "{body}");
 
-    // Tests skipped after the binary budget expired are an interrupted run.
-    let mut interrupted = complete.clone();
-    interrupted.steps[4]
-        .not_run_tests
-        .push("probe::after_budget".into());
-    bench.write_base(&interrupted, false);
-    let (passed, body) = bench.publish();
-    assert!(!passed, "interrupted base published PASS: {body}");
-    assert!(body.contains("paired base incomplete"), "{body}");
-
-    // A failing acceptance exit with nothing completed to explain it is an
-    // infrastructure failure, even when every recorded step passed.
+    // A failing acceptance exit with nothing completed to explain it.
     let mut clean = complete.clone();
     for step in &mut clean.steps {
         step.passed = true;
@@ -2308,14 +2317,105 @@ fn incomplete_paired_base_blocks_publication_but_known_failures_compare() {
     bench.write_base(&clean, false);
     let (passed, body) = bench.publish();
     assert!(
-        !passed,
-        "unexplained base acceptance failure published PASS: {body}"
+        passed,
+        "unexplained base acceptance failure blocked: {body}"
     );
-    assert!(body.contains("paired base incomplete"), "{body}");
-    // Missing exit evidence is not success.
+    assert!(body.contains("infrastructure failure"), "{body}");
+
+    // Missing exit evidence is not success: still a refusal.
     std::fs::remove_file(bench.results().join("base/accept-exit.json")).unwrap();
     let (passed, body) = bench.publish();
     assert!(!passed, "missing base exit status published PASS: {body}");
+}
+
+/// (a) A base interrupted mid-EL1 with a clean candidate passes, and both the
+/// comment and the status description name the gap.
+#[cfg(unix)]
+#[test]
+fn base_interrupted_mid_el1_is_advisory_with_a_named_gap() {
+    let bench = PublishBench::new();
+    bench.write_candidate(&admitted(&bench.head), false);
+    let mut base = admitted(&bench.base);
+    base.steps[2].not_run_tests = (0..7).map(|i| format!("el1::unrun_{i}")).collect();
+    bench.write_base(&base, false);
+    let (passed, body) = bench.publish();
+    assert!(passed, "{body}");
+    assert!(
+        body.contains("step el1-embed interrupted before 7 test(s) ran"),
+        "{body}"
+    );
+    let description = bench.status_description();
+    assert!(description.len() <= 140, "{description}");
+    assert!(
+        description.contains("step el1-embed interrupted before 7 test(s) ran"),
+        "{description}"
+    );
+}
+
+/// (b) The same base gap plus a failure the candidate introduced still blocks.
+#[cfg(unix)]
+#[test]
+fn base_gap_does_not_excuse_an_introduced_candidate_failure() {
+    let bench = PublishBench::new();
+    let mut candidate = admitted(&bench.head);
+    candidate.steps[2]
+        .failed_tests
+        .push("introduced_regression".into());
+    bench.write_candidate(&candidate, false);
+    let mut base = admitted(&bench.base);
+    base.steps[2].not_run_tests = (0..7).map(|i| format!("el1::unrun_{i}")).collect();
+    bench.write_base(&base, false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "{body}");
+    assert!(body.contains("introduced_regression"), "{body}");
+}
+
+/// (c) A candidate interrupted mid-EL1 blocks even though the base is
+/// incomplete too, and even when the base is complete.
+#[cfg(unix)]
+#[test]
+fn candidate_interrupted_mid_el1_blocks_when_the_base_has_a_gap() {
+    let bench = PublishBench::new();
+    let mut candidate = admitted(&bench.head);
+    candidate.steps[2].not_run_tests = vec!["el1::cut_short".into()];
+    bench.write_candidate(&candidate, false);
+    let mut base = admitted(&bench.base);
+    base.steps[2].not_run_tests = (0..7).map(|i| format!("el1::unrun_{i}")).collect();
+    bench.write_base(&base, false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "candidate interruption passed: {body}");
+    assert!(body.contains("Candidate is incomplete"), "{body}");
+    assert!(
+        bench.status_description().contains("Candidate incomplete"),
+        "{}",
+        bench.status_description()
+    );
+}
+
+/// An incomplete base no longer stops the pairing before the candidate runs.
+#[test]
+fn execute_pair_still_runs_the_candidate_when_the_base_is_incomplete() {
+    use carrick_xtask::signed_gate::{Request, RequestKind, execute_pair};
+    let request = Request {
+        kind: RequestKind::PullRequest,
+        prs: vec![123],
+        sha: "b".repeat(40),
+        base: "a".repeat(40),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut ran = Vec::new();
+    execute_pair(&request, dir.path(), |run| {
+        ran.push(run.receipt_name);
+        let mut receipt = admitted(&run.commit);
+        if run.receipt_name == "base.json" {
+            receipt.steps[2].not_run_tests.push("el1::unrun".into());
+        }
+        write_run_evidence(&run.output, run.receipt_name, &receipt);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(ran, ["base.json", "candidate.json"]);
+    assert!(dir.path().join("base-seal.json").exists());
 }
 
 /// Digest inventory of every file under `dir`, computed independently of the

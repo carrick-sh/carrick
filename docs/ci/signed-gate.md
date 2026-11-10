@@ -26,7 +26,8 @@ candidate, on the same Mac in the same job and under the same exclusive
 `gate` lease. The receipts record the execution host and fixture content
 identity, and publication compares the candidate only with this paired base.
 A pair whose host or fixture evidence still differs is reported as
-**INCOMPARABLE BASE — BLOCKED**, never as NEW. No stored receipt from another
+**INCOMPARABLE BASE — BLOCKED**, never as NEW (an incomplete base is not
+that case; see below). No stored receipt from another
 run or host is downloaded.
 
 **Fixture authority comes from main, never from the candidate** (#1889).
@@ -60,13 +61,25 @@ also records `candidate_probes`: each added probe's name and source SHA-256
 records `equal`, `built` or `refused`. A refusal builds nothing, and the Mac
 reports the same input identity refusal on the PR as before.
 
-**An incomplete base blocks.** Completed tests with known failures stay
+**An incomplete base is advisory when the candidate completed** (owner,
+2026-11-10, #231, #2045). Completed tests with known failures stay
 comparable, because the gate is differential. A base step that did not run
 to completion (a killed or unfinished binary, a build failure, zero tests
 selected), tests skipped after the binary budget expired, or a failing
-acceptance exit that no completed failure explains is refused before any
-comparison, in the executor and again at publication. A missing base result
-can therefore never read as FIXED.
+acceptance exit that no completed failure explains is a base gap. The
+candidate still runs. A base gap never reads as FIXED, because the
+comparison classifies against what the base started. The gate then:
+
+- blocks on any failure the candidate introduced, and on any candidate-side
+  interruption, missing step or `not-run:` entry;
+- otherwise passes with a warning in the comment and the status description
+  that names the gap, for example `step el1-embed interrupted before 7
+  test(s) ran`.
+
+A candidate failure in a test the base never started counts as introduced.
+Host or fixture mismatch, an unreadable or unsealed base, missing exit
+evidence and cancellation stay blocking. When both sides complete, nothing
+changes.
 
 **The base evidence is sealed before candidate code runs.** Immediately after
 the base run the executor records a SHA-256 inventory of every file under
@@ -289,8 +302,7 @@ populations, disappeared completed binaries, probe diffs, cleanup counts and
 EL1 set differences are advisory: they appear under `ADVISORY=` in the comment
 and `diff.json` (`blocking` / `advisory`) and the status reads `PASS (advisory
 NEW only)`. The execution job must finish successfully and its receipt
-must pass admission, and the paired base must be complete and match its
-seal. Existing main test failures do not alone reject a PR.
+must pass admission, and the paired base must match its seal (a base gap is advisory, above). Existing main test failures do not alone reject a PR.
 
 Artifacts are `signed-request-<attempt>`, `signed-base-fixtures-<attempt>`
 (the trusted base bundle and its `provenance.json`), `signed-result-<attempt>`
