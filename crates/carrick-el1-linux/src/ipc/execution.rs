@@ -69,6 +69,154 @@ pub trait IpcExecution {
     fn hand_back(&mut self, frame: &mut Self::Frame, packed_token: u64);
 }
 
+/// Scheduler-source-backed [`IpcExecution`] for venues whose context is not
+/// ARM's [`Sched`] (such as x86 CPL0's [`carrick_el1_abi::BornInZoneSource`]
+/// with [`carrick_sched_core::ParkedContextWords`]).
+pub struct NativeIpcExecution<'a, G, Z: EntryContext> {
+    pub source: carrick_el1_abi::BornInZoneSource<'a, Z>,
+    pub task: &'a CurrentTask,
+    pub counters: &'a Counters,
+    pub handoff: &'a mut Option<carrick_el1_abi::EntryHandoffReceipt<Z>>,
+    pub frame: core::marker::PhantomData<fn(&mut G)>,
+}
+
+impl<G: GuestDispatchFrame, Z: EntryContext> IpcExecution for NativeIpcExecution<'_, G, Z> {
+    type Context = Z;
+    type Frame = G;
+    fn zone(&self) -> &ZoneTables<Self::Context> {
+        self.source.zone
+    }
+    fn slot(&self) -> SlotId {
+        self.source.slot
+    }
+    fn task(&self) -> &CurrentTask {
+        self.task
+    }
+    fn counters(&self) -> &Counters {
+        self.counters
+    }
+    fn now(&self) -> u64 {
+        0
+    }
+    fn ticks(&self, _ns: u64) -> u64 {
+        0
+    }
+    fn take_object_operation(&self) -> Result<Option<OperationToken>, ObjectWaitError> {
+        let Some(record) = self
+            .source
+            .zone
+            .slot(self.source.slot)
+            .current()
+            .or_else(|| self.source.zone.slot(self.source.slot).host_record())
+        else {
+            return Ok(None);
+        };
+        let affinity = self.source.zone.record(record).identity().affinity;
+        carrick_core::wait::take_object_operation(
+            self.source.zone,
+            self.source.slot,
+            crate::sched::identity_of(self.task, affinity),
+        )
+    }
+    fn observe_object(&self, key: ObjectWaitKey) -> Result<ObjectWaitSnapshot, ObjectWaitError> {
+        let zone = self.source.zone;
+        let slot = self.source.slot;
+        let completion =
+            |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Z>| {
+                crate::sched::object_wait::deliver_completion(zone, slot, effects)
+            };
+        carrick_core::wait::observe_object(zone, slot, key, &completion)
+    }
+    fn notify_object(
+        &self,
+        key: ObjectWaitKey,
+    ) -> Result<(ObjectWakeReport, WakeEffects), ObjectWaitError> {
+        let zone = self.source.zone;
+        let slot = self.source.slot;
+        carrick_core::wait::notify_object(zone, slot, key, &|owned| {
+            crate::sched::object_wait::deliver_completion(owned.zone(), slot, owned)
+        })
+    }
+    fn finish_object_wake(&mut self, effects: WakeEffects) {
+        crate::sched::object_wait::deliver_wake_effects(
+            self.source.zone,
+            self.source.slot,
+            effects,
+        );
+    }
+    fn may_time_park(&self) -> bool {
+        false
+    }
+    fn object_wait_expired(&self) -> bool {
+        carrick_core::wait::object_wait_expired(self.source.zone, self.source.slot)
+    }
+    fn park(
+        &mut self,
+        frame: &mut Self::Frame,
+        key: ObjectWaitKey,
+        snapshot: ObjectStateSnapshot,
+        operation: OperationToken,
+        deadline: Option<u64>,
+        interrupt: Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<IpcServed, (ObjectWaitError, OperationToken)> {
+        let Some(_resume) = frame.operation_resume_pc() else {
+            return Err((ObjectWaitError::Stale, operation));
+        };
+        let zone = self.source.zone;
+        let slot = self.source.slot;
+        let completion =
+            |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Z>| {
+                crate::sched::object_wait::deliver_completion(zone, slot, effects)
+            };
+        let request = carrick_core::wait::ObjectParkRequest::from_locked_snapshot(
+            key, snapshot, operation, deadline,
+        );
+        let mut parked =
+            carrick_core::wait::park_object_record(zone, slot, request, &completion, || {
+                let record = zone
+                    .slot(slot)
+                    .current()
+                    .or_else(|| zone.slot(slot).host_record())
+                    .ok_or(ObjectWaitError::Stale)?;
+                Ok((record, false))
+            })?;
+        if !parked.matches(zone, slot) {
+            return Ok(IpcServed::Idle);
+        }
+        *self.handoff = parked.take_receipt();
+        if interrupt.is_some_and(|interrupt| interrupt()) {
+            self.task.linux.mark_pending_host_work();
+        }
+        Ok(IpcServed::Idle)
+    }
+    fn park_owner(
+        &mut self,
+        frame: &mut Self::Frame,
+        wait: carrick_core_abi::PortalOwnerWait,
+        operation: OperationToken,
+    ) -> Result<IpcServed, (ObjectWaitError, OperationToken)> {
+        let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
+            self.source.zone,
+            wait.handle(),
+            wait,
+        )
+        .unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
+        IpcExecution::park(
+            self,
+            frame,
+            enrollment.key(),
+            enrollment.observed_snapshot(),
+            operation,
+            None,
+            None,
+        )
+    }
+    fn mark_restart(&mut self, _frame: &mut Self::Frame, _original_argument: u64) {}
+    fn hand_back(&mut self, _frame: &mut Self::Frame, _packed_token: u64) {}
+}
+
 impl<C: ThreadCpu, U: UserWord> IpcExecution for Sched<'_, C, U> {
     type Context = carrick_el1_abi::Aarch64ParkedContext;
     type Frame = TrapFrame;

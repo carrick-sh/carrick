@@ -4625,6 +4625,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     ) -> bool {
         self.binding == crate::common_entry::execution_binding(task)
             && core::ptr::eq(self.control, control)
+            && !self
+                .source
+                .zone
+                .record(self.record.id)
+                .has_adapter_operation()
     }
 
     /// Record an actual refusal by this signal owner. Final return consumes
@@ -8489,6 +8494,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     }
     fn take_handoff_receipt(&mut self) -> Option<EntryHandoffReceipt<C>> {
         self.handoff.take()
+    }
+    fn store_handoff_receipt(&mut self, receipt: EntryHandoffReceipt<C>) {
+        self.handoff = Some(receipt);
+    }
+    fn prepare_object_park(&mut self) {
+        // SAFETY: this admitted lane exclusively owns `self.record.id` in `OnCpu`
+        // before an object-wait park can publish it to a wait queue.
+        unsafe {
+            *self.source.zone.record(self.record.id).ctx_mut() = *self.words;
+        }
     }
     fn fork(&mut self, mut child_tid: ProcessForkChildTid) -> LifecycleOutcome {
         // A suspended parent is woken by the child's in-ring release, which

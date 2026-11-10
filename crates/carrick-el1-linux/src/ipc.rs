@@ -41,6 +41,8 @@ use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{
     PrefixCopy, StepStatus, from_sched_token, to_sched_token, wait_key,
 };
+#[cfg(test)]
+use carrick_el1_abi::TrapFrame;
 pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
@@ -50,7 +52,7 @@ use carrick_el1_abi::ipc::{
     RawOfdPin, RawTableId, WriteProgress,
 };
 use carrick_el1_abi::ipc_tables::IpcTableMap;
-use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave, TrapFrame};
+use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave};
 use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitError, OperationToken};
 use carrick_sched_core::{LockWait, ShortLockSpin, WakeEffects};
 use core::sync::atomic::Ordering;
@@ -73,7 +75,7 @@ pub use linux::{SYS_READ, SYS_WRITE};
 mod epoll;
 pub use epoll::SYS_EPOLL_PWAIT;
 mod execution;
-pub use execution::IpcExecution;
+pub use execution::{IpcExecution, NativeIpcExecution};
 
 /// One Linux syscall argument word from the shared frame.
 fn argument_word(frame: &impl GuestDispatchFrame, index: usize) -> u64 {
@@ -593,28 +595,36 @@ pub(crate) struct PollOutput {
     pub result: i64,
 }
 
-/// Serve the blocking, one-description zone subset of AArch64 `ppoll`.
+/// Serve the blocking, one-description zone subset of `poll(2)` / `ppoll(2)`.
 ///
 /// The shared dispatcher handles immediate, host and mixed sets. This owner
 /// exists for the case the host cannot observe: an inherited zone object that
 /// is not ready yet. It retains the exact pollfd bytes, description pin and
 /// absolute deadline in the same operation arena as pipe and epoll waits.
-pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+pub(crate) fn serve_single_zone_ppoll<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     output: &mut Option<PollOutput>,
 ) -> IpcServed {
+    use crate::dispatch::PollTimeoutKind;
     use crate::file_table::{LINUX_POLLERR, LINUX_POLLHUP, PollFd};
     use carrick_el1_abi::ipc::epoll::EpollMember;
 
     const POLLFD_BYTES: usize = core::mem::size_of::<PollFd>();
-    const SYS_PPOLL: u64 = 73;
 
-    if frame.x[8] != SYS_PPOLL || frame.x[1] != 1 || frame.x[3] != 0 {
+    let timeout_kind = frame.poll_timeout_kind();
+    let mask_arg = match timeout_kind {
+        PollTimeoutKind::Timespec => argument_word(frame, 3),
+        PollTimeoutKind::Milliseconds => 0,
+    };
+    if !frame.may_serve_poll() || argument_word(frame, 1) != 1 || mask_arg != 0 {
         return IpcServed::Forward;
     }
+    let syscall_nr = frame.native_number().raw() as u32;
+    let fds_va = argument_word(frame, 0);
+    let timeout_arg = argument_word(frame, 2);
 
     let region = &venue.region;
     let resumed = match sched.take_object_operation() {
@@ -627,9 +637,9 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 return IpcServed::Forward;
             };
             if op.kind != IpcOpKind::PollWait
-                || op.task != task_key(sched.task)
-                || op.mm != mm_key(sched.task)
-                || op.nr != SYS_PPOLL as u32
+                || op.task != task_key(sched.task())
+                || op.mm != mm_key(sched.task())
+                || op.nr != syscall_nr
             {
                 retain_native_operation(sched, token);
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
@@ -641,14 +651,17 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 revents: i16::from_ne_bytes(raw[6..].try_into().unwrap_or_default()),
             };
             let reason = sched
-                .zone
-                .slot(sched.slot)
+                .zone()
+                .slot(sched.slot())
                 .current()
-                .and_then(|id| sched.zone.record(id).handback());
+                .and_then(|id| sched.zone().record(id).handback());
             if reason == Some(carrick_sched_core::Handback::Signal) && user.interrupt_pending_wait()
             {
                 finish(sched, token, region);
-                frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+                set_result(
+                    frame,
+                    carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+                );
                 return IpcServed::Returned { switched: false };
             }
             Some((pollfd, op.deadline, token, op))
@@ -664,36 +677,60 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
         let bytes = unsafe {
             core::slice::from_raw_parts_mut((&raw mut pollfd).cast::<u8>(), POLLFD_BYTES)
         };
-        if !user.copy_in(bytes, frame.x[0]) {
+        if !user.copy_in(bytes, fds_va) {
             return IpcServed::Forward;
         }
-        let deadline = if frame.x[2] == 0 {
-            carrick_el1_abi::ipc::IpcCounterDeadline::NONE
-        } else {
-            let mut timeout = [0u8; 16];
-            if !user.copy_in(&mut timeout, frame.x[2]) {
-                return IpcServed::Forward;
+        let deadline = match timeout_kind {
+            PollTimeoutKind::Milliseconds => {
+                let timeout_ms = timeout_arg as i32;
+                if timeout_ms < 0 {
+                    carrick_el1_abi::ipc::IpcCounterDeadline::NONE
+                } else if timeout_ms == 0 {
+                    carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.now())
+                } else {
+                    let duration = u64::try_from(timeout_ms)
+                        .unwrap_or(0)
+                        .saturating_mul(1_000_000);
+                    carrick_el1_abi::ipc::IpcCounterDeadline::at(
+                        sched
+                            .now()
+                            .saturating_add(sched.ticks(duration))
+                            .saturating_add(1),
+                    )
+                }
             }
-            let seconds = i64::from_ne_bytes(timeout[..8].try_into().unwrap_or_default());
-            let nanos = i64::from_ne_bytes(timeout[8..].try_into().unwrap_or_default());
-            if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
-                frame.x[0] = carrick_syscall_abi::LINUX_EINVAL.guest_retval() as u64;
-                return IpcServed::Returned { switched: false };
-            }
-            let duration = u64::try_from(seconds)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(1_000_000_000)
-                .saturating_add(nanos as u64);
-            if duration == 0 {
-                carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.cpu.now())
-            } else {
-                carrick_el1_abi::ipc::IpcCounterDeadline::at(
-                    sched
-                        .cpu
-                        .now()
-                        .saturating_add(sched.ticks(duration))
-                        .saturating_add(1),
-                )
+            PollTimeoutKind::Timespec => {
+                if timeout_arg == 0 {
+                    carrick_el1_abi::ipc::IpcCounterDeadline::NONE
+                } else {
+                    let mut timeout = [0u8; 16];
+                    if !user.copy_in(&mut timeout, timeout_arg) {
+                        return IpcServed::Forward;
+                    }
+                    let seconds = i64::from_ne_bytes(timeout[..8].try_into().unwrap_or_default());
+                    let nanos = i64::from_ne_bytes(timeout[8..].try_into().unwrap_or_default());
+                    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+                        set_result(
+                            frame,
+                            carrick_syscall_abi::LINUX_EINVAL.guest_retval() as u64,
+                        );
+                        return IpcServed::Returned { switched: false };
+                    }
+                    let duration = u64::try_from(seconds)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(nanos as u64);
+                    if duration == 0 {
+                        carrick_el1_abi::ipc::IpcCounterDeadline::at(sched.now())
+                    } else {
+                        carrick_el1_abi::ipc::IpcCounterDeadline::at(
+                            sched
+                                .now()
+                                .saturating_add(sched.ticks(duration))
+                                .saturating_add(1),
+                        )
+                    }
+                }
             }
         };
         (pollfd, deadline, None)
@@ -705,7 +742,7 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
         return IpcServed::Forward;
     }
 
-    let Some(raw_table) = venue.tables.table_of(sched.task) else {
+    let Some(raw_table) = venue.tables.table_of(sched.task()) else {
         return IpcServed::Forward;
     };
     let table = TableId::from_raw(raw_table);
@@ -734,18 +771,18 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 Err(FdError::BadFd) => {
                     pollfd.revents = crate::file_table::LINUX_POLLNVAL;
                     *output = Some(PollOutput {
-                        address: IpcUserVa(frame.x[0]),
+                        address: IpcUserVa(fds_va),
                         pollfd,
                         result: 1,
                     });
-                    frame.x[0] = 1;
+                    set_result(frame, 1);
                     return IpcServed::Returned { switched: false };
                 }
                 Err(FdError::PinRaced(raw)) => {
                     let op = IpcOperation {
                         pin: raw,
-                        task: task_key(sched.task),
-                        mm: mm_key(sched.task),
+                        task: task_key(sched.task()),
+                        mm: mm_key(sched.task()),
                         ..IpcOperation::EMPTY
                     };
                     let Ok(token) = region.begin_operation(op) else {
@@ -809,10 +846,10 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
             return IpcServed::Forward;
         };
         pollfd.revents = level as i16 & (pollfd.events | LINUX_POLLERR | LINUX_POLLHUP);
-        if pollfd.revents != 0 || deadline.get().is_some_and(|end| sched.cpu.now() >= end) {
+        if pollfd.revents != 0 || deadline.get().is_some_and(|end| sched.now() >= end) {
             drop(guard);
             *output = Some(PollOutput {
-                address: IpcUserVa(frame.x[0]),
+                address: IpcUserVa(fds_va),
                 pollfd,
                 result: i64::from(pollfd.revents != 0),
             });
@@ -821,7 +858,7 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
             } else if let Some(pin) = fresh_pin {
                 release_pin(sched, pin, region);
             }
-            frame.x[0] = u64::from(pollfd.revents != 0);
+            set_result(frame, u64::from(pollfd.revents != 0));
             return IpcServed::Returned { switched: false };
         }
         let Some(snap) = snapshot(sched, object, lane) else {
@@ -851,12 +888,12 @@ pub(crate) fn serve_single_zone_ppoll<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 kind: IpcOpKind::PollWait,
                 pin: fresh_pin.into_raw(),
                 object: object.to_raw(),
-                task: task_key(sched.task),
-                mm: mm_key(sched.task),
-                buf: IpcUserVa(frame.x[0]),
+                task: task_key(sched.task()),
+                mm: mm_key(sched.task()),
+                buf: IpcUserVa(fds_va),
                 value: carrick_el1_abi::ipc::IpcEventValue(u64::from_ne_bytes(raw)),
-                orig_x0: frame.x[0],
-                nr: SYS_PPOLL as u32,
+                orig_x0: fds_va,
+                nr: syscall_nr,
                 deadline,
                 ..IpcOperation::EMPTY
             };
@@ -1844,7 +1881,7 @@ fn finish<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<
 
 /// Retire the same IPC operation after refused backing preparation. The
 /// scheduler record authenticates its token; the arena authenticates its MM.
-pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
+pub fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     region: &IpcRegion<'_>,
     zone: &carrick_sched_core::ZoneTables<C>,
     slot: carrick_el1_abi::SlotId,
@@ -5447,9 +5484,11 @@ mod tests {
     }
     impl X86PollFrame {
         fn new(native: u64, args: [u64; 5]) -> Self {
-            let mut frame = TrapFrame::default();
+            let mut frame = TrapFrame {
+                elr: A_SVC,
+                ..Default::default()
+            };
             frame.x[..5].copy_from_slice(&args);
-            frame.elr = A_SVC;
             Self {
                 frame,
                 canonical: carrick_syscall_abi::nr::PPOLL,
@@ -5458,10 +5497,12 @@ mod tests {
             }
         }
         fn close(slot: SlotId, fd: i32) -> Self {
-            let mut frame = TrapFrame::default();
-            frame.slot = u64::from(slot.raw());
+            let mut frame = TrapFrame {
+                slot: u64::from(slot.raw()),
+                elr: B_SVC,
+                ..Default::default()
+            };
             frame.x[0] = fd as u64;
-            frame.elr = B_SVC;
             Self {
                 frame,
                 canonical: carrick_personality_linux::crossing::nr::CLOSE,
@@ -5749,14 +5790,14 @@ mod tests {
             ),
         ] {
             let w = world();
-            let layout =
-                Layout::new::<carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>>();
+            let layout = Layout::new::<
+                carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>,
+            >();
             // SAFETY: all-zero is a valid empty zone table.
-            let x86_zone: &carrick_sched_core::ZoneTables<
-                carrick_sched_core::ParkedContextWords,
-            > = unsafe {
+            let x86_zone: &carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords> = unsafe {
                 &*std::alloc::alloc_zeroed(layout)
-                    .cast::<carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>>()
+                    .cast::<carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>>(
+                    )
             };
             x86_zone
                 .bind_ipc_operation_slots(
@@ -5774,9 +5815,10 @@ mod tests {
                 .unwrap();
             x86_zone.spaces.open(mm_index);
             let peer_slot = SlotId::new(1);
+            let affinity = (1u64 << SLOT.raw()) | (1u64 << peer_slot.raw());
             for (slot, tid, serial) in [(SLOT, w.a_tid, 1101u64), (peer_slot, 202u64, 1202u64)] {
                 x86_zone.drive(slot, 1);
-                x86_zone.publish_slot(slot, MM, Some(u32::from(slot.raw())), 3);
+                x86_zone.publish_slot(slot, MM, Some(u32::from(slot.raw())), affinity);
                 let here = carrick_sched_core::ExecutionSlot::zone(slot);
                 x86_zone.occupancy.vacate_any(here);
                 assert!(x86_zone.occupancy.replace(here, 0, MM));
@@ -5789,7 +5831,7 @@ mod tests {
                         file_table: tid,
                         generation: 1,
                         affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
-                        affinity: 3,
+                        affinity,
                         lifecycle_page: 0,
                         control_slot: 0,
                     })
@@ -5812,6 +5854,91 @@ mod tests {
             w.map.publish_owned(w.a_tid, parent_table.to_raw()).unwrap();
             w.map.publish_owned(202, child_table.to_raw()).unwrap();
 
+            struct X86PollProcess<'a> {
+                task: &'a CurrentTask,
+                binding: carrick_el1_abi::ExecutionBinding,
+                handoff: Option<
+                    carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::ParkedContextWords>,
+                >,
+            }
+            impl
+                carrick_personality_linux::lifecycle::ProcessNative<
+                    '_,
+                    carrick_sched_core::ParkedContextWords,
+                > for X86PollProcess<'_>
+            {
+                fn is_root_process(&self) -> bool {
+                    true
+                }
+                fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+                    self.binding
+                }
+                fn complete_copyout(
+                    &mut self,
+                    address: carrick_guest_arch::UserVa,
+                    bytes: Vec<u8>,
+                    result: carrick_personality_linux::abi::entry::SyscallResult,
+                ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+                    let mut copy = crate::file::ValidatedCopy {
+                        task: self.task,
+                        validator: &crate::file::HardwareValidator,
+                    };
+                    let result =
+                        if crate::file::UserCopy::copy_out(&mut copy, address.raw(), &bytes) {
+                            result
+                        } else {
+                            carrick_personality_linux::abi::entry::SyscallResult::new(
+                                carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                            )
+                        };
+                    carrick_personality_linux::lifecycle::LifecycleOutcome::Returned {
+                        result,
+                        work: false,
+                    }
+                }
+                fn take_handoff_receipt(
+                    &mut self,
+                ) -> Option<
+                    carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::ParkedContextWords>,
+                > {
+                    self.handoff.take()
+                }
+                fn store_handoff_receipt(
+                    &mut self,
+                    receipt: carrick_el1_abi::EntryHandoffReceipt<
+                        carrick_sched_core::ParkedContextWords,
+                    >,
+                ) {
+                    self.handoff = Some(receipt);
+                }
+                fn wait_guest_copy(
+                    &mut self,
+                    _: carrick_core::user_copy::GuestCopyRequest,
+                ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+                    panic!("unexpected copy wait")
+                }
+                fn fork(
+                    &mut self,
+                    _: carrick_personality_linux::lifecycle::ProcessForkChildTid,
+                ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+                    panic!("unexpected fork")
+                }
+                fn wait4(
+                    &mut self,
+                    _: carrick_personality_linux::lifecycle::ProcessWaitPid,
+                    _: carrick_guest_arch::UserVa,
+                    _: carrick_personality_linux::lifecycle::LinuxWaitOptions,
+                    _: carrick_guest_arch::UserVa,
+                ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+                    panic!("unexpected wait4")
+                }
+                fn exit_group(
+                    &mut self,
+                    _: u8,
+                ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+                    panic!("unexpected exit_group")
+                }
+            }
             let tables = delegated();
             let venue = IpcVenue {
                 region: *w.region,
@@ -5826,7 +5953,15 @@ mod tests {
                 );
                 task.mm.key.store(MM, Ordering::Relaxed);
                 task.mm.thread_generation.store(serial, Ordering::Relaxed);
-                crate::dispatch::dispatch_syscall_with_native::<
+                let mut process = X86PollProcess {
+                    task: &task,
+                    binding: crate::common_entry::execution_binding(&task),
+                    handoff: None,
+                };
+                if x86_zone.slot(slot).state().is_idle() {
+                    x86_zone.leave_idle(slot);
+                }
+                let route = crate::dispatch::dispatch_syscall_with_native::<
                     _,
                     FakeCpu,
                     HardwareUserWord,
@@ -5844,14 +5979,18 @@ mod tests {
                     None,
                     Some(&venue),
                     None,
-                    None,
+                    Some(&mut process),
                     Some(carrick_el1_abi::BornInZoneSource {
                         zone: x86_zone,
                         slot,
                     }),
                     None,
                     |_| core::ptr::null_mut(),
-                )
+                );
+                if route == CompletionRoute::Suspended && x86_zone.slot(slot).current().is_none() {
+                    x86_zone.enter_idle(slot, true);
+                }
+                route
             };
 
             // Parent closes its own write end; child still holds one writer.
