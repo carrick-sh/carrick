@@ -478,6 +478,83 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
+    /// Process close reaches a clone caller parked on its birth's Busy
+    /// registration (#1974). The caller still owns that published birth, so
+    /// it consumes its exact stock token and finishes the registration first:
+    /// the child then is a registered member the same close already cancelled,
+    /// and its first selection retires it once through the closing-member
+    /// path on either ISA. `Ok(None)`: no such wait, or the child is queued
+    /// and the caller retires with the close status (never the clone's tid).
+    /// Contention still only defers: a Busy registration re-parks the caller
+    /// on the release notification (`Ok(Some(..))`), and its next wake
+    /// returns here.
+    #[inline(never)]
+    pub(super) fn settle_born_registration_on_close(
+        &mut self,
+    ) -> Result<Option<LifecycleOutcome>, NativeProcessError> {
+        let (key, child) = {
+            let graph = self.runtime.graph.lock();
+            let resources = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native()
+                .resources();
+            let Some(stock) = resources.thread_stock.as_ref() else {
+                return Ok(None);
+            };
+            let Some(wait) = stock
+                .born_waiters
+                .iter()
+                .find(|wait| wait.caller == self.record)
+            else {
+                return Ok(None);
+            };
+            let control = resources
+                .owned_control(
+                    self.source
+                        .zone
+                        .record(wait.child.id)
+                        .identity()
+                        .control_slot,
+                )
+                .ok_or(NativeProcessError::Stale)?;
+            // Close requests every Born pool member's exit before it
+            // publishes the pending close this caller observed.
+            if !control.host_exit_requested() {
+                return Err(NativeProcessError::Quarantined);
+            }
+            (stock.release.source.key(), wait.child)
+        };
+        let token = carrick_core::wait::take_object_operation(
+            self.source.zone,
+            self.source.slot,
+            self.source.zone.record(self.record.id).identity(),
+        )
+        .map_err(|_| NativeProcessError::Stale)?
+        .ok_or(NativeProcessError::Stale)?;
+        if token.index() != u64::from(key.index()) || token.generation() != key.generation() {
+            return Err(NativeProcessError::Stale);
+        }
+        {
+            let mut graph = self.runtime.graph.lock();
+            let stock = graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native_mut()
+                .resources_mut()
+                .thread_stock
+                .as_mut()
+                .ok_or(NativeProcessError::Stale)?;
+            take_born_wait(stock, self.record).ok_or(NativeProcessError::Stale)?;
+        }
+        Ok(match self.await_born_registration(child)? {
+            LifecycleOutcome::Returned { .. } => None,
+            parked => Some(parked),
+        })
+    }
+
     /// Finish a published birth whose registration was Busy, as its clone
     /// caller's owned post-Born continuation (#1974). The child stays Born,
     /// unqueued and record-keyed, so its pending signals and its one Born and
@@ -699,6 +776,19 @@ pub(crate) fn claim_counts<M: Clone, C: ProcessContext>(
         .namespace
         .with_view(&carrick_sched_core::ShortLockSpin, |ns| ns.counts())
 }
+/// Clone callers parked on a birth's registration in the root's stock.
+#[cfg(test)]
+pub(crate) fn born_registration_waiters<M: Clone, C: ProcessContext>(
+    runtime: &NativeProcessRuntime<'_, M, C>,
+) -> usize {
+    let graph = runtime.graph.lock();
+    graph
+        .owner
+        .task(graph.root_key)
+        .ok()
+        .and_then(|task| task.native().resources().thread_stock.as_ref())
+        .map_or(0, |stock| stock.born_waiters.len())
+}
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn retain_signal_snapshot<'a, M: Clone, C: ProcessContext>(
     runtime: &NativeProcessRuntime<'a, M, C>,
@@ -809,18 +899,4 @@ mod tests {
         drop(first);
         assert!(NativeThreadStock::new(&controls, &zone, record).is_ok());
     }
-}
-
-/// Clone callers parked on a birth's registration in the root's stock.
-#[cfg(test)]
-pub(crate) fn born_registration_waiters<M: Clone, C: ProcessContext>(
-    runtime: &NativeProcessRuntime<'_, M, C>,
-) -> usize {
-    let graph = runtime.graph.lock();
-    graph
-        .owner
-        .task(graph.root_key)
-        .ok()
-        .and_then(|task| task.native().resources().thread_stock.as_ref())
-        .map_or(0, |stock| stock.born_waiters.len())
 }

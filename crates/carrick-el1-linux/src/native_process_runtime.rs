@@ -6302,10 +6302,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if (continuation || (self.control.host_exit_requested() && !record.has_adapter_operation()))
             && let Some(status) = self.pending_close_status()
         {
-            return Some(match self.retire_closing_member(status) {
-                Ok(outcome) => outcome,
-                Err(error) => self.run_failed(error.run_failure_reason()),
-            });
+            // A clone caller parked on its birth's Busy registration settles
+            // that birth before it retires (#1974): close is terminal, the
+            // contention is not.
+            return Some(
+                match self
+                    .settle_born_registration_on_close()
+                    .and_then(|parked| match parked {
+                        Some(parked) => Ok(parked),
+                        None => self.retire_closing_member(status),
+                    }) {
+                    Ok(outcome) => outcome,
+                    Err(error) => self.run_failed(error.run_failure_reason()),
+                },
+            );
         }
         // Wait/IPC handbacks re-enter the saved syscall instruction too.
         // Their owned operation, rather than a readiness scalar or a new
