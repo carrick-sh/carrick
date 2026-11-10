@@ -32,6 +32,23 @@ pub struct StepDiff {
     pub unfinished_binaries: SetDiff,
     pub unitemized_failures: SetDiff,
     pub failed_tests: SetDiff,
+    /// NEW failed tests absent from the base's `started_tests`: the group
+    /// introduced them. A NEW failure the base already started is pre-existing.
+    pub introduced_failed_tests: BTreeSet<String>,
+    /// NEW unfinished binaries absent from the base's finished and unfinished
+    /// binaries: the group introduced a binary that never finishes.
+    pub introduced_unfinished_binaries: BTreeSet<String>,
+}
+
+/// Evidence-completeness keys: they stay blocking, as before the introduced
+/// test rule. Every other NEW key is blocking only when it is an introduced
+/// test or binary.
+fn is_incomplete_evidence(key: &str) -> bool {
+    ["not-run:", "missing-step:", "skipped:"]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+        || key == "missing-el1-comparison"
+        || key == "dirty-checkout"
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +60,12 @@ pub struct SignedDiff {
     pub el1_failed_tests: SetDiff,
     pub el1_unexpected_failures: SetDiff,
     pub new: BTreeSet<String>,
+    /// NEW entries that block the merge group: introduced tests and binaries
+    /// plus incomplete-evidence keys.
+    pub blocking: BTreeSet<String>,
+    /// NEW entries that are advisory (failures the base already ran, population,
+    /// probe, cleanup and EL1 observations).
+    pub advisory: BTreeSet<String>,
     pub fixed: BTreeSet<String>,
 }
 
@@ -244,6 +267,8 @@ pub fn compare(
                 .map_or(&[], |e| e.unexpected_failures.as_slice()),
         ),
         new: BTreeSet::new(),
+        blocking: BTreeSet::new(),
+        advisory: BTreeSet::new(),
         fixed: BTreeSet::new(),
     };
     for step in &candidate.steps {
@@ -272,7 +297,29 @@ pub fn compare(
             unfinished_binaries: field(|s| &s.unfinished_binaries),
             unitemized_failures: field(|s| &s.unitemized_failures),
             failed_tests: field(|s| &s.failed_tests),
+            introduced_failed_tests: BTreeSet::new(),
+            introduced_unfinished_binaries: BTreeSet::new(),
         };
+        let mut step = step;
+        // Failed and started tests share the `binary::test` key; a deadline
+        // kill is recorded as `deadline:<key>`.
+        step.introduced_failed_tests = step
+            .failed_tests
+            .new
+            .iter()
+            .filter(|test| {
+                let key = test.strip_prefix("deadline:").unwrap_or(test);
+                !step.started_tests.base.contains(key)
+            })
+            .cloned()
+            .collect();
+        step.introduced_unfinished_binaries = step
+            .unfinished_binaries
+            .new
+            .iter()
+            .filter(|binary| !step.finished_binaries.base.contains(*binary))
+            .cloned()
+            .collect();
         for (label, diff) in [
             ("test", &step.failed_tests),
             ("unfinished", &step.unfinished_binaries),
@@ -303,6 +350,16 @@ pub fn compare(
                 .new
                 .insert(format!("missing-finished:{name}:{binary}"));
         }
+        result.blocking.extend(
+            step.introduced_failed_tests
+                .iter()
+                .map(|v| format!("test:{name}:{v}")),
+        );
+        result.blocking.extend(
+            step.introduced_unfinished_binaries
+                .iter()
+                .map(|v| format!("unfinished:{name}:{v}")),
+        );
         result.steps.push(step);
     }
     for (label, diff) in [
@@ -324,15 +381,67 @@ pub fn compare(
     result.new.extend(next.difference(&old).cloned());
     result.fixed.extend(old.difference(&next).cloned());
     result.passed = result.new.is_empty();
+    for key in &result.new {
+        if is_incomplete_evidence(key) {
+            result.blocking.insert(key.clone());
+        }
+    }
+    result.advisory = result.new.difference(&result.blocking).cloned().collect();
     Ok(result)
 }
 
 impl SignedDiff {
+    /// The merge-group verdict from the comparison alone: true when a NEW
+    /// failure is a test or binary the group introduced (or evidence is
+    /// incomplete). `passed` still means "no NEW entry at all".
+    pub fn blocks(&self) -> bool {
+        !self.blocking.is_empty()
+    }
+
+    /// One-line status description naming what blocks.
+    pub fn blocking_summary(&self) -> String {
+        let names: Vec<_> = self.blocking.iter().map(String::as_str).collect();
+        format!(
+            "Blocked by failures this group introduced: {}",
+            names.join(", ")
+        )
+    }
+
+    fn summary(&self) -> String {
+        let list =
+            |set: &BTreeSet<String>| set.iter().map(|k| format!("- `{k}`\n")).collect::<String>();
+        let mut text = String::new();
+        if self.blocks() {
+            text.push_str(&format!(
+                "This group is blocked. These NEW failures were introduced by its own PRs (the test or binary is not in the base's started tests) or leave the evidence incomplete:\n\n{}\n",
+                list(&self.blocking)
+            ));
+        }
+        if !self.advisory.is_empty() {
+            text.push_str(&format!(
+                "{} NEW entries are advisory: they fail a test or binary the base already ran (pre-existing on main) or are population, probe, cleanup or EL1 observations. They do not block:\n\n{}\n",
+                if self.blocks() { "Other" } else { "These" },
+                list(&self.advisory)
+            ));
+        }
+        if text.is_empty() {
+            text.push_str("No NEW failures.\n\n");
+        }
+        text
+    }
+
     /// Markdown also serves as the durable CLI log and PR comment body.
     pub fn markdown(&self) -> String {
+        let verdict = if self.blocks() {
+            "FAIL"
+        } else if self.passed {
+            "PASS"
+        } else {
+            "PASS (advisory NEW only)"
+        };
         let mut text = format!(
-            "Signed gate: **{}**\n\nBase `{}` → candidate `{}`\n\n| Step | Started base → candidate | Finished base → candidate | Unfinished base → candidate | Unitemized base → candidate |\n| --- | ---: | ---: | ---: | ---: |\n",
-            if self.passed { "PASS" } else { "FAIL" },
+            "Signed gate: **{verdict}**\n\n{}Base `{}` → candidate `{}`\n\n| Step | Started base → candidate | Finished base → candidate | Unfinished base → candidate | Unitemized base → candidate |\n| --- | ---: | ---: | ---: | ---: |\n",
+            self.summary(),
             self.base,
             self.candidate
         );
@@ -372,6 +481,10 @@ impl SignedDiff {
                 diff.base, diff.candidate, diff.new, diff.fixed
             ));
         }
+        text.push_str(&format!(
+            "\nBLOCKING={:?}\n\nADVISORY={:?}\n",
+            self.blocking, self.advisory
+        ));
         text.push_str(&format!("\nNEW={:?}\n\nFIXED={:?}\n", self.new, self.fixed));
         text
     }

@@ -1688,16 +1688,17 @@ fn publish(
                 serde_json::to_string_pretty(identity).map_err(|e| fail(e.to_string()))?
             )),
         }
-        let passed = diff.passed
+        let passed = !diff.blocks()
             && valid.is_ok()
             && identity.is_ok()
             && base_evidence.is_ok()
             && execution_result == "success";
-        Ok::<_, ReceiptError>((passed, body))
+        let blocking = diff.blocks().then(|| diff.blocking_summary());
+        Ok::<_, ReceiptError>((passed, body, blocking))
     })();
     let candidate_path = results.join(CANDIDATE_RECEIPT);
-    let (passed, mut body, outcome) = match comparison {
-        Ok((passed, body)) => (passed, body, PublishOutcome::Compared),
+    let (passed, mut body, outcome, blocking) = match comparison {
+        Ok((passed, body, blocking)) => (passed, body, PublishOutcome::Compared, blocking),
         // A cancelled job that never wrote a candidate has no verdict to
         // report; it still fails the required check, only the text differs.
         Err(ReceiptError::Io { path, source })
@@ -1712,6 +1713,7 @@ fn publish(
                     request.sha, request.base
                 ),
                 PublishOutcome::Cancelled,
+                None,
             )
         }
         Err(error @ ReceiptError::IncomparableBase(_)) => (
@@ -1721,6 +1723,7 @@ fn publish(
                 request.sha, request.base
             ),
             PublishOutcome::IncomparableBase,
+            None,
         ),
         Err(error) => (
             false,
@@ -1729,6 +1732,7 @@ fn publish(
                 request.sha, request.base
             ),
             PublishOutcome::Compared,
+            None,
         ),
     };
     if !passed && !body.starts_with("Signed gate: **FAIL**") && outcome == PublishOutcome::Compared
@@ -1760,13 +1764,20 @@ fn publish(
     }
     // Status is written even if comment publication fails.
     let description = if outcome == PublishOutcome::IncomparableBase {
-        "Incomparable base: host, fixture or incomplete base run; blocked"
+        "Incomparable base: host, fixture or incomplete base run; blocked".to_string()
     } else if outcome == PublishOutcome::Cancelled {
-        "Gate run cancelled before producing a result; no verdict"
+        "Gate run cancelled before producing a result; no verdict".to_string()
     } else if passed {
-        "No new failures; populations and completion preserved"
+        "No introduced failures; populations and completion preserved".to_string()
+    } else if let Some(blocking) = &blocking {
+        // GitHub rejects commit status descriptions over 140 characters.
+        let mut text: String = blocking.chars().take(137).collect();
+        if text.len() < blocking.len() {
+            text.push_str("...");
+        }
+        text
     } else {
-        "Signed receipt regression or incomplete gate"
+        "Signed receipt regression or incomplete gate".to_string()
     };
     let status = post(
         &format!("repos/{REPOSITORY}/statuses/{}", request.sha),

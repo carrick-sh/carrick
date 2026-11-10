@@ -720,7 +720,10 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
 
 - **Signed acceptance runs on the merge group** (owner, 2026-11-06, #1750).
   The required **Signed queue gate** check builds the exact `main` queue head
-  and compares against its event `base_sha`; a NEW failure ejects the group.
+  and compares against its event `base_sha`; a NEW failure that is a test or
+  binary the group itself introduces (absent from the base's started tests)
+  ejects the group, every other NEW failure is advisory (owner, 2026-11-10,
+  #231, #2035); incomplete-evidence refusals stay blocking.
   Main pushes publish baselines automatically. PR-time signed runs are
   optional requests via the owner's `gate:signed` label or dispatch, never
   a draft → gate → ready prerequisite. Do not seed a baseline per PR or

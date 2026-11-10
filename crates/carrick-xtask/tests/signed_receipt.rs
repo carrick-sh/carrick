@@ -2710,3 +2710,145 @@ fn queue_refuses_missing_own_entry() {
     let err = validate_queue_entries(&entries, &head, 1950).unwrap_err();
     assert!(err.to_string().contains("not the live entry"), "{err}");
 }
+
+impl PublishBench {
+    /// The `signed-gate` commit status last posted by `publish`.
+    fn last_status(&self) -> (String, String) {
+        let posts = std::fs::read_to_string(self.dir.path().join("posts.jsonl")).unwrap();
+        let post: serde_json::Value = posts
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .rfind(|post| post["endpoint"].as_str().unwrap().contains("/statuses/"))
+            .unwrap();
+        (
+            post["body"]["state"].as_str().unwrap().to_owned(),
+            post["body"]["description"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// Publish a candidate whose `el1-embed` step differs from the base's
+    /// (started red_a, red_b, green; failed red_a, red_b).
+    fn publish_with(
+        &self,
+        edit: impl FnOnce(&mut carrick_xtask::accept::StepResult),
+    ) -> (bool, String, (String, String)) {
+        self.write_base(&admitted(&self.base), false);
+        let mut candidate = admitted(&self.head);
+        edit(&mut candidate.steps[2]);
+        self.write_candidate(&candidate, false);
+        let (passed, body) = self.publish();
+        (passed, body, self.last_status())
+    }
+}
+
+/// #2035 (a): a failing test the group's own PRs add is not in the base's
+/// started tests, so it blocks and is named in the status and the comment.
+#[cfg(unix)]
+#[test]
+fn introduced_failing_test_blocks_and_is_named() {
+    let bench = PublishBench::new();
+    let (passed, body, (state, description)) = bench.publish_with(|step| {
+        step.failed_tests.push("embed::brand_new".into());
+        step.started_tests.push("embed::brand_new".into());
+    });
+    assert!(!passed, "{body}");
+    assert_eq!(state, "failure");
+    assert!(description.contains("embed::brand_new"), "{description}");
+    assert!(description.len() <= 140, "{description}");
+    assert!(body.starts_with("Signed gate: **FAIL**"), "{body}");
+    assert!(
+        body.contains("BLOCKING={\"test:el1-embed:embed::brand_new\"}"),
+        "{body}"
+    );
+    assert!(body.contains("introduced by its own PRs"), "{body}");
+}
+
+/// #2035 (b): a test the base already started that fails only in the
+/// candidate is a pre-existing flake: advisory, listed, never blocking.
+#[cfg(unix)]
+#[test]
+fn preexisting_flake_alone_is_advisory() {
+    let bench = PublishBench::new();
+    let (passed, body, (state, _)) = bench.publish_with(|step| {
+        step.failed_tests.push("embed::green".into());
+    });
+    assert!(passed, "{body}");
+    assert_eq!(state, "success");
+    assert!(
+        body.starts_with("Signed gate: **PASS (advisory NEW only)**"),
+        "{body}"
+    );
+    assert!(body.contains("NEW entries are advisory"), "{body}");
+    assert!(
+        body.contains("ADVISORY={\"test:el1-embed:embed::green\"}"),
+        "{body}"
+    );
+    assert!(body.contains("BLOCKING={}"), "{body}");
+}
+
+/// #2035 (c): a mix blocks and names only the introduced test as blocking.
+#[cfg(unix)]
+#[test]
+fn mixed_flake_and_introduced_test_blocks_naming_only_the_introduced() {
+    let bench = PublishBench::new();
+    let (passed, body, (state, description)) = bench.publish_with(|step| {
+        step.failed_tests.push("embed::green".into());
+        step.failed_tests.push("embed::brand_new".into());
+        step.started_tests.push("embed::brand_new".into());
+    });
+    assert!(!passed, "{body}");
+    assert_eq!(state, "failure");
+    assert!(description.contains("embed::brand_new"), "{description}");
+    assert!(!description.contains("embed::green"), "{description}");
+    assert!(
+        body.contains("BLOCKING={\"test:el1-embed:embed::brand_new\"}"),
+        "{body}"
+    );
+    assert!(
+        body.contains("ADVISORY={\"test:el1-embed:embed::green\"}"),
+        "{body}"
+    );
+}
+
+/// #2035 (d): a binary absent from the base that never finishes is introduced.
+/// A base-finished binary that stops finishing is a pre-existing one.
+#[test]
+fn new_unfinished_binary_is_introduced_and_blocks() {
+    let base = base();
+    let mut next = base.clone();
+    next.steps[0].unfinished_binaries = vec!["newbin".into(), "embed".into()];
+    let diff = compare(&base, &next).unwrap();
+    assert!(diff.blocks());
+    assert!(diff.blocking.contains("unfinished:el1-embed:newbin"));
+    assert!(!diff.blocking.contains("unfinished:el1-embed:embed"));
+    assert!(diff.advisory.contains("unfinished:el1-embed:embed"));
+    assert!(
+        diff.steps[0]
+            .introduced_unfinished_binaries
+            .contains("newbin")
+    );
+}
+
+/// A deadline kill of a test the base started is the same flake, not new.
+#[test]
+fn deadline_failure_of_a_base_started_test_is_not_introduced() {
+    let base = base();
+    let mut next = base.clone();
+    next.steps[0].failed_tests = vec!["deadline:embed::green".into(), "embed::red_a".into()];
+    let diff = compare(&base, &next).unwrap();
+    assert!(!diff.blocks(), "{:?}", diff.blocking);
+    assert!(
+        diff.advisory
+            .contains("test:el1-embed:deadline:embed::green")
+    );
+}
+
+/// Incomplete evidence keeps blocking: a missing step is not an advisory.
+#[test]
+fn incomplete_evidence_still_blocks() {
+    let base = base();
+    let mut next = base.clone();
+    next.steps[0].name = "replacement".into();
+    let diff = compare(&base, &next).unwrap();
+    assert!(diff.blocking.contains("missing-step:el1-embed"));
+}
