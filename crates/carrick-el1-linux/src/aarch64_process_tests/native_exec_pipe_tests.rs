@@ -57,6 +57,15 @@ fn serial_host_native_fork_exec_child_readlink_exe() {
     fork_exec_probe_with_departure(None, u32::MAX as u64, false, None, None, true);
 }
 
+/// RED until #1808 slice 3 routes clock_gettime for native children: an
+/// exec successor's clock read is a counted ENOSYS refusal, which musl
+/// reports as EINVAL for CLOCK_MONOTONIC (the #1900 holder panic).
+#[test]
+#[ignore = "#1808 slice 3: clock_gettime routing for native children"]
+fn serial_host_native_exec_child_clock_gettime() {
+    fork_exec_probe_copy(None, u32::MAX as u64, false, None, None, true, None, true);
+}
+
 #[test]
 fn serial_host_native_readlink_copyout_busy_once_then_success() {
     fork_exec_probe_copy(
@@ -67,6 +76,7 @@ fn serial_host_native_readlink_copyout_busy_once_then_success() {
         None,
         true,
         Some(NativeProcessError::Busy),
+        false,
     );
 }
 
@@ -80,6 +90,7 @@ fn serial_host_native_readlink_copyout_fault_returns_errno_14() {
         None,
         true,
         Some(NativeProcessError::Fault),
+        false,
     );
 }
 
@@ -164,7 +175,9 @@ fn fork_exec_probe_with_departure(
     departure: Option<TimerDeparture>,
     readlink: bool,
 ) {
-    fork_exec_probe_copy(futex, bitset, timed, metadata, departure, readlink, None);
+    fork_exec_probe_copy(
+        futex, bitset, timed, metadata, departure, readlink, None, false,
+    );
 }
 
 fn fork_exec_probe_copy(
@@ -175,6 +188,7 @@ fn fork_exec_probe_copy(
     departure: Option<TimerDeparture>,
     readlink: bool,
     copy_error: Option<NativeProcessError>,
+    clock: bool,
 ) {
     let counters = carrick_el1_abi::Counters::new();
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -852,6 +866,29 @@ fn fork_exec_probe_copy(
                 vec![(UserVa::new(memory.arg() + 512), b"/bi".to_vec())]
             );
             assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
+        }
+        if clock {
+            // musl's clock_gettime issues syscall 113 when the vDSO exports no
+            // clock (fast-path visibility) and turns its ENOSYS into EINVAL
+            // for every clock except CLOCK_REALTIME.
+            let timespec = memory.arg() + 1024;
+            for clock_id in [
+                carrick_abi::LINUX_CLOCK_MONOTONIC,
+                carrick_abi::LINUX_CLOCK_REALTIME,
+            ] {
+                assert_eq!(
+                    call_full(
+                        carrick_abi::syscall::nr::CLOCK_GETTIME.raw(),
+                        clock_id,
+                        timespec,
+                        0,
+                        0
+                    ) as i64,
+                    0,
+                    "exec successor clock_gettime({clock_id}): negative result is Linux errno"
+                );
+                assert_eq!(counters.forwarded[113].load(Ordering::Relaxed), 0);
+            }
         }
         registry.unregister_root_for_test(&runtime);
         return;
