@@ -99,7 +99,37 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     >,
     frame: &mut TrapFrame,
 ) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
-    use crate::sched::ThreadCpu;
+    deliver_on_user_return_at(task, process, frame, |frame, fp| {
+        use crate::sched::ThreadCpu;
+        let mut saved =
+            crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+        crate::sched::HardwareCpu.save(frame, &mut saved, crate::sched::CpuExitCause::Svc);
+        fp.vregs = saved.native.v;
+        fp.fpsr = saved.native.fpsr as u32;
+        fp.fpcr = saved.native.fpcr as u32;
+        unsafe { carrick_el1::isa::aarch64::signal_stack() }
+    })
+}
+
+/// The user-return delivery policy. `live` reads the FP/SIMD state and user
+/// stack pointer only once a signal is owed: the vector reads the hardware,
+/// VM-free witnesses supply both.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn deliver_on_user_return_at<'a, X: super::aarch64_process::ForkStockCrossing>(
+    task: &carrick_el1_abi::CurrentTask,
+    process: &mut super::native_process_runtime::NativeProcessEntry<
+        '_,
+        'a,
+        super::aarch64_process::Mm,
+        carrick_sched_core::Aarch64ParkedContext,
+        super::aarch64_process::Aarch64NativeProcessService<'a, X>,
+    >,
+    frame: &mut TrapFrame,
+    live: impl FnOnce(
+        &TrapFrame,
+        &mut carrick_syscall_abi::LinuxFpsimdContext,
+    ) -> carrick_guest_arch::UserVa,
+) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
     use zerocopy::IntoBytes;
 
     if frame.esr == 0xfffc {
@@ -114,13 +144,8 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     {
         return None;
     }
-    let mut saved = crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    crate::sched::HardwareCpu.save(frame, &mut saved, crate::sched::CpuExitCause::Svc);
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
-    fp.vregs = saved.native.v;
-    fp.fpsr = saved.native.fpsr as u32;
-    fp.fpcr = saved.native.fpcr as u32;
-    let sp = unsafe { carrick_el1::isa::aarch64::signal_stack() };
+    let sp = live(frame, &mut fp);
     let (_, control) = task.lifecycle_refs()?;
     deliver_on_user_return_with(
         task,

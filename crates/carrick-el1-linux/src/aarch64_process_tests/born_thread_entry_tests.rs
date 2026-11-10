@@ -365,3 +365,266 @@ fn arm_born_thread_first_entry_after_another_process_on_the_vcpu() {
 fn arm_born_thread_first_entry_on_a_detached_executor() {
     born_thread_first_entry_after_foreign_occupant(None);
 }
+
+/// Run the production scheduler's `sched_yield` boundary on `fixture.slot`
+/// for the thread `task` names, switching in the next queued record.
+fn yield_on(
+    fixture: &'static Fixture,
+    task: &'static CurrentTask,
+    cpu: &mut crate::sched::FakeCpu,
+    frame: &mut carrick_el1_abi::TrapFrame,
+) -> Option<crate::sched::Served> {
+    if let Some(work) = task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    let _ = task.linux.take_served_boundary();
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let mut switch = ProductionResumeCpu {
+        inner: core::mem::take(cpu),
+        service: &mut service,
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let mut handoff = None;
+    let mut zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut switch,
+        user: &crate::sched::HardwareUserWord,
+    };
+    let served = super::super::dispatch::native_scheduler(
+        &mut zone,
+        task,
+        &counters,
+        fixture.slot,
+        &mut handoff,
+    )
+    .yield_queued(frame);
+    *cpu = core::mem::take(&mut switch.inner);
+    served
+}
+
+/// The real ARM signal checkpoint's admission and delivery for the task
+/// loaded on `fixture.slot` (`arm_signal_user_return` past its vector
+/// reads), counting each signal frame it writes.
+fn signal_checkpoint(
+    fixture: &'static Fixture,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    stack: &carrick_test_support::GuestUserBuffer,
+    delivered: &mut usize,
+) -> Result<carrick_el1_abi::Action, NativeProcessError> {
+    let mut service = fixture.process_service();
+    let ttbr0 = fixture_ttbr0(fixture);
+    let mut saved = Box::new(Aarch64ParkedContext::ZERO);
+    crate::sched::ThreadCpu::save(
+        &mut crate::sched::FakeCpu::default(),
+        frame,
+        &mut saved,
+        crate::sched::CpuExitCause::Svc,
+    );
+    let task: &'static CurrentTask = &fixture.task;
+    super::super::dispatch::arm_signal_user_return_entry(
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        },
+        task,
+        &saved.native,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| {
+            super::super::arm_signal::deliver_on_user_return_at(task, process, frame, |_, _| {
+                *delivered += 1;
+                stack.va_at(stack.len())
+            })
+        },
+    )
+}
+
+/// Witness for #1958's `entry_binding` at the signal user-return checkpoint
+/// (`dispatch.rs` `arm_signal_user_return`, fatal at 2146:25 on `927df2a8a`).
+///
+/// `el1_sched_two_processes_share_vcpus`: the host-loaded root (a registered
+/// native signal owner, host-managed: no zone record) shares its vCPU with
+/// its native fork child. EL1 preempts the root into its slot's home record
+/// and runs the child, whose owner publishes the child's namespace PID and
+/// root incarnation into the slot's `CurrentTask`. Switching the home record
+/// back in frees it (`record=none`) and resumes the root through
+/// `resume_unregistered`, which restores only the record's thread identity:
+/// the root runs on with the child's PID and root incarnation.
+///
+/// Its next syscall (`FUTEX_WAKE`) then fails admission (`Stale`) and is
+/// served owner-free, and the host's signal checkpoint for any forwarded
+/// call (esr 0xfffe) runs the same admission and aborts the carrier.
+fn host_loaded_root_returns_after_foreign_occupant(pending_signal: bool) {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+        ]),
+    )
+    .with_words(words);
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    let task: &'static CurrentTask = &fixture.task;
+    let root_pid = fixture.leader.tid as u32;
+    let root_generation = task.root_generation();
+    assert!(root_generation.is_some());
+
+    if pending_signal {
+        // SIGUSR1 has a handler, then the root signals itself. Both calls
+        // go through the root's process owner, which leaves SIGUSR1 pending
+        // for the next user-return checkpoint.
+        let action = carrick_test_support::GuestUserBuffer::from_values(&[
+            0x70_0000_u64,
+            0x0400_0000,
+            0x71_0000,
+            0,
+        ]);
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 134;
+        frame.x[0] = 10;
+        frame.x[1] = action.arg();
+        frame.x[3] = 8;
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+        assert_eq!(frame.x[0], 0, "rt_sigaction(SIGUSR1)");
+    }
+
+    // The root forks a native child (SIGCHLD); the child is queued here.
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 220;
+    frame.x[0] = 17;
+    arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+    assert!(frame.x[0] as i64 > 0, "fork result {}", frame.x[0] as i64);
+    let child = fixture.zone.runnable_head(fixture.slot).unwrap();
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+
+    // The root yields: EL1 parks it in the slot's home record and runs the
+    // child, whose owner publishes the child's PID into this slot.
+    let mut yielded = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    yielded.x[8] = 124;
+    assert!(yield_on(fixture, task, &mut cpu, &mut yielded).is_some());
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+    let home = fixture
+        .zone
+        .slot(fixture.slot)
+        .host_record()
+        .expect("the host-loaded root parked in its home record");
+    let child_pid = task
+        .visible_pid()
+        .expect("the child's owner published its PID");
+    assert_ne!(child_pid, root_pid);
+
+    // The child yields back: the root's home record is switched in.
+    assert!(yield_on(fixture, task, &mut cpu, &mut yielded).is_some());
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(home));
+    assert_eq!(
+        task.execution.task.load(Ordering::Acquire),
+        fixture.leader.tid,
+        "the home switch-in restores the root's thread identity"
+    );
+    assert_eq!(
+        (task.visible_pid(), task.root_generation()),
+        (Some(root_pid), root_generation),
+        "the host-loaded root resumes with its own namespace PID and root incarnation"
+    );
+
+    // The root's next syscall: FUTEX_WAKE with no waiter, through its owner.
+    let word = carrick_test_support::GuestUserBuffer::from_value(0u32);
+    let mut call = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    call.x[8] = crate::sched::SYS_FUTEX as u64;
+    call.x[0] = word.arg();
+    call.x[1] = crate::sched::FUTEX_WAKE_PRIVATE;
+    call.x[2] = 1;
+    let admitted = arm_call_with_cpu(fixture, fixture.control, &mut service, &mut call, &mut cpu);
+    assert!(
+        admitted.is_ok(),
+        "the root's FUTEX_WAKE was refused by its process owner: {admitted:?}"
+    );
+    assert_eq!(call.x[0], 0, "FUTEX_WAKE with no waiter wakes none");
+
+    if pending_signal {
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 131;
+        frame.x[..3].copy_from_slice(&[u64::from(root_pid), u64::from(root_pid), 10]);
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+        assert_eq!(frame.x[0], 0, "tgkill(self, SIGUSR1)");
+    }
+
+    // The host completed a forwarded call (FUTEX_WAKE woke one) and entered
+    // the native signal checkpoint (esr 0xfffe), as in the fatal runs.
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let mut checkpoint = carrick_el1_abi::TrapFrame {
+        esr: 0xfffe,
+        slot: u64::from(fixture.slot.raw()),
+        elr: 0x40_0004,
+        far: word.arg(),
+        ..Default::default()
+    };
+    checkpoint.x[0] = 1;
+    checkpoint.x[1] = crate::sched::FUTEX_WAKE_PRIVATE;
+    checkpoint.x[8] = crate::sched::SYS_FUTEX as u64;
+    let mut delivered = 0;
+    let outcome = signal_checkpoint(fixture, &mut checkpoint, &stack, &mut delivered);
+    assert_eq!(
+        outcome,
+        Ok(carrick_el1_abi::Action::Served),
+        "the signal checkpoint refused the host-loaded root (vector: entry_binding)"
+    );
+    if pending_signal {
+        assert_eq!(delivered, 1, "SIGUSR1 is delivered at this checkpoint");
+        assert_eq!(checkpoint.elr, 0x70_0000, "the handler runs next");
+        assert_eq!(checkpoint.x[0], 10);
+    } else {
+        assert_eq!(delivered, 0, "no signal is owed");
+        assert_eq!(checkpoint.x[0], 1, "the call's result is preserved");
+    }
+    // A second checkpoint owes nothing: the signal is delivered once.
+    let mut again = carrick_el1_abi::TrapFrame {
+        esr: 0xfffe,
+        slot: u64::from(fixture.slot.raw()),
+        elr: checkpoint.elr,
+        ..Default::default()
+    };
+    again.x[0] = 2;
+    assert_eq!(
+        signal_checkpoint(fixture, &mut again, &stack, &mut delivered),
+        Ok(carrick_el1_abi::Action::Served)
+    );
+    assert_eq!(delivered, usize::from(pending_signal));
+    assert_eq!(again.x[0], 2);
+}
+
+#[test]
+fn arm_host_loaded_root_signal_checkpoint_after_another_process_on_the_vcpu() {
+    host_loaded_root_returns_after_foreign_occupant(false);
+}
+
+#[test]
+fn arm_host_loaded_root_delivers_pending_signal_once_after_another_process_on_the_vcpu() {
+    host_loaded_root_returns_after_foreign_occupant(true);
+}
