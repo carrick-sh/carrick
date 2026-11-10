@@ -41,19 +41,19 @@ type CarrierZoneRef<'a> =
 /// The process-global zone ([`zone`]) serves when present (ARM). Otherwise
 /// a host release reaches the carrier-scoped zone it was built for, if any
 /// (#2031: x86 exit-drain releases otherwise lost every zone wake).
-pub(crate) struct ObjectWakeDelivery<'a> {
+pub(crate) struct ObjectWakeDelivery {
     handed: [std::mem::MaybeUninit<RecordRef>; carrick_sched_core::ZONE_RECORDS],
     len: usize,
     slots: [u64; carrick_el1_abi::ZONE_SLOTS / 64],
-    carrier: Option<CarrierZoneRef<'a>>,
+    carrier: Option<CarrierZone>,
     /// The venue that collected: `handed` and `slots` belong to it.
     collected_in_carrier: bool,
 }
-impl<'a> ObjectWakeDelivery<'a> {
+impl ObjectWakeDelivery {
     pub(crate) fn new() -> Self {
         Self::for_carrier(None)
     }
-    pub(crate) fn for_carrier(carrier: Option<CarrierZoneRef<'a>>) -> Self {
+    pub(crate) fn for_carrier(carrier: Option<CarrierZone>) -> Self {
         Self {
             handed: [const { std::mem::MaybeUninit::uninit() }; carrick_sched_core::ZONE_RECORDS],
             len: 0,
@@ -70,7 +70,7 @@ impl<'a> ObjectWakeDelivery<'a> {
             carrier,
             collected_in_carrier,
         } = self;
-        if let Some(zone) = zone() {
+        let collected = if let Some(zone) = zone() {
             collect_object_wake(
                 zone,
                 &HostLockWait,
@@ -79,8 +79,8 @@ impl<'a> ObjectWakeDelivery<'a> {
                 handed,
                 len,
                 slots,
-            );
-        } else if let Some(carrier) = *carrier {
+            )
+        } else if let Some(carrier) = carrier.as_deref() {
             *collected_in_carrier = true;
             collect_object_wake(
                 carrier.zone(),
@@ -90,11 +90,25 @@ impl<'a> ObjectWakeDelivery<'a> {
                 handed,
                 len,
                 slots,
-            );
+            )
+        } else {
+            Ok(())
+        };
+        match collected {
+            Ok(()) => {}
+            Err(CollectFault::DuplicateDelivery) => {
+                carrick_fatal::carrick_fatal!("ipc::wake", "duplicate object waiter delivery");
+            }
+            Err(CollectFault::Ownership) => {
+                carrick_fatal::carrick_fatal!("ipc::wake", "object wake ownership failed")
+            }
         }
     }
     pub(crate) fn deliver(self) {
-        let carrier = self.carrier.filter(|_| self.collected_in_carrier);
+        let carrier = self
+            .carrier
+            .as_deref()
+            .filter(|_| self.collected_in_carrier);
         for record in &self.handed[..self.len] {
             // SAFETY: collect initialized precisely this prefix.
             let record = unsafe { record.assume_init() };
@@ -118,6 +132,12 @@ impl<'a> ObjectWakeDelivery<'a> {
     }
 }
 
+/// A broken invariant [`collect_object_wake`] reports to its one owner.
+enum CollectFault {
+    DuplicateDelivery,
+    Ownership,
+}
+
 /// Notify the object's own lanes, then the readable lane of every zone
 /// epoll the change queued an item on, collecting into preallocated storage.
 fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
@@ -128,7 +148,7 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
     handed: &mut [std::mem::MaybeUninit<RecordRef>; carrick_sched_core::ZONE_RECORDS],
     len: &mut usize,
     slots: &mut [u64; carrick_el1_abi::ZONE_SLOTS / 64],
-) {
+) -> Result<(), CollectFault> {
     let lanes = [
         (wake.readers, carrick_el1_abi::ipc::pipe::WaitFor::Readable),
         (wake.writers, carrick_el1_abi::ipc::pipe::WaitFor::Writable),
@@ -148,14 +168,13 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
         let Ok(queue) = zone.object_wait(key, wait, completion) else {
             continue;
         };
+        let mut duplicate = false;
         queue
             .notify_object_host(
                 &mut |record| {
                     let Some(slot) = handed.get_mut(*len) else {
-                        carrick_fatal::carrick_fatal!(
-                            "ipc::wake",
-                            "duplicate object waiter delivery"
-                        );
+                        duplicate = true;
+                        return;
                     };
                     slot.write(record);
                     *len += 1;
@@ -167,10 +186,12 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
                     }
                 },
             )
-            .unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::wake", "object wake ownership failed")
-            });
+            .map_err(|_| CollectFault::Ownership)?;
+        if duplicate {
+            return Err(CollectFault::DuplicateDelivery);
+        }
     }
+    Ok(())
 }
 
 /// A host thread waiting for a carrier zone's bucket lock. A holder that
@@ -231,11 +252,16 @@ fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
         // Retired between publication and handback: its owner settled it.
         return;
     };
-    let Some(placement) = zone.place_native_handback(record) else {
-        carrick_fatal::carrick_fatal!(
-            "ipc::wake",
-            "carrier zone handed back a record without native custody"
-        );
+    // A record that is not native-owned still has only this host custody:
+    // queue it on its owner's slot for that slot's driver. Refused both
+    // ways, the record is no longer in host custody: another owner (its
+    // exit, a signal) settled it, and there is nothing left to deliver.
+    let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
+    let Some(placement) = zone
+        .place_native_handback(record)
+        .or_else(|| zone.requeue_on(owner, record.id))
+    else {
+        return;
     };
     if placement.resched {
         carrier.resched(placement.slot);
