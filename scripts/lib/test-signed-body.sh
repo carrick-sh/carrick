@@ -73,6 +73,9 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 phase="${CARRICK_SIGNED_PHASE:-}"
 if [ -z "$phase" ]; then
+    # Both phases are one run: they share its run id, so the build phase's
+    # receipt header names the run whose guests execute (and are reaped).
+    export CARRICK_RUN_ID="${CARRICK_RUN_ID-embed-signed-$$}"
     exec cargo --config "$CARRICK_CARGO_CACHE_CONFIG" run --locked -p carrick-xtask -- signed-phases --check-load -- ./scripts/test-signed.sh "$@"
 fi
 case "$phase" in

@@ -1977,7 +1977,8 @@ fn drive_signed(
         .map_err(|e| AcceptError::Git(e.to_string()))?
         .repository_root;
     // Disk admission takes gate itself, so it cannot run inside the shared
-    // build phase. Admit once here; the build phase's `just build` skips it.
+    // build phase. Admit once here; the build phase then runs `just _build`,
+    // the body `just build` runs after its own disk admission.
     let disk = Command::new("just")
         .arg("check-disk")
         .current_dir(&root)
@@ -2246,20 +2247,21 @@ fn run_inner(
                 "--- Signed build phase starting (profile: {}) ---",
                 args.profile
             );
-            // Signed Step 1: just build + artifact inspection
+            // Signed Step 1: release build + artifact inspection
             let step_name = "build";
             let run_id = format!("accept-{timestamp}-{step_name}");
             let log_path = run_dir.join("signed-01-build.log");
-            let cmd_str = "just build";
+            let cmd_str = "just _build";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
-            // The driver admitted disk under gate before this shared phase;
-            // check-disk takes gate itself and cannot nest under carrick.
+            // `just build` is disk admission (gate) then `_build` under
+            // carrick. The driver admitted disk before this shared phase and
+            // gate cannot nest under carrick, so run the build body directly.
             let (exit_code, duration_s) = run_command_logged(
                 &lease,
                 "just",
-                &["build"],
-                &[("CARRICK_RUN_ID", &run_id), ("CARRICK_DISK_GUARD", "0")],
+                &["_build"],
+                &[("CARRICK_RUN_ID", &run_id)],
                 &root,
                 &log_path,
                 false,
