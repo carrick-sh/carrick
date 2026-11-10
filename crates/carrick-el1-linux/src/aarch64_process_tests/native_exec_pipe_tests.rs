@@ -2262,12 +2262,13 @@ fn child_futex<'a>(
             }
             _ => unreachable!("{case:?} answers at entry"),
         };
-        let resumed = match {
+        let outcome = {
             let mut entry = reenter_worker(fixture, registry, runtime, source, &worker, service);
-            let resumed = entry.resume_pending_wait();
+            let outcome = entry.resume_pending_wait();
             drop(entry);
-            resumed
-        } {
+            outcome
+        };
+        let resumed = match outcome {
             Some(LifecycleOutcome::Returned { result, .. }) => Some(result.raw()),
             _ => None,
         };
