@@ -1,0 +1,37 @@
+schema = "carrick.conformance-exemption.v1"
+base = "21fefb04e22cb7b57e35b740e2a668d7965385bc"
+head = "d6528aa94992760802c47181d7538d0d9d402218"
+contracts = [
+  "core.entry.completion",
+  "diagnostics.syscall-refusal",
+  "kernel.copyout.owner-refusal",
+  "kernel.el1.deferred-handback-identity",
+  "kernel.el1.fork-cow",
+  "kernel.el1.ipc-fd-authority",
+  "kernel.el1.ipc-two-process",
+  "kernel.el1.mm-exclusive-owner",
+  "kernel.el1.signal-delivery-owner",
+  "kernel.el1.thread-lifecycle",
+  "kernel.futex.contention",
+  "kernel.memory.owner-wait",
+  "kernel.mm.private-file-fixed-replacement",
+  "kernel.native.entropy",
+  "kernel.native.host-file-venue",
+  "kernel.native.namespace-mutation",
+  "kernel.scheduler.runnable-progress",
+  "kernel.vcpu.shutdown-entry",
+  "kernel.wait.child-rusage",
+  "kernel.wait.process-group",
+  "process.exec.custody",
+  "process.native.arm-admission",
+  "process.native.short-lock",
+  "process.native.terminal-child",
+]
+paths = [
+  "crates/carrick-el1-image/frame_budget.rs",
+  "crates/carrick-el1-linux/src/aarch64_process.rs",
+  "crates/carrick-el1-linux/src/native_process_runtime.rs",
+  "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs",
+  "crates/carrick-el1-linux/src/native_process_runtime/service.rs",
+]
+rationale = "Slice S3c of #1756 moves IPC adapter operation retirement from the ARM-only NativeProcessService::retire_adapter_operation trait hook into the shared NativeProcessEntry::retire_adapter_result owner over self.service.exec_ipc_binding(), deleting the trait default, the ARM override, the host-test Physical override, and the vanished frame-budget symbol. Witness tests in host_test_support.rs (ipc_backing_refusal_retires_the_operation_and_pin, exec_settlement_retires_retained_ipc_operation_and_pin_once, exit_group_settlement_retires_retained_ipc_operation_and_pin_once) exercise the shared retirement path across both ParkedContextWords and Aarch64ParkedContext; host_test_support.rs is not matched by check-contract-change's *_tests.rs filename heuristic."
