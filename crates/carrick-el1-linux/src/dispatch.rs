@@ -3235,8 +3235,10 @@ impl<
             (zone.as_mut(), cur_task, SlotId::from_index(slot))
         {
             let orig_x0 = frame.x[0];
-            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-            let served = sched.serve_futex_operation(frame, &mut operation);
+            let served = {
+                let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
+                sched.serve_futex_operation(frame, &mut operation)
+            };
             let disposition = match served {
                 Ok(served) => served.map_or(ipc::IpcServed::Forward, ipc::IpcServed::from),
                 Err(carrick_core::user_copy::CopyOutcome::Fault) => {
@@ -3357,11 +3359,12 @@ impl<
     }
 
     fn resumes_operation(&self) -> bool {
-        self.zone.as_ref().is_some_and(|zone| {
-            self.frame
-                .slot()
-                .and_then(|slot| zone.tables.slot(slot).current())
-                .is_some_and(|record| zone.tables.record(record).has_object_operation())
+        self.record_source().is_some_and(|source| {
+            source
+                .zone
+                .slot(source.slot)
+                .current()
+                .is_some_and(|record| source.zone.record(record).has_object_operation())
         })
     }
     fn ipc_available(&self) -> bool {
@@ -3495,12 +3498,14 @@ impl<
         let slot = self.frame.slot()?;
         let task = self.current_tasks.get(self.frame.task_index())?;
         let zone = self.zone.as_mut()?;
-        let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
-        let served = super::mm_portal::park_prepared_edit(
-            &mut sched,
-            self.frame.arm_frame()?,
-            memory::reservations::shared_guest(),
-        )?;
+        let served = {
+            let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
+            super::mm_portal::park_prepared_edit(
+                &mut sched,
+                self.frame.arm_frame()?,
+                memory::reservations::shared_guest(),
+            )?
+        };
         Some(
             carrick_personality_linux::dispatch::accounted_scheduler_effect(
                 served,
@@ -3515,13 +3520,15 @@ impl<
         let slot = self.frame.slot()?;
         let task = self.current_tasks.get(self.frame.task_index())?;
         let zone = self.zone.as_mut()?;
-        let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
-        let served = super::mm_portal::park_anonymous_edit(
-            &mut sched,
-            self.frame.arm_frame()?,
-            memory::reservations::shared_guest(),
-            cause,
-        )?;
+        let served = {
+            let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
+            super::mm_portal::park_anonymous_edit(
+                &mut sched,
+                self.frame.arm_frame()?,
+                memory::reservations::shared_guest(),
+                cause,
+            )?
+        };
         Some(
             carrick_personality_linux::dispatch::accounted_scheduler_effect(
                 served,
@@ -3766,8 +3773,13 @@ fn run_with_table_growth<T>(
     }
 }
 
-impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context: DispatchContext>
-    El1PendingFamilies<'_, '_, F, C, U, G, Context>
+impl<
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame,
+    Context: DispatchContext,
+> El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
     fn native_descriptor_namespace(&self) -> NativeDescriptorNamespace {
         let native = self
@@ -3845,14 +3857,14 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         Ok(())
     }
 
-    fn duplicate_owned_ipc(
+    fn duplicate_owned_ipc<Z: carrick_el1_abi::EntryContext>(
         &mut self,
         venue: &ipc::IpcVenue<'_>,
         task: &CurrentTask,
         table: carrick_el1_abi::ipc::fd::TableId,
         file_table: u64,
         request: NativeDupRequest,
-        zone: Option<(&ZoneTables, SlotId)>,
+        zone: Option<(&carrick_sched_core::ZoneTables<Z>, SlotId)>,
     ) -> Result<carrick_el1_abi::ipc::fd::Fd, FamilyCompletion> {
         use super::file_table::HostBindingDupError;
         use carrick_el1_abi::ipc::fd::Error;
@@ -3925,6 +3937,107 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         Ok(new_fd)
     }
 
+    #[inline(never)]
+    fn ipc_poll_transfer_native(&mut self) -> FamilyCompletion {
+        let Some(venue) = self.ipc else {
+            return FamilyCompletion::Forward;
+        };
+        let (Some(source), Some(task)) = (
+            self.record_source(),
+            self.current_tasks.get(self.frame.task_index()),
+        ) else {
+            return FamilyCompletion::Forward;
+        };
+        let counters = self.counters;
+        let orig_arg0 = self.frame.argument(0).unwrap_or(0);
+        let arguments = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
+        let ordinal = self.frame.canonical_ordinal();
+        let pc = self.frame.arm_frame_ref().map_or(0, |frame| frame.elr);
+        if let Some(process) = self.process.as_deref_mut() {
+            process.prepare_object_park();
+        }
+        let presented = self.process.as_deref().map(|owner| owner.binding());
+        let expected = Some(crate::common_entry::execution_binding(task));
+        let mut native_handoff = None;
+        let mut exec = ipc::NativeIpcExecution {
+            source,
+            task,
+            counters,
+            handoff: &mut native_handoff,
+            frame: core::marker::PhantomData,
+        };
+        let mut user = file::OwnerCopy {
+            inner: file::DiagnosedCopy {
+                inner: file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                },
+                diagnostic: file::CopyDiagnostic {
+                    counters,
+                    ordinal,
+                    arguments,
+                    pc,
+                    presented,
+                    expected,
+                },
+            },
+            owner: self.process.as_deref_mut(),
+            wait: None,
+            input_wait: None,
+        };
+        let mut output = None;
+        let disposition = ipc::serve_single_zone_ppoll(
+            &mut exec,
+            &mut *self.frame,
+            venue,
+            &mut user,
+            &mut output,
+        );
+        let input_wait = user.input_wait.take();
+        if let Some(receipt) = native_handoff
+            && let Some(process) = self.process.as_deref_mut()
+        {
+            process.store_handoff_receipt(receipt);
+        }
+        if let Some(request) = input_wait {
+            let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+            return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+        }
+        if let Some(output) = output {
+            let bytes = output.pollfd.revents.to_ne_bytes();
+            return complete_poll_copyout(
+                self.process.as_deref_mut(),
+                task,
+                carrick_guest_arch::UserVa::new(
+                    output.address.0
+                        + core::mem::offset_of!(crate::file_table::PollFd, revents) as u64,
+                ),
+                &bytes,
+                SyscallResult::new(output.result),
+                (
+                    self.counters,
+                    ordinal,
+                    [
+                        orig_arg0,
+                        arguments[1],
+                        arguments[2],
+                        arguments[3],
+                        arguments[4],
+                        arguments[5],
+                    ],
+                    pc,
+                ),
+            );
+        }
+        let result = self.frame.result().0 as i64;
+        carrick_personality_linux::dispatch::transfer_effect(
+            &task.linux,
+            orig_arg0,
+            result,
+            disposition,
+        )
+    }
+
     /// Metadata snapshots retain the exact description until object work is
     /// complete, then release all locks and the pin before owner copyout.
     #[inline(never)]
@@ -3957,10 +4070,8 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         let fd = Fd(self.frame.argument(0).unwrap_or(0) as i32);
         let authority = venue.region.fd(NativeFdWait);
         let zone = self
-            .zone
-            .as_ref()
-            .zip(self.frame.slot())
-            .map(|(z, slot)| (z.tables, slot));
+            .record_source()
+            .map(|source| (source.zone, source.slot));
         let ordinal = self.frame.canonical_ordinal();
         let arg = self.frame.argument(1).unwrap_or(0);
         let value = self.frame.argument(2).unwrap_or(0);
@@ -4182,11 +4293,14 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
         let ordinal = self.frame.canonical_ordinal().raw();
         let old = Fd(self.frame.argument(0).unwrap_or(0) as i32);
-        let zone = self
+        let create_zone = self
             .zone
             .as_ref()
             .zip(self.frame.slot())
             .map(|(z, slot)| (z.tables, slot));
+        let zone = self
+            .record_source()
+            .map(|source| (source.zone, source.slot));
 
         let owner =
             carrick_personality_linux::dispatch::owner_ordinal(self.frame.canonical_ordinal());
@@ -4256,7 +4370,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     backings,
                     cloexec: flags & carrick_syscall_abi::LINUX_O_CLOEXEC != 0,
                 };
-                if let Some((zone, _)) = zone {
+                if let Some((zone, _)) = create_zone {
                     for lane in [
                         carrick_el1_abi::ipc::pipe::WaitFor::Readable,
                         carrick_el1_abi::ipc::pipe::WaitFor::Writable,
@@ -4362,7 +4476,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     IpcBacking::Epoll { object }
                 }
                 .encode();
-                if let Some((zone, _)) = zone {
+                if let Some((zone, _)) = create_zone {
                     for lane in [
                         carrick_el1_abi::ipc::pipe::WaitFor::Readable,
                         carrick_el1_abi::ipc::pipe::WaitFor::Writable,
@@ -4880,6 +4994,9 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
     where
         F: Fn(u32) -> *mut u8,
     {
+        if !self.frame.arm_scheduler() {
+            return self.ipc_poll_transfer_native();
+        }
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
@@ -5190,8 +5307,13 @@ impl<
             .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
 }
-impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context: DispatchContext>
-    El1PendingFamilies<'_, '_, F, C, U, G, Context>
+impl<
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame,
+    Context: DispatchContext,
+> El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
     fn file_access(&self) -> carrick_el1::substrate::file_notification::FileAccess<'_> {
         match (self.zone.as_ref(), self.frame.slot()) {

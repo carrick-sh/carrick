@@ -1949,11 +1949,7 @@ fn zone_pipe_poll_wake_with_affinity(flags: &[&str], affinity: u64) {
     assert_eq!(native.code(), Some(7), "native oracle: {native:?}");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(try_run_pool_fixture_with_root_affinity(
-            &elf,
-            256,
-            affinity,
-        ));
+        let _ = tx.send(try_run_pool_fixture_with_root_affinity(&elf, 256, affinity));
     });
     let outcome = rx
         .recv_timeout(std::time::Duration::from_secs(60))
