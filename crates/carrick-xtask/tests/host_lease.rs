@@ -1348,3 +1348,46 @@ fn signed_accept_starts_its_build_beside_a_shared_holder() {
     assert_eq!(receipt["overall"], "FAIL");
     drop(holder);
 }
+
+/// `accept --profile kvm` (#2013): its host steps boot KVM guests and take no
+/// lease of their own, so the host phase still waits for gate beside a shared
+/// holder; only compile-and-test host phases moved to the shared lease.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn guest_booting_host_accept_waits_for_gate_beside_a_shared_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("host.lock");
+    let holder = HostLease::acquire_path(&lock, HostLeaseMode::Carrick).unwrap();
+    let stderr = dir.path().join("stderr.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .arg("--root")
+        .arg(dir.path())
+        .args(["accept", "--profile", "kvm"])
+        .current_dir(dir.path())
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env_remove(carrick_xtask::signed_phase::PHASE_ENV)
+        .env_remove(carrick_xtask::signed_phase::STATE_ENV)
+        .env("CARRICK_HOST_LEASE_PATH", &lock)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + SIGNED_PHASE_BOUND;
+    loop {
+        let log = std::fs::read_to_string(&stderr).unwrap_or_default();
+        if log.contains("host-lease: waiting for gate") {
+            break;
+        }
+        let exited = child.try_wait().unwrap();
+        if exited.is_some() || std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!("kvm accept did not wait for gate beside a shared holder ({exited:?}): {log}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.kill().ok();
+    child.wait().ok();
+    drop(holder);
+}
