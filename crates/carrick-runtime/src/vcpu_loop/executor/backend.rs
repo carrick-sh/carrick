@@ -1079,6 +1079,11 @@ pub(super) fn finish_native_service(
         service.serve_host_file()?
     } else if matches!(
         service.request().operation,
+        carrick_core_abi::service::ServiceOperation::Clock { .. }
+    ) {
+        service.serve_clock()?
+    } else if matches!(
+        service.request().operation,
         carrick_core_abi::service::ServiceOperation::Entropy { .. }
     ) {
         service.serve_entropy(|record| {

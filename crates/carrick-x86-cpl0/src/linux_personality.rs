@@ -1186,6 +1186,27 @@ impl Personality for LinuxPersonality {
                     _ => fatal_boot(),
                 };
             }
+            if route == CompletionRoute::NativeService
+                && let Some(clock) =
+                    carrick_personality_linux::clock::ClockCall::from_canonical(call.canonical)
+            {
+                use carrick_el1_linux::native_process_runtime::NativeResume;
+                // The ring planned this reading; the sample crosses once for
+                // the container's clock domain and is copied out by the
+                // exact-MM owner, as ARM does from the same `begin_clock_call`.
+                route = match process.begin_clock_call(
+                    clock,
+                    [call.args[0], call.args[1]],
+                    carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                ) {
+                    Ok(NativeResume::Left(None)) => CompletionRoute::Suspended,
+                    Ok(NativeResume::Returned(result)) => {
+                        frame.rax = result.raw() as u64;
+                        CompletionRoute::Served
+                    }
+                    _ => fatal_boot(),
+                };
+            }
             if let Some(venue) = anonymous.as_mut()
                 && venue.take_retry()
             {

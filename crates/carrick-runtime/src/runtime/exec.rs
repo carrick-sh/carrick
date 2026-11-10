@@ -296,6 +296,16 @@ impl carrick_hal::native_exec::NativeExecHostService<carrick_vmm_hvf::trap::Gues
             .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)
     }
 
+    fn serve_clock(
+        &self,
+        record: &mut [u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES],
+    ) -> Result<(), carrick_core_abi::clock::ClockRecordError> {
+        // The loader capability retains the container's own clock domain, so
+        // virtual-time policy and `clock_settime` agree with the root's reads.
+        carrick_kernel::clock_service::ClockResourceService::new(Arc::clone(&self.loader.clock))
+            .serve_record(record)
+    }
+
     /// The host-served root's live cwd and root, read once for a child the
     /// stopped root is forking (#1392). The root's chdir and chroot are
     /// served by this run's dispatcher, so its filesystem context is the
