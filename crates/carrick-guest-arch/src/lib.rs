@@ -1173,3 +1173,18 @@ mod sgi_encoding_tests {
         assert_eq!(crate::sgi_target_of(0xff), (1 << 15) | (15 << 44));
     }
 }
+
+#[cfg(test)]
+mod asid_tests {
+    use super::Asid;
+
+    #[test]
+    fn x86_untagged_is_its_own_identity_no_allocator_value_aliases() {
+        assert!(Asid::x86_untagged().is_x86_untagged());
+        assert!(!Asid::first().is_x86_untagged());
+        for raw in [1_u16, 2, 47, u16::MAX - 1] {
+            let asid = Asid::from_registry_allocation(core::num::NonZeroU16::new(raw).unwrap());
+            assert!(!asid.is_x86_untagged());
+        }
+    }
+}

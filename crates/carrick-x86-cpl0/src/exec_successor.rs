@@ -202,3 +202,431 @@ where
         self.machine.cross_settle(predecessor_mm, successor_mm)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use carrick_core_abi::service::{
+        ExecSuccessorBacking, ExecSuccessorEntry, ServiceBirth, ServiceOrigin,
+    };
+    use carrick_core_abi::{
+        El1MmHandle, EntryThreadGeneration, ReservationRange, SnapshotGeneration,
+    };
+    use carrick_el1_abi::NativeExecAdoption;
+    use carrick_el1_linux::mm_portal::test_support::{NoPin, Region};
+    use carrick_guest_arch::{Asid, FrameGpa, UserVa};
+    use carrick_sched_core::object_wait::OwnedObjectWakeEffects;
+    use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
+    use carrick_sched_core::{RecordId, RecordRef, Waker};
+    use core::cell::Cell;
+    use core::num::NonZeroI32;
+
+    struct TestVenue;
+    fn deliver(
+        _zone: &ZoneTables<ParkedContextWords>,
+        _waker: Waker,
+        effects: OwnedObjectWakeEffects<'_, ParkedContextWords>,
+    ) {
+        let _ = effects.deliver_handbacks(&mut |_| {});
+    }
+    impl OwnerVenue<ParkedContextWords> for TestVenue {
+        fn space_access(
+            zone: &ZoneTables<ParkedContextWords>,
+            slot: SlotId,
+        ) -> carrick_sched_core::spaces::notification::SpaceAccess<'_, ParkedContextWords> {
+            carrick_core::wait::space_access(zone, slot, deliver)
+        }
+        fn deliver_completion(
+            zone: &ZoneTables<ParkedContextWords>,
+            slot: SlotId,
+            effects: OwnedObjectWakeEffects<'_, ParkedContextWords>,
+        ) {
+            deliver(zone, Waker::El1 { slot }, effects);
+        }
+        fn encode_error(_: carrick_core::mm::transaction::MmError) -> u32 {
+            1
+        }
+        fn cancelled_copy_code() -> u32 {
+            1
+        }
+    }
+
+    /// The stopped host's answers. `accept` mirrors the carrier: on an
+    /// accepted adoption it binds the successor's root into its closed space
+    /// (the BIND service) before replying.
+    struct Machine<'a> {
+        zone: &'a ZoneTables<ParkedContextWords>,
+        accept: Cell<bool>,
+        adopt_crossings: Cell<u32>,
+        cancel_crossings: Cell<u32>,
+        settles: Cell<u32>,
+        parked: Cell<u32>,
+        admitted: Cell<Option<Mm>>,
+        retired_context: Cell<Option<Mm>>,
+        bind: Cell<Option<(u64, u64)>>,
+    }
+    impl X86ExecMachine for Machine<'_> {
+        fn cross_adopt(&self, record: u64) -> Result<(), NativeProcessError> {
+            self.adopt_crossings.set(self.adopt_crossings.get() + 1);
+            // SAFETY: the adopter's record lives on its stack for the whole
+            // synchronous crossing.
+            let record = unsafe { &mut *(record as *mut NativeExecAdoption) };
+            let request = record.claim().ok_or(NativeProcessError::Invalid)?;
+            if let (true, Some((mm, root))) = (self.accept.get(), self.bind.get()) {
+                let index = self.zone.spaces.find(mm).unwrap();
+                assert!(self.zone.spaces.bind_initial_root(index, mm, root, root));
+                request.accept();
+            } else {
+                request.refuse();
+            }
+            Ok(())
+        }
+        fn cross_cancel(&self, record: u64) -> Result<(), NativeProcessError> {
+            self.cancel_crossings.set(self.cancel_crossings.get() + 1);
+            // SAFETY: as for `cross_adopt`.
+            let record = unsafe { &mut *(record as *mut carrick_el1_abi::NativeExecCancellation) };
+            if self.accept.get() {
+                assert!(record.accept());
+            } else {
+                assert!(record.refuse());
+            }
+            Ok(())
+        }
+        fn cross_settle(
+            &self,
+            _: ReservationMm,
+            _: ReservationMm,
+        ) -> Result<(), NativeProcessError> {
+            self.settles.set(self.settles.get() + 1);
+            Ok(())
+        }
+        fn park_on_maintenance_root(&self) -> bool {
+            self.parked.set(self.parked.get() + 1);
+            true
+        }
+        fn admit_context(&self, address: Mm) -> bool {
+            self.admitted.set(Some(address));
+            true
+        }
+        fn retire_context(&self, address: Mm) -> bool {
+            self.retired_context.set(Some(address));
+            true
+        }
+    }
+
+    const PREDECESSOR: u64 = 11;
+    const SUCCESSOR: u64 = 12;
+    const ROOT: u64 = 0x90_0000;
+
+    struct Fixture {
+        region: Region,
+        retired: RetiredSpaces,
+        slot: SlotId,
+    }
+    impl Fixture {
+        fn zone(&self) -> &ZoneTables<ParkedContextWords> {
+            // SAFETY: the retained aligned region owns the zero-valid zone at
+            // its real CPL0 offset for the fixture's life.
+            unsafe {
+                &*self
+                    .region
+                    .ptr
+                    .as_ptr()
+                    .add(carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize)
+                    .cast()
+            }
+        }
+        fn roots(&self) -> &X86Cpl0Reservations {
+            // SAFETY: as for `zone`.
+            unsafe {
+                &*self
+                    .region
+                    .ptr
+                    .as_ptr()
+                    .add(carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
+                    .cast()
+            }
+        }
+        fn new() -> Self {
+            let fixture = Self {
+                region: Region::new(),
+                retired: RetiredSpaces::new(),
+                slot: SlotId::new(0),
+            };
+            // The installed predecessor: a published, admitted, open space
+            // running on the slot.
+            let mm = ReservationMm::new(PREDECESSOR).unwrap();
+            let index = fixture
+                .zone()
+                .spaces
+                .publish_closed(PREDECESSOR, 0x6000, 0)
+                .unwrap();
+            fixture
+                .roots()
+                .publish(index.index(), mm, layout())
+                .unwrap();
+            let portal: MmPortal<'_, NoPin, _, _, TestVenue, X86Mmu, ParkedContextWords> =
+                MmPortal::for_zone(NonZeroU64::MIN, fixture.roots(), fixture.zone())
+                    .with_mmu(X86Mmu);
+            portal.root_any(mm, 0).unwrap().finish_import().unwrap();
+            TestVenue::space_access(fixture.zone(), fixture.slot).open(index);
+            assert!(
+                fixture
+                    .zone()
+                    .install_space(fixture.slot, PREDECESSOR)
+                    .is_some()
+            );
+            fixture
+        }
+        fn machine(&self, accept: bool) -> Machine<'_> {
+            Machine {
+                zone: self.zone(),
+                accept: Cell::new(accept),
+                adopt_crossings: Cell::new(0),
+                cancel_crossings: Cell::new(0),
+                settles: Cell::new(0),
+                parked: Cell::new(0),
+                admitted: Cell::new(None),
+                retired_context: Cell::new(None),
+                bind: Cell::new(Some((SUCCESSOR, ROOT))),
+            }
+        }
+        fn exec<'a>(
+            &'a self,
+            machine: Machine<'a>,
+        ) -> X86ExecSuccessor<'a, NoPin, TestVenue, Machine<'a>> {
+            X86ExecSuccessor {
+                zone: self.zone(),
+                roots: self.roots(),
+                retired: &self.retired,
+                carrier: NonZeroU64::MIN,
+                slot: self.slot,
+                cpus: 1,
+                machine,
+                marker: core::marker::PhantomData,
+            }
+        }
+        fn predecessor_intact(&self) {
+            assert_eq!(self.zone().installed_space(self.slot), PREDECESSOR);
+            assert!(self.zone().spaces.is_open(PREDECESSOR));
+            assert!(self.retired.is_empty());
+        }
+    }
+
+    fn layout() -> carrick_el1::memory::reservations::Layout {
+        carrick_el1::memory::reservations::Layout {
+            heap: ReservationRange::new(0x20_0000, 0x30_0000).unwrap(),
+            arena: ReservationRange::new(0x4000_0000, 0x4400_0000).unwrap(),
+            brk: 0x20_0000,
+            address_limit: u64::MAX,
+            data_limit: u64::MAX,
+            external_address_bytes: 0,
+            external_data_bytes: 0,
+        }
+    }
+
+    fn identity() -> ServiceIdentity {
+        ServiceIdentity {
+            birth: ServiceBirth {
+                origin: ServiceOrigin::Initial,
+                process: TaskKey {
+                    id: TaskId::from_registry_allocation(NonZeroI32::new(7).unwrap()),
+                    serial: TaskSerial::from_registry_allocation(NonZeroU64::new(11).unwrap()),
+                },
+                thread: EntryThreadGeneration::from_raw(13),
+                record: RecordRef {
+                    id: RecordId::from_raw(7).unwrap(),
+                    incarnation: 17,
+                },
+                // SAFETY: a synthetic handle for a VM-free fixture.
+                mm: unsafe {
+                    El1MmHandle::from_admitted_owner(
+                        NonZeroU64::MIN,
+                        ReservationMm::new(PREDECESSOR).unwrap(),
+                        NonZeroU64::new(23).unwrap(),
+                    )
+                },
+            },
+            execution: SnapshotGeneration::from_raw(29),
+            sequence: NonZeroU64::new(31).unwrap(),
+        }
+    }
+
+    fn receipt() -> ExecAdoptionReceipt {
+        ExecAdoptionReceipt::checked(NonZeroU64::new(41).unwrap()).unwrap()
+    }
+
+    fn manifest(
+        generation: NonZeroU64,
+        asid: Asid,
+        asid_generation: NonZeroU64,
+        entry: u64,
+    ) -> ExecSuccessorManifest {
+        ExecSuccessorManifest::propose(
+            identity(),
+            ReservationMm::new(SUCCESSOR).unwrap(),
+            generation,
+        )
+        .seal(
+            identity(),
+            receipt(),
+            ExecSuccessorBacking {
+                root: RootGpa::page_aligned(FrameGpa::new(ROOT)).unwrap(),
+                asid,
+                asid_generation,
+            },
+            ExecSuccessorEntry {
+                entry: UserVa::new(entry),
+                stack_pointer: UserVa::new(0x7fff_f000),
+            },
+        )
+        .unwrap()
+    }
+
+    fn sealed(generation: NonZeroU64) -> ExecSuccessorManifest {
+        manifest(generation, Asid::x86_untagged(), generation, 0x40_1000)
+    }
+
+    #[test]
+    fn adopts_a_sealed_successor_and_switches_the_slot_at_finish() {
+        let fixture = Fixture::new();
+        let exec = fixture.exec(fixture.machine(true));
+        let slot = exec
+            .prepare_slot(ReservationMm::new(SUCCESSOR).unwrap())
+            .unwrap();
+        let manifest = sealed(slot.root_generation());
+        slot.prepare_adoption().unwrap();
+
+        let adopted = exec.adopt(identity(), receipt(), &manifest).unwrap();
+        slot.commit();
+        assert_eq!(exec.machine.adopt_crossings.get(), 1);
+        // Entry state is the sealed rip/rsp under the successor's cr3.
+        assert_eq!(adopted.words.user_rip(), 0x40_1000);
+        assert_eq!(adopted.words.user_rsp(), 0x7fff_f000);
+        assert!(adopted.words.authenticates(adopted.address));
+        assert_eq!(adopted.address.root.address().raw(), ROOT);
+        // The predecessor keeps running until the graph publishes the
+        // successor; adoption alone installs nothing.
+        fixture.predecessor_intact();
+
+        let predecessor = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x6000)).unwrap(),
+            mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(PREDECESSOR).unwrap()),
+            generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
+        exec.finish(predecessor, adopted.address).unwrap();
+        assert_eq!(fixture.zone().installed_space(fixture.slot), SUCCESSOR);
+        assert!(fixture.zone().spaces.is_open(SUCCESSOR));
+        assert!(!fixture.zone().spaces.is_open(PREDECESSOR));
+        assert_eq!(exec.machine.settles.get(), 1);
+        assert_eq!(exec.machine.parked.get(), 1);
+        assert_eq!(exec.machine.admitted.get(), Some(adopted.address));
+        assert_eq!(exec.machine.retired_context.get(), Some(predecessor));
+    }
+
+    #[test]
+    fn refuses_every_asid_but_the_untagged_one_before_the_crossing() {
+        for (asid, asid_generation) in [
+            // Another ISA's tag, with a matching generation.
+            (Asid::first(), None),
+            (
+                Asid::from_registry_allocation(core::num::NonZeroU16::new(47).unwrap()),
+                None,
+            ),
+            // The untagged value with a generation that is not the root's.
+            (Asid::x86_untagged(), Some(NonZeroU64::new(0x1234).unwrap())),
+        ] {
+            let fixture = Fixture::new();
+            let exec = fixture.exec(fixture.machine(true));
+            let slot = exec
+                .prepare_slot(ReservationMm::new(SUCCESSOR).unwrap())
+                .unwrap();
+            let generation = slot.root_generation();
+            let manifest = manifest(
+                generation,
+                asid,
+                asid_generation.unwrap_or(generation),
+                0x40_1000,
+            );
+            slot.prepare_adoption().unwrap();
+
+            assert!(matches!(
+                exec.adopt(identity(), receipt(), &manifest),
+                Err(NativeProcessError::Stale)
+            ));
+            // Refused before the consuming crossing: the receipt is unspent,
+            // the old image is untouched and the successor is still unbound.
+            assert_eq!(exec.machine.adopt_crossings.get(), 0);
+            fixture.predecessor_intact();
+            let index = fixture.zone().spaces.find(SUCCESSOR).unwrap();
+            assert_eq!(
+                fixture.zone().spaces.closed_root_identity(index, SUCCESSOR),
+                None
+            );
+            // The rolled-back slot retires the successor's space.
+            drop(slot);
+            assert!(fixture.zone().spaces.find(SUCCESSOR).is_none());
+            fixture.predecessor_intact();
+        }
+    }
+
+    #[test]
+    fn refuses_an_entry_state_no_user_return_can_enter() {
+        let fixture = Fixture::new();
+        let exec = fixture.exec(fixture.machine(true));
+        let slot = exec
+            .prepare_slot(ReservationMm::new(SUCCESSOR).unwrap())
+            .unwrap();
+        let generation = slot.root_generation();
+        let manifest = manifest(generation, Asid::x86_untagged(), generation, 1 << 47);
+        assert!(matches!(
+            exec.adopt(identity(), receipt(), &manifest),
+            Err(NativeProcessError::Stale)
+        ));
+        assert_eq!(exec.machine.adopt_crossings.get(), 0);
+        fixture.predecessor_intact();
+    }
+
+    #[test]
+    fn a_host_refusal_rolls_back_leaving_the_old_image_installed() {
+        let fixture = Fixture::new();
+        let exec = fixture.exec(fixture.machine(false));
+        let slot = exec
+            .prepare_slot(ReservationMm::new(SUCCESSOR).unwrap())
+            .unwrap();
+        let manifest = sealed(slot.root_generation());
+        assert!(matches!(
+            exec.adopt(identity(), receipt(), &manifest),
+            Err(NativeProcessError::Stale)
+        ));
+        assert_eq!(exec.machine.adopt_crossings.get(), 1);
+        fixture.predecessor_intact();
+        drop(slot);
+        assert!(fixture.zone().spaces.find(SUCCESSOR).is_none());
+        fixture.predecessor_intact();
+    }
+
+    #[test]
+    fn cancel_spends_the_receipt_and_the_dropped_slot_frees_the_successor() {
+        let fixture = Fixture::new();
+        let exec = fixture.exec(fixture.machine(true));
+        let slot = exec
+            .prepare_slot(ReservationMm::new(SUCCESSOR).unwrap())
+            .unwrap();
+        assert!(fixture.zone().spaces.find(SUCCESSOR).is_some());
+        exec.cancel(receipt()).unwrap();
+        assert_eq!(exec.machine.cancel_crossings.get(), 1);
+        drop(slot);
+        assert!(fixture.zone().spaces.find(SUCCESSOR).is_none());
+        fixture.predecessor_intact();
+
+        // A refused cancellation is reported, never swallowed.
+        let exec = fixture.exec(fixture.machine(false));
+        assert!(matches!(
+            exec.cancel(receipt()),
+            Err(NativeProcessError::Stale)
+        ));
+        fixture.predecessor_intact();
+    }
+}
