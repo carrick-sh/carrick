@@ -10489,3 +10489,94 @@ fn native_zone_poll_signal_before_enrolment_completes_eintr_and_delivers_once() 
         "retiring the adapter token must release the pinned reader description"
     );
 }
+
+#[cfg(test)]
+struct ResidentUser;
+
+#[cfg(test)]
+impl crate::file::MemoryValidator for ResidentUser {
+    fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+        len
+    }
+    fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+        len
+    }
+}
+
+/// The x86 CPL0 `NativeService` completion arm's production body, driven with
+/// an admitted native fork child and the registered root: a child's
+/// `execve`/`execveat` takes native-service staging and settles with a counted
+/// ENOSYS, a root's takes the fallback counted refusal, and neither is
+/// forwarded to the host.
+#[test]
+#[cfg(test)]
+fn x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root() {
+    use crate::dispatch::{NativeServiceSettlement, settle_unwired_native_service};
+    use carrick_guest_arch::NativeOrdinal;
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let (child, _, _) = capacity.select().unwrap();
+    let fixture = &capacity.fixture;
+    let root = fixture.record;
+    assert!(fixture.registry.record_is_fork_child(fixture.zone, child));
+    assert!(!fixture.registry.record_is_fork_child(fixture.zone, root));
+
+    let path = b"/bin/static\0";
+    let arg = b"static\0";
+    let env = b"A=B\0";
+    let argv: [u64; 2] = [arg.as_ptr() as u64, 0];
+    let envp: [u64; 2] = [env.as_ptr() as u64, 0];
+    let (path, argv, envp) = (
+        path.as_ptr() as u64,
+        argv.as_ptr() as u64,
+        envp.as_ptr() as u64,
+    );
+    for (native, canonical, args) in [
+        (59, 221, [path, argv, envp, 0, 0, 0]),
+        (322, 281, [(-100i64) as u64, path, argv, envp, 0, 0]),
+    ] {
+        // The x86 route table hands this exec to the native service; without
+        // that arm the call is refused before any completion runs.
+        assert_eq!(
+            carrick_personality_linux::dispatch::route_x86(canonical, u64::MAX),
+            carrick_personality_linux::dispatch::Family::NativeService,
+            "native {native}: x86 routes exec to the native service"
+        );
+        let ordinal = NativeOrdinal::new(native);
+        let bucket = native as usize;
+        let settle = |record, counters: &carrick_el1_abi::Counters| {
+            settle_unwired_native_service(
+                fixture.registry,
+                fixture.zone,
+                Some(record),
+                canonical,
+                args,
+                ordinal,
+                fixture.task,
+                &ResidentUser,
+                counters,
+            )
+        };
+
+        let counters = carrick_el1_abi::Counters::new();
+        assert_eq!(
+            settle(child, &counters),
+            NativeServiceSettlement::ExecStaged(-38),
+            "native {native}: a fork child's exec stages and settles"
+        );
+        assert_eq!(counters.refused[bucket].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.refused_child[bucket].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.forwarded[bucket].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.venue_refused[bucket].load(Ordering::Relaxed), 0);
+
+        let counters = carrick_el1_abi::Counters::new();
+        assert_eq!(
+            settle(root, &counters),
+            NativeServiceSettlement::Refused(-38),
+            "native {native}: a root's exec keeps the counted refusal"
+        );
+        assert_eq!(counters.refused[bucket].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.refused_child[bucket].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.forwarded[bucket].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.venue_refused[bucket].load(Ordering::Relaxed), 0);
+    }
+}
