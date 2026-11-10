@@ -870,7 +870,7 @@ else:
     assert!(!publish("failure").status.success());
     std::fs::write(results.join("identity.json"), "{}").unwrap();
     assert!(!publish("success").status.success());
-    std::fs::remove_file(candidate_path).unwrap();
+    std::fs::remove_file(&candidate_path).unwrap();
     assert!(!publish("failure").status.success());
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(&posts)
         .unwrap()
@@ -884,6 +884,37 @@ else:
             .unwrap()
             .contains("No valid comparison")
     );
+    // A failed (not cancelled) job with no candidate is still a FAIL.
+    let body = std::fs::read_to_string(results.join("comment.md")).unwrap();
+    assert!(body.starts_with("Signed gate: **FAIL**"), "{body}");
+
+    // A cancelled run that never produced a candidate has no verdict to
+    // report, but still must not pass the required check.
+    let cancelled = publish("cancelled");
+    assert!(!cancelled.status.success());
+    let body = std::fs::read_to_string(results.join("comment.md")).unwrap();
+    assert!(
+        body.starts_with("Signed gate: **CANCELLED — no verdict**"),
+        "{body}"
+    );
+    assert!(!body.contains("**FAIL**"), "{body}");
+    assert!(!body.contains("No valid comparison"), "{body}");
+    assert!(body.contains("actions/runs/200"), "{body}");
+    assert!(body.contains(&format!("`{b}`")), "{body}");
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&posts)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows[rows.len() - 2]["body"]["state"], "failure");
+
+    // Cancelled but with a candidate: the normal path, never "no verdict".
+    std::fs::write(&candidate_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+    assert!(!publish("cancelled").status.success());
+    let body = std::fs::read_to_string(results.join("comment.md")).unwrap();
+    assert!(!body.contains("no verdict"), "{body}");
+    assert!(body.contains("Execution job: `cancelled`"), "{body}");
+    std::fs::remove_file(&candidate_path).unwrap();
 
     // The main reseed path uses the same gate, without needing a previous base.
     std::fs::write(&event, json!({"repository":{"full_name":"carrick-sh/carrick"},"ref":"refs/heads/main","deleted":false,"after":a.clone()}).to_string()).unwrap();
