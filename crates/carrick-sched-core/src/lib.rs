@@ -2026,6 +2026,14 @@ pub struct HostPlacement {
     pub resched: bool,
 }
 
+/// Where [`ZoneTables::place_host_handback`] queued a record.
+#[derive(Clone, Copy, Debug)]
+pub struct HostHandback {
+    pub placement: HostPlacement,
+    /// The record has no home slot: any live eligible driver may take it.
+    pub homeless: bool,
+}
+
 /// A carrier-scoped zone a host thread can wake into. A carrier whose zone
 /// lives in its own guest RAM (not the process-global tables) registers one
 /// with its host IPC owner, so host-side object releases (exit drains)
@@ -2036,7 +2044,16 @@ pub trait CarrierZoneWake<C: Copy + Send + Sync + zerocopy::FromZeros>: Send + S
     /// Force a reschedule interrupt at `slot`'s guest CPU (the ISA
     /// mechanic). A stopped CPU takes it when it next enters the guest.
     fn resched(&self, slot: SlotId);
+    /// The first reschedule this carrier could not deliver since last asked.
+    /// The wake's record stays queued, but a halted CPU only runs it if the
+    /// interrupt arrives, so the owner of the release must surface this.
+    fn take_undelivered(&self) -> Option<WakeUndelivered>;
 }
+
+/// A carrier reschedule the ISA mechanic could not deliver (for example a
+/// missing APIC route or a failed MSI). A broken invariant, never contention.
+#[derive(Debug)]
+pub struct WakeUndelivered(pub &'static str);
 
 /// Terminal release owns both alternatives until the scheduler decides.
 /// `rollback` runs only after the OnCpu-to-Queued CAS succeeds, under the
@@ -4879,6 +4896,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.place_from_claim(record.id, from).or_else(|| {
             let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
             self.requeue_from_claim(owner, record.id, from)
+        })
+    }
+
+    /// Place a record the host holds with no guest CPU able to take it: its
+    /// native handback if it owes one, else a queue on its owner's slot for
+    /// that slot's driver. `None` when the incarnation retired or another
+    /// owner settled the record, leaving nothing to deliver.
+    pub fn place_host_handback(&self, record: RecordRef) -> Option<HostHandback> {
+        let rec = self.live(record)?;
+        let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
+        let placement = self
+            .place_native_handback(record)
+            .or_else(|| self.requeue_on(owner, record.id))?;
+        Some(HostHandback {
+            placement,
+            homeless: rec.home().is_none(),
         })
     }
 
