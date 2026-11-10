@@ -1684,7 +1684,7 @@ fn run_on_host(
 /// shared `carrick` lease; only guest execution holds exclusive `gate`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcceptStage {
-    /// The host phase alone: compilation and host tests.
+    /// The host phase alone (see [`host_phase_lease`]).
     HostOnly,
     /// The signed run's build phase (and the host phase of `--phase all`).
     Build,
@@ -1693,21 +1693,35 @@ enum AcceptStage {
 }
 
 impl AcceptStage {
-    fn lease_mode(self) -> HostLeaseMode {
+    fn lease_mode(self, profile: AcceptProfile) -> HostLeaseMode {
         match self {
-            Self::HostOnly | Self::Build => HostLeaseMode::Carrick,
+            Self::HostOnly => host_phase_lease(profile),
+            Self::Build => HostLeaseMode::Carrick,
             Self::Execute => HostLeaseMode::Gate,
         }
     }
 }
 
-/// The lease the CLI takes around a top-level `accept` (#2013). The host
-/// phase is build work under `carrick`. Signed runs take no outer lease: the
-/// signed-phase driver takes `carrick` for their build and `gate` for their
-/// guest execution, one after the other.
-pub fn cli_lease(phase: AcceptPhase) -> Option<HostLeaseMode> {
+/// The lease a profile's host phase needs. The `kvm` and `el1-native` host
+/// steps (`just test-kvm`, `just test-el1-native`) boot guests and take no
+/// lease of their own, so they execute under `gate`. Every other host phase
+/// is compilation and host tests, build work under `carrick` (#2013).
+pub fn host_phase_lease(profile: AcceptProfile) -> HostLeaseMode {
+    match profile {
+        AcceptProfile::Kvm | AcceptProfile::El1Native => HostLeaseMode::Gate,
+        AcceptProfile::LinuxPortable | AcceptProfile::NoDocker | AcceptProfile::Full => {
+            HostLeaseMode::Carrick
+        }
+    }
+}
+
+/// The lease the CLI takes around a top-level `accept` (#2013): the host
+/// phase's lease, or none for a signed run, whose signed-phase driver takes
+/// `carrick` for the build and then `gate` for guest execution, one after
+/// the other.
+pub fn cli_lease(profile: AcceptProfile, phase: AcceptPhase) -> Option<HostLeaseMode> {
     match phase {
-        AcceptPhase::Host => Some(HostLeaseMode::Carrick),
+        AcceptPhase::Host => Some(host_phase_lease(profile)),
         AcceptPhase::Signed | AcceptPhase::All => None,
     }
 }
@@ -2039,8 +2053,8 @@ fn run_inner(
     // remote-accept holds its checkout lock first. This stage's lease spans
     // its own work, scoped cleanup and, when it publishes, the receipt.
     crate::host_load::check().map_err(|e| AcceptError::Failed(e.to_string()))?;
-    let lease =
-        HostLease::acquire(stage.lease_mode()).map_err(|e| AcceptError::Failed(e.to_string()))?;
+    let lease = HostLease::acquire(stage.lease_mode(args.profile))
+        .map_err(|e| AcceptError::Failed(e.to_string()))?;
     let host_load = crate::host_load::check().map_err(|e| AcceptError::Failed(e.to_string()))?;
     let repo_info =
         crate::cli::resolve_repo_info(root_arg).map_err(|e| AcceptError::Git(e.to_string()))?;
@@ -2855,12 +2869,44 @@ mod tests {
     /// execution stage, which runs guests, holds `gate`.
     #[test]
     fn signed_accept_holds_gate_only_for_guest_execution() {
-        assert_eq!(cli_lease(AcceptPhase::Host), Some(HostLeaseMode::Carrick));
-        assert_eq!(cli_lease(AcceptPhase::Signed), None);
-        assert_eq!(cli_lease(AcceptPhase::All), None);
-        assert_eq!(AcceptStage::HostOnly.lease_mode(), HostLeaseMode::Carrick);
-        assert_eq!(AcceptStage::Build.lease_mode(), HostLeaseMode::Carrick);
-        assert_eq!(AcceptStage::Execute.lease_mode(), HostLeaseMode::Gate);
+        for profile in [
+            AcceptProfile::LinuxPortable,
+            AcceptProfile::NoDocker,
+            AcceptProfile::Full,
+        ] {
+            assert_eq!(
+                cli_lease(profile, AcceptPhase::Host),
+                Some(HostLeaseMode::Carrick)
+            );
+            assert_eq!(
+                AcceptStage::HostOnly.lease_mode(profile),
+                HostLeaseMode::Carrick
+            );
+        }
+        // These host phases boot guests (KVM, EL1-native): gate, as before.
+        for profile in [AcceptProfile::Kvm, AcceptProfile::El1Native] {
+            assert_eq!(
+                cli_lease(profile, AcceptPhase::Host),
+                Some(HostLeaseMode::Gate)
+            );
+            assert_eq!(
+                AcceptStage::HostOnly.lease_mode(profile),
+                HostLeaseMode::Gate
+            );
+        }
+        assert_eq!(
+            cli_lease(AcceptProfile::NoDocker, AcceptPhase::Signed),
+            None
+        );
+        assert_eq!(cli_lease(AcceptProfile::NoDocker, AcceptPhase::All), None);
+        assert_eq!(
+            AcceptStage::Build.lease_mode(AcceptProfile::NoDocker),
+            HostLeaseMode::Carrick
+        );
+        assert_eq!(
+            AcceptStage::Execute.lease_mode(AcceptProfile::NoDocker),
+            HostLeaseMode::Gate
+        );
     }
 
     #[test]
