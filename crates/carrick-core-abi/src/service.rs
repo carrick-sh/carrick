@@ -17,6 +17,14 @@ impl ExecCapabilityId {
     pub const fn new(raw: NonZeroU64) -> Self {
         Self(raw)
     }
+    /// The capability of the native process tree led by the host-served
+    /// root task with registry `serial`. The carrier mints it at launch and
+    /// the ring derives it at root admission. Exec keeps the task and its
+    /// serial but replaces its descriptor table, so a table id would name a
+    /// retired capability for every child forked after a root exec (#936).
+    pub const fn of_root_task(serial: carrick_sched_core::process::TaskSerial) -> Self {
+        Self(serial.nonzero())
+    }
     pub const fn raw(self) -> NonZeroU64 {
         self.0
     }

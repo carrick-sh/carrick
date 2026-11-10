@@ -448,6 +448,14 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         }
         Ok(())
     }
+    fn copy_syscall_output(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        self.copy_owned_bytes(mm, address, bytes)
+    }
     fn copy_owned_bytes(
         &mut self,
         mm: &Self::Mm,
@@ -662,8 +670,11 @@ impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
         process_birth: carrick_core_abi::BirthSerial,
         make_words: fn(AddressContext<RootGpa>) -> C,
     ) -> Self {
-        let fixture =
-            Self::with_identity_for::<B>(true, |_| (binding, process, process_birth), make_words);
+        let fixture = Self::with_identity_for::<B>(
+            true,
+            |_| (binding, process, process_birth, 5),
+            make_words,
+        );
         fixture.runtime.give_fixture_root_a_cwd();
         fixture
     }
@@ -676,6 +687,7 @@ impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
             ExecutionBinding,
             carrick_core_abi::EntryTaskKey,
             carrick_core_abi::BirthSerial,
+            u64,
         ),
         make_words: fn(AddressContext<RootGpa>) -> C,
     ) -> Self {
@@ -687,7 +699,7 @@ impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
             assert!(!ptr.is_null());
             Box::leak(Box::from_raw(ptr))
         };
-        let (binding, process, process_birth) = identity(zone);
+        let (binding, process, process_birth, file_table) = identity(zone);
         let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
         let control = Box::leak(Box::new(ThreadControlSlot::new()));
         let child_page = Box::leak(Box::new(ThreadLifecyclePage::new()));
@@ -701,7 +713,7 @@ impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(tid as i32),
             binding.generation,
-            5,
+            file_table,
         );
         task.mm.key.store(mm, Ordering::Release);
         task.mm
@@ -735,7 +747,7 @@ impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
                 tid,
                 serial: binding.thread_generation.raw(),
                 mm,
-                file_table: 5,
+                file_table,
                 generation: binding.generation.raw(),
                 affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
@@ -835,7 +847,7 @@ impl NativeSignalFixture {
         process: carrick_core_abi::EntryTaskKey,
         process_birth: carrick_core_abi::BirthSerial,
     ) -> Self {
-        Self::with_identity(true, |_| (binding, process, process_birth))
+        Self::with_identity(true, |_| (binding, process, process_birth, 5))
     }
 
     /// Admit the identities established by production bootstrap without seeding
@@ -849,7 +861,32 @@ impl NativeSignalFixture {
             carrick_core_abi::BirthSerial,
         ),
     ) -> Self {
+        Self::with_identity(false, |zone| {
+            let (binding, process, birth) = identity(zone);
+            (binding, process, birth, 5)
+        })
+    }
+
+    /// [`Self::from_bootstrap`] that also names the root's published
+    /// descriptor table, as the carrier publishes it for the root's current
+    /// image (an exec replaces it).
+    pub fn from_bootstrap_with_file_table(
+        identity: impl FnOnce(
+            &'static ZoneTables<ParkedContextWords>,
+        ) -> (
+            ExecutionBinding,
+            carrick_core_abi::EntryTaskKey,
+            carrick_core_abi::BirthSerial,
+            u64,
+        ),
+    ) -> Self {
         Self::with_identity(false, identity)
+    }
+
+    /// The exec capability every exec and root fork seed of this admitted
+    /// tree names.
+    pub fn exec_capability(&self) -> Option<carrick_core_abi::service::ExecCapabilityId> {
+        self.runtime.exec_capability()
     }
 
     fn with_identity(
@@ -860,6 +897,7 @@ impl NativeSignalFixture {
             ExecutionBinding,
             carrick_core_abi::EntryTaskKey,
             carrick_core_abi::BirthSerial,
+            u64,
         ),
     ) -> Self {
         Self::with_identity_for::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(seed, identity, words)
@@ -5067,29 +5105,43 @@ fn parent_reaps_then_execs_child(namespace_census: bool) {
                 None,
                 |_| core::ptr::null_mut(),
             );
+            if nr == 78 {
+                // The exec successor uses the exact native file service;
+                // native_exec_pipe_tests drives its reply and copyout too.
+                assert_eq!(
+                    route,
+                    carrick_personality_linux::dispatch::CompletionRoute::NativeService
+                );
+                assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
+            } else {
+                assert_eq!(
+                    route,
+                    carrick_personality_linux::dispatch::CompletionRoute::Forward
+                );
+                assert_eq!(
+                    crate::dispatch::native_unstaged_exit(
+                        &mut frame,
+                        &fixture.task.linux,
+                        carrick_el1_abi::Action::Forward,
+                        || if child.is_root_process() {
+                            NativeThreadGroupOwner::Root
+                        } else {
+                            NativeThreadGroupOwner::ForkChild
+                        },
+                        &counters,
+                    ),
+                    crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
+                );
+                assert_eq!(frame.x[0] as i64, -38, "exec successor ordinal {nr}");
+            }
+            let refused = if nr == 78 { 0 } else { 1 };
             assert_eq!(
-                route,
-                carrick_personality_linux::dispatch::CompletionRoute::Forward
+                counters.refused[nr as usize].load(Ordering::Relaxed),
+                refused
             );
-            assert_eq!(
-                crate::dispatch::native_unstaged_exit(
-                    &mut frame,
-                    &fixture.task.linux,
-                    carrick_el1_abi::Action::Forward,
-                    || if child.is_root_process() {
-                        NativeThreadGroupOwner::Root
-                    } else {
-                        NativeThreadGroupOwner::ForkChild
-                    },
-                    &counters,
-                ),
-                crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
-            );
-            assert_eq!(frame.x[0] as i64, -38, "exec successor ordinal {nr}");
-            assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
             assert_eq!(
                 counters.refused_child[nr as usize].load(Ordering::Relaxed),
-                1
+                refused
             );
             assert_eq!(
                 counters.venue_refused[nr as usize].load(Ordering::Relaxed),

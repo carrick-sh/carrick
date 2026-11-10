@@ -82,6 +82,8 @@ pub enum HostFileOp {
     /// `renameat`/`renameat2`: source path, NUL, target path;
     /// `flags` carries the Linux rename flags.
     Renameat = 21,
+    /// Read the staged link path into the bounded output, without a NUL.
+    Readlinkat = 22,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -208,6 +210,7 @@ impl HostFileOp {
             19 => Self::Truncate,
             20 => Self::Ftruncate,
             21 => Self::Renameat,
+            22 => Self::Readlinkat,
             _ => return None,
         })
     }
@@ -229,6 +232,7 @@ impl HostFileOp {
                 | Self::Utimensat
                 | Self::Truncate
                 | Self::Renameat
+                | Self::Readlinkat
         )
     }
 }

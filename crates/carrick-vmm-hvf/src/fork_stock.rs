@@ -199,6 +199,15 @@ impl Drop for NativeFrameBacking {
 
 #[derive(Debug)]
 pub struct ForkStockHostCustody {
+    /// RootOnly: the stopped root's live identity, consumed by its fork.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) root_executables: std::collections::BTreeMap<
+        carrick_guest_arch::CpuId,
+        (
+            carrick_hal::fork_stock::GrantExecution,
+            std::sync::Arc<dyn carrick_hal::fork_stock::ExecutableIdentity>,
+        ),
+    >,
     pub(crate) owner: ForkStock<AsidAllocator, NativeChildPhysical>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     backing: Option<NativeForkBacking>,
@@ -218,6 +227,8 @@ impl ForkStockHostCustody {
     pub fn with_asids(carrier: NonZeroU64, asids: AsidAllocator) -> Self {
         Self {
             owner: ForkStock::new(carrier, None, asids),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            root_executables: Default::default(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             backing: None,
             run_failure: Default::default(),
@@ -420,8 +431,17 @@ impl ForkStockHostCustody {
             .ok_or(ForkStockServiceError::StaleExecution)?;
         let mm = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
             .ok_or(ForkStockServiceError::StaleExecution)?;
-        self.owner.retire_exited_root(mm);
+        self.retire_root(mm);
         Ok(status)
+    }
+
+    /// Release the host-served root's seed on exit or image replacement.
+    /// The neutral stock owner still decides which physical custody retires.
+    pub(crate) fn retire_root(&mut self, mm: carrick_el1_abi::ReservationMm) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.root_executables
+            .retain(|_, (seed, _)| seed.binding.mm.raw() != mm.raw());
+        self.owner.retire_exited_root(mm);
     }
     /// Resolve a complete physical object, never a kernel virtual wire record.
     pub(crate) fn physical_ptr<T>(
@@ -493,6 +513,50 @@ mod tests {
     use carrick_guest_arch::{AddressContext, ContextGeneration, CpuId, KernelVa, MmGeneration};
     fn page(addr: u64) -> RootGpa {
         RootGpa::page_aligned(FrameGpa::new(addr)).unwrap()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn root_seed_retirement_releases_only_matching_mm() {
+        use std::sync::Arc;
+        #[derive(Debug)]
+        struct Executable;
+        impl carrick_hal::fork_stock::ExecutableIdentity for Executable {
+            fn display_path(&self) -> String {
+                "/root-image".into()
+            }
+        }
+        for through_exit in [false, true] {
+            let mut stock = ForkStockHostCustody::new(NonZeroU64::MIN);
+            let retired = test_execution(41, 0, 301);
+            let other = test_execution(42, 1, 302);
+            let seed: Arc<dyn carrick_hal::fork_stock::ExecutableIdentity> = Arc::new(Executable);
+            let other_seed: Arc<dyn carrick_hal::fork_stock::ExecutableIdentity> =
+                Arc::new(Executable);
+            let retired_live = Arc::downgrade(&seed);
+            let other_live = Arc::downgrade(&other_seed);
+            stock.root_executables.insert(retired.cpu, (retired, seed));
+            stock
+                .root_executables
+                .insert(other.cpu, (other, other_seed));
+            if through_exit {
+                let exit = carrick_core_abi::NativeRootExit::new(
+                    retired.binding,
+                    carrick_sched_core::process::TerminationStatus::exited(0),
+                )
+                .unwrap();
+                stock.service_root_exit(retired, &exit).unwrap();
+            } else {
+                // Image replacement retires the predecessor MM without a
+                // root-exit record through this same carrier entry point.
+                stock.retire_root(ReservationMm::new(retired.binding.mm.raw()).unwrap());
+            }
+            assert_eq!(retired_live.strong_count(), 0);
+            assert_eq!(other_live.strong_count(), 1);
+            stock.retire_root(ReservationMm::new(other.binding.mm.raw()).unwrap());
+            assert_eq!(other_live.strong_count(), 0);
+            assert!(stock.root_executables.is_empty());
+        }
     }
 
     #[test]
