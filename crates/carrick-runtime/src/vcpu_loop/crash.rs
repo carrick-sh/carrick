@@ -885,7 +885,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::tests::{
         CrashCaptureTestEngine, EndpointTestSignalArrival, EndpointTestSignalPump,
         NoopPlatformFutex, registration_test_handle,

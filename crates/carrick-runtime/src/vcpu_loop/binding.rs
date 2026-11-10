@@ -10842,6 +10842,198 @@ mod tests {
         scheduler.close();
     }
 
+    /// #1733 (b), through the terminal owner: the process-terminal owner's
+    /// core capture meets another holder's dependency (a retained reader of
+    /// one page). The owner keeps the capture, releases its executor, enrols
+    /// on the holder's existing release notification and blocks; the
+    /// holder's single release wakes it, and the rerun captures a complete
+    /// core before the terminal continues. Nothing polls.
+    #[test]
+    fn terminal_core_capture_parks_on_another_holder_then_publishes() {
+        use super::super::crash::tests::ReleasableReader;
+
+        let dispatcher = SyscallDispatcher::new();
+        let mut auxv_bytes = Vec::new();
+        auxv_bytes.extend_from_slice(&6_u64.to_le_bytes()); // AT_PAGESZ
+        auxv_bytes.extend_from_slice(&4096_u64.to_le_bytes());
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes()); // AT_NULL
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes());
+        dispatcher.set_auxv_image(auxv_bytes);
+        let (_runtime, scheduler, kernel, root, process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_733, dispatcher);
+        root.thread()
+            .set_affinity(carrick_hal::CpuAffinity::from_words(&[1]));
+        let page = 4096_usize;
+        let prefix = 0x0000_1000_0000_0000_u64;
+        let target = prefix + 0x2000;
+        let deferred = kernel
+            .dispatcher
+            .deferred_anonymous_state(root.shared().mm().id())
+            .expect("deferred anonymous state");
+        for address in [prefix, target] {
+            deferred
+                .reserve_fresh(carrick_guest_mem::GuestVa::new(address), page)
+                .unwrap();
+            deferred
+                .begin_materialization(carrick_guest_mem::GuestVa::new(address), page)
+                .unwrap()
+                .commit();
+            kernel.dispatcher.record_dynamic_mapping(
+                address,
+                page as u64,
+                carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::WRITE,
+                carrick_vfs::ProcMapSharing::Private,
+                String::new(),
+            );
+        }
+
+        let tid = ThreadId::synthetic_for_tests(72_733);
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(tid)),
+            Arc::new(FutexTable::new()),
+            Arc::new(NoopPlatformFutex),
+            Arc::new(|_| Arc::new(NoopPlatformFutex)),
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+        assert!(kernel.fatal_signal.record(FatalSignalRecord {
+            image_generation: kernel.fatal_signal.current_generation(),
+            tid: root.thread().key().tid,
+            signo: 11,
+            code: 1,
+            addr: target,
+        }));
+        let reader = Arc::new(ReleasableReader::default());
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = CrashCaptureTestEngine {
+            guest_memory: [(prefix, vec![0xa5; page]), (target, vec![0x5a; page])].into(),
+            core_owner: Some(root.shared().mm().id().raw()),
+            backing_physical: Some((target, carrick_guest_mem::OwnedMemoryWait(reader.clone()))),
+            backing_reads: Some(Arc::clone(&reads)),
+            ..Default::default()
+        };
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let registration = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let reject_descendant = |_, _| unreachable!();
+        let mut submission = executor::ExecutorSubmissionContext {
+            registration: Some(&registration),
+            scheduler: &scheduler,
+            publish_test_descendant: &reject_descendant,
+            current: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::new(Some(running.take_lease())),
+            exec_replacement: None,
+        };
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+
+        // The production terminal entry: claim, arm, capture.
+        let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
+            &kernel,
+            128 + 11,
+            Some(11),
+            0,
+            false,
+        )));
+        let exit = job.begin_persistent_process_terminal(
+            &mut engine,
+            PersistentTerminal::from_outcome(outcome),
+            root.retain_exact(),
+        );
+        assert!(matches!(exit, executor::ExecutorExit::Yielded), "{exit:?}");
+        assert!(matches!(
+            &job.phase,
+            HvpatchProductionPhase::EnrollRetainedMemory { action, .. }
+                if matches!(action.as_ref(), RetainedMemoryAction::CoreCapture { .. })
+        ));
+        assert!(job.phase.is_terminal_transition());
+        assert_eq!(reads.lock().as_slice(), &[(prefix, page)]);
+
+        // Enrol on the holder's release and block without polling.
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        let parked = job
+            .poll_with_engine_typed(&mut engine, &mut control)
+            .unwrap();
+        assert!(
+            matches!(
+                parked,
+                executor::ExecutorExit::Blocked(
+                    carrick_kernel::kernel::objects::BlockedReason::HostWait
+                )
+            ),
+            "{parked:?}"
+        );
+        assert!(matches!(
+            job.phase,
+            HvpatchProductionPhase::ResumeRetainedPhysical { .. }
+        ));
+        let lease = submission.take_execution_lease().unwrap();
+        running.restore_lease(lease).unwrap();
+        scheduler
+            .settle_blocked(
+                running,
+                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+            )
+            .unwrap();
+        assert_eq!(scheduler.queued_len(), 0, "the holder still owns the wait");
+        assert_eq!(reads.lock().len(), 1, "no read while parked");
+
+        // A sibling changed memory while capture waited.
+        engine.guest_memory.insert(prefix, vec![0xc3; page]);
+        reader.release();
+        assert_eq!(scheduler.queued_len(), 1, "one release, one wake");
+        let mut running = scheduler
+            .try_take(&registration)
+            .unwrap()
+            .expect("the release wakes the terminal owner");
+        submission.authority =
+            executor::ExecutionLeaseAuthoritySlot::new(Some(running.take_lease()));
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        let _ = job
+            .poll_with_engine_typed(&mut engine, &mut control)
+            .unwrap();
+        assert_eq!(
+            reads.lock().as_slice(),
+            &[(prefix, page), (prefix, page), (target, page)],
+            "the rerun captures a fresh snapshot"
+        );
+        let terminal = match &job.phase {
+            HvpatchProductionPhase::TerminalProcessDrain { terminal, .. } => terminal,
+            HvpatchProductionPhase::RetainedMemoryRetry { action } => match action.as_ref() {
+                RetainedMemoryAction::ProcessFinish { terminal, .. } => terminal,
+                _ => panic!("terminal continues as the process owner"),
+            },
+            _ => panic!("terminal continues after the core capture"),
+        };
+        let PersistentTerminal::Outcome {
+            prepared_core: Some(prepared),
+            ..
+        } = terminal
+        else {
+            panic!("the rerun prepares a core publication");
+        };
+        assert_eq!(prepared.payload.extents.len(), 2);
+        assert_eq!(prepared.payload.extents[0].bytes, vec![0xc3; page]);
+        assert_eq!(prepared.payload.extents[1].bytes, vec![0x5a; page]);
+
+        let lease = submission.take_execution_lease().unwrap();
+        running.restore_lease(lease).unwrap();
+        scheduler.settle_runnable_successor(running).unwrap();
+        scheduler.close();
+    }
+
     /// The forkexecstorm wedge: the parked executor's barrier callback woke
     /// only on `Released`, while `publish_quiesce_event` consumes every
     /// one-shot listener on ANY event. A `Raised` from the next fork on a
