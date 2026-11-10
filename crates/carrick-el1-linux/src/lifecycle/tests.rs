@@ -3383,6 +3383,17 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
         fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
             ThreadBirthAdmission::Ready
         }
+        // The native owner queues its own birth (#1958); this venue owns
+        // no registry, so it publishes the record's run queue entry only.
+        fn enqueue_thread(
+            &mut self,
+            record: carrick_el1_abi::RecordRef,
+        ) -> carrick_personality_linux::lifecycle::BornEnqueue {
+            // SAFETY: World retains this scheduler for the whole witness.
+            unsafe { &*self.zone }
+                .requeue_preempted(SLOT, record.id)
+                .into()
+        }
         fn bind_thread_birth(
             &mut self,
             record: carrick_el1_abi::RecordRef,
