@@ -136,8 +136,33 @@ is shared, Cargo locks belong to their own checkout, and they never acquire
 a remote checkout lock. Remote acceptance still takes its checkout lock
 before host admission.
 
-Direct `scripts/build-signed.sh` and `scripts/test-signed.sh` invocations
-still bootstrap xtask before their internal admission. Until those entry
-points are changed, invoke them through the installed supervisor in shared
-`carrick` mode. This remaining gap is recorded on #1693; these changes alone
-do not establish complete host coverage.
+Direct `scripts/build-signed.sh` invocations still bootstrap xtask before
+their internal admission; invoke it through the installed supervisor in
+shared `carrick` mode. This remaining gap is recorded on #1693.
+
+## Gate covers guest execution only (#2013)
+
+Signed runs split into a build phase under shared `carrick` and an
+execution phase under exclusive `gate`, driven by `carrick-xtask
+signed-phases` (`scripts/test-signed.sh`) and by `accept`'s own driver
+(`--phase signed|all`). Each phase is a complete supervised run: the
+`carrick` supervisor and its cleanup finish before `gate` is requested, so
+there is no upgrade and no nesting, and the gate wait is the ordinary
+`HOST_LEASE_WAIT_LIMIT` wait. The build phase lists every artifact it will
+execute; their identity (SHA-256, plus CDHash and LC_UUID on macOS) is
+captured inside the build lease and re-verified right after gate
+admission. A changed artifact refuses execution, and the receipt records
+both phases' leases and the identity (`signed_admission` in accept
+receipts, a `phase_admission` row in test-signed receipts).
+
+Under an outer `gate` both phases reuse it and nothing splits. Under an
+outer `carrick` lease a signed run is refused before it builds, because
+shared admission never becomes `gate`; the justfile's signed recipes
+therefore no longer wrap `scripts/test-signed.sh` in `host-lease --mode
+carrick` and prebuild xtask with `ci-prebuild-xtask` instead. Disk
+admission (`just check-disk`, gate) runs before the build phase starts.
+`signed-gate execute` takes per-step leases: fixture restoration under
+`gate`, its builds under `carrick`, and `accept` admitting itself.
+Host-only accept phases are compilation and host tests under `carrick`,
+except the `kvm` and `el1-native` profiles, whose host steps boot guests
+and keep `gate`.
