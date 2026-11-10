@@ -742,13 +742,6 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
         None
     }
-    fn retire_adapter_operation(
-        &mut self,
-        _binding: ExecutionBinding,
-        _operation: carrick_sched_core::object_wait::OperationToken,
-    ) -> Result<usize, NativeProcessError> {
-        Err(NativeProcessError::Quarantined)
-    }
     /// Copy a completed syscall's output to the caller's user memory on the
     /// selected record's live address space, with EL0 permissions. The
     /// staging step already made the range writable (fault supply first), so
