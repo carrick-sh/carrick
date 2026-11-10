@@ -255,8 +255,16 @@ jobs:
         # install on cloudmac's Homebrew Python).
         run: just ci-install-semgrep
 
+      # `just ci` is compilation and host tests, not timing-sensitive signed
+      # execution, so it takes the shared `carrick` lease, not exclusive `gate`.
+      # Under `gate` its ~49 min blocked every macOS PR CI job on this Mac:
+      # 14 of 14 slow jobs on 2026-11-09 spent 18-47 min in `host-lease:
+      # waiting` (owner decision on #231, 2026-11-10). The signed steps below
+      # keep `gate`. CARRICK_DISK_GUARD=0 because `check-disk` takes `gate`
+      # itself, and a gate nested under a shared lease is refused; the
+      # "Disk admission" step above has already applied this job's 60 GiB floor.
       - name: Host-only source gate
-        run: RUST_TEST_THREADS=1 just lease gate just ci
+        run: RUST_TEST_THREADS=1 CARRICK_DISK_GUARD=0 just lease carrick just ci
 
       # Save after the gate too: `just ci` downloads the workspace's own
       # crates, which the fixture fetch alone does not. `!cancelled()` plus
