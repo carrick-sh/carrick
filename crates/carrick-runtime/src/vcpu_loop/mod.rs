@@ -3719,6 +3719,35 @@ pub(crate) mod tests {
                 == self.wait.revision())
             .then_some(self.wait)
         }
+
+        /// The owner portal's answer while the MM's gate is raised by
+        /// anyone: refuse on `Gate` at the gate producer's live revision,
+        /// exactly as an owner transfer step that needs an editor slot does.
+        fn live_gate_wait(self) -> Option<carrick_el1_abi::PortalOwnerWait> {
+            // SAFETY: the VM-free fixture retains the exact carrier region
+            // until the test has completed every read and release.
+            let zone = unsafe { &*(self.zone as *const carrick_el1_abi::ZoneTables) };
+            let handle = self.wait.handle();
+            let mm = std::num::NonZeroU64::new(handle.mm().raw())?;
+            if zone.spaces.gate(zone.spaces.find(mm.get())?) == 0 {
+                return None;
+            }
+            let revision = zone
+                .space_entry(mm)?
+                .notifications(handle.incarnation())
+                .ok()?
+                .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate)
+                .revision();
+            // SAFETY: `revision` was sampled from this exact admitted owner's
+            // Gate producer while its gate is raised.
+            Some(unsafe {
+                carrick_el1_abi::PortalOwnerWait::from_owner(
+                    handle,
+                    carrick_el1_abi::PortalWaitCause::Gate,
+                    revision,
+                )
+            })
+        }
     }
 
     type AtomicWordLoad = Box<dyn Fn(u64) -> Result<u32, carrick_guest_mem::MemoryError> + Send>;
@@ -3758,6 +3787,8 @@ pub(crate) mod tests {
         pub(crate) prepared_commits: usize,
         pub(crate) prepared_attempts: usize,
         pub(crate) copyout_owner_probe: Option<CopyoutOwnerProbe>,
+        // An admitted owner MM whose portal reads refuse on its live gate.
+        pub(crate) live_owner_gate: Option<CopyoutOwnerProbe>,
         // A real MM gate transition at the first unprepared output boundary.
         pub(crate) close_gate_after_write: Option<(usize, u64)>,
         // Independent payload mapping used by the recvfrom metadata fixture.
@@ -3903,9 +3934,14 @@ pub(crate) mod tests {
             address: u64,
             length: usize,
         ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-            if let Some(probe) = self.copyout_owner_probe
-                && !self.uncontended_reads
-                && let Some(wait) = probe.wait_if_busy()
+            if let Some(wait) = self
+                .live_owner_gate
+                .and_then(CopyoutOwnerProbe::live_gate_wait)
+                .or_else(|| {
+                    self.copyout_owner_probe
+                        .filter(|_| !self.uncontended_reads)
+                        .and_then(CopyoutOwnerProbe::wait_if_busy)
+                })
             {
                 return Err(carrick_guest_mem::MemoryError::ReadSuspended(Box::new(
                     carrick_guest_mem::MemoryReadSuspension {

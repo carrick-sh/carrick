@@ -1593,4 +1593,221 @@ mod tests {
             Duration::from_micros(200)
         );
     }
+
+    /// One crashing worker of a process whose MM is published in a VM-free
+    /// carrier zone as an admitted owner, with its page-table fence mirrored
+    /// into the zone's gate exactly as production publication binds it. Two
+    /// materialized private VMAs hold `0xa5` and `0x5a`.
+    struct CoreGateFixture {
+        kernel: Arc<KernelState>,
+        state: ThreadRuntimeState<CrashCaptureTestEngine>,
+        fatal: FatalSignalRecord,
+        zone: &'static carrick_el1_abi::ZoneTables,
+        portal_wait: carrick_el1_abi::PortalOwnerWait,
+        prefix: u64,
+        target: u64,
+        _worker: carrick_kernel::kernel::KernelContext,
+        _root: carrick_kernel::kernel::KernelContext,
+    }
+
+    const CORE_GATE_PAGE: usize = 4096;
+
+    fn core_gate_fixture(pid: i32) -> CoreGateFixture {
+        use carrick_el1_linux::mm_portal::{
+            MmPortal,
+            test_support::{ROOT, Region, admit_notified, nodes},
+        };
+
+        let (process, root) = crate::hvpatch::process_context_for_tests(pid);
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::THREAD
+                | carrick_abi::LinuxCloneFlags::SIGHAND
+                | carrick_abi::LinuxCloneFlags::VM,
+        )
+        .expect("thread clone plan");
+        let worker = process
+            .kernel_graph()
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve crash worker")
+            .prepare(ThreadId::synthetic_for_tests(pid + 1))
+            .expect("prepare crash worker")
+            .commit()
+            .expect("publish crash worker")
+            .start_thread()
+            .expect("start crash worker")
+            .into_context();
+        let dispatcher = SyscallDispatcher::new();
+        let mut auxv_bytes = Vec::new();
+        auxv_bytes.extend_from_slice(&6_u64.to_le_bytes()); // AT_PAGESZ
+        auxv_bytes.extend_from_slice(&4096_u64.to_le_bytes());
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes()); // AT_NULL
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes());
+        dispatcher.set_auxv_image(auxv_bytes);
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            Some(process.clone()),
+            None,
+        ));
+        let barrier = kernel.process_fork_barrier.clone().expect("crash barrier");
+        let authority = kernel.crash_capture.clone().expect("crash authority");
+        let owner = ThreadId::synthetic_for_tests(pid + 1);
+        let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let kicker = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        register_crash_test_vcpu(kicker.as_ref(), owner, &owner_in_guest);
+        let kicker: Arc<dyn VcpuRegistry> = kicker;
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(owner)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            Some(Arc::clone(&barrier)),
+            Some(Arc::clone(&authority)),
+            Some(Arc::clone(worker.thread())),
+            Some(process.pid()),
+            worker.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            owner,
+            Arc::new(Mutex::new(Vec::new())),
+            kicker,
+            owner_in_guest,
+            1_000,
+        );
+        state.service_kernel_context = Some(worker.retain_exact());
+
+        let prefix = 0x0000_1000_0000_0000_u64;
+        let target = prefix + 0x2000;
+        let deferred = kernel
+            .dispatcher
+            .deferred_anonymous_state(root.task().shared().mm().id())
+            .expect("deferred anonymous state");
+        for address in [prefix, target] {
+            deferred
+                .reserve_fresh(carrick_guest_mem::GuestVa::new(address), CORE_GATE_PAGE)
+                .expect("reserve VMA");
+            deferred
+                .begin_materialization(carrick_guest_mem::GuestVa::new(address), CORE_GATE_PAGE)
+                .expect("materialize VMA")
+                .commit();
+            kernel.dispatcher.record_dynamic_mapping(
+                address,
+                CORE_GATE_PAGE as u64,
+                carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::WRITE,
+                carrick_vfs::ProcMapSharing::Private,
+                String::new(),
+            );
+        }
+
+        // The carrier region outlives every capture the test drives.
+        let region: &'static Region = Box::leak(Box::new(Region::new()));
+        let zone = region.zone();
+        let mm = admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
+        let view = nodes(region);
+        let portal = MmPortal::new(
+            std::num::NonZeroU64::new(1_733).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let index = zone.spaces.find(mm.raw()).unwrap();
+        // Sample a wait receipt for the fixture's owner handle; the engine
+        // answers with the gate's live revision at each refused read.
+        zone.spaces.raise(index);
+        let portal_wait = portal
+            .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Gate)
+            .unwrap()
+            .unwrap();
+        carrick_el1_linux::sched::object_wait::space_access(
+            zone,
+            carrick_sched_core::SlotId::new(1),
+        )
+        .lower(index);
+        assert_eq!(zone.spaces.gate(index), 0);
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            assert!(
+                carrick_kernel::kernel::mm_occupancy::bind_test_zone_space_gate(
+                    root.shared().mm().id(),
+                    &kernel.dispatcher.pt_quiesce(),
+                ),
+                "mirror the MM's pause into its published gate"
+            );
+        });
+        let fatal = FatalSignalRecord {
+            image_generation: kernel.fatal_signal.current_generation(),
+            tid: worker.thread().key().tid,
+            signo: 11,
+            code: 1,
+            addr: target,
+        };
+        CoreGateFixture {
+            kernel,
+            state,
+            fatal,
+            zone,
+            portal_wait,
+            prefix,
+            target,
+            _worker: worker,
+            _root: root,
+        }
+    }
+
+    impl CoreGateFixture {
+        fn engine(&self) -> CrashCaptureTestEngine {
+            CrashCaptureTestEngine {
+                guest_memory: [
+                    (self.prefix, vec![0xa5; CORE_GATE_PAGE]),
+                    (self.target, vec![0x5a; CORE_GATE_PAGE]),
+                ]
+                .into(),
+                live_owner_gate: Some(super::super::tests::CopyoutOwnerProbe::new(
+                    self.portal_wait,
+                    self.zone,
+                )),
+                ..CrashCaptureTestEngine::default()
+            }
+        }
+
+        fn gate(&self) -> u64 {
+            let mm = self.portal_wait.handle().mm().raw();
+            self.zone.spaces.gate(self.zone.spaces.find(mm).unwrap())
+        }
+    }
+
+    /// #1733 (a): capture's own pause raises the MM's published gate, and an
+    /// owner-portal read refuses on that gate. No release can come while
+    /// capture holds it, so the read must never consult the portal: capture
+    /// reads through the exclusion it already holds and publishes both
+    /// extents. Red on main: `read core region ..: owner read retains
+    /// completed progress: .. cause: Gate ..`.
+    #[test]
+    fn capture_core_reads_through_its_own_pause_gate() {
+        let mut fixture = core_gate_fixture(70_280);
+        let mut engine = fixture.engine();
+        let zone = fixture.zone;
+        let prepared = carrick_kernel::el1_zone::with_test_zone(zone, || {
+            fixture
+                .state
+                .capture_core_for_publication(&fixture.kernel, &mut engine, fixture.fatal)
+        })
+        .expect("capture reads through its own pause exclusion")
+        .expect("fatal SIGSEGV prepares a core publication");
+        assert_eq!(prepared.payload.extents.len(), 2);
+        assert_eq!(
+            prepared.payload.extents[0].bytes,
+            vec![0xa5; CORE_GATE_PAGE]
+        );
+        assert_eq!(
+            prepared.payload.extents[1].bytes,
+            vec![0x5a; CORE_GATE_PAGE]
+        );
+        assert_eq!(fixture.gate(), 0, "capture lowers every gate it raised");
+    }
 }
