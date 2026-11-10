@@ -135,14 +135,10 @@ fn with_vmm_vdso_for_dispatcher<A: carrick_hal::GuestArch>(
     dispatcher: &SyscallDispatcher,
     requires_syscall_traps: bool,
 ) -> Result<AddressSpace, carrick_mem::memory::AddressSpaceError> {
-    let requires_syscall_traps = requires_syscall_traps || dispatcher.requires_syscall_traps();
-    if requires_syscall_traps && A::linux_guest_abi() == carrick_abi::LinuxGuestAbi::X86_64 {
-        return Ok(image.with_vdso_auxv(false));
-    }
-    carrick_kernel::vdso_policy::with_optional_vdso_for_clock_with_visibility::<A>(
+    carrick_kernel::vdso_policy::with_vmm_vdso_for_clock::<A>(
         image,
         dispatcher.container().clock(),
-        requires_syscall_traps,
+        requires_syscall_traps || dispatcher.requires_syscall_traps(),
     )
 }
 

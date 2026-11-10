@@ -19,7 +19,6 @@
 use super::*;
 use crate::linux_abi::LinuxErrno;
 use carrick_kernel::dispatch::SyscallDispatcher;
-#[cfg(feature = "platform-macos")]
 use carrick_kernel::exec_helpers::parse_shebang;
 use carrick_mem::memory::AddressSpace;
 use std::sync::Arc;
@@ -119,7 +118,6 @@ fn native_child_exec_path_is_served(resolved: &str) -> bool {
 /// `descriptor_source` selects the object behind a descriptor in the
 /// caller's ring table (the table its ring owner sealed into the request):
 /// `SyscallDispatcher::native_descriptor_exec_source` (#1530).
-#[cfg(feature = "platform-macos")]
 fn prepare_native_exec_image(
     capability: &NativeExecCapability,
     payload: &[u8],
@@ -402,6 +400,38 @@ fn finalize_hvf_exec_base(
         .map_err(|_| LINUX_ENOENT)
 }
 
+/// The architecture whose guests this build runs natively. macOS/HVF hosts are
+/// AArch64 and reach x86_64 guests only through Rosetta; an x86_64 host runs
+/// them natively through the shared `carrick-x86` engine.
+#[cfg(target_arch = "x86_64")]
+type NativeGuestArch = carrick_hal::x8664_arch::X8664GuestArch;
+#[cfg(not(target_arch = "x86_64"))]
+type NativeGuestArch = carrick_hal::aarch64_arch::Aarch64GuestArch;
+
+/// A native guest's base image off macOS: the ELF machine this build's guests
+/// execute, which the loader would otherwise default to AArch64.
+fn native_guest_elf_machine() -> u16 {
+    use carrick_hal::GuestArch as _;
+    NativeGuestArch::elf_machine()
+}
+
+/// Finalize a native (non-HVF) guest's base image. The vDSO choice is the one
+/// every VMM run path makes; page tables, trampolines and the syscall mailbox
+/// belong to the engine that boots the image, so exec adds nothing else.
+#[cfg(not(feature = "platform-macos"))]
+fn finalize_native_guest_exec_base(
+    loader: &ExecLoaderCapabilities,
+    raw: AddressSpace,
+    requires_syscall_traps: bool,
+) -> Result<AddressSpace, LinuxErrno> {
+    carrick_kernel::vdso_policy::with_vmm_vdso_for_clock::<NativeGuestArch>(
+        raw,
+        &loader.clock,
+        requires_syscall_traps || loader.requires_syscall_traps,
+    )
+    .map_err(|_| crate::linux_abi::LINUX_ENOENT)
+}
+
 /// What an exec runs.
 pub(crate) enum ExecTarget<'a> {
     /// A path the caller named, resolved under its access.
@@ -428,7 +458,6 @@ impl<'a> From<&'a String> for ExecTarget<'a> {
     }
 }
 
-#[cfg(feature = "platform-macos")]
 pub(crate) fn load_execve_image<'a>(
     loader: &ExecLoaderCapabilities,
     files: &carrick_kernel::dispatch::exec_files::ExecFiles,
@@ -539,60 +568,84 @@ pub(crate) fn load_execve_image<'a>(
     // host) is ON only for a bare RunElf boot; a container run keeps it OFF so
     // an execve target absent from the container fs ENOENTs instead of escaping
     // to the matching HOST binary. The filesystem capability retains that fallback policy.
-    let vdso_enabled = vdso_enabled_for_debug();
     let requires_syscall_traps = requires_syscall_traps || loader.requires_syscall_traps;
-    // The cache is deliberately limited to direct little-endian AArch64 ELFs.
-    // Rosetta redirects rewrite argv and carry target-specific AT_BASE state;
-    // mutable/foreign images stay on the uncached path below.
-    let cache_key = direct_aarch64
-        .then(|| {
-            source.hvpatch_cache_key(
-                loader.linux_page_size,
-                vdso_enabled,
-                requires_syscall_traps,
-                false,
-            )
-        })
-        .flatten();
+    #[cfg_attr(not(feature = "platform-macos"), allow(unused_mut))]
     let mut binfmt_argv = None;
-    let (base, argv) = if cache_key.is_some() {
-        let base = files.with_cache(cache_key, || {
+    #[cfg(feature = "platform-macos")]
+    let (base, argv) = {
+        let vdso_enabled = vdso_enabled_for_debug();
+        // The cache is deliberately limited to direct little-endian AArch64 ELFs.
+        // Rosetta redirects rewrite argv and carry target-specific AT_BASE state;
+        // mutable/foreign images stay on the uncached path below.
+        let cache_key = direct_aarch64
+            .then(|| {
+                source.hvpatch_cache_key(
+                    loader.linux_page_size,
+                    vdso_enabled,
+                    requires_syscall_traps,
+                    false,
+                )
+            })
+            .flatten();
+        let (base, argv) = if cache_key.is_some() {
+            let base = files.with_cache(cache_key, || {
+                let raw_bytes = source.read_all().map_err(host_io_errno)?;
+                let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|interpreter| {
+                    acquire_source(interpreter).ok()?.read_all().ok()
+                })
+                .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
+                .with_main_file_path(path.clone());
+                finalize_hvf_exec_base(loader, raw, false, vdso_enabled, requires_syscall_traps)
+            })?;
+            (base, argv)
+        } else {
             let raw_bytes = source.read_all().map_err(host_io_errno)?;
+            // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style), so a
+            // later guest exec remains translated rather than being parsed as arm64.
+            let mut needs_at_base = false;
+            let (raw_bytes, argv) = match maybe_redirect_to_rosetta(&path, &raw_bytes, &argv) {
+                None => (raw_bytes, argv),
+                Some(Ok(redirect)) => {
+                    needs_at_base = redirect.target_is_dynamic;
+                    binfmt_argv = Some(redirect.argv.clone());
+                    (redirect.interpreter_bytes, redirect.argv)
+                }
+                Some(Err(errno)) => return Err(errno),
+            };
             let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|interpreter| {
                 acquire_source(interpreter).ok()?.read_all().ok()
             })
             .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
             .with_main_file_path(path.clone());
-            finalize_hvf_exec_base(loader, raw, false, vdso_enabled, requires_syscall_traps)
-        })?;
-        (base, argv)
-    } else {
-        let raw_bytes = source.read_all().map_err(host_io_errno)?;
-        // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style), so a
-        // later guest exec remains translated rather than being parsed as arm64.
-        let mut needs_at_base = false;
-        let (raw_bytes, argv) = match maybe_redirect_to_rosetta(&path, &raw_bytes, &argv) {
-            None => (raw_bytes, argv),
-            Some(Ok(redirect)) => {
-                needs_at_base = redirect.target_is_dynamic;
-                binfmt_argv = Some(redirect.argv.clone());
-                (redirect.interpreter_bytes, redirect.argv)
-            }
-            Some(Err(errno)) => return Err(errno),
+            (
+                finalize_hvf_exec_base(
+                    loader,
+                    raw,
+                    needs_at_base,
+                    vdso_enabled,
+                    requires_syscall_traps,
+                )?,
+                argv,
+            )
         };
-        let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|interpreter| {
-            acquire_source(interpreter).ok()?.read_all().ok()
-        })
+    };
+    // An x86_64 guest on an x86_64 host runs natively: no Rosetta redirect
+    // (binfmt translation is the AArch64 host's route to x86), the build's
+    // own ELF machine, and no HVPatch image cache, whose key is an AArch64
+    // image property.
+    #[cfg(not(feature = "platform-macos"))]
+    let (base, argv) = {
+        let _ = direct_aarch64;
+        let raw_bytes = source.read_all().map_err(host_io_errno)?;
+        let raw = AddressSpace::load_elf_bytes_with_reader_for(
+            &raw_bytes,
+            &|interpreter| acquire_source(interpreter).ok()?.read_all().ok(),
+            native_guest_elf_machine(),
+        )
         .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
         .with_main_file_path(path.clone());
         (
-            finalize_hvf_exec_base(
-                loader,
-                raw,
-                needs_at_base,
-                vdso_enabled,
-                requires_syscall_traps,
-            )?,
+            finalize_native_guest_exec_base(loader, raw, requires_syscall_traps)?,
             argv,
         )
     };
@@ -628,11 +681,14 @@ pub(crate) use carrick_kernel::exec_helpers::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_guest_mem::GuestMemory as _;
 
-    #[cfg(feature = "platform-macos")]
-    fn synthetic_aarch64_exec() -> Vec<u8> {
+    const EM_X86_64: u16 = 62;
+    const EM_AARCH64: u16 = 183;
+
+    /// A static ET_EXEC with one R+X PT_LOAD at 0x400000 holding `code`.
+    fn synthetic_exec(machine: u16, code: [u8; 4]) -> Vec<u8> {
         const ET_EXEC: u16 = 2;
-        const EM_AARCH64: u16 = 183;
         const PT_LOAD: u32 = 1;
         let mut elf = vec![0_u8; 0x1004];
         elf[0..4].copy_from_slice(b"\x7fELF");
@@ -640,7 +696,7 @@ mod tests {
         elf[5] = 1;
         elf[6] = 1;
         elf[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
-        elf[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        elf[18..20].copy_from_slice(&machine.to_le_bytes());
         elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
         elf[24..32].copy_from_slice(&0x400000_u64.to_le_bytes());
         elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
@@ -655,11 +711,15 @@ mod tests {
         elf[ph + 32..ph + 40].copy_from_slice(&4_u64.to_le_bytes());
         elf[ph + 40..ph + 48].copy_from_slice(&0x1000_u64.to_le_bytes());
         elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
-        elf[0x1000..0x1004].copy_from_slice(&0xd503_201f_u32.to_le_bytes());
+        elf[0x1000..0x1004].copy_from_slice(&code);
         elf
     }
 
     #[cfg(feature = "platform-macos")]
+    fn synthetic_aarch64_exec() -> Vec<u8> {
+        synthetic_exec(EM_AARCH64, 0xd503_201f_u32.to_le_bytes())
+    }
+
     fn read_image_u64(image: &AddressSpace, address: u64) -> u64 {
         u64::from_le_bytes(
             image
@@ -670,7 +730,6 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "platform-macos")]
     fn read_image_c_string(image: &AddressSpace, address: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut cursor = address;
@@ -684,7 +743,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "platform-macos")]
     fn execfn(image: &AddressSpace) -> Vec<u8> {
         const AT_EXECFN: u64 = 31;
         let mut cursor = image.initial_stack_pointer().expect("initial stack") + 32;
@@ -1005,7 +1063,6 @@ mod tests {
 
     /// Seal a staged payload with a caller's access context, as the ring
     /// owner does from the caller's task row.
-    #[cfg(feature = "platform-macos")]
     fn sealed(payload: Vec<u8>, fsuid: u32, cwd: &str) -> Vec<u8> {
         sealed_in(payload, fsuid, cwd, None)
     }
@@ -1013,7 +1070,6 @@ mod tests {
     /// Seal a staged payload as the ring owner does, through the production
     /// encoder, from a task row with `fsuid` everywhere, the capabilities
     /// Linux leaves that uid, `cwd` and `root`.
-    #[cfg(feature = "platform-macos")]
     fn sealed_in(payload: Vec<u8>, fsuid: u32, cwd: &str, root: Option<&str>) -> Vec<u8> {
         seal_task_row(payload, fsuid, cwd, root, None)
     }
@@ -1024,7 +1080,6 @@ mod tests {
         seal_task_row(payload, 0, cwd, None, table)
     }
 
-    #[cfg(feature = "platform-macos")]
     fn seal_task_row(
         mut payload: Vec<u8>,
         fsuid: u32,
@@ -1065,7 +1120,6 @@ mod tests {
     }
 
     /// A caller whose ring table resolves no descriptor.
-    #[cfg(feature = "platform-macos")]
     fn no_descriptors(
         _: [u64; 3],
         _: i32,
@@ -1073,7 +1127,6 @@ mod tests {
         Err(crate::linux_abi::LINUX_ENOSYS)
     }
 
-    #[cfg(feature = "platform-macos")]
     fn native_exec_payload(call: carrick_core_abi::service::ExecCall, path: &str) -> Vec<u8> {
         let argv = b"successor\0";
         let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
@@ -1469,5 +1522,60 @@ mod tests {
         );
         drop(capability);
         retirement.prepare().unwrap();
+    }
+
+    /// #1093 S3: a native fork child's exec prepares an EM_X86_64 ELF through
+    /// the production entry point. The build's own machine selects the
+    /// loader (an x86_64 host runs x86 guests natively, with no Rosetta
+    /// redirect) and the other ISA's image is a machine mismatch.
+    #[cfg(all(not(feature = "platform-macos"), target_arch = "x86_64"))]
+    #[test]
+    fn native_child_exec_prepares_an_x86_64_image_through_the_production_entry() {
+        use carrick_core_abi::service::ExecCall;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let write = |name: &str, machine| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, synthetic_exec(machine, [0x90, 0x90, 0x90, 0xc3])).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let x86 = write("x86-successor", EM_X86_64);
+        let arm = write("arm-successor", EM_AARCH64);
+        let dispatcher = SyscallDispatcher::new();
+        let capability = capture_native_exec_capability(&dispatcher).unwrap();
+        let prepare = |path: &str| {
+            prepare_native_exec_image(
+                &capability,
+                &sealed(native_exec_payload(ExecCall::Execve, path), 0, "/"),
+                no_descriptors,
+            )
+        };
+
+        let loaded = prepare(&x86).expect("EM_X86_64 successor prepares");
+        assert_eq!(loaded.image.entry(), 0x400000);
+        assert!(loaded.binfmt_argv.is_none(), "no Rosetta redirect on x86");
+        // The image carries the ring's argv and exec path on its initial
+        // stack, exactly as the AArch64 path stages them.
+        let sp = loaded.image.initial_stack_pointer().expect("initial stack");
+        assert_eq!(read_image_u64(&loaded.image, sp), 1, "argc");
+        let argv0 = read_image_u64(&loaded.image, sp + 8);
+        assert_eq!(read_image_c_string(&loaded.image, argv0), b"successor");
+        assert_eq!(execfn(&loaded.image), x86.as_bytes());
+        assert!(
+            loaded
+                .image
+                .file_mappings()
+                .iter()
+                .any(|mapping| mapping.start == 0x400000 && mapping.path == x86),
+            "the main image is named by its resolved path"
+        );
+
+        // The other ISA's ELF is not this build's machine.
+        match prepare(&arm) {
+            Ok(_) => panic!("an AArch64 ELF prepared on an x86_64 build"),
+            Err(errno) => assert_eq!(errno, crate::linux_abi::LINUX_ENOEXEC),
+        }
     }
 }
