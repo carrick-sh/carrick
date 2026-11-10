@@ -2323,8 +2323,7 @@ fn execed_production_root_admits_with_its_launch_exec_capability() {
         let source = Arc::new(OwnedBirthZone::from_static(zone));
         let (kernel, root) = Kernel::bootstrap_root(bootstrap.with_birth_source(source)).unwrap();
         // Launch: the run installs its exec service under this capability.
-        let installed = crate::dispatch::exec_files::native_exec_capability(&root)
-            .expect("launch root mints a capability");
+        let installed = crate::dispatch::exec_files::native_exec_capability(&root);
         // The root's own exec takes the host route before its first fork.
         let prepared = kernel.prepare_exec(&root, None).unwrap();
         let execed = kernel.commit_exec(prepared, None).unwrap();

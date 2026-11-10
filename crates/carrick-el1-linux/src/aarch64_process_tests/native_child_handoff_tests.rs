@@ -60,7 +60,8 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
     };
     assert_eq!(
         weak_capability.upgrade().map(|cap| cap.raw().get()),
-        Some(5)
+        Some(11),
+        "the tree's capability names its root task's birth serial"
     );
     assert!(weak_runtime.upgrade().is_some());
     if root_exit {
@@ -89,7 +90,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
         );
         assert_eq!(
             weak_capability.upgrade().map(|cap| cap.raw().get()),
-            Some(5),
+            Some(11),
             "surviving fork child retains the tree's host-file capability after root exit"
         );
         assert!(weak_runtime.upgrade().is_some());
@@ -288,7 +289,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
         else {
             panic!("stdout must enter the host-file bridge");
         };
-        assert_eq!(capability.raw().get(), 5);
+        assert_eq!(capability.raw().get(), 11, "the root task's capability");
         // SAFETY: the exact pending owner retains this record until this ticket's ACK.
         let record = unsafe {
             core::slice::from_raw_parts_mut(

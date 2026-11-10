@@ -3852,8 +3852,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         } else {
             1
         };
-        let exec_capability = Arc::new(carrick_core_abi::service::ExecCapabilityId::new(
-            NonZeroU64::new(file_table).ok_or(NativeProcessError::Stale)?,
+        // The tree's capability names its root task, never the descriptor
+        // table a host-routed root exec replaces (#936).
+        let exec_capability = Arc::new(carrick_core_abi::service::ExecCapabilityId::of_root_task(
+            key.serial,
         ));
         let mut members = vec![NativeMember {
             thread: execution,
@@ -4357,8 +4359,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
 pub enum RootFsSeed {
     /// The host-served root's live cwd and root at this fork.
     Seeded(carrick_personality_linux::task_fs::TaskFs),
-    /// The carrier did not serve the seed (for example the root's file
-    /// capability retired with a host exec, #936). The child's cwd is then
+    /// The carrier did not serve the seed (for example its run's exec
+    /// service already retired). The child's cwd is then
     /// unknown, and its path and exec crossings are left unrouted (counted
     /// ENOSYS), never resolved against a guessed cwd.
     Refused,
@@ -13665,8 +13667,8 @@ mod tests {
         let child_exec_capability = runtime.exec_capability().unwrap();
         assert_eq!(
             child_exec_capability.raw().get(),
-            5,
-            "fork inherits the retained file/loader capability"
+            11,
+            "fork inherits the root task's retained file/loader capability"
         );
         assert_eq!(zone.switch_in_full(slot).unwrap().record, child_record.id);
         zone.install_space(slot, child_address.mm.raw().get())
