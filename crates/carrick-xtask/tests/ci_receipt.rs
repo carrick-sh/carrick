@@ -80,6 +80,7 @@ fn receipt(steps: Vec<StepResult>) -> AcceptReceipt {
         host_identity: None,
         fixture_bundle: None,
         host_load: Default::default(),
+        signed_admission: None,
         failures: vec![],
     }
 }
@@ -3111,7 +3112,7 @@ fn review_lib_only_does_not_satisfy_signed_lane_in_all_phase() {
 fn review_signed_build_diagnostics_reach_receipt() {
     // Exercise the signed runner's Cargo output mode with a real link failure.
     // This needs no VM, signing entitlement, network, or platform SDK.
-    let script = include_str!("../../../scripts/lib/test-signed-body.sh");
+    let script = include_str!("../../../scripts/lib/test-signed-build.sh");
     let build = script
         .lines()
         .find(|line| line.starts_with("cargo test --locked -p \"$pkg\""))
