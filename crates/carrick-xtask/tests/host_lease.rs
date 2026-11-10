@@ -1023,3 +1023,244 @@ fn zombie_process_is_reported_dead_by_liveness_helper() {
         "reaped process must return ESRCH from kill(pid, 0)"
     );
 }
+
+// Signed runs (#2013): build under carrick, execute under gate, one artifact.
+const SIGNED_PHASE_FIXTURE: &str = "signed_phase_fixture";
+const SIGNED_PHASE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[test]
+#[ignore = "phase command fixture, invoked by the signed-phases regressions"]
+fn signed_phase_fixture() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let phase = std::env::var(carrick_xtask::signed_phase::PHASE_ENV).unwrap();
+    let state =
+        std::path::PathBuf::from(std::env::var_os(carrick_xtask::signed_phase::STATE_ENV).unwrap());
+    let artifact = std::path::PathBuf::from(std::env::var_os("SIGNED_PHASE_ARTIFACT").unwrap());
+    // The lease this phase inherited from its supervisor, never a new flock.
+    let mode = HostLease::acquire(HostLeaseMode::Carrick).unwrap().mode();
+    // An independent description: shared admission fails only under gate.
+    let lock = std::fs::File::open(std::env::var_os("CARRICK_HOST_LEASE_PATH").unwrap()).unwrap();
+    // SAFETY: lock owns a valid descriptor; a granted probe lock is released below.
+    let shared = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0;
+    if shared {
+        // SAFETY: as above.
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+    }
+    if phase == "build" {
+        std::fs::write(&artifact, b"signed artifact v1").unwrap();
+        carrick_xtask::signed_phase::append_artifacts(&state, std::slice::from_ref(&artifact))
+            .unwrap();
+    }
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::var_os("SIGNED_PHASE_LOG").unwrap())
+        .unwrap();
+    writeln!(
+        log,
+        "{phase} mode={mode} shared={}",
+        if shared { "ok" } else { "blocked" }
+    )
+    .unwrap();
+}
+
+struct SignedPhaseRun {
+    dir: tempfile::TempDir,
+    child: std::process::Child,
+}
+
+impl SignedPhaseRun {
+    fn lock(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("host.lock")
+    }
+
+    fn start(dir: tempfile::TempDir, outer: Option<&HostLease>) -> Self {
+        let lock = Self::lock(dir.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+        command
+            .arg("signed-phases")
+            .arg("--state")
+            .arg(dir.path().join("state"))
+            .arg("--")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", SIGNED_PHASE_FIXTURE, "--ignored", "--nocapture"])
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
+            .env("CARRICK_HOST_LEASE_PATH", &lock)
+            .env("SIGNED_PHASE_ARTIFACT", dir.path().join("artifact"))
+            .env("SIGNED_PHASE_LOG", dir.path().join("phases.log"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(dir.path().join("stderr.log")).unwrap());
+        if let Some(outer) = outer {
+            outer.configure_command(&mut command).unwrap();
+        }
+        let child = command.spawn().unwrap();
+        Self { dir, child }
+    }
+
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.path().join(name)).unwrap_or_default()
+    }
+
+    fn phases(&self) -> String {
+        self.read("phases.log")
+    }
+
+    /// Bounded: a missed admission is a red line, never an hour-long wait.
+    fn until(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
+        let deadline = std::time::Instant::now() + SIGNED_PHASE_BOUND;
+        while !done(self) {
+            if std::time::Instant::now() >= deadline {
+                self.child.kill().ok();
+                self.child.wait().ok();
+                panic!(
+                    "timed out waiting for {what}; phases: {:?}; stderr: {}",
+                    self.phases(),
+                    self.read("stderr.log")
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn finish(mut self) -> (std::process::ExitStatus, Self) {
+        let deadline = std::time::Instant::now() + SIGNED_PHASE_BOUND;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return (status, self);
+            }
+            if std::time::Instant::now() >= deadline {
+                self.child.kill().ok();
+                self.child.wait().ok();
+                panic!(
+                    "signed-phases did not finish; phases: {:?}; stderr: {}",
+                    self.phases(),
+                    self.read("stderr.log")
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn admission(&self) -> Option<carrick_xtask::signed_phase::SignedAdmission> {
+        carrick_xtask::signed_phase::read_admission(&self.dir.path().join("state")).ok()
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+#[test]
+fn signed_phases_build_under_carrick_then_execute_under_gate() {
+    let run = SignedPhaseRun::start(tempfile::tempdir().unwrap(), None);
+    let (status, run) = run.finish();
+    assert!(status.success(), "stderr: {}", run.read("stderr.log"));
+    assert_eq!(
+        run.phases(),
+        "build mode=carrick shared=ok\nexecute mode=gate shared=blocked\n",
+        "the build must hold only shared admission and execution only gate"
+    );
+    let admission = run.admission().expect("execution phase admission record");
+    assert_eq!(admission.build_lease, HostLeaseMode::Carrick);
+    assert_eq!(admission.execute_lease, Some(HostLeaseMode::Gate));
+    let artifact = std::fs::canonicalize(run.dir.path().join("artifact")).unwrap();
+    assert_eq!(admission.artifacts.len(), 1);
+    assert_eq!(admission.artifacts[0].path, artifact);
+    assert_eq!(
+        admission.artifacts[0].sha256,
+        sha256_hex(b"signed artifact v1"),
+        "the executed artifact is the built artifact"
+    );
+}
+
+#[test]
+fn signed_phases_build_beside_a_shared_holder_and_execute_once_it_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let holder =
+        HostLease::acquire_path(&SignedPhaseRun::lock(dir.path()), HostLeaseMode::Carrick).unwrap();
+    let mut run = SignedPhaseRun::start(dir, None);
+    // Busy once: the build shares admission with the holder ...
+    run.until("the build phase beside a shared holder", |run| {
+        run.phases().contains("build mode=carrick")
+    });
+    // ... and execution waits for gate on the ordinary lease wait.
+    run.until("execution to wait for gate", |run| {
+        run.read("stderr.log")
+            .contains("host-lease: waiting for gate")
+    });
+    assert!(
+        !run.phases().contains("execute"),
+        "execution ran beside a shared holder: {}",
+        run.phases()
+    );
+    // Then success once the holder releases.
+    drop(holder);
+    let (status, run) = run.finish();
+    assert!(status.success(), "stderr: {}", run.read("stderr.log"));
+    assert!(
+        run.phases().ends_with("execute mode=gate shared=blocked\n"),
+        "{}",
+        run.phases()
+    );
+}
+
+#[test]
+fn signed_phases_refuse_an_artifact_changed_between_phases() {
+    let dir = tempfile::tempdir().unwrap();
+    let holder =
+        HostLease::acquire_path(&SignedPhaseRun::lock(dir.path()), HostLeaseMode::Carrick).unwrap();
+    let mut run = SignedPhaseRun::start(dir, None);
+    run.until("execution to wait for gate", |run| {
+        run.read("stderr.log")
+            .contains("host-lease: waiting for gate")
+    });
+    // A rebuild between the phases: the executed binary is no longer the
+    // binary whose identity the build phase captured.
+    std::fs::write(run.dir.path().join("artifact"), b"rebuilt after admission").unwrap();
+    drop(holder);
+    let (status, run) = run.finish();
+    assert!(!status.success(), "a changed artifact was executed");
+    assert!(
+        run.read("stderr.log")
+            .contains("artifact identity changed between the build and execution phases"),
+        "{}",
+        run.read("stderr.log")
+    );
+    assert!(!run.phases().contains("execute"), "{}", run.phases());
+    assert!(run.admission().is_none());
+}
+
+#[test]
+fn signed_phases_reuse_an_inherited_gate_for_both_phases() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate =
+        HostLease::acquire_path(&SignedPhaseRun::lock(dir.path()), HostLeaseMode::Gate).unwrap();
+    let (status, run) = SignedPhaseRun::start(dir, Some(&gate)).finish();
+    assert!(status.success(), "stderr: {}", run.read("stderr.log"));
+    // No split under an outer gate: both phases reuse it, never reacquire.
+    assert_eq!(
+        run.phases(),
+        "build mode=gate shared=blocked\nexecute mode=gate shared=blocked\n"
+    );
+    drop(gate);
+}
+
+#[test]
+fn signed_phases_refuse_an_inherited_shared_lease_before_building() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared =
+        HostLease::acquire_path(&SignedPhaseRun::lock(dir.path()), HostLeaseMode::Carrick).unwrap();
+    let (status, run) = SignedPhaseRun::start(dir, Some(&shared)).finish();
+    assert!(!status.success());
+    assert!(
+        run.read("stderr.log")
+            .contains("cannot nest gate under carrick"),
+        "{}",
+        run.read("stderr.log")
+    );
+    assert_eq!(run.phases(), "", "nothing builds without a path to gate");
+    drop(shared);
+}
