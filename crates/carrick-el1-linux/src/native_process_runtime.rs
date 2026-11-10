@@ -1775,9 +1775,9 @@ struct NativeRegistryState<'a, M: Clone, C: ProcessContext> {
     by_process: BTreeMap<(usize, TaskKey), (NativeGroupKey, Vec<NativeExecutionKey>)>,
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+/// The admitted owner kind of a thread's group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NativeThreadGroupOwner {
+pub enum NativeThreadGroupOwner {
     Unowned,
     Root,
     ForkChild,

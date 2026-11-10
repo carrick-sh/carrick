@@ -1078,3 +1078,156 @@ fn at_empty_path_arm_null_bad_fd() {
 fn at_empty_path_x86_null_bad_fd() {
     at_empty_path_dispatch(true, AtEmptyPathCase::NullBadFd);
 }
+
+/// Host pointers stand in for resident guest memory, as the unit tests do.
+struct ResidentUser;
+impl carrick_el1_linux::file::MemoryValidator for ResidentUser {
+    fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+        len
+    }
+    fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+        len
+    }
+}
+
+fn x86_exec_dispatch(native: u64, args: [u64; 6], counters: &Counters) -> (Action, i64, u64) {
+    let tasks = [CurrentTask::new()];
+    tasks[0].set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        7,
+    );
+    let names = InotifyNameCache::new();
+    let isa_unsupported = AtomicU64::new(0);
+    let call = decode_x86_64(native, args, 0x7fff_0000);
+    let mut frame = X86Frame {
+        native: call.native,
+        canonical: call.canonical,
+        args: call.args,
+        rax: 0xfeed,
+        isa_unsupported: &isa_unsupported,
+    };
+    let action = dispatch::dispatch_syscall_with_lifecycle(
+        &mut frame,
+        counters,
+        &tasks,
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
+        None,
+        None,
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    (action, frame.rax as i64, call.canonical.raw())
+}
+
+// x86 execve (59) and execveat (322) reach the native service route instead
+// of the Unported refusal: the production dispatcher no longer answers them,
+// the CPL0 completion arm does (staging, or the unclaimed refusal).
+#[test]
+fn x86_exec_routes_to_the_native_service_not_unported() {
+    for (native, args) in [(59, [1, 2, 3, 0, 0, 0]), (322, [4, 1, 2, 3, 0, 0])] {
+        let counters = Counters::new();
+        let (action, rax, canonical) = x86_exec_dispatch(native, args, &counters);
+        assert!(canonical == 221 || canonical == 281);
+        assert_eq!(action, Action::Forward, "native {native}");
+        assert_eq!(
+            rax, 0xfeed,
+            "native {native}: the dispatcher must not answer"
+        );
+        assert_eq!(
+            counters.refused[native as usize].load(Ordering::Relaxed),
+            0,
+            "native {native}: the CPL0 completion arm owns the refusal"
+        );
+    }
+}
+
+// The claim gate is neutral: only a fork child's exec is the native owner's.
+#[test]
+fn x86_exec_claim_is_a_fork_child_only() {
+    use carrick_el1_linux::native_process_runtime::NativeThreadGroupOwner as Owner;
+    assert!(dispatch::native_exec_claimed(|| Owner::ForkChild));
+    assert!(!dispatch::native_exec_claimed(|| Owner::Root));
+    assert!(!dispatch::native_exec_claimed(|| Owner::Unowned));
+}
+
+// A claimed x86 child's execve/execveat is staged through the neutral body
+// from the decoded x86 registers, then refused with a counted ring ENOSYS.
+#[test]
+fn x86_child_exec_is_staged_then_counted_enosys() {
+    use carrick_el1_linux::exec_stage::ExecStageRequest;
+    let path = b"/bin/static\0";
+    let arg = b"static\0";
+    let env = b"A=B\0";
+    let argv: [u64; 2] = [arg.as_ptr() as u64, 0];
+    let envp: [u64; 2] = [env.as_ptr() as u64, 0];
+    let task = CurrentTask::new();
+    for (native, args) in [
+        (
+            59,
+            [
+                path.as_ptr() as u64,
+                argv.as_ptr() as u64,
+                envp.as_ptr() as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        (
+            322,
+            [
+                (-100i64) as u64,
+                path.as_ptr() as u64,
+                argv.as_ptr() as u64,
+                envp.as_ptr() as u64,
+                0,
+                0,
+            ],
+        ),
+    ] {
+        let call = decode_x86_64(native, args, 0x7fff_0000);
+        let request = ExecStageRequest::from_canonical(call.canonical.raw(), call.args)
+            .expect("exec decodes to a stage request");
+        let counters = Counters::new();
+        let result = dispatch::settle_native_exec_without_successor(
+            &task,
+            &ResidentUser,
+            request,
+            call.native,
+            &counters,
+        );
+        assert_eq!(result, -38, "native {native}");
+        assert_eq!(
+            counters.refused[native as usize].load(Ordering::Relaxed),
+            1,
+            "native {native}: counted once, on the native ordinal"
+        );
+        // An unreadable argument vector is EFAULT, never a host exit.
+        let bad = ExecStageRequest { argv: 0, ..request };
+        struct Refuse;
+        impl carrick_el1_linux::file::MemoryValidator for Refuse {
+            fn writable_bytes(&self, _: u64, _: usize) -> usize {
+                0
+            }
+            fn readable_bytes(&self, _: u64, _: usize) -> usize {
+                0
+            }
+        }
+        let counters = Counters::new();
+        let result = dispatch::settle_native_exec_without_successor(
+            &task,
+            &Refuse,
+            bad,
+            call.native,
+            &counters,
+        );
+        assert_eq!(result, -14, "native {native}");
+        assert_eq!(counters.refused[native as usize].load(Ordering::Relaxed), 0);
+    }
+}

@@ -847,6 +847,7 @@ pub const fn route_x86(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == carrick_syscall_abi::nr::SEMCTL.raw() => Family::Ipc(IpcCall::SemCtl),
         nr if nr == carrick_syscall_abi::nr::SEMTIMEDOP.raw() => Family::Ipc(IpcCall::SemTimedOp),
         nr if nr == carrick_syscall_abi::nr::SEMOP.raw() => Family::Ipc(IpcCall::SemOp),
+        221 | 281 => Family::NativeService,
         _ => route_shared(ordinal, allocator_control),
     }
 }
@@ -1507,10 +1508,10 @@ mod ring_first_tests {
     }
 
     #[test]
-    fn native_exec_routes_to_the_arm_carrier_service_only() {
-        for ordinal in [221, 281] {
-            assert_eq!(route_aarch64(ordinal, u64::MAX), Family::NativeService);
-            assert_eq!(route_x86(ordinal, u64::MAX), Family::Unported);
+    fn native_exec_routes_to_the_native_service_on_both_isas() {
+        for nr in [crate::crossing::nr::EXECVE, crate::crossing::nr::EXECVEAT] {
+            assert_eq!(route_aarch64(nr.raw(), u64::MAX), Family::NativeService);
+            assert_eq!(route_x86(nr.raw(), u64::MAX), Family::NativeService);
         }
     }
 
