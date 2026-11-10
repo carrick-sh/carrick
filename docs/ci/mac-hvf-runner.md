@@ -284,11 +284,12 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
   and without letting an owner `workflow_dispatch` cancel or replace a pending `push`.
 - **Host-lease serialization (`/tmp/carrick-host-lease.lock`):**
   - `hvf-kernel` runs `Host-only source gate` (`just ci`: compilation and host tests) under the
-    **shared** `just lease carrick`, so it no longer blocks PR jobs (#2013). It acquires an
-    **exclusive** `just lease gate` across fixture restoration, `just accept --phase signed`, and
-    `Signed embedded guest tests`.
-  - Director gates (`just accept`, `just remote-accept` on `/Volumes/carrick-gate`) also
-    acquire exclusive `gate` mode.
+    **shared** `just lease carrick`, so it no longer blocks PR jobs (#2013). Fixture
+    restoration takes **exclusive** `just lease gate`; `just accept --phase signed` and
+    `Signed embedded guest tests` then build and sign under shared `carrick` and take
+    exclusive `gate` themselves only while guests execute (#2013).
+  - Director gates (`just accept`, `just remote-accept` on `/Volumes/carrick-gate`) take
+    exclusive `gate` mode for guest execution and shared `carrick` for their builds.
   - `ci.yml`'s `carrick-macos-ci` PR jobs (`macos-clippy`, `macos-build`, `macos-unit-a`,
     `macos-unit-b`, `macos-integration`) prebuild `carrick-xtask` (`just ci-prebuild-xtask`)
     and run every compile, lint, rustdoc, and test step under **shared** `just lease carrick`.
