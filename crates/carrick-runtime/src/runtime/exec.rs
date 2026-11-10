@@ -630,7 +630,7 @@ pub(crate) fn load_execve_image<'a>(
                 )
             })
             .flatten();
-        let (base, argv) = if cache_key.is_some() {
+        if cache_key.is_some() {
             let base = files.with_cache(cache_key, || {
                 let raw_bytes = source.read_all().map_err(host_io_errno)?;
                 let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|interpreter| {
@@ -670,7 +670,7 @@ pub(crate) fn load_execve_image<'a>(
                 )?,
                 argv,
             )
-        };
+        }
     };
     // An x86_64 guest on an x86_64 host runs natively: no Rosetta redirect
     // (binfmt translation is the AArch64 host's route to x86), the build's
@@ -728,8 +728,10 @@ pub(crate) use carrick_kernel::exec_helpers::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "platform-linux")]
     use carrick_guest_mem::GuestMemory as _;
 
+    #[cfg(feature = "platform-linux")]
     const EM_X86_64: u16 = 62;
     const EM_AARCH64: u16 = 183;
 
