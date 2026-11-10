@@ -1,12 +1,28 @@
+#![cfg_attr(
+    any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ),
+    expect(
+        dead_code,
+        reason = "native exec service on non-macOS carriers lands in #1093 S4"
+    )
+)]
 //! execve image loading, split out of runtime.rs (WS-F3): load_execve_image
 //! (rootfs/overlay ELF + shebang + Rosetta redirect). The shebang helpers
 //! (resolve_shebang, parse_shebang) and the signal-death / stop helpers live
 //! in `carrick_kernel::exec_helpers` (cross-platform); they are re-exported here for
 //! existing call sites.
 //! Free functions reached via `use super::*`.
+#[cfg(feature = "platform-macos")]
 use super::*;
 use crate::linux_abi::LinuxErrno;
+use carrick_kernel::dispatch::SyscallDispatcher;
+#[cfg(feature = "platform-macos")]
 use carrick_kernel::exec_helpers::parse_shebang;
+use carrick_mem::memory::AddressSpace;
+use std::sync::Arc;
 
 pub(crate) struct LoadedExecImage {
     pub(crate) image: AddressSpace,
@@ -103,6 +119,7 @@ fn native_child_exec_path_is_served(resolved: &str) -> bool {
 /// `descriptor_source` selects the object behind a descriptor in the
 /// caller's ring table (the table its ring owner sealed into the request):
 /// `SyscallDispatcher::native_descriptor_exec_source` (#1530).
+#[cfg(feature = "platform-macos")]
 fn prepare_native_exec_image(
     capability: &NativeExecCapability,
     payload: &[u8],
@@ -353,6 +370,7 @@ fn inspect_exec_head(
     Ok((head, direct_aarch64))
 }
 
+#[cfg(feature = "platform-macos")]
 fn finalize_hvf_exec_base(
     loader: &ExecLoaderCapabilities,
     raw: AddressSpace,
@@ -410,6 +428,7 @@ impl<'a> From<&'a String> for ExecTarget<'a> {
     }
 }
 
+#[cfg(feature = "platform-macos")]
 pub(crate) fn load_execve_image<'a>(
     loader: &ExecLoaderCapabilities,
     files: &carrick_kernel::dispatch::exec_files::ExecFiles,
@@ -601,6 +620,7 @@ pub(crate) fn load_execve_image<'a>(
 // cross-platform `exec_helpers` module. Re-export them here so the call sites
 // in `runtime.rs` (`use exec::{…}`) and the vcpu_loop macOS import
 // (`use crate::runtime::exec::{…}`) resolve without change.
+#[cfg(feature = "platform-macos")]
 pub(crate) use carrick_kernel::exec_helpers::{
     forked_child_die_by_signal, stop_after_traced_exec, stop_by_signal,
 };
@@ -609,6 +629,7 @@ pub(crate) use carrick_kernel::exec_helpers::{
 mod tests {
     use super::*;
 
+    #[cfg(feature = "platform-macos")]
     fn synthetic_aarch64_exec() -> Vec<u8> {
         const ET_EXEC: u16 = 2;
         const EM_AARCH64: u16 = 183;
@@ -638,6 +659,7 @@ mod tests {
         elf
     }
 
+    #[cfg(feature = "platform-macos")]
     fn read_image_u64(image: &AddressSpace, address: u64) -> u64 {
         u64::from_le_bytes(
             image
@@ -648,6 +670,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "platform-macos")]
     fn read_image_c_string(image: &AddressSpace, address: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut cursor = address;
@@ -661,6 +684,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "platform-macos")]
     fn execfn(image: &AddressSpace) -> Vec<u8> {
         const AT_EXECFN: u64 = 31;
         let mut cursor = image.initial_stack_pointer().expect("initial stack") + 32;
@@ -675,6 +699,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "platform-macos")]
     #[test]
     fn exec_normalizes_dot_slashes_and_dotdot_in_guest_visible_names() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -726,10 +751,10 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "syscall-shim")]
+    #[cfg(all(feature = "platform-macos", feature = "syscall-shim"))]
     struct ContinueInterceptor;
 
-    #[cfg(feature = "syscall-shim")]
+    #[cfg(all(feature = "platform-macos", feature = "syscall-shim"))]
     impl carrick_kernel::observe::SyscallInterceptor for ContinueInterceptor {
         fn intercept(
             &self,
@@ -740,7 +765,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "syscall-shim")]
+    #[cfg(all(feature = "platform-macos", feature = "syscall-shim"))]
     fn synthetic_exec_image() -> AddressSpace {
         let permissions = carrick_mem::elf::SegmentPerms {
             read: true,
@@ -759,7 +784,7 @@ mod tests {
         .expect("synthetic exec image")
     }
 
-    #[cfg(feature = "syscall-shim")]
+    #[cfg(all(feature = "platform-macos", feature = "syscall-shim"))]
     fn image_region(image: &AddressSpace, start: u64) -> &[u8] {
         image
             .regions()
@@ -769,7 +794,7 @@ mod tests {
             .bytes()
     }
 
-    #[cfg(feature = "syscall-shim")]
+    #[cfg(all(feature = "platform-macos", feature = "syscall-shim"))]
     #[test]
     fn interceptor_exec_image_preserves_closed_identity_page() {
         let mut dispatcher = SyscallDispatcher::new();
@@ -802,7 +827,7 @@ mod tests {
         assert_eq!(&vdso[..no_fastpaths.len()], no_fastpaths.as_slice());
     }
 
-    #[cfg(feature = "syscall-shim")]
+    #[cfg(all(feature = "platform-macos", feature = "syscall-shim"))]
     #[test]
     fn unrestricted_exec_image_preserves_fastpaths() {
         use carrick_hal::GuestArch as _;
@@ -884,6 +909,7 @@ mod tests {
         assert_eq!(reused, expected);
     }
 
+    #[cfg(feature = "platform-macos")]
     #[test]
     fn production_hvpatch_exec_builder_emits_only_asid_scoped_leaves() {
         const NON_GLOBAL: u64 = 1 << 11;
@@ -939,6 +965,7 @@ mod tests {
             );
         }
     }
+    #[cfg(feature = "platform-macos")]
     #[test]
     fn retained_exec_files_preserve_numeric_preparation_errnos() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -978,6 +1005,7 @@ mod tests {
 
     /// Seal a staged payload with a caller's access context, as the ring
     /// owner does from the caller's task row.
+    #[cfg(feature = "platform-macos")]
     fn sealed(payload: Vec<u8>, fsuid: u32, cwd: &str) -> Vec<u8> {
         sealed_in(payload, fsuid, cwd, None)
     }
@@ -985,15 +1013,18 @@ mod tests {
     /// Seal a staged payload as the ring owner does, through the production
     /// encoder, from a task row with `fsuid` everywhere, the capabilities
     /// Linux leaves that uid, `cwd` and `root`.
+    #[cfg(feature = "platform-macos")]
     fn sealed_in(payload: Vec<u8>, fsuid: u32, cwd: &str, root: Option<&str>) -> Vec<u8> {
         seal_task_row(payload, fsuid, cwd, root, None)
     }
 
     /// Seal as the ring owner does for a root caller with a ring table.
+    #[cfg(feature = "platform-macos")]
     fn sealed_with_table(payload: Vec<u8>, cwd: &str, table: Option<[u64; 3]>) -> Vec<u8> {
         seal_task_row(payload, 0, cwd, None, table)
     }
 
+    #[cfg(feature = "platform-macos")]
     fn seal_task_row(
         mut payload: Vec<u8>,
         fsuid: u32,
@@ -1034,6 +1065,7 @@ mod tests {
     }
 
     /// A caller whose ring table resolves no descriptor.
+    #[cfg(feature = "platform-macos")]
     fn no_descriptors(
         _: [u64; 3],
         _: i32,
@@ -1041,6 +1073,7 @@ mod tests {
         Err(crate::linux_abi::LINUX_ENOSYS)
     }
 
+    #[cfg(feature = "platform-macos")]
     fn native_exec_payload(call: carrick_core_abi::service::ExecCall, path: &str) -> Vec<u8> {
         let argv = b"successor\0";
         let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
@@ -1064,6 +1097,7 @@ mod tests {
     /// the origin task's live (or captured) cwd and credentials. What the
     /// capability cannot hold (the caller's own `/proc/self` and `/dev/fd`
     /// views, an unsealed payload) stays a counted ENOSYS.
+    #[cfg(feature = "platform-macos")]
     #[test]
     fn native_child_exec_resolves_with_the_callers_own_access() {
         use carrick_core_abi::service::ExecCall;
@@ -1181,6 +1215,7 @@ mod tests {
     /// never its name: replacing the path after the open must not change
     /// what runs. Red on the path-recovery version: it re-resolved the
     /// recorded path and loaded the replacement (ENOEXEC here).
+    #[cfg(feature = "platform-macos")]
     #[test]
     fn native_child_fexecve_executes_the_open_file_not_its_path() {
         use carrick_core_abi::service::ExecCall;
@@ -1261,6 +1296,7 @@ mod tests {
         drop(dispatcher);
     }
 
+    #[cfg(feature = "platform-macos")]
     #[test]
     fn retained_exec_capability_prepares_a_static_binary_successor() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1311,6 +1347,7 @@ mod tests {
     }
 
     /// A minimal ET_DYN AArch64 image, as the dynamic loader is.
+    #[cfg(feature = "platform-macos")]
     fn synthetic_aarch64_interpreter() -> Vec<u8> {
         let mut elf = synthetic_aarch64_exec();
         const ET_DYN: u16 = 3;
@@ -1323,6 +1360,7 @@ mod tests {
     }
 
     /// A minimal ET_EXEC AArch64 image whose PT_INTERP names `interpreter`.
+    #[cfg(feature = "platform-macos")]
     fn synthetic_dynamic_aarch64_exec(interpreter: &str) -> Vec<u8> {
         const PT_INTERP: u32 = 3;
         let mut elf = synthetic_aarch64_exec();
@@ -1347,6 +1385,7 @@ mod tests {
     /// #937: a native fork child's exec of a dynamically linked binary in a
     /// usrmerge rootfs (`/lib -> usr/lib`) must resolve its PT_INTERP through
     /// the layered rootfs, exactly as the host-owned exec does.
+    #[cfg(feature = "platform-macos")]
     #[test]
     fn native_child_exec_prepares_a_dynamic_binary_through_a_usrmerge_rootfs() {
         use std::os::unix::fs::PermissionsExt as _;
