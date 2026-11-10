@@ -58,19 +58,36 @@ export CARRICK_EL1_CENSUS="${CARRICK_EL1_CENSUS:-$PWD/target/carrick-census}"
 # shellcheck disable=SC1091
 . scripts/lib/test-signed-run.sh
 
-# Bootstrap once into the Rust lease supervisor, which owns the lock through
-# build, signing, tests and EXIT cleanup. Descendants get only its validation
-# socket; nested runners never own, reacquire or downgrade the gate flock.
+# Bootstrap once into the signed-phase driver (#2013). It runs this script
+# twice, each time under a Rust lease supervisor that owns the lock through
+# that phase's work and EXIT cleanup: CARRICK_SIGNED_PHASE=build under the
+# shared carrick lease (test executables, signing), then, after that lease is
+# released, =execute under gate (guests). Between them the driver re-verifies
+# every built executable's identity. Descendants get only the validation
+# socket; nested runners never own, reacquire, upgrade or downgrade a flock.
+# Under an outer gate both phases reuse it; under an outer carrick lease the
+# driver refuses, because shared admission never becomes gate.
 if [ "$(uname -s)" != "Darwin" ]; then
     echo "test-signed: macOS/HVF only — the entitlement requirement does not exist on this host" >&2
     exit 1
 fi
-if [ -z "${CARRICK_HOST_LEASE_SOCKET:-}" ]; then
-    exec cargo --config "$CARRICK_CARGO_CACHE_CONFIG" run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- ./scripts/test-signed.sh "$@"
+phase="${CARRICK_SIGNED_PHASE:-}"
+if [ -z "$phase" ]; then
+    exec cargo --config "$CARRICK_CARGO_CACHE_CONFIG" run --locked -p carrick-xtask -- signed-phases --check-load -- ./scripts/test-signed.sh "$@"
 fi
-# Validate the supervised lease and check host load before any work. The runner
-# logs detected PIDs and parent commands even with CARRICK_ALLOW_LOAD=1.
-cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- true
+case "$phase" in
+    build) phase_lease=carrick ;;
+    execute) phase_lease=gate ;;
+    *)
+        echo "test-signed: invalid CARRICK_SIGNED_PHASE: $phase (expected build or execute)" >&2
+        exit 2
+        ;;
+esac
+phase_state="${CARRICK_SIGNED_STATE:?test-signed: CARRICK_SIGNED_PHASE requires CARRICK_SIGNED_STATE}"
+# Validate this phase's supervised lease (execution must hold gate) and check
+# host load before any work. The runner logs detected PIDs and parent
+# commands even with CARRICK_ALLOW_LOAD=1.
+cargo run --locked -p carrick-xtask -- host-lease --mode "$phase_lease" --check-load -- true
 
 pkg="${1:?usage: scripts/test-signed.sh <package> [libtest args...]}"
 shift
@@ -188,6 +205,13 @@ jq -nc \
     ${contract_header_arg[@]+"${contract_header_arg[@]}"} \
     "{schema:\$schema,record_type:\"header\",source_head:\$source_head,package:\$package,arguments:\$arguments,requested_test_filter:\$requested_filter,carrick_run_id:\$run_id,test_target:\$test_target,enabled_features:\$enabled_features$contract_header_entry}" \
     >"$receipt_tmp"
+if [ "$phase" = execute ]; then
+    # The build phase's rows (header, fixture validation) open this receipt,
+    # followed by the leases both phases held and the re-verified identity.
+    cat "$phase_state/receipt-prefix.jsonl" >"$receipt_tmp"
+    jq -c '{schema:"carrick.signed-embed-test.v1",record_type:"phase_admission"} + .' \
+        "$phase_state/admission.json" >>"$receipt_tmp"
+fi
 scratch=()
 active_exe_run_id=""
 active_exe_pid=""
@@ -370,6 +394,7 @@ cleanup() {
             ([.[] | select(.record_type == "executable")] | length >= 1) and
             ([.[] | select(.record_type == "execution")] | length >= 1) and
             ([.[] | select(.record_type == "unentitled_negative_control")] | length == 1) and
+            ([.[] | select(.record_type == "phase_admission" and .execute_lease == "gate")] | length == 1) and
             ([.[] | select(.record_type == "cleanup" and .remaining_processes == 0)] | length == 1) and
             (all(.[] | select(.record_type == "executable");
                 (.executable_id | length) > 0 and
@@ -403,130 +428,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Guest fixtures come from a Linux-published bundle. Rebuilding here would
-# replace the proven executable identity and require toolchains on cloudmac.
-# Also verify on direct test-embed/conformance-next invocations, before signing
-# or executing any test. The inherited lease covers this verification too.
-# The bundle is admitted by fixture input identity: unrelated commits and dirty
-# sources keep it valid, any fixture input change refuses it. Evidence records
-# HEAD, the working tree, dirtiness and the input identity.
-case "$pkg" in
-    carrick-embed|carrick-conformance-next)
-        fixture_receipt="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-fixtures.XXXXXX")"
-        scratch+=("$fixture_receipt")
-        cargo run --locked -p carrick-xtask -- fixtures verify --receipt "$fixture_receipt"
-        jq -c '. + {schema:"carrick.signed-embed-test.v1",record_type:"fixture_validation"}' \
-            "$fixture_receipt" >>"$receipt_tmp"
-        ;;
-esac
-
-# The probe's Rust test is a distinct Linux executable, not its normal storm
-# binary. Build it for every conformance-next signed invocation so case_ gates
-# cannot accidentally run a stale witness after the helper changes.
-if [ "$pkg" = "carrick-conformance-next" ]; then
-    witness_json="$(mktemp "${TMPDIR:-/tmp}/forkexecstorm-witness-build.XXXXXX")"
-    scratch+=("$witness_json")
-    (cd conformance-probes && cargo test --locked --release \
-        --target aarch64-unknown-linux-musl --bin forkexecstorm \
-        --no-run --message-format=json) >"$witness_json"
-    witness_exe="$(jq -ers '[.[] | select(.reason == "compiler-artifact" and .target.name == "forkexecstorm" and .profile.test == true and .executable != null)] | if length == 1 then .[0].executable else error("expected one forkexecstorm test executable") end' "$witness_json")"
-    mkdir -p target/embed-fixtures
-    witness_path=target/embed-fixtures/forkexecstorm-witness-aarch64
-    cp "$witness_exe" "$witness_path"
-    witness_sources='{}'
-    for source in src/bin/forkexecstorm.rs src/lib.rs Cargo.toml Cargo.lock; do
-        digest="$(shasum -a 256 "conformance-probes/$source" | awk '{print $1}')"
-        witness_sources="$(jq -nc --argjson sources "$witness_sources" --arg path "$source" --arg digest "$digest" '$sources + {($path): $digest}')"
-    done
-    jq -nc --arg elf_sha256 "$(shasum -a 256 "$witness_path" | awk '{print $1}')" \
-        --argjson sources "$witness_sources" \
-        '{schema:"forkexecstorm-witness-v1",target:"aarch64-unknown-linux-musl",elf_sha256:$elf_sha256,sources:$sources}' \
-        >"$witness_path.json"
-    echo "test-signed: forkexecstorm witness $(cat "$witness_path.json")"
+# The build phase (fixtures, test executables, selection, signing) runs
+# under the shared lease in scripts/lib/test-signed-build.sh and exits.
+if [ "$phase" = build ]; then
+    # shellcheck source=scripts/lib/test-signed-build.sh
+    . scripts/lib/test-signed-build.sh
 fi
 
-if [ "$pkg" = "carrick-conformance-next" ]; then
-    # This dedicated numeric ELF witness is not a generic blessed probe.
-    # Rebuild it here so the public signed gate never depends on a manual
-    # fixture build. Its compiled fingerprint detects a stale executable.
-    libpython_map_fixture="crates/carrick-conformance-next/tests/fixtures/libpython-map"
-    libpython_map_source_sha256="$(shasum -a 256 "$libpython_map_fixture/src/main.rs" | cut -d ' ' -f 1)"
-    CARRICK_LIBPYTHON_MAP_SOURCE_SHA256="$libpython_map_source_sha256" \
-        CARGO_TARGET_DIR="$PWD/target/libpython-map" \
-        cargo build --locked --manifest-path "$libpython_map_fixture/Cargo.toml" \
-        --target aarch64-unknown-linux-musl --release
-    directory_fixture="crates/carrick-conformance-next/tests/fixtures/directory-copyout"
-    directory_source_sha256="$(shasum -a 256 "$directory_fixture/src/main.rs" | cut -d ' ' -f 1)"
-    CARRICK_DIRECTORY_COPYOUT_SOURCE_SHA256="$directory_source_sha256" \
-        CARGO_TARGET_DIR="$PWD/target/directory-copyout" \
-        cargo build --locked --manifest-path "$directory_fixture/Cargo.toml" \
-        --target aarch64-unknown-linux-musl --release
-    elf_errno_fixture="crates/carrick-conformance-next/tests/fixtures/elf-exec-errno"
-    elf_errno_source_sha256="$(shasum -a 256 "$elf_errno_fixture/src/main.rs" | cut -d ' ' -f 1)"
-    CARRICK_ELF_FIXTURE_SOURCE_SHA256="$elf_errno_source_sha256" \
-        CARGO_TARGET_DIR="$PWD/target/elf-exec-errno" \
-        cargo build --locked --manifest-path "$elf_errno_fixture/Cargo.toml" \
-        --target aarch64-unknown-linux-musl --release
-fi
-
-# 1. Build (never run) the package's test executables and collect their
-#    paths. Only the package's OWN test-profile artifacts carry
-#    `profile.test == true` plus an `executable`; dependencies compile with
-#    `test: false`. The JSON goes to a file first so a build failure stops the
-#    script (a process substitution's exit status would not).
-json_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-build.XXXXXX")"
-scratch+=("$json_log")
-# CARRICK_TEST_TARGET names one Cargo integration-test target. Always build
-# the existing negative control too; it must remain present in narrow runs.
-cargo_target_flags=()
-if [ -n "${CARRICK_TEST_TARGET:-}" ]; then
-    cargo_target_flags=(--test "$CARRICK_TEST_TARGET")
-    case "$pkg" in
-        carrick-vmm-hvf) cargo_target_flags+=(--lib) ;;
-        *) cargo_target_flags+=(--test entitlement_negative) ;;
-    esac
-fi
-# Render compiler diagnostics to stderr so build failures reach the gate log;
-# compiler-artifact records still go to the JSON executable inventory.
-cargo test --locked -p "$pkg" ${cargo_target_flags[@]+"${cargo_target_flags[@]}"} ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} --release --no-run --message-format=json-render-diagnostics >"$json_log"
-exes=()
+# Execution phase, under gate. The driver has re-verified every listed
+# executable's identity since the build phase; load what that phase chose.
+run_exes=()
 while IFS= read -r exe; do
-    [ -n "$exe" ] && exes+=("$exe")
-done < <(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' "$json_log")
-if [ "${#exes[@]}" -eq 0 ]; then
-    echo "test-signed: cargo produced no test executables for $pkg" >&2
-    exit 1
-fi
-
-# Select before signing; libtest listing does not create a VM.
-test_signed_select_executables
-
-# 3. Sign each executable in place through the shared post-link path, and
-#    PROVE the entitlement is on the file before trusting it.
-for exe in "${sign_exes[@]}"; do
-    scratch+=("$exe.raw.$$" "$exe.tmp.$$")
-    carrick_post_link_sign "$exe" "$exe" "$entitlements"
-    if ! test_signed_has_entitlement "$exe"; then
-        echo "test-signed: $exe does not carry com.apple.security.hypervisor after signing" >&2
-        exit 1
-    fi
-    echo "test-signed: signed $exe"
-done
-
-if [ "$has_exact" -eq 1 ]; then
-    rebuilt_args=()
-    replaced_filter=0
-    for arg in "$@"; do
-        if [ "$replaced_filter" -eq 0 ] && [ "$arg" = "$requested_filter" ]; then
-            rebuilt_args+=("$exact_name")
-            replaced_filter=1
-        else
-            rebuilt_args+=("$arg")
-        fi
-    done
-    set -- "${rebuilt_args[@]}"
-    echo "test-signed: resolved exact filter $requested_filter -> $exact_name"
-fi
+    [ -n "$exe" ] && run_exes+=("$exe")
+done <"$phase_state/run_exes"
+sign_exes=()
+while IFS= read -r exe; do
+    [ -n "$exe" ] && sign_exes+=("$exe")
+done <"$phase_state/sign_exes"
+selected="$phase_state/selected"
+carrier=""
+negative_test_name=""
+noent=""
+# shellcheck disable=SC1091
+. "$phase_state/vars"
+scratch+=("$noent")
+set --
+while IFS= read -r -d '' arg; do
+    set -- "$@" "$arg"
+done <"$phase_state/args"
 
 record_executable() {
     exe="$1"
@@ -589,14 +518,7 @@ done
 #    and re-signed ad-hoc WITHOUT the entitlement — byte-for-byte the state
 #    of a bare `cargo test` binary — and must classify HV_DENIED as
 #    EmbedError::Entitlement. The test is #[ignore] so step 4 skips it.
-noent="$carrier.noent.$$"
-scratch+=("$noent")
-cp -f "$carrier" "$noent"
-codesign --force --sign - "$noent"
-if test_signed_has_entitlement "$noent"; then
-    echo "test-signed: $noent still carries the hypervisor entitlement; the negative control would prove nothing" >&2
-    exit 1
-fi
+#    The build phase signed the unentitled copy as $noent.
 neg_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-negative.XXXXXX")"
 scratch+=("$neg_log")
 echo "test-signed: negative control on $noent"
