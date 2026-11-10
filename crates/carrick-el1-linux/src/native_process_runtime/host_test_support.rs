@@ -239,7 +239,22 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         carrick_el1_abi::ipc::IpcRegion<'_>,
         &carrick_el1_abi::ipc_tables::IpcTableMap,
     )> {
-        Some((self.native_ipc?, carrick_el1_abi::ipc_table_map_host()?))
+        static MAP: std::sync::OnceLock<&'static carrick_el1_abi::ipc_tables::IpcTableMap> =
+            std::sync::OnceLock::new();
+        let map = carrick_el1_abi::ipc_table_map_host().unwrap_or_else(|| {
+            MAP.get_or_init(|| {
+                let layout = std::alloc::Layout::new::<carrick_el1_abi::ipc_tables::IpcTableMap>();
+                // SAFETY: typed aligned zeroed allocation is a valid empty IpcTableMap
+                // retained for the life of the isolated test process.
+                unsafe {
+                    let ptr = std::alloc::alloc_zeroed(layout)
+                        .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>();
+                    assert!(!ptr.is_null());
+                    Box::leak(Box::from_raw(ptr))
+                }
+            })
+        });
+        Some((self.native_ipc?, map))
     }
     fn exec_fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
         static MAP: std::sync::OnceLock<&'static [carrick_el1_abi::FdMapSlot]> =
@@ -509,26 +524,6 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         }
         Ok(())
     }
-    fn retire_adapter_operation(
-        &mut self,
-        binding: ExecutionBinding,
-        operation: carrick_sched_core::object_wait::OperationToken,
-    ) -> Result<usize, NativeProcessError> {
-        let region = self
-            .native_ipc
-            .as_ref()
-            .ok_or(NativeProcessError::Unsupported)?;
-        // This fixture's slot owns the same admitted root throughout the wait.
-        let task = CurrentTask::new();
-        crate::ipc::retire_native_operation(
-            region,
-            self.zone,
-            SlotId::from_index(0).unwrap(),
-            &task,
-            binding,
-            operation,
-        )
-    }
     fn signal_deadline(
         &mut self,
         nanos: u64,
@@ -601,10 +596,10 @@ pub fn words(address: AddressContext<RootGpa>) -> ParkedContextWords {
 /// Only physical memory operations are replaced by this host-test service;
 /// registration, ingress drain, pending selection and frame delivery run
 /// through the same production methods as the guest image.
-pub struct NativeSignalFixture {
-    zone: &'static ZoneTables<ParkedContextWords>,
-    registry: &'static NativeProcessRegistry<'static, AddressContext<RootGpa>, ParkedContextWords>,
-    runtime: Arc<NativeProcessRuntime<'static, AddressContext<RootGpa>, ParkedContextWords>>,
+pub struct NativeSignalFixture<C: ProcessContext + 'static = ParkedContextWords> {
+    zone: &'static ZoneTables<C>,
+    registry: &'static NativeProcessRegistry<'static, AddressContext<RootGpa>, C>,
+    runtime: Arc<NativeProcessRuntime<'static, AddressContext<RootGpa>, C>>,
     task: &'static CurrentTask,
     control: &'static ThreadControlSlot,
     page: &'static ThreadLifecyclePage,
@@ -614,9 +609,10 @@ pub struct NativeSignalFixture {
     slot: SlotId,
     record: RecordRef,
     handler_signum: core::sync::atomic::AtomicI32,
+    make_words: fn(AddressContext<RootGpa>) -> C,
 }
 
-impl Drop for NativeSignalFixture {
+impl<C: ProcessContext + 'static> Drop for NativeSignalFixture<C> {
     fn drop(&mut self) {
         // The registry's member and group rows retain the signal owner even
         // after the fixture's runtime handle is dropped.
@@ -625,54 +621,35 @@ impl Drop for NativeSignalFixture {
     }
 }
 
-impl NativeSignalFixture {
-    pub fn new(
+impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
+    fn new_with_context<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
         binding: ExecutionBinding,
         process: carrick_core_abi::EntryTaskKey,
         process_birth: carrick_core_abi::BirthSerial,
+        make_words: fn(AddressContext<RootGpa>) -> C,
     ) -> Self {
-        let fixture = Self::admit_host_root(binding, process, process_birth);
+        let fixture =
+            Self::with_identity_for::<B>(true, |_| (binding, process, process_birth), make_words);
         fixture.runtime.give_fixture_root_a_cwd();
         fixture
     }
 
-    fn admit_host_root(
-        binding: ExecutionBinding,
-        process: carrick_core_abi::EntryTaskKey,
-        process_birth: carrick_core_abi::BirthSerial,
-    ) -> Self {
-        Self::with_identity(true, |_| (binding, process, process_birth))
-    }
-
-    /// Admit the identities established by production bootstrap without seeding
-    /// a fixture namespace domain or issuing any fixture identity claims.
-    pub fn from_bootstrap(
-        identity: impl FnOnce(
-            &'static ZoneTables<ParkedContextWords>,
-        ) -> (
-            ExecutionBinding,
-            carrick_core_abi::EntryTaskKey,
-            carrick_core_abi::BirthSerial,
-        ),
-    ) -> Self {
-        Self::with_identity(false, identity)
-    }
-
-    fn with_identity(
+    fn with_identity_for<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
         seed: bool,
         identity: impl FnOnce(
-            &'static ZoneTables<ParkedContextWords>,
+            &'static ZoneTables<C>,
         ) -> (
             ExecutionBinding,
             carrick_core_abi::EntryTaskKey,
             carrick_core_abi::BirthSerial,
         ),
+        make_words: fn(AddressContext<RootGpa>) -> C,
     ) -> Self {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let layout = std::alloc::Layout::new::<ZoneTables<C>>();
         // SAFETY: one aligned allocation owns this zero-valid compact zone for
         // the entire leaked host-test fixture lifetime.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<C>>();
             assert!(!ptr.is_null());
             Box::leak(Box::from_raw(ptr))
         };
@@ -738,14 +715,14 @@ impl NativeSignalFixture {
             seed_fixture_namespace(zone, task, page);
         }
         let runtime = Arc::new(
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fresh_root::<B>(
                 source,
                 task,
                 page,
                 control,
                 address,
                 address,
-                words(address),
+                make_words(address),
             )
             .unwrap(),
         );
@@ -776,6 +753,7 @@ impl NativeSignalFixture {
             slot,
             record,
             handler_signum: core::sync::atomic::AtomicI32::new(2),
+            make_words,
         }
     }
 
@@ -787,7 +765,7 @@ impl NativeSignalFixture {
         self.control
     }
 
-    fn service(&self) -> Physical<'static> {
+    fn service(&self) -> Physical<'static, C> {
         Physical {
             zone: self.zone,
             page: self.child_page,
@@ -804,6 +782,53 @@ impl NativeSignalFixture {
             refuse_copy: false,
             on_signal_clock: None,
         }
+    }
+}
+
+impl NativeSignalFixture {
+    pub fn new(
+        binding: ExecutionBinding,
+        process: carrick_core_abi::EntryTaskKey,
+        process_birth: carrick_core_abi::BirthSerial,
+    ) -> Self {
+        let fixture = Self::admit_host_root(binding, process, process_birth);
+        fixture.runtime.give_fixture_root_a_cwd();
+        fixture
+    }
+
+    fn admit_host_root(
+        binding: ExecutionBinding,
+        process: carrick_core_abi::EntryTaskKey,
+        process_birth: carrick_core_abi::BirthSerial,
+    ) -> Self {
+        Self::with_identity(true, |_| (binding, process, process_birth))
+    }
+
+    /// Admit the identities established by production bootstrap without seeding
+    /// a fixture namespace domain or issuing any fixture identity claims.
+    pub fn from_bootstrap(
+        identity: impl FnOnce(
+            &'static ZoneTables<ParkedContextWords>,
+        ) -> (
+            ExecutionBinding,
+            carrick_core_abi::EntryTaskKey,
+            carrick_core_abi::BirthSerial,
+        ),
+    ) -> Self {
+        Self::with_identity(false, identity)
+    }
+
+    fn with_identity(
+        seed: bool,
+        identity: impl FnOnce(
+            &'static ZoneTables<ParkedContextWords>,
+        ) -> (
+            ExecutionBinding,
+            carrick_core_abi::EntryTaskKey,
+            carrick_core_abi::BirthSerial,
+        ),
+    ) -> Self {
+        Self::with_identity_for::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(seed, identity, words)
     }
 
     pub fn install_sigint_handler(&self, restart: bool) {
@@ -1948,7 +1973,16 @@ impl NativeServiceCapacityFixture {
 }
 
 fn native_exec_fixture() -> NativeSignalFixture {
-    NativeSignalFixture::new(
+    native_exec_fixture_for::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(words)
+}
+
+fn native_exec_fixture_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) -> NativeSignalFixture<C> {
+    NativeSignalFixture::new_with_context::<B>(
         ExecutionBinding {
             task: carrick_core_abi::EntryTaskKey::from_raw(41),
             generation: carrick_core_abi::SnapshotGeneration::from_raw(11),
@@ -1957,7 +1991,16 @@ fn native_exec_fixture() -> NativeSignalFixture {
         },
         carrick_core_abi::EntryTaskKey::from_raw(41),
         carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap()),
+        make_words,
     )
+}
+
+#[cfg(test)]
+fn arm_words(address: AddressContext<RootGpa>) -> carrick_el1_abi::Aarch64ParkedContext {
+    let mut native = carrick_el1_abi::ThreadCtx::ZERO;
+    native.pc = 0x40_0004;
+    native.sp_el0 = 0x80_0000;
+    carrick_el1_abi::Aarch64ParkedContext::from_parts(native, address)
 }
 
 /// These are corrupt custody, not a sibling holding a releasable resource.
@@ -2182,8 +2225,8 @@ fn carrier_work_wake_preserves_the_completed_syscall_result() {
 }
 
 #[cfg(test)]
-fn publish_test_exec_reply(
-    fixture: &NativeSignalFixture,
+fn publish_test_exec_reply<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
     control: &ThreadControlSlot,
     slot: SlotId,
     receipt_raw: u64,
@@ -2201,8 +2244,8 @@ fn publish_test_exec_reply(
 }
 
 #[cfg(test)]
-fn publish_test_exec_reply_with(
-    fixture: &NativeSignalFixture,
+fn publish_test_exec_reply_with<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
     control: &ThreadControlSlot,
     slot: SlotId,
     receipt_raw: u64,
@@ -2221,8 +2264,8 @@ fn publish_test_exec_reply_with(
 }
 
 #[cfg(test)]
-fn publish_test_exec_reply_for(
-    fixture: &NativeSignalFixture,
+fn publish_test_exec_reply_for<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
     task: &CurrentTask,
     control: &ThreadControlSlot,
     slot: SlotId,
@@ -2382,15 +2425,18 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
     )
 }
 
-fn add_service_sibling(
-    fixture: &NativeSignalFixture,
+fn add_service_sibling<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
     operation: Option<carrick_core_abi::service::ServiceOperation>,
 ) -> ExecSibling {
     add_signal_sibling(fixture, operation, false)
 }
 
 // Prepare a real published birth without entering native registration.
-fn prepare_signal_sibling(fixture: &NativeSignalFixture, host_issued: bool) -> ExecSibling {
+fn prepare_signal_sibling<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
+    host_issued: bool,
+) -> ExecSibling {
     let binding = ExecutionBinding {
         task: carrick_core_abi::EntryTaskKey::from_raw(42),
         generation: carrick_core_abi::SnapshotGeneration::from_raw(12),
@@ -2714,8 +2760,8 @@ fn register_thread_preserves_existing_credential_storage() {
     assert_eq!(child.comm, row.threads.threads[0].comm);
 }
 
-fn add_signal_sibling(
-    fixture: &NativeSignalFixture,
+fn add_signal_sibling<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
     operation: Option<carrick_core_abi::service::ServiceOperation>,
     host_issued: bool,
 ) -> ExecSibling {
@@ -2753,7 +2799,7 @@ fn add_signal_sibling(
                 source,
                 task,
                 fixture.address,
-                &words(fixture.address),
+                &(fixture.make_words)(fixture.address),
                 &mut service,
             )
             .unwrap();
@@ -3237,7 +3283,15 @@ mod anonymous_wait_cancellation_tests {
             token.kind(),
             carrick_sched_core::object_wait::OperationKind::Adapter
         );
-        service.retire_adapter_operation(binding, token).unwrap();
+        crate::ipc::retire_native_operation(
+            &region,
+            fixture.zone,
+            fixture.slot,
+            fixture.task,
+            binding,
+            token,
+        )
+        .unwrap();
         fixture.zone.free_record(fixture.record.id);
         assert!(fixture.zone.live(fixture.record).is_none());
 
@@ -6242,12 +6296,32 @@ fn retained_ipc_supply(
     yielding: bool,
     refusal: AdapterRefusal,
 ) {
+    retained_ipc_supply_for::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words,
+        supplied,
+        already_ready,
+        yielding,
+        refusal,
+    );
+}
+
+#[cfg(test)]
+fn retained_ipc_supply_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    supplied: bool,
+    already_ready: bool,
+    yielding: bool,
+    refusal: AdapterRefusal,
+) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
     use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
     use carrick_el1_abi::ipc::{
         IpcBacking, IpcMmKey, IpcOpKind, IpcOperation, IpcTaskKey, IpcUserVa, OfdPin, WriteProgress,
     };
-    let fixture = native_exec_fixture();
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
     let shared = Box::leak(Box::new(std::sync::Arc::new(
         carrick_kernel::el1_ipc::HostIpc::with_limits(
             1 << 20,
@@ -6301,7 +6375,7 @@ fn retained_ipc_supply(
                 source,
                 fixture.task,
                 fixture.address,
-                &words(fixture.address),
+                &make_words(fixture.address),
                 &mut service,
             )
             .unwrap();
@@ -6597,7 +6671,340 @@ fn ipc_backing_supply_retains_the_exact_operation_and_pin() {
 #[cfg(test)]
 #[test]
 fn ipc_backing_refusal_retires_the_operation_and_pin() {
-    retained_ipc_supply(false, false, false, AdapterRefusal::None);
+    retained_ipc_supply_for::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words,
+        false,
+        false,
+        false,
+        AdapterRefusal::None,
+    );
+    retained_ipc_supply_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, false, false, false, AdapterRefusal::None);
+}
+
+#[cfg(test)]
+fn retained_ipc_terminal_close_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    is_exec: bool,
+) {
+    use carrick_core_abi::service::ServiceOperation;
+    use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
+    use carrick_el1_abi::ipc::{
+        IpcBacking, IpcMmKey, IpcOpKind, IpcOperation, IpcTaskKey, IpcUserVa, OfdPin, WriteProgress,
+    };
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_signal_sibling(&fixture, None, false);
+    assert!(fixture.zone.mark_native_owned(sibling.record.id));
+
+    let shared = Box::leak(Box::new(std::sync::Arc::new(
+        carrick_kernel::el1_ipc::HostIpc::with_limits(
+            1 << 20,
+            carrick_kernel::el1_ipc::IpcLimits::ZONE,
+        )
+        .unwrap(),
+    )));
+    let object = shared
+        .create_eventfd(7, carrick_el1_abi::ipc::EventMode::Counter)
+        .unwrap();
+    let table = shared.create_table(64, 64).unwrap();
+    let description = shared
+        .admit_description(Description::new(
+            IpcBacking::EventFd { object }.encode(),
+            AccessMode::ReadOnly,
+            StatusFlags::default(),
+        ))
+        .unwrap();
+    description.install(table, Fd(0), false).unwrap();
+    drop(description);
+
+    let region = shared.region();
+    let (pin, _) = region
+        .fd(carrick_sched_core::ShortLockSpin)
+        .pin(table, Fd(0))
+        .unwrap();
+    let raw_pin = pin.into_raw();
+    let sibling_binding = crate::common_entry::execution_binding(sibling.task);
+    let raw_ipc_token = region
+        .begin_operation(IpcOperation {
+            kind: IpcOpKind::EventFdRead,
+            pin: raw_pin,
+            object: object.to_raw(),
+            task: IpcTaskKey(sibling_binding.task.raw()),
+            mm: IpcMmKey(sibling_binding.mm.raw()),
+            buf: IpcUserVa(0x10000),
+            progress: WriteProgress::new(8),
+            ..IpcOperation::EMPTY
+        })
+        .unwrap();
+    let token = carrick_el1::substrate::ipc::to_sched_token(raw_ipc_token).unwrap();
+    let (token_index, token_generation) = (token.index(), token.generation());
+
+    let sibling_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: sibling.slot,
+    };
+    let mut service = fixture.service();
+    service.native_ipc = Some(region);
+    {
+        let mut sibling_entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                sibling_source,
+                sibling.task,
+                fixture.address,
+                &make_words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            sibling_entry.yield_owned_operation(token),
+            carrick_core::mm::transaction::OwnedOperationYield::Suspended
+        ));
+        // Close the numeric fd so only the retained IPC operation's pin keeps the object live.
+        assert!(
+            region
+                .fd(carrick_sched_core::ShortLockSpin)
+                .close(table, Fd(0))
+                .unwrap()
+                .is_none()
+        );
+        assert!(region.observe(object).is_ok());
+    }
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(sibling.slot, sibling.record.id)
+            .is_queued()
+    );
+    fixture.zone.clear_current(sibling.slot);
+
+    let leader_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let successor_mm = if is_exec {
+        {
+            let mut leader = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    leader_source,
+                    fixture.task,
+                    fixture.address,
+                    &make_words(fixture.address),
+                    &mut service,
+                )
+                .unwrap();
+            assert!(matches!(
+                leader.begin_exec_service(
+                    test_exec_payload(b"/bin/static"),
+                    None,
+                    NativeServiceCall::new(
+                        carrick_guest_arch::NativeOrdinal::new(221),
+                        &carrick_el1_abi::Counters::new(),
+                    ),
+                ),
+                Ok(NativeResume::Left(None))
+            ));
+            assert!(leader.take_handoff_receipt().is_some());
+        }
+        let successor_mm =
+            publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 0x1756, 0xa0_0000);
+        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        assert_eq!(selected.record, fixture.record.id);
+        // SAFETY: the production service completion selected this exact root record.
+        let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+            .unwrap()
+            .words;
+        let mut leader = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                leader_source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            leader.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(leader.take_run_failure().is_none());
+        Some(successor_mm)
+    } else {
+        let mut leader = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                leader_source,
+                fixture.task,
+                fixture.address,
+                &make_words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            leader.exit_group(23),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(leader.take_run_failure().is_none());
+        assert!(leader.take_handoff_receipt().is_some());
+        None
+    };
+
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::gate(fixture.page),
+        carrick_el1_abi::GateState::Closed
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(sibling.slot).unwrap().record,
+        sibling.record.id
+    );
+    {
+        let mut sibling_entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                sibling_source,
+                sibling.task,
+                fixture.address,
+                &make_words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .zone
+                .record(sibling.record.id)
+                .has_adapter_operation()
+        );
+        let result = sibling_entry.begin_service(
+            ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Syscall,
+            },
+            None,
+        );
+        let settled = sibling_entry
+            .settle_service_exit(result, NativeServiceExit::CarrierWork)
+            .unwrap();
+        assert!(matches!(settled, NativeResume::Left(None)));
+    }
+    fixture.zone.release_space(sibling.slot);
+
+    assert!(
+        !fixture
+            .zone
+            .record(sibling.record.id)
+            .has_object_operation()
+    );
+    assert!(fixture.zone.live(sibling.record).is_none());
+    let replay_ipc = carrick_el1::substrate::ipc::from_sched_token(
+        carrick_sched_core::object_wait::OperationToken::new(token_index, token_generation)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        region.operation(&replay_ipc).is_err(),
+        "the IPC operation record must be retired"
+    );
+    assert!(
+        region.observe(object).is_err()
+            && region
+                .lock(object, &carrick_sched_core::ShortLockSpin)
+                .is_err(),
+        "retirement must release the final endpoint pin"
+    );
+    assert!(
+        region
+            .fd(carrick_sched_core::ShortLockSpin)
+            .unpin_filtered(
+                OfdPin::from_raw(raw_pin),
+                crate::ipc::is_zone_releasable_backing,
+            )
+            .is_err(),
+        "a second unpin of the retired pin must fail"
+    );
+    let replay_token =
+        carrick_sched_core::object_wait::OperationToken::new(token_index, token_generation)
+            .unwrap();
+    assert!(
+        matches!(
+            crate::ipc::retire_native_operation(
+                &region,
+                fixture.zone,
+                sibling.slot,
+                sibling.task,
+                sibling_binding,
+                replay_token,
+            ),
+            Err(NativeProcessError::Stale)
+        ),
+        "a second retirement of the same token must return Stale"
+    );
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    // SAFETY: the sibling's terminal notification woke this exact closing owner.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut leader = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            leader_source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    let completed = leader.resume_checkpoint(|_| Ok(None)).unwrap();
+    if let Some(successor_mm) = successor_mm {
+        assert!(matches!(completed, NativeResume::NoPending));
+        assert_eq!(
+            fixture.zone.installed_space(fixture.slot),
+            successor_mm.raw()
+        );
+    } else {
+        assert!(matches!(
+            completed,
+            NativeResume::Left(Some(status)) if status == LinuxWaitStatus::exited(23)
+        ));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn exec_settlement_retires_retained_ipc_operation_and_pin_once() {
+    retained_ipc_terminal_close_for::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words, true,
+    );
+    retained_ipc_terminal_close_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, true);
+}
+
+#[cfg(test)]
+#[test]
+fn exit_group_settlement_retires_retained_ipc_operation_and_pin_once() {
+    retained_ipc_terminal_close_for::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words, false,
+    );
+    retained_ipc_terminal_close_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, false);
 }
 #[cfg(test)]
 #[test]

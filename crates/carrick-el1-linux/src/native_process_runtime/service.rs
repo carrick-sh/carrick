@@ -2853,7 +2853,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         )
         .map_err(|_| NativeProcessError::Quarantined)?
         .ok_or(NativeProcessError::Stale)?;
-        let written = self.service.retire_adapter_operation(self.binding, token)?;
+        let (region, _) = self
+            .service
+            .exec_ipc_binding()
+            .ok_or(NativeProcessError::Stale)?;
+        let written = crate::ipc::retire_native_operation(
+            &region,
+            self.source.zone,
+            self.source.slot,
+            self.current,
+            self.binding,
+            token,
+        )?;
         // SAFETY: this exact admitted record still owns the completed adapter.
         unsafe {
             self.source
