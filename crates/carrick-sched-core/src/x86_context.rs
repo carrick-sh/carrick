@@ -26,6 +26,13 @@ pub struct ParkedContextWords {
 
 pub const X86_XSAVE_BYTES: usize = 832;
 
+/// User 64-bit code selector in the CPL0 GDT.
+const USER_CODE_SELECTOR: u64 = 0x23;
+/// User data selector in the CPL0 GDT.
+const USER_DATA_SELECTOR: u64 = 0x1b;
+/// Fixed bit plus interrupt enable.
+const USER_ENTRY_FLAGS: u64 = 0x202;
+
 /// Supervisor IRET/SYSCALL return target checks shared by native frames and
 /// parked scheduler records. Only canonical lower-half user targets qualify.
 pub const fn valid_user_return_words(rip: u64, rsp: u64, flags: u64) -> bool {
@@ -87,6 +94,36 @@ impl ParkedContextWords {
             _xsave_align: [0; 56],
             xsave,
         }
+    }
+
+    /// The first user entry of a fresh image: `rip`/`rsp` under the
+    /// supervisor GDT's 64-bit user selectors, interrupts enabled, with zero
+    /// segment bases and an empty extended-state save area. The caller holds
+    /// the record's claim while publishing this typed owner.
+    pub fn user_entry(address: AddressContext<RootGpa>, rip: u64, rsp: u64) -> Self {
+        let mut frame = [0; 20];
+        frame[15] = rip;
+        frame[16] = USER_CODE_SELECTOR;
+        frame[17] = USER_ENTRY_FLAGS;
+        frame[18] = rsp;
+        frame[19] = USER_DATA_SELECTOR;
+        Self::from_parts(frame, address, 0, 0, [0; X86_XSAVE_BYTES])
+    }
+
+    /// Whether `rip`/`rsp` can be a first user entry: canonical lower-half
+    /// targets under the entry flags `user_entry` publishes.
+    pub const fn valid_user_entry(rip: u64, rsp: u64) -> bool {
+        valid_user_return_words(rip, rsp, USER_ENTRY_FLAGS)
+    }
+
+    /// The saved user instruction pointer (IRET tail word 0).
+    pub fn user_rip(&self) -> u64 {
+        self.frame[15]
+    }
+
+    /// The saved user stack pointer (IRET tail word 3).
+    pub fn user_rsp(&self) -> u64 {
+        self.frame[18]
     }
 
     /// A zero, corrupt or recycled save area cannot authenticate a live MM.

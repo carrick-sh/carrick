@@ -13,6 +13,7 @@ pub mod common_entry;
 pub mod cow_resolver;
 pub mod dispatch;
 pub mod exec_stage;
+pub mod exec_successor;
 pub mod file;
 pub mod file_table;
 pub mod fork_loan;

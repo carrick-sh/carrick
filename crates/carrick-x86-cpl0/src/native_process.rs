@@ -3,6 +3,7 @@
 mod user_copy;
 
 use super::anonymous;
+use crate::exec_successor::{X86ExecMachine, X86ExecSuccessor};
 use crate::rust_alloc::{boxed::Box, sync::Arc, vec::Vec};
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue};
@@ -18,8 +19,8 @@ use carrick_el1_abi::{
 use carrick_el1_linux::mm_portal::production::GuestMetadataPin;
 use carrick_el1_linux::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
 use carrick_el1_linux::native_process_runtime::{
-    NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
-    NativeProcessRuntime, NativeProcessService,
+    ExecSuccessorSlot, NativeExecSuccessor, NativeForkPreparation, NativeLifecycleResources,
+    NativeProcessError, NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
 };
 use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces};
 use carrick_guest_arch::{
@@ -211,6 +212,39 @@ pub(super) fn admit_root(
     Ok(())
 }
 
+/// The machine effects of exec on this CPU. The three consuming crossings
+/// have no x86 transport yet (#1093 S4c), so they refuse: native exec stays
+/// an observable, counted refusal end to end until the transport lands.
+struct ServiceExecMachine {
+    slot: SlotId,
+}
+impl X86ExecMachine for ServiceExecMachine {
+    fn cross_adopt(&self, _record: u64) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
+    fn cross_cancel(&self, _record: u64) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
+    fn cross_settle(
+        &self,
+        _predecessor: ReservationMm,
+        _successor: ReservationMm,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
+    fn park_on_maintenance_root(&self) -> bool {
+        carrick_x86_carrier::native_execution::park_on_maintenance_root(
+            carrick_x86_carrier::native_execution::source(self.slot),
+        )
+    }
+    fn admit_context(&self, address: Mm) -> bool {
+        anonymous::admit_context(address)
+    }
+    fn retire_context(&self, address: Mm) -> bool {
+        anonymous::retire_context(address)
+    }
+}
+
 struct Venue;
 impl OwnerVenue<ParkedContextWords> for Venue {
     fn space_access(
@@ -298,6 +332,34 @@ impl Service {
     }
     fn worker(&self) -> u32 {
         u32::from(self.slot.raw())
+    }
+
+    /// The descriptor namespace of the CPU this service runs on, the same
+    /// admitted tables fork inherits.
+    fn file_tables(&self) -> Option<carrick_el1_abi::FileTables<'static>> {
+        Some(crate::linux_personality::file_tables(
+            carrick_el1::isa::x86::context::current_cpu_binding()?,
+        ))
+    }
+
+    /// Exec custody over this CPU's zone and reservations.
+    fn exec_successor(
+        &self,
+    ) -> Result<
+        X86ExecSuccessor<'static, GuestMetadataPin, Venue, ServiceExecMachine>,
+        NativeProcessError,
+    > {
+        let owner = portal()?;
+        Ok(X86ExecSuccessor {
+            zone: owner.zone.ok_or(NativeProcessError::Stale)?,
+            roots: owner.roots,
+            retired: &RETIRED_SPACES,
+            carrier: owner.carrier,
+            slot: self.slot,
+            cpus: carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT,
+            machine: ServiceExecMachine { slot: self.slot },
+            marker: PhantomData,
+        })
     }
 
     /// The part of `prepare_mm_start` after the stock crossing granted
@@ -486,6 +548,39 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     type Mm = Mm;
     type PreparedMm = Prepared;
     type Born = Box<Born>;
+    fn prepare_exec_successor_slot(
+        &self,
+        mm: ReservationMm,
+    ) -> Result<Box<dyn ExecSuccessorSlot + 'static>, NativeProcessError> {
+        self.exec_successor()?.prepare_slot(mm)
+    }
+    fn adopt_exec_successor(
+        &self,
+        identity: carrick_core_abi::service::ServiceIdentity,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        manifest: &carrick_core_abi::service::ExecSuccessorManifest,
+    ) -> Result<NativeExecSuccessor<Mm, ParkedContextWords>, NativeProcessError> {
+        self.exec_successor()?.adopt(identity, receipt, manifest)
+    }
+    fn cancel_exec_successor(
+        &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+    ) -> Result<(), NativeProcessError> {
+        self.exec_successor()?.cancel(receipt)
+    }
+    fn finish_exec_successor(
+        &self,
+        predecessor: Mm,
+        successor: Mm,
+    ) -> Result<(), NativeProcessError> {
+        self.exec_successor()?.finish(predecessor, successor)
+    }
+    fn exec_fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
+        self.file_tables().map_or(&[], |files| files.fd_map())
+    }
+    fn exec_open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
+        self.file_tables().map_or(&[], |files| files.opens())
+    }
     fn native_service_doorbell(&mut self) -> bool {
         // SAFETY: shared owner published the exact retained notice and released
         // its graph/MM guards. The stopped host consumes that notice, not RAX.

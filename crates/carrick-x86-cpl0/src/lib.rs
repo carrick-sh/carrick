@@ -5,6 +5,8 @@ extern crate alloc as rust_alloc;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod anonymous;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+mod exec_successor;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod linux_personality;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
