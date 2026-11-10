@@ -96,10 +96,31 @@ impl<G: GuestDispatchFrame, Z: EntryContext> IpcExecution for NativeIpcExecution
         self.counters
     }
     fn now(&self) -> u64 {
-        0
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            carrick_el1::isa::signal_clock()
+                .counter()
+                .map_or(1, |tick| tick.raw().max(1))
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            1_000
+        }
     }
-    fn ticks(&self, _ns: u64) -> u64 {
-        0
+    fn ticks(&self, ns: u64) -> u64 {
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            let freq = carrick_el1::isa::signal_clock()
+                .frequency()
+                .map_or(0, |hz| hz.raw().get());
+            (u128::from(ns) * u128::from(freq) / 1_000_000_000) as u64
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ns
+        }
     }
     fn take_object_operation(&self) -> Result<Option<OperationToken>, ObjectWaitError> {
         let Some(record) = self
@@ -145,7 +166,7 @@ impl<G: GuestDispatchFrame, Z: EntryContext> IpcExecution for NativeIpcExecution
         );
     }
     fn may_time_park(&self) -> bool {
-        false
+        carrick_core::wait::may_time_park(self.source.zone, self.source.slot)
     }
     fn object_wait_expired(&self) -> bool {
         carrick_core::wait::object_wait_expired(self.source.zone, self.source.slot)
