@@ -2800,19 +2800,6 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             None
         }
     }
-    fn retire_adapter_operation(
-        &mut self,
-        binding: carrick_el1_abi::ExecutionBinding,
-        operation: carrick_sched_core::object_wait::OperationToken,
-    ) -> Result<usize, NativeProcessError> {
-        let (region, _) = self
-            .crossing
-            .ipc_binding()
-            .ok_or(NativeProcessError::Stale)?;
-        crate::ipc::retire_native_operation(
-            &region, self.zone, self.slot, self.task, binding, operation,
-        )
-    }
     fn copy_syscall_output(
         &mut self,
         mm: &Self::Mm,
