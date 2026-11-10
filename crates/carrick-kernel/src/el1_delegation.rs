@@ -4132,5 +4132,205 @@ mod tests {
                 "never yielded"
             );
         }
+
+        /// #1958 through the host's real load publication. The host loads
+        /// thread 8 of process 7 on a reused slot (`publish_current_task`,
+        /// after binding A of another process), while the group's leader
+        /// (thread 7) stays parked live in the zone. EL1 preempts thread 8
+        /// into the slot's home record and runs a record whose owner
+        /// overwrites the live namespace PID and root incarnation; switching
+        /// the home record back in through `Sched::load` must restore
+        /// binding B exactly: thread 8's identity with the group's PID 7.
+        #[test]
+        fn host_loaded_thread_home_resume_restores_the_published_binding() {
+            use carrick_el1::substrate::sched::{FakeCpu, FakeRegs, Sched, Served};
+            use carrick_el1_abi::{
+                Aarch64ParkedContext, Claim, ContextGeneration, Counters, SlotId, ThreadCtx,
+                ThreadIdentity, TrapFrame, ZoneTables,
+            };
+            use carrick_el1_linux::sched::{
+                FUTEX_WAKE_PRIVATE, HardwareUserWord, LinuxSchedEntry, SYS_FUTEX,
+            };
+            use carrick_sched_core::LockWait;
+            use std::num::NonZeroU64;
+
+            const MM: u64 = 7;
+            const TTBR_MM: u64 = (7 << 48) | 0x7000_0000;
+            const SLOT: SlotId = SlotId::new(3);
+            const GROUP_PID: u32 = 7;
+            const THREAD: i32 = 8;
+            struct Spin;
+            impl LockWait<Aarch64ParkedContext> for Spin {
+                fn wait(&self, _attempt: u32) -> bool {
+                    core::hint::spin_loop();
+                    true
+                }
+            }
+            let identity = |tid: u64| ThreadIdentity {
+                tid,
+                serial: tid + 1000,
+                mm: MM,
+                file_table: 5,
+                generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            };
+            let thread_ctx = |tag: u64, uaddr: u64| {
+                let mut ctx = ThreadCtx::ZERO;
+                for (i, x) in ctx.x.iter_mut().enumerate() {
+                    *x = tag << 8 | i as u64;
+                }
+                ctx.x[0] = uaddr;
+                ctx.x[8] = SYS_FUTEX as u64;
+                ctx.pc = tag << 12;
+                ctx.pstate = 0x3c0;
+                ctx.sp_el0 = tag << 16;
+                ctx
+            };
+            let zone: Box<ZoneTables> = unsafe {
+                // SAFETY: all-zero is the valid empty zone.
+                let layout = std::alloc::Layout::new::<ZoneTables>();
+                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+                assert!(!ptr.is_null());
+                Box::from_raw(ptr)
+            };
+            // Park `tid` on `uaddr` the way the host parks a forwarded wait.
+            let park = |tid: u64, uaddr: u64| {
+                let guard = zone
+                    .lock(ZoneTables::bucket_of_with_context(MM, uaddr), &Spin)
+                    .unwrap();
+                let record = zone.alloc_record(identity(tid)).unwrap();
+                // SAFETY: freshly allocated and unpublished.
+                unsafe {
+                    *zone.record(record).ctx_mut() =
+                        Aarch64ParkedContext::from_register(thread_ctx(tid, uaddr), TTBR_MM, MM, 1)
+                };
+                let seq = zone.next_seq(record);
+                zone.enqueue(&guard, record, seq, MM, uaddr, u32::MAX, 0)
+                    .unwrap();
+                zone.publish_park(record, seq);
+                record
+            };
+
+            let _region = Region::new();
+            // SAFETY: the region holds 256 current-task slots.
+            let task = unsafe {
+                &*((get_el1_region_host_ptr()
+                    + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+                    + usize::from(SLOT.raw()) * core::mem::size_of::<CurrentTask>())
+                    as *const CurrentTask)
+            };
+            let generation = |raw| ContextGeneration::new(NonZeroU64::new(raw).unwrap());
+            // Binding A: an earlier occupant of this slot, another process.
+            publish_current_task(
+                usize::from(SLOT.raw()),
+                El1TaskId::from_linux_tid(41),
+                carrick_el1_abi::SnapshotGeneration::from_raw(1),
+                5,
+                41,
+                false,
+                generation(301),
+            );
+            // Binding B: the host loads thread 8, whose process is PID 7.
+            publish_current_task(
+                usize::from(SLOT.raw()),
+                El1TaskId::from_linux_tid(THREAD),
+                carrick_el1_abi::SnapshotGeneration::from_raw(1),
+                5,
+                GROUP_PID,
+                false,
+                generation(707),
+            );
+            task.mm.key.store(MM, Ordering::Relaxed);
+            task.mm.thread_generation.store(1008, Ordering::Relaxed);
+            let thread_task = task.execution.task.load(Ordering::Relaxed);
+            assert_eq!(
+                thread_task,
+                El1TaskId::from_linux_tid(THREAD).raw(),
+                "binding B is the loaded thread"
+            );
+            assert_eq!(task.visible_pid(), Some(GROUP_PID));
+
+            // The group's leader stays live, parked in the zone on its own word.
+            let leader_word = std::sync::atomic::AtomicU32::new(0);
+            let leader = park(u64::from(GROUP_PID), leader_word.as_ptr() as u64);
+            // Another record waits on `word`; thread 8 wakes it.
+            let word = std::sync::atomic::AtomicU32::new(0);
+            let uaddr = word.as_ptr() as u64;
+            let other = park(202, uaddr);
+            zone.drive(SLOT, u64::from(SLOT.raw()) + 1);
+            zone.publish_slot(SLOT, MM, None, 0);
+            let here = carrick_sched_core::ExecutionSlot::zone(SLOT);
+            zone.occupancy.vacate_any(here);
+            assert!(zone.occupancy.replace(here, 0, MM));
+
+            let ctx = thread_ctx(0xA, uaddr);
+            let mut frame = TrapFrame {
+                x: ctx.x,
+                elr: ctx.pc,
+                spsr: ctx.pstate,
+                slot: u64::from(SLOT.raw()),
+                ..TrapFrame::default()
+            };
+            frame.x[1] = FUTEX_WAKE_PRIVATE;
+            frame.x[2] = 1;
+            frame.x[3] = 0;
+            let mut cpu = FakeCpu {
+                regs: FakeRegs {
+                    sp_el0: ctx.sp_el0,
+                    ..FakeRegs::default()
+                },
+                ..FakeCpu::default()
+            };
+            let counters = Box::leak(Box::new(Counters::default()));
+            let mut sched = |frame: &mut TrapFrame, cpu: &mut FakeCpu, wake: bool| {
+                let mut sched = Sched {
+                    handoff: None,
+                    zone: &zone,
+                    slot: SLOT,
+                    task,
+                    cpu,
+                    user: &HardwareUserWord,
+                    counters,
+                };
+                if wake {
+                    assert_eq!(
+                        sched.serve_futex(frame),
+                        Some(Served::Returned { switched: false })
+                    );
+                } else {
+                    assert_eq!(sched.serve_irq(frame), carrick_el1_abi::Action::Served);
+                }
+            };
+            sched(&mut frame, &mut cpu, true);
+            assert_eq!(frame.x[0], 1, "thread 8 woke the waiter");
+            let slice = cpu.freq / 1000 * 2;
+
+            // The slice ends: EL1 parks thread 8 in its home record and runs
+            // the other record, whose owner publishes a foreign binding.
+            cpu.now += slice;
+            sched(&mut frame, &mut cpu, false);
+            assert_eq!(zone.slot(SLOT).current(), Some(other));
+            let home = zone.slot(SLOT).host_record().unwrap();
+            task.publish_visible_pid(41);
+            task.publish_root_generation(generation(301));
+
+            // The next slice end switches the home record back in.
+            cpu.now += slice;
+            sched(&mut frame, &mut cpu, false);
+            assert_eq!(zone.slot(SLOT).current(), Some(home));
+            assert_eq!(task.execution.task.load(Ordering::Relaxed), thread_task);
+            assert_eq!(
+                (task.visible_pid(), task.root_generation()),
+                (Some(GROUP_PID), Some(generation(707))),
+                "the home switch-in restores the host's published binding B"
+            );
+            assert!(
+                matches!(zone.record(leader).claim(), Claim::Parked { .. }),
+                "the group's leader is retained, still parked"
+            );
+        }
     }
 }
