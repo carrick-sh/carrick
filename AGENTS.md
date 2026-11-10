@@ -138,17 +138,19 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
 **Running**
 - **Never run carrick and Docker concurrently** (VMs starve → wrong verdicts).
   Two-phase gate; `carrick‖carrick`/`docker‖docker` OK.
-- **Machine quietness:** exclusive `gate` covers guest execution; shared
-  `carrick` covers compilation, host tests, linking and signing (#2013).
-  `just accept`, `scripts/test-signed.sh` and `signed-gate execute` build
-  and sign under `carrick`, release it, then wait for `gate` (the ordinary
-  lease wait) to run guests and their scoped cleanup; the artifact executed
-  under `gate` must keep the identity captured at the end of the build
-  (SHA-256, CDHash, LC_UUID), or the run fails. Under an outer `gate` both
-  halves reuse it (no split); under an outer `carrick` a signed run is
-  refused. Host phases that boot guests (`--profile kvm`, `el1-native`)
-  keep `gate`. Host tests/compilation compete for CPU and memory too. These
-  runners refuse `yes`, `stress`
+- **Machine quietness:** `just accept` builds under shared `carrick` and holds
+  exclusive `gate` only for guest execution (#2013): host-only phases run under
+  `carrick` (the guest-booting `kvm`/`el1-native` profiles keep `gate`); the
+  signed phase admits disk under `gate`, builds and signs under `carrick`,
+  releases it, then waits for `gate` to run every guest step (test-signed
+  inside it reuses that gate) and its scoped cleanup. What it built or installed
+  before the release (the signed binary: SHA-256, CDHash, LC_UUID; every
+  fixture: content hash) must be unchanged after gate admission, or nothing
+  runs. Under an outer `gate` accept reuses it whole; under an outer `carrick`
+  it refuses. `scripts/test-signed.sh` holds shared `carrick` mode through
+  build, signing, execution and scoped cleanup (its own split is a #2013
+  follow-up), and `signed-gate execute` holds `gate` across its pair. Host
+  tests/compilation compete for CPU and memory too. These refuse `yes`, `stress`
   and `stress-ng`, reporting PIDs and parent commands. Deliberate load requires
   `CARRICK_ALLOW_LOAD=1`; logs record detected load and acceptance receipts
   include it. Contention fails explicitly after `HOST_LEASE_WAIT_LIMIT` (one
@@ -168,8 +170,8 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   [Contabo setup](docs/ci/contabo-kvm.md#vm-local-leases-owner-decision-639).
 - **Lock order:** remote-accept checkout lock → host lease → build/test work.
   No host-lease holder may acquire a remote checkout lock; never upgrade a
-  shared lease into a gate/Docker lease (release `carrick` fully, then
-  request `gate`); nested signed runs reuse the gate's lease and never
+  shared lease into a gate/Docker lease (accept releases `carrick` fully, then
+  requests `gate`); nested signed runs reuse the gate's lease and never
   downgrade or reacquire it. Supervisor custody, cleanup
   deadlines and known escape limits:
   [`docs/host-lease-containment-follow-up.md`](docs/host-lease-containment-follow-up.md).
