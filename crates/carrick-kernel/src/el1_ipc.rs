@@ -553,6 +553,10 @@ pub struct HostIpc {
     /// The carrier descriptor ceiling every host-side install raises first
     /// (the kernel's authority, which owns the carrier publisher; #1398).
     ceiling: std::sync::Arc<crate::kernel::FdCeilingAuthority>,
+    /// The carrier-scoped zone host releases wake into when the
+    /// process-global zone is absent (x86 CPL0, #2031). Bound once by the
+    /// carrier that maps this region.
+    carrier_zone: std::sync::OnceLock<crate::el1_zone::CarrierZone>,
 }
 impl std::fmt::Debug for HostIpc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -627,6 +631,7 @@ impl HostIpc {
             limits,
             growth: Mutex::new(IpcGrowth::default()),
             ceiling,
+            carrier_zone: std::sync::OnceLock::new(),
         };
         let identity = NEXT_REGION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -1131,7 +1136,7 @@ impl HostIpc {
     ) -> Result<usize, AdmissionError> {
         self.region()
             .resize_pipe(object, requested, limit, &HostLockWait, |wake| {
-                let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
+                let mut delivery = self.object_wake_delivery();
                 delivery.collect(wake);
                 delivery.deliver();
             })
@@ -1323,6 +1328,23 @@ impl HostIpc {
     pub fn retained_host_resources(&self) -> usize {
         self.resources.lock().live.len()
     }
+    /// Bind the carrier-scoped zone this region's host releases wake into.
+    /// A carrier binds once; a second binding is refused, never replaced.
+    pub fn bind_carrier_zone(
+        &self,
+        zone: crate::el1_zone::CarrierZone,
+    ) -> Result<(), crate::el1_zone::CarrierZone> {
+        self.carrier_zone.set(zone)
+    }
+
+    /// Zone wake collection for a host-side object change: the
+    /// process-global zone when it serves, else this region's carrier zone.
+    fn object_wake_delivery(&self) -> crate::el1_zone::ObjectWakeDelivery<'_> {
+        crate::el1_zone::ObjectWakeDelivery::for_carrier(
+            self.carrier_zone.get().map(|zone| &**zone),
+        )
+    }
+
     /// Final-description release, after leaving the descriptor table lock.
     /// Delivers guest and host wakes after leaving object locks.
     pub fn release(&self, backing: fd::BackingToken) -> Result<IpcReleased, IpcError> {
@@ -1330,7 +1352,7 @@ impl HostIpc {
         if let IpcReleased::Object { wake, freed: false } = released {
             let region = self.region();
             if let Ok(guard) = region.lock(wake.object, &HostLockWait) {
-                let mut delivery = crate::el1_zone::ObjectWakeDelivery::new();
+                let mut delivery = self.object_wake_delivery();
                 delivery.collect(wake);
                 drop(guard);
                 delivery.deliver();

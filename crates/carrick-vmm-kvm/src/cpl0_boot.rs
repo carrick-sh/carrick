@@ -1626,6 +1626,17 @@ impl Cpl0Carrier {
         self.custody.ipc_table_map()
     }
 
+    /// The carrier-scoped zone wake sink the host IPC owner binds, so host
+    /// releases (exit drains) wake tasks parked in this carrier's zone.
+    pub fn carrier_zone_wake(
+        &self,
+    ) -> Result<
+        Arc<dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>>,
+        TrapError,
+    > {
+        self.custody.carrier_zone_wake()
+    }
+
     pub fn file_tables(
         &self,
         binding: carrick_el1_abi::FileRegionBinding,
