@@ -142,7 +142,7 @@ pub enum Commands {
     #[command(
         name = "signed-phases",
         about = "Run a signed command's build phase under the carrick lease, then its execution phase under gate",
-        long_about = "Run COMMAND twice with CARRICK_SIGNED_PHASE=build and then =execute (#2013). The build phase runs under the shared carrick lease and writes the absolute paths of the artifacts it produced to $CARRICK_SIGNED_STATE/artifacts; their identity (SHA-256, plus CDHash and LC_UUID on macOS) is captured before that lease is released. The execution phase waits for gate with the ordinary lease wait, re-verifies the identity and refuses to run if any artifact changed. The two leases are never held together. Under an inherited gate both phases reuse it; under an inherited carrick lease the run is refused before building, because shared admission is never upgraded."
+        long_about = "Run COMMAND twice with CARRICK_SIGNED_PHASE=build and then =execute (#2013). The build phase runs under the shared carrick lease and lists every artifact the execution phase runs in $CARRICK_SIGNED_STATE/artifacts, one `<signed|content>\t<absolute path>` line each; their identity (SHA-256 for all, plus CDHash and LC_UUID for signed Mach-O executables on macOS) is captured before that lease is released. `accept --phase signed` drives its own build and guest execution through this. The execution phase waits for gate with the ordinary lease wait, re-verifies the identity and refuses to run if any artifact changed. The two leases are never held together. Under an inherited gate both phases reuse it; under an inherited carrick lease the run is refused before building, because shared admission is never upgraded."
     )]
     SignedPhases(crate::signed_phase::SignedPhasesArgs),
 
