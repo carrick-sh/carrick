@@ -54,9 +54,21 @@ rationale = "Admission creates one native process owner for the retained root an
 # Production registration must preserve their backing pointers, capacities and
 # contents, and the pre-reserved table, while copying only the new credentials.
 # This is a deterministic payload-copy budget, not a runtime-ratio claim.
+# #1958: a native-owned ARM thread birth is registered with its process
+# owner at publication (`enqueue_born` -> `enqueue_thread`), as on x86,
+# instead of lazily at first entry. Its first switch-in then publishes the
+# owner's namespace PID; a vCPU last loaded with another process (or with
+# none) no longer makes the birth's first admission refuse Stale, which the
+# final signal checkpoint aborted as `entry_binding`. Admission semantics and
+# budgets are unchanged. Red on main e3086946eb, green on the fix:
+# carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::*.
+# Signed proof (20 runs of el1_sched_two_processes_share_vcpus) is the
+# director's.
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_born_thread_first_entry_after_another_process_on_the_vcpu",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_born_thread_first_entry_on_a_detached_executor",
   "carrick-el1-linux::native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable",
   "carrick-el1-linux::native_process_runtime::host_test_support::register_thread_preserves_existing_credential_storage",
   "carrick-el1-linux::aarch64_process_tests::native_retirement_tests::two_live_processes_reauthenticate_birth_settlement_after_parent_generation_moves",

@@ -205,6 +205,8 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.wait.process-group" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "process.native.arm-admission" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/born_thread_entry_tests.rs", contract = "process.native.arm-admission" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/exit_group_hang_tests.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/exit_group_hang_tests.rs", contract = "kernel.vcpu.shutdown-entry" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_child_handoff_tests.rs", contract = "diagnostics.syscall-refusal" },
