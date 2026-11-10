@@ -1555,9 +1555,24 @@ pub struct CurrentTask {
     pub metadata: LinuxTaskMetadata,
     root_generation: AtomicU64,
     pub service_notice: carrick_core_abi::service::ServiceNotice,
+    /// The process binding the host published for the thread it loaded on
+    /// this slot. EL1 switching another process's record in overwrites the
+    /// live `visible_pid` and `root_generation`; switching the host-loaded
+    /// thread's home record back in restores them from here (#1958).
+    host_loaded: HostLoadedBinding,
+    _reserved: [u64; 14],
 }
 
-pub const CURRENT_TASK_STRIDE_SHIFT: u32 = 7;
+/// The host-loaded thread's namespace PID and translation-root incarnation,
+/// written only by the host's load publication.
+#[repr(C, align(8))]
+#[derive(::core::fmt::Debug)]
+struct HostLoadedBinding {
+    visible_pid: AtomicU32,
+    root_generation: AtomicU64,
+}
+
+pub const CURRENT_TASK_STRIDE_SHIFT: u32 = 8;
 const _: () = assert!(core::mem::size_of::<CurrentTask>() == 1 << CURRENT_TASK_STRIDE_SHIFT);
 
 const _: () = {
@@ -1591,6 +1606,11 @@ impl CurrentTask {
             metadata: LinuxTaskMetadata::new(),
             root_generation: AtomicU64::new(0),
             service_notice: carrick_core_abi::service::ServiceNotice::new(),
+            host_loaded: HostLoadedBinding {
+                visible_pid: AtomicU32::new(0),
+                root_generation: AtomicU64::new(0),
+            },
+            _reserved: [0; 14],
         }
     }
 
@@ -1688,6 +1708,32 @@ impl CurrentTask {
             .store(generation.raw().get(), Ordering::Release);
     }
 
+    /// The host's load publication of its thread's process binding: the
+    /// live values, and the copy a home-record switch-in restores.
+    pub fn publish_host_loaded(
+        &self,
+        visible_pid: u32,
+        root_generation: carrick_guest_arch::ContextGeneration,
+    ) {
+        self.host_loaded
+            .visible_pid
+            .store(visible_pid, Ordering::Relaxed);
+        self.host_loaded
+            .root_generation
+            .store(root_generation.raw().get(), Ordering::Release);
+        self.publish_visible_pid(visible_pid);
+        self.publish_root_generation(root_generation);
+    }
+
+    /// EL1 switched the host-loaded thread's home record back in: it runs
+    /// in its own process again, whatever another record published here.
+    pub fn restore_host_loaded(&self) {
+        let root_generation = self.host_loaded.root_generation.load(Ordering::Acquire);
+        self.publish_visible_pid(self.host_loaded.visible_pid.load(Ordering::Relaxed));
+        self.root_generation
+            .store(root_generation, Ordering::Release);
+    }
+
     #[inline]
     pub fn clear(&self) {
         self.linux.file_table.store(0, Ordering::Release);
@@ -1702,6 +1748,8 @@ impl CurrentTask {
         self.mm.key.store(0, Ordering::Release);
         self.mm.thread_generation.store(0, Ordering::Release);
         self.root_generation.store(0, Ordering::Release);
+        self.host_loaded.visible_pid.store(0, Ordering::Relaxed);
+        self.host_loaded.root_generation.store(0, Ordering::Release);
         self.publish_lifecycle(0, 0);
         self.publish_visible_pid(0);
         self.publish_ptrace_traced(false);

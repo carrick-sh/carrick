@@ -1549,7 +1549,6 @@ impl Fixture {
         task.mm
             .thread_generation
             .store(leader.serial, Ordering::Release);
-        task.publish_visible_pid(leader.tid as u32);
         task.publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
 
         let address = AddressContext {
@@ -1558,7 +1557,8 @@ impl Fixture {
             generation: ContextGeneration::new(NonZeroU64::new(101).unwrap()),
         };
         zone.mm_issuer().observe_existing(address.mm);
-        task.publish_root_generation(address.generation);
+        // As the host's load publication (`publish_current_task`).
+        task.publish_host_loaded(leader.tid as u32, address.generation);
 
         let slot = SlotId::new(0);
         let ttbr0 = (u64::from(asid.raw()) << 48) | root_gpa;
