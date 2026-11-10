@@ -2850,34 +2850,38 @@ fn arm_root_ring_born_tgkill_before_first_entry_queues_signal_once() {
         -11
     );
 
-    // Switch the unmanaged ring-born child in on its process's vCPU (PID 41)
-    // and verify lazy `register_thread` + `project_member` delivers SIGUSR1
-    // once on its first guest syscall.
-    h.env.init_guest_slot(SlotId::new(3));
-    h.env.tasks[3].publish_visible_pid(41);
-    h.env.tasks[3].publish_root_generation(f.address.generation);
-    let mut born_cpu = crate::sched::FakeCpu::default();
+    // Switch the unmanaged ring-born child in on its home vCPU (`SlotId(0)`,
+    // matching `f.leader.affinity == 1`) after settling the host-birth doorbell
+    // and parking the leader behind it, then verify lazy `register_thread` +
+    // `project_member` delivers SIGUSR1 once on its first guest syscall.
+    let root_record = f.zone.slot(SlotId::new(0)).current().unwrap();
+    let _ = h.env.tasks[0].linux.take_host_work_doorbell();
+    assert!(
+        f.zone
+            .requeue_preempted(SlotId::new(0), root_record)
+            .is_queued()
+    );
     assert_eq!(
-        h.env.switch_in(SlotId::new(3), &mut born_cpu),
+        h.env.switch_in(SlotId::new(0), &mut h.root_cpu),
         carrick_el1_abi::Action::Served
     );
-    assert_eq!(f.zone.slot(SlotId::new(3)).current(), Some(born_record));
+    assert_eq!(f.zone.slot(SlotId::new(0)).current(), Some(born_record));
     assert_eq!(
         h.env.poll_sig(
-            SlotId::new(3),
+            SlotId::new(0),
             f.page,
             born_control,
-            &mut born_cpu,
+            &mut h.root_cpu,
             SIGUSR1_NUM
         ),
         SIGUSR1_NUM as i64
     );
     assert_eq!(
         h.env.poll_sig(
-            SlotId::new(3),
+            SlotId::new(0),
             f.page,
             born_control,
-            &mut born_cpu,
+            &mut h.root_cpu,
             SIGUSR1_NUM
         ),
         -11
@@ -2935,6 +2939,8 @@ fn arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry() {
 
 fn register_arm_claim_free_birth(
     h: &NativeOwnedTwoThreadHarness,
+    template_id: ThreadIdentity,
+    template_ctx: Aarch64ParkedContext,
     blocked: carrick_el1_abi::BlockedMask,
 ) -> (
     carrick_sched_core::RecordRef,
@@ -2973,11 +2979,11 @@ fn register_arm_claim_free_birth(
                 .alloc_record(ThreadIdentity {
                     tid: u64::from(identity.tid),
                     serial: identity.thread_serial,
-                    mm: h.env.fixture.zone.record(h.born_record).identity().mm,
+                    mm: template_id.mm,
                     file_table: 0,
                     generation: 0,
-                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
-                    affinity: 1,
+                    affinity_source: template_id.affinity_source,
+                    affinity: template_id.affinity,
                     lifecycle_page: h.target_page as *const _ as u64,
                     control_slot: address,
                 })
@@ -2987,8 +2993,7 @@ fn register_arm_claim_free_birth(
             process.bind_thread_birth(record, child_slot).unwrap();
             assert!(h.env.fixture.zone.issue_native_birth(record_id));
             unsafe {
-                *h.env.fixture.zone.record(record_id).ctx_mut() =
-                    *h.env.fixture.zone.record(h.born_record).ctx_mut();
+                *h.env.fixture.zone.record(record_id).ctx_mut() = template_ctx;
             }
             process
                 .thread_spawned(h.target_pid, identity.visible_tid, &mut || {
@@ -3029,6 +3034,8 @@ fn register_arm_claim_free_birth(
 #[test]
 fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
     let mut h = setup_native_owned_ring_birth_before_first_entry();
+    let template_id = h.env.fixture.zone.record(h.born_record).identity();
+    let template_ctx = unsafe { *h.env.fixture.zone.record(h.born_record).ctx_mut() };
 
     // Drain the earlier queued `h.born_record` first so SlotId(3) selects our
     // registered-but-unqueued births directly when we requeue them.
@@ -3047,8 +3054,12 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
     // Case A: unmasked at clone (`BlockedMask(0)`). `tgkill` while registered
     // in `Claim::Free` (`home == None`) holds SIGUSR1 on the child, delivers
     // it to the handler at the child's first entry, and does not double it.
-    let (unmasked_record, unmasked_tid, unmasked_control) =
-        register_arm_claim_free_birth(&h, carrick_el1_abi::BlockedMask(0));
+    let (unmasked_record, unmasked_tid, unmasked_control) = register_arm_claim_free_birth(
+        &h,
+        template_id,
+        template_ctx,
+        carrick_el1_abi::BlockedMask(0),
+    );
     let tgkill_rc = h.env.tgkill(
         SlotId::new(1),
         h.target_page,
@@ -3185,8 +3196,12 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
     // `tgkill` while registered-but-unqueued succeeds, first entry keeps ELR at
     // the child's entry PC (`0x40_0200`), and SIGUSR1 stays pending until unmasked.
     let sigusr1_bit = 1u64 << (SIGUSR1_NUM - 1);
-    let (masked_record, masked_tid, masked_control) =
-        register_arm_claim_free_birth(&h, carrick_el1_abi::BlockedMask(sigusr1_bit));
+    let (masked_record, masked_tid, masked_control) = register_arm_claim_free_birth(
+        &h,
+        template_id,
+        template_ctx,
+        carrick_el1_abi::BlockedMask(sigusr1_bit),
+    );
     assert_eq!(
         h.env.tgkill(
             SlotId::new(1),
