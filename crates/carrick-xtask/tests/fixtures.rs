@@ -4118,20 +4118,23 @@ fn added_probe_with_any_other_difference_is_refused() {
 /// that difference is admissible; the same head's edit to the fixture
 /// publisher input `probe_inventory.rs` (its dedicated-runner row, which now
 /// lives in the non-input `probe_runners.rs`) is not.
+///
+/// The checkout's inventory may already carry #1935's own row, so the BASE
+/// inventory is derived by removing that row when present (a no-op on main),
+/// and the CANDIDATE is BASE with the row re-inserted ahead of `nativex18`.
 #[test]
 fn pr_1935_shape_is_admissible() {
-    let inventory = fs::read_to_string(
+    let checkout_inventory = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance-probes/probe-inventory.json"),
     )
     .unwrap();
-    // #1935's textual insertion, verbatim, ahead of `nativex18`.
+    // #1935's row, verbatim, as it sits in the inventory ahead of `nativex18`.
+    let row = "  \"nativeprefixwrite\": {\n    \"class\": \"conformance\",\n    \"excluded\": false,\n    \"runner\": \"case_native_prefix_write_child_inherited_file\"\n  },\n";
     let anchor = "  \"nativex18\": {";
+    let inventory = checkout_inventory.replacen(row, "", 1);
     assert_eq!(inventory.matches(anchor).count(), 1);
-    let candidate_inventory = inventory.replacen(
-        anchor,
-        "  \"nativeprefixwrite\": {\n    \"class\": \"conformance\",\n    \"excluded\": false,\n    \"runner\": \"case_native_prefix_write_child_inherited_file\"\n  },\n  \"nativex18\": {",
-        1,
-    );
+    assert_eq!(inventory.matches(row).count(), 0);
+    let candidate_inventory = inventory.replacen(anchor, &format!("{row}{anchor}"), 1);
     let mut base = BTreeMap::new();
     base.insert(INVENTORY.to_owned(), source_hash(inventory.as_bytes()));
     base.insert(
