@@ -810,3 +810,17 @@ mod tests {
         assert!(NativeThreadStock::new(&controls, &zone, record).is_ok());
     }
 }
+
+/// Clone callers parked on a birth's registration in the root's stock.
+#[cfg(test)]
+pub(crate) fn born_registration_waiters<M: Clone, C: ProcessContext>(
+    runtime: &NativeProcessRuntime<'_, M, C>,
+) -> usize {
+    let graph = runtime.graph.lock();
+    graph
+        .owner
+        .task(graph.root_key)
+        .ok()
+        .and_then(|task| task.native().resources().thread_stock.as_ref())
+        .map_or(0, |stock| stock.born_waiters.len())
+}

@@ -139,6 +139,7 @@ vm_free = [
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
+  "carrick-el1-linux::{aarch64_process_tests::arm_ring_clone_registration_busy_then_sibling_exit_group_settles_both,aarch64_process_tests::arm_ring_clone_registration_busy_again_in_closing_process_then_settles,native_process_runtime::host_test_support::x86_ring_clone_registration_busy_then_sibling_exit_group_settles_both} (production clone then sibling exit_group while registration is Busy; consume the exact stock token, register before queueing, retire child once through the existing close owner; no quarantine or retained birth waiter)",
 ]
 
 [bindings.unresolved]

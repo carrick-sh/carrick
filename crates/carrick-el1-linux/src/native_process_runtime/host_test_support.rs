@@ -2652,11 +2652,22 @@ fn prepare_signal_sibling<C: ProcessContext + 'static>(
     fixture: &NativeSignalFixture<C>,
     host_issued: bool,
 ) -> ExecSibling {
+    prepare_signal_sibling_with_tid(fixture, host_issued, 42)
+}
+
+/// [`prepare_signal_sibling`] for visible and binding tid `tid` (generation
+/// `tid - 30`, thread serial `tid + 60`).
+fn prepare_signal_sibling_with_tid<C: ProcessContext + 'static>(
+    fixture: &NativeSignalFixture<C>,
+    host_issued: bool,
+    tid: u32,
+) -> ExecSibling {
+    let (generation, serial) = (u64::from(tid) - 30, u64::from(tid) + 60);
     let binding = ExecutionBinding {
-        task: carrick_core_abi::EntryTaskKey::from_raw(42),
-        generation: carrick_core_abi::SnapshotGeneration::from_raw(12),
+        task: carrick_core_abi::EntryTaskKey::from_raw(u64::from(tid)),
+        generation: carrick_core_abi::SnapshotGeneration::from_raw(generation),
         mm: carrick_core_abi::EntryMmKey::from_raw(1),
-        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(102),
+        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(serial),
     };
     // The host issues the sibling's tid in the shared namespace table before
     // registration claims it, as a production host-born thread does.
@@ -2664,18 +2675,20 @@ fn prepare_signal_sibling<C: ProcessContext + 'static>(
         .zone
         .namespace()
         .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
-            ns.reserve_exact(42, ClaimKind::Thread).unwrap();
+            ns.reserve_exact(tid as i32, ClaimKind::Thread).unwrap();
         });
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
     if host_issued {
         control
             .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
             .unwrap();
-        assert!(control.publish_visible_tid(42));
+        assert!(control.publish_visible_tid(tid));
         control.publish_host_birth_identity(
             carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 binding.task,
-                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+                carrick_core_abi::BirthSerial::of_task(
+                    TaskSerial::from_raw_u64(generation).unwrap(),
+                ),
                 binding.thread_generation,
             )
             .unwrap(),
@@ -2693,11 +2706,11 @@ fn prepare_signal_sibling<C: ProcessContext + 'static>(
             .stock(
                 0,
                 carrick_el1_abi::EntryIdentity {
-                    tid: 42,
-                    visible_tid: 42,
-                    thread_serial: 102,
+                    tid,
+                    visible_tid: tid,
+                    thread_serial: serial,
                     birth: carrick_core_abi::entry::BirthSerial::of_task(
-                        TaskSerial::from_raw_u64(12).unwrap(),
+                        TaskSerial::from_raw_u64(generation).unwrap(),
                     ),
                     uid_credit: 0,
                 },
@@ -2710,11 +2723,13 @@ fn prepare_signal_sibling<C: ProcessContext + 'static>(
         control
             .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
             .unwrap();
-        assert!(control.publish_visible_tid(42));
+        assert!(control.publish_visible_tid(tid));
         control.publish_host_birth_identity(
             carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 binding.task,
-                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+                carrick_core_abi::BirthSerial::of_task(
+                    TaskSerial::from_raw_u64(generation).unwrap(),
+                ),
                 binding.thread_generation,
             )
             .unwrap(),
@@ -2739,12 +2754,12 @@ fn prepare_signal_sibling<C: ProcessContext + 'static>(
 
     let task = Box::leak(Box::new(CurrentTask::new()));
     task.set(
-        carrick_el1_abi::El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::El1TaskId::from_linux_tid(tid as i32),
         binding.generation,
         5,
     );
     task.mm.key.store(1, Ordering::Release);
-    task.mm.thread_generation.store(102, Ordering::Release);
+    task.mm.thread_generation.store(serial, Ordering::Release);
     task.publish_visible_pid(41);
     task.publish_root_generation(fixture.address.generation);
     task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
@@ -2758,11 +2773,11 @@ fn prepare_signal_sibling<C: ProcessContext + 'static>(
         .current_or_new(
             slot,
             ThreadIdentity {
-                tid: 42,
-                serial: 102,
+                tid: u64::from(tid),
+                serial,
                 mm: 1,
                 file_table: 5,
-                generation: 12,
+                generation,
                 affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: fixture.page as *const _ as u64,
@@ -10589,8 +10604,25 @@ fn x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root() {
 #[test]
 #[cfg(test)]
 fn x86_ring_clone_registration_busy_once_then_succeeds() {
+    x86_ring_clone_registration_busy(false);
+}
+
+/// #1974 slice 1 review P0, x86 twin: a sibling's `exit_group` closes the
+/// process while the clone caller is parked on its child's Busy registration.
+/// The caller settles the birth (registers and queues it) and retires with
+/// the close; the child retires once at its first selection through the
+/// closing-member path. x86 selects only registered records
+/// (`carrick-x86-cpl0` `runtime_for_record`), so the child must be registered.
+#[test]
+#[cfg(test)]
+fn x86_ring_clone_registration_busy_then_sibling_exit_group_settles_both() {
+    x86_ring_clone_registration_busy(true);
+}
+
+#[cfg(test)]
+fn x86_ring_clone_registration_busy(close: bool) {
     use carrick_personality_linux::dispatch::SyscallFrame;
-    struct Frame(carrick_el1_abi::TrapFrame);
+    struct Frame(carrick_el1_abi::TrapFrame, AddressContext<RootGpa>);
     impl SyscallFrame for Frame {
         fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
             self.0.canonical_ordinal()
@@ -10623,9 +10655,18 @@ fn x86_ring_clone_registration_busy_once_then_succeeds() {
         }
         fn capture_x86_thread_child(
             &self,
-            _: &mut ParkedContextWords,
-            _: &crate::lifecycle::ChildContext,
+            child: &mut ParkedContextWords,
+            context: &crate::lifecycle::ChildContext,
         ) -> bool {
+            // Match production x86 capture: retain the address context and
+            // apply the child's stack, return word and optional TLS.
+            use carrick_guest_arch::ProcessContext;
+            *child = words(self.1);
+            child.set_user_stack(context.stack.raw());
+            child.set_syscall_return(context.result.raw() as u64);
+            if let Some(tls) = context.tls {
+                child.set_thread_pointer(carrick_guest_arch::ThreadPointerRegister::FS, tls.raw());
+            }
             true
         }
         fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> {
@@ -10681,10 +10722,12 @@ fn x86_ring_clone_registration_busy_once_then_succeeds() {
         slot: fixture.slot,
     };
     type Writer = carrick_el1_abi::NativePendingCustody<'static>;
-    static HELD: std::sync::Mutex<Option<(Writer, usize)>> = std::sync::Mutex::new(None);
+    let held: Arc<std::sync::Mutex<Option<(Writer, usize)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let hook_held = held.clone();
     install_born_registration_hook(
         &fixture.runtime,
-        Box::new(|control| {
+        Box::new(move |control| {
             // SAFETY: the address is the birth's control in the leaked extent.
             let control: &'static ThreadControlSlot =
                 unsafe { &*(control as usize as *const ThreadControlSlot) };
@@ -10692,10 +10735,10 @@ fn x86_ring_clone_registration_busy_once_then_succeeds() {
                 carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap(),
             ))
             .unwrap();
-            *HELD.lock().unwrap() = Some((writer, control as *const _ as usize));
+            *hook_held.lock().unwrap() = Some((writer, control as *const _ as usize));
         }),
     );
-    let members = fixture.registry.member_count();
+    let members = fixture.registry.member_count(fixture.zone);
     let venue = Venue {
         page: fixture.page,
         control: fixture.control,
@@ -10713,7 +10756,7 @@ fn x86_ring_clone_registration_busy_once_then_succeeds() {
                 &mut service,
             )
             .unwrap();
-        let mut frame = Frame(carrick_el1_abi::TrapFrame::default());
+        let mut frame = Frame(carrick_el1_abi::TrapFrame::default(), fixture.address);
         frame.0.x[8] = 220;
         frame.0.x[0] = 0x0005_0f00;
         frame.0.x[1] = 0x7f00_0000;
@@ -10737,22 +10780,69 @@ fn x86_ring_clone_registration_busy_once_then_succeeds() {
         assert_eq!(
             route,
             carrick_personality_linux::dispatch::CompletionRoute::Suspended,
-            "Busy parks the clone caller instead of failing the run"
+            "Busy parks the clone caller instead of failing the run: {:#x}",
+            frame.0.x[0]
         );
         assert!(entry.take_run_failure().is_none());
     }
-    let control_address = HELD.lock().unwrap().as_ref().unwrap().1;
+    let control_address = held.lock().unwrap().as_ref().unwrap().1;
     // SAFETY: the child's control lives in the leaked extent.
     let child_control: &'static ThreadControlSlot =
         unsafe { &*(control_address as *const ThreadControlSlot) };
     let child = child_control.zone_record().unwrap();
     let tid = child_control.visible_tid().unwrap();
-    assert_eq!(fixture.registry.member_count(), members);
+    assert_eq!(fixture.registry.member_count(fixture.zone), members);
     assert_eq!(
         fixture.zone.record(child.id).claim(),
         carrick_sched_core::Claim::Free
     );
-    drop(HELD.lock().unwrap().take());
+    if close {
+        // A second live thread of the process (host-issued tid 60, beside
+        // the child's ring-issued 42), registered on its own slot.
+        let sibling = prepare_signal_sibling_with_tid(&fixture, true, 60);
+        fixture
+            .registry
+            .register_thread(
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: sibling.slot,
+                },
+                sibling.task,
+                fixture.address,
+                fixture.page,
+                sibling.control,
+            )
+            .unwrap();
+        let mut sibling_service = fixture.service();
+        let mut terminator = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: sibling.slot,
+                },
+                sibling.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut sibling_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            terminator.exit_group(23),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(terminator.take_run_failure().is_none());
+        drop(terminator);
+        assert!(
+            child_control.host_exit_requested(),
+            "close cancels the child"
+        );
+        drop(held.lock().unwrap().take());
+        x86_settle_close_while_busy(&fixture, source, &mut service, child, child_control);
+        return;
+    }
+    drop(held.lock().unwrap().take());
     assert_eq!(
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
         fixture.record.id
@@ -10781,9 +10871,140 @@ fn x86_ring_clone_registration_busy_once_then_succeeds() {
     );
     assert!(entry.take_run_failure().is_none());
     drop(entry);
-    assert_eq!(fixture.registry.member_count(), members + 1);
+    assert_eq!(fixture.registry.member_count(fixture.zone), members + 1);
     assert!(matches!(
         fixture.zone.record(child.id).claim(),
         carrick_sched_core::Claim::Queued { .. }
     ));
+}
+
+/// The woken clone caller of [`x86_ring_clone_registration_busy`] resumes
+/// into the closing process, then the child's first selection.
+#[cfg(test)]
+fn x86_settle_close_while_busy(
+    fixture: &NativeSignalFixture,
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    service: &mut Physical<'static>,
+    child: RecordRef,
+    child_control: &'static ThreadControlSlot,
+) {
+    assert_eq!(thread_stock::born_registration_waiters(&fixture.runtime), 1);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    // SAFETY: the selected record's continuation is quiescent here.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let live = fixture.page.live();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                service,
+            )
+            .unwrap();
+        // The caller retires with the close, never with the clone's tid.
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::Left(_))
+        ));
+        assert!(entry.take_run_failure().is_none());
+    }
+    assert_eq!(
+        thread_stock::born_registration_waiters(&fixture.runtime),
+        0,
+        "the caller left its registration wait"
+    );
+    assert!(
+        !fixture
+            .zone
+            .record(fixture.record.id)
+            .has_object_operation(),
+        "the stock token is consumed"
+    );
+    // The caller registered the child before it retired: the close reaches
+    // it as a member, queued once.
+    assert!(fixture.registry.for_record(fixture.zone, child).is_some());
+    assert!(matches!(
+        fixture.zone.record(child.id).claim(),
+        carrick_sched_core::Claim::Queued { .. }
+    ));
+    // The caller's handback is the host's.
+    assert!(matches!(
+        fixture.zone.claim_for_host(
+            fixture.record,
+            None,
+            carrick_el1_abi::Handback::Control,
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        ),
+        carrick_sched_core::HostClaim::Claimed
+    ));
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        child.id
+    );
+    // Bind the child the way the x86 scheduler does (`native_execution.rs`
+    // `schedule`): from its exact record binding and identity.
+    // SAFETY: the selected child's context is quiescent here.
+    let state = unsafe { fixture.runtime.record_binding(child) }.unwrap();
+    let child_words = state.words;
+    let child_task = Box::leak(Box::new(CurrentTask::new()));
+    let identity = fixture.zone.record(child.id).identity();
+    child_task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(identity.tid as i32),
+        carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+        identity.file_table,
+    );
+    child_task.mm.key.store(identity.mm, Ordering::Release);
+    child_task
+        .mm
+        .thread_generation
+        .store(identity.serial, Ordering::Release);
+    child_task.publish_visible_pid(state.visible_pid);
+    child_task.publish_root_generation(fixture.address.generation);
+    child_task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                child_task,
+                fixture.address,
+                &child_words,
+                service,
+            )
+            .unwrap();
+        // Its first selection retires it; it never returns to user code.
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::Left(_))
+        ));
+        assert!(entry.take_run_failure().is_none());
+    }
+    let entry = child_control.entry().unwrap();
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::expected_exit_receipt(fixture.page, child_control, Some(entry)),
+        carrick_core::lifecycle::ExpectedExitReceipt::AlreadyExited,
+        "the child's close receipt is published"
+    );
+    assert_eq!(
+        fixture.page.live(),
+        live - 1,
+        "the child retires exactly once"
+    );
+    assert_ne!(
+        fixture.zone.record(child.id).incarnation(),
+        child.incarnation,
+        "the child's record is released"
+    );
+    assert!(fixture.registry.for_record(fixture.zone, child).is_none());
 }

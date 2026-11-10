@@ -1804,10 +1804,17 @@ pub struct NativeProcessRegistry<'a, M: Clone, C: ProcessContext> {
 }
 
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
-    /// Registered native members across every process (witness census).
+    /// Registered native members of one carrier (witness census; the
+    /// registry is shared by concurrently running witnesses).
     #[cfg(test)]
-    pub(crate) fn member_count(&self) -> usize {
-        self.state.lock().members.len()
+    pub(crate) fn member_count(&self, zone: &ZoneTables<C>) -> usize {
+        let carrier = core::ptr::from_ref(zone).addr();
+        self.state
+            .lock()
+            .members
+            .keys()
+            .filter(|key| key.carrier == carrier)
+            .count()
     }
     /// Consume host retirement receipts when a sibling next enters the ring.
     /// HostRetiring records the exit path before the shared entry is reaped;

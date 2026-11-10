@@ -6871,8 +6871,293 @@ fn arm_tgkill_reaches_a_managed_ring_born_sibling_control() {
 /// registration. The caller completes with the child's tid exactly once,
 /// the child is registered exactly once and queued, and no run fails
 /// (`BornEnqueueRefused` was the pre-fix outcome for every Busy).
+/// One ARM syscall by `task` (a sibling bound on `service`'s slot).
+#[cfg(test)]
+fn arm_call_as(
+    fixture: &'static Fixture,
+    task: &'static CurrentTask,
+    control: &'static ThreadControlSlot,
+    service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    frame: &mut carrick_el1_abi::TrapFrame,
+) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {
+    carrick_test_support::assert_guest_args(&frame.x[..6]);
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    super::dispatch::dispatch_arm_syscall_with_native_process(
+        frame,
+        &counters,
+        core::slice::from_ref(task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut crate::sched::FakeCpu::default(),
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        fixture.page,
+        control,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        service,
+        |_| core::ptr::null_mut(),
+    )
+}
+
+/// #1974 slice 1 review P0: a sibling's `exit_group` closes the process
+/// while the clone caller is parked on its child's Busy registration. Close
+/// is terminal; the contention is not. The parked caller observes the close
+/// like any other member of a closing process, the Born child is retired
+/// exactly once (never left parked or unregistered), and no run is
+/// quarantined (the pre-fix outcome: `NativeQuarantined` on the caller's
+/// resume, its stock token still attached to its host handoff).
 #[test]
-fn arm_ring_clone_registration_busy_once_then_succeeds() {
+fn arm_ring_clone_registration_busy_then_sibling_exit_group_settles_both() {
+    arm_ring_clone_registration_busy_across_close(false);
+}
+
+/// The same close, with the registration Busy once more when the woken
+/// caller retries it inside the closing process: it parks again (Busy once,
+/// then success), and the next return settles both.
+#[test]
+fn arm_ring_clone_registration_busy_again_in_closing_process_then_settles() {
+    arm_ring_clone_registration_busy_across_close(true);
+}
+
+#[cfg(test)]
+fn arm_ring_clone_registration_busy_across_close(busy_again: bool) {
+    let BusyRingBirth {
+        fixture,
+        mut service,
+        sibling_task,
+        sibling_control,
+        child_control,
+        child,
+        held,
+        ..
+    } = park_ring_clone_on_busy_registration();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let mut sibling_service = Aarch64NativeProcessService::with_crossing(
+        sibling_task,
+        SlotId::new(1),
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94; // exit_group by the sibling while the caller is parked
+    assert_eq!(
+        arm_call_as(
+            fixture,
+            sibling_task,
+            sibling_control,
+            &mut sibling_service,
+            &mut frame,
+        )
+        .unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+        "the closing sibling waits for the members' receipts"
+    );
+    assert!(
+        child_control.host_exit_requested(),
+        "close cancels the Born child"
+    );
+    let caller_id = fixture.zone.slot(fixture.slot).host_record().unwrap();
+    let caller = fixture.zone.record(caller_id);
+    assert!(matches!(
+        caller.claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    // A second holder takes the child's custody inside the woken caller's
+    // registration retry, so that retry is Busy once more.
+    let again = Arc::new(std::sync::Mutex::new(None));
+    if busy_again {
+        let hook_again = again.clone();
+        super::native_process_runtime::install_born_registration_hook(
+            &runtime,
+            Box::new(move |control| {
+                // SAFETY: the address is the birth's control in the leaked slot.
+                let control: &'static ThreadControlSlot =
+                    unsafe { &*(control as usize as *const ThreadControlSlot) };
+                *hook_again.lock().unwrap() = Some(
+                    carrick_el1_abi::NativePendingCustody::try_admit(Arc::new(
+                        carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap(),
+                    ))
+                    .unwrap(),
+                );
+            }),
+        );
+    }
+    let resume_caller = |service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>| {
+        // The holder's return notified the caller into a closing process.
+        assert!(matches!(
+            caller.claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ));
+        assert_eq!(
+            super::native_process_runtime::thread_stock::born_registration_waiters(&runtime),
+            1
+        );
+        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        assert_eq!(selected.record, caller_id);
+        run_as_leader(fixture);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::aarch64_process::resume_selected(
+                &runtime,
+                registry(),
+                source,
+                &fixture.task,
+                selected.record,
+                service,
+            )
+        }))
+        .unwrap_or_else(|failure| {
+            panic!(
+                "the caller must observe the close, not fail the run: {:?}",
+                failure.downcast_ref::<super::native_run_failure::NativeRunFailurePanic>()
+            )
+        })
+    };
+    // The holder returns its custody after the close.
+    drop(held.lock().unwrap().take());
+    assert!(held.lock().unwrap().is_none(), "no custody stays held");
+    let live = carrick_el1_abi::Lifecycle::live(fixture.page);
+    if busy_again {
+        // Busy inside the closing process re-parks the caller on the same
+        // notification: contention is not the close's refusal.
+        assert!(matches!(
+            resume_caller(&mut service),
+            crate::native_process_runtime::NativeResume::Left(None)
+        ));
+        assert!(matches!(
+            caller.claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        assert!(registry().for_record(fixture.zone, child).is_none());
+        assert_eq!(
+            fixture.zone.record(child.id).claim(),
+            carrick_sched_core::Claim::Free,
+            "the child stays Born and unqueued while its registration waits"
+        );
+        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), live);
+        drop(again.lock().unwrap().take());
+    }
+    let resumed = resume_caller(&mut service);
+    assert!(again.lock().unwrap().is_none(), "no custody stays held");
+    // The root leader's record is host-owned: it leaves to its host owner
+    // with the close status, never with the clone's result.
+    assert!(matches!(
+        resumed,
+        crate::native_process_runtime::NativeResume::Left(None)
+    ));
+    assert!(
+        !caller.has_object_operation(),
+        "the stock token is consumed"
+    );
+    assert_eq!(
+        super::native_process_runtime::thread_stock::born_registration_waiters(&runtime),
+        0,
+        "the caller left its registration wait"
+    );
+    // The caller finished its birth's registration before retiring: the
+    // child is a registered member of the closing process, queued once.
+    assert!(registry().for_record(fixture.zone, child).is_some());
+    assert!(child_control.native_signal_owner());
+    assert!(matches!(
+        fixture.zone.record(child.id).claim(),
+        carrick_sched_core::Claim::Queued { .. }
+    ));
+    // The caller's handback is the host's: its executor takes it off the
+    // run queue (production: the leader's host thread retires it).
+    assert!(caller.needs_host());
+    assert!(matches!(
+        fixture.zone.claim_for_host(
+            fixture.zone.record_ref(caller_id),
+            None,
+            carrick_el1_abi::Handback::Control,
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        ),
+        carrick_sched_core::HostClaim::Claimed
+    ));
+    assert_eq!(fixture.zone.slot(fixture.slot).queued(), 1);
+    // Its first selection retires it through the closing-member path (the
+    // close requested its exit); it never returns to EL0.
+    let identity = fixture.zone.record(child.id).identity();
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        child.id
+    );
+    run_as(
+        fixture,
+        identity.tid as i32,
+        identity.generation,
+        identity.serial,
+        child_control,
+    );
+    assert!(matches!(
+        super::aarch64_process::resume_production_with_service(
+            fixture.zone,
+            &fixture.task,
+            fixture.slot,
+            child.id,
+            &mut service,
+        ),
+        crate::sched::ResumeAction::Left
+    ));
+    let entry = child_control.entry().unwrap();
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::expected_exit_receipt(fixture.page, child_control, Some(entry)),
+        carrick_core::lifecycle::ExpectedExitReceipt::AlreadyExited,
+        "the child's close receipt is published"
+    );
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::live(fixture.page),
+        live - 1,
+        "the child retires exactly once"
+    );
+    assert_ne!(
+        fixture.zone.record(child.id).incarnation(),
+        child.incarnation,
+        "the child's record is released"
+    );
+    assert!(registry().for_record(fixture.zone, child).is_none());
+    assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+}
+
+/// A ring clone (syscall 220) by the root leader whose child's native
+/// registration finds its pending-signal writer held once, so the caller is
+/// parked as the birth's post-Born continuation. A second live thread (an
+/// adopted host-born sibling on slot 1) exists alongside.
+#[cfg(test)]
+struct BusyRingBirth {
+    fixture: &'static Fixture,
+    service: Aarch64NativeProcessService<'static, TestStockCrossing>,
+    sibling_task: &'static CurrentTask,
+    sibling_control: &'static ThreadControlSlot,
+    child_control: &'static ThreadControlSlot,
+    child: carrick_el1_abi::RecordRef,
+    tid: u32,
+    members: usize,
+    /// The held registration custody: dropping it is the holder's return.
+    held: Arc<std::sync::Mutex<Option<carrick_el1_abi::NativePendingCustody<'static>>>>,
+}
+
+#[cfg(test)]
+fn park_ring_clone_on_busy_registration() -> BusyRingBirth {
     use carrick_el1_abi::{EntryState, Lifecycle};
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let mut service = fixture.process_service();
@@ -6885,8 +7170,6 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
         )
         .unwrap();
     assert!(root_holds_native_stock(fixture));
-    // A second live thread (an adopted host-born sibling on its own slot)
-    // signals the child while the child's registration is Busy.
     let sibling_control = host_born_sibling(fixture, 43);
     let sibling_task = register_sibling_on_slot(fixture, sibling_control, 43);
     let source = BornInZoneSource {
@@ -6898,11 +7181,12 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
         .unwrap();
     // The holder of the child's registration custody, taken inside the
     // production registration of this exact birth.
-    type Writer = carrick_el1_abi::NativePendingCustody<'static>;
-    static HELD: std::sync::Mutex<Option<(Writer, usize)>> = std::sync::Mutex::new(None);
+    let held = Arc::new(std::sync::Mutex::new(None));
+    let control_address = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (hook_held, hook_address) = (held.clone(), control_address.clone());
     super::native_process_runtime::install_born_registration_hook(
         &runtime,
-        Box::new(|control| {
+        Box::new(move |control| {
             // SAFETY: the address is the birth's control in the leaked slot.
             let control: &'static ThreadControlSlot =
                 unsafe { &*(control as usize as *const ThreadControlSlot) };
@@ -6910,10 +7194,12 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
                 carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap(),
             ))
             .unwrap();
-            *HELD.lock().unwrap() = Some((writer, control as *const _ as usize));
+            *hook_held.lock().unwrap() = Some(writer);
+            hook_address.store(control as *const _ as usize, Ordering::Release);
         }),
     );
-    let members = registry().member_count();
+    drop(runtime);
+    let members = registry().member_count(fixture.zone);
     run_as_leader(fixture);
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[8] = 220;
@@ -6924,10 +7210,10 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
         carrick_personality_linux::dispatch::CompletionRoute::Suspended,
         "Busy parks the clone caller instead of failing the run"
     );
-    let control_address = HELD.lock().unwrap().as_ref().unwrap().1;
+    assert!(held.lock().unwrap().is_some());
     // SAFETY: the child's control lives in the leaked lifecycle slot.
     let child_control: &'static ThreadControlSlot =
-        unsafe { &*(control_address as *const ThreadControlSlot) };
+        unsafe { &*(control_address.load(Ordering::Acquire) as *const ThreadControlSlot) };
     let entry = child_control.entry().unwrap();
     let child = child_control.zone_record().unwrap();
     let tid = child_control.visible_tid().unwrap();
@@ -6937,7 +7223,7 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
         "the birth stays published across Busy"
     );
     assert_eq!(
-        registry().member_count(),
+        registry().member_count(fixture.zone),
         members,
         "Busy registered nothing"
     );
@@ -6951,6 +7237,40 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
         child.incarnation,
         "the child's record is retained"
     );
+    BusyRingBirth {
+        fixture,
+        service,
+        sibling_task,
+        sibling_control,
+        child_control,
+        child,
+        tid,
+        members,
+        held,
+    }
+}
+
+#[test]
+fn arm_ring_clone_registration_busy_once_then_succeeds() {
+    use carrick_el1_abi::Lifecycle;
+    let BusyRingBirth {
+        fixture,
+        mut service,
+        sibling_task,
+        sibling_control,
+        child_control,
+        child,
+        tid,
+        members,
+        held,
+    } = park_ring_clone_on_busy_registration();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
 
     // tgkill(SIGUSR1) from the sibling resolves the Born child by its
     // record and keeps the signal record-keyed across the Busy window.
@@ -7002,7 +7322,7 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
         carrick_sched_core::Claim::Parked { .. }
     ));
     let pin = carrick_core::lifecycle::MemberControlCustody::retain(child_control).unwrap();
-    drop(HELD.lock().unwrap().take());
+    drop(held.lock().unwrap().take());
     assert!(matches!(
         parked.claim(),
         carrick_sched_core::Claim::Queued { .. }
@@ -7029,7 +7349,7 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
         u64::from(tid),
         "the clone caller completes with the child tid"
     );
-    assert_eq!(registry().member_count(), members + 1);
+    assert_eq!(registry().member_count(fixture.zone), members + 1);
     assert!(matches!(
         fixture.zone.record(child.id).claim(),
         carrick_sched_core::Claim::Queued { .. }
