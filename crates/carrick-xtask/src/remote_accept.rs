@@ -294,8 +294,9 @@ pub fn build_accept_job_script(
             shell_quote(bundle.path()),
             shell_quote(&run_dir.to_string_lossy()),
         );
+        // Grouped, so the job log captures preparation as well as accept.
         format!(
-            "just lease gate sh -c {} && just accept --phase {phase} --receipt {q_receipt}",
+            "{{ just lease gate sh -c {} && just accept --phase {phase} --receipt {q_receipt}; }}",
             shell_quote(&preparation)
         )
     };
