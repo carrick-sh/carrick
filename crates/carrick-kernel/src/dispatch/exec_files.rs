@@ -329,9 +329,8 @@ impl ExecFilesystem {
 /// admits that root, and every native child's exec and root fork seed names it.
 pub fn native_exec_capability(
     root: &crate::kernel::KernelContext,
-) -> Option<carrick_core_abi::service::ExecCapabilityId> {
-    core::num::NonZeroU64::new(root.resources().files().id().raw())
-        .map(carrick_core_abi::service::ExecCapabilityId::new)
+) -> carrick_core_abi::service::ExecCapabilityId {
+    carrick_core_abi::service::ExecCapabilityId::of_root_task(root.task().key().serial)
 }
 
 impl SyscallDispatcher {

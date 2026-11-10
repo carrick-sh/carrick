@@ -338,8 +338,8 @@ struct TestStockCrossing {
     /// reads it, and how many seeds were served.
     root_cwd: std::sync::Mutex<Vec<u8>>,
     root_seeds: AtomicUsize,
-    /// Refuse the seed, as the carrier does once the root's capability
-    /// retired with a host exec.
+    /// Refuse the seed, as the carrier does once the run's exec service
+    /// retired.
     refuse_root_seed: core::sync::atomic::AtomicBool,
     /// The one capability the carrier's exec service directory holds, when
     /// a fixture models it: a seed naming any other resolves no service and
