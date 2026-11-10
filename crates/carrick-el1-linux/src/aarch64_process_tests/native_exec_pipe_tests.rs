@@ -1327,6 +1327,46 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     registry.unregister_root_for_test(&runtime);
 }
 
+/// Re-enters a woken sleeper's registered thread, as its executor does
+/// before consuming the retained operation.
+fn reenter_worker<'r, 'a>(
+    fixture: &'a Fixture,
+    registry: &NativeProcessRegistry<'a, AddressContext<RootGpa>, Aarch64ParkedContext>,
+    runtime: &'r NativeProcessRuntime<'a, AddressContext<RootGpa>, Aarch64ParkedContext>,
+    source: BornInZoneSource<'a, Aarch64ParkedContext>,
+    worker: &crate::native_process_runtime::NativeRecordBinding<
+        AddressContext<RootGpa>,
+        Aarch64ParkedContext,
+    >,
+    service: &'r mut Physical<'a, Aarch64ParkedContext>,
+) -> Box<
+    crate::native_process_runtime::NativeProcessEntry<
+        'r,
+        'a,
+        AddressContext<RootGpa>,
+        Aarch64ParkedContext,
+        Physical<'a, Aarch64ParkedContext>,
+    >,
+> {
+    activate_target(source, &fixture.task, worker);
+    let identity = fixture.zone.record(worker.record.id).identity();
+    fixture.task.set(
+        El1TaskId::from_linux_tid(identity.tid as i32),
+        carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+        identity.file_table,
+    );
+    runtime
+        .enter_registered(
+            registry,
+            source,
+            &fixture.task,
+            worker.address,
+            &worker.words,
+            service,
+        )
+        .unwrap()
+}
+
 // Control only physical word supply. Fork, exec, copy preparation, scheduler
 // custody and resumption all use the production native owner.
 fn child_futex<'a>(
@@ -1984,30 +2024,6 @@ fn child_futex<'a>(
         let sleeper = fixture.zone.record(worker.record.id);
         // Re-enter the selected sleeper after a wake and consume its retained
         // operation, as its executor does before returning to EL0.
-        macro_rules! resume {
-            ($entry:ident => $consume:expr) => {{
-                activate_target(source, &fixture.task, &worker);
-                let identity = fixture.zone.record(worker.record.id).identity();
-                fixture.task.set(
-                    El1TaskId::from_linux_tid(identity.tid as i32),
-                    carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
-                    identity.file_table,
-                );
-                let mut $entry = runtime
-                    .enter_registered(
-                        registry,
-                        source,
-                        &fixture.task,
-                        worker.address,
-                        &worker.words,
-                        service,
-                    )
-                    .unwrap();
-                let resumed = $consume;
-                drop($entry);
-                resumed
-            }};
-        }
         // The executor departs; the deadline survives on the carrier
         // driver's heap and expires exactly once at its original tick.
         let depart_and_expire = || {
@@ -2060,7 +2076,13 @@ fn child_futex<'a>(
             );
             assert!(take_signal_copies().is_empty(), "nothing written yet");
             assert_eq!(fixture.zone.timer_node_count(), nodes, "no timer lease");
-            let resumed = resume!(entry => entry.resume_checkpoint(|_| Ok(None)));
+            let resumed = {
+                let mut entry =
+                    reenter_worker(fixture, registry, runtime, source, &worker, service);
+                let resumed = entry.resume_checkpoint(|_| Ok(None));
+                drop(entry);
+                resumed
+            };
             let resumed = match resumed {
                 Ok(NativeResume::Returned(result)) => Some(result.raw()),
                 _ => None,
@@ -2089,7 +2111,13 @@ fn child_futex<'a>(
             // The gate's release publishes the owner notification and wakes
             // the parked caller; its checkpoint reruns the retained copy.
             access.lower(space.index());
-            let resumed = resume!(entry => entry.resume_checkpoint(|_| Ok(None)));
+            let resumed = {
+                let mut entry =
+                    reenter_worker(fixture, registry, runtime, source, &worker, service);
+                let resumed = entry.resume_checkpoint(|_| Ok(None));
+                drop(entry);
+                resumed
+            };
             let resumed = match resumed {
                 Ok(NativeResume::Returned(result)) => Some(result.raw()),
                 _ => None,
@@ -2155,7 +2183,13 @@ fn child_futex<'a>(
                 // read. The sleep must park again on its own deadline, never
                 // reach the rt_sigtimedwait EAGAIN answer.
                 script_signal_clock(&[1050]);
-                let first = resume!(entry => entry.resume_pending_wait());
+                let first = {
+                    let mut entry =
+                        reenter_worker(fixture, registry, runtime, source, &worker, service);
+                    let resumed = entry.resume_pending_wait();
+                    drop(entry);
+                    resumed
+                };
                 let first = match first {
                     Some(LifecycleOutcome::Transferred {
                         progress: carrick_core::Served::Idle,
@@ -2185,7 +2219,13 @@ fn child_futex<'a>(
                     worker.record,
                     carrick_signal_core::policy::Signal::from_number(2).unwrap(),
                 );
-                let resumed = resume!(entry => entry.resume_pending_wait());
+                let resumed = {
+                    let mut entry =
+                        reenter_worker(fixture, registry, runtime, source, &worker, service);
+                    let resumed = entry.resume_pending_wait();
+                    drop(entry);
+                    resumed
+                };
                 assert!(fired.load(Ordering::Acquire), "the publication raced");
                 let resumed = match resumed {
                     Some(LifecycleOutcome::Returned { result, .. }) => Some(result.raw()),
@@ -2222,7 +2262,12 @@ fn child_futex<'a>(
             }
             _ => unreachable!("{case:?} answers at entry"),
         };
-        let resumed = match resume!(entry => entry.resume_pending_wait()) {
+        let resumed = match {
+            let mut entry = reenter_worker(fixture, registry, runtime, source, &worker, service);
+            let resumed = entry.resume_pending_wait();
+            drop(entry);
+            resumed
+        } {
             Some(LifecycleOutcome::Returned { result, .. }) => Some(result.raw()),
             _ => None,
         };
