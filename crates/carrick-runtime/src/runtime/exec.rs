@@ -404,12 +404,27 @@ fn finalize_hvf_exec_base(
 /// AArch64 and reach x86_64 guests only through Rosetta; an x86_64 host runs
 /// them natively through the shared `carrick-x86` engine.
 #[cfg(target_arch = "x86_64")]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 type NativeGuestArch = carrick_hal::x8664_arch::X8664GuestArch;
 #[cfg(not(target_arch = "x86_64"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 type NativeGuestArch = carrick_hal::aarch64_arch::Aarch64GuestArch;
 
 /// A native guest's base image off macOS: the ELF machine this build's guests
 /// execute, which the loader would otherwise default to AArch64.
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 fn native_guest_elf_machine() -> u16 {
     use carrick_hal::GuestArch as _;
     NativeGuestArch::elf_machine()
@@ -418,7 +433,11 @@ fn native_guest_elf_machine() -> u16 {
 /// Finalize a native (non-HVF) guest's base image. The vDSO choice is the one
 /// every VMM run path makes; page tables, trampolines and the syscall mailbox
 /// belong to the engine that boots the image, so exec adds nothing else.
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 fn finalize_native_guest_exec_base(
     loader: &ExecLoaderCapabilities,
     raw: AddressSpace,
@@ -481,8 +500,25 @@ pub(crate) fn load_execve_image<'a>(
     // interpreter (execve03/execve02). Then resolve any `#!` shebang script to
     // its interpreter (shared with the initial entrypoint load via
     // `resolve_shebang`).
+    // The bare-run host-file fallback is the HVF embedding's physical file
+    // service. Other carriers supply none until their host-file venue serves
+    // exec (#1093 S4): the retained filesystem alone resolves the image.
+    #[cfg(feature = "platform-macos")]
     let host_open = |path: &str| std::fs::File::open(path);
-    let acquire_source = |path: &str| files.acquire_with_host_file_service(path, &host_open);
+    let acquire_source = |path: &str| {
+        #[cfg(feature = "platform-macos")]
+        {
+            files.acquire_with_host_file_service(path, &host_open)
+        }
+        #[cfg(any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ))]
+        {
+            files.acquire(path)
+        }
+    };
     let (abs_path, named_source, descriptor) = match target.into() {
         ExecTarget::Path(path) => (
             files.resolve_path(path),
@@ -569,7 +605,14 @@ pub(crate) fn load_execve_image<'a>(
     // an execve target absent from the container fs ENOENTs instead of escaping
     // to the matching HOST binary. The filesystem capability retains that fallback policy.
     let requires_syscall_traps = requires_syscall_traps || loader.requires_syscall_traps;
-    #[cfg_attr(not(feature = "platform-macos"), allow(unused_mut))]
+    #[cfg_attr(
+        any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ),
+        allow(unused_mut)
+    )]
     let mut binfmt_argv = None;
     #[cfg(feature = "platform-macos")]
     let (base, argv) = {
@@ -633,7 +676,11 @@ pub(crate) fn load_execve_image<'a>(
     // (binfmt translation is the AArch64 host's route to x86), the build's
     // own ELF machine, and no HVPatch image cache, whose key is an AArch64
     // image property.
-    #[cfg(not(feature = "platform-macos"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     let (base, argv) = {
         let _ = direct_aarch64;
         let raw_bytes = source.read_all().map_err(host_io_errno)?;
@@ -1524,26 +1571,41 @@ mod tests {
         retirement.prepare().unwrap();
     }
 
-    /// #1093 S3: a native fork child's exec prepares an EM_X86_64 ELF through
-    /// the production entry point. The build's own machine selects the
-    /// loader (an x86_64 host runs x86 guests natively, with no Rosetta
-    /// redirect) and the other ISA's image is a machine mismatch.
-    #[cfg(all(not(feature = "platform-macos"), target_arch = "x86_64"))]
+    /// #1093 S3: a native fork child's exec prepares the build's own guest
+    /// machine through the production entry point (EM_X86_64 on an x86_64
+    /// host, which runs x86 guests natively with no Rosetta redirect), and
+    /// the other ISA's image is a machine mismatch.
+    #[cfg(feature = "platform-linux")]
     #[test]
-    fn native_child_exec_prepares_an_x86_64_image_through_the_production_entry() {
+    fn native_child_exec_prepares_the_native_guest_machine_through_the_production_entry() {
         use carrick_core_abi::service::ExecCall;
-        use std::os::unix::fs::PermissionsExt as _;
 
-        let directory = tempfile::tempdir().unwrap();
-        let write = |name: &str, machine| {
-            let path = directory.path().join(name);
-            std::fs::write(&path, synthetic_exec(machine, [0x90, 0x90, 0x90, 0xc3])).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path.to_str().unwrap().to_owned()
+        let (native, foreign) = if cfg!(target_arch = "x86_64") {
+            (EM_X86_64, EM_AARCH64)
+        } else {
+            (EM_AARCH64, EM_X86_64)
         };
-        let x86 = write("x86-successor", EM_X86_64);
-        let arm = write("arm-successor", EM_AARCH64);
-        let dispatcher = SyscallDispatcher::new();
+        // A container rootfs: the retained filesystem is the only authority
+        // that can resolve the image (no host-file fallback on this lane).
+        let mut layer = tar::Builder::new(Vec::new());
+        for (name, machine) in [("native-successor", native), ("foreign-successor", foreign)] {
+            let image = synthetic_exec(machine, [0x90, 0x90, 0x90, 0xc3]);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(image.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            layer
+                .append_data(&mut header, format!("bin/{name}"), image.as_slice())
+                .unwrap();
+        }
+        let rootfs =
+            carrick_vfs::rootfs::RootFs::from_layers([carrick_vfs::rootfs::LayerSource::Tar(
+                layer.into_inner().unwrap(),
+            )])
+            .unwrap();
+        let native_path = "/bin/native-successor".to_owned();
+        let foreign_path = "/bin/foreign-successor".to_owned();
+        let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
         let prepare = |path: &str| {
             prepare_native_exec_image(
@@ -1553,28 +1615,28 @@ mod tests {
             )
         };
 
-        let loaded = prepare(&x86).expect("EM_X86_64 successor prepares");
+        let loaded = prepare(&native_path).expect("the native machine's successor prepares");
         assert_eq!(loaded.image.entry(), 0x400000);
-        assert!(loaded.binfmt_argv.is_none(), "no Rosetta redirect on x86");
+        assert!(loaded.binfmt_argv.is_none(), "no Rosetta redirect");
         // The image carries the ring's argv and exec path on its initial
         // stack, exactly as the AArch64 path stages them.
         let sp = loaded.image.initial_stack_pointer().expect("initial stack");
         assert_eq!(read_image_u64(&loaded.image, sp), 1, "argc");
         let argv0 = read_image_u64(&loaded.image, sp + 8);
         assert_eq!(read_image_c_string(&loaded.image, argv0), b"successor");
-        assert_eq!(execfn(&loaded.image), x86.as_bytes());
+        assert_eq!(execfn(&loaded.image), native_path.as_bytes());
         assert!(
             loaded
                 .image
                 .file_mappings()
                 .iter()
-                .any(|mapping| mapping.start == 0x400000 && mapping.path == x86),
+                .any(|mapping| mapping.start == 0x400000 && mapping.path == native_path),
             "the main image is named by its resolved path"
         );
 
         // The other ISA's ELF is not this build's machine.
-        match prepare(&arm) {
-            Ok(_) => panic!("an AArch64 ELF prepared on an x86_64 build"),
+        match prepare(&foreign_path) {
+            Ok(_) => panic!("a foreign-machine ELF prepared"),
             Err(errno) => assert_eq!(errno, crate::linux_abi::LINUX_ENOEXEC),
         }
     }
