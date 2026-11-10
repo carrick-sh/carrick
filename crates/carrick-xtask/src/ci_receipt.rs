@@ -1924,9 +1924,10 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                     })?;
                 std::fs::write(&path, bytes).map_err(|source| ReceiptError::Io { path, source })?;
             }
-            if !result.passed {
+            // Advisory-only NEW entries print "PASS (advisory NEW only)" and pass.
+            if result.blocks() {
                 return Err(ReceiptError::New {
-                    count: result.new.len(),
+                    count: result.blocking.len(),
                     base: result.base,
                 });
             }

@@ -1732,8 +1732,14 @@ fn publish(
         // its interruption is not visible in the advisory EL1 set differences.
         let candidate_gaps = receipt_gaps(&candidate);
         if !base_gaps.is_empty() {
+            // Only a complete candidate may be described as completed (#2049).
+            let candidate_note = if candidate_gaps.is_empty() {
+                "; the candidate completed, so this does not block"
+            } else {
+                ""
+            };
             body.push_str(&format!(
-                "\n**Advisory: the paired base is incomplete.** {}. Base failures it never ran cannot be compared, so they are not read as fixed; the candidate completed, so this does not block.\n",
+                "\n**Advisory: the paired base is incomplete.** {}. Base failures it never ran cannot be compared, so they are not read as fixed{candidate_note}.\n",
                 base_gaps.join("; ")
             ));
         }
@@ -1762,13 +1768,19 @@ fn publish(
                 format!("Advisory, base incomplete: {gap} (+{more} more)")
             }
         });
-        Ok::<_, ReceiptError>((passed, body, blocking, advisory))
+        let advisory_new = !diff.blocks() && !diff.passed;
+        Ok::<_, ReceiptError>((passed, body, blocking, advisory, advisory_new))
     })();
     let candidate_path = results.join(CANDIDATE_RECEIPT);
-    let (passed, mut body, outcome, blocking, advisory) = match comparison {
-        Ok((passed, body, blocking, advisory)) => {
-            (passed, body, PublishOutcome::Compared, blocking, advisory)
-        }
+    let (passed, mut body, outcome, blocking, advisory, advisory_new) = match comparison {
+        Ok((passed, body, blocking, advisory, advisory_new)) => (
+            passed,
+            body,
+            PublishOutcome::Compared,
+            blocking,
+            advisory,
+            advisory_new,
+        ),
         // A cancelled job that never wrote a candidate has no verdict to
         // report; it still fails the required check, only the text differs.
         Err(ReceiptError::Io { path, source })
@@ -1785,6 +1797,7 @@ fn publish(
                 PublishOutcome::Cancelled,
                 None,
                 None,
+                false,
             )
         }
         Err(error @ ReceiptError::IncomparableBase(_)) => (
@@ -1796,6 +1809,7 @@ fn publish(
             PublishOutcome::IncomparableBase,
             None,
             None,
+            false,
         ),
         Err(error) => (
             false,
@@ -1806,6 +1820,7 @@ fn publish(
             PublishOutcome::Compared,
             None,
             None,
+            false,
         ),
     };
     if !passed && !body.starts_with("Signed gate: **FAIL**") && outcome == PublishOutcome::Compared
@@ -1847,6 +1862,8 @@ fn publish(
             text.push_str("...");
         }
         text
+    } else if passed && advisory_new {
+        "advisory NEW entries present; see comment".to_string()
     } else if passed {
         "No introduced failures; populations and completion preserved".to_string()
     } else if let Some(blocking) = &blocking {
