@@ -1334,46 +1334,24 @@ impl Personality for LinuxPersonality {
             // Entropy has been staged above. Any other unwired native service
             // fails closed with a counted refusal.
             CompletionRoute::NativeService => {
-                let child = source.zone.slot(slot).current().is_some_and(|record| {
-                    native_process::registry()
-                        .record_is_fork_child(source.zone, source.zone.record_ref(record))
-                });
-                // A fork child's exec is the native exec service's. It has no
-                // x86 successor hooks yet (#1093 S3/S4), so it stages its
-                // arguments and refuses with a counted ENOSYS; a root's exec
-                // is unclaimed and keeps the refusal below.
-                if let Some(request) =
-                    carrick_el1_linux::exec_stage::ExecStageRequest::from_canonical(
-                        call.canonical.raw(),
-                        call.args,
-                    )
-                    && carrick_el1_linux::dispatch::native_exec_claimed(|| {
-                        if child {
-                            carrick_el1_linux::native_process_runtime::NativeThreadGroupOwner::ForkChild
-                        } else {
-                            carrick_el1_linux::native_process_runtime::NativeThreadGroupOwner::Root
-                        }
-                    })
-                {
-                    frame.rax = carrick_el1_linux::dispatch::settle_native_exec_without_successor(
-                        task,
-                        &carrick_el1_linux::file::HardwareValidator,
-                        request,
-                        carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
-                        counters,
-                    ) as u64;
-                    return ControlFlow::Return(());
-                }
-                counters.record_refusal(
+                // A fork child's exec stages (no x86 successor hooks until
+                // #1093 S3/S4); everything else is the counted refusal.
+                frame.rax = carrick_el1_linux::dispatch::settle_unwired_native_service(
+                    native_process::registry(),
+                    source.zone,
+                    source
+                        .zone
+                        .slot(slot)
+                        .current()
+                        .map(|r| source.zone.record_ref(r)),
+                    call.canonical.raw(),
+                    call.args,
                     carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
-                    if child {
-                        carrick_core_abi::service::ServiceOrigin::Descendant
-                    } else {
-                        carrick_core_abi::service::ServiceOrigin::Initial
-                    },
-                    carrick_el1_abi::RefusalVenue::Ring,
-                );
-                frame.rax = carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64;
+                    task,
+                    &carrick_el1_linux::file::HardwareValidator,
+                    counters,
+                )
+                .retval() as u64;
                 ControlFlow::Return(())
             }
             CompletionRoute::Forward | CompletionRoute::HostCustody => {

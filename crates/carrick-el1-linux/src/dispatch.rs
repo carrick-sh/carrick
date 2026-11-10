@@ -1245,6 +1245,64 @@ pub fn settle_native_exec_without_successor<V: file::MemoryValidator>(
     }
 }
 
+/// How an unwired native-service call was settled in ring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeServiceSettlement {
+    /// A claimed fork child's exec: arguments staged, then settled.
+    ExecStaged(i64),
+    /// Not claimed (or not an exec): the counted fallback refusal.
+    Refused(i64),
+}
+
+impl NativeServiceSettlement {
+    /// The guest return word.
+    pub fn retval(self) -> i64 {
+        match self {
+            Self::ExecStaged(value) | Self::Refused(value) => value,
+        }
+    }
+}
+
+/// The CPL0 completion of a native-service call no x86 service serves yet:
+/// ownership is derived from the registry's record (a fork child's exec is the
+/// native exec service's and stages), everything else is the counted ring
+/// refusal. One body for the CPL0 target and the host witnesses.
+#[allow(clippy::too_many_arguments)]
+pub fn settle_unwired_native_service<'a, M: Clone, C: carrick_guest_arch::ProcessContext, V>(
+    registry: &super::native_process_runtime::NativeProcessRegistry<'a, M, C>,
+    zone: &carrick_sched_core::ZoneTables<C>,
+    record: Option<carrick_sched_core::RecordRef>,
+    canonical: u64,
+    args: [u64; 6],
+    native: carrick_guest_arch::NativeOrdinal,
+    task: &CurrentTask,
+    validator: &V,
+    counters: &Counters,
+) -> NativeServiceSettlement
+where
+    V: file::MemoryValidator,
+{
+    use super::native_process_runtime::NativeThreadGroupOwner as Owner;
+    let child = record.is_some_and(|record| registry.record_is_fork_child(zone, record));
+    if let Some(request) = crate::exec_stage::ExecStageRequest::from_canonical(canonical, args)
+        && native_exec_claimed(|| if child { Owner::ForkChild } else { Owner::Root })
+    {
+        return NativeServiceSettlement::ExecStaged(settle_native_exec_without_successor(
+            task, validator, request, native, counters,
+        ));
+    }
+    counters.record_refusal(
+        native,
+        if child {
+            carrick_core_abi::service::ServiceOrigin::Descendant
+        } else {
+            carrick_core_abi::service::ServiceOrigin::Initial
+        },
+        carrick_el1_abi::RefusalVenue::Ring,
+    );
+    NativeServiceSettlement::Refused(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
+}
+
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn refuse_traced_native_exec(
     frame: &mut TrapFrame,
