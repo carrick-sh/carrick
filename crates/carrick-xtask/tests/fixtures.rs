@@ -4542,3 +4542,99 @@ fn unlisted_reader_refuses_assembler_and_linker_reads() {
         assert_eq!(candidate_probes::unlisted_reader(source), None, "{source}");
     }
 }
+
+/// `accept --phase signed` with valid fixtures and a failing release build
+/// (#2017): the build phase publishes its FAIL receipt under `carrick` and
+/// exits, never requesting gate or starting a guest, even while a shared
+/// holder would keep gate waiting. `_build` exits nonzero on macOS aarch64;
+/// elsewhere the build step fails on its platform check before running it.
+#[test]
+fn signed_accept_failed_build_publishes_fail_without_gate() {
+    if !cargo_env::in_clean_cargo_test() {
+        return;
+    }
+    use carrick_xtask::host_lease::{HostLease, HostLeaseMode};
+    let f = Fixture::new();
+    let root = f.repo.path();
+    fixtures::restore(root, &f.path, None, None, &private_gate().lease).unwrap();
+    let guest = f.store.path().join("guest-ran");
+    write(
+        root,
+        "justfile",
+        format!(
+            "check-disk:\n    @true\n\n_build:\n    @touch {0}/build-ran\n    @exit 1\n",
+            f.store.path().display()
+        )
+        .as_bytes(),
+    );
+    // Every guest step in the execution phase starts here first.
+    write(
+        root,
+        "scripts/test-signed.sh",
+        format!("#!/bin/sh\ntouch {}\n", guest.display()).as_bytes(),
+    );
+    fs::set_permissions(
+        root.join("scripts/test-signed.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    git(root, &["add", "justfile", "scripts/test-signed.sh"]);
+    git(root, &["commit", "-qm", "failing build"]);
+    carrick_xtask::accept::verify_signed_fixtures(root).unwrap();
+
+    let lock = f.store.path().join("host.lock");
+    let holder = HostLease::acquire_path(&lock, HostLeaseMode::Carrick).unwrap();
+    let receipt_path = f.store.path().join("receipt.json");
+    let stderr = f.store.path().join("stderr.log");
+    let stdout = f.store.path().join("stdout.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(root)
+        .args(["accept", "--phase", "signed", "--receipt"])
+        .arg(&receipt_path)
+        .env("CARRICK_HOST_LEASE_PATH", &lock)
+        .env_remove("CARRICK_HOST_LEASE_FD")
+        .env_remove("CARRICK_HOST_LEASE_MODE")
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env_remove(carrick_xtask::signed_phase::PHASE_ENV)
+        .env_remove(carrick_xtask::signed_phase::STATE_ENV)
+        .stdin(std::process::Stdio::null())
+        .stdout(fs::File::create(&stdout).unwrap())
+        .stderr(fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    // Bounded: a run that waits for gate behind the holder is the red line.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        let log = fs::read_to_string(&stderr).unwrap_or_default();
+        if log.contains("waiting for gate") || std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!("a failed build waited for gate instead of publishing FAIL: {log}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let log = fs::read_to_string(&stderr).unwrap();
+    let out = fs::read_to_string(&stdout).unwrap();
+    assert!(!status.success(), "{log}");
+    assert!(!out.contains("Signed execution phase"), "{out}");
+    assert!(!guest.exists(), "a guest step ran after a failed build");
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap())
+        .unwrap_or_else(|error| panic!("{error}: {log}"));
+    assert_eq!(receipt["overall"], "FAIL", "{receipt}");
+    let steps = receipt["steps"].as_array().unwrap();
+    let names: Vec<_> = steps.iter().map(|step| step["name"].clone()).collect();
+    assert_eq!(names, ["fixtures", "build"], "{receipt}");
+    assert_eq!(steps[0]["passed"], true, "{receipt}");
+    assert_eq!(steps[1]["passed"], false, "{receipt}");
+    assert!(receipt["signed_admission"].is_null(), "{receipt}");
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        assert!(f.store.path().join("build-ran").exists(), "{log}");
+    } else {
+        assert!(log.contains("signed phase requires macOS aarch64"), "{log}");
+        assert!(!f.store.path().join("build-ran").exists(), "{log}");
+    }
+    drop(holder);
+}
