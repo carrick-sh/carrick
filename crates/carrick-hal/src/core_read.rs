@@ -15,7 +15,7 @@
 //!   pristine private file contents or as an untouched zero page, and as
 //!   nothing else), and how a refusal is classified. A wait on the gate capture itself raised is a broken
 //!   invariant ([`CoreReadError::OwnGate`]); any other holder's dependency
-//!   means "not now" ([`CoreReadError::Busy`]): capture keeps the operation,
+//!   means "not now" ([`CoreReadError::Wait`]): capture keeps the operation,
 //!   releases its pause and execution lease, enrols on that wait's existing
 //!   release notification, probes once and reruns.
 //! - Per ISA ([`CoreMemorySource`]): translating a guest VA through its own
@@ -103,7 +103,7 @@ pub enum CoreReadError {
     /// Not now: another holder must release first. Capture discards its
     /// partial snapshot, releases its pause, enrols on this wait, probes
     /// once and reruns.
-    Busy(CoreReadWait),
+    Wait(CoreReadWait),
     /// The read waited on the gate of the very MM whose exclusion capture
     /// holds. Nothing but capture can lower that gate, so waiting would
     /// deadlock; reaching this is a broken invariant, never retried.
@@ -115,7 +115,7 @@ pub enum CoreReadError {
 impl std::fmt::Display for CoreReadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy(wait) => write!(formatter, "core read waits on another holder: {wait:?}"),
+            Self::Wait(wait) => write!(formatter, "core read waits on another holder: {wait:?}"),
             Self::OwnGate(wait) => write!(
                 formatter,
                 "core read waited on the gate of the MM its own capture excludes: {wait:?}"
@@ -244,7 +244,7 @@ fn classify(
         CoreReadWait::Owner(wait) if wait.cause() == PortalWaitCause::Gate => {
             CoreReadError::OwnGate(wait)
         }
-        wait => CoreReadError::Busy(wait),
+        wait => CoreReadError::Wait(wait),
     })
 }
 
@@ -404,7 +404,7 @@ mod tests {
             read_core_bytes(&fake, excluded, 0x1000, 0x3000).unwrap_err()
         });
         assert!(
-            matches!(&error, CoreReadError::Busy(CoreReadWait::Owner(wait)) if *wait == refusal),
+            matches!(&error, CoreReadError::Wait(CoreReadWait::Owner(wait)) if *wait == refusal),
             "{error:?}"
         );
     }
@@ -431,7 +431,7 @@ mod tests {
             read_core_bytes(&fake, excluded, 0x1000, 0x3000).unwrap_err()
         });
         assert!(
-            matches!(&error, CoreReadError::Busy(CoreReadWait::Physical(wait)) if *wait == reader),
+            matches!(&error, CoreReadError::Wait(CoreReadWait::Physical(wait)) if *wait == reader),
             "{error:?}"
         );
     }
