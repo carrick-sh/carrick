@@ -11,6 +11,13 @@ use support::*;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_kernel::dispatch::MemoryError;
 
+/// Backing for fixtures that need an mmap arena. `from_segments` allocates its
+/// whole `memory_size` eagerly, so fixtures back a bounded window of the arena
+/// (it starts at the real `LINUX_MMAP_BASE`) instead of `LINUX_MMAP_SIZE`
+/// (32 GiB, which aborts 14 GiB hosts). Each user reserves well under this.
+const FIXTURE_ARENA_SIZE: u64 = 1024 * 1024 * 1024;
+const _: () = assert!(FIXTURE_ARENA_SIZE <= LINUX_MMAP_SIZE);
+
 struct ProtectedAddressSpace {
     inner: AddressSpace,
     protections: MemoryProtections,
@@ -180,7 +187,7 @@ fn mmap_maps_file_bytes_into_guest_memory_arena() {
 fn mmap_anonymous_reservations_fit_in_runtime_arena() {
     let mut memory = AddressSpace::from_segments(
         0,
-        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), FIXTURE_ARENA_SIZE)],
     )
     .unwrap();
     let reporter = CompatReporter::default();
@@ -194,6 +201,11 @@ fn mmap_anonymous_reservations_fit_in_runtime_arena() {
         64 * 1024 * 1024,
         512 * 1024 * 1024,
     ];
+
+    // The reservations fit the real 32 GiB layout and the backed window.
+    let total: u64 = reservations.iter().sum();
+    assert!(total <= LINUX_MMAP_SIZE);
+    assert!(total <= FIXTURE_ARENA_SIZE);
 
     let mut expected = LINUX_MMAP_BASE;
     for length in reservations {
@@ -225,7 +237,7 @@ fn mmap_rejects_unknown_map_flag_bits() {
     const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
     let mut memory = AddressSpace::from_segments(
         0,
-        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), FIXTURE_ARENA_SIZE)],
     )
     .unwrap();
     let reporter = CompatReporter::default();
@@ -262,7 +274,7 @@ fn mmap_rejects_unknown_map_flag_bits() {
 fn mmap_out_of_bounds_hint_relocated_advisory() {
     let mut memory = AddressSpace::from_segments(
         0,
-        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), FIXTURE_ARENA_SIZE)],
     )
     .unwrap();
     let reporter = CompatReporter::default();
@@ -319,7 +331,7 @@ fn mmap_out_of_bounds_hint_relocated_advisory() {
 fn mmap_without_hint_uses_next_page_granular_address() {
     let mut memory = AddressSpace::from_segments(
         0,
-        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), FIXTURE_ARENA_SIZE)],
     )
     .unwrap();
     let reporter = CompatReporter::default();
@@ -381,7 +393,7 @@ fn mmap_without_hint_uses_next_page_granular_address() {
 fn dispatcher_mmap_uses_configured_16k_linux_page_size() {
     let mut memory = AddressSpace::from_segments(
         0,
-        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), FIXTURE_ARENA_SIZE)],
     )
     .unwrap();
     let reporter = CompatReporter::default();
@@ -432,7 +444,7 @@ fn mprotect_rounds_length_to_configured_16k_linux_page_size() {
     let mut memory = ProtectedAddressSpace::new(
         AddressSpace::from_segments(
             0,
-            [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+            [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), FIXTURE_ARENA_SIZE)],
         )
         .unwrap(),
     );
@@ -499,7 +511,7 @@ fn mremap_rounds_old_size_to_configured_16k_linux_page_size_when_moving() {
     const MREMAP_MAYMOVE: u64 = 0x01;
     let mut memory = AddressSpace::from_segments(
         0,
-        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), FIXTURE_ARENA_SIZE)],
     )
     .unwrap();
     let reporter = CompatReporter::default();
@@ -569,7 +581,7 @@ fn mremap_rounds_old_size_to_configured_16k_linux_page_size_when_moving() {
 fn mmap_non_fixed_hint_does_not_overlap_existing_bump_allocation() {
     let mut memory = AddressSpace::from_segments(
         0,
-        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), FIXTURE_ARENA_SIZE)],
     )
     .unwrap();
     let reporter = CompatReporter::default();
