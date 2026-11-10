@@ -76,9 +76,17 @@ comparison classifies against what the base started. The gate then:
   that names the gap, for example `step el1-embed interrupted before 7
   test(s) ran`.
 
-A candidate failure in a test the base never started counts as introduced.
-Host or fixture mismatch, an unreadable or unsealed base, missing exit
-evidence and cancellation stay blocking. When both sides complete, nothing
+A candidate failure in a test the base never started counts as introduced
+and blocks. This holds end to end: a base step killed before it reported
+any test or binary population (the empty-population shape of #1974) is a
+recorded gap, so neither the base's own admission in `execute_one` nor
+`publish` refuses it, and the candidate still runs. Only the empty-population
+check is relaxed, and only for a base step the receipt itself records as a
+gap. The candidate is always checked for its own gaps, whatever the base
+looks like, and its receipt validation stays strict (an empty population is a
+refusal). Host or fixture mismatch, artifact identity, a bad seal or
+cleanup, an unreadable or unsealed base, missing exit evidence, an
+unsuccessful execution job and cancellation stay blocking. When both sides complete, nothing
 changes.
 
 **The base evidence is sealed before candidate code runs.** Immediately after

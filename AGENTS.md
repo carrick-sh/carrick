@@ -724,9 +724,11 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
   binary the group itself introduces (absent from the base's started tests)
   ejects the group, every other NEW failure is advisory (owner, 2026-11-10,
   #231, #2035); incomplete-evidence refusals stay blocking. An incomplete
-  base (interrupted or unrun steps) with a completed candidate passes with a
-  warning naming the gap; introduced failures and any candidate-side gap
-  still block (owner, 2026-11-10, #231, #2045).
+  base (interrupted or unrun steps, including empty test populations of an
+  interrupted step) with a completed candidate passes with a warning naming
+  the gap; introduced failures, any candidate-side gap, and identity, seal,
+  cleanup and cancellation refusals still block (owner, 2026-11-10, #231,
+  #2045).
   Main pushes publish baselines automatically. PR-time signed runs are
   optional requests via the owner's `gate:signed` label or dispatch, never
   a draft → gate → ready prerequisite. Do not seed a baseline per PR or
