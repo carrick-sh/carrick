@@ -61,7 +61,7 @@ fn serial_host_native_fork_exec_child_readlink_exe() {
 /// exec successor's clock read is a counted ENOSYS refusal, which musl
 /// reports as EINVAL for CLOCK_MONOTONIC (the #1900 holder panic).
 #[test]
-#[ignore = "#1808 slice 3: clock_gettime routing for native children"]
+#[ignore = "#2028: native-child clock_gettime is unrouted when the vDSO has no clock fast path; un-ignore in #2028's PR"]
 fn serial_host_native_exec_child_clock_gettime() {
     fork_exec_probe_copy(None, u32::MAX as u64, false, None, None, true, None, true);
 }

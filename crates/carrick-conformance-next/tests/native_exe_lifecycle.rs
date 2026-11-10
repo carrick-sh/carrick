@@ -71,7 +71,7 @@ fn case_native_exe_lifecycle_real_vfork_shared_mm() {
 }
 
 #[test]
-#[ignore = "boots HVF; run via the signed conformance recipe with --include-ignored"]
+#[ignore = "#1958: carrier-fatal EL1 entry_binding when the second live thread runs; un-ignore in #1958's PR"]
 fn case_native_exe_lifecycle_two_live_threads() {
     run("thread");
 }
