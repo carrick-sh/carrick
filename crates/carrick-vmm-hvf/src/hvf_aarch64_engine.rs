@@ -2197,7 +2197,9 @@ impl HvpatchPersistentExecutorFactoryAuthority {
     pub fn install_native_exec_service(
         &self,
         capability: carrick_core_abi::service::ExecCapabilityId,
-        service: Arc<dyn crate::metadata_grant::NativeExecHostService>,
+        service: Arc<
+            dyn carrick_hal::native_exec::NativeExecHostService<crate::trap::GuestMappingPlan>,
+        >,
     ) -> Result<crate::metadata_grant::NativeExecServiceRegistration, TrapError> {
         self.spec
             .install_native_exec_service(capability, service)

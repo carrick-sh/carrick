@@ -199,9 +199,13 @@ impl core::fmt::Debug for NativePreparedExecImage {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_vmm_hvf::metadata_grant::NativeExecPreparation for NativePreparedExecImage {
-    fn into_parts(self: Box<Self>) -> carrick_vmm_hvf::metadata_grant::NativeExecParts {
-        carrick_vmm_hvf::metadata_grant::NativeExecParts {
+impl carrick_hal::native_exec::NativeExecPreparation<carrick_vmm_hvf::trap::GuestMappingPlan>
+    for NativePreparedExecImage
+{
+    fn into_parts(
+        self: Box<Self>,
+    ) -> carrick_hal::native_exec::NativeExecParts<carrick_vmm_hvf::trap::GuestMappingPlan> {
+        carrick_hal::native_exec::NativeExecParts {
             plan: self.plan,
             lazy_regions: self.successor.lazy_regions,
             sources: self.successor.sources,
@@ -210,14 +214,20 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecPreparation for NativePreparedEx
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapability {
+impl carrick_hal::native_exec::NativeExecHostService<carrick_vmm_hvf::trap::GuestMappingPlan>
+    for NativeExecCapability
+{
     fn prepare(
         &self,
         request: carrick_core_abi::service::ServiceRequest,
         payload: &[u8],
         successor: carrick_el1_abi::ReservationMm,
     ) -> Result<
-        Box<dyn carrick_vmm_hvf::metadata_grant::NativeExecPreparation>,
+        Box<
+            dyn carrick_hal::native_exec::NativeExecPreparation<
+                    carrick_vmm_hvf::trap::GuestMappingPlan,
+                >,
+        >,
         carrick_core_abi::service::ServiceFailureCode,
     > {
         let fail = |errno: LinuxErrno| {
@@ -254,7 +264,7 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
         record: &mut [u8],
     ) -> Result<
         Option<std::sync::Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
-        carrick_vmm_hvf::metadata_grant::NativeHostFileRefused,
+        carrick_hal::fork_stock::NativeHostFileRefused,
     > {
         // The request identity was authenticated by the service cell; the
         // record names the caller's own ring table, pinned at service time.
@@ -262,11 +272,11 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             .run
             .get()
             .and_then(std::sync::Weak::upgrade)
-            .ok_or(carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)?;
+            .ok_or(carrick_hal::fork_stock::NativeHostFileRefused)?;
         run.dispatcher
             .serve_native_host_file(record)
             .map(|served| served.retained_source)
-            .map_err(|_| carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)
+            .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)
     }
 
     /// The host-served root's live cwd and root, read once for a child the

@@ -437,7 +437,7 @@ pub(crate) fn prepare_native_exec_successor(
     custody: std::sync::Arc<CarrierVmCustody>,
     parts: crate::metadata_grant::NativeExecParts,
 ) -> Result<PreparedNativeExecSuccessor, TrapError> {
-    let crate::metadata_grant::NativeExecParts {
+    let carrick_hal::native_exec::NativeExecParts {
         mut plan,
         lazy_regions,
         sources,

@@ -37,6 +37,7 @@ pub mod birth_serial;
 pub mod core_read;
 pub mod el1_editor_exclusion;
 pub mod fork_stock;
+pub mod native_exec;
 pub mod physical_grants;
 pub mod stage1_exclusive;
 pub mod stage1_mm;

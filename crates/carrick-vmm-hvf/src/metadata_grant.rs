@@ -3,16 +3,21 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod native_service;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use carrick_hal::native_exec::NativeExecRegistrationError;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use native_service::NativeService;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use native_service::settle_native_cow;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use native_service::{
-    NativeExecHostService, NativeExecParts, NativeExecPreparation, NativeExecRegistrationError,
-    NativeExecServiceRegistration, NativeHostFileRefused, NativeService,
-};
+pub type NativeExecParts = carrick_hal::native_exec::NativeExecParts<crate::trap::GuestMappingPlan>;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use native_service::{
-    NativeExecServiceDirectory, NativeRootReplyLedger, NativeRootWaitLedger,
-};
+pub type NativeExecServiceRegistration =
+    carrick_hal::native_exec::NativeExecServiceRegistration<crate::trap::GuestMappingPlan>;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type NativeExecServiceDirectory =
+    carrick_hal::native_exec::NativeExecServiceDirectory<crate::trap::GuestMappingPlan>;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use native_service::{NativeRootReplyLedger, NativeRootWaitLedger};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn take_native_service(
     custody: &Arc<crate::trap::CarrierVmCustody>,

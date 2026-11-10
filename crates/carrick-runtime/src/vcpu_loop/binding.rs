@@ -7038,7 +7038,11 @@ where
             let native_exec_registration = match authority.install_native_exec_service(
                 native_exec_capability.id(),
                 native_exec_capability
-                    as Arc<dyn carrick_vmm_hvf::metadata_grant::NativeExecHostService>,
+                    as Arc<
+                        dyn carrick_hal::native_exec::NativeExecHostService<
+                                carrick_vmm_hvf::trap::GuestMappingPlan,
+                            >,
+                    >,
             ) {
                 Ok(registration) => registration,
                 Err(error) => {
