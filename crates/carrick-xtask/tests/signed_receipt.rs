@@ -142,6 +142,31 @@ fn cli_prints_and_persists_diff_before_returning_failure() {
     assert_eq!(diff["passed"], false);
 }
 
+/// #2038: advisory-only NEW entries print "PASS (advisory NEW only)" and must
+/// exit 0, matching the Markdown; a blocking pair still exits non-zero.
+#[test]
+fn cli_advisory_only_new_entries_exit_zero() {
+    let fixture =
+        |name: &str| concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/").to_owned() + name;
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args([
+            "ci-receipt",
+            "signed-diff",
+            "--base",
+            &fixture("signed-base.json"),
+            "--candidate",
+            &fixture("signed-population-drop.json"),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Signed gate: **PASS (advisory NEW only)**"),
+        "{stdout}"
+    );
+    assert!(output.status.success(), "{stdout}");
+}
+
 #[test]
 fn owner_only_and_latest_label_transition_is_authority() {
     assert!(allowed("tjfontaine"));
@@ -2352,6 +2377,43 @@ fn base_interrupted_mid_el1_is_advisory_with_a_named_gap() {
     );
 }
 
+/// #2049: the base-gap advisory may claim candidate completion only when the
+/// candidate has no gap of its own. A mixed case names both and still blocks.
+#[cfg(unix)]
+#[test]
+fn base_gap_with_candidate_gap_does_not_claim_candidate_completed() {
+    let bench = PublishBench::new();
+    let mut candidate = admitted(&bench.head);
+    candidate.steps[2].not_run_tests = vec!["el1::cut_short".into()];
+    bench.write_candidate(&candidate, false);
+    let mut base = admitted(&bench.base);
+    base.steps[2].not_run_tests = (0..7).map(|i| format!("el1::unrun_{i}")).collect();
+    bench.write_base(&base, false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "{body}");
+    assert!(
+        body.contains("Advisory: the paired base is incomplete"),
+        "{body}"
+    );
+    assert!(!body.contains("the candidate completed"), "{body}");
+    assert!(body.contains("Candidate is incomplete — BLOCKED"), "{body}");
+}
+
+/// #2049: a base gap with a complete candidate keeps the completed wording.
+#[cfg(unix)]
+#[test]
+fn base_gap_alone_still_says_the_candidate_completed() {
+    let bench = PublishBench::new();
+    bench.write_candidate(&admitted(&bench.head), false);
+    let mut base = admitted(&bench.base);
+    base.steps[2].not_run_tests = (0..7).map(|i| format!("el1::unrun_{i}")).collect();
+    bench.write_base(&base, false);
+    let (passed, body) = bench.publish();
+    assert!(passed, "{body}");
+    assert!(body.contains("the candidate completed"), "{body}");
+    assert!(!body.contains("Candidate is incomplete"), "{body}");
+}
+
 /// (b) The same base gap plus a failure the candidate introduced still blocks.
 #[cfg(unix)]
 #[test]
@@ -2978,7 +3040,7 @@ fn introduced_failing_test_blocks_and_is_named() {
 #[test]
 fn preexisting_flake_alone_is_advisory() {
     let bench = PublishBench::new();
-    let (passed, body, (state, _)) = bench.publish_with(|step| {
+    let (passed, body, (state, description)) = bench.publish_with(|step| {
         step.failed_tests.push("embed::green".into());
     });
     assert!(passed, "{body}");
@@ -2993,6 +3055,24 @@ fn preexisting_flake_alone_is_advisory() {
         "{body}"
     );
     assert!(body.contains("BLOCKING={}"), "{body}");
+    assert_eq!(
+        description, "advisory NEW entries present; see comment",
+        "advisory-only pass must not claim preservation"
+    );
+}
+
+/// #2038: a clean pass (no NEW entry at all) keeps the preservation wording.
+#[cfg(unix)]
+#[test]
+fn clean_pass_keeps_the_preservation_wording() {
+    let bench = PublishBench::new();
+    let (passed, body, (state, description)) = bench.publish_with(|_| {});
+    assert!(passed, "{body}");
+    assert_eq!(state, "success");
+    assert_eq!(
+        description,
+        "No introduced failures; populations and completion preserved"
+    );
 }
 
 /// #2035 (c): a mix blocks and names only the introduced test as blocking.
