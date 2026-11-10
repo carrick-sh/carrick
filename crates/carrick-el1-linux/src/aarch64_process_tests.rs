@@ -344,9 +344,13 @@ struct TestStockCrossing {
     /// reads it, and how many seeds were served.
     root_cwd: std::sync::Mutex<Vec<u8>>,
     root_seeds: AtomicUsize,
-    /// Refuse the seed, as the carrier does once the root's capability
-    /// retired with a host exec.
+    /// Refuse the seed, as the carrier does once the run's exec service
+    /// retired.
     refuse_root_seed: core::sync::atomic::AtomicBool,
+    /// The one capability the carrier's exec service directory holds, when
+    /// a fixture models it: a seed naming any other resolves no service and
+    /// is refused, as `service_root_fork_seed` refuses it.
+    installed_exec_capability: Option<carrick_core_abi::service::ExecCapabilityId>,
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -434,6 +438,7 @@ impl TestStockCrossing {
             root_cwd: std::sync::Mutex::new(b"/".to_vec()),
             root_seeds: AtomicUsize::new(0),
             refuse_root_seed: core::sync::atomic::AtomicBool::new(false),
+            installed_exec_capability: None,
         }
     }
 }
@@ -442,7 +447,11 @@ impl ForkStockCrossing for TestStockCrossing {
     fn cross_root_fork_seed(&self, record_va: u64, _cpu: u64) -> Result<(), NativeProcessError> {
         // SAFETY: the synchronous crossing retains the ring's boxed record.
         let record = unsafe { &mut *(record_va as *mut carrick_core_abi::service::RootForkSeed) };
-        if self.refuse_root_seed.load(Ordering::Acquire) {
+        if self.refuse_root_seed.load(Ordering::Acquire)
+            || self
+                .installed_exec_capability
+                .is_some_and(|installed| record.requested() != Some(installed))
+        {
             return Err(NativeProcessError::Stale);
         }
         let cwd = self.root_cwd.lock().unwrap().clone();

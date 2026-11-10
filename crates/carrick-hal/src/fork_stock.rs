@@ -72,13 +72,28 @@ pub trait HostBackingRetention: Send + Sync {
     fn read(&self, request: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError>;
 }
 
+/// The personality's live executable object retained by a memory owner.
+/// Fork shares this identity; exec replaces it only in the successor MM.
+pub trait ExecutableIdentity: core::fmt::Debug + Send + Sync {
+    fn display_path(&self) -> String;
+}
+
 /// Sources inherited from an exact, live committed child. Source identities
 /// belong to byte custody, never to the resident-frame inventory.
 #[derive(Default, Clone)]
 pub struct ForkHostBackingCustody {
+    executable: Option<std::sync::Arc<dyn ExecutableIdentity>>,
     sources: BTreeMap<(NonZeroU64, NonZeroU64), std::sync::Arc<dyn HostBackingRetention>>,
 }
 impl ForkHostBackingCustody {
+    pub fn bind_executable(&mut self, executable: std::sync::Arc<dyn ExecutableIdentity>) {
+        self.executable = Some(executable);
+    }
+
+    pub fn executable(&self) -> Option<std::sync::Arc<dyn ExecutableIdentity>> {
+        self.executable.clone()
+    }
+
     /// Retire the request's released sources before admitting one more private
     /// mapping. Exhaustion is a completed Linux ENOMEM reply, never a carrier
     /// invariant failure. Non-mapping records need no source admission.

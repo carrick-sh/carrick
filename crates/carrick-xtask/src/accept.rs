@@ -1778,6 +1778,8 @@ struct TestSignedStep {
     log_name: &'static str,
     package: &'static str,
     filter: &'static str,
+    /// Extra libtest arguments, placed before `--nocapture`.
+    extra_args: &'static [&'static str],
     verdict: SignedVerdict,
 }
 
@@ -1798,6 +1800,7 @@ const TEST_SIGNED_STEPS: &[TestSignedStep] = &[
         log_name: "el1-embed.log",
         package: "carrick-embed",
         filter: "el1_",
+        extra_args: &[],
         verdict: SignedVerdict::El1,
     },
     TestSignedStep {
@@ -1806,6 +1809,7 @@ const TEST_SIGNED_STEPS: &[TestSignedStep] = &[
         log_name: "fresh-executable-page.log",
         package: "carrick-embed",
         filter: "a_fresh_executable_page",
+        extra_args: &[],
         verdict: SignedVerdict::ExitCode("fresh executable page step"),
     },
     TestSignedStep {
@@ -1814,6 +1818,7 @@ const TEST_SIGNED_STEPS: &[TestSignedStep] = &[
         log_name: "generic-probe-shards.log",
         package: "carrick-conformance-next",
         filter: "generic_probe_shard_",
+        extra_args: &[],
         verdict: SignedVerdict::Probes("generic probe shards"),
     },
     TestSignedStep {
@@ -1822,16 +1827,27 @@ const TEST_SIGNED_STEPS: &[TestSignedStep] = &[
         log_name: "probe-cases.log",
         package: "carrick-conformance-next",
         filter: "case_",
+        extra_args: &["--include-ignored"],
         verdict: SignedVerdict::Probes("probe cases"),
     },
 ];
 
 impl TestSignedStep {
+    fn args(&self) -> Vec<&'static str> {
+        let mut args = vec![self.package, self.filter];
+        args.extend_from_slice(self.extra_args);
+        args.push("--nocapture");
+        args
+    }
+
     fn command(&self) -> String {
-        format!(
-            "./scripts/test-signed.sh {} {} --nocapture",
-            self.package, self.filter
-        )
+        let mut cmd = format!("./scripts/test-signed.sh {} {}", self.package, self.filter);
+        for arg in self.extra_args {
+            cmd.push(' ');
+            cmd.push_str(arg);
+        }
+        cmd.push_str(" --nocapture");
+        cmd
     }
 
     /// test-signed's own `host-lease --mode carrick` reuses the inherited
@@ -1846,7 +1862,7 @@ impl TestSignedStep {
         run_command_logged(
             lease,
             "./scripts/test-signed.sh",
-            &[self.package, self.filter, "--nocapture"],
+            &self.args(),
             &[("CARRICK_RUN_ID", run_id)],
             root,
             log_path,
