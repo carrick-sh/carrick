@@ -1773,10 +1773,18 @@ fn child_futex<'a>(
         2,
         "exec child's leader and cloned thread remain live"
     );
-    registry
-        .register_thread(source, &fixture.task, binding.address, page, control)
-        .unwrap();
     let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+    // The clone published the birth through its owner (#1958): it is
+    // registered before any CPU selected it, never lazily at first entry.
+    assert!(
+        registry
+            .for_record(fixture.zone, fixture.zone.record_ref(selected))
+            .is_some_and(|owner| core::ptr::eq(std::sync::Arc::as_ptr(&owner), runtime))
+    );
+    assert!(matches!(
+        registry.register_thread(source, &fixture.task, binding.address, page, control),
+        Err(NativeProcessError::Busy)
+    ));
     // SAFETY: the scheduler selected this exact clone birth for execution.
     let worker = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
     let mut entry = runtime

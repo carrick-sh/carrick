@@ -733,12 +733,35 @@ impl<
         let Some(slot) = self.frame.slot() else {
             return BornEnqueue::Refused;
         };
+        let Some(zone) = &self.zone else {
+            return BornEnqueue::Refused;
+        };
+        let retained = zone.tables.record(record.id);
+        if retained.incarnation() != record.incarnation {
+            return BornEnqueue::Refused;
+        }
+        let native_owned = retained.has_native_execution_owner();
+        // A native-owned birth is its process owner's to retain before any
+        // CPU can select it, as on x86. The scheduler switch-in publishes
+        // only the record's thread identity; the namespace PID comes from
+        // the owner's resume checkpoint, which an unregistered record skips.
+        // A vCPU last loaded with another process kept that PID, and the
+        // birth's first entry was refused as Stale (#1958). A host-managed
+        // birth is adopted by its host task at first entry instead.
+        if native_owned && let Some(venue) = self.process_venue() {
+            let queued = venue.enqueue_thread(record);
+            if queued == BornEnqueue::Queued
+                && let Some(zone) = self.zone.as_mut()
+            {
+                // ARM's first-entry timer obligation, as for fork publication.
+                native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+                    .arm_published_runnable();
+            }
+            return queued;
+        }
         let Some(zone) = &mut self.zone else {
             return BornEnqueue::Refused;
         };
-        if zone.tables.record(record.id).incarnation() != record.incarnation {
-            return BornEnqueue::Refused;
-        }
         native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
             .enqueue_born(record.id)
             .into()
