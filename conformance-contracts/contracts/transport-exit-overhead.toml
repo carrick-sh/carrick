@@ -5,6 +5,10 @@
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
 # carrick-vmm-hvf::trap::transport_test::transport_exit_overhead_contract
+# #1733 (core capture reads under its own exclusion): HVF implements
+# translated_read_excluded. Only core capture's read path changes; this
+# contract's semantics and work budgets are unchanged and its existing
+# bindings remain the evidence.
 schema_version = 1
 id = "kernel.transport.exit-overhead"
 title = "Forwarded HVF syscall transport imposes zero host register accesses"

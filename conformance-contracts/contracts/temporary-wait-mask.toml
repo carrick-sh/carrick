@@ -10,6 +10,11 @@
 # terminal suspension. Zone saves retain their existing context/origin;
 # ordinary guest dispatch, exec drains and this contract's budgets and primary
 # bindings are unchanged. Native signed stress qualification remains required.
+# #1733 (core capture reads under its own exclusion): vcpu_loop/mod.rs
+# adds only test-engine fixtures and re-exports for the capture
+# witnesses. Only core capture's read path changes; this contract's
+# semantics and work budgets are unchanged and its existing bindings
+# remain the evidence.
 schema_version = 1
 id = "kernel.signal.temporary-wait-mask"
 title = "A blocked syscall's temporary signal mask is installed for the duration of the wait and restored after, on every carrier"

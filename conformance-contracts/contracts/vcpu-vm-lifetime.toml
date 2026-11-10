@@ -5,6 +5,13 @@
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
 # carrick-vmm-hvf::trap::vcpu_admission::vcpu_lifetime_tests::vcpus_live_for_the_vm_lifetime
+# #1733 (core capture reads under its own exclusion): the AArch64 engine
+# replaces read_core_bytes with CoreMemorySource mechanics (stage-1
+# output, backing copy, untouched-zero leaf check); Aarch64Vmm gains
+# translated_read_excluded for capture's backing read; HVF implements
+# translated_read_excluded. Only core capture's read path changes; this
+# contract's semantics and work budgets are unchanged and its existing
+# bindings remain the evidence.
 schema_version = 1
 # Pool admission audit (2026-10-04): reject unservable scheduler CPU counts
 # before driver/resolver publication or vCPU creation. Runtime executor tests

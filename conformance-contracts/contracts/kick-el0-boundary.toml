@@ -5,6 +5,11 @@
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
 # carrick-aarch64::owed_kick::tests::kick_absorbed_in_el1_vector_surfaces_at_the_el0_boundary
+# #1733 (core capture reads under its own exclusion): Aarch64Vmm gains
+# translated_read_excluded for capture's backing read; HVF implements
+# translated_read_excluded. Only core capture's read path changes; this
+# contract's semantics and work budgets are unchanged and its existing
+# bindings remain the evidence.
 schema_version = 1
 id = "kernel.vcpu.kick-el0-boundary"
 title = "A kick absorbed in Carrick's EL1 code surfaces at the next EL0 instruction boundary"

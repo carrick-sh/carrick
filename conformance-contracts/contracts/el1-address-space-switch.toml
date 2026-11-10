@@ -1,3 +1,8 @@
+# #1733 (core capture reads under its own exclusion): mm_occupancy.rs
+# adds capture's exclusion proof, a nested counted raise of the gate its
+# pause already holds. Only core capture's read path changes; this
+# contract's semantics and work budgets are unchanged and its existing
+# bindings remain the evidence.
 schema_version = 1
 id = "kernel.el1.address-space-switch"
 title = "Guest EL1 switches a vCPU between processes' address spaces itself, never installing one that a page-table pause or ASID retirement has fenced, and every pause drains each vCPU EL1 put on its space"

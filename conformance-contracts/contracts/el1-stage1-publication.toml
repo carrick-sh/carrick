@@ -17,6 +17,15 @@
 # No GIC, fault, metadata or page-table layout/algorithm changed here; retain
 # those existing regression bindings. New transfer unit tests do not prove
 # these contracts, and fresh signed promotion remains required.
+# #1733 (core capture reads under its own exclusion): the AArch64 engine
+# replaces read_core_bytes with CoreMemorySource mechanics (stage-1
+# output, backing copy, untouched-zero leaf check); Aarch64Vmm gains
+# translated_read_excluded for capture's backing read; ThreadedEngine
+# drops read_core_bytes and requires CoreMemorySource; mm_occupancy.rs
+# adds capture's exclusion proof, a nested counted raise of the gate its
+# pause already holds; HVF implements translated_read_excluded. Only
+# core capture's read path changes; this contract's semantics and work
+# budgets are unchanged and its existing bindings remain the evidence.
 schema_version = 1
 id = "kernel.el1.stage1-publication"
 title = "One rollback-capable stage-1 publication authority across guest EL1 and the host"
