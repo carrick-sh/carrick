@@ -476,6 +476,7 @@ pub fn rosetta_available() -> bool {
 ))]
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 pub mod runtime {
+    pub(crate) mod exec;
     pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
     // Private: `RunResult`/`RuntimeError` are kernel types and the carrier does
     // not re-export them. The `run_oci` signature below names them; callers name
