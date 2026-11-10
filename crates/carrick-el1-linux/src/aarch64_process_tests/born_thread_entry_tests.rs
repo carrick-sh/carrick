@@ -365,3 +365,1079 @@ fn arm_born_thread_first_entry_after_another_process_on_the_vcpu() {
 fn arm_born_thread_first_entry_on_a_detached_executor() {
     born_thread_first_entry_after_foreign_occupant(None);
 }
+
+/// Exact `raw_clone_thread` flags from `fixtures/embed-el1-sched/src/threads.rs`
+/// (`tgkill_after_clone`): `CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+/// CLONE_THREAD | CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID`.
+const TGKILL_AFTER_CLONE_FLAGS: u64 = 0x0035_0f00;
+const SIGUSR1_NUM: u64 = 10;
+const SIGUSR2_NUM: u64 = 12;
+
+#[derive(Clone, Copy)]
+struct MultiSlotEnv {
+    fixture: &'static Fixture,
+    tasks: &'static [CurrentTask; 4],
+    crossing: &'static TestStockCrossing,
+}
+
+impl MultiSlotEnv {
+    fn new() -> Self {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        fixture.zone.spaces.set_idle_ttbr(0x30000);
+        let tasks = Box::leak(Box::new(core::array::from_fn(|_| CurrentTask::new())));
+        let stock_pages: Vec<u64> = (0..24).map(|i| 0x20000 + i * 0x1000).collect();
+        let crossing = Box::leak(Box::new(TestStockCrossing::new(&stock_pages)));
+        Self {
+            fixture,
+            tasks,
+            crossing,
+        }
+    }
+
+    fn service_for(
+        self,
+        task: &'static CurrentTask,
+        slot: SlotId,
+    ) -> Aarch64NativeProcessService<'static, &'static TestStockCrossing> {
+        let words = Box::leak(Box::new(
+            self.fixture.tables.live(&self.fixture.maintenance),
+        ));
+        Aarch64NativeProcessService::with_crossing(
+            task,
+            slot,
+            self.fixture.zone,
+            self.fixture.region.table(),
+            NonZeroU64::MIN,
+            self.crossing,
+        )
+        .with_words(words)
+    }
+
+    fn service(
+        self,
+        slot: SlotId,
+    ) -> Aarch64NativeProcessService<'static, &'static TestStockCrossing> {
+        self.service_for(&self.tasks[slot.index()], slot)
+    }
+
+    fn init_guest_slot(self, slot: SlotId) {
+        self.fixture.zone.drive(slot, 1);
+        self.fixture.zone.publish_slot(slot, 0, None, 0);
+        self.fixture.zone.enter_guest(slot);
+    }
+
+    fn switch_in(self, slot: SlotId, cpu: &mut crate::sched::FakeCpu) -> carrick_el1_abi::Action {
+        let task = &self.tasks[slot.index()];
+        let mut service = Aarch64NativeProcessService::with_crossing(
+            task,
+            slot,
+            self.fixture.zone,
+            self.fixture.region.table(),
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&[]),
+        );
+        let mut switch = ProductionResumeCpu {
+            inner: core::mem::take(cpu),
+            service: &mut service,
+        };
+        let counters = carrick_el1_abi::Counters::new();
+        let mut handoff = None;
+        let mut dummy = carrick_el1_abi::TrapFrame::default();
+        let mut zone = crate::dispatch::Zone {
+            tables: self.fixture.zone,
+            cpu: &mut switch,
+            user: &crate::sched::HardwareUserWord,
+        };
+        let action = super::super::dispatch::native_scheduler(
+            &mut zone,
+            task,
+            &counters,
+            slot,
+            &mut handoff,
+        )
+        .idle_entry(&mut dummy, 0);
+        *cpu = core::mem::take(&mut switch.inner);
+        action
+    }
+
+    fn call(
+        self,
+        slot: SlotId,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        counters: &carrick_el1_abi::Counters,
+        frame: &mut carrick_el1_abi::TrapFrame,
+        cpu: &mut crate::sched::FakeCpu,
+    ) -> carrick_personality_linux::dispatch::CompletionRoute {
+        let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+        let saved_native = match self.fixture.zone.slot(slot).current() {
+            // SAFETY: `slot` exclusively owns `current` while OnCpu.
+            Some(current) => unsafe { (*self.fixture.zone.record(current).ctx_mut()).native },
+            None => ThreadCtx::ZERO,
+        };
+        let ttbr0 = cpu.ttbr.0;
+        frame.slot = u64::from(slot.raw());
+        frame.esr = 0x15 << 26;
+        let mut service = self.service(slot);
+        super::super::dispatch::dispatch_arm_syscall_with_native_process(
+            frame,
+            counters,
+            self.tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: self.fixture.zone,
+                cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(&LoadedVenue),
+            page,
+            control,
+            &saved_native,
+            ttbr0,
+            &mut service,
+            |_| core::ptr::null_mut(),
+        )
+        .expect("syscall must dispatch cleanly")
+    }
+
+    fn tgkill(
+        self,
+        slot: SlotId,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        cpu: &mut crate::sched::FakeCpu,
+        tgid: u32,
+        tid: u32,
+        sig: u64,
+    ) -> i64 {
+        let counters = carrick_el1_abi::Counters::new();
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 131; // SYS_tgkill
+        frame.x[..3].copy_from_slice(&[u64::from(tgid), u64::from(tid), sig]);
+        self.call(slot, page, control, &counters, &mut frame, cpu);
+        frame.x[0] as i64
+    }
+
+    fn peer_kill(
+        self,
+        slot: SlotId,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        cpu: &mut crate::sched::FakeCpu,
+        tid: u32,
+        sig: u64,
+    ) -> i64 {
+        let counters = carrick_el1_abi::Counters::new();
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 129; // SYS_kill
+        frame.x[..2].copy_from_slice(&[u64::from(tid), sig]);
+        self.call(slot, page, control, &counters, &mut frame, cpu);
+        frame.x[0] as i64
+    }
+
+    fn poll_sig(
+        self,
+        slot: SlotId,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        cpu: &mut crate::sched::FakeCpu,
+        sig: u64,
+    ) -> i64 {
+        let sigset = carrick_test_support::GuestUserBuffer::from_value(1u64 << (sig - 1));
+        let zero_ts = carrick_test_support::GuestUserBuffer::from_value([0i64, 0i64]);
+        let counters = carrick_el1_abi::Counters::new();
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 137; // SYS_rt_sigtimedwait
+        frame.x[..4].copy_from_slice(&[sigset.arg(), 0, zero_ts.arg(), 8]);
+        self.call(slot, page, control, &counters, &mut frame, cpu);
+        frame.x[0] as i64
+    }
+
+    fn install_handler(
+        self,
+        slot: SlotId,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        cpu: &mut crate::sched::FakeCpu,
+        sig: u64,
+    ) {
+        let act = carrick_test_support::GuestUserBuffer::from_value([0x40_1000u64, 0u64, 0u64]);
+        let counters = carrick_el1_abi::Counters::new();
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 134; // SYS_rt_sigaction
+        frame.x[..4].copy_from_slice(&[sig, act.arg(), 0, 8]);
+        self.call(slot, page, control, &counters, &mut frame, cpu);
+        assert_eq!(frame.x[0] as i64, 0);
+    }
+
+    fn clone_thread(
+        self,
+        slot: SlotId,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        counters: &carrick_el1_abi::Counters,
+        cpu: &mut crate::sched::FakeCpu,
+    ) -> (
+        carrick_personality_linux::dispatch::CompletionRoute,
+        i64,
+        u32,
+    ) {
+        let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+        let ptid = carrick_test_support::GuestUserBuffer::from_value(0u32);
+        let ctid = carrick_test_support::GuestUserBuffer::from_value(0xffffu32);
+        let mut clone = carrick_el1_abi::TrapFrame::default();
+        clone.x[8] = 220; // SYS_clone
+        clone.x[..5].copy_from_slice(&[
+            TGKILL_AFTER_CLONE_FLAGS,
+            stack.arg() + 8192,
+            ptid.arg(),
+            0,
+            ctid.arg(),
+        ]);
+        let route = self.call(slot, page, control, counters, &mut clone, cpu);
+        (route, clone.x[0] as i64, ptid.get::<u32>(0))
+    }
+}
+
+struct NativeOwnedTwoThreadHarness {
+    env: MultiSlotEnv,
+    peer_page: &'static ThreadLifecyclePage,
+    peer_control: &'static ThreadControlSlot,
+    peer_cpu: crate::sched::FakeCpu,
+    target_pid: u32,
+    target_page: &'static ThreadLifecyclePage,
+    leader_control: &'static ThreadControlSlot,
+    leader_cpu: crate::sched::FakeCpu,
+    sibling_control: &'static ThreadControlSlot,
+    sibling_cpu: crate::sched::FakeCpu,
+    born_record: RecordId,
+    born_tid: u32,
+    born_control: &'static ThreadControlSlot,
+}
+
+fn setup_native_owned_ring_birth_before_first_entry() -> NativeOwnedTwoThreadHarness {
+    let env = MultiSlotEnv::new();
+    let mut boot_service = env.service_for(&env.fixture.task, env.fixture.slot);
+    let mut boot_cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(env.fixture), fixture_ttbr0(env.fixture)),
+        ..Default::default()
+    };
+    let mut fork = carrick_el1_abi::TrapFrame::default();
+    fork.x[8] = 220;
+    fork.x[0] = 17;
+    arm_call_with_cpu(
+        env.fixture,
+        env.fixture.control,
+        &mut boot_service,
+        &mut fork,
+        &mut boot_cpu,
+    )
+    .unwrap();
+    let target_leader = env.fixture.zone.runnable_head(env.fixture.slot).unwrap();
+    let target_id = env.fixture.zone.record(target_leader).identity();
+    let target_page = unsafe { &*(target_id.lifecycle_page as *const ThreadLifecyclePage) };
+    let leader_control = unsafe { &*(target_id.control_slot as *const ThreadControlSlot) };
+
+    let mut fork_peer = carrick_el1_abi::TrapFrame::default();
+    fork_peer.x[8] = 220;
+    fork_peer.x[0] = 17;
+    arm_call_with_cpu(
+        env.fixture,
+        env.fixture.control,
+        &mut boot_service,
+        &mut fork_peer,
+        &mut boot_cpu,
+    )
+    .unwrap();
+
+    let mut leader_cpu = crate::sched::FakeCpu::default();
+    env.fixture.zone.publish_slot(SlotId::new(0), 0, None, 0);
+    assert_eq!(
+        env.switch_in(SlotId::new(0), &mut leader_cpu),
+        carrick_el1_abi::Action::Served
+    );
+    let target_pid = env.tasks[0].visible_pid().unwrap();
+
+    env.init_guest_slot(SlotId::new(2));
+    let mut peer_cpu = crate::sched::FakeCpu::default();
+    assert_eq!(
+        env.switch_in(SlotId::new(2), &mut peer_cpu),
+        carrick_el1_abi::Action::Served
+    );
+    let peer_rec = env.fixture.zone.slot(SlotId::new(2)).current().unwrap();
+    let peer_id = env.fixture.zone.record(peer_rec).identity();
+    let peer_page = unsafe { &*(peer_id.lifecycle_page as *const ThreadLifecyclePage) };
+    let peer_control = unsafe { &*(peer_id.control_slot as *const ThreadControlSlot) };
+    assert_ne!(env.tasks[2].visible_pid().unwrap(), target_pid);
+
+    for sig in [SIGUSR1_NUM, SIGUSR2_NUM] {
+        env.install_handler(
+            SlotId::new(0),
+            target_page,
+            leader_control,
+            &mut leader_cpu,
+            sig,
+        );
+    }
+
+    let counters = carrick_el1_abi::Counters::new();
+    let (_, sib1_tid, _) = env.clone_thread(
+        SlotId::new(0),
+        target_page,
+        leader_control,
+        &counters,
+        &mut leader_cpu,
+    );
+    let sib1_rec = env.fixture.zone.runnable_head(SlotId::new(0)).unwrap();
+    let sibling_control = unsafe {
+        &*(env.fixture.zone.record(sib1_rec).identity().control_slot as *const ThreadControlSlot)
+    };
+
+    env.init_guest_slot(SlotId::new(1));
+    let mut sibling_cpu = crate::sched::FakeCpu::default();
+    assert_eq!(
+        env.switch_in(SlotId::new(1), &mut sibling_cpu),
+        carrick_el1_abi::Action::Served
+    );
+    let mut gettid = carrick_el1_abi::TrapFrame::default();
+    gettid.x[8] = 178;
+    env.call(
+        SlotId::new(1),
+        target_page,
+        sibling_control,
+        &counters,
+        &mut gettid,
+        &mut sibling_cpu,
+    );
+    assert_eq!(gettid.x[0] as i64, sib1_tid);
+
+    let (_, born_tid, born_ptid) = env.clone_thread(
+        SlotId::new(0),
+        target_page,
+        leader_control,
+        &counters,
+        &mut leader_cpu,
+    );
+    assert!(born_tid > sib1_tid);
+    assert_eq!(born_ptid, born_tid as u32);
+    let born_record = env.fixture.zone.runnable_head(SlotId::new(0)).unwrap();
+    let born_control = unsafe {
+        &*(env.fixture.zone.record(born_record).identity().control_slot as *const ThreadControlSlot)
+    };
+    assert_eq!(
+        counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    NativeOwnedTwoThreadHarness {
+        env,
+        peer_page,
+        peer_control,
+        peer_cpu,
+        target_pid,
+        target_page,
+        leader_control,
+        leader_cpu,
+        sibling_control,
+        sibling_cpu,
+        born_record,
+        born_tid: born_tid as u32,
+        born_control,
+    }
+}
+
+fn publish_host_born_sibling_only(
+    fixture: &'static Fixture,
+    visible_tid: u32,
+) -> &'static ThreadControlSlot {
+    let mut binding_tid = 0;
+    for _ in 0..64 {
+        let (issued_tid, reservation) = fixture.host_ids.reserve_thread().unwrap();
+        fixture
+            .host_threads
+            .lock()
+            .unwrap()
+            .push(reservation.commit());
+        binding_tid = issued_tid.raw() as u32;
+        if binding_tid >= visible_tid {
+            break;
+        }
+    }
+    assert!(binding_tid >= visible_tid);
+    let generation = u64::from(binding_tid - 30);
+    let thread_generation = u64::from(binding_tid + 60);
+    fixture
+        .zone
+        .namespace()
+        .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            use carrick_sched_core::process::identity_allocator::{
+                ClaimKind, VisibleIdentity, VisibleNamespace,
+            };
+            let raw_tid = binding_tid as i32;
+            if !ns.is_reserved_number(raw_tid) {
+                ns.reserve_exact(raw_tid, ClaimKind::Thread).unwrap();
+            }
+            let domain = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
+            let _ = ns.bind_visible_domain(raw_tid, domain);
+            ns.advance_visible_past(
+                domain,
+                VisibleIdentity::from_existing_member(NonZeroU32::new(visible_tid).unwrap()),
+            )
+            .unwrap();
+        });
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    control
+        .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+        .unwrap();
+    assert!(control.publish_visible_tid(visible_tid));
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_el1_abi::EntryTaskKey::from_raw(u64::from(binding_tid)),
+            carrick_core_abi::entry::BirthSerial::of_task(
+                TaskSerial::from_raw_u64(generation).unwrap(),
+            ),
+            carrick_el1_abi::EntryThreadGeneration::from_raw(thread_generation),
+        )
+        .unwrap(),
+    );
+    let birth_slot = fixture.page.reserve_host_birth().expect("host birth slot");
+    carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
+    assert!(
+        fixture
+            .page
+            .publish_host_birth(birth_slot, control.host_birth_identity().unwrap())
+    );
+    control
+}
+
+fn adopt_host_sibling_on_slot(
+    env: MultiSlotEnv,
+    slot: SlotId,
+    sib_control: &'static ThreadControlSlot,
+    keep_on_cpu: bool,
+) -> (RecordId, crate::sched::FakeCpu) {
+    let fixture = env.fixture;
+    let birth = sib_control.host_birth_identity().unwrap();
+    let task = &env.tasks[slot.index()];
+    task.set(
+        El1TaskId::from_linux_tid(birth.task().raw() as i32),
+        carrick_el1_abi::SnapshotGeneration::from_raw(birth.birth().raw()),
+        fixture.leader.file_table,
+    );
+    task.mm.key.store(fixture.leader.mm, Ordering::Release);
+    task.mm
+        .thread_generation
+        .store(birth.thread().raw(), Ordering::Release);
+    task.publish_visible_pid(41);
+    task.publish_root_generation(fixture.address.generation);
+    task.publish_lifecycle(
+        fixture.page as *const _ as u64,
+        sib_control as *const _ as u64,
+    );
+
+    fixture.zone.drive(slot, fixture.leader.mm);
+    fixture
+        .zone
+        .publish_slot(slot, fixture.leader.mm, Some(0), 1);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
+    let sib_record = fixture
+        .zone
+        .current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: birth.task().raw(),
+                serial: birth.thread().raw(),
+                mm: fixture.leader.mm,
+                file_table: fixture.leader.file_table,
+                generation: birth.birth().raw(),
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: fixture.page as *const _ as u64,
+                control_slot: sib_control as *const _ as u64,
+            },
+        )
+        .unwrap();
+    sib_control.bind_zone_record(fixture.zone.record_ref(sib_record));
+    unsafe {
+        *fixture.zone.record(sib_record).ctx_mut() = Aarch64ParkedContext::from_register(
+            ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.address.mm.raw().get(),
+            fixture.address.generation.raw().get(),
+        );
+    }
+    let mut sib_cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    if keep_on_cpu {
+        assert!(fixture.zone.requeue_preempted(slot, sib_record).is_queued());
+        assert_eq!(
+            fixture.zone.switch_in_full(slot).unwrap().record,
+            sib_record
+        );
+        let counters = carrick_el1_abi::Counters::new();
+        let mut gettid = carrick_el1_abi::TrapFrame::default();
+        gettid.x[8] = 178;
+        env.call(
+            slot,
+            fixture.page,
+            sib_control,
+            &counters,
+            &mut gettid,
+            &mut sib_cpu,
+        );
+        assert_eq!(gettid.x[0] as u32, sib_control.visible_tid().unwrap());
+    } else {
+        let mut sib_service = env.service(slot);
+        with_process_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            task,
+            &ThreadCtx::ZERO,
+            sib_cpu.ttbr.0,
+            fixture.page,
+            sib_control,
+            &mut sib_service,
+            |_| {
+                assert!(fixture.zone.requeue_preempted(slot, sib_record).is_queued());
+            },
+        )
+        .unwrap();
+        assert_eq!(fixture.zone.slot(slot).current(), None);
+        assert_eq!(fixture.zone.slot(slot).queued(), 1);
+    }
+    (sib_record, sib_cpu)
+}
+
+fn stock_arm_root_pool_identity(
+    fixture: &'static Fixture,
+    visible_tid: u32,
+    serial: u64,
+) -> &'static ThreadControlSlot {
+    fixture
+        .zone
+        .namespace()
+        .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            use carrick_sched_core::process::identity_allocator::*;
+            let raw_tid = visible_tid as i32;
+            if !ns.is_reserved_number(raw_tid) {
+                ns.reserve_exact(raw_tid, ClaimKind::Thread).unwrap();
+            }
+            let domain = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
+            let _ = ns.bind_visible_domain(raw_tid, domain);
+            ns.advance_visible_past(
+                domain,
+                VisibleIdentity::from_existing_member(NonZeroU32::new(visible_tid).unwrap()),
+            )
+            .unwrap();
+        });
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let entry = fixture
+        .page
+        .stock(
+            0,
+            carrick_el1_abi::EntryIdentity {
+                tid: visible_tid,
+                visible_tid,
+                thread_serial: 200 + serial,
+                birth: carrick_core_abi::entry::BirthSerial::of_task(
+                    TaskSerial::from_raw_u64(50 + serial).unwrap(),
+                ),
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(entry, control as *const _ as u64)
+        .unwrap();
+    control
+}
+
+struct ArmRootTwoThreadHarness {
+    env: MultiSlotEnv,
+    root_cpu: crate::sched::FakeCpu,
+    sib_control: &'static ThreadControlSlot,
+    sib_cpu: crate::sched::FakeCpu,
+    peer_control: &'static ThreadControlSlot,
+    peer_page: &'static ThreadLifecyclePage,
+    peer_cpu: crate::sched::FakeCpu,
+}
+
+fn setup_arm_root_two_live_threads_and_peer() -> ArmRootTwoThreadHarness {
+    let env = MultiSlotEnv::new();
+    let fixture = env.fixture;
+    env.tasks[0].set(
+        El1TaskId::from_linux_tid(fixture.leader.tid as i32),
+        carrick_el1_abi::SnapshotGeneration::from_raw(fixture.leader.generation),
+        fixture.leader.file_table,
+    );
+    env.tasks[0]
+        .mm
+        .key
+        .store(fixture.leader.mm, Ordering::Release);
+    env.tasks[0]
+        .mm
+        .thread_generation
+        .store(fixture.leader.serial, Ordering::Release);
+    env.tasks[0].publish_visible_pid(41);
+    env.tasks[0].publish_root_generation(fixture.address.generation);
+    env.tasks[0].publish_lifecycle(
+        fixture.page as *const _ as u64,
+        fixture.control as *const _ as u64,
+    );
+
+    let root_record = fixture
+        .zone
+        .current_or_new(SlotId::new(0), fixture.leader)
+        .unwrap();
+    fixture
+        .control
+        .bind_zone_record(fixture.zone.record_ref(root_record));
+    unsafe {
+        *fixture.zone.record(root_record).ctx_mut() = Aarch64ParkedContext::from_register(
+            ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.address.mm.raw().get(),
+            fixture.address.generation.raw().get(),
+        );
+    }
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(SlotId::new(0), root_record)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(SlotId::new(0)).unwrap().record,
+        root_record
+    );
+
+    let mut root_cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let mut fork_frame = carrick_el1_abi::TrapFrame::default();
+    fork_frame.x[8] = 220;
+    fork_frame.x[0] = 17;
+    env.call(
+        SlotId::new(0),
+        fixture.page,
+        fixture.control,
+        &counters,
+        &mut fork_frame,
+        &mut root_cpu,
+    );
+    assert!(fork_frame.x[0] as i64 > 41);
+    let peer_record = fixture.zone.runnable_head(SlotId::new(0)).unwrap();
+    let peer_id = fixture.zone.record(peer_record).identity();
+    let peer_page = unsafe { &*(peer_id.lifecycle_page as *const ThreadLifecyclePage) };
+    let peer_control = unsafe { &*(peer_id.control_slot as *const ThreadControlSlot) };
+
+    env.init_guest_slot(SlotId::new(2));
+    let mut peer_cpu = crate::sched::FakeCpu::default();
+    assert_eq!(
+        env.switch_in(SlotId::new(2), &mut peer_cpu),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        fixture.zone.slot(SlotId::new(2)).current(),
+        Some(peer_record)
+    );
+
+    let sib_control = publish_host_born_sibling_only(fixture, 43);
+    let (_, sib_cpu) = adopt_host_sibling_on_slot(env, SlotId::new(1), sib_control, true);
+
+    for sig in [SIGUSR1_NUM, SIGUSR2_NUM] {
+        env.install_handler(
+            SlotId::new(0),
+            fixture.page,
+            fixture.control,
+            &mut root_cpu,
+            sig,
+        );
+    }
+    assert_eq!(
+        fixture.zone.slot(SlotId::new(0)).current(),
+        Some(root_record)
+    );
+
+    ArmRootTwoThreadHarness {
+        env,
+        root_cpu,
+        sib_control,
+        sib_cpu,
+        peer_control,
+        peer_page,
+        peer_cpu,
+    }
+}
+
+/// Passing CONTROL: in the ARM root two-live-thread harness, a sibling that is
+/// registered with the process owner and parked in `Claim::Queued` on its own
+/// slot (`SlotId(3)`) accepts `tgkill(41, 44, SIGUSR1) == 0` and observes
+/// `SIGUSR1` pending once when selected.
+#[test]
+fn arm_registered_queued_sibling_tgkill_control() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let queued_control = publish_host_born_sibling_only(f, 44);
+    let (queued_rec, mut queued_cpu) =
+        adopt_host_sibling_on_slot(h.env, SlotId::new(3), queued_control, false);
+
+    assert_eq!(
+        h.env.tgkill(
+            SlotId::new(0),
+            f.page,
+            f.control,
+            &mut h.root_cpu,
+            41,
+            44,
+            SIGUSR1_NUM
+        ),
+        0,
+        "registered queued sibling control must accept tgkill"
+    );
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(0),
+            f.page,
+            f.control,
+            &mut h.root_cpu,
+            SIGUSR1_NUM
+        ),
+        -11
+    );
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(1),
+            f.page,
+            h.sib_control,
+            &mut h.sib_cpu,
+            SIGUSR1_NUM
+        ),
+        -11
+    );
+
+    assert_eq!(
+        h.env.switch_in(SlotId::new(3), &mut queued_cpu),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(f.zone.slot(SlotId::new(3)).current(), Some(queued_rec));
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(3),
+            f.page,
+            queued_control,
+            &mut queued_cpu,
+            SIGUSR1_NUM
+        ),
+        SIGUSR1_NUM as i64
+    );
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(3),
+            f.page,
+            queued_control,
+            &mut queued_cpu,
+            SIGUSR1_NUM
+        ),
+        -11
+    );
+}
+
+#[test]
+fn arm_native_owned_ring_born_tgkill_before_first_entry_queues_signal_once() {
+    let mut h = setup_native_owned_ring_birth_before_first_entry();
+    assert_eq!(
+        h.env.tgkill(
+            SlotId::new(0),
+            h.target_page,
+            h.leader_control,
+            &mut h.leader_cpu,
+            h.target_pid,
+            h.born_tid,
+            SIGUSR1_NUM,
+        ),
+        0,
+        "native-owned ring-born tgkill before first entry must return 0"
+    );
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(0),
+            h.target_page,
+            h.leader_control,
+            &mut h.leader_cpu,
+            SIGUSR1_NUM
+        ),
+        -11
+    );
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(1),
+            h.target_page,
+            h.sibling_control,
+            &mut h.sibling_cpu,
+            SIGUSR1_NUM
+        ),
+        -11
+    );
+
+    h.env.init_guest_slot(SlotId::new(3));
+    let mut born_cpu = crate::sched::FakeCpu::default();
+    assert_eq!(
+        h.env.switch_in(SlotId::new(3), &mut born_cpu),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        h.env.fixture.zone.slot(SlotId::new(3)).current(),
+        Some(h.born_record)
+    );
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(3),
+            h.target_page,
+            h.born_control,
+            &mut born_cpu,
+            SIGUSR1_NUM
+        ),
+        SIGUSR1_NUM as i64
+    );
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(3),
+            h.target_page,
+            h.born_control,
+            &mut born_cpu,
+            SIGUSR1_NUM
+        ),
+        -11
+    );
+}
+
+#[test]
+fn arm_native_owned_ring_born_peer_kill_before_first_entry() {
+    let mut h = setup_native_owned_ring_birth_before_first_entry();
+    assert_eq!(
+        h.env.tgkill(
+            SlotId::new(0),
+            h.target_page,
+            h.leader_control,
+            &mut h.leader_cpu,
+            h.target_pid,
+            h.born_tid,
+            SIGUSR1_NUM,
+        ),
+        0
+    );
+    let peer_kill_rc = h.env.peer_kill(
+        SlotId::new(2),
+        h.peer_page,
+        h.peer_control,
+        &mut h.peer_cpu,
+        h.born_tid,
+        SIGUSR2_NUM,
+    );
+    assert_eq!(
+        peer_kill_rc, 0,
+        "peer kill(born_tid, SIGUSR2) before first entry must return 0"
+    );
+}
+
+#[test]
+fn arm_root_ring_born_tgkill_and_peer_kill_before_first_entry() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let born_control = stock_arm_root_pool_identity(f, 44, 1);
+    let counters = carrick_el1_abi::Counters::new();
+    let (_, clone_rc, ptid) = h.env.clone_thread(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &counters,
+        &mut h.root_cpu,
+    );
+    assert_eq!(clone_rc, 44, "clone served in ring on ARM root");
+    assert_eq!(ptid, 44);
+    assert_eq!(
+        counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(born_control.zone_record(), None);
+
+    let tgkill_rc = h.env.tgkill(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &mut h.root_cpu,
+        41,
+        44,
+        SIGUSR1_NUM,
+    );
+    let peer_kill_rc = h.env.peer_kill(
+        SlotId::new(2),
+        h.peer_page,
+        h.peer_control,
+        &mut h.peer_cpu,
+        44,
+        SIGUSR2_NUM,
+    );
+    assert_eq!(
+        (tgkill_rc, peer_kill_rc),
+        (0, 0),
+        "ARM root ring-born thread before first entry must accept both tgkill and peer kill(tid)"
+    );
+}
+
+#[test]
+fn arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let counters = carrick_el1_abi::Counters::new();
+    let (route, _, _) = h.env.clone_thread(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &counters,
+        &mut h.root_cpu,
+    );
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "empty ring pool must decline clone to the host"
+    );
+    assert_eq!(
+        counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    let _host_child_control = publish_host_born_sibling_only(f, 44);
+    let tgkill_rc = h.env.tgkill(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &mut h.root_cpu,
+        41,
+        44,
+        SIGUSR1_NUM,
+    );
+    let peer_kill_rc = h.env.peer_kill(
+        SlotId::new(2),
+        h.peer_page,
+        h.peer_control,
+        &mut h.peer_cpu,
+        44,
+        SIGUSR2_NUM,
+    );
+    assert_eq!(
+        (tgkill_rc, peer_kill_rc),
+        (0, 0),
+        "host-issued ClonePoolEmpty thread before first entry must accept both tgkill and peer kill(tid)"
+    );
+}
+
+#[test]
+fn arm_mid_clone_claim_free_birth_before_requeue_fails_sibling_tgkill() {
+    use carrick_el1_abi::Lifecycle;
+    use carrick_personality_linux::lifecycle::ProcessNative;
+    let mut h = setup_native_owned_ring_birth_before_first_entry();
+    let mut leader_service = h.env.service(SlotId::new(0));
+
+    let claim_free_tid = with_process_entry(
+        BornInZoneSource {
+            zone: h.env.fixture.zone,
+            slot: SlotId::new(0),
+        },
+        &h.env.tasks[0],
+        &ThreadCtx::ZERO,
+        h.leader_cpu.ttbr.0,
+        h.target_page,
+        h.leader_control,
+        &mut leader_service,
+        |process| {
+            assert!(matches!(
+                process.prepare_thread_birth(),
+                carrick_personality_linux::lifecycle::ThreadBirthAdmission::Ready
+            ));
+            let mut claimed = Some(h.target_page.claim_any().expect("native stock entry"));
+            let entry = claimed.as_ref().unwrap().entry();
+            let identity = h.target_page.identity(entry).unwrap();
+            let address = h.target_page.control_address(entry).unwrap();
+            let child_slot = unsafe { &*(address as *const ThreadControlSlot) };
+            let _ = child_slot.publish_visible_tid(identity.visible_tid);
+            let record_id = h
+                .env
+                .fixture
+                .zone
+                .alloc_record(ThreadIdentity {
+                    tid: u64::from(identity.tid),
+                    serial: identity.thread_serial,
+                    mm: h.env.fixture.zone.record(h.born_record).identity().mm,
+                    file_table: 0,
+                    generation: 0,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: h.target_page as *const _ as u64,
+                    control_slot: address,
+                })
+                .unwrap();
+            let record = h.env.fixture.zone.record_ref(record_id);
+            child_slot
+                .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+                .unwrap();
+            process.bind_thread_birth(record, child_slot).unwrap();
+            assert!(h.env.fixture.zone.issue_native_birth(record_id));
+            process
+                .thread_spawned(h.target_pid, identity.visible_tid, &mut || {
+                    Lifecycle::thread_born(h.target_page).ok_or(-11)?;
+                    h.target_page
+                        .record_born(
+                            claimed.take().unwrap(),
+                            carrick_el1_abi::BornRecord {
+                                caller_task: 0,
+                                caller_serial: 0,
+                                clone_flags: TGKILL_AFTER_CLONE_FLAGS,
+                                clear_child_tid: 0,
+                                blocked: carrick_el1_abi::BlockedMask(0),
+                            },
+                        )
+                        .map_err(|_| -11)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                h.env.fixture.zone.record(record_id).claim(),
+                carrick_sched_core::Claim::Free
+            );
+            identity.visible_tid
+        },
+    )
+    .unwrap();
+
+    let tgkill_rc = h.env.tgkill(
+        SlotId::new(1),
+        h.target_page,
+        h.sibling_control,
+        &mut h.sibling_cpu,
+        h.target_pid,
+        claim_free_tid,
+        SIGUSR1_NUM,
+    );
+    assert_eq!(
+        tgkill_rc, 0,
+        "sibling tgkill during pre-requeue Claim::Free window must resolve"
+    );
+}
