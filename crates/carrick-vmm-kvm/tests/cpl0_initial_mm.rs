@@ -2003,6 +2003,16 @@ fn zone_pipe_poll_loaded_affinity_parks_before_last_writer_closes() {
     );
 }
 
+#[test]
+fn zone_pipe_ppoll_zero_timeout_returns_immediately() {
+    zone_pipe_poll_wake(&["-DWAKE_BY_CLOSE", "-DZERO_TIMEOUT"]);
+}
+
+#[test]
+fn zone_pipe_poll_zero_timeout_returns_immediately() {
+    zone_pipe_poll_wake(&["-DUSE_POLL", "-DWAKE_BY_CLOSE", "-DZERO_TIMEOUT"]);
+}
+
 fn private_file_fixture(cow: bool) {
     private_file_fixture_with(cow, &[], 0);
 }

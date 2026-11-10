@@ -4,7 +4,10 @@
  * Exit 7 = success; every other code names the failed stage. The native
  * oracle (same source) runs under `timeout 10`. -DUSE_POLL selects poll(7).
  * -DWAKE_BY_CLOSE: the parent closes its write end and the child closes the
- * last one instead of writing, so the wake is writer-close POLLHUP. */
+ * last one instead of writing, so the wake is writer-close POLLHUP.
+ * -DZERO_TIMEOUT: poll/ppoll uses a zero timeout while the child sleeps 50ms
+ * before closing the last writer, so poll/ppoll must return 0 with revents
+ * cleared to 0 before the child closes. */
 .global _start
 .text
 _start:
@@ -36,16 +39,31 @@ _start:
     lea pfd(%rip), %rdi
     mov $1, %esi
 #ifdef USE_POLL
+#ifdef ZERO_TIMEOUT
+    xor %edx, %edx                 /* poll(pfd, 1, 0) */
+#else
     mov $-1, %edx                  /* poll(pfd, 1, -1) */
+#endif
     mov $7, %eax
 #else
+#ifdef ZERO_TIMEOUT
+    lea zero_ts(%rip), %rdx        /* ppoll(pfd, 1, &{0, 0}, NULL, 8) */
+#else
     xor %edx, %edx                 /* ppoll(pfd, 1, NULL, NULL, 8) */
+#endif
     xor %r10d, %r10d
     mov $8, %r8d
     mov $271, %eax
 #endif
     syscall
     mov %rax, poll_result(%rip)
+#ifdef ZERO_TIMEOUT
+    test %rax, %rax
+    jnz fail_result
+    movzwl pfd+6(%rip), %eax
+    test %eax, %eax                /* revents cleared to 0 */
+    jnz fail_revents
+#else
     cmp $1, %rax
     jne fail_result
     movzwl pfd+6(%rip), %eax
@@ -55,6 +73,7 @@ _start:
     cmp $1, %eax                   /* revents == POLLIN only */
 #endif
     jne fail_revents
+#endif
     mov fds(%rip), %eax
     cmp pfd(%rip), %eax
     jne fail_fields
@@ -127,6 +146,7 @@ exit:
 .data
 .balign 16
 delay: .quad 0, 50000000
+zero_ts: .quad 0, 0
 byte: .byte 'x'
 .bss
 .balign 4096
