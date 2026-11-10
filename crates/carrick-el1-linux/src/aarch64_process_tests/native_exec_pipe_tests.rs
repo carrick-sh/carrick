@@ -327,7 +327,25 @@ fn fork_exec_probe_with_departure(
     metadata: Option<super::pipe_metadata_tests::Case>,
     departure: Option<TimerDeparture>,
 ) {
-    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fork_exec_probe_full(futex, bitset, timed, metadata, departure, false);
+}
+
+/// #2028: the exec successor of a live-parent fork child reads the run's
+/// clock in ring (frozen domain), with no child forward or refusal.
+#[test]
+fn serial_host_native_fork_exec_successor_clock_reads_the_domain() {
+    fork_exec_probe_full(None, u32::MAX as u64, false, None, None, true);
+}
+
+fn fork_exec_probe_full(
+    futex: Option<u64>,
+    bitset: u64,
+    timed: bool,
+    metadata: Option<super::pipe_metadata_tests::Case>,
+    departure: Option<TimerDeparture>,
+    successor_clock: bool,
+) {
+    let fixture: &'static Fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let metadata_scope = MetadataScope::new(fixture);
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
@@ -342,7 +360,7 @@ fn fork_exec_probe_with_departure(
         slot: fixture.slot,
     };
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
-    let owner = Arc::new(
+    let owner: &'static Arc<HostIpc> = Box::leak(Box::new(Arc::new(
         HostIpc::with_limits(
             1 << 20,
             IpcLimits {
@@ -351,7 +369,7 @@ fn fork_exec_probe_with_departure(
             },
         )
         .unwrap(),
-    );
+    )));
     let table = Arc::new(HostTable::create(owner.clone(), 64, 64).unwrap());
     let object = owner.create_pipe(65536).unwrap();
     for (number, end, access) in [
@@ -377,12 +395,15 @@ fn fork_exec_probe_with_departure(
     let map = carrick_el1_abi::ipc_table_map_host().unwrap();
     map.publish(5, table.id().to_raw()).unwrap();
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
-    let mut crossing = TestStockCrossing::new(&pages);
+    let crossing: &'static mut TestStockCrossing =
+        Box::leak(Box::new(TestStockCrossing::new(&pages)));
     crossing.metadata_in_el1_window = true;
     crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     crossing.ipc = Some((owner.clone(), map));
-    let words = fixture.tables.live(&fixture.maintenance);
-    let tables = crate::ipc::MapTables(map);
+    let crossing: &'static TestStockCrossing = crossing;
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let tables: &'static crate::ipc::MapTables<'static> =
+        Box::leak(Box::new(crate::ipc::MapTables(map)));
     let runtime = Arc::new(
         NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
             source,
@@ -408,7 +429,7 @@ fn fork_exec_probe_with_departure(
         NonZeroU64::MIN,
         &crossing,
     )
-    .with_words(&words);
+    .with_words(&*words);
     let parent = TaskKey {
         id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
         serial: TaskSerial::from_raw_u64(11).unwrap(),
@@ -482,7 +503,8 @@ fn fork_exec_probe_with_departure(
         refuse_copy: false,
         on_signal_clock: None,
     };
-    let counters = carrick_el1_abi::Counters::new();
+    let counters: &'static carrick_el1_abi::Counters =
+        Box::leak(Box::new(carrick_el1_abi::Counters::new()));
     let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
     payload.extend_from_slice(b"/bin/pipe-writer\0");
     carrick_core_abi::service::encode_exec_payload_header(
@@ -590,6 +612,11 @@ fn fork_exec_probe_with_departure(
         fixture.task.mm.key.load(Ordering::Acquire),
         child_binding.address.mm.raw().get()
     );
+    if successor_clock {
+        exec_successor_clock_reads(fixture, registry, &runtime, source, counters, parent, child);
+        registry.unregister_root_for_test(&runtime);
+        return;
+    }
     if let Some(operation) = futex {
         child_futex(
             fixture,
@@ -605,7 +632,7 @@ fn fork_exec_probe_with_departure(
     }
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
-        tables: &tables,
+        tables,
     };
     let mut memory = carrick_test_support::GuestUserBuffer::zeroed(1024);
     memory.as_mut_bytes()[128..130].copy_from_slice(b"1\n");
@@ -1365,6 +1392,203 @@ fn reenter_worker<'r, 'a>(
             service,
         )
         .unwrap()
+}
+
+/// The exec successor's clock readings, through the production dispatch owner:
+/// dispatch -> ARM staging -> begin body -> host `ClockDomain` service ->
+/// ticket acknowledgment -> native resume. The parent stays live throughout.
+#[allow(clippy::too_many_arguments)]
+fn exec_successor_clock_reads(
+    fixture: &'static Fixture,
+    registry: &NativeProcessRegistry<'static, AddressContext<RootGpa>, Aarch64ParkedContext>,
+    runtime: &NativeProcessRuntime<'static, AddressContext<RootGpa>, Aarch64ParkedContext>,
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    counters: &'static carrick_el1_abi::Counters,
+    parent: TaskKey,
+    child: TaskKey,
+) {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use std::time::{Duration, UNIX_EPOCH};
+    assert!(
+        runtime.task_binding(parent).is_some(),
+        "parent remains live"
+    );
+    if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    let clock = Arc::new(carrick_kernel::kernel::container::ClockDomain::frozen(
+        UNIX_EPOCH + Duration::from_secs(777),
+    ));
+    let names = carrick_el1_abi::InotifyNameCache::new();
+    // The successor runs on the production ARM service (the shipping begin
+    // body is typed to it); the exec itself was driven above.
+    let crossing = Box::leak(Box::new(TestStockCrossing::new(&[
+        0x80000, 0x81000, 0x82000, 0x83000, 0x84000, 0x85000, 0x86000, 0x87000,
+    ])));
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &*crossing,
+    )
+    .with_words(&*words);
+    let service = &mut service;
+    for (nr, x0, x1) in [(113_u64, 0_u64, 1_u64), (169, 1, 0)] {
+        let out = carrick_test_support::GuestUserBuffer::from_bytes(&[0xaa; 16]);
+        let (x0, x1) = (
+            if x0 == 1 { out.arg() } else { x0 },
+            if x1 == 1 { out.arg() } else { x1 },
+        );
+        let binding = runtime.task_binding(child).unwrap();
+        assert_ne!(binding.address.mm, fixture.address.mm, "exec successor");
+        let mut frame = carrick_el1_abi::TrapFrame {
+            elr: 0x400004,
+            esr: 0x15 << 26,
+            slot: u64::from(fixture.slot.raw()),
+            ..Default::default()
+        };
+        frame.x[8] = nr;
+        frame.x[0] = x0;
+        frame.x[1] = x1;
+        let (page, _) = fixture.task.lifecycle_refs().unwrap();
+        let owner =
+            registry.thread_group_owner(fixture.zone, page, fixture.task.visible_pid().unwrap());
+        assert_eq!(
+            owner,
+            crate::native_process_runtime::NativeThreadGroupOwner::ForkChild
+        );
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                binding.address,
+                &binding.words,
+                service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            None,
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            route,
+            CompletionRoute::NativeService,
+            "successor clock {nr}: routed to the clock owner, not forwarded"
+        );
+        let begin = match crate::dispatch::native_service_decision(
+            &mut frame,
+            &fixture.task,
+            carrick_el1_abi::Action::Forward,
+            None,
+            counters,
+            || owner,
+            |_| None,
+        ) {
+            crate::dispatch::NativeServiceDecision::Begin(begin) => begin,
+            _ => panic!("a successor clock reading must publish a clock request"),
+        };
+        let (result, _) = crate::dispatch::begin_native_service(
+            &mut *entry,
+            nr,
+            begin,
+            None,
+            counters,
+            counters,
+            || None,
+        );
+        assert!(matches!(result.unwrap(), NativeResume::Left(None)));
+        drop(entry);
+        let notice = fixture.task.service_notice.take().unwrap().unwrap();
+        let member = fixture.zone.record(notice.record.id).identity();
+        // SAFETY: the live successor retains its control slot.
+        let control = unsafe { &*(member.control_slot as *const ThreadControlSlot) };
+        // SAFETY: this fixture consumes the exact published ticket once.
+        let ticket = unsafe {
+            carrick_core_abi::service::ServiceCell::claim_notice(
+                &control.service,
+                notice,
+                NonZeroU64::MIN,
+                member,
+            )
+        }
+        .unwrap();
+        let carrick_core_abi::service::ServiceOperation::Clock { payload, .. } =
+            ticket.request().operation
+        else {
+            panic!("a successor clock reading must stage a typed clock request");
+        };
+        // SAFETY: the pending ring service retains this staging record until
+        // the ticket's acknowledgment.
+        let record = unsafe {
+            &mut *(payload.address().raw()
+                as *mut [u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES])
+        };
+        carrick_kernel::clock_service::ClockResourceService::new(Arc::clone(&clock))
+            .serve_record(record)
+            .unwrap();
+        assert!(ticket.complete(true).is_ok());
+        let queue = fixture
+            .zone
+            .object_wait(
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(notice.record)
+                    .unwrap(),
+                &ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            )
+            .unwrap();
+        let mut effects = WakeEffects::default();
+        queue.notify_object(fixture.slot, &mut effects).unwrap();
+        drop(queue);
+        service.wake_effects(effects);
+        let selected = activate_target(source, &fixture.task, &binding);
+        assert_eq!(selected.record, binding.record.id);
+        // SAFETY: this fixture owns the selected successor's exact record.
+        let saved = unsafe { runtime.record_binding(binding.record) }
+            .unwrap()
+            .words;
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                binding.address,
+                &saved,
+                service,
+            )
+            .unwrap();
+        let Ok(NativeResume::Returned(result)) = entry.resume_checkpoint(|_| Ok(None)) else {
+            panic!("a completed successor clock reading resumes with its result");
+        };
+        drop(entry);
+        assert_eq!(result.raw(), 0, "successor clock {nr}");
+        assert_eq!(
+            i64::from_le_bytes(out.as_bytes()[..8].try_into().unwrap()),
+            777,
+            "the frozen ClockDomain's realtime, not the host's"
+        );
+        assert_eq!(
+            counters.refused_child[nr as usize].load(Ordering::Acquire),
+            0,
+            "no child refusal for {nr}"
+        );
+    }
 }
 
 // Control only physical word supply. Fork, exec, copy preparation, scheduler
