@@ -887,6 +887,7 @@ impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
 /// its retired shape). Raising the gate refuses new EL1 editors and waits for
 /// an admitted one; EL1 then forwards the fault or syscall to the host.
 pub struct El1EditorExclusion {
+    excluded: carrick_sched_core::ExcludedEditor<'static>,
     tables: SpaceTables,
     index: SpaceIndex,
     key: u64,
@@ -894,6 +895,14 @@ pub struct El1EditorExclusion {
     /// while it is held, engine code on this thread may store to the MM's
     /// live descriptors itself. Released before the gate is lowered.
     held: Option<carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion>,
+}
+
+impl El1EditorExclusion {
+    /// The typed proof this guard holds, for host work that must run
+    /// without a concurrent EL1 editor of the MM.
+    pub fn excluded(&self) -> &carrick_sched_core::ExcludedEditor<'_> {
+        &self.excluded
+    }
 }
 
 impl std::fmt::Debug for El1EditorExclusion {
@@ -931,11 +940,49 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
     settle_excluded(&tables, &excluded);
     let held = Some(carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded));
     Some(El1EditorExclusion {
+        excluded,
         tables,
         index,
         key,
         held,
     })
+}
+
+/// The exclusion core capture reads a paused MM under
+/// ([`carrick_hal::core_read`]): the MM's published EL1 editor is excluded,
+/// or no published space names the MM so no EL1 editor of it can exist.
+pub enum CoreCaptureExclusion {
+    /// The MM's gate is raised by this guard and no admitted editor remains.
+    Published(El1EditorExclusion),
+    /// No published space names the MM.
+    Unpublished(carrick_sched_core::ExcludedEditor<'static>),
+}
+
+impl CoreCaptureExclusion {
+    /// The typed proof a core read demands.
+    pub fn excluded(&self) -> &carrick_sched_core::ExcludedEditor<'_> {
+        match self {
+            Self::Published(exclusion) => exclusion.excluded(),
+            Self::Unpublished(excluded) => excluded,
+        }
+    }
+}
+
+/// No carrier zone: no space is published, so no EL1 editor exists.
+static NO_EL1_ZONE: AddressSpaces = AddressSpaces::new();
+
+/// Exclude `mm`'s EL1 editor for a core capture that already holds the MM's
+/// page-table pause. The guard's gate raise nests inside the pause's (gates
+/// are counted) and is lowered before it, so it never reopens the MM early.
+/// `None` only for the null MM.
+pub fn exclude_el1_editor_for_core_capture(mm: MmId) -> Option<CoreCaptureExclusion> {
+    if let Some(exclusion) = exclude_el1_editor(mm) {
+        return Some(CoreCaptureExclusion::Published(exclusion));
+    }
+    let spaces = crate::el1_zone::zone().map_or(&NO_EL1_ZONE, |zone| &zone.spaces);
+    spaces
+        .unpublished(mm.raw())
+        .map(CoreCaptureExclusion::Unpublished)
 }
 
 /// Test: mirror `fence` into the gate of `mm`'s space already published in

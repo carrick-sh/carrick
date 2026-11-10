@@ -3274,7 +3274,9 @@ pub enum NativeOwnerWaitOrigin {
     HostEl0,
 }
 
-pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
+pub trait ThreadedEngine:
+    SyscallTrap + RegAccess + CurrentMmMemory + crate::core_read::CoreMemorySource + Send
+{
     /// A ring-owned signal binding must checkpoint delivery after a host
     /// forwarded completion and before the next EL0 instruction.
     fn complete_native_signal_return(
@@ -3732,18 +3734,6 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// stage-1 observer from the live hardware table backing without editing it.
     fn prepare_core_snapshot(&mut self) -> Result<(), TrapError> {
         Ok(())
-    }
-
-    /// Read bytes from a VMA already authenticated as readable by the coherent
-    /// core snapshot. The default preserves ordinary checked guest-memory
-    /// semantics; AArch64 HVPatch bypasses only its syscall-path PROT_NONE
-    /// reservation gate so a live `brk` prefix can be captured from backing.
-    fn read_core_bytes(
-        &self,
-        address: u64,
-        length: usize,
-    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-        self.read_bytes(address, length)
     }
 
     /// Best-effort fault-time walk of the live stage-1 backing. The returned

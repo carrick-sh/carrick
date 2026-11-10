@@ -473,7 +473,7 @@ pub(crate) use lifecycle::{HvpatchProcessBackendOps, HvpatchProcessInventoryPrep
 #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) use lifecycle::{HvpatchProcessFailpoint, check_hvpatch_process_failpoint};
 
-pub(crate) use crash::PreparedCorePublication;
+pub(crate) use crash::{CoreCaptureAttempt, CoreCaptureError, PreparedCorePublication};
 
 /// Shared kernel-half state for the threaded loop: the syscall dispatcher, the
 /// compat reporter, and the start-only signal-pump controller (held object-safe
@@ -3789,6 +3789,15 @@ pub(crate) mod tests {
         pub(crate) copyout_owner_probe: Option<CopyoutOwnerProbe>,
         // An admitted owner MM whose portal reads refuse on its live gate.
         pub(crate) live_owner_gate: Option<CopyoutOwnerProbe>,
+        // The admitted owner MM core capture reads through its exclusion;
+        // `None` keeps the host-owned ordinary read.
+        pub(crate) core_owner: Option<u64>,
+        // Backing pages whose read depends on another holder's gate.
+        pub(crate) backing_owner_waits: std::collections::BTreeMap<u64, CopyoutOwnerProbe>,
+        // Every page the excluded backing read served, in order.
+        pub(crate) backing_reads: Option<CrashReadTracker>,
+        // A backing page another holder's retained reader pins until ready.
+        pub(crate) backing_physical: Option<(u64, carrick_guest_mem::OwnedMemoryWait)>,
         // A real MM gate transition at the first unprepared output boundary.
         pub(crate) close_gate_after_write: Option<(usize, u64)>,
         // Independent payload mapping used by the recvfrom metadata fixture.
@@ -3995,6 +4004,71 @@ pub(crate) mod tests {
     }
 
     impl carrick_guest_mem::CurrentMmMemory for CrashCaptureTestEngine {}
+
+    /// Identity stage-1; the backing read never consults the owner portal
+    /// (`read_bytes_raw`), only another holder's gate where one is armed.
+    impl carrick_hal::core_read::CoreMemorySource for CrashCaptureTestEngine {
+        fn core_memory_mm(&self) -> Option<u64> {
+            self.core_owner
+        }
+
+        fn core_stage1_output(
+            &self,
+            va: carrick_guest_mem::GuestVa,
+        ) -> Result<Option<carrick_guest_mem::Gpa>, carrick_guest_mem::MemoryError> {
+            Ok(Some(carrick_guest_mem::Gpa::new(va.raw())))
+        }
+
+        fn read_core_backing(
+            &self,
+            excluded: &carrick_sched_core::ExcludedEditor<'_>,
+            va: carrick_guest_mem::GuestVa,
+            _output: carrick_guest_mem::Gpa,
+            length: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            assert_eq!(Some(excluded.key()), self.core_owner);
+            if let Some(probe) = self.live_owner_gate {
+                assert!(
+                    probe.live_gate_wait().is_some(),
+                    "a core backing read runs while capture holds the MM's gate"
+                );
+            }
+            let address = va.raw();
+            if let Some(wait) = self
+                .backing_owner_waits
+                .get(&address)
+                .and_then(|probe| probe.live_gate_wait())
+            {
+                return Err(carrick_guest_mem::MemoryError::ReadSuspended(Box::new(
+                    carrick_guest_mem::MemoryReadSuspension {
+                        wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                        continuation: carrick_guest_mem::OwnedReadContinuation::new((
+                            address, length,
+                        )),
+                    },
+                )));
+            }
+            if let Some((_, wait)) = self
+                .backing_physical
+                .as_ref()
+                .filter(|(page, wait)| *page == address && !wait.0.is_ready())
+            {
+                return Err(carrick_guest_mem::MemoryError::Physical(wait.clone()));
+            }
+            if self.fail_read_at == Some(address) {
+                return Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length });
+            }
+            if let Some(tracker) = &self.backing_reads {
+                tracker.lock().push((address, length));
+            }
+            Ok(self
+                .guest_memory
+                .get(&address)
+                .filter(|bytes| bytes.len() == length)
+                .cloned()
+                .unwrap_or_else(|| vec![0; length]))
+        }
+    }
 
     impl carrick_hal::RegAccess for CrashCaptureTestEngine {
         fn get_reg(&self, _register: carrick_hal::Reg) -> Result<u64, carrick_hal::OsError> {

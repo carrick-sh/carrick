@@ -1191,6 +1191,20 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// backend.
     fn translated_read(&self, va: u64, ipa: u64, len: usize) -> Result<Vec<u8>, MemoryError>;
 
+    /// Backing read for core capture while the caller holds the exact MM's
+    /// EL1-editor exclusion. The default is the ordinary translated read;
+    /// owner-routed backends read the selected backing directly instead of
+    /// re-entering the owner's transfer portal behind the held gate.
+    fn translated_read_excluded(
+        &self,
+        _excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        va: u64,
+        ipa: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        self.translated_read(va, ipa, len)
+    }
+
     /// Backing WRITE of `bytes` to `[va, va+len)` whose stage-1 translation is
     /// `ipa`. Symmetric to [`Self::translated_read`].
     fn translated_write(&mut self, va: u64, ipa: u64, bytes: &[u8]) -> Result<(), MemoryError>;
