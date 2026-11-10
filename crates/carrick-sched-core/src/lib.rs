@@ -2026,6 +2026,18 @@ pub struct HostPlacement {
     pub resched: bool,
 }
 
+/// A carrier-scoped zone a host thread can wake into. A carrier whose zone
+/// lives in its own guest RAM (not the process-global tables) registers one
+/// with its host IPC owner, so host-side object releases (exit drains)
+/// reach the tasks parked in that zone.
+pub trait CarrierZoneWake<C: Copy + Send + Sync + zerocopy::FromZeros>: Send + Sync {
+    /// The carrier's retained zone tables.
+    fn zone(&self) -> &ZoneTables<C>;
+    /// Force a reschedule interrupt at `slot`'s guest CPU (the ISA
+    /// mechanic). A stopped CPU takes it when it next enters the guest.
+    fn resched(&self, slot: SlotId);
+}
+
 /// Terminal release owns both alternatives until the scheduler decides.
 /// `rollback` runs only after the OnCpu-to-Queued CAS succeeds, under the
 /// slot lock and before queue publication. It must use lock-free atomics only:
