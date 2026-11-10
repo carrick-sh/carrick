@@ -379,9 +379,9 @@ struct CarrierZoneWakeSink<M: CarrierMemoryIo> {
     zone: std::ptr::NonNull<X86Cpl0Zone>,
     routes: std::ptr::NonNull<PublishedApicIds>,
     vm: Arc<M>,
-    /// The first reschedule this carrier could not deliver. A failed MSI
-    /// leaves the wake queued (`resched_owed`) for the CPU's next entry.
-    resched_fault: std::sync::OnceLock<TrapError>,
+    /// The first reschedule this carrier could not deliver since the host
+    /// IPC owner last asked ([`CarrierZoneWake::take_undelivered`]).
+    resched_fault: std::sync::Mutex<Option<carrick_sched_core::WakeUndelivered>>,
 }
 // SAFETY: both pointers name retained, aligned, atomic-only records inside
 // `_ram`, which this sink keeps alive; they are only read through shared
@@ -407,9 +407,20 @@ impl<M: CarrierMemoryIo> carrick_sched_core::CarrierZoneWake<carrick_sched_core:
         };
         #[cfg(not(feature = "test-support"))]
         let delivered = signal_resched(routes, &*self.vm, slot);
-        if let Err(error) = delivered {
-            let _ = self.resched_fault.set(error);
+        if delivered.is_err() {
+            self.resched_fault
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(carrick_sched_core::WakeUndelivered(
+                    "APIC route absent or reschedule MSI not delivered",
+                ));
         }
+    }
+    fn take_undelivered(&self) -> Option<carrick_sched_core::WakeUndelivered> {
+        self.resched_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -429,7 +440,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             zone,
             routes,
             vm: self._vm.clone_vm(),
-            resched_fault: std::sync::OnceLock::new(),
+            resched_fault: std::sync::Mutex::new(None),
         }))
     }
 }
