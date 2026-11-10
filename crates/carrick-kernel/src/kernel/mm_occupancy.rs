@@ -938,6 +938,29 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
     })
 }
 
+/// Test: mirror `fence` into the gate of `mm`'s space already published in
+/// the calling thread's test zone, exactly as production publication binds
+/// it, so a page-table pause of `mm` raises that gate. `false` when the zone
+/// has no such space or the fence already has a mirror.
+#[cfg(feature = "test-support")]
+pub fn bind_test_zone_space_gate(mm: MmId, fence: &MmFence) -> bool {
+    let Some(zone) = crate::el1_zone::zone() else {
+        return false;
+    };
+    let Some(index) = zone.spaces.find(mm.raw()) else {
+        return false;
+    };
+    fence.bind_mirror(Arc::new(SpaceGate {
+        tables: SpaceTables {
+            spaces: &zone.spaces,
+            occupancy: &zone.occupancy,
+            zone: Some(zone),
+            backing: None,
+        },
+        index,
+    }))
+}
+
 impl Drop for El1EditorExclusion {
     fn drop(&mut self) {
         drop(self.held.take());
