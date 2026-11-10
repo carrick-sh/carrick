@@ -1354,6 +1354,15 @@ impl HostIpc {
                 delivery.collect(wake);
                 drop(guard);
                 delivery.deliver();
+                if let Some(fault) = self.carrier_zone.get().and_then(|c| c.take_undelivered()) {
+                    // The record stays queued, but a halted CPU never runs
+                    // it: the release cannot claim the wake was delivered.
+                    carrick_fatal::carrick_fatal!(
+                        "ipc::wake",
+                        "carrier zone wake undelivered: {}",
+                        fault.0
+                    );
+                }
             }
             self.service_wake(&wake);
         }
@@ -1434,6 +1443,9 @@ mod tests {
             }
             fn resched(&self, slot: SlotId) {
                 self.rescheds.lock().push(slot);
+            }
+            fn take_undelivered(&self) -> Option<carrick_sched_core::WakeUndelivered> {
+                None
             }
         }
 

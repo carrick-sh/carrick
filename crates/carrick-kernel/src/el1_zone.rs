@@ -248,25 +248,17 @@ fn complete_carrier_object_wake(
 /// [`route_native_handback_in_zone`]; a stopped driver takes it on entry.
 fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
     let zone = carrier.zone();
-    let Some(rec) = zone.live(record) else {
-        // Retired between publication and handback: its owner settled it.
+    // Refused: the record retired between publication and handback, or
+    // another owner (its exit, a signal) settled it. Nothing is left to
+    // deliver.
+    let Some(handback) = zone.place_host_handback(record) else {
         return;
     };
-    // A record that is not native-owned still has only this host custody:
-    // queue it on its owner's slot for that slot's driver. Refused both
-    // ways, the record is no longer in host custody: another owner (its
-    // exit, a signal) settled it, and there is nothing left to deliver.
-    let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
-    let Some(placement) = zone
-        .place_native_handback(record)
-        .or_else(|| zone.requeue_on(owner, record.id))
-    else {
-        return;
-    };
+    let placement = handback.placement;
     if placement.resched {
         carrier.resched(placement.slot);
     }
-    if !zone.slot(placement.slot).is_live() && rec.home().is_none() {
+    if !zone.slot(placement.slot).is_live() && handback.homeless {
         for index in 0..carrick_sched_core::ZONE_SLOTS {
             let slot = SlotId::new(index as u8);
             if zone.slot(slot).is_live() && zone.record_allows_slot(record.id, slot) {
