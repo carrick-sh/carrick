@@ -2133,7 +2133,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    let delivered = super::aarch64_process::with_process_entry(
+    arm_signal_user_return_entry(
         source,
         task,
         &saved.native,
@@ -2143,12 +2143,40 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    match delivered {
+    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding))
+}
+
+/// The signal checkpoint's process admission and delivery, shared by the EL1
+/// vector and the VM-free witnesses. A refused admission is returned to the
+/// caller: the vector treats it as a broken entry binding (#1958).
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockCrossing>(
+    source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    deliver: impl FnOnce(
+        &mut super::native_process_runtime::NativeProcessEntry<
+            '_,
+            'static,
+            super::aarch64_process::Mm,
+            carrick_el1_abi::Aarch64ParkedContext,
+            super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+        >,
+    ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
+) -> Result<Action, super::native_process_runtime::NativeProcessError> {
+    let delivered = super::aarch64_process::with_process_entry(
+        source, task, native, ttbr0, page, control, service, deliver,
+    )?;
+    Ok(match delivered {
         None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
         Some(_) => invalid_completion(NativeInvariant::EntryBinding),
-    }
+    })
 }
 
 /// [`dispatch_irq`] with explicitly supplied tables (EL1 and host tests).
