@@ -2181,12 +2181,20 @@ fn run_inner(
     //    its signing, all under the shared lease. Fail before signing or
     //    guest execution, while preserving a FAIL receipt.
     if stage == AcceptStage::Build && signed_requested {
-        if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
-            return Err(AcceptError::UnsupportedPlatform(format!(
-                "{}-{} (signed phase requires macOS aarch64)",
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            )));
+        // Only macOS aarch64 can build the signed release binary. Elsewhere
+        // the build step fails without running, through the same
+        // failed-build path as a `just _build` that exits nonzero.
+        let platform_error =
+            (std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64").then(|| {
+                format!(
+                    "{}-{} (signed phase requires macOS aarch64)",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )
+            });
+        if let Some(error) = &platform_error {
+            eprintln!("accept: {error}");
+            failures.push(error.clone());
         }
         let start = Instant::now();
         let result = verify_signed_fixtures(&root);
@@ -2231,6 +2239,7 @@ fn run_inner(
         let state = state.as_deref().unwrap_or(Path::new("."));
         let mut artifacts = Vec::new();
         let mut fixture_artifacts = Vec::new();
+        let mut build_valid = false;
         if fixtures_valid {
             println!(
                 "--- Signed build phase starting (profile: {}) ---",
@@ -2246,30 +2255,41 @@ fn run_inner(
             // `just build` is disk admission (gate) then `_build` under
             // carrick. The driver admitted disk before this shared phase and
             // gate cannot nest under carrick, so run the build body directly.
-            let (exit_code, duration_s) = run_command_logged(
-                &lease,
-                "just",
-                &["_build"],
-                &[("CARRICK_RUN_ID", &run_id)],
-                &root,
-                &log_path,
-                false,
-            )
-            .map_err(|e| AcceptError::Io {
-                path: log_path.clone(),
-                source: e,
-            })?;
-
-            reap_step(
-                &root,
-                step_name,
-                &run_id,
-                &mut failures,
-                &mut cleanup_counts,
-            );
+            let (exit_code, duration_s) = if let Some(error) = &platform_error {
+                fs::write(&log_path, error).map_err(|source| AcceptError::Io {
+                    path: log_path.clone(),
+                    source,
+                })?;
+                (None, 0.0)
+            } else {
+                let ran = run_command_logged(
+                    &lease,
+                    "just",
+                    &["_build"],
+                    &[("CARRICK_RUN_ID", &run_id)],
+                    &root,
+                    &log_path,
+                    false,
+                )
+                .map_err(|e| AcceptError::Io {
+                    path: log_path.clone(),
+                    source: e,
+                })?;
+                reap_step(
+                    &root,
+                    step_name,
+                    &run_id,
+                    &mut failures,
+                    &mut cleanup_counts,
+                );
+                ran
+            };
 
             let mut passed = exit_code == Some(0);
-            let mut error = if !passed {
+            let mut error = if let Some(error) = &platform_error {
+                // Already a failure of this run; the step names its cause.
+                Some(error.clone())
+            } else if !passed {
                 Some(format!(
                     "build step failed with exit code {}",
                     exit_code.unwrap_or(-1)
@@ -2322,9 +2342,10 @@ fn run_inner(
                         error = Some(err);
                     }
                 }
-            } else if let Some(e) = &error {
+            } else if let Some(e) = error.as_ref().filter(|_| platform_error.is_none()) {
                 failures.push(e.clone());
             }
+            build_valid = passed;
 
             step_results.push(step_result(
                 step_name,
@@ -2349,7 +2370,9 @@ fn run_inner(
             }
         }
 
-        if !fixture_artifacts.is_empty() {
+        // Hand off to gate only with a release binary that built and passed
+        // inspection, and fixtures to run: guests execute both.
+        if build_valid && !fixture_artifacts.is_empty() {
             crate::signed_phase::append_artifacts(state, ArtifactKind::Signed, &artifacts)
                 .and_then(|()| {
                     crate::signed_phase::append_artifacts(
@@ -2379,9 +2402,9 @@ fn run_inner(
             println!("--- Signed build phase complete; guest execution waits for gate ---");
             return Ok(());
         }
-        // No admitted fixtures, so no guest can run (main skips the signed
-        // steps the same way): publish this FAIL receipt now rather than
-        // wait for gate.
+        // A failed or unverified release build, or no admitted fixtures:
+        // no guest may run, so publish this FAIL receipt now under
+        // `carrick` rather than wait for gate.
     }
 
     // 3. Signed execution phase under gate, after the driver re-verified
