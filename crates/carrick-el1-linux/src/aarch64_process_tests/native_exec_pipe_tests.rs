@@ -66,6 +66,7 @@ fn serial_host_native_readlink_copyout_busy_once_then_success() {
         None,
         None,
         true,
+        false,
         Some(NativeProcessError::Busy),
     );
 }
@@ -79,8 +80,22 @@ fn serial_host_native_readlink_copyout_fault_returns_errno_14() {
         None,
         None,
         true,
+        false,
         Some(NativeProcessError::Fault),
     );
+}
+
+/// A native fork child that execs reads the clock through the `clock_gettime`
+/// syscall whenever its vDSO exports no clock fast path (an observer requiring
+/// syscall visibility, a controlled clock domain, `CARRICK_VDSO_MODE`), and
+/// always for the CPU-time clocks. musl turns that syscall's ENOSYS into
+/// EINVAL for every clock but CLOCK_REALTIME, which is the `Os { code: 22 }`
+/// Rust std panicked on in the signed native_exe_lifecycle holders (#1900).
+/// Red: native-child `clock_gettime` is unrouted until #1808's slice 3.
+#[test]
+#[ignore = "red until #1808 slice 3 serves clock_gettime for native children (#1900)"]
+fn serial_host_native_fork_exec_child_clock_gettime() {
+    fork_exec_probe_copy(None, u32::MAX as u64, false, None, None, false, true, None);
 }
 
 fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
@@ -164,7 +179,9 @@ fn fork_exec_probe_with_departure(
     departure: Option<TimerDeparture>,
     readlink: bool,
 ) {
-    fork_exec_probe_copy(futex, bitset, timed, metadata, departure, readlink, None);
+    fork_exec_probe_copy(
+        futex, bitset, timed, metadata, departure, readlink, false, None,
+    );
 }
 
 fn fork_exec_probe_copy(
@@ -174,6 +191,7 @@ fn fork_exec_probe_copy(
     metadata: Option<super::pipe_metadata_tests::Case>,
     departure: Option<TimerDeparture>,
     readlink: bool,
+    clock: bool,
     copy_error: Option<NativeProcessError>,
 ) {
     let counters = carrick_el1_abi::Counters::new();
@@ -465,7 +483,7 @@ fn fork_exec_probe_copy(
     {
         memory.as_mut_bytes()[index * 8..index * 8 + 8].copy_from_slice(&word.to_ne_bytes());
     }
-    if readlink {
+    if readlink || clock {
         if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
             work.settled();
         }
@@ -767,7 +785,7 @@ fn fork_exec_probe_copy(
             );
             assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
             assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 1);
-            if readlink {
+            if readlink || clock {
                 return frame.x[0];
             }
         }
@@ -853,6 +871,29 @@ fn fork_exec_probe_copy(
             );
             assert_eq!(counters.forwarded[78].load(Ordering::Relaxed), 0);
         }
+        registry.unregister_root_for_test(&runtime);
+        return;
+    }
+    if clock {
+        // CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1), as Rust std's
+        // SystemTime::now and Instant::now issue them through musl.
+        for clock_id in [0u64, 1] {
+            let output = memory.arg() + 512;
+            assert_eq!(
+                call_full(113, clock_id, output, 0, 0) as i64,
+                0,
+                "native exec child clock_gettime({clock_id}): expected 0; negative result is Linux errno"
+            );
+            let copies = crate::native_process_runtime::host_test_support::take_signal_copies();
+            assert_eq!(copies.len(), 1, "one timespec copyout: {copies:?}");
+            let (at, bytes) = &copies[0];
+            assert_eq!(*at, UserVa::new(output));
+            assert_eq!(bytes.len(), 16);
+            let nanoseconds = i64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+            assert!((0..1_000_000_000).contains(&nanoseconds));
+        }
+        assert_eq!(counters.forwarded[113].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.refused[113].load(Ordering::Relaxed), 0);
         registry.unregister_root_for_test(&runtime);
         return;
     }
