@@ -79,8 +79,8 @@ Temporary crossings are `RingOwed`, rather than permanent host ownership. All
 those host handlers still depend on ambient root state, so none of their rows
 are inert. The exact mirror test includes the nine threaded independent entries.
 
-`WiredService::MissingRingFamily` exposes the twelve ISA wiring gaps separately
-from the shared service owner. The gap ceiling is twelve and must shrink as
+`WiredService::MissingRingFamily` exposes the ten ISA wiring gaps separately
+from the shared service owner. The gap ceiling is ten and must shrink as
 wiring lands. Private x86 aliases use their canonical twin for ownership only;
 ABI operand interpretation and current venue selection remain unchanged.
 
