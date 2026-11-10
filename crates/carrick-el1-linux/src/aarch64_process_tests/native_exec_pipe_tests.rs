@@ -180,6 +180,8 @@ fn fork_exec_probe_with_departure(
     );
 }
 
+// One knob per fixture variant; a struct would only rename these.
+#[allow(clippy::too_many_arguments)]
 fn fork_exec_probe_copy(
     futex: Option<u64>,
     bitset: u64,
