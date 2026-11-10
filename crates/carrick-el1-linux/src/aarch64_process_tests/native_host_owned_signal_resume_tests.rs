@@ -410,6 +410,13 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
         let _ = scheduler.run_ready(&mut frame);
         assert_eq!(cpu.owner_resumes, if inline_ack { 2 } else { 1 });
         assert_eq!(cpu.deferred_return_observed, pending_work);
+        if pending_work && !inline_ack {
+            // #2039: the owner's carrier work is a published notice the
+            // host takes at this vCPU's exit, so the lane left vacated
+            // rather than running its peer (this fixture publishes no
+            // maintenance root, so the word is the host installer's).
+            assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
+        }
     } else {
         // The direct refusal checkpoint parked A. Let the real scheduler
         // select its runnable peer before the host ACK wakes A again.
@@ -500,7 +507,10 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
                 .notify_object(fixture.slot, &mut Default::default())
                 .unwrap();
         }
-        if fixture.zone.slot(fixture.slot).current() == Some(peer_record) {
+        if fixture.zone.slot(fixture.slot).current() == Some(peer_record)
+            || (fixture.zone.runnable_head(fixture.slot) == Some(peer_record)
+                && fixture.zone.switch_in_full(fixture.slot).map(|s| s.record) == Some(peer_record))
+        {
             assert!(
                 fixture
                     .zone
