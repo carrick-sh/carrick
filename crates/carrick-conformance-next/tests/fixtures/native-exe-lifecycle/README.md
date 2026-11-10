@@ -14,6 +14,17 @@ rename/unlink of both files while both holders remain live. Renamed paths
 must update, and unlink must append ` (deleted)`. Every scenario reports
 the initial population and completion, so an early death cannot pass.
 
+The holders are native fork children. Their `nanosleep` is unrouted
+until #1808 lands. These cases run under `run_with_audit`, whose
+fast-path visibility removes the vDSO clock, so a holder's clock read is
+syscall 113, also unrouted. Either one is a counted ENOSYS refusal. musl
+reports `clock_gettime(CLOCK_MONOTONIC)`'s ENOSYS as EINVAL, and
+`Instant::now` panics (`time.rs:107`). So holder code bounds every wait
+with `poll` on a pipe: a child's exit shows as EOF on the result pipe
+that only the child still holds, and a thread's last act is a byte on a
+pipe. Only the root driver, whose calls the host serves, uses `Instant`
+and `std::thread::sleep`.
+
 The native Linux x86_64 known-answer outputs in `oracle.json` qualify the
 fixture and are source-hash checked. They are explicitly pending the
 director's native ARM64 Linux bless. They are not Carrick execution proof.

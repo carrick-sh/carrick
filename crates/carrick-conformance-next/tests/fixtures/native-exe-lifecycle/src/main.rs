@@ -274,6 +274,34 @@ fn reap(pid: i32) {
     }
 }
 
+/// Holder-side reap. The holders are native fork children, which have no
+/// clock or sleep in ring yet (#1808), so the bound is the child's own exit:
+/// EOF on the result pipe it alone still holds, observed by a bounded poll.
+fn reap_exited(pid: i32, result: i32, role: &str) {
+    let mut ready = libc::pollfd {
+        fd: result,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut ready, 1, 5000) },
+        1,
+        "bounded exit of {role} {pid}"
+    );
+    let mut byte = 0u8;
+    assert_eq!(
+        unsafe { libc::read(result, (&mut byte as *mut u8).cast(), 1) },
+        0,
+        "{role} {pid} closed its result pipe at exit"
+    );
+    unsafe {
+        libc::close(result);
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert_eq!(status, 0, "{role} {pid} failed");
+}
+
 fn fork_read(expected: &str) {
     let result = pipe();
     let pid = unsafe { libc::fork() };
@@ -283,14 +311,12 @@ fn fork_read(expected: &str) {
         send(result[1], b'F');
         unsafe { libc::_exit(0) }
     }
+    unsafe {
+        libc::close(result[1]);
+    }
     assert_eq!(receive(result[0], "fork child result"), b'F');
     check_link(expected);
-    reap(pid);
-    for fd in result {
-        unsafe {
-            libc::close(fd);
-        }
-    }
+    reap_exited(pid, result[0], "fork child");
 }
 
 // CLONE_VM|CLONE_VFORK is Linux vfork with a private child stack. Returning
@@ -324,18 +350,16 @@ fn vfork_read(expected: &str) {
         )
     };
     assert!(pid >= 0);
+    unsafe {
+        libc::close(result[1]);
+    }
     assert_eq!(
         receive(result[0], "vfork child result"),
         0,
         "vfork caller readlink errno"
     );
     check_link(expected);
-    reap(pid);
-    for fd in result {
-        unsafe {
-            libc::close(fd);
-        }
-    }
+    reap_exited(pid, result[0], "vfork child");
 }
 
 fn thread_read(expected: &str) {
@@ -348,15 +372,13 @@ fn thread_read(expected: &str) {
         send(ready[1], b'T');
         assert_eq!(receive(release[0], "thread release"), b'Q');
         check_link(&worker_expected);
+        send(ready[1], b'D');
     });
     assert_eq!(receive(ready[0], "thread ready"), b'T');
     check_link(&expected); // Worker is live, waiting for this leader.
     send(release[1], b'Q');
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !worker.is_finished() {
-        assert!(Instant::now() < deadline, "bounded thread completion");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    // The worker's last act is `D`; join then waits only for its return.
+    assert_eq!(receive(ready[0], "thread done"), b'D');
     worker.join().unwrap();
     for fd in [ready[0], ready[1], release[0], release[1]] {
         unsafe {
