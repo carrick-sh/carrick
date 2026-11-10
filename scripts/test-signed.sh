@@ -3,6 +3,10 @@
 # Rust guard through build, signing, execution and scoped EXIT cleanup.
 # CARRICK_TEST_TARGET=<integration-target> narrows Cargo linking while retaining
 # the package's negative control. Omit it to build all test targets.
+# Before anything runs, stderr gets one `test-signed: selected <name>` line per
+# selected test (libtest --list name, file order). A name that two executables
+# list prints twice. A zero-match filter refuses with no such line. Callers
+# that expect a verdict per test can treat a selected name with no verdict as missing.
 # Gate recipes clear this override; use this direct script for focused runs.
 set -euo pipefail
 cd "$(dirname "$0")/.."

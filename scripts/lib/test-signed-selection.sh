@@ -3,6 +3,10 @@
 # and host-only harness. Inputs: exes, filter/ignored flags, negative_test.
 # Outputs: run_exes, sign_exes, carrier, negative_test_name, exact_name,
 # selected census path; temporary files append to the caller's scratch array.
+# Before any execution, prints one `test-signed: selected <name>` stderr line per
+# selected test in census order (name = libtest --list name, as in
+# `test <name> ... ok`). A name listed by two executables prints twice; a
+# zero-match refusal prints no such line.
 test_signed_select_executables() {
     # 2. Enumerate every test before execution, including the ignored subset, then
     #    resolve the invocation's exact/non-exact filter fail-closed.
@@ -67,6 +71,7 @@ test_signed_select_executables() {
         echo "test-signed: filter ${requested_filter:-<unfiltered>} resolved zero tests" >&2
         exit 1
     fi
+    awk -F '\t' '{ print "test-signed: selected " $2 }' "$selected" >&2
 
     run_exes=()
     while IFS= read -r exe; do
