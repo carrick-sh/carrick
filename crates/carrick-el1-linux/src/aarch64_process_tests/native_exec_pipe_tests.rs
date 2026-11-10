@@ -218,8 +218,8 @@ fn serial_host_native_child_nanosleep_rescans_a_raced_publication() {
     fork_exec_probe_with_departure(
         Some(crate::sched::FUTEX_WAIT_PRIVATE),
         u32::MAX as u64,
-        false,
         true,
+        None,
         Some(TimerDeparture::Nanosleep(SleepCase::RacedPublication)),
     );
 }
@@ -229,8 +229,8 @@ fn serial_host_native_child_nanosleep_eintr_prepares_a_lazy_remainder() {
     fork_exec_probe_with_departure(
         Some(crate::sched::FUTEX_WAIT_PRIVATE),
         u32::MAX as u64,
-        false,
         true,
+        None,
         Some(TimerDeparture::Nanosleep(
             SleepCase::PendingSignalLazyRemainder,
         )),
@@ -242,8 +242,8 @@ fn serial_host_native_child_nanosleep_eintr_retains_a_busy_remainder() {
     fork_exec_probe_with_departure(
         Some(crate::sched::FUTEX_WAIT_PRIVATE),
         u32::MAX as u64,
-        false,
         true,
+        None,
         Some(TimerDeparture::Nanosleep(
             SleepCase::PendingSignalBusyRemainder,
         )),
@@ -255,8 +255,8 @@ fn serial_host_native_child_nanosleep_eintr_retains_an_owner_wait_remainder() {
     fork_exec_probe_with_departure(
         Some(crate::sched::FUTEX_WAIT_PRIVATE),
         u32::MAX as u64,
-        false,
         true,
+        None,
         Some(TimerDeparture::Nanosleep(
             SleepCase::PendingSignalOwnerWaitRemainder,
         )),
@@ -268,8 +268,8 @@ fn serial_host_native_child_nanosleep_deadline_crossing_between_checks_returns_z
     fork_exec_probe_with_departure(
         Some(crate::sched::FUTEX_WAIT_PRIVATE),
         u32::MAX as u64,
-        false,
         true,
+        None,
         Some(TimerDeparture::Nanosleep(SleepCase::DeadlineCrossesChecks)),
     );
 }
@@ -279,8 +279,8 @@ fn serial_host_native_child_nanosleep_signal_between_checks_writes_remaining() {
     fork_exec_probe_with_departure(
         Some(crate::sched::FUTEX_WAIT_PRIVATE),
         u32::MAX as u64,
-        false,
         true,
+        None,
         Some(TimerDeparture::Nanosleep(SleepCase::SignalBetweenChecks)),
     );
 }
@@ -290,8 +290,8 @@ fn serial_host_native_child_future_absolute_clock_nanosleep_expires_at_deadline(
     fork_exec_probe_with_departure(
         Some(crate::sched::FUTEX_WAIT_PRIVATE),
         u32::MAX as u64,
-        false,
         true,
+        None,
         Some(TimerDeparture::Nanosleep(SleepCase::FutureAbsolute)),
     );
 }
@@ -301,8 +301,8 @@ fn serial_host_native_child_future_absolute_clock_nanosleep_eintr_leaves_rem() {
     fork_exec_probe_with_departure(
         Some(crate::sched::FUTEX_WAIT_PRIVATE),
         u32::MAX as u64,
-        false,
         true,
+        None,
         Some(TimerDeparture::Nanosleep(
             SleepCase::FutureAbsoluteInterrupted,
         )),
