@@ -10,6 +10,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 #[path = "common/kvm_pool_fixture.rs"]
+#[allow(dead_code)] // each test file uses a subset of the shared fixture
 mod kvm_pool_fixture;
 
 /// Only CPU 0 (the loaded lane) schedules the root and its children.
