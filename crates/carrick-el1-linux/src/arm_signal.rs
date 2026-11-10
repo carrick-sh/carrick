@@ -113,7 +113,7 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     })
 }
 
-/// The user-return delivery policy. `live` reads the FP/SIMD state and user
+/// The user-return delivery policy. `capture` reads the FP/SIMD state and user
 /// stack pointer only once a signal is owed: the vector reads the hardware,
 /// VM-free witnesses supply both.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -128,7 +128,7 @@ pub(crate) fn deliver_on_user_return_at<'a, X: super::aarch64_process::ForkStock
         super::aarch64_process::Aarch64NativeProcessService<'a, X>,
     >,
     frame: &mut TrapFrame,
-    live: impl FnOnce(
+    capture: impl FnOnce(
         &TrapFrame,
         &mut carrick_syscall_abi::LinuxFpsimdContext,
     ) -> carrick_guest_arch::UserVa,
@@ -148,7 +148,7 @@ pub(crate) fn deliver_on_user_return_at<'a, X: super::aarch64_process::ForkStock
         return None;
     }
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
-    let sp = live(frame, &mut fp);
+    let sp = capture(frame, &mut fp);
     deliver_on_user_return_with(
         task,
         control,
