@@ -38,6 +38,14 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
         record: &mut [u8],
     ) -> Result<Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>, NativeHostFileRefused>;
 
+    /// Answer one ring-staged clock record against this capability's
+    /// container `ClockDomain`, in place ([`carrick_core_abi::clock`]).
+    /// `Err` leaves the record unanswered; the carrier then replies ENOSYS.
+    fn serve_clock(
+        &self,
+        record: &mut [u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES],
+    ) -> Result<(), carrick_core_abi::clock::ClockRecordError>;
+
     /// Serve the root fork seed crossing: write the host-served root's live
     /// cwd and root into `record` once ([`carrick_core_abi::service::RootForkSeed::serve`]).
     /// `false` refuses it; the fork then fails without a child.
@@ -186,6 +194,13 @@ mod native_exec_service_registration_tests {
             NativeHostFileRefused,
         > {
             Err(NativeHostFileRefused)
+        }
+
+        fn serve_clock(
+            &self,
+            _record: &mut [u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES],
+        ) -> Result<(), carrick_core_abi::clock::ClockRecordError> {
+            Err(carrick_core_abi::clock::ClockRecordError::Invalid)
         }
 
         fn root_fork_seed(&self, _record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
@@ -460,6 +475,36 @@ impl NativeService {
         let record = self.exec_payload.as_mut().ok_or_else(stale)?;
         if !serve(record.bytes_mut()) {
             return Err(stale());
+        }
+        self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))
+    }
+
+    /// Serve one ring-staged clock sample against the container clock domain
+    /// the request's capability names, and publish the reply before
+    /// acknowledging. An unresolvable capability or an unanswerable record is
+    /// answered ENOSYS in the record itself: the ring turns a refused clock
+    /// request into a quarantine, never a soft errno.
+    pub fn serve_clock(mut self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let carrick_core_abi::service::ServiceOperation::Clock { capability, .. } =
+            self.request().operation
+        else {
+            return Err(stale());
+        };
+        let service = self
+            .custody
+            .native_exec_services
+            .resolve(ExecCapabilityId::new(capability.raw()))
+            .ok();
+        let record = self.exec_payload.as_mut().ok_or_else(stale)?;
+        let record: &mut [u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES] =
+            record.bytes_mut().try_into().map_err(|_| stale())?;
+        if service.is_none_or(|service| service.serve_clock(record).is_err()) {
+            const ENOSYS: carrick_core_abi::clock::ClockErrno =
+                match carrick_core_abi::clock::ClockErrno::new(38) {
+                    Some(errno) => errno,
+                    None => unreachable!(),
+                };
+            carrick_core_abi::clock::write_errno_reply(record, ENOSYS).map_err(|_| stale())?;
         }
         self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))
     }
@@ -1705,6 +1750,15 @@ pub(super) fn take(
                         )?)
                     }
                     carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } => {
+                        Some(retain_exec_payload(
+                            custody,
+                            region,
+                            ticket.request().identity.birth.mm,
+                            payload.address().raw(),
+                            payload.length().raw(),
+                        )?)
+                    }
+                    carrick_core_abi::service::ServiceOperation::Clock { payload, .. } => {
                         Some(retain_exec_payload(
                             custody,
                             region,

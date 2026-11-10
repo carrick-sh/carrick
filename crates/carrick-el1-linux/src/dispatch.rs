@@ -1292,6 +1292,7 @@ pub(super) struct NativeServiceBegin {
         crate::native_process_runtime::NativeEntropyFlags,
         carrick_guest_arch::GuestLen,
     )>,
+    clock: Option<(carrick_personality_linux::clock::ClockCall, [u64; 2])>,
     retry_exec_stage: bool,
     stage_prefix: Option<alloc::boxed::Box<[u8]>>,
     service_wait: Option<carrick_core_abi::PortalOwnerWait>,
@@ -1341,6 +1342,29 @@ pub(super) fn native_service_decision(
         // work first settles that work (CarrierWork) and is replayed;
         // staging it here would pre-empt the settlement forever.
         None if action != Action::Forward => NativeServiceStage::Operation,
+        // A fork child's clock reading is sampled on the run's clock domain.
+        // Planning is argument-only and matches the ring's own answer for
+        // everything that needs no sample, so only a reading is staged here.
+        None if child()
+            && let Some(call) = carrick_personality_linux::clock::ClockCall::from_canonical(
+                carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
+            )
+            && matches!(
+                carrick_personality_linux::clock::plan(call, [frame.x[0], frame.x[1]]),
+                carrick_personality_linux::clock::ClockPlan::Sample { .. }
+            ) =>
+        {
+            return NativeServiceDecision::Begin(alloc::boxed::Box::new(NativeServiceBegin {
+                operation: None,
+                exec_payload: None,
+                host_file: None,
+                entropy: None,
+                clock: Some((call, [frame.x[0], frame.x[1]])),
+                retry_exec_stage: false,
+                stage_prefix: None,
+                service_wait: None,
+            }));
+        }
         None if frame.x[8] == 278 => {
             let (address, capacity, flags, requested) = native_entropy_stage(frame);
             NativeServiceStage::Entropy {
@@ -1488,6 +1512,7 @@ pub(super) fn native_service_decision(
         exec_payload,
         host_file,
         entropy,
+        clock: None,
         retry_exec_stage,
         stage_prefix,
         service_wait,
@@ -1527,6 +1552,7 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
         exec_payload,
         host_file,
         entropy,
+        clock,
         retry_exec_stage,
         stage_prefix,
         service_wait,
@@ -1556,6 +1582,12 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
                     counters,
                 ),
             )
+        }
+    } else if let Some((call, args)) = clock {
+        if service_wait.is_some() {
+            Err(super::native_process_runtime::NativeProcessError::Quarantined)
+        } else {
+            process.begin_clock_service(call, args, carrick_guest_arch::NativeOrdinal::new(ordinal))
         }
     } else if let Some((address, capacity, flags, requested)) = entropy {
         process.begin_entropy_service(address, capacity, flags, requested)

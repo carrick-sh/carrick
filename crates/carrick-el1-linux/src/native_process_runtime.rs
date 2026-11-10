@@ -5587,6 +5587,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             result: interrupted,
             prefix_on_fault: false,
             effect: None,
+            then: None,
         });
         self.finish_output_outcome(result)
     }
@@ -8315,6 +8316,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             result: SyscallResult::new(0),
             prefix_on_fault: false,
             effect: Some(effect),
+            then: None,
         });
         self.finish_output_outcome(result)
     }
@@ -8331,6 +8333,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             prefix_on_fault: false,
             result,
             effect: None,
+            then: None,
         });
         self.finish_output_outcome(result)
     }
