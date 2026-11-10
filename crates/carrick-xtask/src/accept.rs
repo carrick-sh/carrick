@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::command;
 use crate::host_lease::{HostLease, HostLeaseMode, extract_exit_code};
-use crate::signed_phase::SignedPhase;
+use crate::signed_phase::{ArtifactKind, SignedPhase};
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct AcceptArgs {
@@ -1743,13 +1743,12 @@ struct AcceptCarry {
     el1: Option<El1Comparison>,
     probe_diffs: Vec<ProbeDiff>,
     cleanup_counts: Vec<CleanupCount>,
-    /// Test-signed steps whose build phase passed, with its duration.
-    built: Vec<(String, f64)>,
 }
 
-/// One `scripts/test-signed.sh` invocation of the signed phase. Its build
-/// half (test executables, signing) runs in the build stage and its
-/// execution half (guests) in the execution stage.
+/// One `scripts/test-signed.sh` invocation of the signed phase. It runs
+/// whole in the execution stage: test-signed builds and signs its own test
+/// executables there, under the gate it inherits, so nothing it builds
+/// crosses a released lease and none of it needs a handoff.
 struct TestSignedStep {
     name: &'static str,
     run_id: &'static str,
@@ -1812,49 +1811,23 @@ impl TestSignedStep {
         )
     }
 
-    fn state(&self, state: &Path) -> PathBuf {
-        state.join("test-signed").join(self.name)
-    }
-
-    /// Run one half; the build half truncates the step log, execution appends.
-    fn run_half(
+    /// test-signed's own `host-lease --mode carrick` reuses the inherited
+    /// gate (gate grants carrick); it never waits on this run's gate.
+    fn run(
         &self,
         lease: &HostLease,
-        phase: SignedPhase,
-        state: &Path,
         run_id: &str,
         root: &Path,
         log_path: &Path,
     ) -> Result<(Option<i32>, f64), AcceptError> {
-        let step_state = self.state(state);
-        fs::create_dir_all(&step_state).map_err(|source| AcceptError::Io {
-            path: step_state.clone(),
-            source,
-        })?;
-        if phase == SignedPhase::Execute {
-            // This run's gate admission, re-verified over every artifact the
-            // build phase listed, is the step's admission too.
-            let admission = crate::signed_phase::ADMISSION_FILE;
-            fs::copy(state.join(admission), step_state.join(admission)).map_err(|source| {
-                AcceptError::Io {
-                    path: state.join(admission),
-                    source,
-                }
-            })?;
-        }
-        let state = step_state.to_string_lossy().into_owned();
         run_command_logged(
             lease,
             "./scripts/test-signed.sh",
             &[self.package, self.filter, "--nocapture"],
-            &[
-                ("CARRICK_RUN_ID", run_id),
-                (crate::signed_phase::PHASE_ENV, phase.as_str()),
-                (crate::signed_phase::STATE_ENV, &state),
-            ],
+            &[("CARRICK_RUN_ID", run_id)],
             root,
             log_path,
-            phase == SignedPhase::Execute,
+            false,
         )
         .map_err(|source| AcceptError::Io {
             path: log_path.to_path_buf(),
@@ -2110,7 +2083,6 @@ fn run_inner(
     let mut skipped_steps = Vec::new();
     let mut artifact_identity = None;
     let mut fixture_validation = None;
-    let mut built = Vec::new();
     let mut el1_summary = None;
     let mut probe_diffs = Vec::new();
     let mut cleanup_counts = Vec::new();
@@ -2123,7 +2095,6 @@ fn run_inner(
         el1_summary = carry.el1;
         probe_diffs = carry.probe_diffs;
         cleanup_counts = carry.cleanup_counts;
-        built = carry.built;
     }
     let signed_requested = matches!(args.phase, AcceptPhase::Signed | AcceptPhase::All);
 
@@ -2206,9 +2177,9 @@ fn run_inner(
         }
     }
 
-    // 2. Signed build phase: fixtures, release build, test builds and
-    //    signing, all under the shared lease. Fail before signing or guest
-    //    execution, while preserving a FAIL receipt.
+    // 2. Signed build phase: fixture verification, the release build and
+    //    its signing, all under the shared lease. Fail before signing or
+    //    guest execution, while preserving a FAIL receipt.
     if stage == AcceptStage::Build && signed_requested {
         if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
             return Err(AcceptError::UnsupportedPlatform(format!(
@@ -2259,6 +2230,7 @@ fn run_inner(
 
         let state = state.as_deref().unwrap_or(Path::new("."));
         let mut artifacts = Vec::new();
+        let mut fixture_artifacts = Vec::new();
         if fixtures_valid {
             println!(
                 "--- Signed build phase starting (profile: {}) ---",
@@ -2364,48 +2336,28 @@ fn run_inner(
                 error,
             ));
 
-            // Build and sign each signed test step's executables now; their
-            // guests run in the execution phase.
-            for step in TEST_SIGNED_STEPS {
-                let run_id = format!("accept-{timestamp}-{}", step.run_id);
-                let log_path = run_dir.join(step.log_name);
-                println!("  building: {} (run_id: {run_id})", step.command());
-                let (exit_code, duration_s) =
-                    step.run_half(&lease, SignedPhase::Build, state, &run_id, &root, &log_path)?;
-                if exit_code == Some(0) {
-                    let list = step.state(state).join(crate::signed_phase::ARTIFACTS_FILE);
-                    let listed = fs::read_to_string(&list).map_err(|source| AcceptError::Io {
-                        path: list.clone(),
-                        source,
-                    })?;
-                    artifacts.extend(listed.lines().filter(|l| !l.is_empty()).map(PathBuf::from));
-                    built.push((step.name.to_string(), duration_s));
-                    continue;
+            // Everything the guests run that was built or installed before
+            // this lease is released: the signed release binary (when it
+            // built) and every installed fixture. test-signed builds its own
+            // test executables later, under gate, and needs no handoff.
+            match crate::fixtures::installed_artifact_paths(&root) {
+                Ok(paths) => fixture_artifacts = paths,
+                Err(error) => {
+                    let msg = format!("signed fixture artifacts: {error}");
+                    failures.push(msg);
                 }
-                let (passed, error) = step.evaluate(
-                    &root,
-                    exit_code,
-                    &log_path,
-                    &mut el1_summary,
-                    &mut probe_diffs,
-                );
-                if let Some(msg) = &error {
-                    failures.push(msg.clone());
-                }
-                step_results.push(step_result(
-                    step.name,
-                    step.command(),
-                    exit_code,
-                    log_path,
-                    duration_s,
-                    passed,
-                    error,
-                ));
             }
         }
 
-        if !artifacts.is_empty() {
-            crate::signed_phase::append_artifacts(state, &artifacts)
+        if !fixture_artifacts.is_empty() {
+            crate::signed_phase::append_artifacts(state, ArtifactKind::Signed, &artifacts)
+                .and_then(|()| {
+                    crate::signed_phase::append_artifacts(
+                        state,
+                        ArtifactKind::Content,
+                        &fixture_artifacts,
+                    )
+                })
                 .map_err(|e| AcceptError::Failed(e.to_string()))?;
             let carry = AcceptCarry {
                 timestamp,
@@ -2417,7 +2369,6 @@ fn run_inner(
                 el1: el1_summary,
                 probe_diffs,
                 cleanup_counts,
-                built,
             };
             crate::atomic_file::write(&state.join(CARRY_FILE), &serde_json::to_vec(&carry)?)
                 .map_err(|source| AcceptError::Io {
@@ -2428,12 +2379,15 @@ fn run_inner(
             println!("--- Signed build phase complete; guest execution waits for gate ---");
             return Ok(());
         }
-        // Nothing was built to execute: publish this FAIL receipt now
-        // rather than wait for gate with no guest to run.
+        // No admitted fixtures, so no guest can run (main skips the signed
+        // steps the same way): publish this FAIL receipt now rather than
+        // wait for gate.
     }
 
-    // 3. Signed execution phase: guests only, under gate, after the driver
-    //    re-verified every built artifact's identity.
+    // 3. Signed execution phase under gate, after the driver re-verified
+    //    every admitted artifact's identity: test-signed (which builds and
+    //    signs its own test executables here, under this gate), the full
+    //    profile's extras, scoped reaps and the receipt.
     let mut signed_admission = None;
     if stage == AcceptStage::Execute {
         let state = state.as_deref().unwrap_or(Path::new("."));
@@ -2444,23 +2398,19 @@ fn run_inner(
             lease.mode(),
             args.profile
         );
-        for (name, build_s) in &built {
-            let Some(step) = TEST_SIGNED_STEPS.iter().find(|step| step.name == *name) else {
-                return Err(AcceptError::Failed(format!(
-                    "build phase carried an unknown signed step '{name}'"
-                )));
-            };
+        // The driver compared every admitted identity after gate admission.
+        // Verify the fixture provenance once more under gate, so the bytes
+        // the guests run are the manifest's bytes as well as the build's.
+        if let Err(error) = verify_signed_fixtures(&root) {
+            return Err(AcceptError::Failed(format!(
+                "signed fixtures changed before guest execution; refusing to execute: {error}"
+            )));
+        }
+        for step in TEST_SIGNED_STEPS {
             let run_id = format!("accept-{timestamp}-{}", step.run_id);
             let log_path = run_dir.join(step.log_name);
             println!("  running: {} (run_id: {run_id})", step.command());
-            let (exit_code, duration_s) = step.run_half(
-                &lease,
-                SignedPhase::Execute,
-                state,
-                &run_id,
-                &root,
-                &log_path,
-            )?;
+            let (exit_code, duration_s) = step.run(&lease, &run_id, &root, &log_path)?;
             reap_step(
                 &root,
                 step.name,
@@ -2483,7 +2433,7 @@ fn run_inner(
                 step.command(),
                 exit_code,
                 log_path,
-                build_s + duration_s,
+                duration_s,
                 passed,
                 error,
             ));
