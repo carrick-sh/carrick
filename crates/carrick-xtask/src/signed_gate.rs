@@ -758,6 +758,19 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
 
 /// An empty, truncated or unsigned receipt can never seed a baseline or stand for a gate.
 pub fn validate_receipt(receipt: &AcceptReceipt, expected: &str) -> Result<(), ReceiptError> {
+    validate_side_receipt(PairSide::Candidate, receipt, expected)
+}
+
+/// `validate_receipt` for one side of a pair. The base side alone tolerates a
+/// missing test/completion population, and only on a step the receipt itself
+/// records as a gap (#2045: a base killed before it reported anything is
+/// advisory data). Identity, seal, cleanup and every other check, and the
+/// whole candidate side, stay strict.
+pub fn validate_side_receipt(
+    side: PairSide,
+    receipt: &AcceptReceipt,
+    expected: &str,
+) -> Result<(), ReceiptError> {
     for (field, actual, expected) in [
         ("head", receipt.head.as_str(), expected),
         ("phase", receipt.phase.as_str(), "signed"),
@@ -812,7 +825,13 @@ pub fn validate_receipt(receipt: &AcceptReceipt, expected: &str) -> Result<(), R
                 return Err(fail(format!("{name} failed")));
             }
         } else {
-            if step.started_tests.is_empty() || step.finished_binaries.is_empty() {
+            let recorded_gap = matches!(
+                step.execution_outcome(),
+                crate::accept::StepOutcome::NotRun { .. }
+            ) || !step.not_run_tests.is_empty();
+            if (step.started_tests.is_empty() || step.finished_binaries.is_empty())
+                && !(side == PairSide::Base && recorded_gap)
+            {
                 return Err(fail(format!("{name} has no test/completion population")));
             }
         }
@@ -1243,8 +1262,7 @@ fn execute(
         execute_one(
             root,
             &lease,
-            &run.commit,
-            &run.fixture_publisher,
+            run,
             FixtureSources {
                 bundle: &bundle,
                 candidate_probes: match run.side {
@@ -1252,8 +1270,6 @@ fn execute(
                     PairSide::Candidate => candidate_probes.as_deref(),
                 },
             },
-            &run.output,
-            run.receipt_name,
         )
     })
 }
@@ -1444,12 +1460,23 @@ struct FixtureSources<'a> {
 fn execute_one(
     root: &Path,
     lease: &HostLease,
-    commit: &str,
-    publisher: &str,
+    run: &PairedRun,
     fixtures: FixtureSources<'_>,
-    output: &Path,
-    receipt_name: &str,
 ) -> Result<(), ReceiptError> {
+    let PairedRun {
+        side,
+        commit,
+        fixture_publisher: publisher,
+        output,
+        receipt_name,
+    } = run;
+    let (side, commit, publisher, output, receipt_name) = (
+        *side,
+        commit.as_str(),
+        publisher.as_str(),
+        output.as_path(),
+        *receipt_name,
+    );
     let FixtureSources {
         bundle,
         candidate_probes,
@@ -1579,7 +1606,7 @@ fn execute_one(
             &output.join("identity.json"),
             serde_json::to_vec_pretty(&identity).map_err(|e| fail(e.to_string()))?,
         )?;
-        validate_receipt(&receipt, commit)
+        validate_side_receipt(side, &receipt, commit)
     })();
     // Preserve logs even on errors before dropping the detached worktree.
     let logs = tree.join("target/el1-gate");
@@ -1665,7 +1692,11 @@ fn publish(
             let evidence = admit_evidence(&dir, &base).map(|_| ());
             (base, evidence)
         };
-        validate_receipt(&base, &request.base)?;
+        if request.kind == RequestKind::Main {
+            validate_receipt(&base, &request.base)?;
+        } else {
+            validate_side_receipt(PairSide::Base, &base, &request.base)?;
+        }
         let diff = signed_receipt::compare(&base, &candidate)?;
         write(
             &results.join("diff.json"),
@@ -1697,13 +1728,9 @@ fn publish(
                 serde_json::to_string_pretty(identity).map_err(|e| fail(e.to_string()))?
             )),
         }
-        // With a base gap the candidate must itself be complete: its
-        // interruption is not visible in the advisory EL1 set differences.
-        let candidate_gaps = if base_gaps.is_empty() {
-            Vec::new()
-        } else {
-            receipt_gaps(&candidate)
-        };
+        // The candidate must itself be complete whatever the base looks like:
+        // its interruption is not visible in the advisory EL1 set differences.
+        let candidate_gaps = receipt_gaps(&candidate);
         if !base_gaps.is_empty() {
             body.push_str(&format!(
                 "\n**Advisory: the paired base is incomplete.** {}. Base failures it never ran cannot be compared, so they are not read as fixed; the candidate completed, so this does not block.\n",

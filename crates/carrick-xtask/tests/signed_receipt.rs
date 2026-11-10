@@ -2392,6 +2392,115 @@ fn candidate_interrupted_mid_el1_blocks_when_the_base_has_a_gap() {
     );
 }
 
+/// Base step killed before it reported any population (the #1974 shape).
+fn base_killed_before_reporting(commit: &str) -> AcceptReceipt {
+    let mut base = admitted(commit);
+    let step = &mut base.steps[2];
+    step.started_tests.clear();
+    step.finished_binaries.clear();
+    step.failed_tests.clear();
+    step.passed = false;
+    step.exit_code = None;
+    step.not_run_tests = (0..7).map(|i| format!("el1::unrun_{i}")).collect();
+    base
+}
+
+/// Review P0 on #2047: a COMPLETE base must not hide a candidate interruption.
+#[cfg(unix)]
+#[test]
+fn complete_base_does_not_hide_candidate_interruption() {
+    let bench = PublishBench::new();
+    let mut candidate = admitted(&bench.head);
+    candidate.steps[2].not_run_tests = vec!["el1::cut_short".into()];
+    bench.write_candidate(&candidate, false);
+    bench.write_base(&admitted(&bench.base), false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "candidate interruption passed: {body}");
+    assert!(body.contains("Candidate is incomplete"), "{body}");
+    assert!(body.contains("step el1-embed interrupted"), "{body}");
+}
+
+/// Review P0 on #2047: empty base populations are advisory through `publish`.
+#[cfg(unix)]
+#[test]
+fn review_base_missing_population_clean_candidate_must_pass() {
+    let bench = PublishBench::new();
+    let mut candidate = admitted(&bench.head);
+    candidate.steps[2].failed_tests.clear();
+    candidate.steps[2].passed = true;
+    candidate.steps[2].exit_code = Some(0);
+    bench.write_candidate(&candidate, false);
+    bench.write_base(&base_killed_before_reporting(&bench.base), false);
+    let (passed, body) = bench.publish();
+    assert!(passed, "{body}");
+    assert!(body.contains("paired base is incomplete"), "{body}");
+    assert!(body.contains("step el1-embed"), "{body}");
+    let description = bench.status_description();
+    assert!(description.len() <= 140, "{description}");
+    assert!(description.contains("step el1-embed"), "{description}");
+}
+
+/// Candidate failures in tests the base never started count as introduced.
+#[cfg(unix)]
+#[test]
+fn missing_base_population_does_not_excuse_introduced_failure_or_empty_candidate() {
+    let bench = PublishBench::new();
+    bench.write_base(&base_killed_before_reporting(&bench.base), false);
+
+    let mut introduced = admitted(&bench.head);
+    introduced.steps[2].failed_tests = vec!["introduced_regression".into()];
+    introduced.steps[2]
+        .failed_tests
+        .push("introduced_regression".into());
+    bench.write_candidate(&introduced, false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "{body}");
+    assert!(body.contains("introduced_regression"), "{body}");
+
+    let mut empty = admitted(&bench.head);
+    empty.steps[2].started_tests.clear();
+    empty.steps[2].finished_binaries.clear();
+    bench.write_candidate(&empty, false);
+    let (passed, body) = bench.publish();
+    assert!(!passed, "empty candidate population passed: {body}");
+}
+
+/// The production admission `execute_one` ends with, driven through
+/// `execute_pair`: a base killed before reporting populations must not stop
+/// the candidate, while the same shape on the candidate side is refused.
+#[test]
+fn execute_pair_admits_a_base_without_populations_and_still_runs_the_candidate() {
+    use carrick_xtask::signed_gate::{Request, RequestKind, execute_pair, validate_side_receipt};
+    let request = Request {
+        kind: RequestKind::PullRequest,
+        prs: vec![123],
+        sha: "b".repeat(40),
+        base: "a".repeat(40),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut ran = Vec::new();
+    execute_pair(&request, dir.path(), |run| {
+        ran.push(run.receipt_name);
+        let receipt = if run.receipt_name == "base.json" {
+            base_killed_before_reporting(&run.commit)
+        } else {
+            admitted(&run.commit)
+        };
+        write_run_evidence(&run.output, run.receipt_name, &receipt);
+        validate_side_receipt(run.side, &receipt, &run.commit)
+    })
+    .unwrap();
+    assert_eq!(ran, ["base.json", "candidate.json"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let result = execute_pair(&request, dir.path(), |run| {
+        let receipt = base_killed_before_reporting(&run.commit);
+        write_run_evidence(&run.output, run.receipt_name, &receipt);
+        validate_side_receipt(run.side, &receipt, &run.commit)
+    });
+    assert!(result.is_err(), "candidate without populations admitted");
+}
+
 /// An incomplete base no longer stops the pairing before the candidate runs.
 #[test]
 fn execute_pair_still_runs_the_candidate_when_the_base_is_incomplete() {
