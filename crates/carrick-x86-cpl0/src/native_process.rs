@@ -483,6 +483,23 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         let venue = carrick_el1_linux::ipc::guest_venue(self.slot.raw() as u32)?;
         Some((venue.region, carrick_el1_abi::ipc_table_map_guest()))
     }
+    fn retire_adapter_operation(
+        &mut self,
+        binding: carrick_el1_abi::ExecutionBinding,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> Result<usize, NativeProcessError> {
+        let venue = carrick_el1_linux::ipc::guest_venue(self.slot.raw() as u32)
+            .ok_or(NativeProcessError::Stale)?;
+        let source = carrick_x86_carrier::native_execution::source(self.slot);
+        carrick_el1_linux::ipc::retire_native_operation(
+            &venue.region,
+            source.zone,
+            source.slot,
+            self.task,
+            binding,
+            operation,
+        )
+    }
     type Mm = Mm;
     type PreparedMm = Prepared;
     type Born = Box<Born>;
