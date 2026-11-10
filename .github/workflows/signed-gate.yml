@@ -123,6 +123,15 @@ jobs:
           test "$(uname -m)" = aarch64
       - name: Install pinned Rust toolchain and guest targets
         run: rustup show active-toolchain
+      # The candidate probe build runs the fixture builders with `--offline`
+      # (the publisher policy), so their lockfile dependencies must be in the
+      # Cargo cache first, as kernel-runtime.yml's publisher does before its
+      # fixture build. Without this every merge group failed here with
+      # "failed to download `simd-adler32` ... --offline was specified".
+      # Trusted main code fetches main's fixture lockfiles; a candidate that
+      # changed any lockfile is refused by the classifier anyway.
+      - name: Fetch fixture lockfile dependencies
+        run: cargo run --locked -p carrick-xtask -- fixtures fetch
       - uses: actions/download-artifact@v4
         with:
           name: signed-request-${{ github.run_attempt }}
