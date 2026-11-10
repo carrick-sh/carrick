@@ -661,7 +661,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// `NeedsHost`: EL1 may not install that address space now (a pause of it is
     /// raised, or it is unpublished or retiring); the thread went back to
     /// the head of the run queue and the vCPU must leave for its executor
-    /// ([`Self::service_exit`]), which loads it.
+    /// ([`Self::service_exit`]), which loads it. Also `NeedsHost`: its owner
+    /// parked it behind a native service notice the host takes at this
+    /// vCPU's exit; nothing is installed.
     fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) -> LoadResult {
         let (zone, slot) = (self.zone, self.slot);
         let rec = zone.record(switched.record);
@@ -697,6 +699,16 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             ResumeAction::RetrySavedSyscall | ResumeAction::RetrySyscall => None,
             ResumeAction::Left => {
                 self.leave_space();
+                // A resumed owner can park its record again behind a fresh
+                // native service notice (a copyout that could not finish
+                // here). The notice is consumed only at this vCPU's next
+                // exit, so the lane leaves for the host now, vacated, as the
+                // entry's own service park does: running another record
+                // first would hand the host that notice on an exit naming
+                // the other record's space (#2039).
+                if self.task.service_notice.is_published() {
+                    return LoadResult::NeedsHost;
+                }
                 return LoadResult::Left;
             }
         };
