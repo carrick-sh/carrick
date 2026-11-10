@@ -373,3 +373,32 @@ fn child_clock_errors_are_linux_errnos() {
     assert_eq!(child_clock_call(CLOCK_GETRES, 1, 0, &clock, &mut served), 0);
     assert_eq!(served, 0, "no refused call reached the service");
 }
+
+/// Linux: -1/EFAULT for an unmapped non-null destination. The sample was
+/// served, so the failure is the copyout's, and it is the guest's.
+#[test]
+fn child_clock_gettime_invalid_output_is_efault() {
+    let mut served = 0;
+    assert_eq!(
+        child_clock_call(
+            CLOCK_GETTIME,
+            0,
+            u64::MAX,
+            &deterministic(1_234),
+            &mut served
+        ),
+        -14
+    );
+}
+
+#[test]
+fn child_gettimeofday_invalid_timeval_is_efault() {
+    assert_eq!(child_gettimeofday(u64::MAX, 0, &mut 0), -14);
+}
+
+#[test]
+fn child_gettimeofday_faulting_timezone_is_efault_after_timeval() {
+    let tv = carrick_test_support::GuestUserBuffer::from_bytes(&[0xaa; 16]);
+    assert_eq!(child_gettimeofday(tv.arg(), u64::MAX, &mut 0), -14);
+    assert_eq!(pair(tv.as_bytes()), (1_234, 0), "timeval was already written");
+}
