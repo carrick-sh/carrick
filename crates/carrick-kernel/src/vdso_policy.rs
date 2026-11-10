@@ -75,6 +75,22 @@ pub(crate) fn with_optional_vdso_for_clock<A: carrick_hal::GuestArch>(
     with_optional_vdso_for_clock_with_visibility::<A>(image, clock, false)
 }
 
+/// Attach the architecture-appropriate VMM vDSO after sealing fast-path
+/// visibility. Carrick has no x86_64 no-fastpaths vDSO image yet, so the
+/// fail-closed x86 choice is to omit AT_SYSINFO_EHDR and the mapping
+/// entirely; libc then uses ordinary syscalls. AArch64 retains the existing
+/// no-fastpaths image because it still provides rt_sigreturn.
+pub fn with_vmm_vdso_for_clock<A: carrick_hal::GuestArch>(
+    image: AddressSpace,
+    clock: &crate::kernel::container::ClockDomain,
+    requires_syscall_traps: bool,
+) -> Result<AddressSpace, AddressSpaceError> {
+    if requires_syscall_traps && A::linux_guest_abi() == carrick_abi::LinuxGuestAbi::X86_64 {
+        return Ok(image.with_vdso_auxv(false));
+    }
+    with_optional_vdso_for_clock_with_visibility::<A>(image, clock, requires_syscall_traps)
+}
+
 pub fn with_optional_vdso_for_clock_with_visibility<A: carrick_hal::GuestArch>(
     image: AddressSpace,
     clock: &crate::kernel::container::ClockDomain,
