@@ -5955,6 +5955,110 @@ mod tests {
         }
     }
 
+    /// #2034: the signed probe's whole child sequence at the staging layer.
+    /// After a prefix-bearing `write`, a `writev` of `hello` plus an
+    /// unmapped vector, a write from the unmapped page and a write of a
+    /// never-touched readable page each stage independently: the prefix
+    /// never leaks into the next call, a refused empty fault is EFAULT, and
+    /// a supplied untouched page stages exactly once (no supply loop).
+    #[test]
+    fn native_host_file_stage_probe_sequence_stages_each_call_once() {
+        use carrick_personality_linux::native_host_file::{DescriptionAccess, HostFileStage};
+        use core::cell::Cell;
+        /// `[hole, untouched)` unmapped; `untouched` readable once supplied.
+        struct Probe {
+            hole: u64,
+            untouched: u64,
+            supplied: Cell<bool>,
+        }
+        impl file::MemoryValidator for Probe {
+            fn writable_bytes(&self, _user_va: u64, _len: usize) -> usize {
+                0
+            }
+            fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+                let end = if user_va < self.hole {
+                    self.hole
+                } else if user_va >= self.untouched && self.supplied.get() {
+                    self.untouched + 4096
+                } else {
+                    return 0;
+                };
+                (end.saturating_sub(user_va) as usize).min(len)
+            }
+        }
+        #[repr(C, align(4096))]
+        struct Pages([u8; 3 * 4096]);
+        let mut pages = Box::new(Pages([0; 3 * 4096]));
+        let base = pages.0.as_ptr().addr() as u64;
+        let hole = base + 4096;
+        let untouched = base + 2 * 4096;
+        pages.0[4080..4096].copy_from_slice(b"0123456789abcdef");
+        // The writev vector array: "hello" (in the readable page) then the hole.
+        pages.0[4000..4005].copy_from_slice(b"hello");
+        for (at, word) in [base + 4000, 5, hole, 4096].into_iter().enumerate() {
+            pages.0[at * 8..at * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let probe = Probe {
+            hole,
+            untouched,
+            supplied: Cell::new(false),
+        };
+        let task = CurrentTask::new();
+        let table = [3, 4, 5];
+        let stage = |nr: u64, args: [u64; 3]| {
+            let mut frame = TrapFrame {
+                esr: 0x15 << 26,
+                ..TrapFrame::default()
+            };
+            frame.x[8] = nr;
+            frame.x[..3].copy_from_slice(&args);
+            native_host_file_stage(
+                &frame,
+                &task,
+                &probe,
+                table,
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                |_| {
+                    Some(NativeDescriptor::HostBacked {
+                        access: DescriptionAccess::WriteOnly,
+                    })
+                },
+                &mut |_| 0,
+            )
+            .expect("a host-backed write is staged")
+        };
+        let input = |stage: HostFileStage| match stage {
+            HostFileStage::Request { mut record, .. } => {
+                carrick_core_abi::host_file::HostFileRequestView::parse(&mut record)
+                    .unwrap()
+                    .input()
+                    .to_vec()
+            }
+            other => panic!("expected a host request, got {other:?}"),
+        };
+        let read = carrick_guest_arch::Access::Read;
+        // 1. write(fd, hole - 16, 0x100001): the 16-byte prefix.
+        let first = stage(64, [1, hole - 16, 0x100001]);
+        assert_eq!(first.fault(), Some((hole, read)));
+        assert_eq!(input(first.refused()), b"0123456789abcdef");
+        // 2. writev(fd, [hello, hole], 2): only `hello`.
+        let second = stage(66, [1, base, 2]);
+        assert_eq!(second.fault(), Some((hole, read)));
+        assert_eq!(input(second.refused()), b"hello");
+        // 3. write(fd, hole, 16): nothing readable, so EFAULT once refused.
+        let third = stage(64, [1, hole, 16]);
+        assert_eq!(third.fault(), Some((hole, read)));
+        assert!(
+            matches!(third.refused(), HostFileStage::Returned(_)),
+            "an empty refused fault is an errno, not a write"
+        );
+        // 4. write(fd, untouched, 4096): fault, supply, then one request.
+        let fourth = stage(64, [1, untouched, 4096]);
+        assert_eq!(fourth.fault(), Some((untouched, read)));
+        probe.supplied.set(true);
+        assert_eq!(input(stage(64, [1, untouched, 4096])), [0u8; 4096]);
+    }
+
     /// #894: Rust std's startup `ppoll` over host-bound fds 0-2 (no events,
     /// zero timeout) from a native child. Its in-ring owner leaves the set
     /// unrouted (only the carrier observes host descriptions); the native
