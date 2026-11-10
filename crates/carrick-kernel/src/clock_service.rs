@@ -23,6 +23,10 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::dispatch::format_time::linux_coarse_duration;
 use crate::kernel::container::ClockDomain;
 
+/// A clock-record handler a carrier retains and calls with one staged record.
+pub type ClockRecordService =
+    Arc<dyn Fn(&mut [u8; CLOCK_RECORD_BYTES]) -> Result<(), ClockRecordError> + Send + Sync>;
+
 /// Run-scoped host adapter serving `carrick_core_abi::clock` records against
 /// one container's [`ClockDomain`]. Sleeps never reach it: the ring's signal
 /// wait owner serves them on the scheduler timer (#1808).
@@ -45,6 +49,12 @@ impl ClockResourceService {
 
     pub fn clock(&self) -> &Arc<ClockDomain> {
         &self.clock
+    }
+
+    /// This service as the record handler a carrier retains: it answers one
+    /// staged record in place and owns nothing else of the run.
+    pub fn into_record_service(self) -> ClockRecordService {
+        Arc::new(move |record| self.serve_record(record))
     }
 
     /// Validate and answer one 256-byte staged clock-resource record in place.

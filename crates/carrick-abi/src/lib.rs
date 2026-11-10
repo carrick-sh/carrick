@@ -3884,7 +3884,6 @@ pub const LINUX_SIG_UNBLOCK: u64 = 1;
 pub const LINUX_SIG_SETMASK: u64 = 2;
 pub const LINUX_BOOTSTRAP_PID: u64 = 1;
 pub const LINUX_MINSIGSTKSZ: u64 = 2048;
-pub const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
 pub const LINUX_ITIMER_REAL: u64 = 0;
 pub const LINUX_ITIMER_VIRTUAL: u64 = 1;
 pub const LINUX_ITIMER_PROF: u64 = 2;
