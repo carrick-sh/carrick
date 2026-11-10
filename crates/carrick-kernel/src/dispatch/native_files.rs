@@ -2010,13 +2010,14 @@ mod tests {
                 b"child\n",
                 0,
             );
-            let result = match fixture
-                .dispatcher
-                .serve_native_host_file_in(&fixture.owner, &mut bytes, None)
-            {
-                Ok(_) => host_file::reply(&bytes).unwrap().result,
-                Err(NativeHostFileRefusal) => -38,
-            };
+            let result =
+                match fixture
+                    .dispatcher
+                    .serve_native_host_file_in(&fixture.owner, &mut bytes, None)
+                {
+                    Ok(_) => host_file::reply(&bytes).unwrap().result,
+                    Err(NativeHostFileRefusal) => -38,
+                };
             assert_eq!(
                 result, 6,
                 "{upper:?}: native redirected write returned {result}"
