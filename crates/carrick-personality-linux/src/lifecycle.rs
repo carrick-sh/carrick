@@ -306,6 +306,8 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }
+    fn store_handoff_receipt(&mut self, _receipt: carrick_core_abi::EntryHandoffReceipt<C>) {}
+    fn prepare_object_park(&mut self) {}
     fn take_run_failure(&mut self) -> Option<NativeRunFailureReason> {
         None
     }
