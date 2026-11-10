@@ -1065,11 +1065,13 @@ fn signed_phase_fixture() {
     .unwrap();
 }
 
+#[cfg(test)]
 struct SignedPhaseRun {
     dir: tempfile::TempDir,
     child: std::process::Child,
 }
 
+#[cfg(test)]
 impl SignedPhaseRun {
     fn lock(dir: &std::path::Path) -> std::path::PathBuf {
         dir.join("host.lock")
@@ -1148,6 +1150,7 @@ impl SignedPhaseRun {
     }
 }
 
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(bytes))
@@ -1263,4 +1266,85 @@ fn signed_phases_refuse_an_inherited_shared_lease_before_building() {
     );
     assert_eq!(run.phases(), "", "nothing builds without a path to gate");
     drop(shared);
+}
+
+/// `accept --phase signed` (#2013): the run starts its build phase beside a
+/// shared holder instead of waiting for gate first. Off macOS ARM64 the build
+/// phase stops at the signed platform check, before any gate request.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[test]
+fn signed_accept_starts_its_build_beside_a_shared_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    // drive_signed admits disk through the checkout's own recipe.
+    std::fs::write(repo.join("justfile"), "check-disk:\n    @true\n").unwrap();
+    for args in [
+        &["init", "--quiet"][..],
+        &["add", "justfile"],
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@invalid",
+            "commit",
+            "--no-gpg-sign",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let lock = dir.path().join("host.lock");
+    let holder = HostLease::acquire_path(&lock, HostLeaseMode::Carrick).unwrap();
+    let stderr = dir.path().join("stderr.log");
+    let receipt = dir.path().join("receipt.json");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .arg("--root")
+        .arg(&repo)
+        .args(["accept", "--phase", "signed", "--receipt"])
+        .arg(&receipt)
+        .current_dir(&repo)
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env_remove(carrick_xtask::signed_phase::PHASE_ENV)
+        .env_remove(carrick_xtask::signed_phase::STATE_ENV)
+        .env("CARRICK_HOST_LEASE_PATH", &lock)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + SIGNED_PHASE_BOUND;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!(
+                "signed accept waited behind a shared holder: {}",
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let log = std::fs::read_to_string(&stderr).unwrap();
+    assert!(!status.success(), "{log}");
+    assert!(
+        log.contains("signed phase requires macOS aarch64"),
+        "the build phase must run beside a shared holder: {log}"
+    );
+    assert!(!log.contains("waiting for gate"), "{log}");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(receipt["overall"], "FAIL");
+    drop(holder);
 }

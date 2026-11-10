@@ -438,13 +438,16 @@ where
                 Some((crate::host_lease::HostLeaseMode::Carrick, true))
             }
             Commands::CheckDisk(_) => Some((crate::host_lease::HostLeaseMode::Gate, false)),
+            // Signed runs take carrick for their build and gate only for
+            // guest execution, through the signed-phase driver (#2013).
             Commands::Accept(args) => crate::accept::validate_request_for_host(
                 args,
                 std::env::consts::OS,
                 std::env::consts::ARCH,
             )
             .ok()
-            .map(|_| (crate::host_lease::HostLeaseMode::Gate, true)),
+            .and_then(crate::accept::cli_lease)
+            .map(|mode| (mode, true)),
             Commands::Fixtures(args) => match &args.action {
                 crate::fixtures::FixturesAction::Restore { .. }
                 | crate::fixtures::FixturesAction::Prepare { .. } => {

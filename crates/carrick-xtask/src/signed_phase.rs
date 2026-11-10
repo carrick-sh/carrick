@@ -157,11 +157,7 @@ pub fn run(state: &Path, check_load: bool, command: &[OsString]) -> Result<i32, 
     if command.is_empty() {
         return Err(HostLeaseError::EmptyCommand.into());
     }
-    // An inherited shared lease can never become gate; refuse before the
-    // build spends its time. An inherited gate serves both phases.
-    if HostLease::inherited() {
-        drop(HostLease::acquire(HostLeaseMode::Gate)?);
-    }
+    preflight()?;
     fs::create_dir_all(state).map_err(|source| SignedPhaseError::Io {
         path: state.to_path_buf(),
         source,
@@ -204,6 +200,15 @@ pub fn run(state: &Path, check_load: bool, command: &[OsString]) -> Result<i32, 
         }
     }
     Ok(0)
+}
+
+/// An inherited shared lease can never become gate; refuse before a build
+/// spends its time. An inherited gate serves both phases.
+pub fn preflight() -> Result<(), SignedPhaseError> {
+    if HostLease::inherited() {
+        drop(HostLease::acquire(HostLeaseMode::Gate)?);
+    }
+    Ok(())
 }
 
 /// One phase, inside the lease its supervisor holds.
