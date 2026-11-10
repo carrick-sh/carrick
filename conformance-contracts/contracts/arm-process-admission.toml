@@ -71,11 +71,18 @@ rationale = "Admission creates one native process owner for the retained root an
 # through its own owner. Semantics and budgets are unchanged. Red on main
 # 927df2a8a, green on the fix:
 # carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_host_loaded_root_*.
+# The host's real load publication (`publish_current_task`) feeds that
+# restoration on a reused slot for a host-loaded thread (#2044 review P0 1),
+# and the checkpoint returns a refused admission (`Stale`) or delivery
+# (`Quarantined`, at the declined-fault seam) instead of serving it (P0 2).
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_host_loaded_root_signal_checkpoint_after_another_process_on_the_vcpu",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_host_loaded_root_delivers_pending_signal_once_after_another_process_on_the_vcpu",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_signal_checkpoint_returns_a_stale_admission_refusal",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_declined_fault_returns_a_quarantined_delivery_refusal",
+  "carrick-kernel::el1_delegation::tests::serial_host::host_loaded_thread_home_resume_restores_the_published_binding",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_born_thread_first_entry_after_another_process_on_the_vcpu",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_born_thread_first_entry_on_a_detached_executor",
   "carrick-el1-linux::native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable",
