@@ -6992,7 +6992,21 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
 
     // The holder returns its custody: the release notification wakes the
     // parked caller, whose continuation reruns only the registration.
+    // It keeps a control pin of its own, so the wake is the writer's
+    // return, not the control's final-reference release.
+    let parked = fixture
+        .zone
+        .record(fixture.zone.slot(fixture.slot).host_record().unwrap());
+    assert!(matches!(
+        parked.claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    let pin = carrick_core::lifecycle::MemberControlCustody::retain(child_control).unwrap();
     drop(HELD.lock().unwrap().take());
+    assert!(matches!(
+        parked.claim(),
+        carrick_sched_core::Claim::Queued { .. }
+    ));
     let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
     run_as_leader(fixture);
     let resumed = super::aarch64_process::resume_selected(
@@ -7027,6 +7041,7 @@ fn arm_ring_clone_registration_busy_once_then_succeeds() {
         "SIGUSR1 sent across Busy is pending on the registered child"
     );
     assert_eq!(Lifecycle::live(fixture.page), 3);
+    drop(pin);
 }
 
 #[test]
