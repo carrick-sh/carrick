@@ -607,6 +607,13 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
 /// A real guest birth, handshake and nonfinal raw exit. No fixture-image
 /// ordinals, preseeded members or host-answered clone can satisfy this probe.
 fn production_thread_clone_probe() -> Vec<u8> {
+    production_thread_clone_probe_with(false)
+}
+
+/// [`production_thread_clone_probe`]; with `tgkill`, the parent signals the
+/// child (`tgkill(getpid(), child, 0)`) the instant clone returns, before the
+/// child can have been selected (#1974), and any error fails the probe.
+fn production_thread_clone_probe_with(tgkill: bool) -> Vec<u8> {
     fn mov(code: &mut Vec<u8>, register: &[u8], value: u64) {
         code.extend_from_slice(register);
         code.extend_from_slice(&value.to_le_bytes());
@@ -664,6 +671,15 @@ fn production_thread_clone_probe() -> Vec<u8> {
     failures.push(branch(&mut code, 0x85));
     code.extend_from_slice(&[0x4c, 0x39, 0xf0]); // cmp rax,r14 (distinct tids)
     failures.push(branch(&mut code, 0x84));
+    if tgkill {
+        mov(&mut code, &[0x48, 0xb8], 39); // getpid
+        code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7]); // rdi = tgid
+        code.extend_from_slice(&[0x4c, 0x89, 0xee]); // rsi = child tid
+        mov(&mut code, &[0x48, 0xba], 0); // signal 0: existence probe
+        mov(&mut code, &[0x48, 0xb8], 234); // tgkill
+        code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0]);
+        failures.push(branch(&mut code, 0x85)); // any errno (ESRCH) fails
+    }
     // Parent ran after clone. Release the child's bounded handshake wait.
     code.extend_from_slice(&[0x41, 0xc7, 0x44, 0x24, 0x0c, 1, 0, 0, 0]);
     code.extend_from_slice(&[0x49, 0x8d, 0x7c, 0x24, 0x0c]);
@@ -725,6 +741,28 @@ fn production_clone_thread_runs_and_exits_without_ending_parent() {
     );
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(outcome.physical.initial_execution_witness().unwrap().1, 0);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(56))
+            .unwrap(),
+        0,
+        "clone must be served in ring"
+    );
+}
+
+/// #1974 x86 control: a ring-born x86 child is registered before clone
+/// returns, so the parent's immediate `tgkill(getpid(), child, 0)` succeeds.
+/// x86 roots already hold native stock and register births through
+/// `enqueue_thread`; this stays green before and after the ARM slice.
+#[test]
+fn production_clone_then_immediate_tgkill_reaches_the_child() {
+    let outcome = run_pool_fixture(&production_thread_clone_probe_with(true), 32);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "immediate tgkill of the new child failed (or the clone lifecycle did)"
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(
         outcome
             .physical
