@@ -1339,10 +1339,8 @@ impl HostIpc {
 
     /// Zone wake collection for a host-side object change: the
     /// process-global zone when it serves, else this region's carrier zone.
-    fn object_wake_delivery(&self) -> crate::el1_zone::ObjectWakeDelivery<'_> {
-        crate::el1_zone::ObjectWakeDelivery::for_carrier(
-            self.carrier_zone.get().map(|zone| &**zone),
-        )
+    fn object_wake_delivery(&self) -> crate::el1_zone::ObjectWakeDelivery {
+        crate::el1_zone::ObjectWakeDelivery::for_carrier(self.carrier_zone.get().cloned())
     }
 
     /// Final-description release, after leaving the descriptor table lock.
