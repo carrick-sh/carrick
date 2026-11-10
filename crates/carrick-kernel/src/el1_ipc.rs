@@ -1354,14 +1354,16 @@ impl HostIpc {
                 delivery.collect(wake);
                 drop(guard);
                 delivery.deliver();
-                if let Some(fault) = self.carrier_zone.get().and_then(|c| c.take_undelivered()) {
+                if self
+                    .carrier_zone
+                    .get()
+                    .and_then(|carrier| carrier.take_undelivered())
+                    .is_some()
+                {
                     // The record stays queued, but a halted CPU never runs
                     // it: the release cannot claim the wake was delivered.
-                    carrick_fatal::carrick_fatal!(
-                        "ipc::wake",
-                        "carrier zone wake undelivered: {}",
-                        fault.0
-                    );
+                    // Its callers fail closed on a corrupt release.
+                    return Err(IpcError::Corrupt);
                 }
             }
             self.service_wake(&wake);
