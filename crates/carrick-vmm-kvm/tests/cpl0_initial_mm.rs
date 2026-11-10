@@ -1619,7 +1619,7 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
                 &mut |origin, record| {
                     assert_eq!(origin, carrick_core_abi::service::ServiceOrigin::Descendant);
                     let served = dispatcher
-                        .serve_native_host_file(record)
+                        .serve_native_host_file(record, None)
                         .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
                     served_marker = true;
                     Ok(served.retained_source)
