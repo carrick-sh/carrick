@@ -16,11 +16,11 @@ pub(crate) enum CoreCaptureAttempt {
     /// execution lease, enrols on this wait's release notification, probes
     /// once and reruns the whole capture, which takes a fresh snapshot (a
     /// sibling may have changed memory meanwhile).
-    Busy(carrick_hal::core_read::CoreReadWait),
+    Wait(carrick_hal::core_read::CoreReadWait),
 }
 
 /// Why core capture failed.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) enum CoreCaptureError {
     /// A read waited on the gate of the MM this capture itself excludes.
     /// Only capture can lower that gate, so no release can come: a broken
@@ -50,7 +50,7 @@ impl std::fmt::Display for CoreCaptureError {
 
 /// What ends one capture attempt early.
 enum CaptureStop {
-    Busy(carrick_hal::core_read::CoreReadWait),
+    Wait(carrick_hal::core_read::CoreReadWait),
     Failed(CoreCaptureError),
 }
 
@@ -59,9 +59,12 @@ impl CaptureStop {
         Self::Failed(CoreCaptureError::Runtime(error))
     }
 
-    fn read(error: carrick_hal::core_read::CoreReadError, what: impl FnOnce() -> String) -> Self {
+    fn from_core_read(
+        error: carrick_hal::core_read::CoreReadError,
+        what: impl FnOnce() -> String,
+    ) -> Self {
         match error {
-            carrick_hal::core_read::CoreReadError::Busy(wait) => Self::Busy(wait),
+            carrick_hal::core_read::CoreReadError::Wait(wait) => Self::Wait(wait),
             carrick_hal::core_read::CoreReadError::OwnGate(wait) => {
                 Self::Failed(CoreCaptureError::OwnGate(wait))
             }
@@ -426,9 +429,11 @@ where
             // portal, whose editor admission the same gate refuses: only this
             // capture could release it. Take the typed proof for the exact MM;
             // its nested gate raise is counted and lowered before the pause.
+            let no_zone = Box::new(carrick_sched_core::AddressSpaces::new());
             let snapshot_exclusion =
                 carrick_kernel::kernel::mm_occupancy::exclude_el1_editor_for_core_capture(
                     context.shared().mm().id(),
+                    &no_zone,
                 )
                 .ok_or_else(|| {
                     RuntimeError::Configuration(
@@ -539,7 +544,7 @@ where
                                 let resume_pc =
                                     guest_visible_resume_pc(&*engine, excluded, resume_pc)
                                         .map_err(|error| {
-                                            CaptureStop::read(error, || {
+                                            CaptureStop::from_core_read(error, || {
                                                 format!("read resume island at {resume_pc:#x}")
                                             })
                                         })?;
@@ -806,7 +811,7 @@ where
                             &*engine, excluded, address, to_read,
                         )
                         .map_err(|error| {
-                            CaptureStop::read(error, || {
+                            CaptureStop::from_core_read(error, || {
                                 format!(
                                     "read core region {address:#x}..{:#x}",
                                     address.saturating_add(to_read as u64)
@@ -870,14 +875,14 @@ where
         })();
         let result = match result {
             Ok(prepared) => Ok(CoreCaptureAttempt::Done(prepared)),
-            Err(CaptureStop::Busy(wait)) => Ok(CoreCaptureAttempt::Busy(wait)),
+            Err(CaptureStop::Wait(wait)) => Ok(CoreCaptureAttempt::Wait(wait)),
             Err(CaptureStop::Failed(error)) => Err(error),
         };
         match &result {
             Err(_) => lifecycle(6, 1),
             // A Busy attempt publishes nothing for this generation; its
             // rerun issues a fresh one.
-            Ok(CoreCaptureAttempt::Done(None) | CoreCaptureAttempt::Busy(_)) => lifecycle(6, 2),
+            Ok(CoreCaptureAttempt::Done(None) | CoreCaptureAttempt::Wait(_)) => lifecycle(6, 2),
             Ok(CoreCaptureAttempt::Done(Some(_))) => {}
         }
         finish_crash_collection(authority, barrier, quiesced, lease_drain_guard, result)
@@ -2001,7 +2006,7 @@ pub(crate) mod tests {
         };
 
         let first = capture(&mut engine).expect("another holder's refusal is not a failure");
-        let CoreCaptureAttempt::Busy(carrick_hal::core_read::CoreReadWait::Physical(wait)) = first
+        let CoreCaptureAttempt::Wait(carrick_hal::core_read::CoreReadWait::Physical(wait)) = first
         else {
             panic!("the reader's dependency must come back as Busy");
         };

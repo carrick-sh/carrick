@@ -1560,7 +1560,7 @@ where
         }
         if let RetainedMemoryAction::CoreCapture { context, terminal } = action {
             return Ok(
-                self.continue_persistent_process_terminal_as_owner(engine, terminal, context)
+                self.begin_persistent_process_terminal_with_claim(engine, terminal, context, None)
             );
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1942,7 +1942,7 @@ where
                     "claim persistent process terminal owner failed: {failure}"
                 );
             });
-        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, receipt)
+        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, Some(receipt))
     }
 
     fn begin_persistent_process_terminal_from_exec(
@@ -1972,7 +1972,7 @@ where
         if receipt.claim == ProcessExitClaim::Owner {
             self.kernel.begin_process_exit();
         }
-        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, receipt)
+        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, Some(receipt))
     }
 
     fn begin_persistent_process_terminal_with_claim(
@@ -1980,81 +1980,73 @@ where
         engine: &mut E,
         terminal: PersistentTerminal,
         context: carrick_kernel::kernel::KernelContext,
-        receipt: ProcessExitClaimReceipt,
+        receipt: Option<ProcessExitClaimReceipt>,
     ) -> executor::ExecutorExit {
-        match receipt.claim {
-            ProcessExitClaim::LostToExec | ProcessExitClaim::AlreadyOwned => {
-                self.state.trace_hvpatch_thread_terminal(
-                    carrick_observability::probes::HvpatchThreadTerminalReason::ProcessTerminalLoser,
-                    2,
-                );
-                if self.terminal_runtime == PersistentTerminalRuntimeState::Resident {
-                    if let Err(error) = self.state.capture_child_tid_clear() {
-                        return self.finish(Err(error));
+        // `None`: this is the won, armed owner rerunning a retained core
+        // capture; it claims and arms nothing again.
+        if let Some(receipt) = receipt {
+            match receipt.claim {
+                ProcessExitClaim::LostToExec | ProcessExitClaim::AlreadyOwned => {
+                    self.state.trace_hvpatch_thread_terminal(
+                        carrick_observability::probes::HvpatchThreadTerminalReason::ProcessTerminalLoser,
+                        2,
+                    );
+                    if self.terminal_runtime == PersistentTerminalRuntimeState::Resident {
+                        if let Err(error) = self.state.capture_child_tid_clear() {
+                            return self.finish(Err(error));
+                        }
+                        if !self.state.thread_exit_withdrawn {
+                            let _ = self
+                                .state
+                                .withdraw_persistent_terminal_owner_runtime(&self.kernel);
+                            self.state.thread_exit_withdrawn = true;
+                        }
+                        self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
                     }
-                    if !self.state.thread_exit_withdrawn {
-                        let _ = self
-                            .state
-                            .withdraw_persistent_terminal_owner_runtime(&self.kernel);
-                        self.state.thread_exit_withdrawn = true;
-                    }
-                    self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
+                    self.state.handoff_child_tid_clear();
+                    return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
                 }
-                self.state.handoff_child_tid_clear();
-                return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
-            }
-            ProcessExitClaim::Pending => {
-                tracing::info!(tid = ?self.state.this_tid, "process-terminal claim PENDING parks");
-                let scheduler = self
-                    .kernel
-                    .hvpatch_runtime
-                    .as_ref()
-                    .unwrap_or_else(|| carrick_fatal!("kernel::runtime_binding", "A pending terminal claim cannot subscribe its exact thread without the Kernel HVPatch runtime"))
-                    .continuation_services(context.kernel())
-                    .0;
-                let thread = context.thread().key();
-                let subscription = self.kernel.clone_admission.subscribe_change(
-                    receipt.change_epoch,
-                    Arc::new(move || {
-                        let _ = scheduler.wake(thread);
-                    }),
-                );
-                self.phase = HvpatchProductionPhase::TerminalClaimRetry {
-                    terminal,
-                    context,
-                    _subscription: subscription,
-                };
-                return self.suspend(
-                    HvpatchLoopSuspension::TerminalSiblingDrain,
-                    executor::ExecutorExit::Blocked(
-                        carrick_kernel::kernel::objects::BlockedReason::ChildState,
-                    ),
-                );
-            }
-            ProcessExitClaim::Owner => {
-                self.terminal_settlement
-                    .arm_process_owner()
-                    .unwrap_or_else(|failure| {
-                        tracing::error!(%failure, "arm persistent terminal result owner");
-                        carrick_fatal!(
-                            "kernel::terminal_settlement",
-                            "arm persistent terminal result owner failed: {failure}"
-                        );
-                    });
+                ProcessExitClaim::Pending => {
+                    tracing::info!(tid = ?self.state.this_tid, "process-terminal claim PENDING parks");
+                    let scheduler = self
+                        .kernel
+                        .hvpatch_runtime
+                        .as_ref()
+                        .unwrap_or_else(|| carrick_fatal!("kernel::runtime_binding", "A pending terminal claim cannot subscribe its exact thread without the Kernel HVPatch runtime"))
+                        .continuation_services(context.kernel())
+                        .0;
+                    let thread = context.thread().key();
+                    let subscription = self.kernel.clone_admission.subscribe_change(
+                        receipt.change_epoch,
+                        Arc::new(move || {
+                            let _ = scheduler.wake(thread);
+                        }),
+                    );
+                    self.phase = HvpatchProductionPhase::TerminalClaimRetry {
+                        terminal,
+                        context,
+                        _subscription: subscription,
+                    };
+                    return self.suspend(
+                        HvpatchLoopSuspension::TerminalSiblingDrain,
+                        executor::ExecutorExit::Blocked(
+                            carrick_kernel::kernel::objects::BlockedReason::ChildState,
+                        ),
+                    );
+                }
+                ProcessExitClaim::Owner => {
+                    self.terminal_settlement
+                        .arm_process_owner()
+                        .unwrap_or_else(|failure| {
+                            tracing::error!(%failure, "arm persistent terminal result owner");
+                            carrick_fatal!(
+                                "kernel::terminal_settlement",
+                                "arm persistent terminal result owner failed: {failure}"
+                            );
+                        });
+                }
             }
         }
-        self.continue_persistent_process_terminal_as_owner(engine, terminal, context)
-    }
-
-    /// The won, armed process-terminal owner: capture the core, then retire
-    /// the process. A core read that must wait on another holder parks this
-    /// exact owner on that holder's release and reruns from here.
-    fn continue_persistent_process_terminal_as_owner(
-        &mut self,
-        engine: &mut E,
-        terminal: PersistentTerminal,
-        context: carrick_kernel::kernel::KernelContext,
-    ) -> executor::ExecutorExit {
         let mut terminal = terminal;
         if let PersistentTerminal::Outcome {
             ref outcome,
@@ -2080,7 +2072,7 @@ where
                     .capture_core_for_publication(&self.kernel, engine, fatal)
                 {
                     Ok(CoreCaptureAttempt::Done(prepared)) => *prepared_core = prepared,
-                    Ok(CoreCaptureAttempt::Busy(wait)) => {
+                    Ok(CoreCaptureAttempt::Wait(wait)) => {
                         // Not now: keep the capture, release this executor and
                         // enrol on the holder's release at the next poll.
                         let wait = match wait {
@@ -2103,10 +2095,16 @@ where
                             executor::ExecutorExit::Yielded,
                         );
                     }
-                    Err(CoreCaptureError::OwnGate(wait)) => carrick_fatal!(
-                        "hvpatch::core_capture",
-                        "core read waited on the gate its own capture holds: {wait:?}"
-                    ),
+                    // A broken invariant, never a wait: only this capture could
+                    // lower that gate. It costs the core, never the carrier
+                    // (no new fatal site: the authority-debt ceiling holds).
+                    Err(CoreCaptureError::OwnGate(wait)) => {
+                        tracing::error!(
+                            ?wait,
+                            "core capture invariant broken: a read waited on its own gate"
+                        );
+                        *prepared_core = None;
+                    }
                     Err(CoreCaptureError::Runtime(error)) => {
                         tracing::warn!(%error, "capture core for publication");
                         *prepared_core = None;
