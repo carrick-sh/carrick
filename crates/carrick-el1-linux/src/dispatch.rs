@@ -520,6 +520,14 @@ where
     )
 }
 
+/// Whether the native exec service owns this exec: only a ring-owned fork
+/// child's. A root or host-loaded task execs through the host, on either ISA.
+pub fn native_exec_claimed(
+    owner: impl FnOnce() -> super::native_process_runtime::NativeThreadGroupOwner,
+) -> bool {
+    owner() == super::native_process_runtime::NativeThreadGroupOwner::ForkChild
+}
+
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) fn arm_process_call_claimed(
     nr: u64,
@@ -536,7 +544,7 @@ pub(super) fn arm_process_call_claimed(
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
         || match nr {
-            221 | 281 => owner() == NativeThreadGroupOwner::ForkChild,
+            221 | 281 => native_exec_claimed(owner),
             260 | 93 | 94 | 95 | 58 | 139 => owner() != NativeThreadGroupOwner::Unowned,
             _ => false,
         }
@@ -969,29 +977,15 @@ fn native_exec_stage(frame: &TrapFrame, task: &CurrentTask) -> Option<NativeExec
     if (frame.esr >> 26) & 0x3f != 0x15 {
         return None;
     }
-    let request = match frame.x[8] {
-        221 => crate::exec_stage::ExecStageRequest {
-            call: carrick_core_abi::service::ExecCall::Execve,
-            path: frame.x[0],
-            argv: frame.x[1],
-            envp: frame.x[2],
-        },
-        281 => crate::exec_stage::ExecStageRequest {
-            call: carrick_core_abi::service::ExecCall::Execveat {
-                dirfd: frame.x[0] as i32,
-                flags: frame.x[4] as u32,
-            },
-            path: frame.x[1],
-            argv: frame.x[2],
-            envp: frame.x[3],
-        },
-        _ => return None,
-    };
+    let args = [
+        frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+    ];
+    let request = crate::exec_stage::ExecStageRequest::from_canonical(frame.x[8], args)?;
     native_exec_stage_request(task, &file::HardwareValidator, request)
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-enum NativeExecStage {
+/// What staging a native exec's arguments decided.
+pub enum NativeExecStage {
     Payload(alloc::boxed::Box<[u8]>),
     Fault(carrick_guest_arch::FaultInfo),
     Failed(carrick_syscall_abi::LinuxErrno),
@@ -1184,13 +1178,11 @@ fn native_source_releases<C: Copy + Send + Sync + zerocopy::FromZeros>(
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 use carrick_personality_linux::native_host_file::NativeDescriptor;
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 struct ExecStageCopy<'a, V: file::MemoryValidator> {
     inner: file::ValidatedCopy<'a, V>,
     fault: Option<u64>,
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 impl<V: file::MemoryValidator> file::UserCopy for ExecStageCopy<'_, V> {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
         self.inner.copy_out(dst_va, src)
@@ -1205,8 +1197,7 @@ impl<V: file::MemoryValidator> file::UserCopy for ExecStageCopy<'_, V> {
     }
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn native_exec_stage_request<V: file::MemoryValidator>(
+pub fn native_exec_stage_request<V: file::MemoryValidator>(
     task: &CurrentTask,
     validator: &V,
     request: crate::exec_stage::ExecStageRequest,
@@ -1227,6 +1218,31 @@ fn native_exec_stage_request<V: file::MemoryValidator>(
         }
         (Err(errno), _) => NativeExecStage::Failed(errno),
     })
+}
+
+/// Settle a claimed native child's exec on a venue whose exec service has no
+/// successor hooks yet (x86, until #1093 S3/S4): stage the arguments exactly
+/// as the ARM carrier path does, then refuse with a counted ENOSYS in ring.
+/// Never a host exit and never a hang. Returns the guest return word.
+pub fn settle_native_exec_without_successor<V: file::MemoryValidator>(
+    task: &CurrentTask,
+    validator: &V,
+    request: crate::exec_stage::ExecStageRequest,
+    ordinal: carrick_guest_arch::NativeOrdinal,
+    counters: &Counters,
+) -> i64 {
+    match native_exec_stage_request(task, validator, request) {
+        Some(NativeExecStage::Payload(_)) | None => {
+            counters.record_refusal(
+                ordinal,
+                carrick_core_abi::service::ServiceOrigin::Descendant,
+                carrick_el1_abi::RefusalVenue::Ring,
+            );
+            carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
+        }
+        Some(NativeExecStage::Failed(errno)) => errno.guest_retval(),
+        Some(NativeExecStage::Fault(_)) => carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+    }
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]

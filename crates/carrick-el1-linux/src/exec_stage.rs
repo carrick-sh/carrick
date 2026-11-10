@@ -18,6 +18,33 @@ pub struct ExecStageRequest {
     pub envp: u64,
 }
 
+impl ExecStageRequest {
+    /// The request an `execve`/`execveat` makes, from the canonical argument
+    /// words (`execveat` is `dirfd, path, argv, envp, flags`). Each ISA's
+    /// decoder has already placed its registers in canonical order. `None` for
+    /// any other ordinal.
+    pub fn from_canonical(ordinal: u64, args: [u64; 6]) -> Option<Self> {
+        match ordinal {
+            221 => Some(Self {
+                call: ExecCall::Execve,
+                path: args[0],
+                argv: args[1],
+                envp: args[2],
+            }),
+            281 => Some(Self {
+                call: ExecCall::Execveat {
+                    dirfd: args[0] as i32,
+                    flags: args[4] as u32,
+                },
+                path: args[1],
+                argv: args[2],
+                envp: args[3],
+            }),
+            _ => None,
+        }
+    }
+}
+
 fn reserve(output: &mut Vec<u8>, additional: usize) -> Result<(), LinuxErrno> {
     output.try_reserve(additional).map_err(|_| LINUX_ENOMEM)
 }

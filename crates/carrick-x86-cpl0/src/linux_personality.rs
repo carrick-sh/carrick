@@ -1338,6 +1338,32 @@ impl Personality for LinuxPersonality {
                     native_process::registry()
                         .record_is_fork_child(source.zone, source.zone.record_ref(record))
                 });
+                // A fork child's exec is the native exec service's. It has no
+                // x86 successor hooks yet (#1093 S3/S4), so it stages its
+                // arguments and refuses with a counted ENOSYS; a root's exec
+                // is unclaimed and keeps the refusal below.
+                if let Some(request) =
+                    carrick_el1_linux::exec_stage::ExecStageRequest::from_canonical(
+                        call.canonical.raw(),
+                        call.args,
+                    )
+                    && carrick_el1_linux::dispatch::native_exec_claimed(|| {
+                        if child {
+                            carrick_el1_linux::native_process_runtime::NativeThreadGroupOwner::ForkChild
+                        } else {
+                            carrick_el1_linux::native_process_runtime::NativeThreadGroupOwner::Root
+                        }
+                    })
+                {
+                    frame.rax = carrick_el1_linux::dispatch::settle_native_exec_without_successor(
+                        task,
+                        &carrick_el1_linux::file::HardwareValidator,
+                        request,
+                        carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                        counters,
+                    ) as u64;
+                    return ControlFlow::Return(());
+                }
                 counters.record_refusal(
                     carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
                     if child {
