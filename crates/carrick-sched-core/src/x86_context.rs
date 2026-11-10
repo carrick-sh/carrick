@@ -238,3 +238,36 @@ mod anonymous_restart_tests {
         assert_eq!(words.syscall_return(), 11);
     }
 }
+
+#[cfg(test)]
+mod user_entry_tests {
+    use super::*;
+    use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
+    use core::num::NonZeroU64;
+
+    #[test]
+    fn user_entry_publishes_the_irets_tail_under_the_address_context() {
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::new(7).unwrap()),
+            generation: ContextGeneration::new(NonZeroU64::new(9).unwrap()),
+        };
+        let words = ParkedContextWords::user_entry(address, 0x40_1000, 0x7fff_f000);
+        assert!(words.authenticates(address));
+        assert_eq!(
+            (words.user_rip(), words.user_rsp()),
+            (0x40_1000, 0x7fff_f000)
+        );
+        assert_eq!(&words.frame[16..20], &[0x23, 0x202, 0x7fff_f000, 0x1b]);
+        assert!(valid_user_return_words(
+            words.frame[15],
+            words.frame[18],
+            words.frame[17]
+        ));
+        assert_eq!((words.fs_base, words.gs_base), (0, 0));
+        assert!(words.xsave.iter().all(|byte| *byte == 0));
+        assert!(ParkedContextWords::valid_user_entry(0x40_1000, 0x7fff_f000));
+        assert!(!ParkedContextWords::valid_user_entry(0, 0x7fff_f000));
+        assert!(!ParkedContextWords::valid_user_entry(1 << 47, 0x7fff_f000));
+    }
+}
