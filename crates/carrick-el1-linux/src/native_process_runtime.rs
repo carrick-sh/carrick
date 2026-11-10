@@ -5801,6 +5801,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             PendingContinuation::Ipc(pending) => Some(self.resume_ipc(pending)),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn register_born_before_requeue_for_test(
+        &self,
+        record: RecordRef,
+    ) -> Result<bool, NativeProcessError> {
+        let registry = (*self.runtime.registry.lock()).ok_or(NativeProcessError::Stale)?;
+        registry.register_native_birth(self.runtime, self.key, self.source, record)
+    }
     // Keep parking scratch out of the status-copy branch of wait_query.
     #[inline(never)]
     fn park_continuation(
