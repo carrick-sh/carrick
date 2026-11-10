@@ -285,12 +285,15 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
   from each merge group's own Signed queue gate.
 - **Host-lease serialization (`/tmp/carrick-host-lease.lock`):**
   - `hvf-kernel` builds its checkout xtask under the **shared** `just lease carrick` (it no
-    longer runs `just ci`; hosted CI covers it, #2057). Fixture restoration takes **exclusive**
-    `just lease gate`; `just accept --phase signed` and `Signed embedded guest tests` then build
-    and sign under shared `carrick` and take exclusive `gate` themselves only while guests
-    execute (#2013).
-  - Director gates (`just accept`, `just remote-accept` on `/Volumes/carrick-gate`) take
-    exclusive `gate` mode for guest execution and shared `carrick` for their builds.
+    longer runs `just ci`; hosted CI covers it, #2057). Fixture restoration and `Signed embedded
+    guest tests` hold an **exclusive** `just lease gate`. `just accept --phase signed` takes its
+    own leases (#2013 stage 2): `gate` for disk admission, shared `carrick` for its release build
+    and signing, then `gate` again for guest execution, after re-checking that the signed binary
+    and every installed fixture are unchanged.
+  - Director gates (`just accept`, `just remote-accept` on `/Volumes/carrick-gate`) lease the
+    same way: `gate` for disk admission, fixture restoration and guest execution, shared
+    `carrick` for accept's build. A PR job's shared steps can run beside accept's build, and
+    accept's execution then waits for them like any `gate` request.
   - `ci.yml`'s `carrick-macos-ci` PR jobs (`macos-clippy`, `macos-build`, `macos-unit-a`,
     `macos-unit-b`, `macos-integration`) prebuild `carrick-xtask` (`just ci-prebuild-xtask`)
     and run every compile, lint, rustdoc, and test step under **shared** `just lease carrick`.
