@@ -1083,6 +1083,7 @@ fn signed_phase_fixture() {
 /// `codesign -s -` under identifier `tag`), so the production identity
 /// probe reads its CDHash and LC_UUID; elsewhere no host signs, and the
 /// SHA-256 of `tag`'s bytes is the identity.
+#[cfg(test)]
 fn write_signed_artifact(path: &std::path::Path, tag: &str) {
     #[cfg(target_os = "macos")]
     {
@@ -1342,12 +1343,14 @@ fn signed_phases_refuse_an_inherited_shared_lease_before_building() {
 /// A committed checkout whose `check-disk` recipe records its admission
 /// outside the checkout, and a `carrick-xtask accept --phase signed` run on
 /// it under `CARRICK_HOST_LEASE_PATH`, optionally inside an outer lease.
+#[cfg(test)]
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 struct SignedAcceptRun {
     dir: tempfile::TempDir,
     child: std::process::Child,
 }
 
+#[cfg(test)]
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 impl SignedAcceptRun {
     fn lock(dir: &std::path::Path) -> std::path::PathBuf {
