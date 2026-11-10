@@ -363,34 +363,32 @@ fn signal_resched<M: CarrierMemoryIo>(
 /// and APIC routes live in guest RAM this sink retains; the host IPC owner
 /// delivers through it when no process-global zone serves.
 struct CarrierZoneWakeSink<M: CarrierMemoryIo> {
-    ram: Arc<GuestRam>,
+    _ram: Arc<GuestRam>,
+    zone: std::ptr::NonNull<X86Cpl0Zone>,
+    routes: std::ptr::NonNull<PublishedApicIds>,
     vm: Arc<M>,
+    /// The first reschedule this carrier could not deliver. A failed MSI
+    /// leaves the wake queued (`resched_owed`) for the CPU's next entry.
+    resched_fault: std::sync::OnceLock<TrapError>,
 }
-impl<M: CarrierMemoryIo> CarrierZoneWakeSink<M> {
-    fn routes(&self) -> &PublishedApicIds {
-        let pointer = self
-            .ram
-            .host_ptr(META_GPA + ROUTES_OFFSET, size_of::<PublishedApicIds>())
-            .unwrap_or_else(|| {
-                carrick_fatal::carrick_fatal!("cpl0::wake", "retained APIC routes absent")
-            });
-        // SAFETY: bootstrap initialized this retained aligned atomic record;
-        // `ram` retains it for this sink's lifetime (checked at creation).
-        unsafe { &*pointer.cast::<PublishedApicIds>() }
-    }
-}
+// SAFETY: both pointers name retained, aligned, atomic-only records inside
+// `_ram`, which this sink keeps alive; they are only read through shared
+// references.
+unsafe impl<M: CarrierMemoryIo> Send for CarrierZoneWakeSink<M> {}
+// SAFETY: as above.
+unsafe impl<M: CarrierMemoryIo> Sync for CarrierZoneWakeSink<M> {}
 impl<M: CarrierMemoryIo> carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>
     for CarrierZoneWakeSink<M>
 {
     fn zone(&self) -> &X86Cpl0Zone {
-        retained_cow_zone(&self.ram).unwrap_or_else(|_| {
-            carrick_fatal::carrick_fatal!("cpl0::wake", "retained carrier zone absent")
-        })
+        // SAFETY: validated at creation; retained by `_ram`.
+        unsafe { self.zone.as_ref() }
     }
     fn resched(&self, slot: SlotId) {
-        // A route or MSI failure is a broken carrier, not contention.
-        if let Err(error) = signal_resched(self.routes(), &*self.vm, slot) {
-            carrick_fatal::carrick_fatal!("cpl0::wake", "carrier zone reschedule: {error}");
+        // SAFETY: validated at creation; retained by `_ram`.
+        let routes = unsafe { self.routes.as_ref() };
+        if let Err(error) = signal_resched(routes, &*self.vm, slot) {
+            let _ = self.resched_fault.set(error);
         }
     }
 }
@@ -403,11 +401,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         Arc<dyn carrick_sched_core::CarrierZoneWake<carrick_sched_core::ParkedContextWords>>,
         TrapError,
     > {
-        retained_cow_zone(&self.ram)?;
-        HostCowWake::new(&self.ram, self._vm.clone_vm())?;
+        let zone = std::ptr::NonNull::from(retained_cow_zone(&self.ram)?);
+        let routes =
+            std::ptr::NonNull::from(HostCowWake::new(&self.ram, self._vm.clone_vm())?.routes);
         Ok(Arc::new(CarrierZoneWakeSink {
-            ram: Arc::clone(&self.ram),
+            _ram: Arc::clone(&self.ram),
+            zone,
+            routes,
             vm: self._vm.clone_vm(),
+            resched_fault: std::sync::OnceLock::new(),
         }))
     }
 }
