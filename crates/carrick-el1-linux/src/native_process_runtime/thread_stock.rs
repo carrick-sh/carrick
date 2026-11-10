@@ -8,8 +8,19 @@ pub(super) struct NativeThreadStock<'a, C: ProcessContext> {
     controls: &'a [ThreadControlSlot],
     identities: StockEntries<NativeClaim<'a>>,
     waiters: Vec<carrick_el1_abi::RecordRef>,
+    /// Clone callers parked as the owned continuation of a published birth
+    /// whose registration was Busy (#1974). Same release notification.
+    born_waiters: Vec<BornRegistrationWait>,
     release: Arc<ControlRelease<'a, C>>,
     namespace_exhausted: bool,
+}
+/// The retained state of one post-Born registration continuation: the
+/// parked clone caller, its Born child and the caller's clone result.
+#[derive(Clone, Copy)]
+struct BornRegistrationWait {
+    caller: carrick_el1_abi::RecordRef,
+    child: carrick_el1_abi::RecordRef,
+    result: SyscallResult,
 }
 struct ControlRelease<'a, C: ProcessContext> {
     zone: &'a ZoneTables<C>,
@@ -25,17 +36,21 @@ impl<C: ProcessContext> carrick_core::lifecycle::MemberControlRelease for Contro
     }
 }
 impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
+    /// `None`: the page already lends a pool identity from another stocker.
     pub(super) fn new_root(
         page: &ThreadLifecyclePage,
         controls: &'a [ThreadControlSlot],
         zone: &'a ZoneTables<C>,
         record: RecordRef,
-    ) -> Result<Self, NativeProcessError> {
-        let identities =
-            StockEntries::for_fresh_root(page).map_err(|_| NativeProcessError::Invalid)?;
+    ) -> Result<Option<Self>, NativeProcessError> {
+        let identities = match StockEntries::for_fresh_root(page) {
+            Ok(identities) => identities,
+            Err(carrick_core::lifecycle::TransitionError::WrongState(_)) => return Ok(None),
+            Err(_) => return Err(NativeProcessError::Invalid),
+        };
         let mut stock = Self::new(controls, zone, record)?;
         stock.identities = identities;
-        Ok(stock)
+        Ok(Some(stock))
     }
     pub(super) fn new(
         controls: &'a [ThreadControlSlot],
@@ -73,6 +88,7 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
                         identities: StockEntries::default(),
                         namespace_exhausted: false,
                         waiters: Vec::with_capacity(carrick_el1_abi::THREAD_POOL_ENTRIES + 1),
+                        born_waiters: Vec::with_capacity(carrick_el1_abi::THREAD_POOL_ENTRIES + 1),
                         release: Arc::new(ControlRelease {
                             zone,
                             source: ticket,
@@ -283,7 +299,7 @@ pub(super) fn admission_settled<M: Clone, C: ProcessContext>(
             .task(key)
             .ok()
             .and_then(|task| task.native().resources().thread_stock.as_ref())
-            .filter(|stock| !stock.waiters.is_empty())
+            .filter(|stock| !stock.waiters.is_empty() || !stock.born_waiters.is_empty())
             .map(|stock| stock.release.clone())
     };
     if let Some(release) = release {
@@ -441,11 +457,148 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
     pub(super) fn clear_thread_stock_wait(&self) {
-        let mut graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task_mut(self.key)
-            && let Some(stock) = task.native_mut().resources_mut().thread_stock.as_mut()
-        {
+        let abandoned = {
+            let mut graph = self.runtime.graph.lock();
+            let Ok(task) = graph.owner.task_mut(self.key) else {
+                return;
+            };
+            let Some(stock) = task.native_mut().resources_mut().thread_stock.as_mut() else {
+                return;
+            };
             stock.waiters.retain(|record| *record != self.record);
+            take_born_wait(stock, self.record)
+        };
+        // A caller leaving its post-Born continuation (process close) hands
+        // the still-Born child to the scheduler: its own first entry is an
+        // issued native admission that registers it and observes the close.
+        if let Some(wait) = abandoned {
+            let _ = self
+                .source
+                .zone
+                .requeue_preempted(self.source.slot, wait.child.id);
+        }
+    }
+
+    /// Finish a published birth whose registration was Busy, as its clone
+    /// caller's owned post-Born continuation (#1974). The child stays Born,
+    /// unqueued and record-keyed, so its pending signals and its one Born and
+    /// tid publication are untouched. The caller enrols on the stock's
+    /// release notification (armed on the child's control, whose registration
+    /// custody a holder returns), probes registration once under that
+    /// enrolment, and otherwise parks, releasing its execution lease; the
+    /// notification reruns it. Only a broken invariant is an error.
+    pub(super) fn await_born_registration(
+        &mut self,
+        child: RecordRef,
+        result: SyscallResult,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
+        let (release, control) = {
+            let graph = self.runtime.graph.lock();
+            let resources = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native()
+                .resources();
+            let stock = resources
+                .thread_stock
+                .as_ref()
+                .ok_or(NativeProcessError::Stale)?;
+            let control = resources
+                .owned_control(self.source.zone.record(child.id).identity().control_slot)
+                .ok_or(NativeProcessError::Stale)?;
+            (stock.release.clone(), control)
+        };
+        let key = release.source.key();
+        let zone = self.source.zone;
+        let caller = self.record;
+        loop {
+            match self.register_born(child) {
+                Ok(closing) => {
+                    return match self.queue_registered_birth(child, closing) {
+                        carrick_personality_linux::lifecycle::BornEnqueue::Queued => {
+                            Ok(LifecycleOutcome::Returned {
+                                result,
+                                work: false,
+                            })
+                        }
+                        _ => Err(NativeProcessError::Stale),
+                    };
+                }
+                Err(NativeProcessError::Busy) => {}
+                Err(error) => return Err(error),
+            }
+            let token = OperationToken::new(u64::from(key.index()), key.generation())
+                .ok_or(NativeProcessError::Stale)?;
+            let parked = carrick_core::wait::park_object_record(
+                zone,
+                self.source.slot,
+                carrick_core::wait::ObjectParkRequest::owner(
+                    key,
+                    token,
+                    OwnerEntry::Syscall,
+                    // SAFETY: the save_context closure below arms the child
+                    // control's release under this same object queue and then
+                    // reprobes the custody its registration waits for.
+                    unsafe {
+                        carrick_core::wait::OwnerProbeUnderQueueLock::for_save_context_probe()
+                    },
+                ),
+                &|owned| crate::sched::object_wait::deliver_host_completion(zone, owned),
+                || {
+                    // SAFETY: the stock retains this release source and the
+                    // control extent until final-pin settlement.
+                    let _ = unsafe {
+                        carrick_core::lifecycle::arm_member_release(control, release.clone())
+                    };
+                    // Pairs with the holder's fence between returning its
+                    // custody and notifying: one of the two sees the other.
+                    // The registry is never locked under this queue.
+                    core::sync::atomic::fence(Ordering::SeqCst);
+                    if !control.native_pending_custody_held() {
+                        return Err(ObjectWaitError::Changed);
+                    }
+                    let mut graph = self.runtime.graph.lock();
+                    let stock = graph
+                        .owner
+                        .task_mut(self.key)
+                        .map_err(|_| ObjectWaitError::Stale)?
+                        .native_mut()
+                        .resources_mut()
+                        .thread_stock
+                        .as_mut()
+                        .ok_or(ObjectWaitError::Stale)?;
+                    if stock.born_waiters.iter().any(|wait| wait.caller == caller)
+                        || stock.born_waiters.len() == stock.born_waiters.capacity()
+                    {
+                        return Err(ObjectWaitError::Stale);
+                    }
+                    stock.born_waiters.push(BornRegistrationWait {
+                        caller,
+                        child,
+                        result,
+                    });
+                    // The queue is enrolled before this final probe. Only the
+                    // release notification wakes the retained continuation.
+                    unsafe {
+                        *zone.record(caller.id).ctx_mut() = *self.words;
+                    }
+                    Ok((caller.id, false))
+                },
+            );
+            match parked {
+                Ok(mut parked) => {
+                    self.handoff = parked.take_receipt();
+                    return Ok(LifecycleOutcome::Transferred {
+                        progress: carrick_core::Served::Idle,
+                        result: SyscallResult::new(0),
+                    });
+                }
+                // The custody was returned before enrolment: rerun.
+                Err((ObjectWaitError::Changed, _)) => {}
+                Err(_) => return Err(NativeProcessError::Stale),
+            }
         }
     }
     /// Resume a clone caller parked on the thread stock, or report no
@@ -460,7 +613,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .map_err(NativeProcessError::run_failure_reason)
     }
     fn take_thread_stock_wait(&mut self) -> Result<Option<NativeResume>, NativeProcessError> {
-        let key = {
+        let (key, born) = {
             let graph = self.runtime.graph.lock();
             let task = graph
                 .owner
@@ -469,10 +622,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let Some(stock) = task.native().resources().thread_stock.as_ref() else {
                 return Ok(None);
             };
-            if !stock.waiters.contains(&self.record) {
+            let born = stock
+                .born_waiters
+                .iter()
+                .find(|wait| wait.caller == self.record)
+                .copied();
+            if born.is_none() && !stock.waiters.contains(&self.record) {
                 return Ok(None);
             }
-            stock.release.source.key()
+            (stock.release.source.key(), born)
         };
         let token = carrick_core::wait::take_object_operation(
             self.source.zone,
@@ -484,7 +642,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if token.index() != u64::from(key.index()) || token.generation() != key.generation() {
             return Err(NativeProcessError::Stale);
         }
-        self.clear_thread_stock_wait();
+        if born.is_some() {
+            let mut graph = self.runtime.graph.lock();
+            if let Some(stock) = graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native_mut()
+                .resources_mut()
+                .thread_stock
+                .as_mut()
+            {
+                take_born_wait(stock, self.record);
+            }
+        } else {
+            self.clear_thread_stock_wait();
+        }
         // SAFETY: the selected record owns this exact Syscall continuation;
         // its token was consumed above and no guest instruction resumed.
         unsafe {
@@ -493,8 +666,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .record(self.record.id)
                 .consume_owner_continuation();
         }
-        Ok(Some(NativeResume::RetrySyscall))
+        let Some(born) = born else {
+            return Ok(Some(NativeResume::RetrySyscall));
+        };
+        // The clone already committed: rerun only its birth's registration,
+        // then complete the caller with its retained result (never a retry).
+        Ok(Some(
+            match self.await_born_registration(born.child, born.result)? {
+                LifecycleOutcome::Returned { result, .. } => NativeResume::Returned(result),
+                _ => NativeResume::Left(None),
+            },
+        ))
     }
+}
+
+fn take_born_wait<C: ProcessContext>(
+    stock: &mut NativeThreadStock<'_, C>,
+    caller: RecordRef,
+) -> Option<BornRegistrationWait> {
+    let index = stock
+        .born_waiters
+        .iter()
+        .position(|wait| wait.caller == caller)?;
+    Some(stock.born_waiters.swap_remove(index))
 }
 
 #[cfg(test)]

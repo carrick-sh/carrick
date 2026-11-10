@@ -202,7 +202,10 @@ pub(super) fn admit_root(
             carrick_el1_abi::THREAD_POOL_ENTRIES + 1,
         )
     };
-    owner.admit_thread_stock(NativeLifecycleResources { page, controls })?;
+    // The bootstrap page is fresh: no other stocker has lent an identity.
+    if !owner.admit_thread_stock(NativeLifecycleResources { page, controls })? {
+        return Err(NativeProcessError::Invalid);
+    }
     REGISTRY.register_root(Arc::new(owner), source, task, address)?;
     let binding =
         carrick_el1::isa::x86::context::current_cpu_binding().ok_or(NativeProcessError::Stale)?;

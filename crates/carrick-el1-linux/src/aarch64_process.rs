@@ -624,9 +624,21 @@ fn admit_entry_runtime(
         address.mm.raw().get(),
         address.generation.raw().get(),
     );
-    let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source, task, page, control, address, address, words,
-    )?);
+    )?;
+    // Like an x86 root and every native fork child, the root holds the shared
+    // native thread stock, so its ring births are managed and registered
+    // before they can run (#1974). The carrier published this page as a whole
+    // lifecycle slot and stopped its host ledger stocking it. A page the
+    // ledger stocked before that publication keeps its births unmanaged.
+    if page.serves_threads() {
+        // SAFETY: the ARM carrier publishes every root page as the head of a
+        // retained `ThreadLifecycleSlot` granule for the carrier's lifetime.
+        let controls = unsafe { carrick_el1_abi::ThreadLifecycleSlot::controls_of(page) };
+        runtime.admit_thread_stock(NativeLifecycleResources { page, controls })?;
+    }
+    let runtime = Arc::new(runtime);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
     Ok((runtime, address))
 }

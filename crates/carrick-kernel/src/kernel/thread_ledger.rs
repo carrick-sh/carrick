@@ -996,10 +996,10 @@ impl ThreadLedger {
         publisher: &KernelContext,
     ) {
         let depth = self.pool_depth();
-        if depth == 0
-            || publisher.thread().control_lease().lifecycle().gate()
-                != carrick_el1_abi::GateState::Open
-        {
+        let page = publisher.thread().control_lease().lifecycle();
+        // One stocker per page: a page ceded to its ring root's native stock
+        // is never stocked here, whatever the host-side clone that published.
+        if depth == 0 || page.ring_owns_stock() || page.gate() != carrick_el1_abi::GateState::Open {
             return;
         }
         let Some(record) = state.tasks.get(&publisher.task().key().id) else {
@@ -1057,7 +1057,7 @@ impl ThreadLedger {
                 record,
                 uid,
                 limit,
-                page: publisher.thread().control_lease().lifecycle(),
+                page,
             },
             depth,
         );
@@ -3547,6 +3547,104 @@ mod tests {
         assert_ne!(second.thread().key().serial.raw(), native_unpublished.get());
         let later_native = zone.serial_issuer().allocate().unwrap();
         assert!(after.iter().all(|serial| *serial < later_native.get()));
+    }
+
+    /// #1974, one stocker per page: once the carrier cedes a page's stock to
+    /// its ring root (publication with thread births served), production host
+    /// clones never restock it, before or after `execve` (which keeps the
+    /// page); a fork child's page is its own slot, stocked by whichever owner
+    /// its own publication picks. A page never ceded keeps the ledger.
+    #[test]
+    fn ceded_pages_are_never_restocked_across_fork_and_exec() {
+        let (kernel, root) = bootstrap(9_590);
+        kernel.registry().thread_ledger().set_pool_depth_for_test(4);
+        let standing = |context: &KernelContext| {
+            let page = context.thread().control_lease().lifecycle();
+            (0..page.entry_count())
+                .filter(|&index| {
+                    page.state(index)
+                        .is_some_and(|(_, state)| state == EntryState::Reserved)
+                })
+                .count()
+        };
+        let clone = |context: &KernelContext, tid: i32| {
+            kernel
+                .clone_thread(
+                    context,
+                    thread_plan(),
+                    ThreadId::synthetic_for_tests(tid),
+                    None,
+                )
+                .expect("host thread clone")
+        };
+        // The fork child is created before the root page is ceded, and its
+        // page is never published to a ring: the ledger still stocks it.
+        let unceded = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_591),
+                "unceded child".into(),
+                None,
+            )
+            .expect("fork");
+        root.thread()
+            .control_lease()
+            .lifecycle()
+            .cede_stock_to_ring();
+        let _first = clone(&root, 9_592);
+        assert_eq!(standing(&root), 0, "the ledger stocked a ceded root page");
+        assert!(
+            kernel
+                .standing_thread_identities(root.task().key().id)
+                .is_empty()
+        );
+        let _sibling = clone(&unceded, 9_593);
+        assert_eq!(standing(&unceded), 4, "an unceded page keeps the ledger");
+
+        // A fork child ceded by its own publication is never stocked.
+        let child = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_594),
+                "ceded child".into(),
+                None,
+            )
+            .expect("fork");
+        assert!(!child.thread().control_lease().lifecycle().ring_owns_stock());
+        child
+            .thread()
+            .control_lease()
+            .lifecycle()
+            .cede_stock_to_ring();
+        let _child_thread = clone(&child, 9_595);
+        assert_eq!(standing(&child), 0, "the ledger stocked a ceded child page");
+
+        // execve keeps the ceded page: the successor is still never stocked.
+        let root = {
+            let state = kernel.registry().settled().read();
+            let record = state.tasks.get(&root.task().key().id).expect("root task");
+            KernelContext::from_parts(
+                kernel.clone(),
+                record.task.clone(),
+                root.thread().clone(),
+                record.task.shared(),
+                root.thread().resources(),
+                record.revision,
+            )
+        };
+        let prepared = kernel.prepare_exec(&root, None).expect("prepare exec");
+        let successor = kernel.commit_exec(prepared, None).expect("commit exec");
+        assert!(
+            successor
+                .thread()
+                .control_lease()
+                .lifecycle()
+                .ring_owns_stock()
+        );
+        let _after_exec = clone(&successor, 9_596);
+        assert_eq!(standing(&successor), 0, "the ledger stocked after exec");
     }
 
     /// `CARRICK_THREAD_POOL=0`: no standing entries; each clone reserves its

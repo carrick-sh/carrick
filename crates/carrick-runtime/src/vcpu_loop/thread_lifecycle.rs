@@ -176,6 +176,9 @@ impl CarrierLifecycleMappings {
                     ));
                 }
                 if lifecycle.serves_threads() {
+                    // The mapped granule is the page's whole lifecycle slot,
+                    // control extent included: the ring root stocks it.
+                    lifecycle.cede_stock_to_ring();
                     if let Some(activity) = lifecycle.ledger_activity() {
                         let offset =
                             activity.activity_address().raw() - activity.backing_base().raw();

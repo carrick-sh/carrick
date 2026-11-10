@@ -75,6 +75,19 @@ impl<
         (venue.binding() == binding).then_some(venue)
     }
 
+    /// ARM's first-entry timer obligation for a birth the process venue just
+    /// registered and queued (the same obligation `Sched::enqueue_born` keeps).
+    fn arm_born_runnable(&mut self) {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+            return;
+        };
+        let (Some(slot), Some(zone)) = (self.frame.slot(), self.zone.as_mut()) else {
+            return;
+        };
+        native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+            .arm_published_runnable();
+    }
+
     fn run_ready_after_native_transfer(&mut self, outcome: &mut LifecycleOutcome) {
         if let LifecycleOutcome::Transferred { progress, .. } = outcome
             && matches!(progress, carrick_core::Served::Idle)
@@ -390,7 +403,7 @@ impl<
         (venue.binding() == binding && venue.has_thread(tid)).then_some(binding)
     }
 
-    fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
+    fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<BornEnqueue, i64> {
         let mut process = self.process.take();
         let result = if let Some(venue) = process.as_deref_mut() {
             if Some(venue.binding()) != LifecycleNative::binding(self) {
@@ -412,10 +425,35 @@ impl<
         // under the graph guard; that caller instead rolls back live/claim
         // custody before publishing the settlement wake. Born is published,
         // so a refused enqueue is not a clone failure: fail closed (#1100).
-        if self.enqueue_born(birth.record) == BornEnqueue::Refused {
+        // Busy registration is contention: the clone caller awaits it.
+        let enqueued = self.enqueue_born(birth.record);
+        if enqueued == BornEnqueue::Refused {
             self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BornEnqueueRefused);
         }
-        Ok(())
+        Ok(enqueued)
+    }
+    fn await_born_registration(
+        &mut self,
+        record: RecordRef,
+        result: SyscallResult,
+    ) -> LifecycleOutcome {
+        let outcome = self
+            .process_venue()
+            .and_then(|venue| venue.await_thread_registration(record, result));
+        match outcome {
+            Some(outcome) => {
+                if self.frame.arm_scheduler()
+                    && matches!(outcome, LifecycleOutcome::Returned { .. })
+                {
+                    // Registered and queued without parking the caller.
+                    self.arm_born_runnable();
+                }
+                outcome
+            }
+            None => {
+                self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BornEnqueueRefused)
+            }
+        }
     }
     fn thread_exited(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         if let Some(venue) = self.process_venue() {
@@ -722,10 +760,25 @@ impl<
             aarch64_child_vdso_identity(ctx.native.tpidrro_el0, context.visible_tid);
     }
     fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue {
-        if !self.frame.arm_scheduler() {
-            return self
+        // A managed birth (native thread stock, either ISA) registers its
+        // native member through the process venue before it can be selected
+        // (#1974). ARM keeps only its first-entry timer obligation here.
+        let managed = self.zone.as_ref().map_or_else(
+            || {
+                self.source.is_some_and(|source| {
+                    source.zone.record(record.id).has_native_execution_owner()
+                })
+            },
+            |zone| zone.tables.record(record.id).has_native_execution_owner(),
+        );
+        if !self.frame.arm_scheduler() || managed {
+            let enqueued = self
                 .process_venue()
                 .map_or(BornEnqueue::Refused, |venue| venue.enqueue_thread(record));
+            if self.frame.arm_scheduler() && enqueued == BornEnqueue::Queued {
+                self.arm_born_runnable();
+            }
+            return enqueued;
         }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return BornEnqueue::Refused;

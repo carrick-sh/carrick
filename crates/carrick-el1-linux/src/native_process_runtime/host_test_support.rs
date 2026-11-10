@@ -10580,3 +10580,210 @@ fn x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root() {
         assert_eq!(counters.venue_refused[bucket].load(Ordering::Relaxed), 0);
     }
 }
+
+/// #1974 control on x86 context words: the production clone family through
+/// an x86 frame (`arm_scheduler() == false`), whose births have always
+/// registered through `NativeProcessEntry::enqueue_thread`. There is no x86
+/// red for slice 1: this is the shared post-Born continuation, Busy once on
+/// the child's pending-signal writer, then success when it is returned.
+#[test]
+#[cfg(test)]
+fn x86_ring_clone_registration_busy_once_then_succeeds() {
+    use carrick_personality_linux::dispatch::SyscallFrame;
+    struct Frame(carrick_el1_abi::TrapFrame);
+    impl SyscallFrame for Frame {
+        fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+            self.0.canonical_ordinal()
+        }
+        fn argument(&self, index: usize) -> Option<u64> {
+            self.0.argument(index)
+        }
+        fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+            self.0.result()
+        }
+        fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
+            self.0.set_result(result);
+        }
+        fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
+            self.0.slot()
+        }
+        fn user_sp(&self) -> Option<UserVa> {
+            self.0.user_sp()
+        }
+    }
+    impl crate::dispatch::GuestDispatchFrame for Frame {
+        fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+            carrick_guest_arch::NativeOrdinal::new(56)
+        }
+        fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+            carrick_personality_linux::crossing::HostCrossingSet::X86
+        }
+        fn can_capture_thread_child(&self, _: UserVa, _: Option<UserVa>) -> bool {
+            true
+        }
+        fn capture_x86_thread_child(
+            &self,
+            _: &mut ParkedContextWords,
+            _: &crate::lifecycle::ChildContext,
+        ) -> bool {
+            true
+        }
+        fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> {
+            None
+        }
+        fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> {
+            None
+        }
+        fn arm_scheduler(&self) -> bool {
+            false
+        }
+        fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+            None
+        }
+    }
+    use crate::thread_setup::{LifecycleThread, LifecycleVenue};
+    struct Venue {
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+    }
+    impl LifecycleVenue for Venue {
+        fn thread<'a>(&'a self, _: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
+            Some(LifecycleThread {
+                page: self.page,
+                slot: self.control,
+            })
+        }
+        fn born_slot(
+            &self,
+            page: &ThreadLifecyclePage,
+            entry: EntryRef,
+        ) -> Option<&ThreadControlSlot> {
+            // SAFETY: the stock bound this retained extent slot to the entry.
+            page.control_address(entry)
+                .map(|address| unsafe { &*(address as *const ThreadControlSlot) })
+        }
+    }
+    let fixture = native_exec_fixture();
+    let controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+        ThreadControlSlot::new()
+    })));
+    assert!(
+        fixture
+            .runtime
+            .admit_thread_stock(NativeLifecycleResources {
+                page: fixture.page,
+                controls,
+            })
+            .unwrap()
+    );
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    type Writer = carrick_el1_abi::NativePendingCustody<'static>;
+    static HELD: std::sync::Mutex<Option<(Writer, usize)>> = std::sync::Mutex::new(None);
+    install_born_registration_hook(
+        &fixture.runtime,
+        Box::new(|control| {
+            // SAFETY: the address is the birth's control in the leaked extent.
+            let control: &'static ThreadControlSlot =
+                unsafe { &*(control as usize as *const ThreadControlSlot) };
+            let writer = carrick_el1_abi::NativePendingCustody::try_admit(Arc::new(
+                carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap(),
+            ))
+            .unwrap();
+            *HELD.lock().unwrap() = Some((writer, control as *const _ as usize));
+        }),
+    );
+    let members = fixture.registry.member_count();
+    let venue = Venue {
+        page: fixture.page,
+        control: fixture.control,
+    };
+    let mut service = fixture.service();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let mut frame = Frame(carrick_el1_abi::TrapFrame::default());
+        frame.0.x[8] = 220;
+        frame.0.x[0] = 0x0005_0f00;
+        frame.0.x[1] = 0x7f00_0000;
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &carrick_el1_abi::Counters::new(),
+            core::slice::from_ref(fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &carrick_el1_abi::InotifyNameCache::new(),
+            None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            Some(&venue),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            route,
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+            "Busy parks the clone caller instead of failing the run"
+        );
+        assert!(entry.take_run_failure().is_none());
+    }
+    let control_address = HELD.lock().unwrap().as_ref().unwrap().1;
+    // SAFETY: the child's control lives in the leaked extent.
+    let child_control: &'static ThreadControlSlot =
+        unsafe { &*(control_address as *const ThreadControlSlot) };
+    let child = child_control.zone_record().unwrap();
+    let tid = child_control.visible_tid().unwrap();
+    assert_eq!(fixture.registry.member_count(), members);
+    assert_eq!(
+        fixture.zone.record(child.id).claim(),
+        carrick_sched_core::Claim::Free
+    );
+    drop(HELD.lock().unwrap().take());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    // SAFETY: the selected record's continuation is quiescent here.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::Returned(result) if result.raw() == i64::from(tid)
+        ),
+        "the clone caller completes with the child tid exactly once"
+    );
+    assert!(entry.take_run_failure().is_none());
+    drop(entry);
+    assert_eq!(fixture.registry.member_count(), members + 1);
+    assert!(matches!(
+        fixture.zone.record(child.id).claim(),
+        carrick_sched_core::Claim::Queued { .. }
+    ));
+}

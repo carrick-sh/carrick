@@ -472,6 +472,21 @@ pub unsafe fn arm_member_release<'a, R: MemberControlRelease + 'a>(
     }
 }
 
+/// Wake the control's armed release observer when a custody that is not a
+/// control reference (the native pending-signal writer) is returned. A
+/// registration that found that custody held enrolled on exactly this
+/// observer; it reprobes, and an observer still waiting for the final
+/// reference re-arms on its own probe. The caller fences (`SeqCst`) between
+/// returning its custody and this call, pairing with the enrolled probe.
+pub fn notify_member_release(member: &(impl MemberControl + ?Sized)) {
+    let word = &member.exit_custody().word;
+    if word.fetch_and(!MEMBER_WAITER, Ordering::AcqRel) & MEMBER_WAITER != 0
+        && let Some(waiter) = member.release_waiter()
+    {
+        waiter.notify();
+    }
+}
+
 /// An owned control reference that prevents allocation reuse. A committed
 /// registration publishes its unregister receipt when every reference drops.
 pub struct MemberControlCustody<'a, T: MemberControl + ?Sized> {

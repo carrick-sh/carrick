@@ -126,7 +126,7 @@ struct SharedAbiPage<T: AbiPage> {
 /// accidentally placed inside an EL1-published granule by a generic caller.
 trait AbiPage: Send + Sync {}
 impl AbiPage for ControlPage {}
-impl AbiPage for LifecycleBacking {}
+impl AbiPage for carrick_el1_abi::ThreadLifecycleSlot {}
 impl AbiPage for ActivityBacking {}
 
 impl<T: AbiPage> SharedAbiPage<T> {
@@ -177,14 +177,6 @@ struct FreeSlot {
     index: usize,
 }
 
-/// The complete mapping granule contains only shared ABI bytes.
-#[repr(C, align(16384))]
-#[derive(Debug)]
-struct LifecycleBacking {
-    page: ThreadLifecyclePage,
-    padding: [u8; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
-}
-
 #[repr(C, align(16384))]
 #[derive(Debug)]
 struct ActivityBacking {
@@ -224,11 +216,22 @@ impl Deref for ThreadLedgerActivityLease {
 }
 
 /// Pins a process's lifecycle page without retaining the task/kernel graph.
+/// The complete mapping granule is one [`carrick_el1_abi::ThreadLifecycleSlot`]:
+/// the page and the control extent a ring root's native stock issues from.
 #[derive(Clone, Debug)]
 pub struct ThreadLifecycleLease(
-    Arc<SharedAbiPage<LifecycleBacking>>,
+    Arc<SharedAbiPage<carrick_el1_abi::ThreadLifecycleSlot>>,
     Arc<std::sync::OnceLock<ThreadLedgerActivityLease>>,
+    Arc<NativeStockCustody>,
 );
+
+/// Which owner stocks this page's pool. One stocker per page: once the
+/// carrier publishes the page to a ring that serves thread births, the ring
+/// root's native stock (over the slot's control extent) is the only stocker,
+/// for the page's lifetime, across exec (which keeps the page) and in every
+/// fork child (whose own page is published the same way).
+#[derive(Debug, Default)]
+struct NativeStockCustody(std::sync::atomic::AtomicBool);
 
 impl carrick_core::cancellation::CancellationOwner for ThreadLifecycleLease {
     type Word = std::sync::atomic::AtomicU32;
@@ -245,6 +248,8 @@ impl ThreadLifecycleLease {
 
     pub(in crate::kernel) fn for_fork(&self) -> Self {
         let child = Self::in_pool(self.0.pool.clone(), self.1.clone());
+        // The child's page is a distinct slot. Its stocker is decided when
+        // the carrier publishes that page, never inherited from the parent.
         // Host-only service includes inherited seccomp authority. Terminal
         // close and temporary fork/exec custody belong only to the parent.
         if self.gate() == carrick_el1_abi::GateState::HostOnly {
@@ -259,13 +264,11 @@ impl ThreadLifecycleLease {
     ) -> Self {
         let page = Self(
             Arc::new(SharedAbiPage::new(
-                LifecycleBacking {
-                    page: ThreadLifecyclePage::with_hatches(*LIFECYCLE_HATCHES),
-                    padding: [0; PAGE_BYTES - std::mem::size_of::<ThreadLifecyclePage>()],
-                },
+                carrick_el1_abi::ThreadLifecycleSlot::with_hatches(*LIFECYCLE_HATCHES),
                 pool,
             )),
             activity,
+            Arc::default(),
         );
         if let Some(activity) = page.1.get() {
             // SAFETY: the page lease retains its immutable activity owner.
@@ -307,6 +310,21 @@ impl ThreadLifecycleLease {
 
     pub fn page_address(&self) -> HostVa {
         HostVa::new(std::ptr::from_ref(&**self.0).addr())
+    }
+
+    /// The carrier published this page, with its slot's control extent, to a
+    /// ring that serves thread births: the ring root's native stock becomes
+    /// the page's only stocker and the host ledger never stocks it again.
+    /// Idempotent; a page whose ring serves no thread births keeps the ledger.
+    pub fn cede_stock_to_ring(&self) {
+        if self.serves_threads() {
+            self.2.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Whether the ring's native stock owns this page's pool.
+    pub fn ring_owns_stock(&self) -> bool {
+        self.2.0.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

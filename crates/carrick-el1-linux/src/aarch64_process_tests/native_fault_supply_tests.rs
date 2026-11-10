@@ -4427,9 +4427,7 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
         0x10000,
         asid(1),
         5,
-        Box::leak(Box::new(ThreadLifecyclePage::with_hatches(
-            carrick_el1_abi::LifecycleHatches::ON,
-        ))),
+        super::leaked_root_page(carrick_el1_abi::LifecycleHatches::ON),
     )));
     // `VA + 4096` is reserved in the VMA tree (`VA..VA + 8192`), but its
     // Stage-1 leaf is not yet resident while sibling B's grant is in flight.
@@ -5401,7 +5399,7 @@ fn native_owner_code_range(whole: bool) {
     const LENGTH: u64 = 256 * 1024 * 1024;
     const START: u64 = VA + 8192;
     const CODE: u64 = START + 4096;
-    let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let page = super::leaked_root_page(carrick_el1_abi::LifecycleHatches::ON);
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
     let fixture = Box::leak(Box::new(Fixture::with_identity_and_arena(
         0x10000,

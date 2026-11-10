@@ -438,10 +438,11 @@ impl ForkTableLedger for NoTableLedger {
 }
 
 /// Byte stride between lifecycle slots; each slot holds the 4 KiB lifecycle
-/// page and, [`LIFECYCLE_CONTROLS_OFFSET`] above it, the thread controls.
-pub const LIFECYCLE_SLOT_STRIDE: u64 = 0x4000;
+/// page and, [`LIFECYCLE_CONTROLS_OFFSET`] above it, the thread controls
+/// ([`carrick_el1_abi::ThreadLifecycleSlot`], shared with root pages).
+pub const LIFECYCLE_SLOT_STRIDE: u64 = carrick_el1_abi::THREAD_LIFECYCLE_SLOT_SIZE as u64;
 /// Offset of a slot's thread control array from its lifecycle page.
-pub const LIFECYCLE_CONTROLS_OFFSET: u64 = 0x1000;
+pub const LIFECYCLE_CONTROLS_OFFSET: u64 = carrick_el1_abi::THREAD_LIFECYCLE_CONTROLS_OFFSET as u64;
 
 /// `count` lifecycle slots starting at `first_page` inside the metadata
 /// aperture at `aperture`. Every carrier uses this one slot shape.

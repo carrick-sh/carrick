@@ -158,6 +158,20 @@ fn signal_record_exists<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordR
         })
 }
 
+/// The identity of a Born, native-owned record not yet published runnable:
+/// the window between Born and its member's registration.
+fn unregistered_birth_identity<C: ProcessContext>(
+    zone: &ZoneTables<C>,
+    record: RecordRef,
+) -> Option<carrick_sched_core::ThreadIdentity> {
+    let retained = zone.record(record.id);
+    (retained.incarnation() == record.incarnation
+        && retained.claim() == carrick_sched_core::Claim::Free
+        && retained.home().is_none()
+        && retained.has_native_execution_owner())
+    .then(|| retained.identity())
+}
+
 fn request_signal_reschedule<'a, C: ProcessContext, S: NativeProcessService<'a, C>>(
     zone: &ZoneTables<C>,
     service: &mut S,
@@ -1790,6 +1804,11 @@ pub struct NativeProcessRegistry<'a, M: Clone, C: ProcessContext> {
 }
 
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
+    /// Registered native members across every process (witness census).
+    #[cfg(test)]
+    pub(crate) fn member_count(&self) -> usize {
+        self.state.lock().members.len()
+    }
     /// Consume host retirement receipts when a sibling next enters the ring.
     /// HostRetiring records the exit path before the shared entry is reaped;
     /// the exact receipt arrives only after kernel and runtime withdrawal.
@@ -2799,7 +2818,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         let record_key = Self::record_key(source.zone, source.zone.record_ref(record));
         if state.members.contains_key(&key) || state.records.contains_key(&record_key) {
-            return Err(NativeProcessError::Busy);
+            // A birth's execution key and record incarnation are fresh: a
+            // collision is a broken invariant, never contention to wait out.
+            return Err(match admission {
+                NativeThreadAdmission::AdmittedBirth => NativeProcessError::Stale,
+                NativeThreadAdmission::CurrentEntry => NativeProcessError::Busy,
+            });
         }
         if !state.by_process.contains_key(&(key.carrier, process)) {
             return Err(NativeProcessError::Stale);
@@ -3363,10 +3387,16 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
             let Some(record) = control.zone_record() else {
                 continue;
             };
-            let Some(live) = zone.live(record) else {
+            // A Born native birth is retained unpublished until its member
+            // registers (a Busy registration waits there, #1974): its tid is
+            // already visible, so a signal keys on its exact record.
+            let Some(thread) = zone
+                .live(record)
+                .map(|live| live.identity())
+                .or_else(|| unregistered_birth_identity(zone, record))
+            else {
                 continue;
             };
-            let thread = live.identity();
             if thread.tid != u64::from(identity.tid)
                 || thread.serial != identity.thread_serial
                 || thread.mm != self.address.mm.raw().get()
@@ -3594,10 +3624,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     /// Admit carrier-retained control storage for a fresh native root. No
     /// identity is preseeded: the shared stock owner issues and reclaims it at
     /// clone admission, under the same limits as native fork children.
+    ///
+    /// `Ok(false)`: the page already lends pool identities issued by another
+    /// stocker before this admission (one stocker per page), so the root stays
+    /// unmanaged and keeps that stocker's births.
     pub fn admit_thread_stock(
         &self,
         lifecycle: NativeLifecycleResources<'a>,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<bool, NativeProcessError> {
         let mut graph = self.graph.lock();
         let key = graph.root_key;
         let resources = graph
@@ -3612,13 +3646,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         {
             return Err(NativeProcessError::Invalid);
         }
-        resources.thread_stock = Some(thread_stock::NativeThreadStock::new_root(
+        let Some(stock) = thread_stock::NativeThreadStock::new_root(
             lifecycle.page,
             lifecycle.controls,
             self.zone,
             resources.record,
-        )?);
-        Ok(())
+        )?
+        else {
+            return Ok(false);
+        };
+        resources.thread_stock = Some(stock);
+        Ok(true)
     }
 
     /// Import only retained, published thread records. The lifecycle census
@@ -4689,6 +4727,77 @@ impl carrick_sched_core::ShortLockWait for NativeBucketWait<'_> {
             probe(_attempt);
         }
         core::hint::spin_loop();
+    }
+}
+impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    NativeProcessEntry<'_, 'a, M, C, S>
+{
+    /// Register a Born, native-owned birth of this process before it can be
+    /// selected. `Busy` is contention on its registration custody.
+    fn register_born(&self, record: RecordRef) -> Result<bool, NativeProcessError> {
+        #[cfg(test)]
+        run_born_registration_hook(
+            self.runtime,
+            self.source.zone.record(record.id).identity().control_slot,
+        );
+        let registry = (*self.runtime.registry.lock()).ok_or(NativeProcessError::Stale)?;
+        registry.register_native_birth(self.runtime, self.key, self.source, record)
+    }
+    /// Queue a birth registered by [`Self::register_born`] on this lane.
+    fn queue_registered_birth(
+        &mut self,
+        record: RecordRef,
+        closing: bool,
+    ) -> carrick_personality_linux::lifecycle::BornEnqueue {
+        if closing {
+            self.current.linux.mark_pending_host_work();
+        }
+        let queued = self
+            .source
+            .zone
+            .requeue_preempted(self.source.slot, record.id);
+        if queued.is_queued() {
+            self.service.wake_effects(WakeEffects {
+                queued_own: true,
+                ..WakeEffects::default()
+            });
+        }
+        queued.into()
+    }
+}
+
+/// Run once before the next native birth registration of `runtime`'s process,
+/// with the birth's control address, so a witness can hold registration
+/// custody across the production clone.
+#[cfg(test)]
+type BornRegistrationHook = Vec<(usize, Box<dyn FnOnce(u64) + Send>)>;
+#[cfg(test)]
+static BORN_REGISTRATION_HOOK: SpinLock<BornRegistrationHook> = SpinLock::new(Vec::new());
+#[cfg(test)]
+pub(crate) fn install_born_registration_hook<M: Clone, C: ProcessContext>(
+    runtime: &NativeProcessRuntime<'_, M, C>,
+    hook: Box<dyn FnOnce(u64) + Send>,
+) {
+    let key = core::ptr::from_ref(runtime).addr();
+    let mut hooks = BORN_REGISTRATION_HOOK.lock();
+    hooks.retain(|(existing, _)| *existing != key);
+    hooks.push((key, hook));
+}
+#[cfg(test)]
+fn run_born_registration_hook<M: Clone, C: ProcessContext>(
+    runtime: &NativeProcessRuntime<'_, M, C>,
+    control: u64,
+) {
+    let key = core::ptr::from_ref(runtime).addr();
+    let hook = {
+        let mut hooks = BORN_REGISTRATION_HOOK.lock();
+        hooks
+            .iter()
+            .position(|(existing, _)| *existing == key)
+            .map(|index| hooks.swap_remove(index).1)
+    };
+    if let Some(hook) = hook {
+        hook(control);
     }
 }
 fn returned(value: i64) -> LifecycleOutcome {
@@ -8397,28 +8506,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         {
             return BornEnqueue::Refused;
         }
-        let Some(registry) = *self.runtime.registry.lock() else {
-            return BornEnqueue::Refused;
-        };
-        match registry.register_native_birth(self.runtime, self.key, self.source, record) {
-            Ok(closing) => {
-                if closing {
-                    self.current.linux.mark_pending_host_work();
-                }
-            }
-            Err(_) => return BornEnqueue::Refused,
+        match self.register_born(record) {
+            Ok(closing) => self.queue_registered_birth(record, closing),
+            // Contention is not a refusal: the birth stays Born, unqueued
+            // and record-keyed; its clone caller awaits the registration.
+            Err(NativeProcessError::Busy) => BornEnqueue::Busy,
+            Err(_) => BornEnqueue::Refused,
         }
-        let queued = self
-            .source
-            .zone
-            .requeue_preempted(self.source.slot, record.id);
-        if queued.is_queued() {
-            self.service.wake_effects(WakeEffects {
-                queued_own: true,
-                ..WakeEffects::default()
-            });
-        }
-        queued.into()
+    }
+    fn await_thread_registration(
+        &mut self,
+        record: RecordRef,
+        result: SyscallResult,
+    ) -> Option<LifecycleOutcome> {
+        self.await_born_registration(record, result).ok()
     }
     fn wake_thread_join(&mut self, mm: carrick_core_abi::EntryMmKey, address: UserVa) -> bool {
         if mm != self.binding.mm {

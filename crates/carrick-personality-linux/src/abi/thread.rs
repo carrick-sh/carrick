@@ -389,6 +389,10 @@ impl Drop for NativePendingCustody<'_> {
             .native_pending
             .replace_from_locked_queue(PendingSignals(0));
         control.native_pending_writer.store(0, Ordering::Release);
+        // A birth registration that found this writer held waits on the
+        // control's release observer (#1974); pairs with its enrolled probe.
+        ::core::sync::atomic::fence(Ordering::SeqCst);
+        carrick_core::lifecycle::notify_member_release(control);
     }
 }
 
@@ -738,6 +742,10 @@ impl ThreadControlSlot {
         &self,
     ) -> Result<carrick_core::lifecycle::MemberReset<'_>, TransitionError> {
         self.host_exit_requested.reserve_reset()
+    }
+    /// Whether a [`NativePendingCustody`] writer is admitted on this control.
+    pub fn native_pending_custody_held(&self) -> bool {
+        self.native_pending_writer.load(Ordering::Acquire) != 0
     }
     pub fn graph_referenced(&self) -> bool {
         self.host_exit_requested.custody().referenced()
@@ -1490,6 +1498,60 @@ pub struct ThreadLifecyclePage {
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
+
+/// The one lifecycle slot shape: a process's lifecycle page followed, at
+/// [`THREAD_LIFECYCLE_CONTROLS_OFFSET`], by the control extent its native
+/// thread stock issues from (slot zero belongs to the leader, pool entry `i`
+/// to slot `i + 1`). Native fork loans and every ARM carrier-published root
+/// page use this exact layout, so a root's stock extent is part of the same
+/// carrier-retained granule as its page and needs no second publication.
+#[repr(C, align(16384))]
+#[derive(::core::fmt::Debug)]
+pub struct ThreadLifecycleSlot {
+    pub page: ThreadLifecyclePage,
+    pub controls: [ThreadControlSlot; THREAD_POOL_ENTRIES + 1],
+    padding: [u8; THREAD_LIFECYCLE_SLOT_SIZE
+        - THREAD_LIFECYCLE_PAGE_SIZE
+        - (THREAD_POOL_ENTRIES + 1) * core::mem::size_of::<ThreadControlSlot>()],
+}
+
+/// Bytes between consecutive lifecycle slots.
+pub const THREAD_LIFECYCLE_SLOT_SIZE: usize = 0x4000;
+/// Offset of a slot's control extent from its lifecycle page.
+pub const THREAD_LIFECYCLE_CONTROLS_OFFSET: usize =
+    ::core::mem::offset_of!(ThreadLifecycleSlot, controls);
+
+const _: () = {
+    assert!(core::mem::size_of::<ThreadLifecycleSlot>() == THREAD_LIFECYCLE_SLOT_SIZE);
+    assert!(core::mem::offset_of!(ThreadLifecycleSlot, page) == 0);
+    assert!(THREAD_LIFECYCLE_CONTROLS_OFFSET == THREAD_LIFECYCLE_PAGE_SIZE);
+};
+
+impl ThreadLifecycleSlot {
+    /// A fresh page with [`ThreadLifecyclePage::with_hatches`] and an empty,
+    /// never-issued control extent.
+    pub const fn with_hatches(hatches: LifecycleHatches) -> Self {
+        Self {
+            page: ThreadLifecyclePage::with_hatches(hatches),
+            controls: [const { ThreadControlSlot::new() }; THREAD_POOL_ENTRIES + 1],
+            padding: [0; THREAD_LIFECYCLE_SLOT_SIZE
+                - THREAD_LIFECYCLE_PAGE_SIZE
+                - (THREAD_POOL_ENTRIES + 1) * core::mem::size_of::<ThreadControlSlot>()],
+        }
+    }
+
+    /// The control extent of the slot whose page is `page`.
+    ///
+    /// # Safety
+    ///
+    /// `page` must be the [`ThreadLifecycleSlot::page`] field of a live slot
+    /// whose storage stays mapped for `'a`, as the ARM carrier guarantees for
+    /// every lifecycle page it publishes.
+    pub unsafe fn controls_of<'a>(page: &'a ThreadLifecyclePage) -> &'a [ThreadControlSlot] {
+        // SAFETY: the caller guarantees `page` heads a whole retained slot.
+        unsafe { &(*core::ptr::from_ref(page).cast::<ThreadLifecycleSlot>()).controls }
+    }
+}
 
 /// Shared-page identity for a member born on the host before EL1 can map its
 /// control slab. States: vacant, publication claim, live, cancel requested,
