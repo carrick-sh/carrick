@@ -24,6 +24,7 @@ vm_free = [
   "carrick-kernel::dispatch::executable_authority::tests::retained_host_source_rechecks_execute_mode_on_exact_object",
   "carrick-kernel::dispatch::executable_authority::tests::proc_exe_fd_keeps_original_source_after_process_exec_identity_changes",
   "carrick-runtime::runtime::exec::tests",
+  "carrick-runtime::runtime::exec::tests::native_child_exec_prepares_the_native_guest_machine_through_the_production_entry (#1093 S3: the native guest machine (EM_X86_64 on an x86_64 host) prepares through prepare_native_exec_image with no Rosetta redirect; the other ISA's ELF is ENOEXEC)",
 ]
 
 [bindings.unresolved]
