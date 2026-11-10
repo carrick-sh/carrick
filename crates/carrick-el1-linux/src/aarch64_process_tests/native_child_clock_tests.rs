@@ -26,10 +26,87 @@ fn pair(bytes: &[u8]) -> (i64, i64) {
     )
 }
 
+/// A production native fork child whose clock call the host has served: its
+/// record is runnable on the fixture slot again, behind the parent's.
+struct ServedChildClock {
+    fixture: &'static Fixture,
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    runtime: Arc<NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>>,
+    registry: &'static NativeProcessRegistry<'static, Mm, Aarch64ParkedContext>,
+    child_task: &'static CurrentTask,
+    child: crate::native_process_runtime::NativeRecordBinding<Mm, Aarch64ParkedContext>,
+    parent: RecordId,
+    service: Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
+    counters: &'static carrick_el1_abi::Counters,
+}
+
+/// Either the ring's own answer, or a reading the host has already served.
+enum ChildClock {
+    InRing(i64),
+    Served(Box<ServedChildClock>),
+}
+
 /// Run one clock call from a production native fork child and return its
 /// final result. `x0`/`x1` are the call's first two arguments. The host
 /// service answers against `clock`; `served` counts the records it served.
 fn child_clock_call(nr: u64, x0: u64, x1: u64, clock: &Arc<ClockDomain>, served: &mut u32) -> i64 {
+    use crate::native_process_runtime::NativeResume;
+    let mut call = match serve_child_clock(nr, x0, x1, clock, served) {
+        ChildClock::InRing(result) => return result,
+        ChildClock::Served(call) => call,
+    };
+    let selected = call.fixture.zone.switch_in_full(call.fixture.slot).unwrap();
+    if selected.record != call.child.record.id {
+        assert_eq!(selected.record, call.parent);
+        assert!(
+            call.fixture
+                .zone
+                .requeue_preempted(call.fixture.slot, selected.record)
+                .is_queued()
+        );
+        assert_eq!(
+            call.fixture
+                .zone
+                .switch_in_full(call.fixture.slot)
+                .unwrap()
+                .record,
+            call.child.record.id
+        );
+    }
+    let saved = unsafe { call.runtime.record_binding(call.child.record) }
+        .unwrap()
+        .words;
+    let mut entry = call
+        .runtime
+        .enter_registered(
+            call.registry,
+            call.source,
+            call.child_task,
+            call.child.address,
+            &saved,
+            &mut call.service,
+        )
+        .unwrap();
+    let NativeResume::Returned(result) = entry.resume_checkpoint(|_| Ok(None)).unwrap() else {
+        panic!("a completed clock reading resumes with its result");
+    };
+    assert_eq!(
+        call.counters.refused_child[nr as usize].load(Ordering::Acquire),
+        0
+    );
+    result.raw()
+}
+
+/// Stage one clock call from a production native fork child through ring
+/// dispatch and its begin body, serve it as the carrier does, and wake the
+/// parked child.
+fn serve_child_clock(
+    nr: u64,
+    x0: u64,
+    x1: u64,
+    clock: &Arc<ClockDomain>,
+    served: &mut u32,
+) -> ChildClock {
     use crate::native_process_runtime::{NativeResume, NativeThreadGroupOwner};
     use carrick_personality_linux::dispatch::CompletionRoute;
 
@@ -151,7 +228,7 @@ fn child_clock_call(nr: u64, x0: u64, x1: u64, clock: &Arc<ClockDomain>, served:
     );
     if matches!(route, CompletionRoute::Served | CompletionRoute::WithWork) {
         // Answered in ring without a crossing.
-        return frame.x[0] as i64;
+        return ChildClock::InRing(frame.x[0] as i64);
     }
     assert_eq!(route, CompletionRoute::NativeService, "clock {nr}");
     let begin = match crate::dispatch::native_service_decision(
@@ -237,41 +314,17 @@ fn child_clock_call(nr: u64, x0: u64, x1: u64, clock: &Arc<ClockDomain>, served:
         )
         .unwrap();
     drop(queue);
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
-    if selected.record != child.record.id {
-        assert_eq!(selected.record, parent_binding.record.id);
-        assert!(
-            fixture
-                .zone
-                .requeue_preempted(fixture.slot, selected.record)
-                .is_queued()
-        );
-        assert_eq!(
-            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
-            child.record.id
-        );
-    }
-    let saved = unsafe { runtime.record_binding(child.record) }
-        .unwrap()
-        .words;
-    let mut entry = runtime
-        .enter_registered(
-            registry,
-            source,
-            child_task,
-            child.address,
-            &saved,
-            &mut child_service,
-        )
-        .unwrap();
-    let NativeResume::Returned(result) = entry.resume_checkpoint(|_| Ok(None)).unwrap() else {
-        panic!("a completed clock reading resumes with its result");
-    };
-    assert_eq!(
-        counters.refused_child[nr as usize].load(Ordering::Acquire),
-        0
-    );
-    result.raw()
+    ChildClock::Served(Box::new(ServedChildClock {
+        fixture,
+        source,
+        runtime,
+        registry,
+        child_task,
+        child,
+        parent: parent_binding.record.id,
+        service: child_service,
+        counters,
+    }))
 }
 
 #[test]
@@ -405,4 +458,176 @@ fn child_gettimeofday_faulting_timezone_is_efault_after_timeval() {
         (1_234, 0),
         "timeval was already written"
     );
+}
+
+/// #2039: a native service notice is published, parked and then exited on;
+/// the host consumes it at the vCPU's next exit as an idle service exit
+/// ([`carrick_core_abi::service::ServiceNotice`]). A clock sample is copied
+/// out when the scheduler resumes its record, and a copyout that cannot
+/// finish there (Busy once) parks the record again behind a fresh notice.
+/// The scheduler must then leave for the host with no address space
+/// installed, not switch in the other runnable process: the host would serve
+/// the notice on an exit that still names that process's space, and its
+/// executor parks off-guest into the zone's refused-leave fatal. This drives
+/// the production scheduler (`Sched::run_next`), its ARM resume checkpoint
+/// and the clock owner with two live processes on one slot; the Busy is the
+/// test's owner-access seam standing in for an owner-busy page.
+#[test]
+fn child_clock_copyout_repark_leaves_the_slot_before_another_process_runs() {
+    let out = carrick_test_support::GuestUserBuffer::zeroed(16);
+    let target = out.arg();
+    let ChildClock::Served(mut call) =
+        serve_child_clock(CLOCK_GETTIME, 1, target, &deterministic(1_234), &mut 0)
+    else {
+        panic!("a child clock reading crosses");
+    };
+    let (zone, slot) = (call.fixture.zone, call.fixture.slot);
+    // A published maintenance root lets EL1 install each process's space.
+    zone.spaces.set_idle_ttbr(0x30000);
+    // The served child resumes first; the parent stays runnable behind it.
+    let selected = zone.switch_in_full(slot).unwrap();
+    if selected.record != call.child.record.id {
+        assert_eq!(selected.record, call.parent);
+        assert!(zone.requeue_preempted(slot, selected.record).is_queued());
+    } else {
+        assert!(zone.requeue_preempted(slot, selected.record).is_queued());
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, call.parent);
+        assert!(zone.requeue_preempted(slot, call.parent).is_queued());
+    }
+    struct ResetAccess;
+    impl Drop for ResetAccess {
+        fn drop(&mut self) {
+            crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    let _reset = ResetAccess;
+    let busy = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&busy);
+    crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_, address, _, bytes, _| {
+            (address.raw() == target && bytes.is_some() && seen.fetch_add(1, Ordering::AcqRel) == 0)
+                .then_some(Err(crate::native_process_runtime::NativeProcessError::Busy))
+        }));
+    });
+    let mut cpu = ChildResumeCpu {
+        child: call.child.record.id,
+        inner: ResumeCpu {
+            inner: crate::sched::FakeCpu::default(),
+            runtime: &call.runtime,
+            registry: call.registry,
+            source: call.source,
+            task: call.child_task,
+            service: &mut call.service,
+        },
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let served = (crate::sched::Sched {
+        handoff: None,
+        zone,
+        slot,
+        task: call.child_task,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+        counters: &counters,
+    })
+    .run_next(&mut frame, 0);
+    assert_eq!(
+        busy.load(Ordering::Acquire),
+        1,
+        "the resumed copyout was Busy once"
+    );
+    let notice = call.child_task.service_notice.take().unwrap();
+    assert!(
+        notice.is_some(),
+        "the Busy copyout parked behind a fresh notice"
+    );
+    assert_eq!(
+        (
+            served,
+            zone.installed_space(slot),
+            zone.slot(slot).current()
+        ),
+        (crate::sched::Served::Idle, 0, None),
+        "a published service notice must end the run: the slot leaves for the host vacated"
+    );
+    assert!(
+        matches!(
+            zone.record(call.parent).claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ),
+        "the other process stays queued for the next entry"
+    );
+}
+
+/// The production ARM resume checkpoint for the clock child's record. The
+/// other process's record models an ordinary runnable thread with nothing
+/// owed at its checkpoint (it was preempted, not parked by its owner), which
+/// is what the scheduler would run next on the slot.
+struct ChildResumeCpu<'a, 'b> {
+    child: RecordId,
+    inner: ResumeCpu<'a, 'b, &'static TestStockCrossing>,
+}
+
+impl crate::sched::ThreadCpu for ChildResumeCpu<'_, '_> {
+    fn save(
+        &mut self,
+        frame: &carrick_el1_abi::TrapFrame,
+        ctx: &mut Aarch64ParkedContext,
+        exit: crate::sched::CpuExitCause,
+    ) {
+        self.inner.save(frame, ctx, exit);
+    }
+    fn load(&mut self, frame: &mut carrick_el1_abi::TrapFrame, ctx: &Aarch64ParkedContext) {
+        self.inner.load(frame, ctx);
+    }
+    fn resume_lifecycle(
+        &mut self,
+        zone: &ZoneTables<Aarch64ParkedContext>,
+        task: &CurrentTask,
+        slot: SlotId,
+        record: RecordId,
+    ) -> crate::sched::ResumeAction {
+        if record == self.child {
+            self.inner.resume_lifecycle(zone, task, slot, record)
+        } else {
+            crate::sched::ResumeAction::NoPending
+        }
+    }
+    fn set_translation(&mut self, a: u64, b: u64) {
+        self.inner.set_translation(a, b);
+    }
+    fn live_ttbr0(&self) -> Option<u64> {
+        self.inner.live_ttbr0()
+    }
+    fn invalidate_asid(&mut self, root: u64) {
+        self.inner.invalidate_asid(root);
+    }
+    fn now(&self) -> u64 {
+        self.inner.now()
+    }
+    fn freq(&self) -> u64 {
+        self.inner.freq()
+    }
+    fn set_timer(&mut self, deadline: Option<u64>) {
+        self.inner.set_timer(deadline);
+    }
+    fn send_sgi(&mut self, route: u64) {
+        self.inner.send_sgi(route);
+    }
+    fn ack_irq(&mut self) -> u32 {
+        self.inner.ack_irq()
+    }
+    fn end_irq(&mut self, intid: u32) {
+        self.inner.end_irq(intid);
+    }
+    fn wait_for_interrupt(&mut self) {
+        self.inner.wait_for_interrupt();
+    }
+    fn spin(&mut self) {
+        self.inner.spin();
+    }
+    fn own_sgi_target(&self) -> u64 {
+        self.inner.own_sgi_target()
+    }
 }
