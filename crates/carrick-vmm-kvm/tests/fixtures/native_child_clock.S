@@ -9,6 +9,11 @@
  *   5  clock_getres(CLOCK_MONOTONIC, &ts)    0, {0, 1 ms}
  *   6  gettimeofday(&tv, &tz)                0, tv_sec past 2023, tz zeroed
  *   7  gettimeofday(NULL, NULL)              0
+ * With -DFAULT_ROW=n the fixture instead runs only row n of:
+ *   8  clock_gettime(REALTIME, (void*)-1)    -EFAULT (a faulting copyout is the
+ *                                            call's result, never a run failure)
+ *   9  gettimeofday((void*)-1, NULL)         -EFAULT
+ *  10  gettimeofday(&tv, (void*)-1)          -EFAULT, tv already written
  */
 .global _start
 .text
@@ -103,6 +108,33 @@ child:
     syscall
     test %rax, %rax
     jnz row7
+#ifdef FAULT_ROW
+#if FAULT_ROW == 8
+    xor %edi, %edi
+    mov $-1, %rsi
+    mov $228, %eax
+    syscall
+    cmp $-14, %rax
+    jne row8
+#elif FAULT_ROW == 9
+    mov $-1, %rdi
+    xor %esi, %esi
+    mov $96, %eax
+    syscall
+    cmp $-14, %rax
+    jne row9
+#elif FAULT_ROW == 10
+    movq $-1, (%rsp)
+    mov %rsp, %rdi
+    mov $-1, %rsi
+    mov $96, %eax
+    syscall
+    cmp $-14, %rax
+    jne row10
+    cmpq $1700000000, (%rsp)
+    jl row10
+#endif
+#endif
     mov $8, %edi
     jmp exit
 row1:
@@ -125,6 +157,15 @@ row6:
     jmp exit
 row7:
     mov $47, %edi
+    jmp exit
+row8:
+    mov $48, %edi
+    jmp exit
+row9:
+    mov $49, %edi
+    jmp exit
+row10:
+    mov $50, %edi
     jmp exit
 enosys:
     mov $218, %edi
