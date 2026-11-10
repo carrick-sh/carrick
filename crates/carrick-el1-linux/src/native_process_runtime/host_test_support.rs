@@ -5856,6 +5856,7 @@ fn completed_output_busy_yields(in_preparation: bool) {
             offset: 0,
             result: SyscallResult::new(37),
             prefix_on_fault: false,
+            efault_on_fault: false,
             then: None,
         });
         assert!(
@@ -5972,6 +5973,7 @@ fn poll_revents_crossing_a_page_retains_partial_copy_and_fault() {
             offset: 0,
             result: SyscallResult::new(1),
             prefix_on_fault: false,
+            efault_on_fault: false,
         };
         let result = entry.finish_copyout(output);
         let bytes = 0x1234_i16.to_ne_bytes();

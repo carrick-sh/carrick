@@ -5601,6 +5601,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             offset: 0,
             result: interrupted,
             prefix_on_fault: false,
+            efault_on_fault: false,
             effect: None,
             then: None,
         });
@@ -8329,6 +8330,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             offset: 0,
             result: SyscallResult::new(0),
             prefix_on_fault: false,
+            efault_on_fault: false,
             effect: Some(effect),
             then: None,
         });
@@ -8347,6 +8349,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             result,
             effect: None,
             then: None,
+            efault_on_fault: false,
         });
         self.finish_output_outcome(result)
     }
@@ -8359,6 +8362,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             data: service::CopyoutData::Poll(fields),
             offset: 0,
             prefix_on_fault: false,
+            efault_on_fault: false,
             result,
             effect: None,
             then: None,

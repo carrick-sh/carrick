@@ -142,6 +142,9 @@ pub(super) struct OwnedCopyout<'a> {
     pub offset: usize,
     pub result: SyscallResult,
     pub prefix_on_fault: bool,
+    /// A guest-address fault in this output is the call's `-EFAULT` result
+    /// (clock samples), not a run failure. Ownership errors still propagate.
+    pub efault_on_fault: bool,
     pub effect: Option<Box<dyn carrick_personality_linux::lifecycle::CopyoutEffect + 'a>>,
     /// A second output written after this one completes, keeping its result
     /// (`gettimeofday` writes `timeval` then `timezone`).
@@ -226,6 +229,7 @@ fn clock_copyout<'a>(
         offset: 0,
         result: SyscallResult::new(0),
         prefix_on_fault: false,
+        efault_on_fault: true,
         effect: None,
         then: None,
     };
@@ -740,6 +744,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// retain both the answer and its next unwritten byte in the service row.
     #[inline(never)]
     pub(super) fn finish_copyout(
+        &mut self,
+        output: OwnedCopyout<'a>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let efault_on_fault = output.efault_on_fault;
+        match self.finish_copyout_pages(output) {
+            Err(NativeProcessError::Fault) if efault_on_fault => Ok(NativeResume::Returned(
+                SyscallResult::new(carrick_syscall_abi::LINUX_EFAULT.guest_retval()),
+            )),
+            result => result,
+        }
+    }
+
+    #[inline(never)]
+    fn finish_copyout_pages(
         &mut self,
         mut output: OwnedCopyout<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
@@ -3335,6 +3353,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     value
                 }),
                 prefix_on_fault: true,
+                efault_on_fault: false,
                 effect: None,
                 then: None,
             }));
