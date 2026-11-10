@@ -4616,7 +4616,7 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
         bytes,
         &mut cursor,
         0x8B10_0231 | (carrick_el1_abi::CURRENT_TASK_STRIDE_SHIFT << 10),
-    ); // add x17, x17, x16, lsl #7 (CurrentTask[slot])
+    ); // add x17, x17, x16, lsl #CURRENT_TASK_STRIDE_SHIFT (CurrentTask[slot])
     emit(bytes, &mut cursor, enc_ldr_xt_xn(16, 17, 24)); // ldr x16, [x17, #24] (fixup_pc)
     let cbz_fail = cursor;
     emit(bytes, &mut cursor, 0); // cbz x16, fail_loud
@@ -5464,7 +5464,7 @@ fn write_el1_hook(
         bytes,
         &mut cursor,
         0x8B11_0021 | (carrick_el1_abi::CURRENT_TASK_STRIDE_SHIFT << 10),
-    ); // add x1, x1, x17, lsl #7 (CurrentTask[slot])
+    ); // add x1, x1, x17, lsl #CURRENT_TASK_STRIDE_SHIFT (CurrentTask[slot])
     emit(bytes, &mut cursor, 0x9100_A021); // add x1, x1, #40 (&pending_host_work)
     emit(bytes, &mut cursor, enc_ldar_wt_xn(2, 1)); // ldar w2, [x1]
     let cbz_skip = cursor;

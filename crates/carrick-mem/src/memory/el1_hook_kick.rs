@@ -33,7 +33,7 @@ const GUEST_ELR: u64 = 0x4000_1000;
 const SLOT: u64 = 3;
 /// The mailbox capture's offset in the test page; reaching it is a host exit.
 const CAPTURE: usize = 0x800;
-/// `CurrentTask` is 128 bytes (`lsl #7` in the hook); `pending_host_work` at 40.
+/// `CurrentTask` is 256 bytes (`lsl #8` in the hook); `pending_host_work` at 40.
 const PENDING_HOST_WORK: u64 = 40;
 const SERVED_WITH_WORK: u64 = 44;
 /// A syscall's syndrome (EC 0x15), stale in `ESR_EL1` when an IRQ is taken.

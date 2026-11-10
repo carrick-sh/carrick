@@ -5413,7 +5413,7 @@ mod tests {
 
     #[test]
     fn test_current_task_layout() {
-        assert_eq!(core::mem::size_of::<CurrentTask>(), 128);
+        assert_eq!(core::mem::size_of::<CurrentTask>(), 256);
         assert_eq!(core::mem::align_of::<CurrentTask>(), 8);
         assert_eq!(core::mem::offset_of!(CurrentTask, execution.generation), 0);
         assert_eq!(core::mem::offset_of!(CurrentTask, execution.task), 8);
@@ -6832,7 +6832,7 @@ mod layout_manifest {
     fn current_task() {
         assert_eq!(
             (size_of::<CurrentTask>(), align_of::<CurrentTask>()),
-            (128, 8)
+            (256, 8)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |CurrentTask {
@@ -6842,6 +6842,8 @@ mod layout_manifest {
                      metadata: _,
                      root_generation: _,
                      service_notice: _,
+                     host_loaded: _,
+                     _reserved: _,
                  }: CurrentTask| {};
         field!(CurrentTask, execution, ExecutionIdentity, 0, 16, 8);
         field!(CurrentTask, linux, LinuxTaskState, 16, 32, 8);
@@ -6856,6 +6858,8 @@ mod layout_manifest {
             32,
             8
         );
+        field!(CurrentTask, host_loaded, HostLoadedBinding, 128, 16, 8);
+        field!(CurrentTask, _reserved, [u64; 14], 144, 112, 8);
     }
 
     #[test]
