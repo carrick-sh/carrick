@@ -305,10 +305,8 @@ pub(crate) fn capture_native_exec_capability(
     let context = dispatcher
         .capture_one_task_context()
         .map_err(|_| crate::linux_abi::LINUX_ESRCH)?;
-    let raw = context.resources().files().id().raw();
-    let id = carrick_core_abi::service::ExecCapabilityId::new(
-        core::num::NonZeroU64::new(raw).ok_or(crate::linux_abi::LINUX_ESRCH)?,
-    );
+    let id = carrick_kernel::dispatch::exec_files::native_exec_capability(&context)
+        .ok_or(crate::linux_abi::LINUX_ESRCH)?;
     Ok(NativeExecCapability {
         id,
         files: dispatcher.capture_exec_files(&context)?,
@@ -1421,9 +1419,7 @@ mod tests {
     fn native_exec_capability_outlives_context_without_host_task_lookup() {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();
-        let id = carrick_core_abi::service::ExecCapabilityId::new(
-            core::num::NonZeroU64::new(context.resources().files().id().raw()).unwrap(),
-        );
+        let id = carrick_kernel::dispatch::exec_files::native_exec_capability(&context).unwrap();
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
         drop(context);
 
