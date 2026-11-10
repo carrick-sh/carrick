@@ -5,6 +5,79 @@
 
 use super::*;
 
+/// One core-capture attempt that did not fail.
+pub(crate) enum CoreCaptureAttempt {
+    /// A prepared publication, or `None` when Linux dumps no core (a
+    /// non-core signal, an undumpable process, `RLIMIT_CORE` 0).
+    Done(Option<Box<PreparedCorePublication>>),
+    /// Another holder's dependency refused a read: "not now". Nothing was
+    /// published and the pause, exclusion and register collection are
+    /// released. The caller keeps the capture operation, releases its
+    /// execution lease, enrols on this wait's release notification, probes
+    /// once and reruns the whole capture, which takes a fresh snapshot (a
+    /// sibling may have changed memory meanwhile).
+    Busy(carrick_hal::core_read::CoreReadWait),
+}
+
+/// Why core capture failed.
+#[derive(Debug)]
+pub(crate) enum CoreCaptureError {
+    /// A read waited on the gate of the MM this capture itself excludes.
+    /// Only capture can lower that gate, so no release can come: a broken
+    /// invariant, never a wait and never retried.
+    OwnGate(carrick_el1_abi::PortalOwnerWait),
+    /// Capture failed; the process terminates without a core.
+    Runtime(RuntimeError),
+}
+
+impl From<RuntimeError> for CoreCaptureError {
+    fn from(error: RuntimeError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+impl std::fmt::Display for CoreCaptureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OwnGate(wait) => write!(
+                formatter,
+                "core read waited on the gate of the MM its own capture excludes: {wait:?}"
+            ),
+            Self::Runtime(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+/// What ends one capture attempt early.
+enum CaptureStop {
+    Busy(carrick_hal::core_read::CoreReadWait),
+    Failed(CoreCaptureError),
+}
+
+impl CaptureStop {
+    fn runtime(error: RuntimeError) -> Self {
+        Self::Failed(CoreCaptureError::Runtime(error))
+    }
+
+    fn read(error: carrick_hal::core_read::CoreReadError, what: impl FnOnce() -> String) -> Self {
+        match error {
+            carrick_hal::core_read::CoreReadError::Busy(wait) => Self::Busy(wait),
+            carrick_hal::core_read::CoreReadError::OwnGate(wait) => {
+                Self::Failed(CoreCaptureError::OwnGate(wait))
+            }
+            carrick_hal::core_read::CoreReadError::Memory(error) => Self::runtime(
+                RuntimeError::Trap(TrapError::Hypervisor(format!("{}: {error}", what()))),
+            ),
+        }
+    }
+}
+
+impl From<RuntimeError> for CaptureStop {
+    fn from(error: RuntimeError) -> Self {
+        Self::runtime(error)
+    }
+}
+
 pub(crate) struct PreparedCorePublication {
     pub(crate) snapshot: carrick_kernel::dispatch::CoreProcessSnapshot,
     pub(crate) payload: carrick_kernel::core_dump::CorePayload,
@@ -110,13 +183,13 @@ where
     }
 }
 
-pub(crate) fn finish_crash_collection<T>(
+pub(crate) fn finish_crash_collection<T, Error>(
     authority: &carrick_kernel::kernel::CrashCaptureAuthority,
     barrier: &crate::fork_quiesce::QuiesceBarrier,
     quiesced: bool,
     lease_drain_guard: Option<carrick_hal::VcpuLeaseDrainGuard>,
-    result: Result<T, RuntimeError>,
-) -> Result<T, RuntimeError> {
+    result: Result<T, Error>,
+) -> Result<T, Error> {
     authority.stop_collecting();
     if quiesced {
         barrier.end_quiesce();
@@ -217,11 +290,11 @@ where
         kernel: &Kernel,
         engine: &mut E,
         fatal: FatalSignalRecord,
-    ) -> Result<Option<PreparedCorePublication>, RuntimeError> {
+    ) -> Result<CoreCaptureAttempt, CoreCaptureError> {
         // Linux default actions that carry a core. Other fatal signals still
         // publish a signal wait status, but never set WCOREDUMP.
         if !matches!(fatal.signo, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
-            return Ok(None);
+            return Ok(CoreCaptureAttempt::Done(None));
         }
         let context = kernel
             .dispatcher
@@ -263,25 +336,25 @@ where
             .is_some_and(|value| value == "capture-timeout")
         {
             lifecycle(6, 1);
-            return Err(RuntimeError::Configuration(
+            return Err(CoreCaptureError::Runtime(RuntimeError::Configuration(
                 "core publication failpoint capture-timeout".to_owned(),
-            ));
+            )));
         }
         if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
             .is_some_and(|value| value == "capture-interrupted")
         {
             lifecycle(6, 1);
-            return Err(RuntimeError::Configuration(
+            return Err(CoreCaptureError::Runtime(RuntimeError::Configuration(
                 "core publication failpoint capture-interrupted".to_owned(),
-            ));
+            )));
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !barrier.try_begin_fork() {
             if std::time::Instant::now() >= deadline {
                 lifecycle(6, 1);
-                return Err(RuntimeError::Configuration(
+                return Err(CoreCaptureError::Runtime(RuntimeError::Configuration(
                     "HVPatch crash capture timed out behind fork/exec quiesce".to_owned(),
-                ));
+                )));
             }
             std::thread::yield_now();
         }
@@ -290,13 +363,13 @@ where
         authority.advertise(generation);
         let mut quiesced = false;
         let mut lease_drain_guard = None;
-        let result = (|| {
+        let result = (|| -> Result<Option<Box<PreparedCorePublication>>, CaptureStop> {
             if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "capture-registers")
             {
-                return Err(RuntimeError::Configuration(
+                return Err(CaptureStop::runtime(RuntimeError::Configuration(
                     "core publication failpoint capture-registers".to_owned(),
-                ));
+                )));
             }
             self.publish_crash_registers_if_requested(engine)?;
             // Raise the barrier whenever this task has a sibling at all. A
@@ -348,6 +421,21 @@ where
                         "core capture could not pause its address space: {error:?}"
                     ))
                 })?;
+            // The pause above already raised the MM's published gate. Core
+            // reads must run under that exclusion, never through the owner
+            // portal, whose editor admission the same gate refuses: only this
+            // capture could release it. Take the typed proof for the exact MM;
+            // its nested gate raise is counted and lowered before the pause.
+            let snapshot_exclusion =
+                carrick_kernel::kernel::mm_occupancy::exclude_el1_editor_for_core_capture(
+                    context.shared().mm().id(),
+                )
+                .ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "core capture has no exclusion proof for its address space".to_owned(),
+                    )
+                })?;
+            let excluded = snapshot_exclusion.excluded();
             lifecycle(1, 0);
 
             engine.prepare_core_snapshot().map_err(|error| {
@@ -375,9 +463,9 @@ where
             if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "missing-thread")
             {
-                return Err(RuntimeError::Configuration(
+                return Err(CaptureStop::runtime(RuntimeError::Configuration(
                     "core publication failpoint missing-thread".to_owned(),
-                ));
+                )));
             }
             let fatal_visible_tid = u32::try_from(fatal.tid.raw())
                 .ok()
@@ -448,7 +536,13 @@ where
                                 // CopyIn on every blocking park, and for a
                                 // thread EL1 itself parked mid-syscall; see
                                 // `guest_visible_resume_pc`'s doc comment).
-                                let resume_pc = guest_visible_resume_pc(engine, resume_pc);
+                                let resume_pc =
+                                    guest_visible_resume_pc(&*engine, excluded, resume_pc)
+                                        .map_err(|error| {
+                                            CaptureStop::read(error, || {
+                                                format!("read resume island at {resume_pc:#x}")
+                                            })
+                                        })?;
                                 gregs[32] = resume_pc;
                                 gregs[33] = carrick_hal::el0_visible_pstate(resume_pstate);
                                 Ok(carrick_kernel::core_dump::ThreadState {
@@ -467,7 +561,7 @@ where
                                     },
                                 })
                             })
-                            .collect::<Result<Vec<_>, RuntimeError>>()?;
+                            .collect::<Result<Vec<_>, CaptureStop>>()?;
                     }
                     carrick_kernel::kernel::CrashQuorumPoll::Waiting(tid) => {
                         let _ = tid;
@@ -489,25 +583,25 @@ where
             if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "capture-mm")
             {
-                return Err(RuntimeError::Configuration(
+                return Err(CaptureStop::runtime(RuntimeError::Configuration(
                     "core publication failpoint capture-mm".to_owned(),
-                ));
+                )));
             }
             if process.auxv.is_empty()
                 || ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                     .is_some_and(|value| value == "missing-auxv")
             {
-                return Err(RuntimeError::Configuration(
+                return Err(CaptureStop::runtime(RuntimeError::Configuration(
                     "core capture missing authoritative auxv".to_owned(),
-                ));
+                )));
             }
             if process.maps.is_empty()
                 || ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                     .is_some_and(|value| value == "missing-vma")
             {
-                return Err(RuntimeError::Configuration(
+                return Err(CaptureStop::runtime(RuntimeError::Configuration(
                     "core capture missing authoritative VMA state".to_owned(),
-                ));
+                )));
             }
             let _readable_bytes = process
                 .maps
@@ -615,9 +709,9 @@ where
             if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "missing-file-identity")
             {
-                return Err(RuntimeError::Configuration(
+                return Err(CaptureStop::runtime(RuntimeError::Configuration(
                     "core capture missing file mapping identity".to_owned(),
-                ));
+                )));
             }
             let mm = context.shared().mm().id().raw();
             let asid = kernel
@@ -657,9 +751,9 @@ where
             if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "memory-read")
             {
-                return Err(RuntimeError::Configuration(
+                return Err(CaptureStop::runtime(RuntimeError::Configuration(
                     "core publication failpoint memory-read".to_owned(),
-                ));
+                )));
             }
             let mut extents = Vec::new();
             let mut remaining_budget = process.rlimit_core;
@@ -704,11 +798,20 @@ where
                         // continue scanning past them to later nonzero data.
                         let to_read = (sub_len - consumed).min(64 * 1024);
                         let address = sub_start + consumed as u64;
-                        let bytes = engine.read_core_bytes(address, to_read).map_err(|error| {
-                            RuntimeError::Trap(TrapError::Hypervisor(format!(
-                                "read core region {address:#x}..{:#x}: {error}",
-                                address.saturating_add(to_read as u64)
-                            )))
+                        // Never wait here: the pause and exclusion this
+                        // snapshot holds would outlive the wait. A Busy read
+                        // returns its dependency; the unpublished partial
+                        // snapshot is discarded and the rerun captures afresh.
+                        let bytes = carrick_hal::core_read::read_core_bytes(
+                            &*engine, excluded, address, to_read,
+                        )
+                        .map_err(|error| {
+                            CaptureStop::read(error, || {
+                                format!(
+                                    "read core region {address:#x}..{:#x}",
+                                    address.saturating_add(to_read as u64)
+                                )
+                            })
                         })?;
                         // Bulk preparation is not guest residency. Zero-filled
                         // pages can be holes without omitting host-written data.
@@ -737,9 +840,9 @@ where
             if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "validator")
             {
-                return Err(RuntimeError::Configuration(
+                return Err(CaptureStop::runtime(RuntimeError::Configuration(
                     "core publication failpoint validator".to_owned(),
-                ));
+                )));
             }
             let digest = payload.manifest_digest();
             let mut hash_words = [0_u64; 4];
@@ -757,16 +860,25 @@ where
             );
             crate::probes::hvpatch_core_hash(generation.get(), hash_words);
             lifecycle(3, 0);
-            Ok(Some(PreparedCorePublication {
+            Ok(Some(Box::new(PreparedCorePublication {
                 snapshot: process,
                 payload,
                 generation: generation.get(),
                 fatal_tid: fatal.tid.raw(),
                 publication: None,
-            }))
+            })))
         })();
-        if result.is_err() || matches!(&result, Ok(None)) {
-            lifecycle(6, if result.is_err() { 1 } else { 2 });
+        let result = match result {
+            Ok(prepared) => Ok(CoreCaptureAttempt::Done(prepared)),
+            Err(CaptureStop::Busy(wait)) => Ok(CoreCaptureAttempt::Busy(wait)),
+            Err(CaptureStop::Failed(error)) => Err(error),
+        };
+        match &result {
+            Err(_) => lifecycle(6, 1),
+            // A Busy attempt publishes nothing for this generation; its
+            // rerun issues a fresh one.
+            Ok(CoreCaptureAttempt::Done(None) | CoreCaptureAttempt::Busy(_)) => lifecycle(6, 2),
+            Ok(CoreCaptureAttempt::Done(Some(_))) => {}
         }
         finish_crash_collection(authority, barrier, quiesced, lease_drain_guard, result)
     }
@@ -993,7 +1105,7 @@ mod tests {
             .expect("bounded crash publication body");
         let barrier_acquire = capture.find("while !barrier.try_begin_fork()").unwrap();
         let advertise = capture.find("authority.advertise(generation)").unwrap();
-        let envelope = capture.find("let result = (|| {").unwrap();
+        let envelope = capture.find("let result = (||").unwrap();
         let envelope_end = capture
             .rfind("})();")
             .expect("exact protected crash publication closure end")
@@ -1008,19 +1120,28 @@ mod tests {
         let barrier_raise = protected.find("barrier.set_quiescing()").unwrap();
         let acquire = protected.find("acquire_crash_lease_drain(").unwrap();
         let prepare = protected.find("engine.prepare_core_snapshot()").unwrap();
+        let pause = protected.find(".pause_current_mm_for_capture(").unwrap();
+        let exclusion = protected
+            .find("exclude_el1_editor_for_core_capture(")
+            .unwrap();
         let quorum = protected.find("quorum.poll()").unwrap();
-        let read = protected.find(".read_core_bytes").unwrap();
+        let read = protected.find("core_read::read_core_bytes(").unwrap();
         let serialize = protected.find(".build_payload(").unwrap();
         let publication = protected.find("PreparedCorePublication {").unwrap();
         assert!(barrier_raise < acquire);
-        assert!(acquire < prepare);
+        assert!(acquire < pause);
+        assert!(
+            pause < exclusion,
+            "core reads run under the pause's exclusion"
+        );
+        assert!(exclusion < prepare);
         assert!(prepare < quorum);
         assert!(quorum < read);
         assert!(read < serialize);
         assert!(serialize < publication);
         assert_eq!(
-            protected.matches(".read_core_bytes").count(),
-            capture.matches(".read_core_bytes").count(),
+            protected.matches("read_core_bytes(").count(),
+            capture.matches("read_core_bytes(").count(),
             "every live engine read must remain inside the drain-guard closure"
         );
         assert!(
@@ -1317,9 +1438,9 @@ mod tests {
             },
         );
 
-        let prepared = result
-            .expect("capture core must succeed")
-            .expect("fatal signal must yield prepared publication");
+        let Ok(CoreCaptureAttempt::Done(Some(prepared))) = result else {
+            panic!("fatal signal must yield prepared publication");
+        };
 
         // 1. Verify read_core_bytes was called ONLY for the 3 touched pages (total 12 KiB)
         let reads = tracker.lock().clone();
@@ -1771,6 +1892,7 @@ mod tests {
                     self.portal_wait,
                     self.zone,
                 )),
+                core_owner: Some(self.portal_wait.handle().mm().raw()),
                 ..CrashCaptureTestEngine::default()
             }
         }
@@ -1789,7 +1911,7 @@ mod tests {
     /// completed progress: .. cause: Gate ..`.
     #[test]
     fn capture_core_reads_through_its_own_pause_gate() {
-        let mut fixture = core_gate_fixture(70_280);
+        let fixture = core_gate_fixture(70_280);
         let mut engine = fixture.engine();
         let zone = fixture.zone;
         let prepared = carrick_kernel::el1_zone::with_test_zone(zone, || {
@@ -1797,8 +1919,10 @@ mod tests {
                 .state
                 .capture_core_for_publication(&fixture.kernel, &mut engine, fixture.fatal)
         })
-        .expect("capture reads through its own pause exclusion")
-        .expect("fatal SIGSEGV prepares a core publication");
+        .expect("capture reads through its own pause exclusion");
+        let CoreCaptureAttempt::Done(Some(prepared)) = prepared else {
+            panic!("capture's own gate is never a wait to enrol on");
+        };
         assert_eq!(prepared.payload.extents.len(), 2);
         assert_eq!(
             prepared.payload.extents[0].bytes,
@@ -1809,5 +1933,125 @@ mod tests {
             vec![0x5a; CORE_GATE_PAGE]
         );
         assert_eq!(fixture.gate(), 0, "capture lowers every gate it raised");
+    }
+
+    /// Another holder's retained reader of one backing page: not ready until
+    /// [`Self::release`], which wakes every enrolled waiter exactly once.
+    #[derive(Default)]
+    pub(crate) struct ReleasableReader {
+        ready: std::sync::atomic::AtomicBool,
+        wakes: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl std::fmt::Debug for ReleasableReader {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ReleasableReader")
+                .field("ready", &self.ready)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ReleasableReader {
+        pub(crate) fn release(&self) {
+            self.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+            for wake in std::mem::take(&mut *self.wakes.lock()) {
+                wake();
+            }
+        }
+    }
+
+    impl carrick_guest_mem::PhysicalMemoryWait for ReleasableReader {
+        fn is_ready(&self) -> bool {
+            self.ready.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn enroll(
+            &self,
+            wake: Arc<dyn Fn() + Send + Sync>,
+        ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+            self.wakes.lock().push(wake);
+            (Box::new("reader subscription"), self.is_ready())
+        }
+    }
+
+    /// #1733 (b): a read refused by ANOTHER holder (a retained reader of the
+    /// target page) is "not now". Capture returns that exact dependency with
+    /// its pause, exclusion and collection released and nothing published;
+    /// after the holder releases once, the rerun takes a fresh snapshot (a
+    /// sibling changed the prefix meanwhile) and publishes a complete core.
+    /// Red on main: the refusal fails the capture outright.
+    #[test]
+    fn capture_core_busy_once_then_publishes_after_another_holder_releases() {
+        let fixture = core_gate_fixture(70_290);
+        let reader = Arc::new(ReleasableReader::default());
+        let dependency = carrick_guest_mem::OwnedMemoryWait(reader.clone());
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = CrashCaptureTestEngine {
+            backing_physical: Some((fixture.target, dependency.clone())),
+            backing_reads: Some(Arc::clone(&reads)),
+            ..fixture.engine()
+        };
+        let zone = fixture.zone;
+        let capture = |engine: &mut CrashCaptureTestEngine| {
+            carrick_kernel::el1_zone::with_test_zone(zone, || {
+                fixture
+                    .state
+                    .capture_core_for_publication(&fixture.kernel, engine, fixture.fatal)
+            })
+        };
+
+        let first = capture(&mut engine).expect("another holder's refusal is not a failure");
+        let CoreCaptureAttempt::Busy(carrick_hal::core_read::CoreReadWait::Physical(wait)) = first
+        else {
+            panic!("the reader's dependency must come back as Busy");
+        };
+        assert_eq!(wait, dependency, "the exact holder's dependency");
+        assert_eq!(fixture.gate(), 0, "the snapshot's gate is released");
+        let authority = fixture.kernel.crash_capture.as_ref().unwrap();
+        assert!(authority.collecting().is_none(), "collection is released");
+        let barrier = fixture.kernel.process_fork_barrier.as_ref().unwrap();
+        assert!(!barrier.is_quiescing(), "siblings are released");
+
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&woken);
+        let (_subscription, ready) = wait.0.enroll(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        assert!(!ready, "enrolment precedes the holder's release");
+        // A sibling ran while capture waited; the rerun must not reuse the
+        // first attempt's bytes.
+        engine
+            .guest_memory
+            .insert(fixture.prefix, vec![0xc3; CORE_GATE_PAGE]);
+        reader.release();
+        assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            wait.0.is_ready(),
+            "the probe after the wake sees the release"
+        );
+
+        let second = capture(&mut engine).expect("the released dependency reads");
+        let CoreCaptureAttempt::Done(Some(prepared)) = second else {
+            panic!("the rerun publishes a core");
+        };
+        assert_eq!(prepared.payload.extents.len(), 2);
+        assert_eq!(
+            prepared.payload.extents[0].bytes,
+            vec![0xc3; CORE_GATE_PAGE]
+        );
+        assert_eq!(
+            prepared.payload.extents[1].bytes,
+            vec![0x5a; CORE_GATE_PAGE]
+        );
+        assert_eq!(fixture.gate(), 0);
+        assert_eq!(
+            reads.lock().as_slice(),
+            &[
+                (fixture.prefix, CORE_GATE_PAGE),
+                (fixture.prefix, CORE_GATE_PAGE),
+                (fixture.target, CORE_GATE_PAGE),
+            ],
+            "the prefix is recaptured, the target read once after release"
+        );
     }
 }

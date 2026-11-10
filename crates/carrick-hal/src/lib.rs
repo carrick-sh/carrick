@@ -34,6 +34,7 @@ pub use foreign_mm::{
 };
 pub mod asid;
 pub mod birth_serial;
+pub mod core_read;
 pub mod el1_editor_exclusion;
 pub mod fork_stock;
 pub mod physical_grants;

@@ -1572,6 +1572,46 @@ fn x86_task_state_from_snapshot<V: X86Vmm>(
     )
 }
 
+/// x86-64 mechanics for the ISA-neutral core read policy
+/// ([`carrick_hal::core_read`]): the engine's per-page VA -> GPA selection
+/// (identity window or live page-table walk) and the VMM's host window.
+impl<V: X86Vmm> carrick_hal::core_read::CoreMemorySource for X86EngineCore<V> {
+    fn core_memory_mm(&self) -> Option<u64> {
+        (self.mm_generation != 0).then_some(self.mm_generation)
+    }
+
+    fn core_stage1_output(&self, va: GuestVa) -> Result<Option<Gpa>, MemoryError> {
+        Ok(self.syscall_buffer_gpa(va, 1))
+    }
+
+    fn read_core_backing(
+        &self,
+        _excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        va: GuestVa,
+        output: Gpa,
+        length: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        let host = self.vm.syscall_buffer_host_ptr(va, output, length).ok_or(
+            MemoryError::OutOfBounds {
+                address: va.raw(),
+                length,
+            },
+        )?;
+        let mut bytes = vec![0; length];
+        // SAFETY: the VMM resolved the complete fragment to one live host
+        // window; the caller's exclusion keeps the MM's translations still and
+        // the destination is disjoint storage.
+        unsafe { std::ptr::copy_nonoverlapping(host, bytes.as_mut_ptr(), length) };
+        Ok(bytes)
+    }
+
+    fn core_untouched_zero(&self, page: GuestVa) -> bool {
+        // A reserved, never-committed page reads as the kernel's lazy zero
+        // fill, exactly as the ordinary raw read treats it.
+        self.vm.is_guest_reserved(page.raw())
+    }
+}
+
 impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
     type Arch = X8664GuestArch;
     type KickHandle = V::KickHandle;
@@ -2433,6 +2473,51 @@ mod tests {
                 .expect_err("high user alias must be rejected before VMM install");
             assert!(format!("{error:?}").contains("outside lower-half user range"));
         }
+    }
+
+    /// #1733 (c), x86 mechanics: core capture's read goes through the
+    /// ISA-neutral policy (`carrick_hal::core_read`) while capture holds the
+    /// MM's gate, translating every page fragment on its own (identity,
+    /// private overlay, identity) and copying the VMM's host backing. A proof
+    /// for another MM reads nothing; an untranslated page that is not an
+    /// untouched reservation fails rather than reading as zero.
+    #[test]
+    fn core_read_under_capture_exclusion_uses_x86_translation_and_backing() {
+        let shared = carrick_mem::memory::LINUX_SHARED_FILE_BASE;
+        let overlay = carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE;
+        let vm = FragmentVmm::new(shared, overlay);
+        let engine = X86EngineCore::from_parts(vm, TestVcpu::default(), test_layout());
+        let mm = carrick_hal::core_read::CoreMemorySource::core_memory_mm(&engine)
+            .expect("an x86 engine reads its exact MM directly");
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let index = spaces.publish_closed(mm, 0x1000, 0).unwrap();
+        let other = spaces.publish_closed(mm + 1, 0x2000, 0).unwrap();
+        {
+            let excluded = spaces.raise_and_wait_for_editor(index, || {});
+            assert_ne!(spaces.gate(index), 0, "capture holds the MM's gate");
+            let bytes =
+                carrick_hal::core_read::read_core_bytes(&engine, &excluded, shared + 0xff0, 0x1020)
+                    .expect("read under capture's own exclusion");
+            assert_eq!(bytes.len(), 0x1020);
+            assert!(bytes[..0x10].iter().all(|byte| *byte == 0x11));
+            assert!(bytes[0x10..0x1010].iter().all(|byte| *byte == 0x22));
+            assert!(bytes[0x1010..].iter().all(|byte| *byte == 0x33));
+            assert!(matches!(
+                carrick_hal::core_read::read_core_bytes(&engine, &excluded, shared + 0x3000, 0x10),
+                Err(carrick_hal::core_read::CoreReadError::Memory(
+                    MemoryError::OutOfBounds { .. }
+                ))
+            ));
+            let wrong = spaces.raise_and_wait_for_editor(other, || {});
+            assert!(matches!(
+                carrick_hal::core_read::read_core_bytes(&engine, &wrong, shared, 1),
+                Err(carrick_hal::core_read::CoreReadError::Memory(
+                    MemoryError::HostMap(_)
+                ))
+            ));
+        }
+        spaces.lower(other);
+        spaces.lower(index);
     }
 
     #[test]

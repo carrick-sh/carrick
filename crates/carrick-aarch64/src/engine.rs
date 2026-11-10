@@ -5390,6 +5390,65 @@ fn seed_sibling_snapshot(
     snap
 }
 
+/// AArch64 mechanics for the ISA-neutral core read policy
+/// ([`carrick_hal::core_read`]): stage-1 descriptor translation, the VMM's
+/// backing copy, and the live-leaf half of the untouched-zero question.
+impl<V: Aarch64Vmm> carrick_hal::core_read::CoreMemorySource for Aarch64EngineCore<V> {
+    fn core_memory_mm(&self) -> Option<u64> {
+        self.protections.owner().map(|handle| handle.mm().raw())
+    }
+
+    fn read_host_owned_core_bytes(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        // The range is already joined to a quiesced, readable Linux VMA. Use
+        // the backing-only path so the syscall EFAULT metadata of the larger
+        // hidden heap reservation does not reject its live `[heap_base, brk)`
+        // prefix.
+        <Self as GuestMemory>::read_bytes_raw(self, address, length)
+    }
+
+    fn core_stage1_output(&self, va: GuestVa) -> Result<Option<Gpa>, MemoryError> {
+        if self.protections.owner().map(|handle| handle.mm().raw()) != Some(self.mm_generation) {
+            return Err(MemoryError::HostMap(
+                "owner memory incarnation mismatch".into(),
+            ));
+        }
+        let va = va.raw();
+        // A leaf whose valid bit `munmap`/`PROT_NONE` cleared keeps its
+        // output; boot identity windows need no stage-1 translation at all.
+        Ok(self
+            .page_tables
+            .with_manager(|manager| manager.translate_retained_output(va))
+            .flatten()
+            .map(Gpa::new)
+            .or_else(|| {
+                (!carrick_mem::memory::needs_stage1_translation(va, 1)).then_some(Gpa::new(va))
+            }))
+    }
+
+    fn read_core_backing(
+        &self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        va: GuestVa,
+        output: Gpa,
+        length: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        self.vm
+            .translated_read_excluded(excluded, va.raw(), output.raw(), length)
+    }
+
+    fn core_deferred_anonymous(&self) -> Option<Arc<carrick_guest_mem::DeferredAnonymousState>> {
+        self.vm.deferred_anonymous_state()
+    }
+
+    fn core_untouched_zero(&self, page: GuestVa) -> bool {
+        self.fresh_zero_chunk(page.raw(), 0, 0x1000) == Some(0x1000)
+    }
+}
+
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn cancel_native_fault_wait(&mut self) -> Result<(), TrapError> {
         self.pending_resume_pc = None;
@@ -6257,18 +6316,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })?;
         }
         Ok(())
-    }
-
-    fn read_core_bytes(
-        &self,
-        address: u64,
-        length: usize,
-    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-        // `capture_and_publish_core` has already joined this range to a
-        // quiesced, readable Linux VMA. Use the backing-only path so the
-        // syscall EFAULT metadata for the larger hidden heap reservation does
-        // not reject its live `[heap_base, brk)` prefix.
-        <Self as GuestMemory>::read_bytes_raw(self, address, length)
     }
 
     fn diagnostic_fault_page_tables(&self, far: u64) -> Option<(u64, [u64; 4])> {

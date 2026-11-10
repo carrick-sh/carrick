@@ -597,19 +597,28 @@ pub(crate) fn core_note_resume_pair(
 /// Both sources are uniform at this point (`ThreadState` conversion).
 /// An already guest-visible PC passes through unchanged: the word before a
 /// genuine guest `svc`+4 address is the patched branch, so the shape check fails.
+/// So does a PC whose two words are unreadable. A read that must wait is not
+/// unreadable: it stops the capture attempt (`CoreReadError::Busy`/`OwnGate`).
 pub(crate) fn guest_visible_resume_pc<E: carrick_hal::ThreadedEngine>(
     engine: &E,
+    excluded: &carrick_sched_core::ExcludedEditor<'_>,
     resume_pc: u64,
-) -> u64 {
-    (|| {
-        let start = resume_pc.checked_sub(4)?;
-        let bytes = engine.read_core_bytes(start, 8).ok()?;
+) -> Result<u64, carrick_hal::core_read::CoreReadError> {
+    let Some(start) = resume_pc.checked_sub(4) else {
+        return Ok(resume_pc);
+    };
+    let bytes = match carrick_hal::core_read::read_core_bytes(engine, excluded, start, 8) {
+        Ok(bytes) => bytes,
+        Err(carrick_hal::core_read::CoreReadError::Memory(_)) => return Ok(resume_pc),
+        Err(wait) => return Err(wait),
+    };
+    Ok((|| {
         let svc = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
         let return_branch = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
         carrick_hal::aarch64::decode_hvpatch_island_origin(resume_pc, svc, return_branch)?
             .checked_add(4)
     })()
-    .unwrap_or(resume_pc)
+    .unwrap_or(resume_pc))
 }
 
 #[derive(Debug)]
@@ -837,8 +846,10 @@ mod tests {
             .guest_memory
             .insert(ISLAND_RETURN_BRANCH - 4, island_bytes);
 
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let excluded = spaces.unpublished(1).unwrap();
         assert_eq!(
-            guest_visible_resume_pc(&engine, ISLAND_RETURN_BRANCH),
+            guest_visible_resume_pc(&engine, &excluded, ISLAND_RETURN_BRANCH).unwrap(),
             EXPECTED_RESUME_PC,
             "an island's return-branch address must translate back to svc+4"
         );
@@ -856,7 +867,12 @@ mod tests {
         // `read_bytes_raw` answers zero-filled bytes, which is not the
         // `svc #0`/`B` shape.
         let live_pc = 0x210300_u64;
-        assert_eq!(guest_visible_resume_pc(&engine, live_pc), live_pc);
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let excluded = spaces.unpublished(1).unwrap();
+        assert_eq!(
+            guest_visible_resume_pc(&engine, &excluded, live_pc).unwrap(),
+            live_pc
+        );
     }
 
     #[test]
