@@ -760,6 +760,11 @@ impl ServiceNotice {
             .store(u64::from(selector.record.id.raw()) + 1, Ordering::Release);
         Ok(())
     }
+    /// Whether a publication awaits the host's take (or is mid-write). Its
+    /// lane must exit before admitting another record.
+    pub fn is_published(&self) -> bool {
+        self.record.load(Ordering::Acquire) != 0
+    }
     pub fn take(&self) -> Result<Option<ServiceSelector>, ServiceError> {
         let record = self.record.load(Ordering::Acquire);
         if record == 0 {
