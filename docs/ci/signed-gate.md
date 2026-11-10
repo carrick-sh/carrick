@@ -156,8 +156,14 @@ main's own evidence. Queue and PR requests do not consume it.
 
 PRs in a batch receive the verdict comment, found through the comparison's
 commits and their associated PRs. The group status and Actions summary also
-link the itemized comparison and logs. A NEW failure fails **Signed queue
-gate**, so the required check ejects the group instead of landing it.
+link the itemized comparison and logs. A NEW failure that is a test or binary
+the group itself introduced fails **Signed queue gate**, so the required check
+ejects the group instead of landing it (owner, 2026-11-10, #231, #2035). Every
+other NEW failure is advisory: the comment lists it, the check passes. "Introduced"
+means the failing test is absent from the base's `started_tests` (or the
+unfinished binary is absent from the base's finished and unfinished binaries) in
+the same step; the base is the merge-group's `base_sha` run in the same job, so
+"pre-existing" means failing on main, not on a PR's base.
 
 ## Optional PR gates and recovery
 
@@ -274,10 +280,15 @@ unitemized failures, and itemized `failed_tests` NEW/FIXED sets. EL1
 from structured fields, never human `failures` strings. FIXED is an observed
 set difference and is not proof that a killed binary recovered.
 
-PASS requires no new itemized or unitemized failures, no newly unfinished
-binary, no missing step, no smaller started-test or finished-binary
-population, and no disappeared completed binary. New probe diffs or cleanup
-failures also fail. The execution job must finish successfully and its receipt
+PASS requires no introduced failure: no NEW failed test absent from the base's
+started tests and no NEW unfinished binary the base never ran. Evidence
+completeness also blocks: a missing or not-run step, skipped steps, a dirty
+checkout and a missing EL1 comparison. NEW failures of tests the base already
+started, unitemized failures, smaller started-test or finished-binary
+populations, disappeared completed binaries, probe diffs, cleanup counts and
+EL1 set differences are advisory: they appear under `ADVISORY=` in the comment
+and `diff.json` (`blocking` / `advisory`) and the status reads `PASS (advisory
+NEW only)`. The execution job must finish successfully and its receipt
 must pass admission, and the paired base must be complete and match its
 seal. Existing main test failures do not alone reject a PR.
 
