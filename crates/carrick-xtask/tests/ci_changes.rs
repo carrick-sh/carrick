@@ -556,7 +556,6 @@ fn draft_pr_runs_cheap_linux_checks_and_its_ci_ok_cannot_land() {
 
 #[cfg(unix)]
 fn write_mock_gh(bin_dir: &Path, body: &str) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let gh_path = bin_dir.join("gh");
     carrick_test_support::executable::write_executable(&gh_path, body);
     let old_path = std::env::var("PATH").unwrap_or_default();
