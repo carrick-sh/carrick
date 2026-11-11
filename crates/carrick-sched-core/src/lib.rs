@@ -3628,26 +3628,39 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 unlink();
             }
         };
+        let waker_cpu = self.slot(waker).cpu.load(Ordering::Relaxed);
+        let waker_cpu_allowed = rec.allows_cpu(waker_cpu);
+        let runs_on_waker = home.is_none_or(|home| home == waker)
+            && self.runs_mm_of(waker, rec)
+            && waker_cpu_allowed;
         let target = self
             .placement(record, waker)
             .filter(|target| *target != waker);
         if let Some(target) = target
-            && let Some(slot_guard) = self.slot_lock(
-                target,
-                &BoundedSpin(if nonblocking { 0 } else { EL1_SLOT_LOCK_SPINS }),
-            )
+            && let Some(slot_guard) = if nonblocking {
+                self.slot_lock(target, &BoundedSpin(0))
+            } else if runs_on_waker {
+                self.slot_lock(target, &BoundedSpin(EL1_SLOT_LOCK_SPINS))
+            } else {
+                self.slot_lock(target, &SpinForever)
+            }
         {
-            let is_home = home == Some(target);
+            // This is the target's only attempt. Apply its full owner
+            // admission here, including an allowed driver stopped at a host
+            // boundary, rather than trying it again with broader custody.
+            let custody = if home == Some(target) {
+                OwnerCustody::Home
+            } else {
+                OwnerCustody::Driven
+            };
             let state = self.slot(target).state();
-            // A busy slot takes a thread that may run there, as an idle one
-            // does: the queue is its own, and the SGI below makes it
-            // reschedule ([`Self::placement`]).
-            let takes = if is_home {
+            let guest_takes = if home == Some(target) {
                 state.in_guest()
             } else {
                 self.accepts(target, rec, false)
                     || (state.in_guest() && self.accepts_running(target, rec))
             };
+            let takes = custody.holds(self, target, rec) && (guest_takes || !runs_on_waker);
             if takes {
                 if !rec.cas(Claim::Parked { seq }, Claim::Queued { slot: target, seq }) {
                     return false;
@@ -3660,6 +3673,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 if matches!(state, SlotState::Running | SlotState::IdleWfi) {
                     effects.push_sgi(target);
                 }
+                self.kick_peers_of_away_owner(rec, target, effects);
                 self.counters.el1_wakes.fetch_add(1, Ordering::Relaxed);
                 self.counters
                     .el1_cross_wakes
@@ -3667,11 +3681,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 return true;
             }
         }
-        let waker_cpu = self.slot(waker).cpu.load(Ordering::Relaxed);
-        let waker_cpu_allowed = rec.allows_cpu(waker_cpu);
-        let runs_on_waker = home.is_none_or(|home| home == waker)
-            && self.runs_mm_of(waker, rec)
-            && waker_cpu_allowed;
         if !runs_on_waker && home != Some(waker) {
             // The waker may not run it, and no slot in the guest took it
             // now: queue it on the slot that owns it, busy, contended or
