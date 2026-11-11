@@ -9,6 +9,7 @@ rationale = "A contiguous private anonymous VMA requires one backend discard or 
 [bindings]
 vm_free = [
   "carrick-kernel::dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_madvise_dontneed_returns_zero",
 ]
 embed = [
   "carrick-conformance-next::deferred_anonymous_pristine_scrub_semantics",

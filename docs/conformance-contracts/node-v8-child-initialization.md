@@ -50,3 +50,38 @@ On the admitted GitHub main, #1830, #1740 and #1792 are OPEN/unmerged.
 No prerequisite workaround belongs in this slice. The reported post-SIGABRT
 hang remains separate: it needs its own production termination/wait witness;
 this attribution does not establish its cause.
+
+## Round 2 admission reduction
+
+The native witness extends the existing fork/exec fixture in
+`aarch64_process_tests/native_exec_pipe_tests.rs`. It keeps the admitted parent
+and exec child alive, enters the registered child, dispatches canonical ordinal
+233, and applies the shipping final-capture policy with the registry's actual
+thread-group owner. It requires `madvise(0x400000, 0, 4)` to return zero.
+The zero-length call isolates admission; it does not pretend to own a populated
+V8 reservation. The existing pipe witness retains its test name and assertions.
+
+This limitation is material: the VM-free dispatcher's default anonymous venue
+is absent (`El1PendingFamilies::anonymous_venue`, non-`target_os = "none"`).
+Supplying the child's physical `FixtureMapping` venue over the admitted
+successor MM tests the production delegated anonymous path without inventing
+semantics. The production crossing table marks Madvise temporary, and no ring
+stage handles it yet.
+
+The separate Linux-only exec-child control reserves 128 MiB with PROT_NONE,
+trims a page at each end, makes 2 MiB RWX, writes it, discards it and checks every
+byte is zero. It also checks the zero-length reduction, NONE/RW/RX/RWX
+transitions, and MAP_FIXED|MAP_NORESERVE anonymous decommit/readback. Its parent
+stays alive and bounds the exec child at ten seconds. This is a local native
+Linux control, not the native ARM64 Docker oracle or Carrick guest evidence.
+
+Contract: `kernel.mm.anonymous-discard`; the new admission binding does not
+change its existing backend-call budget or claim a structural measurement.
+No signed Node result is claimed here. The post-SIGABRT hang is still a
+separate termination/wait investigation, with no fix here.
+
+Observed red: after settling the completed exec setup boundary,
+`serial_host_native_fork_exec_madvise_dontneed_returns_zero` returns raw `-38`
+(ENOSYS), expected `0`, for `(address=0x400000, length=0, advice=4)`.
+The production dispatcher forwards; final capture refuses it once as a child
+call, with zero carrier-venue refusals.
