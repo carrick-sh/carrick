@@ -316,11 +316,12 @@ An address-only wake that cannot immediately place a native waiter still
 finishes in the ring (#1941): `wake_placed` never refuses, so the native
 adapter makes one wake under the bucket lock with the original key, mask and
 count. A waiter whose allowed slots are all busy is queued on the least loaded
-one with a reschedule. A waiter no guest slot may run is queued on the waker,
-misplaced, and the waker owes the host a boundary; there the waker's executor
-relocates it and the host routes the native handback (`place_native_handback`),
-which retains the completed wait until an eligible driver returns. No guest
-operand is read and no second futex wake is needed for that completion.
+one with a reschedule. A waiter no guest slot may run now is queued, in the
+same wake, on the slot that owns it (`ZoneTables::owner_slot`), stopped,
+contended or busy: the custody the host's `place_native_handback` gives a
+native handback, which retains the completed wait until an eligible driver
+returns. No guest operand is read and no second futex wake is needed for that
+completion.
 `native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody` drives
 the production adapter with one excluded-mask waiter and two matching waiters
 whose only allowed slot is busy. It requires exactly one counted completion,
@@ -412,8 +413,17 @@ forever: `el1_sched_two_processes_share_vcpus` hung 10 of 10.
 `ZoneTables::wake_placed` now has no refusal. A waiter whose allowed CPUs are
 all busy is queued on the least loaded of them with a reschedule SGI, the
 choice the host's `place_in_guest` makes. A waiter no guest slot may run
-(its only slot stopped at a host exit) is queued on the waker's own slot and
-reported misplaced; the waker's host exit relocates it. A `futex_waitv`
+now (its only slot stopped at a host exit, or that slot's run-queue lock
+contended) is queued on the slot that owns it, chosen by
+`ZoneTables::owner_slot`: its home; else the slot it last ran on, if live
+and able to run it; else the shortest live run queue that may run it; else
+the slot it last ran on if its affinity allows that CPU. The waker takes
+that slot's lock without a bound, the order (bucket, then slot) the host's
+`wake_host` already uses. A slot in the guest gets a reschedule SGI; a
+stopped slot's driver raises its owed reschedule before it runs the vCPU
+again (`ZoneTables::reschedule_owed`), and an away driver at `step_back`.
+Only a thread no slot but the waker's may run is queued on the waker's own
+slot and reported misplaced, for the waker's executor. A `futex_waitv`
 waiter, which only the host parks, is claimed into a transfer, its woken entry
 is unlinked under the bucket lock, and it goes to the carrier completion
 chain; the host boundary the waker then owes unlinks its other entries and
@@ -488,32 +498,77 @@ on PR head `adb6aec667`):
   completes in ring, queues the waiter on its busy slot and sends one kick
   (`el1_sgis`, was 0).
 - `native_futex_wake_of_a_waiter_on_a_stopped_cpu_owes_a_host_boundary`: the
-  waiter's only CPU is stopped; it is queued misplaced on the waker's slot
-  and the waker has pending host work (was false).
+  waiter's only CPU has no slot an executor drives and it never ran
+  elsewhere, so no slot but the waker's may hold it. It is queued misplaced
+  on the waker's slot and the waker has pending host work (was false).
 
-x86 production owner guard (real KVM production image,
-`carrick-vmm-kvm/tests/cpl0_initial_mm.rs`):
-`native_exit_wake_to_a_busy_home_is_misplaced_and_owes_the_host`. A fork
-child's exit wake on CPU 1 reaches `Service::wake_effects` while the host
-holds the parent's home queue, so the parent is queued misplaced on slot 1
-and the waker leaves at the WORK doorbell with its doorbell rung. It is not
-red before the migration: `begin_closing` rings that doorbell itself. It
-remains a refactor guard, not evidence for the added host-work marking.
+### Misplaced waiters are placed by the wake itself (#1961 review)
 
-`native_kill_wake_to_a_busy_home_marks_fresh_host_work` supplies the non-exit
-production-entry witness. The parent blocks SIGWINCH, forks a live child,
-and enrolls its real `wait4` continuation. With CPU 0's home queue locked,
-the child on CPU 1 calls native `kill(parent, SIGWINCH)`. The blocked signal
-cannot interrupt a futex or cancel a service; kill nevertheless publishes
-the parent's process channel through `Service::wake_effects`. The test reads
-and asserts a clear sender doorbell before the call, then requires exactly
-one channel wake, one misplaced placement on slot 1, fresh pending host work,
-and the WORK boundary. Neither process exits, and no genuine debt is cleared.
-The witness fails on pre-migration `725967082` at the fresh host-work
-assertion, after the wake and misplaced placement assertions pass; the
-shared applier passes it. It reuses the existing KVM production factory,
-wait-enrollment observer, queue-lock fixture and read-only debt snapshot;
-it adds no production owner, queue or wake mechanism.
+The first version of this change queued every waiter no guest slot could
+take now on the waker's own run queue, `misplaced`, and said the waker's
+host boundary would relocate it. No shipping boundary does: `relocate` runs
+only when a slot is vacated (`leave_slot`/`step_away`), and ARM's
+`take_service_head_for_executor` and x86's WORK boundary do not move a
+waker's queue. The waker's CPU then switched in another slot's home thread
+or a thread its affinity excluded (the review's red run of the kill
+witness showed CPU 1 switching in CPU 0's home parent), and the review
+found an ARM executor could bounce such a thread between `load` and the
+host without serving it. The nearest existing mover,
+`ZoneTables::migrate_queued` (`carrick-sched-core/src/lib.rs`), runs at an
+x86 resume or an ARM tick but moves only unhomed threads, and only to idle
+slots in the guest, so it cannot cover a homed waiter or a stopped slot.
+
+`claim_for_el1` now places such a waiter, in the same wake and under the
+same bucket lock, on the slot that owns it (`ZoneTables::owner_slot`, see
+above), whatever that slot's state, through `requeue_claimed`, the queue
+step the host's `requeue_on` and `place_native_handback` already use. This
+restores the #1892/#1902 custody (home, else last slot) that the removed
+`wake_host` + `place_native_handback` second pass gave, in the one wake
+path, for every EL1 waker on both ISAs: native futex and clear-child-tid
+wakes, `Sched::wake_word`, x86 `NativeLane::wake_word` and object-wait
+readiness. Only a waiter no slot but the waker's may run stays misplaced.
+
+Witnesses (red on PR #1961 head `2e4ffdf78`, green after):
+
+- ARM, `forked_child_futex_wake_places_a_waiter_pinned_to_a_stopped_vcpu_on_it`
+  (`carrick-el1-linux`, through `dispatch_arm_syscall_with_native_process`):
+  a fork child's `FUTEX_WAKE_PRIVATE` wakes a waiter pinned to CPU 1, whose
+  executor is stopped at a host exit. Red: `Queued { slot: SlotId(0) }`,
+  the waker's slot. Green: queued on CPU 1, nothing misplaced, and CPU 1
+  switches it in with result 0 once back in the guest.
+- `native_clear_tid_stopped_join_driver_{aarch64,x86}`: the joiner's only
+  driver is away; the exiting member's clear-child-tid wake queues it on that
+  driver's slot. The test no longer relocates or places the joiner itself,
+  its service delivers wake effects from the waker's own slot, and it
+  asserts no doorbell and no SGI. Red: `Queued { slot: SlotId(1) }`.
+- x86 KVM production image (`carrick-vmm-kvm/tests/cpl0_initial_mm.rs`):
+  - `native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there`
+    (fixture `native_child_futex_wake.S`): a fork child's thread on CPU 1
+    wakes the child's main thread, pinned to CPU 0, while the host holds
+    CPU 0's run-queue lock until the waker has waited 50 ms on it inside its
+    wake (the futex bucket stays held). The waiter is queued on CPU 0, CPU 1
+    never runs it, and the run completes: the child exits 19 and the root
+    reaps it and exits 7. Red: `nothing left to relocate`, misplaced 1.
+  - `native_kill_wake_to_a_busy_home_queues_the_parent_at_home` and
+    `native_exit_wake_to_a_busy_home_queues_the_parent_at_home`: a native
+    `kill` and an exit wake publish the parent's wait4 channel while the
+    host holds the parent's home queue for 300 ms. The waker waits for the
+    lock and queues the parent at home (slot 0), nothing misplaced; the
+    kill owes the host nothing and the exit still leaves at its WORK
+    boundary. Red: the waker returned before the release, having queued the
+    homed parent on its own slot 1 (`migrate_queued` never moves it). These
+    replace `native_kill_wake_to_a_busy_home_marks_fresh_host_work` and
+    `native_exit_wake_to_a_busy_home_is_misplaced_and_owes_the_host`, which
+    asserted that misplacement.
+
+The x86 KVM futex witness also exposed an x86 result defect, older than
+this change: the x86 native futex branch of the EL1 pending families
+(`carrick-el1-linux/src/dispatch.rs`) returned a `Returned` outcome without
+writing it to the frame, and the shared completion installs no result for
+the futex family (ARM's `serve_futex_operation` writes x0 itself). Every
+x86 native `FUTEX_WAKE` therefore returned its own syscall number, 202. The
+branch now installs the result, as the IPC families do. Red: the waker's
+`FUTEX_WAKE` returned 202 and the child exited 46 (100 + 202, mod 256).
 
 The lifecycle wait-channel wake crossing (`cross_wait_channel_wake`, HVC
 `GRANT_OP_WAIT_CHANNEL_WAKE`) has no guest caller left; retiring its host

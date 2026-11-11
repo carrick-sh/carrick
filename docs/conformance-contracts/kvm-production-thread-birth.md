@@ -92,9 +92,12 @@ and merge-group lane. Worker gate evidence is recorded on draft PR #1902.
 The native syscall and clear-child-tid callers share `wake_native_futex`.
 It makes one `wake_placed` call, which never refuses (#1941), without
 changing the caller's MM, key, mask or count. A joiner no guest slot may run
-is queued on the waker, misplaced; the waker's host boundary relocates it into
-`place_native_handback` queue custody. No new queue, poll or retry is
-introduced.
+now is queued, inside that same wake, on the slot that owns it
+(`ZoneTables::owner_slot`: its home, else the slot it last ran on, else an
+eligible live slot), stopped or busy, the custody `place_native_handback`
+gives a native handback. Its driver runs it when it is in the guest again.
+No host boundary relocates a waker's run queue, so the waker never keeps it
+(#1961 review). No new queue, poll or retry is introduced.
 The existing syscall adapter's mask/count witness remains authoritative;
 clear-tid retains the shared-on-private key and CHILD_TID wake constants.
 
@@ -102,10 +105,15 @@ The two `native_clear_tid_stopped_join_driver_*` bindings enroll a timed
 join through a registered native futex entry, authenticate a published Born
 sibling through the production registry, and dispatch its raw nonfinal exit
 through the common lifecycle owner. They stop the only eligible join driver
-and require the joiner queued misplaced on the exiting member's slot after
-exit. Exit must retire in ring with no host custody or service notice, clear
-the TID once, and retain exactly one join completion, through relocation and
-native handback, until the driver returns. The schedule uses fixed scheduler steps
+(`step_away`) and require the joiner queued on that driver's slot after exit,
+with nothing on the exiting member's slot, no misplaced wake, no doorbell
+rung and no SGI sent: the test's service delivers the wake's effects as the
+production one does, from the exiting member's own slot. Exit must retire in
+ring with no host custody or service notice, clear the TID once, and retain
+exactly one join completion until the driver returns (`step_back`); no test
+step relocates or places the joiner. They were red on PR #1961 head
+`2e4ffdf78` once the test stopped relocating the joiner itself: the joiner
+was `Queued { slot: SlotId(1) }`, the exiting member's slot. The schedule uses fixed scheduler steps
 on AArch64/Aarch64Mmu and x86/X86Mmu contexts, with no host blocking waits.
 
 These bindings were red on `e9afb2e70a` production code: both observed
