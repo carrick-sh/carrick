@@ -73,20 +73,31 @@ where
     // existing route, as ARM's staging does, so an initial write keeps its
     // stdout route and a strict refusal stays the crossing table's.
     let (table, mut resolve) = namespace()?;
+    // A descriptor is owned by exactly one table. The run root's ring
+    // namespace holds what its staged calls opened; a descriptor absent
+    // there (one the host table opened) keeps the host route, which answers
+    // it, rather than a ring EBADF.
+    let mut absent = false;
+    let mut resolve = |fd| {
+        let descriptor = resolve(fd);
+        absent |= matches!(descriptor, Some(NativeDescriptor::Absent));
+        descriptor
+    };
     let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
-    Some(
-        carrick_el1_linux::dispatch::stage_native_host_file(
-            decoded,
-            task,
-            validator,
-            &mut NativeNamespace {
-                table,
-                resolve: &mut resolve,
-                releases: &mut releases,
-            },
-        )
-        .unwrap_or(HostFileStage::InRing),
-    )
+    let staged = carrick_el1_linux::dispatch::stage_native_host_file(
+        decoded,
+        task,
+        validator,
+        &mut NativeNamespace {
+            table,
+            resolve: &mut resolve,
+            releases: &mut releases,
+        },
+    );
+    if absent && origin == ServiceOrigin::Initial {
+        return None;
+    }
+    Some(staged.unwrap_or(HostFileStage::InRing))
 }
 
 #[cfg(test)]
@@ -218,6 +229,27 @@ mod tests {
             assert!(
                 matches!(staged, Some(HostFileStage::Request { .. })),
                 "{name}: {staged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_descriptor_absent_from_the_ring_keeps_the_host_route() {
+        // A descriptor the host table opened for the run root is not in its
+        // ring namespace; the host route owns it (one table per descriptor).
+        let mut buf = [0u8; 64];
+        let out = buf.as_mut_ptr() as u64;
+        for (origin, expected_route_kept) in [(INITIAL, true), (CHILD, false)] {
+            let staged = stage(
+                17,
+                [3, out, 1, 0, 0, 0],
+                origin,
+                Some(NativeDescriptor::Absent),
+            );
+            assert_eq!(
+                staged.is_none(),
+                expected_route_kept,
+                "{origin:?}: {staged:?}"
             );
         }
     }
