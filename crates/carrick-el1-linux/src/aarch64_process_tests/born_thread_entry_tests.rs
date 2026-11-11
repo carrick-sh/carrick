@@ -2250,6 +2250,148 @@ fn arm_empty_pool_clone_unstocked_answer_falls_back_to_host_once() {
     );
 }
 
+/// The host answered the root's empty-pool clone `Unstockable` and the root
+/// is selected again with that answer retained for its exact rerun.
+fn root_holds_unstockable_answer(h: &mut ArmRootTwoThreadHarness) -> RecordId {
+    let f = h.env.fixture;
+    let root_record = clone_on_empty_pool_parks(h);
+    answer_clone_carrier_work(h.env, SlotId::new(0), f.control, root_record, || {});
+    if f.zone.slot(SlotId::new(0)).current() != Some(root_record) {
+        assert_eq!(
+            h.env.switch_in(SlotId::new(0), &mut h.root_cpu),
+            carrick_el1_abi::Action::Served
+        );
+    }
+    root_record
+}
+
+/// The root's next thread clone, on an empty pool the host can now stock, is
+/// "not now" (no host-issued birth) and completes ring-born once stocked.
+fn later_clone_waits_for_stock(h: &mut ArmRootTwoThreadHarness, root_record: RecordId) {
+    let f = h.env.fixture;
+    let counters = carrick_el1_abi::Counters::new();
+    let (route, _, _) = h.env.clone_thread(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &counters,
+        &mut h.root_cpu,
+    );
+    assert_ne!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "a stale `Unstockable` answer must not make a later clone host-issued"
+    );
+    assert_eq!(
+        counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
+            .load(Ordering::Relaxed),
+        0
+    );
+    let mut born_control = None;
+    answer_clone_carrier_work(h.env, SlotId::new(0), f.control, root_record, || {
+        born_control = Some(stock_arm_root_pool_identity(f, 44, 1));
+    });
+    let (clone_rc, _, born_record) = rerun_clone_in_ring(h, root_record);
+    assert_eq!(clone_rc, 44, "the later clone completes in ring");
+    assert_eq!(
+        born_control.unwrap().zone_record(),
+        Some(f.zone.record_ref(born_record))
+    );
+}
+
+/// #1974 round 4: a caught signal is delivered between the `Unstockable`
+/// carrier-work completion and the clone's rerun. The handler's own thread
+/// clone runs on a pool the host can stock by then; the retained answer
+/// belonged to the interrupted clone, so the handler's clone is "not now"
+/// and gets stocked, never a host-issued birth.
+#[test]
+fn arm_empty_pool_clone_answer_does_not_cross_signal_delivery() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let root_record = root_holds_unstockable_answer(&mut h);
+    assert_eq!(
+        h.env.tgkill(
+            SlotId::new(1),
+            f.page,
+            h.sib_control,
+            &mut h.sib_cpu,
+            (41, 41),
+            SIGUSR1_NUM,
+        ),
+        0,
+        "the sibling directs SIGUSR1 at the waiting root"
+    );
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let mut frame = carrick_el1_abi::TrapFrame {
+        slot: 0,
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    assert_eq!(
+        h.env.deliver_user_return(
+            SlotId::new(0),
+            f.page,
+            f.control,
+            &h.root_cpu,
+            stack.arg() + 16384,
+            &mut frame,
+        ),
+        None
+    );
+    assert_eq!(frame.elr, 0x40_1000, "the root enters its SIGUSR1 handler");
+    later_clone_waits_for_stock(&mut h, root_record);
+}
+
+/// #1974 round 4: the retained answer is spent by the very next syscall,
+/// whatever it is. After an ordinary syscall, a later clone is "not now".
+#[test]
+fn arm_empty_pool_clone_answer_does_not_cross_another_syscall() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let root_record = root_holds_unstockable_answer(&mut h);
+    let counters = carrick_el1_abi::Counters::new();
+    let mut gettid = carrick_el1_abi::TrapFrame::default();
+    gettid.x[8] = 178;
+    h.env.call(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &counters,
+        &mut gettid,
+        &mut h.root_cpu,
+    );
+    assert_eq!(gettid.x[0], 41);
+    later_clone_waits_for_stock(&mut h, root_record);
+}
+
+/// #1974 round 4: a clone that `serve_clone` turns away before the pool
+/// probe (here a thread clone without a stack) also spends the answer.
+#[test]
+fn arm_empty_pool_clone_answer_does_not_cross_an_early_clone_exit() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let root_record = root_holds_unstockable_answer(&mut h);
+    let counters = carrick_el1_abi::Counters::new();
+    let mut clone = carrick_el1_abi::TrapFrame::default();
+    clone.x[8] = 220; // SYS_clone
+    clone.x[0] = TGKILL_AFTER_CLONE_FLAGS;
+    let _ = h.env.call(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &counters,
+        &mut clone,
+        &mut h.root_cpu,
+    );
+    assert_eq!(
+        f.zone.slot(SlotId::new(0)).current(),
+        Some(root_record),
+        "the stackless clone never waited"
+    );
+    later_clone_waits_for_stock(&mut h, root_record);
+}
+
 fn register_arm_claim_free_birth(
     h: &NativeOwnedTwoThreadHarness,
     template_id: ThreadIdentity,
