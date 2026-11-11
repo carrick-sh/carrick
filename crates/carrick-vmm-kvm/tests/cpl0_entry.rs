@@ -3470,3 +3470,240 @@ fn production_signal_frame_real_fault_delivers_sigsegv_si_kernel() {
         );
     }
 }
+
+/// #2071 witness 4 (x86 CPL0/KVM twin of witness 1): two threads of one
+/// native x86_64 process each call blocking `wait4` on distinct forked
+/// children while both children are still alive (`nanosleep`). On unmodified
+/// `main`, the second waiter gets `-EAGAIN` (`-11`, reported as exit `111`);
+/// with per-member wait continuations, both block and each reaps its own child.
+#[test]
+fn production_two_threads_blocking_wait4_reap_distinct_children() {
+    const CHILD_ENV: &str = "CARRICK_WAIT4_TWO_THREADS_CHILD";
+    const TEST_NAME: &str = "production_two_threads_blocking_wait4_reap_distinct_children";
+    if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(TEST_NAME)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "20"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, TEST_NAME)
+            .output()
+            .expect("bounded x86 wait4 witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded x86 wait4 witness failed: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    let asm = r#"
+.global _start
+.text
+_start:
+    /* mmap(NULL, 0x3000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) */
+    xor %edi, %edi
+    mov $0x3000, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    mov $9, %eax
+    syscall
+    test %rax, %rax
+    js fail_mmap
+    mov %rax, %r12
+
+    /* Shared layout in %r12:
+     * +0x00: u32 worker tid / CLEARTID word
+     * +0x10: i32 child_a_pid
+     * +0x18: i32 child_b_pid
+     * +0x20: i32 status_a
+     * +0x28: i32 status_b
+     * +0x30: i32 worker_reaped_code
+     * +0x40: timespec join_timeout = { 5, 0 }
+     * +0x50: timespec sleep_a = { 0, 150000000 }
+     * +0x60: timespec sleep_b = { 0, 220000000 }
+     */
+    movq $5, 0x40(%r12)
+    movq $0, 0x48(%r12)
+    movq $0, 0x50(%r12)
+    movq $150000000, 0x58(%r12)
+    movq $0, 0x60(%r12)
+    movq $220000000, 0x68(%r12)
+
+    /* Fork child_a: sleeps 150 ms, then exits 11. */
+    mov $57, %eax
+    syscall
+    test %eax, %eax
+    js report_errno
+    jz child_a
+    mov %eax, 0x10(%r12)
+
+    /* Fork child_b: sleeps 220 ms, then exits 22. */
+    mov $57, %eax
+    syscall
+    test %eax, %eax
+    js report_errno
+    jz child_b
+    mov %eax, 0x18(%r12)
+
+    /* Clone sibling worker thread (CLONE_VM..CLONE_CHILD_CLEARTID|SETTID). */
+    mov $0x013d0f00, %edi
+    lea 0x2ff0(%r12), %rsi
+    mov %r12, %rdx
+    mov %r12, %r10
+    lea 0x100(%r12), %r8
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js report_errno
+    jz worker_thread
+    mov %eax, %r13d
+
+    /* Leader calls blocking wait4(child_a_pid, &status_a, 0, NULL). */
+    mov 0x10(%r12), %edi
+    lea 0x20(%r12), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    test %rax, %rax
+    js report_errno
+    cmp 0x10(%r12), %eax
+    jne fail_pid_a
+    mov 0x20(%r12), %eax
+    cmp $(11 << 8), %eax
+    jne fail_status_a
+
+    /* Join worker via CLONE_CHILD_CLEARTID futex word at 0(%r12). */
+join_loop:
+    mov (%r12), %edx
+    test %edx, %edx
+    jz joined
+    mov %r12, %rdi
+    xor %esi, %esi
+    lea 0x40(%r12), %r10
+    mov $202, %eax
+    syscall
+    cmp $-110, %rax
+    je fail_join_timeout
+    jmp join_loop
+
+joined:
+    cmpl $22, 0x30(%r12)
+    jne fail_worker_code
+    mov $7, %edi
+    mov $231, %eax
+    syscall
+    ud2
+
+worker_thread:
+    /* Worker calls blocking wait4(child_b_pid, &status_b, 0, NULL). */
+    mov 0x18(%r12), %edi
+    lea 0x28(%r12), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    test %rax, %rax
+    js report_errno
+    cmp 0x18(%r12), %eax
+    jne fail_pid_b
+    mov 0x28(%r12), %eax
+    cmp $(22 << 8), %eax
+    jne fail_status_b
+    movl $22, 0x30(%r12)
+    xor %edi, %edi
+    mov $60, %eax
+    syscall
+    ud2
+
+child_a:
+    lea 0x50(%r12), %rdi
+    xor %esi, %esi
+    mov $35, %eax
+    syscall
+    mov $11, %edi
+    mov $231, %eax
+    syscall
+    ud2
+
+child_b:
+    lea 0x60(%r12), %rdi
+    xor %esi, %esi
+    mov $35, %eax
+    syscall
+    mov $22, %edi
+    mov $231, %eax
+    syscall
+    ud2
+
+report_errno:
+    neg %eax
+    add $100, %eax
+    mov %eax, %edi
+    mov $231, %eax
+    syscall
+    ud2
+
+fail_mmap:
+    mov $91, %edi
+    jmp die
+fail_pid_a:
+    mov $92, %edi
+    jmp die
+fail_status_a:
+    mov $93, %edi
+    jmp die
+fail_join_timeout:
+    mov $94, %edi
+    jmp die
+fail_worker_code:
+    mov $95, %edi
+    jmp die
+fail_pid_b:
+    mov $96, %edi
+    jmp die
+fail_status_b:
+    mov $97, %edi
+die:
+    mov $231, %eax
+    syscall
+    ud2
+"#;
+
+    let dir = tempfile::tempdir().expect("tempdir for x86 wait4 witness");
+    let src = dir.path().join("witness.S");
+    let out = dir.path().join("witness");
+    std::fs::write(&src, asm).expect("write witness.S");
+    let compiled = std::process::Command::new("timeout")
+        .args([
+            "10",
+            "cc",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+        ])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("compile x86 wait4 witness");
+    assert!(
+        compiled.status.success(),
+        "assemble failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let elf = std::fs::read(&out).expect("read compiled ELF");
+    let outcome = run_pool_fixture(&elf, 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "two-thread x86 wait4 failed (100 + n reports errno n, 111 = EAGAIN): {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
