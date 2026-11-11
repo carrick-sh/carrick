@@ -1105,11 +1105,11 @@ impl<'a> MemView<'a> {
     /// next touch supplies the file's current bytes at the node's offset,
     /// exactly as the first touch did. `false` when any page of `segment` is
     /// not such a node (host setup restores its own bytes below).
-    fn discard_owner_private_file_segment(
+    pub(crate) fn discard_owner_private_file_segment(
         &self,
         memory: &mut impl CurrentMmMemory,
         segment: &MadviseCoveredSegment,
-    ) -> Result<bool, LinuxErrno> {
+    ) -> Result<bool, DispatchError> {
         let Some(root) = self.mem().lock().delegated_root().cloned() else {
             return Ok(false);
         };
@@ -1128,13 +1128,15 @@ impl<'a> MemView<'a> {
             Ok(()) => {}
             // Every predecessor translation and frame is intact: a host
             // mapping failure, not contention.
-            Err(carrick_guest_mem::MappingRetirementError::Clean(_)) => return Err(LINUX_ENOMEM),
+            Err(carrick_guest_mem::MappingRetirementError::Clean(_)) => {
+                return Err(DispatchError::Errno(LINUX_ENOMEM));
+            }
             Err(carrick_guest_mem::MappingRetirementError::Indeterminate(error)) => {
-                carrick_fatal!(
-                    "dispatch::private_file_discard",
-                    "private file discard retirement is indeterminate at {:#x}+{len:#x}: {error}",
-                    segment.start
-                );
+                return Err(DispatchError::PrivateFileDiscardIndeterminate {
+                    address: segment.start,
+                    len: len as u64,
+                    error,
+                });
             }
         }
         if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
@@ -1162,9 +1164,6 @@ impl<'a> MemView<'a> {
         memory: &mut impl CurrentMmMemory,
         segment: &MadviseCoveredSegment,
     ) -> Result<(), LinuxErrno> {
-        if self.discard_owner_private_file_segment(memory, segment)? {
-            return Ok(());
-        }
         let mut sources: Vec<_> = self
             .mem()
             .lock()
