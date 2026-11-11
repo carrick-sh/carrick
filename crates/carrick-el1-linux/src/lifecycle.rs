@@ -306,6 +306,19 @@ impl<
             admission => admission,
         }
     }
+    fn await_unmanaged_thread_stock(&mut self) -> Option<LifecycleOutcome> {
+        let mut outcome = self.process_venue()?.await_unmanaged_thread_stock()?;
+        if matches!(outcome, LifecycleOutcome::Redispatch) {
+            self.frame.restart_syscall();
+        }
+        self.run_ready_after_native_transfer(&mut outcome);
+        Some(outcome)
+    }
+    fn unmanaged_thread_stock_claimed(&mut self) {
+        if let Some(venue) = self.process_venue() {
+            venue.unmanaged_thread_stock_claimed();
+        }
+    }
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         if let Some(venue) = self.process_venue() {
             venue.lifecycle_admission_settled()?;

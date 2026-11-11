@@ -69,6 +69,26 @@ pub fn settle_host_work_boundary(
     deliver_boundary_wakes(kernel, served, doorbell);
 }
 
+/// Settle the host work a native member's `CarrierWork` request owes. A
+/// thread-stock cause names that member's ring clone, waiting on an empty
+/// unmanaged pool (#1974): stock its exact process first, so the clone the
+/// reply reruns claims a ring entry instead of becoming a host birth.
+pub fn settle_carrier_work_boundary(
+    kernel: &crate::kernel::Kernel,
+    requester: carrick_sched_core::RecordRef,
+    doorbell: Option<carrick_el1_abi::HostWorkDoorbell>,
+) {
+    if doorbell
+        .as_ref()
+        .is_some_and(carrick_el1_abi::HostWorkDoorbell::thread_stock_demand)
+        && let Some(zone) = zone_tables()
+        && zone.record_ref(requester.id) == requester
+    {
+        kernel.stock_thread_births_on_demand(&zone.record(requester.id).identity());
+    }
+    settle_host_work_boundary(kernel, true, doorbell);
+}
+
 /// Publish wakes after the stopped carrier has consumed its exact task's
 /// completed-work and pending-work flags. Both ARM mailboxes and x86 CPL0
 /// work doorbells use this host side of the in-zone completion boundary.

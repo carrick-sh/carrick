@@ -458,6 +458,18 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         Ok(())
     }
+    /// An unmanaged clone (no venue stock) found the ring pool empty. The
+    /// host ledger stocks this pool, so the empty pool is contention, not a
+    /// host birth (#1974): keep the clone, release the execution lease
+    /// through carrier work that asks the host for stock, and rerun the clone
+    /// in ring. `None` keeps today's host-issued birth for this call: the
+    /// host already answered this clone's demand without stock (no stocker,
+    /// `RLIMIT_NPROC`, exhaustion), or there is no venue to wait in.
+    fn await_unmanaged_thread_stock(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
+    /// The unmanaged clone claimed a pool entry: its stock demand is settled.
+    fn unmanaged_thread_stock_claimed(&mut self) {}
     fn retire_thread_verdict(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}
     fn route_host_thread_exit(
         &mut self,
@@ -586,6 +598,11 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         Ok(())
     }
+    /// See [`ProcessNative::await_unmanaged_thread_stock`].
+    fn await_unmanaged_thread_stock(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn unmanaged_thread_stock_claimed(&mut self) {}
 
     fn arguments(&self) -> [u64; 6];
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa;
@@ -1302,7 +1319,12 @@ fn serve_clone<'a>(
     };
     let claimed = loop {
         match page.claim_any() {
-            Ok(claimed) => break claimed,
+            Ok(claimed) => {
+                if !managed {
+                    native.unmanaged_thread_stock_claimed();
+                }
+                break claimed;
+            }
             Err(TransitionError::GateClosed(_)) => {
                 // A speculative claim may have been observed by an exit before
                 // the gate check backed it out. That rollback also owes a wake.
@@ -1321,6 +1343,11 @@ fn serve_clone<'a>(
                                 native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
                             }
                         }
+                    }
+                    // Busy, not a host birth: the host ledger stocks an
+                    // unmanaged pool, and this clone reruns in ring after it.
+                    if !managed && let Some(outcome) = native.await_unmanaged_thread_stock() {
+                        return Some(outcome);
                     }
                     native.record_decline(LifecycleDecline::ClonePoolEmpty);
                 }
