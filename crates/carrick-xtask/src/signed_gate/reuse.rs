@@ -531,7 +531,7 @@ fn verify_reusable_package(
             actual_base: format!("run_id={}", reuse.source_run_id),
         });
     }
-    if require_artifact_id && !reuse.artifact_id.is_some_and(|id| id > 0) {
+    if require_artifact_id && reuse.artifact_id.is_none_or(|id| id == 0) {
         return Err(ReuseMissReason::MalformedSeal(
             "verified reuse seal lacks non-zero artifact_id".into(),
         ));
