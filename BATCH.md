@@ -55,3 +55,17 @@ commit after the picks, so it can be reviewed apart from the PRs.
 | S2 | `b3b9cfbd2` `test(x86): give the nonleader-kill checkpoint injection its own ordinal` | #2065 + #1994 | Both PRs gave a new CPL0 test-support injection the ordinal `0xffff_ffff_ffff_fe1d`: #2065's `INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE` and #1994's `INJECT_BLOCK_SIGUSR1_AT_SECOND_CHECKPOINT`. The test CPL0 image failed `unreachable_patterns` and `match_overlapping_arm`. | #1994's injection moves to the unused ordinal `0xfe1e`, in `carrick-x86-cpl0/src/lib.rs` (`test_support`, behind `feature = "test-support"`) and in the `cpl0_entry.rs` witness that issues it. Production code is unchanged. |
 
 Verification of the combined branch is posted on the batch PR.
+
+## Rebase onto main `c971a0d2ca` (director, 2026-11-11 ~18:15 UTC)
+
+#2063 landed on its own (`3be6c9282`, `d54de26a3`), and #1883, #1936 and #2041 landed too, so the batch was rebased onto main `c971a0d2ca`.
+
+- **Dropped:** #2063's three commits, already on main. 43 cherry-picks remain, plus S1, S2 and this file.
+- **R1, a new conflict:** #2080 (`fe6ebefcf`, park signal-frame setup on address-space contention) against #1883 (`1e95238dc`, retain native signal-frame refusal context), now on main.
+  - **`crates/carrick-el1-linux/src/arm_signal.rs`:** kept #2080's `CopyOutcome` match (`Done` / `NotYet` → `SignalFrameSetup::NotYet` / `Fault`) and #1883's two diagnostics: `signal-frame-build` on a build error, and `signal-frame-copy` on the `Fault` arm only.
+  - **`crates/carrick-el1-linux/src/native_process_runtime.rs`:** kept #2080's `copy_signal_frame_bytes`, which no longer maps `OwnerWait` to `Fault`, and kept #1883's `signal-copy-refused` diagnostic for every error except `OwnerWait`. After #2080 an owner wait is contention that parks and retries, not a refusal. #1883's witness only checks that the probe exists, so it is unaffected.
+- **Verified on the rebased head:**
+  - `cargo test -p carrick-el1-linux --lib --features host-test -- native_signal_resume_tests arm_signal signal_frame`: 32 passed;
+  - `cargo clippy -p carrick-el1-linux --lib --tests --features host-test -- -D warnings` and `cargo fmt --check`: clean;
+  - semgrep `lint-domains.sh`: passes.
+- **No longer closed here:** #2063 and its `Closes #1897`, which #2063 closed itself.
