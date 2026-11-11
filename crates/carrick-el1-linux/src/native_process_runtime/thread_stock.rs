@@ -440,6 +440,64 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
     }
+    /// The shared clone policy found this unmanaged (host-stocked) pool
+    /// empty: contention, not a host birth (#1974). The caller's first
+    /// attempt keeps its clone and releases its execution lease through the
+    /// existing carrier-work retry (as an input preparation's `Busy` does),
+    /// ringing the thread-stock cause so the host ledger stocks this process
+    /// before it replies. The exact SVC then reruns and probes the pool
+    /// again, so stock published before the carrier served the request is
+    /// never missed. A rerun that still finds it empty takes today's host
+    /// answer for that call (`None`): the host could not stock (no standing
+    /// depth, `RLIMIT_NPROC`, exhaustion), and waiting again would never end.
+    pub(super) fn await_unmanaged_thread_stock(
+        &mut self,
+    ) -> Result<Option<LifecycleOutcome>, NativeProcessError> {
+        {
+            let mut graph = self.runtime.graph.lock();
+            let resources = graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native_mut()
+                .resources_mut();
+            // A managed pool's own stock owner waits in `prepare_thread_birth`.
+            if resources.thread_stock.is_some() {
+                return Err(NativeProcessError::Invalid);
+            }
+            let demands = &mut resources.host_stock_demands;
+            if let Some(index) = demands.iter().position(|record| *record == self.record) {
+                demands.swap_remove(index);
+                return Ok(None);
+            }
+            // A caller retired mid-wait leaves an exact, never-matching
+            // incarnation behind; the bound keeps those finite.
+            if demands.len() >= carrick_sched_core::ZONE_RECORDS || demands.try_reserve(1).is_err()
+            {
+                return Ok(None);
+            }
+            demands.push(self.record);
+        }
+        self.current.linux.mark_thread_stock_work();
+        self.retry_guest_input(
+            carrick_core_abi::service::ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Syscall,
+            },
+            None,
+            None,
+        )
+        .map(Some)
+    }
+    /// The caller claimed a pool entry: its stock demand, if any, is settled.
+    pub(super) fn unmanaged_thread_stock_claimed(&self) {
+        let mut graph = self.runtime.graph.lock();
+        if let Ok(task) = graph.owner.task_mut(self.key) {
+            task.native_mut()
+                .resources_mut()
+                .host_stock_demands
+                .retain(|record| *record != self.record);
+        }
+    }
     pub(super) fn clear_thread_stock_wait(&self) {
         let mut graph = self.runtime.graph.lock();
         if let Ok(task) = graph.owner.task_mut(self.key)

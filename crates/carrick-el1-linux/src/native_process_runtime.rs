@@ -1087,6 +1087,10 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     page: &'a ThreadLifecyclePage,
     members: Vec<NativeMember<'a, C>>,
     thread_stock: Option<thread_stock::NativeThreadStock<'a, C>>,
+    /// Unmanaged clone callers whose carrier work asked the host ledger for
+    /// stock (#1974); a caller's rerun that still finds the pool empty takes
+    /// the host's answer instead of asking again.
+    host_stock_demands: Vec<RecordRef>,
     mm: M,
     address: AddressContext<RootGpa>,
     interrupted_child_waits: BTreeMap<RecordRef, InterruptedChildWait<C>>,
@@ -4091,6 +4095,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             page,
             members,
             thread_stock: None,
+            host_stock_demands: Vec::new(),
             mm,
             address,
             interrupted_child_waits: BTreeMap::new(),
@@ -8182,6 +8187,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 expected_host,
             }],
             thread_stock: Some(thread_stock),
+            host_stock_demands: Vec::new(),
             mm: self.service.prepared_mm(&prepared),
             address,
             interrupted_child_waits: BTreeMap::new(),
@@ -8893,6 +8899,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                 self.run_failed(error.run_failure_reason()),
             ),
         }
+    }
+    fn await_unmanaged_thread_stock(&mut self) -> Option<LifecycleOutcome> {
+        self.await_unmanaged_thread_stock()
+            .unwrap_or_else(|error| Some(self.run_failed(error.run_failure_reason())))
+    }
+    fn unmanaged_thread_stock_claimed(&mut self) {
+        NativeProcessEntry::unmanaged_thread_stock_claimed(self);
     }
     fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         self.retire_thread_verdict(verdict);

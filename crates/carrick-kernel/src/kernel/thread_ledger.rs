@@ -1284,6 +1284,59 @@ impl Kernel {
             .replenish(self, &state, context);
     }
 
+    /// A ring clone by the exact zone `member` found its process's standing
+    /// pool empty and waits in carrier work for stock (#1974). That clone is
+    /// the demand [`Self::prepare_executable_thread_births`] defers for a
+    /// singleton, so stock the member's process as its first host clone
+    /// would. Stocking nothing (no standing depth, `RLIMIT_NPROC`, exhaustion)
+    /// leaves the clone's rerun to the host-issued answer.
+    pub fn stock_thread_births_on_demand(&self, member: &carrick_sched_core::ThreadIdentity) {
+        let Some(kernel) = self
+            .registry()
+            .thread_ledger()
+            .kernel
+            .get()
+            .and_then(Weak::upgrade)
+        else {
+            return;
+        };
+        let state = self.registry().settled().read();
+        let Some((record, thread)) = state.tasks.values().find_map(|record| {
+            record
+                .task
+                .threads()
+                .into_iter()
+                .find(|thread| {
+                    let key = thread.key();
+                    // The zone identity's own tid mapping (`El1TaskId`).
+                    carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw() == member.tid
+                        && key.serial.raw() == member.serial
+                })
+                .map(|thread| (record, thread))
+        }) else {
+            return;
+        };
+        if !thread.control_lease().lifecycle().serves_threads()
+            || record
+                .task
+                .thread_adoption_factory()
+                .is_none_or(|factory| !factory.executable_births())
+        {
+            return;
+        }
+        let context = KernelContext::from_parts(
+            kernel,
+            record.task.clone(),
+            thread.clone(),
+            record.task.shared(),
+            thread.resources(),
+            record.revision,
+        );
+        self.registry()
+            .thread_ledger()
+            .replenish(self, &state, &context);
+    }
+
     /// Retire unused standing birth reservations after scheduler admission
     /// closes. The write view waits out replenishment that admitted a runtime
     /// submission before close but has not inserted its pool entry yet.
@@ -2162,6 +2215,82 @@ mod tests {
             "old executable capacity must be revoked before MM replacement"
         );
         assert_eq!(peer_page.gate(), carrick_el1_abi::GateState::Open);
+    }
+
+    /// #1974: binding a singleton is not demand, but its ring clone that
+    /// found the pool empty is. On-demand stock fills exactly the demanding
+    /// member's process; an unknown or stale member and a zero standing depth
+    /// stock nothing, so that clone's rerun takes the host answer.
+    #[test]
+    fn on_demand_stock_fills_only_the_demanding_process() {
+        use crate::kernel::thread_adoption::{
+            ThreadBirthAdoptionFactory, ThreadBirthAdoptionReservation,
+        };
+        #[derive(Debug)]
+        struct Executable(crate::kernel::TaskKey);
+        impl ThreadBirthAdoptionFactory for Executable {
+            fn executable_births(&self) -> bool {
+                true
+            }
+            fn owner(&self) -> crate::kernel::TaskKey {
+                self.0
+            }
+            fn reserve(
+                &self,
+                thread: crate::kernel::ThreadKey,
+            ) -> Option<ThreadBirthAdoptionReservation> {
+                Some(ThreadBirthAdoptionReservation::new(self.0, thread, ()))
+            }
+        }
+        let member =
+            |context: &KernelContext, serial_delta: u64| carrick_sched_core::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(context.thread().key().tid.raw())
+                    .raw(),
+                serial: context.thread().key().serial.raw() + serial_delta,
+                ..Default::default()
+            };
+        let (kernel, root) = bootstrap(9_850);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_851),
+                "stock-peer".into(),
+                None,
+            )
+            .unwrap();
+        for context in [&root, &peer] {
+            context
+                .task()
+                .install_thread_adoption_factory(Arc::new(Executable(context.task().key())))
+                .unwrap();
+            kernel.prepare_executable_thread_births(context);
+        }
+        let standing = |context: &KernelContext| {
+            kernel
+                .standing_thread_identities(context.task().key().id)
+                .len()
+        };
+        assert_eq!((standing(&root), standing(&peer)), (0, 0), "singletons");
+        kernel.stock_thread_births_on_demand(&member(&root, 1));
+        assert_eq!((standing(&root), standing(&peer)), (0, 0), "stale member");
+        kernel.stock_thread_births_on_demand(&member(&root, 0));
+        assert_eq!(
+            (standing(&root), standing(&peer)),
+            (super::DEFAULT_THREAD_POOL_DEPTH, 0),
+            "exactly the demanding process"
+        );
+        assert!(
+            root.thread()
+                .control_lease()
+                .lifecycle()
+                .claim_any()
+                .is_ok(),
+            "the ring clone's rerun claims a stocked entry"
+        );
+        kernel.registry().thread_ledger().set_pool_depth_for_test(0);
+        kernel.stock_thread_births_on_demand(&member(&peer, 0));
+        assert_eq!(standing(&peer), 0, "no standing depth, no stock");
     }
 
     #[test]
