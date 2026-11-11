@@ -22,7 +22,7 @@ fn write_then_exec_never_sees_text_file_busy_under_spawn_load() {
         for _ in 0..6 {
             scope.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
-                    Command::new("/bin/true").status().unwrap();
+                    Command::new("/usr/bin/true").status().unwrap();
                 }
             });
         }
