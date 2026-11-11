@@ -418,11 +418,18 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
             assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
         }
     } else {
-        // The direct refusal checkpoint parked A. Let the real scheduler
-        // select its runnable peer before the host ACK wakes A again.
+        // The direct refusal checkpoint parked A behind a published notice.
+        // #2039: the host takes it only at this vCPU's exit, so the real
+        // scheduler leaves vacated instead of running A's peer first; the
+        // peer stays queued for the next entry.
+        assert!(fixture.task.service_notice.is_published());
         let _ = scheduler.run_ready(&mut frame);
         assert_eq!(cpu.owner_resumes, 0);
-        assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(peer_record));
+        assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
+        assert!(matches!(
+            fixture.zone.record(peer_record).claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ));
     }
     if (pending_work && !inline_ack) || defer_race {
         let parked = fixture.zone.record(member.id);
