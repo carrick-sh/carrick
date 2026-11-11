@@ -1115,6 +1115,11 @@ where
         syndrome: u64,
         far: u64,
     ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
+        let _settled = self
+            .state
+            .zone_mm
+            .and_then(carrick_kernel::kernel::MmId::from_raw_u64)
+            .and_then(signal::exclude_settling_guest_cow);
         engine.resolve_frame_cow_fault(syndrome, far)
     }
 

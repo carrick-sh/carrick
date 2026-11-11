@@ -805,6 +805,26 @@ pub(super) fn settle_guest_cow_of(mm: carrick_kernel::kernel::MmId) {
     }
 }
 
+/// Settle `mm`'s guest COW completions and keep its EL1 editor excluded for
+/// as long as the returned guard lives. `None` (and no exclusion) when no
+/// completion of `mm` awaits settlement.
+///
+/// The host frame-COW resolver refills an MM's grant chain when EL1 found
+/// it empty. Only settlement frees the chain's USED records, so a chain
+/// full of them made the refill publish nothing, and an owner MM's host
+/// COW path then denied the write: SIGSEGV on an ordinary copy-on-write
+/// write after fork (#1733). Holding the exclusion through the resolver
+/// keeps EL1 from refilling the chain with new completions before the
+/// refill publishes.
+pub(super) fn exclude_settling_guest_cow(
+    mm: carrick_kernel::kernel::MmId,
+) -> Option<carrick_kernel::kernel::mm_occupancy::El1EditorExclusion> {
+    if !guest_cow_awaiting_settlement(mm) {
+        return None;
+    }
+    carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(mm)
+}
+
 /// Release a retiring MM's unclaimed frame-grant mailbox work. Descriptor
 /// transactions settle in the faulting holder and leave no runtime ledger.
 pub(super) fn withdraw_guest_descriptor_work(mm_key: u64) {
