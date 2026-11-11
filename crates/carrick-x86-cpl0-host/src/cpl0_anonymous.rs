@@ -380,7 +380,7 @@ struct CarrierZoneWakeSink<M: CarrierMemoryIo> {
     routes: std::ptr::NonNull<PublishedApicIds>,
     vm: Arc<M>,
     /// The first reschedule this carrier could not deliver since the host
-    /// IPC owner last asked ([`CarrierZoneWake::take_undelivered`]).
+    /// IPC owner last asked ([`carrick_sched_core::CarrierZoneWake::take_undelivered`]).
     resched_fault: std::sync::Mutex<Option<carrick_sched_core::WakeUndelivered>>,
 }
 // SAFETY: both pointers name retained, aligned, atomic-only records inside
