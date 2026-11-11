@@ -403,10 +403,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
 }
 
 /// The CPL0 carrier's answer to a `CarrierWork` request.
-fn carrier_work_supplied(_demand: carrick_core_abi::service::CarrierDemand) -> bool {
-    // The shared owner retains the operation and reruns preparation
-    // after this physical checkpoint; Busy never becomes an errno.
-    true
+fn carrier_work_supplied(demand: carrick_core_abi::service::CarrierDemand) -> bool {
+    use carrick_core_abi::service::CarrierDemand;
+    match demand {
+        // The shared owner retains the operation and reruns preparation
+        // after this physical checkpoint; Busy never becomes an errno.
+        CarrierDemand::Work => true,
+        // No thread-stock owner runs on the CPL0 carrier (x86 roots stock
+        // their own managed pool), so it never answers `Stocked`: the
+        // refusal reads back as `Unstockable`, today's host answer (#1974).
+        CarrierDemand::ThreadStock => false,
+    }
 }
 
 #[cfg(test)]
