@@ -187,6 +187,49 @@ where
     ))
 }
 
+/// Consume the scheduler-owned token after a resumed anonymous edit commits.
+///
+/// A caught signal unlinks the wait but deliberately leaves its operation on
+/// the record while the handler borrows execution.  A successful replay is
+/// the terminal owner of that token.  Match it against this MM's typed space
+/// notification keys before taking it so an unrelated adapter operation can
+/// never be consumed by the anonymous path.
+pub fn complete_anonymous_edit_replay<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
+    slot: SlotId,
+    mm_key: u64,
+) -> Result<bool, ObjectWaitError> {
+    let Some(record) = zone
+        .slot(slot)
+        .current()
+        .or_else(|| zone.slot(slot).host_record())
+    else {
+        return Ok(false);
+    };
+    let retained = zone.record(record);
+    let Some(census) = retained.object_wait_census() else {
+        return Ok(false);
+    };
+    let notifications = core::num::NonZeroU64::new(mm_key)
+        .and_then(|mm| zone.space_entry(mm))
+        .and_then(|entry| entry.live_notifications().ok());
+    let Some(notifications) = notifications else {
+        return Ok(false);
+    };
+    let anonymous = SpaceWaitCause::ALL.into_iter().any(|cause| {
+        let key = notifications.key(cause);
+        OperationToken::anonymous_edit(key).is_some_and(|token| {
+            token.index() == census.operation && token.generation() == census.operation_generation
+        })
+    });
+    if !anonymous {
+        return Ok(false);
+    }
+    take_object_operation(zone, slot, retained.identity())?
+        .map(|_| true)
+        .ok_or(ObjectWaitError::Stale)
+}
+
 /// Authenticate exact record ownership, identity and address space, then take the operation token.
 pub fn take_object_operation<C: carrick_core_abi::EntryContext>(
     zone: &ZoneTables<C>,
