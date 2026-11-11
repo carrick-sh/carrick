@@ -56,9 +56,19 @@ impl FutexCall {
     /// A shared operation can use an MM key only after the memory owner
     /// authenticates private anonymous storage. Keep this candidate separate
     /// from admission: shared mappings require their own object authority.
+    ///
+    /// Every shared spelling of an admitted PRIVATE op is a candidate. glibc's
+    /// `pthread_join` waits on the clear-child-tid word with a shared
+    /// `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` (#2124); refusing it ends in
+    /// ENOSYS, which glibc treats as fatal.
     pub fn shared_private_candidate(mut self) -> Option<Self> {
-        match self.args[1] {
-            0 | 1 => {}
+        match self.args[1] | 128 {
+            FUTEX_WAIT_PRIVATE
+            | FUTEX_WAKE_PRIVATE
+            | FUTEX_WAIT_BITSET_PRIVATE
+            | FUTEX_WAKE_BITSET_PRIVATE
+            | FUTEX_WAIT_BITSET_PRIVATE_REALTIME
+                if self.args[1] & 128 == 0 => {}
             _ => return None,
         }
         self.args[1] |= 128;
