@@ -2683,21 +2683,40 @@ mod tests {
     }
     #[test]
     fn image_build_tracks_neutral_owner_inputs() {
+        // The image's rerun-if-changed list is derived from the nested EL1
+        // build's dep-info, not hand-listed. The invariant is that build.rs
+        // keeps deriving it, and that the emitted list is witnessed to cover
+        // every neutral owner crate (`el1_image_inputs.rs`).
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let build = fs::read_to_string(repo.join("crates/carrick-el1-image/build.rs")).unwrap();
+        for needle in [
+            "carrick-el1.d",
+            "read_depfile(",
+            "derive_watch_list(",
+            "cargo:rerun-if-changed={}",
+        ] {
+            assert!(
+                build.contains(needle),
+                "image rerun inputs are no longer derived from dep-info: missing {needle}"
+            );
+        }
+        let witness =
+            fs::read_to_string(repo.join("crates/carrick-el1-image/tests/el1_image_inputs.rs"))
+                .unwrap();
+        assert!(
+            witness.contains("fn emitted_watch_list_tracks_neutral_owner_crates"),
+            "the emitted-watch-list neutral owner witness is gone"
+        );
         for dependency in [
             "carrick-core",
             "carrick-core-abi",
             "carrick-personality-api",
             "carrick-personality-linux",
         ] {
-            for input in ["src", "Cargo.toml"] {
-                let declaration = format!("cargo:rerun-if-changed=../{dependency}/{input}");
-                assert!(
-                    build.contains(&declaration),
-                    "image can retain stale {dependency}/{input}"
-                );
-            }
+            assert!(
+                witness.contains(&format!("\"{dependency}\"")),
+                "image can retain stale {dependency}: witness does not pin it"
+            );
         }
     }
     #[test]
