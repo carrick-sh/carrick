@@ -743,3 +743,123 @@ pub(crate) fn prepare_initial_entrypoint(
         argv,
     })
 }
+
+/// Issue #1852: the image path kept its scratch and trash under
+/// `$HOME/.carrick` whatever `CARRICK_HOME` said, and abandoned it at exit.
+#[cfg(test)]
+mod carrick_home_scratch_tests {
+    use super::prepare_host_root;
+    use carrick_vfs::fs_backend::{HostFsBackend, default_scratch_root, finish_scratch_cleanup};
+    use std::collections::BTreeMap;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+
+    const CHILD: &str = "execute::carrick_home_scratch_tests::image_path_child";
+
+    /// Every entry under `root` with its size, so "returns to its starting
+    /// size" also catches a leftover empty directory.
+    fn census(root: &Path) -> BTreeMap<PathBuf, u64> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, u64>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+                let rel = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                out.insert(rel, if meta.is_dir() { 0 } else { meta.len() });
+                if meta.is_dir() {
+                    walk(root, &entry.path(), out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// A gzip layer blob in the image store, as a pull leaves it. Incompressible
+    /// payload so that cutting the blob short lands inside the file data.
+    fn store_layer(store: &carrick_image::ImageStore, hex: &str, cut: Option<usize>) -> PathBuf {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let payload: Vec<u8> = (0..4 << 20)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_mode(0o755);
+        dir.set_size(0);
+        tar.append_data(&mut dir, "etc/", std::io::empty()).unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o644);
+        file.set_size(payload.len() as u64);
+        tar.append_data(&mut file, "etc/payload", &payload[..])
+            .unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar.into_inner().unwrap()).unwrap();
+        let mut bytes = gz.finish().unwrap();
+        if let Some(cut) = cut {
+            bytes.truncate(cut);
+        }
+        let path = store.blob_path(&format!("sha256:{hex}")).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// One `carrick run` image setup: the production scratch backend, the
+    /// production cache-root lookup, the production layer unpack.
+    fn run_image(layer: &Path) -> std::io::Result<()> {
+        let mut host = HostFsBackend::new()?;
+        let cache_root = default_scratch_root()?;
+        let result =
+            prepare_host_root(&mut host, &[layer.to_path_buf()], false, false, &cache_root);
+        drop(host);
+        finish_scratch_cleanup();
+        result.map(|_| ())
+    }
+
+    /// Body of the test below, in a child so it owns the environment.
+    #[test]
+    #[ignore = "child of image_runs_keep_all_state_under_carrick_home"]
+    fn image_path_child() {
+        let carrick_home = PathBuf::from(std::env::var_os("CARRICK_HOME").unwrap());
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let store = carrick_image::ImageStore::default_for_user();
+        assert_eq!(store.root(), carrick_home, "store follows CARRICK_HOME");
+        let good = store_layer(&store, &"a".repeat(64), None);
+        let bad = store_layer(&store, &"b".repeat(64), Some(256 << 10));
+
+        run_image(&good).expect("good layer unpacks");
+        let scratch = carrick_home.join("scratch");
+        let start = census(&scratch);
+        run_image(&bad).expect_err("the injected layer error must surface");
+        run_image(&good).expect("good layer unpacks after the failure");
+
+        assert_eq!(census(&home), BTreeMap::new(), "nothing under $HOME");
+        assert_eq!(census(&scratch), start, "scratch and trash back to start");
+    }
+
+    #[test]
+    fn image_runs_keep_all_state_under_carrick_home() {
+        let carrick_home = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", CHILD, "--nocapture"])
+            .env("CARRICK_HOME", carrick_home.path())
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
