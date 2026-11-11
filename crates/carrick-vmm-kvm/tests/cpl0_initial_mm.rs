@@ -1495,6 +1495,23 @@ fn production_user_page_fault_terminates_with_sigsegv_in_ring() {
     assert_eq!(exits, 2);
 }
 
+/// #1714: the run root's stack grows below the 64 KiB the carrier built, up
+/// to Linux's default `RLIMIT_STACK`, as Linux grows the stack VMA. Before,
+/// the first touch below the built stack was a SIGSEGV: CPython's compiler
+/// died there compiling its startup modules.
+#[test]
+fn production_initial_stack_grows_below_the_built_pages() {
+    let elf = native_exit_fixture("native_stack_growth.S");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_LOADED)
+        .expect("stack growth run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "1 MiB of stack below the entry pointer: {:?}",
+        outcome.run
+    );
+}
+
 #[test]
 fn block_then_user_page_fault_terminates_with_sigsegv_in_ring() {
     let elf = block_then_fault_elf();
