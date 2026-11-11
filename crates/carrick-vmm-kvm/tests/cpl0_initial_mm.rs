@@ -2026,13 +2026,7 @@ fn run_poll_revents_only_fixture(flags: &[&str]) {
     let elf = native_exit_fixture_with_flags("native_poll_revents_only.S", flags);
     let dir = tempfile::tempdir().expect("oracle directory");
     let oracle = dir.path().join("oracle");
-    std::fs::write(&oracle, &elf).expect("oracle binary");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o755))
-            .expect("executable oracle");
-    }
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
     let native = std::process::Command::new("timeout")
         .arg("10")
         .arg(&oracle)
