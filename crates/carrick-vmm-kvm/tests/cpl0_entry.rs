@@ -618,6 +618,12 @@ enum CloneProbe {
     /// The child sends SIGUSR1 to its own tid, then blocks it before its
     /// checkpoint; the parked parent must be the member that takes it.
     KillKicksEveryMember,
+    /// glibc's `pthread_join` shape from the Docker oracle (#2124): the
+    /// parent joins with shared `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME`
+    /// (op 265), NULL timeout and `FUTEX_BITSET_MATCH_ANY`. Linux answers 0,
+    /// or EAGAIN when the child already cleared the word; any other errno
+    /// aborts glibc.
+    GlibcPthreadJoin,
 }
 
 /// A real guest birth, handshake and nonfinal raw exit. No fixture-image
@@ -736,9 +742,23 @@ fn production_thread_clone_probe(mode: CloneProbe) -> Vec<u8> {
         mov(&mut code, &[0x48, 0xb8], 231);
         code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     }
-    // Join the child using its CHILD_CLEARTID word and the same deadline.
+    // Join the child using its CHILD_CLEARTID word.
     code.extend_from_slice(&[0x4c, 0x89, 0xe7, 0x4c, 0x89, 0xea]);
-    wait(&mut code);
+    match mode {
+        CloneProbe::GlibcPthreadJoin => {
+            mov(&mut code, &[0x48, 0xbe], 265);
+            mov(&mut code, &[0x49, 0xba], 0); // r10 = NULL timeout
+            mov(&mut code, &[0x49, 0xb9], 0xffff_ffff); // r9 = val3
+            mov(&mut code, &[0x48, 0xb8], 202);
+            code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0]); // test rax,rax
+            let joined = branch(&mut code, 0x84);
+            code.extend_from_slice(&[0x48, 0x83, 0xf8, 0xf5]); // only EAGAIN (-11) remains
+            failures.push(branch(&mut code, 0x85));
+            let joined_pc = code.len();
+            target(&mut code, joined, joined_pc);
+        }
+        _ => wait(&mut code), // the same deadline
+    }
     code.extend_from_slice(&[0x48, 0x83, 0xf8, 0x92]); // timeout is failure (-110)
     failures.push(branch(&mut code, 0x84));
     code.extend_from_slice(&[0x41, 0x83, 0x3c, 0x24, 0]);
@@ -859,6 +879,30 @@ fn production_kill_nonleader_tid_kicks_every_eligible_member() {
         "the parked sibling must be interrupted and consume SIGUSR1 once"
     );
     assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// glibc's `pthread_join` futex is served in ring and woken by the child's
+/// clear-child-tid exit (#2124); ENOSYS made glibc abort with "The futex
+/// facility returned an unexpected error code".
+#[test]
+fn production_glibc_pthread_join_futex_is_served_in_ring() {
+    let outcome = run_pool_fixture(
+        &production_thread_clone_probe(CloneProbe::GlibcPthreadJoin),
+        32,
+    );
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "glibc join wait failed (exit 9: an errno other than 0/EAGAIN, or a live tid word)"
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(202))
+            .unwrap(),
+        0,
+        "futex must be served in ring"
+    );
 }
 
 /// A sole native thread must resume a timed futex with Linux ETIMEDOUT;
