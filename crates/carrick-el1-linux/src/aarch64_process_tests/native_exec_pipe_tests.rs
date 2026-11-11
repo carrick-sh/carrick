@@ -776,7 +776,7 @@ fn fork_exec_probe_with_scenario(
             fixture: &'static Fixture,
             counters: &'a carrick_el1_abi::Counters,
             is_root_process: bool,
-            editor: super::native_fault_supply_tests::FixtureDiscardMapping<'a>,
+            editor: FixtureDiscardMapping<'a>,
         }
         impl carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
             for DiscardAnonymousVenue<'_>
@@ -865,7 +865,7 @@ fn fork_exec_probe_with_scenario(
             fixture,
             counters: &counters,
             is_root_process,
-            editor: super::native_fault_supply_tests::FixtureDiscardMapping {
+            editor: FixtureDiscardMapping {
                 mapping: super::native_fault_supply_tests::FixtureMapping {
                     words: if is_root_process {
                         &words
@@ -3033,5 +3033,85 @@ fn serial_host_linux_exec_child_v8_memory_control() {
         println!(
             "Linux exec child: reserve=128MiB, trim=0, RWX=0, DONTNEED(2MiB)=0, zeros=true, DONTNEED(0x400000,0,4)=0, NONE/RW/RX/RWX=0, fixed-decommit=zeros, unmap=0"
         );
+    }
+}
+
+struct FixtureDiscardMapping<'a> {
+    mapping: super::native_fault_supply_tests::FixtureMapping<'a>,
+    pages: &'a std::cell::RefCell<BTreeMap<u64, Vec<u8>>>,
+    scrubs: &'a std::cell::Cell<usize>,
+}
+impl carrick_el1::memory::AnonymousBackingProbe for FixtureDiscardMapping<'_> {
+    fn bind_operation(&mut self, sequence: carrick_el1_abi::ReservationSequence) {
+        self.mapping.bind_operation(sequence);
+    }
+    fn backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> carrick_el1::memory::Stage1Backing {
+        self.mapping.backing(root, va, len)
+    }
+    fn stock_span(
+        &mut self,
+        mm: ReservationMm,
+        va: UserVa,
+    ) -> Option<carrick_guest_arch::UserRange> {
+        self.mapping.stock_span(mm, va)
+    }
+}
+impl carrick_el1::memory::AnonymousPermissionEditor for FixtureDiscardMapping<'_> {
+    fn bind_resident_edit(&mut self, generation: carrick_el1::memory::AnonymousEditGeneration) {
+        self.mapping.bind_resident_edit(generation);
+    }
+    fn protect_and_invalidate(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        self.mapping.protect_and_invalidate(root, edit)
+    }
+}
+impl carrick_el1::memory::AnonymousRetirementEditor for FixtureDiscardMapping<'_> {
+    fn bind_resident_edit(&mut self, generation: carrick_el1::memory::AnonymousEditGeneration) {
+        self.mapping.bind_resident_edit(generation);
+    }
+    fn retire_and_invalidate(
+        &mut self,
+        mm: ReservationMm,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        address: UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
+        self.mapping.retire_and_invalidate(mm, root, address, len)
+    }
+}
+impl carrick_el1::memory::AnonymousDiscardEditor for FixtureDiscardMapping<'_> {
+    fn discard_and_scrub(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        steps: &[carrick_el1::memory::AnonymousDiscardStep],
+    ) -> Result<(), carrick_el1::memory::AnonymousDiscardError> {
+        carrick_el1::memory::discard_aarch64_anonymous_steps(
+            self.mapping.words,
+            carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
+            carrick_el1_abi::EL1_COW_COPY_BASE,
+            steps,
+            |alias_va, _| {
+                let to = super::native_fault_supply_tests::leaf(
+                    self.mapping.words,
+                    root.raw(),
+                    alias_va,
+                );
+                assert_eq!(to & 3, 3);
+                assert_eq!(to & (3 << 6), 0);
+                assert_ne!(to & ((1 << 54) | (1 << 53)), 0);
+                self.pages
+                    .borrow_mut()
+                    .insert(to & AARCH64_ROOT_ADDRESS_MASK, vec![0; 4096]);
+                self.scrubs.set(self.scrubs.get() + 1);
+            },
+        )
     }
 }
