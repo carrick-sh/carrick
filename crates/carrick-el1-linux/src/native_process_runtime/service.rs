@@ -1005,6 +1005,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let result = self.begin_service_inner(
             ServiceOperation::CarrierWork {
                 entry: OwnerEntry::Syscall,
+                demand: carrick_core_abi::service::CarrierDemand::Work,
             },
             None,
             owner_wait,
