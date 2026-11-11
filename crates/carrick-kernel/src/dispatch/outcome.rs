@@ -1181,6 +1181,25 @@ impl GuestMemory for LinearMemory {
 
 impl CurrentMmMemory for LinearMemory {}
 
+/// Why an admitted MM's retained private file range lost its frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateFileRetirement {
+    /// `MADV_DONTNEED` returned the pages to the node's retained source.
+    Discard,
+    /// In-place `mremap` growth cleared predecessor backing under the
+    /// extension before the node's source supplies it.
+    Growth,
+}
+
+impl std::fmt::Display for PrivateFileRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Discard => "discard",
+            Self::Growth => "mremap growth",
+        })
+    }
+}
+
 #[derive(Debug, ::thiserror::Error)]
 #[allow(private_interfaces)]
 pub enum DispatchError {
@@ -1192,11 +1211,15 @@ pub enum DispatchError {
     MemoryPreparation(String),
     #[error("file mmap attempted to reacquire its own owner gate: {0:?}")]
     MmapSelfHeldOwnerGate(carrick_el1_abi::PortalOwnerWait),
-    /// Retiring a discarded private file page's frames failed after its
-    /// translation edit began: the old owner can be neither trusted nor
-    /// restored, so the run must stop rather than answer the guest.
-    #[error("private file discard retirement is indeterminate at {address:#x}+{len:#x}: {error}")]
-    PrivateFileDiscardIndeterminate {
+    /// Retiring a private file node's frames (a discard, or the predecessor
+    /// backing under an in-place growth) failed after its translation edit
+    /// began: the old owner can be neither trusted nor restored, so the run
+    /// must stop rather than answer the guest.
+    #[error(
+        "private file {operation} retirement is indeterminate at {address:#x}+{len:#x}: {error}"
+    )]
+    PrivateFileRetirementIndeterminate {
+        operation: PrivateFileRetirement,
         address: u64,
         len: u64,
         error: carrick_guest_mem::MemoryError,

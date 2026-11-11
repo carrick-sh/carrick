@@ -1123,8 +1123,31 @@ impl<'a> MemView<'a> {
         if cursor < segment.end {
             return Ok(false);
         }
-        let len = usize::try_from(segment.end - segment.start).map_err(|_| LINUX_ENOMEM)?;
-        match memory.retire_mapping(GuestVa::new(segment.start), len) {
+        let len = segment.end - segment.start;
+        self.retire_owner_private_file_range(
+            memory,
+            segment.start,
+            len,
+            crate::dispatch::outcome::PrivateFileRetirement::Discard,
+        )?;
+        self.mark_range_nonresident(segment.start, len);
+        Ok(true)
+    }
+
+    /// Retire the frames under `[start, start + len)` of an admitted MM's
+    /// retained private file node, so its next touch faults to the owner
+    /// and reads the node's source. The root decides these pages: the host
+    /// keeps no fact for them and arms no new-mapping publication, since
+    /// nothing is published here.
+    pub(crate) fn retire_owner_private_file_range(
+        &self,
+        memory: &mut impl CurrentMmMemory,
+        start: u64,
+        len: u64,
+        operation: crate::dispatch::outcome::PrivateFileRetirement,
+    ) -> Result<(), DispatchError> {
+        let length = usize::try_from(len).map_err(|_| LINUX_ENOMEM)?;
+        match memory.retire_mapping(GuestVa::new(start), length) {
             Ok(()) => {}
             // Every predecessor translation and frame is intact: a host
             // mapping failure, not contention.
@@ -1132,23 +1155,21 @@ impl<'a> MemView<'a> {
                 return Err(DispatchError::Errno(LINUX_ENOMEM));
             }
             Err(carrick_guest_mem::MappingRetirementError::Indeterminate(error)) => {
-                return Err(DispatchError::PrivateFileDiscardIndeterminate {
-                    address: segment.start,
-                    len: len as u64,
+                return Err(DispatchError::PrivateFileRetirementIndeterminate {
+                    operation,
+                    address: start,
+                    len,
                     error,
                 });
             }
         }
         if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
-            table.retire_overlapping(self.mm_authority().mm_id.raw(), segment.start, len as u64);
+            table.retire_overlapping(self.mm_authority().mm_id.raw(), start, len);
         }
         // Retirement marks the range unmapped; the node and its permission
-        // remain, and the owner publishes leaves on the next touch. The root
-        // decides these pages, so the host keeps no fact for them and arms
-        // no new-mapping publication: nothing is published here.
-        memory.release_root_facts(segment.start, len);
-        self.mark_range_nonresident(segment.start, len as u64);
-        Ok(true)
+        // remain, and the owner publishes leaves on the next touch.
+        memory.release_root_facts(start, length);
+        Ok(())
     }
 
     /// Restore mapped file identity, including after fd close or pathname

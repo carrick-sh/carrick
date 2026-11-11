@@ -2662,14 +2662,33 @@ impl MemView<'_> {
         let mut dispatch = self.begin_conditional_vma_dispatch(&permit);
         let memory = &mut *cx.memory;
         let extension = proposed.range;
-        let prot = LinuxProtFlags::from_bits_retain(proposed.protection.bits());
-        // A file extension is supplied from the node's source on first
-        // touch: there is no stale content to scrub and no owner write.
-        let stale = !file_node && extension.start() < self.writable_high();
-        if let Err(errno) =
-            self.publish_fresh_anonymous(memory, extension.start(), extension.len(), prot, stale)
-        {
-            return Ok(DispatchOutcome::errno(errno));
+        if file_node {
+            // A file extension is the node's next source pages, supplied by
+            // the owner on first touch. Publishing host protection here would
+            // install zero-filled leaves the guest reads instead, so only
+            // predecessor backing under the extension is retired.
+            match self.retire_owner_private_file_range(
+                memory,
+                extension.start(),
+                extension.len(),
+                crate::dispatch::outcome::PrivateFileRetirement::Growth,
+            ) {
+                Ok(()) => {}
+                Err(DispatchError::Errno(errno)) => return Ok(DispatchOutcome::errno(errno)),
+                Err(error) => return Err(error),
+            }
+        } else {
+            let prot = LinuxProtFlags::from_bits_retain(proposed.protection.bits());
+            let stale = extension.start() < self.writable_high();
+            if let Err(errno) = self.publish_fresh_anonymous(
+                memory,
+                extension.start(),
+                extension.len(),
+                prot,
+                stale,
+            ) {
+                return Ok(DispatchOutcome::errno(errno));
+            }
         }
         if locked
             && let Err(errno) = self.populate_locked(memory, extension.start(), extension.len())
