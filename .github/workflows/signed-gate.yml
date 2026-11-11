@@ -35,6 +35,7 @@ jobs:
       sha: ${{ steps.request.outputs.sha }}
       base: ${{ steps.request.outputs.base }}
       main: ${{ steps.request.outputs.main }}
+      xtask_key: ${{ steps.xtask.outputs.key }}
     steps:
       - name: Refuse unauthorized actors before checking out code
         env:
@@ -51,12 +52,34 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      # Build carrick-xtask once for the run (#2058). Later hosted jobs that
+      # check out the same commit and lockfile verify and reuse these exact
+      # bytes (scripts/ci/xtask-prebuilt.sh); any mismatch falls back to
+      # their own source build.
+      - name: Build carrick-xtask once for this run
+        id: xtask
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p carrick-xtask
+          key=$(scripts/ci/xtask-prebuilt.sh build-key)
+          out="$RUNNER_TEMP/xtask-prebuilt"
+          mkdir -p "$out"
+          cp target/release/carrick-xtask "$out/carrick-xtask"
+          (cd "$out" && sha256sum carrick-xtask > carrick-xtask.sha256)
+          printf '%s\n' "$key" > "$out/carrick-xtask.key"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carrick-xtask-${{ steps.xtask.outputs.key }}
+          path: ${{ runner.temp }}/xtask-prebuilt/
+          if-no-files-found: error
+          compression-level: 0
       - name: Authorize exact SHA and merge base
         id: request
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          cargo run --locked -p carrick-xtask -- signed-gate prepare
+          "$RUNNER_TEMP/xtask-prebuilt/carrick-xtask" signed-gate prepare
           --event "$GITHUB_EVENT_PATH" --output "$RUNNER_TEMP/request"
       - uses: actions/upload-artifact@v4
         with:
@@ -82,6 +105,16 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      - name: Download the prebuilt carrick-xtask
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: carrick-xtask-${{ needs.authorize.outputs.xtask_key }}
+          path: ${{ runner.temp }}/xtask-prebuilt
+      - name: Use the prebuilt carrick-xtask when it matches this checkout
+        id: prebuilt
+        continue-on-error: true
+        run: scripts/ci/xtask-prebuilt.sh verify "$RUNNER_TEMP/xtask-prebuilt"
       - uses: actions/download-artifact@v4
         with:
           name: signed-request-${{ github.run_attempt }}
@@ -89,9 +122,11 @@ jobs:
       - name: Fetch the merge base's trusted fixture bundle
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          cargo run --locked -p carrick-xtask -- signed-gate base-fixtures
-          --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/base-fixtures"
+        run: |
+          xtask=(cargo run --locked -p carrick-xtask --)
+          if [[ "${{ steps.prebuilt.outcome }}" == success ]]; then xtask=("$CARRICK_XTASK_PREBUILT"); fi
+          "${xtask[@]}" signed-gate base-fixtures \
+            --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/base-fixtures"
       - name: Upload the trusted base fixture bundle
         uses: actions/upload-artifact@v4
         with:
@@ -271,6 +306,16 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      - name: Download the prebuilt carrick-xtask
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: carrick-xtask-${{ needs.authorize.outputs.xtask_key }}
+          path: ${{ runner.temp }}/xtask-prebuilt
+      - name: Use the prebuilt carrick-xtask when it matches this checkout
+        id: prebuilt
+        continue-on-error: true
+        run: scripts/ci/xtask-prebuilt.sh verify "$RUNNER_TEMP/xtask-prebuilt"
       - uses: actions/download-artifact@v4
         with:
           name: signed-request-${{ github.run_attempt }}
@@ -289,7 +334,9 @@ jobs:
           EXECUTION_RESULT: ${{ needs.gate.result }}
         run: |
           mkdir -p "$RUNNER_TEMP/signed-result"
-          cargo run --locked -p carrick-xtask -- signed-gate publish \
+          xtask=(cargo run --locked -p carrick-xtask --)
+          if [[ "${{ steps.prebuilt.outcome }}" == success ]]; then xtask=("$CARRICK_XTASK_PREBUILT"); fi
+          "${xtask[@]}" signed-gate publish \
             --request "$RUNNER_TEMP/request/request.json" --results "$RUNNER_TEMP/signed-result" \
             --run-url "$RUN_URL" --execution-result "$EXECUTION_RESULT"
       - name: Publish admitted main baseline
