@@ -3162,7 +3162,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             result = ServiceResult::Cancelled;
         }
         if exiting {
-            let _ = ProcessNative::take_relative_futex_wait(self);
+            self.discard_rerun_answers();
             if let (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(receipt)) =
                 (request.operation, result)
             {

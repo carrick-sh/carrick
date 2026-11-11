@@ -314,11 +314,6 @@ impl<
         self.run_ready_after_native_transfer(&mut outcome);
         Some(outcome)
     }
-    fn unmanaged_thread_stock_claimed(&mut self) {
-        if let Some(venue) = self.process_venue() {
-            venue.unmanaged_thread_stock_claimed();
-        }
-    }
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         if let Some(venue) = self.process_venue() {
             venue.lifecycle_admission_settled()?;
