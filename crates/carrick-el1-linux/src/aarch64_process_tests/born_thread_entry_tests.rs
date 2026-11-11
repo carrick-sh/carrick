@@ -1037,7 +1037,7 @@ impl ProductionProcessHarness {
     fn with_current_entry<R>(
         &mut self,
         cpu: &mut crate::sched::FakeCpu,
-        run: impl FnOnce(&mut dyn carrick_personality_linux::lifecycle::ProcessNative) -> R,
+        run: impl FnOnce(&mut dyn carrick_personality_linux::ipc::ProcessIpcVenue) -> R,
     ) -> R {
         self.settle_doorbells();
         let current = self.fixture.zone.slot(self.fixture.slot).current().unwrap();
@@ -1075,13 +1075,7 @@ impl ProductionProcessHarness {
     }
 
     fn msgget_current(&mut self, key: i32, msgflg: i32, cpu: &mut crate::sched::FakeCpu) -> i32 {
-        self.with_current_entry(cpu, |entry| {
-            entry
-                .as_ipc_venue()
-                .expect("native IPC venue")
-                .msgget(key, msgflg)
-                .expect("msgget")
-        })
+        self.with_current_entry(cpu, |venue| venue.msgget(key, msgflg).expect("msgget"))
     }
 
     fn msgrcv_current(
@@ -1092,12 +1086,9 @@ impl ProductionProcessHarness {
         msgtyp: i64,
         msgflg: i32,
         cpu: &mut crate::sched::FakeCpu,
-        switched_frame: &mut carrick_el1_abi::TrapFrame,
     ) -> Result<carrick_personality_linux::ipc::IpcOutcome, i64> {
-        let result = self.with_current_entry(cpu, |entry| {
-            entry
-                .as_ipc_venue()
-                .expect("native IPC venue")
+        let result = self.with_current_entry(cpu, |venue| {
+            venue
                 .msgrcv(msqid, UserVa::new(msgp), msgtyp, msgflg, msgsz)
                 .map(|(outcome, _)| outcome)
         });
@@ -1111,8 +1102,9 @@ impl ProductionProcessHarness {
             .current()
             .is_none()
         {
+            let mut switched_frame = carrick_el1_abi::TrapFrame::default();
             assert_eq!(
-                self.switch_next(cpu, switched_frame),
+                self.switch_next(cpu, &mut switched_frame),
                 carrick_el1_abi::Action::Served
             );
         }
@@ -1127,12 +1119,7 @@ impl ProductionProcessHarness {
         msgflg: i32,
         cpu: &mut crate::sched::FakeCpu,
     ) -> Result<carrick_personality_linux::ipc::IpcOutcome, i64> {
-        self.with_current_entry(cpu, |entry| {
-            entry
-                .as_ipc_venue()
-                .expect("native IPC venue")
-                .msgsnd(msqid, mtype, mtext, msgflg)
-        })
+        self.with_current_entry(cpu, |venue| venue.msgsnd(msqid, mtype, mtext, msgflg))
     }
 }
 
@@ -1712,9 +1699,7 @@ fn arm_msgrcv_and_sibling_wait4_do_not_block_each_other() {
 
         if msgrcv_first {
             // Leader parks in blocking msgrcv(qid, rx_buf, 8, 0, 0).
-            let mut rcv_switched = carrick_el1_abi::TrapFrame::default();
-            let rcv =
-                harness.msgrcv_current(qid, rx_buf.arg(), 8, 0, 0, &mut cpu, &mut rcv_switched);
+            let rcv = harness.msgrcv_current(qid, rx_buf.arg(), 8, 0, 0, &mut cpu);
             assert!(
                 matches!(
                     rcv,
@@ -1795,9 +1780,7 @@ fn arm_msgrcv_and_sibling_wait4_do_not_block_each_other() {
             );
 
             // Sibling calls blocking msgrcv: must park, NOT -11!
-            let mut rcv_switched = carrick_el1_abi::TrapFrame::default();
-            let rcv =
-                harness.msgrcv_current(qid, rx_buf.arg(), 8, 0, 0, &mut cpu, &mut rcv_switched);
+            let rcv = harness.msgrcv_current(qid, rx_buf.arg(), 8, 0, 0, &mut cpu);
             assert!(
                 matches!(
                     rcv,

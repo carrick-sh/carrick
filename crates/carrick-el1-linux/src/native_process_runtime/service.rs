@@ -2446,6 +2446,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .unwrap_or_default();
         row.has_execed = true;
         row.dumpable = 1;
+        graph.pending.remove_process_child_waits(&self.key);
 
         member.address = successor.address;
         let _ = state.members.remove(&old_key);
