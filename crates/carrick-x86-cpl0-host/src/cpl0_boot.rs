@@ -2072,7 +2072,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
 
     /// Bind a queued, unhomed fixture thread to its actor CPU while stopped.
     /// Queue placement alone permits the other CPU to steal the child while
-    /// its parent parks. A fixture holding that CPU stopped would then strand
+    /// its parent parks (an idle CPU steals any queued thread its affinity
+    /// allows). A fixture holding that CPU stopped would then strand
     /// the child there instead of exercising the intended peer exit path.
     pub fn fixture_pin_native_thread(
         &self,
@@ -2130,9 +2131,6 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             ));
         }
         let slot = SlotId::new(cpu.raw() as u8);
-        if pin_thread && zone.slot(slot).host_record().is_some() {
-            return Err(fail("fixture affinity requires a peer without a host home"));
-        }
         if zone.claim_for_host(
             zone.record_ref(record),
             None,
@@ -2144,9 +2142,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             return Err(fail("fixture queue placement refused"));
         }
         if pin_thread {
-            // The host owns this exact unhomed queued thread. The target has
-            // no host home, and a Host claim has no live park timer. Use the
-            // existing home-release primitive to publish its actor affinity.
+            // The host owns this exact unhomed queued thread, and a Host
+            // claim has no live park timer. Use the existing home-release
+            // primitive to publish its actor affinity: it clears a slot's
+            // host home only when that home names this record, so a target
+            // CPU running its own home thread (CPU 0's root) keeps it.
             let _ = zone.unhome(slot, record, 1 << cpu.raw());
         }
         if zone.requeue_on(slot, record).is_none() {
@@ -2287,6 +2287,30 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         let result = body();
         drop(guard);
         Ok(result)
+    }
+
+    /// Whether a guest CPU holds futex bucket `bucket`'s lock now (a waker
+    /// inside its wake). Takes and drops the lock if free; changes nothing.
+    pub fn fixture_futex_bucket_held(&self, bucket: usize) -> Result<bool, TrapError> {
+        if bucket >= carrick_sched_core::ZONE_BUCKETS {
+            return Err(fail("unknown fixture futex bucket"));
+        }
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let pointer = custody
+            .ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("fixture native zone backing"))?;
+        // SAFETY: boot initialized the aligned zone in this retained window.
+        let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
+        Ok(zone
+            .lock(bucket, &carrick_sched_core::BoundedSpin(0))
+            .is_none())
     }
 
     /// Snapshot while this factory still retains the carrier metadata mapping.

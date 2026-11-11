@@ -685,6 +685,259 @@ fn native_kill_wake_to_a_busy_home_marks_fresh_host_work() {
     ));
 }
 
+/// #1961 review P0-1, x86 production witness: a fork child's thread on
+/// CPU 1 wakes the child's main thread with `FUTEX_WAKE_PRIVATE`; that
+/// waiter may run only on CPU 0, whose run queue is busy (the host holds
+/// its lock, as a contending CPU would). x86 CPL0 never leaves the guest
+/// state, so a contended queue lock is how this lane meets a waiter no
+/// guest CPU may take now. The wake must still queue the waiter on CPU 0,
+/// once the lock is free, never on the waker's CPU 1: it used to fall back
+/// to CPU 1, `misplaced`, for a host relocation no boundary performs, and
+/// CPU 1 then ran the waiter, pinned to CPU 0, itself. The run completes.
+/// (The fixture pins the waiter; the guest cannot, as a fork child's
+/// `sched_setaffinity` answers ENOSYS on x86 today.)
+#[test]
+fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
+    use carrick_sched_core::Claim;
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    let elf = native_exit_fixture("native_child_futex_wake.S");
+    let (parts, root_tid, dispatcher) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
+    let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let (cpu0, cpu1) = (
+        carrick_guest_arch::CpuId::new(0),
+        carrick_guest_arch::CpuId::new(1),
+    );
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut peer = factory.claim(1).expect("idle peer executor");
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).expect("load root");
+    run_to_marker(&mut parent, task, 1, &factory);
+    // CPU 1 runs the child's real thread birth. The new thread (the waker)
+    // runs first and stops at its marker with the main thread queued.
+    factory
+        .fixture_pin_native_thread(child_tid, cpu1)
+        .expect("child on CPU 1");
+    let mut marker = false;
+    for _ in 0..128 {
+        let exit = peer.fixture_run_idle_peer().expect("thread birth on CPU 1");
+        assert!(
+            matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }),
+            "thread birth exit {exit:?}"
+        );
+        assert!(
+            peer.service_idle_peer_doorbell_with_host_file(&exit, |_, _| {}, &mut |origin, record| {
+                assert_eq!(origin, carrick_core_abi::service::ServiceOrigin::Descendant);
+                let served = dispatcher
+                    .serve_native_host_file(record)
+                    .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
+                marker = true;
+                Ok(served.retained_source)
+            })
+            .expect("thread birth service")
+            .is_none()
+        );
+        if marker {
+            break;
+        }
+    }
+    assert_eq!(dispatcher.stdout(), [2], "the waker stopped at its marker");
+    // The waiter (the child's main thread) may run only on CPU 0. CPU 0
+    // resumes the root into wait4, then runs the waiter into its futex wait.
+    factory
+        .fixture_pin_native_thread(child_tid, cpu0)
+        .expect("pin the waiter to CPU 0");
+    run_until_wait_enrolled_with_boundary(&mut parent, task, &factory, child_tid, false, true);
+    assert!(matches!(
+        factory
+            .fixture_native_wait_state(child_tid)
+            .expect("waiter wait")
+            .0,
+        Claim::Parked { .. }
+    ));
+    let bucket = parked_bucket(&factory, child_tid);
+    let (misplaced_before, _) = factory.fixture_native_wake_debt(cpu1).expect("debt");
+    // The host holds CPU 0's run queue while CPU 1 resumes the waker. It
+    // lets go once the waker has waited on that lock far longer than a
+    // bounded spin (the waker holds the futex bucket throughout), or once
+    // the waiter left its park without it.
+    let (locked, held) = std::sync::mpsc::channel();
+    let waited = std::thread::scope(|scope| {
+        let holder = scope.spawn(|| {
+            factory
+                .fixture_with_slot_locked(cpu0, || {
+                    locked.send(()).expect("holder rendezvous");
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let mut held_since = None;
+                    loop {
+                        let now = std::time::Instant::now();
+                        if factory.fixture_futex_bucket_held(bucket).expect("bucket") {
+                            let since = *held_since.get_or_insert(now);
+                            if now - since >= std::time::Duration::from_millis(50) {
+                                return true;
+                            }
+                        } else {
+                            held_since = None;
+                            if !matches!(
+                                factory.fixture_native_wait_state(child_tid).expect("waiter").0,
+                                Claim::Parked { .. }
+                            ) {
+                                return false;
+                            }
+                        }
+                        if now >= deadline {
+                            return false;
+                        }
+                        std::thread::yield_now();
+                    }
+                })
+                .expect("hold CPU 0's run queue")
+        });
+        held.recv().expect("CPU 0's run queue held");
+        // CPU 1: the waker's wake and raw exit. The waiter must never run
+        // here; CPU 1 idles once the waker is gone.
+        run_until_idle(&factory, cpu1, || {
+            let exit = peer.fixture_run_idle_peer().expect("waker on CPU 1");
+            eprintln!("DBG exit {exit:?} waiter {:?}", factory.fixture_native_wait_state(child_tid).map(|s| s.0));
+            assert!(
+                !matches!(
+                    exit,
+                    CarrierRunExit::PhysicalDoorbell {
+                        port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                        ..
+                    }
+                ),
+                "the waiter, pinned to CPU 0, ran and exited the child on CPU 1"
+            );
+            if matches!(exit, CarrierRunExit::PhysicalDoorbell { .. }) {
+                assert!(
+                    peer.service_idle_peer_doorbell(&exit, |_, _| {})
+                        .expect("waker service")
+                        .is_none()
+                );
+            }
+            exit
+        });
+        holder.join().expect("bounded holder")
+    });
+    let (claim, _, _) = factory
+        .fixture_native_wait_state(child_tid)
+        .expect("woken waiter");
+    let (misplaced, _) = factory.fixture_native_wake_debt(cpu1).expect("debt");
+    assert!(
+        matches!(claim, Claim::Queued { slot, .. } if slot == carrick_sched_core::SlotId::new(0)),
+        "the waiter is queued on CPU 0, the CPU it may run on: {claim:?}, \
+         misplaced {misplaced_before} -> {misplaced}"
+    );
+    assert_eq!(misplaced, misplaced_before, "nothing left to relocate");
+    assert!(waited, "the waker waited for CPU 0's run queue");
+    // CPU 0 runs the waiter: it exits the child with 19, and the root
+    // reaps it and exits 7.
+    let status = (0..128)
+        .find_map(|_| {
+            let exit = parent
+                .fixture_run_loaded(task)
+                .expect("waiter and root on CPU 0")
+                .exit;
+            match exit {
+                CarrierRunExit::PhysicalDoorbell { .. } => parent
+                    .service_physical_doorbell(task, &exit, |_, _| {})
+                    .expect("root service"),
+                other => panic!("unexpected exit on CPU 0: {other:?}"),
+            }
+        })
+        .expect("root exit");
+    assert_eq!(
+        status,
+        carrick_vmm_kvm::cpl0_boot::PhysicalProcessExit::Exited(
+            carrick_sched_core::process::TerminationStatus::exited(7)
+        ),
+        "the root reaped the child's 19 and exited 7"
+    );
+    assert_eq!(dispatcher.stdout(), [2]);
+}
+
+/// The futex bucket `tid`'s parked record waits in, from the zone census.
+fn parked_bucket(
+    factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
+    tid: carrick_el1_abi::El1TaskId,
+) -> usize {
+    let census = factory.capture_physical_state().zone_census;
+    let index = census
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("zone record ")?;
+            let (index, fields) = rest.split_once(": ")?;
+            fields
+                .split(' ')
+                .any(|field| field == format!("tid={}", tid.raw()))
+                .then(|| index.to_owned())
+        })
+        .expect("parked record in the census");
+    let parked = census
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("zone record {index} parked: ")))
+        .expect("parked wait in the census");
+    let field = |name: &str| {
+        parked
+            .split(' ')
+            .find_map(|field| field.strip_prefix(name))
+            .expect("census field")
+            .to_owned()
+    };
+    let mm = field("first_wait_mm=").parse::<u64>().expect("mm");
+    let address = u64::from_str_radix(
+        field("first_wait_address=").trim_start_matches("0x"),
+        16,
+    )
+    .expect("address");
+    carrick_sched_core::ZoneTables::<carrick_sched_core::ParkedContextWords>::bucket_of_with_context(
+        mm, address,
+    )
+}
+
+/// Run the idle peer `cpu` through `run` (one guest entry, its doorbell
+/// serviced) until it idles with nothing to run; a watcher kicks it at that
+/// idle boundary.
+fn run_until_idle(
+    factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
+    cpu: carrick_guest_arch::CpuId,
+    mut run: impl FnMut() -> carrick_vmm_kvm::carrier_cpu::CarrierRunExit,
+) {
+    use carrick_hal::VcpuKick;
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    for _ in 0..128 {
+        let kick = carrick_vmm_kvm::KvmKickHandle::for_current_thread();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let (exit, idle) = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    if factory.fixture_native_cpu_idle(cpu).expect("idle census") {
+                        kick.kick();
+                        return true;
+                    }
+                    if stopped.load(std::sync::atomic::Ordering::Acquire)
+                        || std::time::Instant::now() >= deadline
+                    {
+                        return false;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            let exit = run();
+            stopped.store(true, std::sync::atomic::Ordering::Release);
+            (exit, watcher.join().expect("bounded idle watcher"))
+        });
+        match exit {
+            CarrierRunExit::Kick if idle => return,
+            CarrierRunExit::Kick | CarrierRunExit::PhysicalDoorbell { .. } => {}
+            other => panic!("unexpected exit before idle: {other:?}"),
+        }
+    }
+    panic!("idle budget");
+}
+
 fn native_runtime_exit_wake(hold_home: bool) {
     use carrick_sched_core::Claim;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
