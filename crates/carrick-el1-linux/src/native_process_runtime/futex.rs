@@ -252,8 +252,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 {
     /// One wake authority for native futex syscalls and clear-child-tid.
     /// An EL1 wake always finishes in the ring (#1941): a waiter no guest
-    /// slot may run now is queued on the waker, misplaced, and the shared
-    /// effects consumer marks the host boundary that relocates it.
+    /// slot may run now is queued on the slot that owns it, stopped,
+    /// contended or busy (`ZoneTables::owner_slot`), whose driver runs it
+    /// when that slot is in the guest again; never on a waker that may not
+    /// run it, since no host boundary relocates the waker's queue.
     pub(super) fn wake_native_futex(
         &mut self,
         mm: carrick_core_abi::ReservationMm,

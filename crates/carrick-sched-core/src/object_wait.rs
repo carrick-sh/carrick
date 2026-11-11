@@ -1706,9 +1706,10 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
             report.visited += 1;
             if let Claim::Parked { seq } = rec.claim() {
                 // Readiness is already committed by the object. Even when no
-                // slot admits this MM now, queue the owned operation on the
-                // waker and request host handback via WakeEffects::misplaced.
-                // A generic pending-host flag alone cannot find this waiter.
+                // slot in the guest admits it now, queue the owned operation
+                // on the slot that owns it (`ZoneTables::owner_slot`); only a
+                // waiter no slot but the waker's may run stays on the waker,
+                // reported via WakeEffects::misplaced.
                 if self
                     .zone
                     .claim_for_el1(record, seq, 0, waker, effects, || self.unlink(record))
