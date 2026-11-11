@@ -25,6 +25,8 @@ pub fn schedule(slot: SlotId) -> ! {
     crate::anonymous::release_injected_edit_wait(source, current);
     #[cfg(feature = "test-support")]
     crate::test_support::signal_parked_member(source, current);
+    #[cfg(feature = "test-support")]
+    crate::test_support::release_birth_on_park(source);
     settle_current_work(current);
     loop {
         #[cfg(feature = "test-support")]
