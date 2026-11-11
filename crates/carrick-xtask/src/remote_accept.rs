@@ -282,18 +282,23 @@ pub fn build_accept_job_script(
         format!("just accept --phase {phase} --receipt {q_receipt}")
     } else {
         let bundle = fixture_bundle.ok_or(RemoteAcceptError::MissingFixtureBundle)?;
-        // One gate lease spans restoration/verification, accept and scoped guest cleanup.
+        // Fixture restoration needs gate. Accept then takes its own leases:
+        // carrick for its build, gate again only for guest execution (#2013).
         // The checkout lock is already held and remains held until job exit.
         let source = match &bundle {
             FixtureBundle::Local(_) => "local",
             FixtureBundle::Remote(_) => "remote",
         };
         let preparation = format!(
-            "test -d {q_lock} && cargo run --locked -p carrick-xtask -- fixtures prepare --bundle {} --run-dir {} --source {source} && just accept --phase {phase} --receipt {q_receipt}",
+            "test -d {q_lock} && cargo run --locked -p carrick-xtask -- fixtures prepare --bundle {} --run-dir {} --source {source}",
             shell_quote(bundle.path()),
             shell_quote(&run_dir.to_string_lossy()),
         );
-        format!("just lease gate sh -c {}", shell_quote(&preparation))
+        // Grouped, so the job log captures preparation as well as accept.
+        format!(
+            "{{ just lease gate sh -c {} && just accept --phase {phase} --receipt {q_receipt}; }}",
+            shell_quote(&preparation)
+        )
     };
     Ok(format!(
         "[ -f {q_env} ] && . {q_env}; cd {q_worktree} && {command} > {q_log} 2>&1; echo $? > {q_exit_tmp} && mv {q_exit_tmp} {q_exit}; {release}"
@@ -1407,6 +1412,12 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
             script.find("fixtures prepare").unwrap()
                 < script.find("just accept --phase signed").unwrap()
         );
+        // #2013: accept is not nested in the restore's gate lease; it takes
+        // carrick for its build and gate only for guest execution.
+        assert!(
+            script.contains("' && just accept --phase signed"),
+            "{script}"
+        );
         let local_script = build_accept_job_script(
             worktree,
             AcceptPhase::Signed,
@@ -1549,6 +1560,7 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
             probe_diffs: vec![],
             cleanup_counts: vec![],
             host_load: Default::default(),
+            signed_admission: None,
             failures: vec![],
             host_identity: None,
             fixture_bundle: None,

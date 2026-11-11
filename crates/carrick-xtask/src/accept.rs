@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::command;
 use crate::host_lease::{HostLease, HostLeaseMode, extract_exit_code};
+use crate::signed_phase::{ArtifactKind, SignedPhase};
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct AcceptArgs {
@@ -336,6 +337,10 @@ pub struct AcceptReceipt {
     pub fixture_bundle: Option<FixtureBundleReceipt>,
     #[serde(default)]
     pub host_load: crate::host_load::HostLoadReport,
+    /// Signed runs (#2013): the lease each phase held and the artifact
+    /// identity carried from the build phase into guest execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_admission: Option<crate::signed_phase::SignedAdmission>,
     pub failures: Vec<String>,
 }
 
@@ -1370,6 +1375,29 @@ pub fn inspect_artifact(root: &Path) -> Result<ArtifactIdentity, String> {
     inspect_executable(&bin_path)
 }
 
+/// Every installed file a signed run executes or mounts into its guests:
+/// the installed receipt itself, the bundle's executables and any
+/// candidate-built probes (#1980), as absolute paths. Signed acceptance
+/// hashes these at the end of its build and compares them after gate
+/// admission (#2013), so the bytes verified are the bytes the guests run.
+/// Built from `fixtures`' public verification: the manifest's executables
+/// and the candidate probe names, which the publisher builds for both targets.
+pub fn installed_artifact_paths(
+    root: &Path,
+) -> Result<Vec<PathBuf>, crate::fixtures::FixturesError> {
+    use crate::fixtures::{GuestTarget, INSTALLED_MANIFEST};
+    let manifest = crate::fixtures::verify_installed(root)?;
+    let receipt = crate::fixtures::verify_installed_receipt(root)?;
+    let mut paths = vec![root.join(INSTALLED_MANIFEST)];
+    paths.extend(manifest.executables.iter().map(|e| root.join(&e.path)));
+    for probe in receipt.candidate_probes.iter().flat_map(|c| &c.probes) {
+        for target in [GuestTarget::Musl, GuestTarget::Gnu] {
+            paths.push(root.join(probe.name.executable(target)));
+        }
+    }
+    Ok(paths)
+}
+
 /// SHA-256, CDHash, LC_UUID, hypervisor entitlement and `__dof_carrick`
 /// presence of one signed Mach-O executable.
 pub fn inspect_executable(bin_path: &Path) -> Result<ArtifactIdentity, String> {
@@ -1502,18 +1530,26 @@ pub fn resolve_ltp_suites(root: &Path) -> io::Result<Vec<String>> {
     Ok(suites)
 }
 
-fn run_command_redirect(
+/// Run one step with its output in `log_path`, truncated or appended. Signed
+/// phase variables never leak into a step that did not ask for them.
+fn run_command_logged(
     lease: &HostLease,
     prog: &str,
     args: &[&str],
     env: &[(&str, &str)],
     cwd: &Path,
     log_path: &Path,
+    append: bool,
 ) -> io::Result<(Option<i32>, f64)> {
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let log_file = fs::File::create(log_path)?;
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(log_path)?;
     let err_file = log_file.try_clone()?;
 
     let mut cmd = if prog == "cargo" {
@@ -1527,6 +1563,8 @@ fn run_command_redirect(
     cmd.stdin(Stdio::null());
     cmd.stdout(log_file);
     cmd.stderr(err_file);
+    cmd.env_remove(crate::signed_phase::PHASE_ENV)
+        .env_remove(crate::signed_phase::STATE_ENV);
 
     for (k, v) in env {
         cmd.env(k, v);
@@ -1624,6 +1662,7 @@ pub fn publish_refusal(
         host_identity: SignedHostIdentity::capture(),
         fixture_bundle: None,
         host_load: Default::default(),
+        signed_admission: None,
         failures: vec![format!("{ACCEPT_REFUSAL_PREFIX}{error}")],
     };
     if let Some(parent) = path
@@ -1653,7 +1692,7 @@ fn run_on_host(
     let mut published = false;
     let result = validate_request_for_host(&args, os, arch).and_then(|phase| {
         args.phase = phase;
-        run_inner(root_arg, args, &mut published)
+        run_staged(root_arg, args, &mut published)
     });
     if let Err(error) = &result
         && !published
@@ -1663,17 +1702,358 @@ fn run_on_host(
     result
 }
 
-fn run_inner(
+/// Which lease-bounded part of an accept run this process performs (#2013).
+/// Compilation, host tests, linking and signing are build work under the
+/// shared `carrick` lease; only guest execution holds exclusive `gate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptStage {
+    /// The host phase alone (see [`host_phase_lease`]).
+    HostOnly,
+    /// The signed run's build phase (and the host phase of `--phase all`).
+    Build,
+    /// The signed run's guest execution, after artifact re-verification.
+    Execute,
+}
+
+impl AcceptStage {
+    fn lease_mode(self, profile: AcceptProfile) -> HostLeaseMode {
+        match self {
+            Self::HostOnly => host_phase_lease(profile),
+            Self::Build => HostLeaseMode::Carrick,
+            Self::Execute => HostLeaseMode::Gate,
+        }
+    }
+}
+
+/// The lease a profile's host phase needs. The `kvm` and `el1-native` host
+/// steps (`just test-kvm`, `just test-el1-native`) boot guests and take no
+/// lease of their own, so they execute under `gate`. Every other host phase
+/// is compilation and host tests, build work under `carrick` (#2013).
+pub fn host_phase_lease(profile: AcceptProfile) -> HostLeaseMode {
+    match profile {
+        AcceptProfile::Kvm | AcceptProfile::El1Native => HostLeaseMode::Gate,
+        AcceptProfile::LinuxPortable | AcceptProfile::NoDocker | AcceptProfile::Full => {
+            HostLeaseMode::Carrick
+        }
+    }
+}
+
+/// The lease the CLI takes around a top-level `accept` (#2013): the host
+/// phase's lease, or none for a signed run, whose signed-phase driver takes
+/// `carrick` for the build and then `gate` for guest execution, one after
+/// the other.
+pub fn cli_lease(profile: AcceptProfile, phase: AcceptPhase) -> Option<HostLeaseMode> {
+    match phase {
+        AcceptPhase::Host => Some(host_phase_lease(profile)),
+        AcceptPhase::Signed | AcceptPhase::All => None,
+    }
+}
+
+/// Written to the driver state once a stage publishes the receipt.
+const PUBLISHED_MARKER: &str = "accept-published";
+/// What the build stage hands the execution stage.
+const CARRY_FILE: &str = "accept-build.json";
+
+/// Build-stage results the execution stage completes into one receipt.
+#[derive(Serialize, Deserialize)]
+struct AcceptCarry {
+    timestamp: String,
+    failures: Vec<String>,
+    steps: Vec<StepResult>,
+    skipped_steps: Vec<String>,
+    artifact: Option<ArtifactIdentity>,
+    fixture_validation: Option<crate::fixtures::ValidationReceipt>,
+    el1: Option<El1Comparison>,
+    probe_diffs: Vec<ProbeDiff>,
+    cleanup_counts: Vec<CleanupCount>,
+}
+
+/// One `scripts/test-signed.sh` invocation of the signed phase. It runs
+/// whole in the execution stage: test-signed builds and signs its own test
+/// executables there, under the gate it inherits, so nothing it builds
+/// crosses a released lease and none of it needs a handoff.
+struct TestSignedStep {
+    name: &'static str,
+    run_id: &'static str,
+    log_name: &'static str,
+    package: &'static str,
+    filter: &'static str,
+    verdict: SignedVerdict,
+}
+
+#[derive(Clone, Copy)]
+enum SignedVerdict {
+    /// Compared with `scripts/conformance/el1-known-red.txt`.
+    El1,
+    /// Passes on exit status 0.
+    ExitCode(&'static str),
+    /// Passes on exit status 0 without a probe DIFF or panic.
+    Probes(&'static str),
+}
+
+const TEST_SIGNED_STEPS: &[TestSignedStep] = &[
+    TestSignedStep {
+        name: "el1-embed",
+        run_id: "el1",
+        log_name: "el1-embed.log",
+        package: "carrick-embed",
+        filter: "el1_",
+        verdict: SignedVerdict::El1,
+    },
+    TestSignedStep {
+        name: "fresh-executable-page",
+        run_id: "icache",
+        log_name: "fresh-executable-page.log",
+        package: "carrick-embed",
+        filter: "a_fresh_executable_page",
+        verdict: SignedVerdict::ExitCode("fresh executable page step"),
+    },
+    TestSignedStep {
+        name: "generic-probe-shards",
+        run_id: "probe-shards",
+        log_name: "generic-probe-shards.log",
+        package: "carrick-conformance-next",
+        filter: "generic_probe_shard_",
+        verdict: SignedVerdict::Probes("generic probe shards"),
+    },
+    TestSignedStep {
+        name: "probe-cases",
+        run_id: "probe-cases",
+        log_name: "probe-cases.log",
+        package: "carrick-conformance-next",
+        filter: "case_",
+        verdict: SignedVerdict::Probes("probe cases"),
+    },
+];
+
+impl TestSignedStep {
+    fn command(&self) -> String {
+        format!(
+            "./scripts/test-signed.sh {} {} --nocapture",
+            self.package, self.filter
+        )
+    }
+
+    /// test-signed's own `host-lease --mode carrick` reuses the inherited
+    /// gate (gate grants carrick); it never waits on this run's gate.
+    fn run(
+        &self,
+        lease: &HostLease,
+        run_id: &str,
+        root: &Path,
+        log_path: &Path,
+    ) -> Result<(Option<i32>, f64), AcceptError> {
+        run_command_logged(
+            lease,
+            "./scripts/test-signed.sh",
+            &[self.package, self.filter, "--nocapture"],
+            &[("CARRICK_RUN_ID", run_id)],
+            root,
+            log_path,
+            false,
+        )
+        .map_err(|source| AcceptError::Io {
+            path: log_path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn evaluate(
+        &self,
+        root: &Path,
+        exit_code: Option<i32>,
+        log_path: &Path,
+        el1_summary: &mut Option<El1Comparison>,
+        probe_diffs: &mut Vec<ProbeDiff>,
+    ) -> (bool, Option<String>) {
+        let log = fs::read_to_string(log_path).unwrap_or_default();
+        match self.verdict {
+            SignedVerdict::El1 => {
+                let allowlist = load_allowlist(&root.join("scripts/conformance/el1-known-red.txt"))
+                    .unwrap_or_default();
+                let (comparison, passed, error) = evaluate_el1_step(exit_code, &log, &allowlist);
+                if !comparison.now_passing.is_empty() {
+                    println!(
+                        "  [NOTICE] el1 tests now passing, remove from allowlist: {}",
+                        comparison.now_passing.join(", ")
+                    );
+                }
+                *el1_summary = Some(comparison);
+                (passed, error)
+            }
+            SignedVerdict::ExitCode(label) => {
+                let passed = exit_code == Some(0);
+                let error = (!passed)
+                    .then(|| format!("{label} failed with exit code {}", exit_code.unwrap_or(-1)));
+                (passed, error)
+            }
+            SignedVerdict::Probes(label) => {
+                let diffs = extract_probe_diffs(self.name, &log);
+                if !diffs.is_empty() {
+                    let names: Vec<_> = diffs.iter().map(|d| d.probe.as_str()).collect();
+                    let error = format!("{label} contained DIFF or panic: {}", names.join(", "));
+                    probe_diffs.extend(diffs);
+                    (false, Some(error))
+                } else if exit_code != Some(0) {
+                    (
+                        false,
+                        Some(format!(
+                            "{label} failed with exit code {}",
+                            exit_code.unwrap_or(-1)
+                        )),
+                    )
+                } else {
+                    (true, None)
+                }
+            }
+        }
+    }
+}
+
+fn step_result(
+    name: &str,
+    command: String,
+    exit_code: Option<i32>,
+    log_path: PathBuf,
+    duration_s: f64,
+    passed: bool,
+    error: Option<String>,
+) -> StepResult {
+    StepResult {
+        outcome: None,
+        name: name.to_string(),
+        command,
+        exit_code,
+        log_path,
+        duration_s,
+        passed,
+        error,
+        failed_tests: Vec::new(),
+        not_run_tests: Vec::new(),
+        unitemized_failures: Vec::new(),
+        started_tests: Vec::new(),
+        finished_binaries: Vec::new(),
+        unfinished_binaries: Vec::new(),
+    }
+}
+
+/// Scoped reap after a step that may have launched guests.
+fn reap_step(
+    root: &Path,
+    step_name: &str,
+    run_id: &str,
+    failures: &mut Vec<String>,
+    cleanup_counts: &mut Vec<CleanupCount>,
+) {
+    let reap = command::run_checked("scripts/sudo/kill.sh", [run_id], Some(root));
+    let remaining_count = cleanup_remaining(&reap, step_name, failures);
+    cleanup_counts.push(CleanupCount {
+        step: step_name.to_string(),
+        run_id: run_id.to_string(),
+        remaining_count,
+    });
+    if remaining_count != 0 {
+        failures.push(format!(
+            "step '{step_name}' leaked {remaining_count} processes under run_id '{run_id}'"
+        ));
+    }
+}
+
+fn run_staged(
     root_arg: Option<&Path>,
-    mut args: AcceptArgs,
+    args: AcceptArgs,
     published: &mut bool,
 ) -> Result<(), AcceptError> {
-    args.phase = profile_phase(args.profile, args.phase)?;
-    // remote-accept holds its checkout lock first. Hold the host lease across
-    // host compilation/tests, signing, cleanup, and receipt publication.
+    if args.phase == AcceptPhase::Host {
+        return run_inner(root_arg, args, AcceptStage::HostOnly, published);
+    }
+    match SignedPhase::current().map_err(|e| AcceptError::Failed(e.to_string()))? {
+        Some(SignedPhase::Build) => run_inner(root_arg, args, AcceptStage::Build, published),
+        Some(SignedPhase::Execute) => run_inner(root_arg, args, AcceptStage::Execute, published),
+        None => drive_signed(root_arg, args, published),
+    }
+}
+
+/// Run this accept again as the signed-phase driver's build and execution
+/// phases. This process holds no lease: `carrick` covers the build phase
+/// and is released before `gate` is requested for guest execution.
+fn drive_signed(
+    root_arg: Option<&Path>,
+    args: AcceptArgs,
+    published: &mut bool,
+) -> Result<(), AcceptError> {
+    crate::signed_phase::preflight().map_err(|e| AcceptError::Failed(e.to_string()))?;
+    let root = crate::cli::resolve_repo_info(root_arg)
+        .map_err(|e| AcceptError::Git(e.to_string()))?
+        .repository_root;
+    // Refuse a dirty checkout before any admission or work, as each stage
+    // does again under its own lease.
+    verify_clean_checkout(&root)?;
+    // Disk admission takes gate itself, so it cannot run inside the shared
+    // build phase. Admit once here; the build phase then runs `just _build`,
+    // the body `just build` runs after its own disk admission.
+    let disk = Command::new("just")
+        .arg("check-disk")
+        .current_dir(&root)
+        .env_remove(crate::signed_phase::PHASE_ENV)
+        .env_remove(crate::signed_phase::STATE_ENV)
+        .status()
+        .map_err(|source| AcceptError::Io {
+            path: root.clone(),
+            source,
+        })?;
+    if !disk.success() {
+        return Err(AcceptError::Failed(
+            "disk admission (just check-disk) failed before the signed build".into(),
+        ));
+    }
+    let state = tempfile::Builder::new()
+        .prefix("carrick-accept-")
+        .tempdir()
+        .map_err(|source| AcceptError::Io {
+            path: std::env::temp_dir(),
+            source,
+        })?;
+    let executable = std::env::current_exe().map_err(|source| AcceptError::Io {
+        path: PathBuf::from("current executable"),
+        source,
+    })?;
+    let mut command: Vec<std::ffi::OsString> = vec![executable.into_os_string()];
+    if let Some(root) = root_arg {
+        command.extend(["--root".into(), root.as_os_str().to_owned()]);
+    }
+    command.extend([
+        "accept".into(),
+        "--phase".into(),
+        args.phase.to_string().into(),
+        "--profile".into(),
+        args.profile.to_string().into(),
+    ]);
+    if let Some(receipt) = &args.receipt {
+        command.extend(["--receipt".into(), receipt.as_os_str().to_owned()]);
+    }
+    let code = crate::signed_phase::run(state.path(), true, &command)
+        .map_err(|e| AcceptError::Failed(e.to_string()));
+    *published = state.path().join(PUBLISHED_MARKER).exists();
+    match code? {
+        0 => Ok(()),
+        code => Err(AcceptError::Failed(format!(
+            "signed acceptance phases exited with status {code}"
+        ))),
+    }
+}
+
+fn run_inner(
+    root_arg: Option<&Path>,
+    args: AcceptArgs,
+    stage: AcceptStage,
+    published: &mut bool,
+) -> Result<(), AcceptError> {
+    // remote-accept holds its checkout lock first. This stage's lease spans
+    // its own work, scoped cleanup and, when it publishes, the receipt.
     crate::host_load::check().map_err(|e| AcceptError::Failed(e.to_string()))?;
-    let gate_lease =
-        HostLease::acquire(HostLeaseMode::Gate).map_err(|e| AcceptError::Failed(e.to_string()))?;
+    let lease = HostLease::acquire(stage.lease_mode(args.profile))
+        .map_err(|e| AcceptError::Failed(e.to_string()))?;
     let host_load = crate::host_load::check().map_err(|e| AcceptError::Failed(e.to_string()))?;
     let repo_info =
         crate::cli::resolve_repo_info(root_arg).map_err(|e| AcceptError::Git(e.to_string()))?;
@@ -1685,7 +2065,29 @@ fn run_inner(
         .map_err(|e| AcceptError::Git(e.to_string()))?;
     let short_head = short_head_out.stdout.trim().to_string();
 
-    let timestamp = generate_timestamp();
+    let state = match stage {
+        AcceptStage::HostOnly => None,
+        AcceptStage::Build | AcceptStage::Execute => Some(
+            std::env::var_os(crate::signed_phase::STATE_ENV)
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    AcceptError::Failed("signed accept stage without its phase state".into())
+                })?,
+        ),
+    };
+    let carried: Option<AcceptCarry> = match (stage, &state) {
+        (AcceptStage::Execute, Some(state)) => {
+            let path = state.join(CARRY_FILE);
+            let bytes = fs::read(&path).map_err(|source| AcceptError::Io { path, source })?;
+            Some(serde_json::from_slice(&bytes)?)
+        }
+        _ => None,
+    };
+
+    let timestamp = carried
+        .as_ref()
+        .map(|carry| carry.timestamp.clone())
+        .unwrap_or_else(generate_timestamp);
 
     // The output directory is target/el1-gate/<short_head>/
     let run_dir = root.join("target/el1-gate").join(&short_head);
@@ -1694,116 +2096,132 @@ fn run_inner(
         source: e,
     })?;
 
-    let receipt_path = args.receipt.unwrap_or_else(|| run_dir.join("receipt.json"));
+    let receipt_path = args
+        .receipt
+        .clone()
+        .unwrap_or_else(|| run_dir.join("receipt.json"));
 
-    let mut clean_tree = true;
     let mut failures = Vec::new();
-
     let mut step_results = Vec::new();
     let mut skipped_steps = Vec::new();
     let mut artifact_identity = None;
+    let mut fixture_validation = None;
     let mut el1_summary = None;
     let mut probe_diffs = Vec::new();
     let mut cleanup_counts = Vec::new();
-
-    if args.profile == AcceptProfile::LinuxPortable {
-        skipped_steps.push("host-authority live compiler profiles macos-*, freebsd-*, netbsd-*: require their respective hosts; lint-domains runs the Linux compiler profiles and source checks here".to_string());
+    if let Some(carry) = carried {
+        failures = carry.failures;
+        step_results = carry.steps;
+        skipped_steps = carry.skipped_steps;
+        artifact_identity = carry.artifact;
+        fixture_validation = carry.fixture_validation;
+        el1_summary = carry.el1;
+        probe_diffs = carry.probe_diffs;
+        cleanup_counts = carry.cleanup_counts;
     }
+    let signed_requested = matches!(args.phase, AcceptPhase::Signed | AcceptPhase::All);
 
-    let linux_exceptions: Vec<LinuxHostTestException> =
+    if stage != AcceptStage::Execute {
         if args.profile == AcceptProfile::LinuxPortable {
-            let path = root.join("scripts/linux-host-test-allowlist.json");
-            let content =
-                fs::read_to_string(&path).map_err(|source| AcceptError::Io { path, source })?;
-            let entries: Vec<LinuxHostTestException> = serde_json::from_str(&content)?;
-            if entries
-                .iter()
-                .any(|entry| entry.test.is_empty() || entry.reason.is_empty())
-            {
-                return Err(AcceptError::Failed(
-                    "Linux host test exceptions must name a test and reason".to_string(),
-                ));
-            }
-            entries
-        } else {
-            Vec::new()
-        };
+            skipped_steps.push("host-authority live compiler profiles macos-*, freebsd-*, netbsd-*: require their respective hosts; lint-domains runs the Linux compiler profiles and source checks here".to_string());
+        }
 
-    // 1. Host Phase
-    if matches!(args.phase, AcceptPhase::Host | AcceptPhase::All) {
-        println!("--- Host phase starting ---");
-        for step in host_steps(args.profile) {
-            let log_path = run_dir.join(step.log_name);
-            let display_cmd = format!("{} {}", step.program, step.args.join(" "));
-            println!("  running: {display_cmd} (log: {})", log_path.display());
-
-            let (exit_code, duration_s) = run_command_redirect(
-                &gate_lease,
-                step.program,
-                step.args,
-                step.env,
-                &root,
-                &log_path,
-            )
-            .map_err(|e| AcceptError::Io {
-                path: log_path.clone(),
-                source: e,
-            })?;
-
-            let passed = exit_code == Some(0);
-            let error = if !passed {
-                let mut msg = format!(
-                    "step '{}' failed with exit code {}",
-                    step.name,
-                    exit_code.unwrap_or(-1)
-                );
-                if args.profile == AcceptProfile::LinuxPortable {
-                    let log = fs::read_to_string(&log_path).unwrap_or_default();
-                    let details = linux_host_failure_details(&log, &linux_exceptions);
-                    if !details.is_empty() {
-                        msg.push_str(&format!(": {details}"));
-                    }
+        let linux_exceptions: Vec<LinuxHostTestException> =
+            if args.profile == AcceptProfile::LinuxPortable {
+                let path = root.join("scripts/linux-host-test-allowlist.json");
+                let content =
+                    fs::read_to_string(&path).map_err(|source| AcceptError::Io { path, source })?;
+                let entries: Vec<LinuxHostTestException> = serde_json::from_str(&content)?;
+                if entries
+                    .iter()
+                    .any(|entry| entry.test.is_empty() || entry.reason.is_empty())
+                {
+                    return Err(AcceptError::Failed(
+                        "Linux host test exceptions must name a test and reason".to_string(),
+                    ));
                 }
-                failures.push(msg.clone());
-                Some(msg)
+                entries
             } else {
-                None
+                Vec::new()
             };
 
-            step_results.push(StepResult {
-                outcome: None,
-                name: step.name.to_string(),
-                command: display_cmd,
-                exit_code,
-                log_path,
-                duration_s,
-                passed,
-                error,
-                failed_tests: Vec::new(),
-                not_run_tests: Vec::new(),
-                unitemized_failures: Vec::new(),
-                started_tests: Vec::new(),
-                finished_binaries: Vec::new(),
-                unfinished_binaries: Vec::new(),
-            });
+        // 1. Host Phase
+        if matches!(args.phase, AcceptPhase::Host | AcceptPhase::All) {
+            println!("--- Host phase starting ---");
+            for step in host_steps(args.profile) {
+                let log_path = run_dir.join(step.log_name);
+                let display_cmd = format!("{} {}", step.program, step.args.join(" "));
+                println!("  running: {display_cmd} (log: {})", log_path.display());
+
+                let (exit_code, duration_s) = run_command_logged(
+                    &lease,
+                    step.program,
+                    step.args,
+                    step.env,
+                    &root,
+                    &log_path,
+                    false,
+                )
+                .map_err(|e| AcceptError::Io {
+                    path: log_path.clone(),
+                    source: e,
+                })?;
+
+                let passed = exit_code == Some(0);
+                let error = if !passed {
+                    let mut msg = format!(
+                        "step '{}' failed with exit code {}",
+                        step.name,
+                        exit_code.unwrap_or(-1)
+                    );
+                    if args.profile == AcceptProfile::LinuxPortable {
+                        let log = fs::read_to_string(&log_path).unwrap_or_default();
+                        let details = linux_host_failure_details(&log, &linux_exceptions);
+                        if !details.is_empty() {
+                            msg.push_str(&format!(": {details}"));
+                        }
+                    }
+                    failures.push(msg.clone());
+                    Some(msg)
+                } else {
+                    None
+                };
+
+                step_results.push(step_result(
+                    step.name,
+                    display_cmd,
+                    exit_code,
+                    log_path,
+                    duration_s,
+                    passed,
+                    error,
+                ));
+            }
         }
     }
 
-    // Fail before signing or guest execution, while preserving a FAIL receipt.
-    let signed_requested = matches!(args.phase, AcceptPhase::Signed | AcceptPhase::All);
-    let mut fixtures_valid = false;
-    let mut fixture_validation = None;
-    if signed_requested {
-        if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
-            return Err(AcceptError::UnsupportedPlatform(format!(
-                "{}-{} (signed phase requires macOS aarch64)",
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            )));
+    // 2. Signed build phase: fixture verification, the release build and
+    //    its signing, all under the shared lease. Fail before signing or
+    //    guest execution, while preserving a FAIL receipt.
+    if stage == AcceptStage::Build && signed_requested {
+        // Only macOS aarch64 can build the signed release binary. Elsewhere
+        // the build step fails without running, through the same
+        // failed-build path as a `just _build` that exits nonzero.
+        let platform_error =
+            (std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64").then(|| {
+                format!(
+                    "{}-{} (signed phase requires macOS aarch64)",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )
+            });
+        if let Some(error) = &platform_error {
+            eprintln!("accept: {error}");
+            failures.push(error.clone());
         }
         let start = Instant::now();
         let result = verify_signed_fixtures(&root);
-        fixtures_valid = result.is_ok();
+        let fixtures_valid = result.is_ok();
         let error = match result {
             Ok(validation) => {
                 fixture_validation = Some(validation);
@@ -1831,67 +2249,70 @@ fn run_inner(
             source,
         })?;
         println!("  fixtures: {message}");
-        step_results.push(StepResult {
-            outcome: None,
-            name: "fixtures".into(),
-            command: "xtask fixtures verify".into(),
-            exit_code: Some(if fixtures_valid { 0 } else { 1 }),
+        step_results.push(step_result(
+            "fixtures",
+            "xtask fixtures verify".into(),
+            Some(if fixtures_valid { 0 } else { 1 }),
             log_path,
-            duration_s: start.elapsed().as_secs_f64(),
-            passed: fixtures_valid,
+            start.elapsed().as_secs_f64(),
+            fixtures_valid,
             error,
-            failed_tests: Vec::new(),
-            not_run_tests: Vec::new(),
-            unitemized_failures: Vec::new(),
-            started_tests: Vec::new(),
-            finished_binaries: Vec::new(),
-            unfinished_binaries: Vec::new(),
-        });
-    }
+        ));
 
-    // 2. Signed Phase
-    if signed_requested && fixtures_valid {
-        println!("--- Signed phase starting (profile: {}) ---", args.profile);
-
-        // Signed Step 1: just build + artifact inspection
-        let mut initial_sha = String::new();
-        {
+        let state = state.as_deref().unwrap_or(Path::new("."));
+        let mut artifacts = Vec::new();
+        let mut fixture_artifacts = Vec::new();
+        let mut build_valid = false;
+        if fixtures_valid {
+            println!(
+                "--- Signed build phase starting (profile: {}) ---",
+                args.profile
+            );
+            // Signed Step 1: release build + artifact inspection
             let step_name = "build";
             let run_id = format!("accept-{timestamp}-{step_name}");
             let log_path = run_dir.join("signed-01-build.log");
-            let cmd_str = "just build";
+            let cmd_str = "just _build";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
-            let (exit_code, duration_s) = run_command_redirect(
-                &gate_lease,
-                "just",
-                &["build"],
-                &[("CARRICK_RUN_ID", &run_id)],
-                &root,
-                &log_path,
-            )
-            .map_err(|e| AcceptError::Io {
-                path: log_path.clone(),
-                source: e,
-            })?;
-
-            let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-
-            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
-            cleanup_counts.push(CleanupCount {
-                step: step_name.to_string(),
-                run_id: run_id.clone(),
-                remaining_count,
-            });
-
-            if remaining_count != 0 {
-                failures.push(format!(
-                    "step '{step_name}' leaked {remaining_count} processes under run_id '{run_id}'"
-                ));
-            }
+            // `just build` is disk admission (gate) then `_build` under
+            // carrick. The driver admitted disk before this shared phase and
+            // gate cannot nest under carrick, so run the build body directly.
+            let (exit_code, duration_s) = if let Some(error) = &platform_error {
+                fs::write(&log_path, error).map_err(|source| AcceptError::Io {
+                    path: log_path.clone(),
+                    source,
+                })?;
+                (None, 0.0)
+            } else {
+                let ran = run_command_logged(
+                    &lease,
+                    "just",
+                    &["_build"],
+                    &[("CARRICK_RUN_ID", &run_id)],
+                    &root,
+                    &log_path,
+                    false,
+                )
+                .map_err(|e| AcceptError::Io {
+                    path: log_path.clone(),
+                    source: e,
+                })?;
+                reap_step(
+                    &root,
+                    step_name,
+                    &run_id,
+                    &mut failures,
+                    &mut cleanup_counts,
+                );
+                ran
+            };
 
             let mut passed = exit_code == Some(0);
-            let mut error = if !passed {
+            let mut error = if let Some(error) = &platform_error {
+                // Already a failure of this run; the step names its cause.
+                Some(error.clone())
+            } else if !passed {
                 Some(format!(
                     "build step failed with exit code {}",
                     exit_code.unwrap_or(-1)
@@ -1903,7 +2324,6 @@ fn run_inner(
             if passed {
                 match inspect_artifact(&root) {
                     Ok(identity) => {
-                        initial_sha = identity.sha256.clone();
                         let artifact_txt_path = run_dir.join("artifact.txt");
                         let artifact_txt = format!(
                             "head {}\nsha256 {}\nCDHash={}\n    uuid {}\n{}\n{}",
@@ -1936,6 +2356,7 @@ fn run_inner(
                             failures.push(msg.clone());
                             error = Some(msg);
                         }
+                        artifacts.push(identity.path.clone());
                         artifact_identity = Some(identity);
                     }
                     Err(err) => {
@@ -1944,327 +2365,124 @@ fn run_inner(
                         error = Some(err);
                     }
                 }
-            } else if let Some(e) = &error {
+            } else if let Some(e) = error.as_ref().filter(|_| platform_error.is_none()) {
                 failures.push(e.clone());
             }
+            build_valid = passed;
 
-            step_results.push(StepResult {
-                outcome: None,
-                name: step_name.to_string(),
-                command: cmd_str.to_string(),
+            step_results.push(step_result(
+                step_name,
+                cmd_str.to_string(),
                 exit_code,
                 log_path,
                 duration_s,
                 passed,
                 error,
-                failed_tests: Vec::new(),
-                not_run_tests: Vec::new(),
-                unitemized_failures: Vec::new(),
-                started_tests: Vec::new(),
-                finished_binaries: Vec::new(),
-                unfinished_binaries: Vec::new(),
-            });
+            ));
+
+            // Everything the guests run that was built or installed before
+            // this lease is released: the signed release binary (when it
+            // built) and every installed fixture. test-signed builds its own
+            // test executables later, under gate, and needs no handoff.
+            match installed_artifact_paths(&root) {
+                Ok(paths) => fixture_artifacts = paths,
+                Err(error) => {
+                    let msg = format!("signed fixture artifacts: {error}");
+                    failures.push(msg);
+                }
+            }
         }
 
-        // Signed Step 3: el1-embed (carrick-embed el1_) vs allowlist
-        {
-            let step_name = "el1-embed";
-            let run_id = format!("accept-{timestamp}-el1");
-            let log_path = run_dir.join("el1-embed.log");
-            let cmd_str = "./scripts/test-signed.sh carrick-embed el1_ --nocapture";
-            println!("  running: {cmd_str} (run_id: {run_id})");
+        // Hand off to gate only with a release binary that built and passed
+        // inspection, and fixtures to run: guests execute both.
+        if build_valid && !fixture_artifacts.is_empty() {
+            crate::signed_phase::append_artifacts(state, ArtifactKind::Signed, &artifacts)
+                .and_then(|()| {
+                    crate::signed_phase::append_artifacts(
+                        state,
+                        ArtifactKind::Content,
+                        &fixture_artifacts,
+                    )
+                })
+                .map_err(|e| AcceptError::Failed(e.to_string()))?;
+            let carry = AcceptCarry {
+                timestamp,
+                failures,
+                steps: step_results,
+                skipped_steps,
+                artifact: artifact_identity,
+                fixture_validation,
+                el1: el1_summary,
+                probe_diffs,
+                cleanup_counts,
+            };
+            crate::atomic_file::write(&state.join(CARRY_FILE), &serde_json::to_vec(&carry)?)
+                .map_err(|source| AcceptError::Io {
+                    path: state.join(CARRY_FILE),
+                    source,
+                })?;
+            drop(lease);
+            println!("--- Signed build phase complete; guest execution waits for gate ---");
+            return Ok(());
+        }
+        // A failed or unverified release build, or no admitted fixtures:
+        // no guest may run, so publish this FAIL receipt now under
+        // `carrick` rather than wait for gate.
+    }
 
-            let (exit_code, duration_s) = run_command_redirect(
-                &gate_lease,
-                "./scripts/test-signed.sh",
-                &["carrick-embed", "el1_", "--nocapture"],
-                &[("CARRICK_RUN_ID", &run_id)],
+    // 3. Signed execution phase under gate, after the driver re-verified
+    //    every admitted artifact's identity: test-signed (which builds and
+    //    signs its own test executables here, under this gate), the full
+    //    profile's extras, scoped reaps and the receipt.
+    let mut signed_admission = None;
+    if stage == AcceptStage::Execute {
+        let state = state.as_deref().unwrap_or(Path::new("."));
+        let admission = crate::signed_phase::read_admission(state)
+            .map_err(|e| AcceptError::Failed(e.to_string()))?;
+        println!(
+            "--- Signed execution phase starting under {} (profile: {}) ---",
+            lease.mode(),
+            args.profile
+        );
+        // The driver compared every admitted identity after gate admission.
+        // Verify the fixture provenance once more under gate, so the bytes
+        // the guests run are the manifest's bytes as well as the build's.
+        if let Err(error) = verify_signed_fixtures(&root) {
+            return Err(AcceptError::Failed(format!(
+                "signed fixtures changed before guest execution; refusing to execute: {error}"
+            )));
+        }
+        for step in TEST_SIGNED_STEPS {
+            let run_id = format!("accept-{timestamp}-{}", step.run_id);
+            let log_path = run_dir.join(step.log_name);
+            println!("  running: {} (run_id: {run_id})", step.command());
+            let (exit_code, duration_s) = step.run(&lease, &run_id, &root, &log_path)?;
+            reap_step(
                 &root,
+                step.name,
+                &run_id,
+                &mut failures,
+                &mut cleanup_counts,
+            );
+            let (passed, error) = step.evaluate(
+                &root,
+                exit_code,
                 &log_path,
-            )
-            .map_err(|e| AcceptError::Io {
-                path: log_path.clone(),
-                source: e,
-            })?;
-
-            let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-
-            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
-            cleanup_counts.push(CleanupCount {
-                step: step_name.to_string(),
-                run_id: run_id.clone(),
-                remaining_count,
-            });
-
-            if remaining_count != 0 {
-                failures.push(format!(
-                    "step '{step_name}' leaked {remaining_count} processes under run_id '{run_id}'"
-                ));
-            }
-
-            let log_content = fs::read_to_string(&log_path).unwrap_or_default();
-            let allowlist_path = root.join("scripts/conformance/el1-known-red.txt");
-            let allowlist = load_allowlist(&allowlist_path).unwrap_or_default();
-
-            let (comparison, passed, error) =
-                evaluate_el1_step(exit_code, &log_content, &allowlist);
-
-            if !comparison.now_passing.is_empty() {
-                println!(
-                    "  [NOTICE] el1 tests now passing, remove from allowlist: {}",
-                    comparison.now_passing.join(", ")
-                );
-            }
-
+                &mut el1_summary,
+                &mut probe_diffs,
+            );
             if let Some(msg) = &error {
                 failures.push(msg.clone());
             }
-
-            el1_summary = Some(comparison);
-
-            step_results.push(StepResult {
-                outcome: None,
-                name: step_name.to_string(),
-                command: cmd_str.to_string(),
+            step_results.push(step_result(
+                step.name,
+                step.command(),
                 exit_code,
                 log_path,
                 duration_s,
                 passed,
                 error,
-                failed_tests: Vec::new(),
-                not_run_tests: Vec::new(),
-                unitemized_failures: Vec::new(),
-                started_tests: Vec::new(),
-                finished_binaries: Vec::new(),
-                unfinished_binaries: Vec::new(),
-            });
-        }
-
-        // Signed Step 4: a_fresh_executable_page (i-cache test)
-        {
-            let step_name = "fresh-executable-page";
-            let run_id = format!("accept-{timestamp}-icache");
-            let log_path = run_dir.join("fresh-executable-page.log");
-            let cmd_str =
-                "./scripts/test-signed.sh carrick-embed a_fresh_executable_page --nocapture";
-            println!("  running: {cmd_str} (run_id: {run_id})");
-
-            let (exit_code, duration_s) = run_command_redirect(
-                &gate_lease,
-                "./scripts/test-signed.sh",
-                &["carrick-embed", "a_fresh_executable_page", "--nocapture"],
-                &[("CARRICK_RUN_ID", &run_id)],
-                &root,
-                &log_path,
-            )
-            .map_err(|e| AcceptError::Io {
-                path: log_path.clone(),
-                source: e,
-            })?;
-
-            let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-
-            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
-            cleanup_counts.push(CleanupCount {
-                step: step_name.to_string(),
-                run_id: run_id.clone(),
-                remaining_count,
-            });
-
-            if remaining_count != 0 {
-                failures.push(format!(
-                    "step '{step_name}' leaked {remaining_count} processes under run_id '{run_id}'"
-                ));
-            }
-
-            let passed = exit_code == Some(0);
-            let error = if !passed {
-                let msg = format!(
-                    "fresh executable page step failed with exit code {}",
-                    exit_code.unwrap_or(-1)
-                );
-                failures.push(msg.clone());
-                Some(msg)
-            } else {
-                None
-            };
-
-            step_results.push(StepResult {
-                outcome: None,
-                name: step_name.to_string(),
-                command: cmd_str.to_string(),
-                exit_code,
-                log_path,
-                duration_s,
-                passed,
-                error,
-                failed_tests: Vec::new(),
-                not_run_tests: Vec::new(),
-                unitemized_failures: Vec::new(),
-                started_tests: Vec::new(),
-                finished_binaries: Vec::new(),
-                unfinished_binaries: Vec::new(),
-            });
-        }
-
-        // Signed Step 5: generic_probe_shard_
-        {
-            let step_name = "generic-probe-shards";
-            let run_id = format!("accept-{timestamp}-probe-shards");
-            let log_path = run_dir.join("generic-probe-shards.log");
-            let cmd_str = "./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture";
-            println!("  running: {cmd_str} (run_id: {run_id})");
-
-            let (exit_code, duration_s) = run_command_redirect(
-                &gate_lease,
-                "./scripts/test-signed.sh",
-                &[
-                    "carrick-conformance-next",
-                    "generic_probe_shard_",
-                    "--nocapture",
-                ],
-                &[("CARRICK_RUN_ID", &run_id)],
-                &root,
-                &log_path,
-            )
-            .map_err(|e| AcceptError::Io {
-                path: log_path.clone(),
-                source: e,
-            })?;
-
-            let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-
-            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
-            cleanup_counts.push(CleanupCount {
-                step: step_name.to_string(),
-                run_id: run_id.clone(),
-                remaining_count,
-            });
-
-            if remaining_count != 0 {
-                failures.push(format!(
-                    "step '{step_name}' leaked {remaining_count} processes under run_id '{run_id}'"
-                ));
-            }
-
-            let log_content = fs::read_to_string(&log_path).unwrap_or_default();
-            let diffs = extract_probe_diffs(step_name, &log_content);
-            let mut passed = exit_code == Some(0) && diffs.is_empty();
-            let mut error = None;
-
-            if !diffs.is_empty() {
-                passed = false;
-                let probe_names: Vec<_> = diffs.iter().map(|d| d.probe.as_str()).collect();
-                let msg = format!(
-                    "generic probe shards contained DIFF or panic: {}",
-                    probe_names.join(", ")
-                );
-                failures.push(msg.clone());
-                error = Some(msg);
-                probe_diffs.extend(diffs);
-            } else if exit_code != Some(0) {
-                let msg = format!(
-                    "generic probe shards failed with exit code {}",
-                    exit_code.unwrap_or(-1)
-                );
-                failures.push(msg.clone());
-                error = Some(msg);
-            }
-
-            step_results.push(StepResult {
-                outcome: None,
-                name: step_name.to_string(),
-                command: cmd_str.to_string(),
-                exit_code,
-                log_path,
-                duration_s,
-                passed,
-                error,
-                failed_tests: Vec::new(),
-                not_run_tests: Vec::new(),
-                unitemized_failures: Vec::new(),
-                started_tests: Vec::new(),
-                finished_binaries: Vec::new(),
-                unfinished_binaries: Vec::new(),
-            });
-        }
-
-        // Signed Step 6: case_
-        {
-            let step_name = "probe-cases";
-            let run_id = format!("accept-{timestamp}-probe-cases");
-            let log_path = run_dir.join("probe-cases.log");
-            let cmd_str = "./scripts/test-signed.sh carrick-conformance-next case_ --nocapture";
-            println!("  running: {cmd_str} (run_id: {run_id})");
-
-            let (exit_code, duration_s) = run_command_redirect(
-                &gate_lease,
-                "./scripts/test-signed.sh",
-                &["carrick-conformance-next", "case_", "--nocapture"],
-                &[("CARRICK_RUN_ID", &run_id)],
-                &root,
-                &log_path,
-            )
-            .map_err(|e| AcceptError::Io {
-                path: log_path.clone(),
-                source: e,
-            })?;
-
-            let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-
-            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
-            cleanup_counts.push(CleanupCount {
-                step: step_name.to_string(),
-                run_id: run_id.clone(),
-                remaining_count,
-            });
-
-            if remaining_count != 0 {
-                failures.push(format!(
-                    "step '{step_name}' leaked {remaining_count} processes under run_id '{run_id}'"
-                ));
-            }
-
-            let log_content = fs::read_to_string(&log_path).unwrap_or_default();
-            let diffs = extract_probe_diffs(step_name, &log_content);
-            let mut passed = exit_code == Some(0) && diffs.is_empty();
-            let mut error = None;
-
-            if !diffs.is_empty() {
-                passed = false;
-                let probe_names: Vec<_> = diffs.iter().map(|d| d.probe.as_str()).collect();
-                let msg = format!(
-                    "probe cases contained DIFF or panic: {}",
-                    probe_names.join(", ")
-                );
-                failures.push(msg.clone());
-                error = Some(msg);
-                probe_diffs.extend(diffs);
-            } else if exit_code != Some(0) {
-                let msg = format!(
-                    "probe cases failed with exit code {}",
-                    exit_code.unwrap_or(-1)
-                );
-                failures.push(msg.clone());
-                error = Some(msg);
-            }
-
-            step_results.push(StepResult {
-                outcome: None,
-                name: step_name.to_string(),
-                command: cmd_str.to_string(),
-                exit_code,
-                log_path,
-                duration_s,
-                passed,
-                error,
-                failed_tests: Vec::new(),
-                not_run_tests: Vec::new(),
-                unitemized_failures: Vec::new(),
-                started_tests: Vec::new(),
-                finished_binaries: Vec::new(),
-                unfinished_binaries: Vec::new(),
-            });
+            ));
         }
 
         // Full Profile Only: Retained probes, LTP subset, inotify09
@@ -2277,13 +2495,14 @@ fn run_inner(
                 let cmd_str = "just --no-deps conformance-probes";
                 println!("  running: {cmd_str} (run_id: {run_id})");
 
-                let (exit_code, duration_s) = run_command_redirect(
-                    &gate_lease,
+                let (exit_code, duration_s) = run_command_logged(
+                    &lease,
                     "just",
                     &["--no-deps", "conformance-probes"],
                     &[("CARRICK_RUN_ID", &run_id)],
                     &root,
                     &log_path,
+                    false,
                 )
                 .map_err(|e| AcceptError::Io {
                     path: log_path.clone(),
@@ -2291,7 +2510,6 @@ fn run_inner(
                 })?;
 
                 let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-
                 let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
                 cleanup_counts.push(CleanupCount {
                     step: step_name.to_string(),
@@ -2311,22 +2529,15 @@ fn run_inner(
                     None
                 };
 
-                step_results.push(StepResult {
-                    outcome: None,
-                    name: step_name.to_string(),
-                    command: cmd_str.to_string(),
+                step_results.push(step_result(
+                    step_name,
+                    cmd_str.to_string(),
                     exit_code,
                     log_path,
                     duration_s,
                     passed,
                     error,
-                    failed_tests: Vec::new(),
-                    not_run_tests: Vec::new(),
-                    unitemized_failures: Vec::new(),
-                    started_tests: Vec::new(),
-                    finished_binaries: Vec::new(),
-                    unfinished_binaries: Vec::new(),
-                });
+                ));
             }
 
             // Step 8: LTP file/inotify suite subset (may start Docker -> LOCK_EX)
@@ -2361,13 +2572,14 @@ fn run_inner(
                 );
                 println!("  running: {display_cmd} (run_id: {run_id})");
 
-                let (exit_code, duration_s) = run_command_redirect(
-                    &gate_lease,
+                let (exit_code, duration_s) = run_command_logged(
+                    &lease,
                     "cargo",
                     &cmd_args,
                     &[("CARRICK_RUN_ID", &run_id)],
                     &root,
                     &log_path,
+                    false,
                 )
                 .map_err(|e| AcceptError::Io {
                     path: log_path.clone(),
@@ -2375,7 +2587,6 @@ fn run_inner(
                 })?;
 
                 let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-
                 let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
                 cleanup_counts.push(CleanupCount {
                     step: step_name.to_string(),
@@ -2395,22 +2606,15 @@ fn run_inner(
                     None
                 };
 
-                step_results.push(StepResult {
-                    outcome: None,
-                    name: step_name.to_string(),
-                    command: display_cmd,
+                step_results.push(step_result(
+                    step_name,
+                    display_cmd,
                     exit_code,
                     log_path,
                     duration_s,
                     passed,
                     error,
-                    failed_tests: Vec::new(),
-                    not_run_tests: Vec::new(),
-                    unitemized_failures: Vec::new(),
-                    started_tests: Vec::new(),
-                    finished_binaries: Vec::new(),
-                    unfinished_binaries: Vec::new(),
-                });
+                ));
             }
 
             // Step 9: inotify09 screen with CARRICK_EL1=1 and =0
@@ -2426,8 +2630,8 @@ fn run_inner(
                 );
                 println!("  running: {cmd_str} (run_id: {run_id})");
 
-                let (exit_code, duration_s) = run_command_redirect(
-                    &gate_lease,
+                let (exit_code, duration_s) = run_command_logged(
+                    &lease,
                     &bin_str,
                     &[
                         "run",
@@ -2440,6 +2644,7 @@ fn run_inner(
                     &[("CARRICK_RUN_ID", &run_id), ("CARRICK_EL1", mode)],
                     &root,
                     &log_path,
+                    false,
                 )
                 .map_err(|e| AcceptError::Io {
                     path: log_path.clone(),
@@ -2447,7 +2652,6 @@ fn run_inner(
                 })?;
 
                 let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-
                 let remaining_count = cleanup_remaining(&reap, &step_name, &mut failures);
                 cleanup_counts.push(CleanupCount {
                     step: step_name.clone(),
@@ -2478,40 +2682,30 @@ fn run_inner(
                     let _ = writeln!(f, "inotify09 EL1={mode} wall {:.2}", duration_s);
                 }
 
-                step_results.push(StepResult {
-                    outcome: None,
-                    name: step_name,
-                    command: cmd_str,
-                    exit_code,
-                    log_path,
-                    duration_s,
-                    passed,
-                    error,
-                    failed_tests: Vec::new(),
-                    not_run_tests: Vec::new(),
-                    unitemized_failures: Vec::new(),
-                    started_tests: Vec::new(),
-                    finished_binaries: Vec::new(),
-                    unfinished_binaries: Vec::new(),
-                });
+                step_results.push(step_result(
+                    &step_name, cmd_str, exit_code, log_path, duration_s, passed, error,
+                ));
             }
         } else {
             skipped_steps.extend(NO_DOCKER_EXCLUSIONS.iter().map(|s| (*s).to_owned()));
         }
 
         // Final check: Binary unchanged
-        let bin_path = root.join("target/release/carrick");
-        if let Ok(bytes) = fs::read(&bin_path) {
+        if let Some(initial) = &artifact_identity
+            && let Ok(bytes) = fs::read(&initial.path)
+        {
             let now_sha = format!("{:x}", Sha256::digest(&bytes));
-            if !initial_sha.is_empty() && now_sha != initial_sha {
-                let msg = format!(
-                    "binary changed during the gate (initial: {initial_sha}, now: {now_sha})"
-                );
-                failures.push(msg);
+            if now_sha != initial.sha256 {
+                failures.push(format!(
+                    "binary changed during the gate (initial: {}, now: {now_sha})",
+                    initial.sha256
+                ));
             }
         }
+        signed_admission = Some(admission);
     }
 
+    let mut clean_tree = true;
     if let Err(error) = verify_clean_checkout(&root) {
         clean_tree = false;
         failures.push(error.to_string());
@@ -2550,6 +2744,7 @@ fn run_inner(
         host_identity: SignedHostIdentity::capture(),
         fixture_bundle: None,
         host_load,
+        signed_admission,
         failures: failures.clone(),
     };
 
@@ -2581,6 +2776,14 @@ fn run_inner(
     })?;
 
     *published = true;
+    if let Some(state) = &state {
+        // Tell the driver's caller this stage published, so a nonzero
+        // stage exit is never overwritten with a refusal receipt.
+        fs::write(state.join(PUBLISHED_MARKER), b"").map_err(|source| AcceptError::Io {
+            path: state.join(PUBLISHED_MARKER),
+            source,
+        })?;
+    }
 
     // Print summary
     println!("\n==================== ACCEPT GATE SUMMARY ====================");
@@ -2661,18 +2864,63 @@ mod tests {
         assert!(profile_phase(profile, AcceptPhase::Signed).is_err());
     }
 
+    /// #2013: host work and the signed build share `carrick`; only the
+    /// execution stage, which runs guests, holds `gate`.
+    #[test]
+    fn signed_accept_holds_gate_only_for_guest_execution() {
+        for profile in [
+            AcceptProfile::LinuxPortable,
+            AcceptProfile::NoDocker,
+            AcceptProfile::Full,
+        ] {
+            assert_eq!(
+                cli_lease(profile, AcceptPhase::Host),
+                Some(HostLeaseMode::Carrick)
+            );
+            assert_eq!(
+                AcceptStage::HostOnly.lease_mode(profile),
+                HostLeaseMode::Carrick
+            );
+        }
+        // These host phases boot guests (KVM, EL1-native): gate, as before.
+        for profile in [AcceptProfile::Kvm, AcceptProfile::El1Native] {
+            assert_eq!(
+                cli_lease(profile, AcceptPhase::Host),
+                Some(HostLeaseMode::Gate)
+            );
+            assert_eq!(
+                AcceptStage::HostOnly.lease_mode(profile),
+                HostLeaseMode::Gate
+            );
+        }
+        assert_eq!(
+            cli_lease(AcceptProfile::NoDocker, AcceptPhase::Signed),
+            None
+        );
+        assert_eq!(cli_lease(AcceptProfile::NoDocker, AcceptPhase::All), None);
+        assert_eq!(
+            AcceptStage::Build.lease_mode(AcceptProfile::NoDocker),
+            HostLeaseMode::Carrick
+        );
+        assert_eq!(
+            AcceptStage::Execute.lease_mode(AcceptProfile::NoDocker),
+            HostLeaseMode::Gate
+        );
+    }
+
     #[test]
     fn acceptance_child_cannot_inherit_a_target_override() {
         let dir = tempfile::tempdir().unwrap();
         let lease =
             HostLease::acquire_path(&dir.path().join("host.lock"), HostLeaseMode::Gate).unwrap();
-        let (status, _) = run_command_redirect(
+        let (status, _) = run_command_logged(
             &lease,
             "sh",
             &["-c", "test \"${CARRICK_TEST_TARGET+x}\" != x"],
             &[("CARRICK_TEST_TARGET", "one_target")],
             dir.path(),
             &dir.path().join("log"),
+            false,
         )
         .unwrap();
         assert_eq!(status, Some(0));
@@ -3148,6 +3396,7 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
             host_identity: SignedHostIdentity::capture(),
             fixture_bundle: None,
             host_load: crate::host_load::HostLoadReport::default(),
+            signed_admission: None,
             failures: vec![],
         };
 

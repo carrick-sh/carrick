@@ -818,6 +818,11 @@ impl HostLease {
         self.mode
     }
 
+    /// Whether an outer runner's lease is offered to this process.
+    pub fn inherited() -> bool {
+        std::env::var_os(INHERITED_SOCKET).is_some()
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
