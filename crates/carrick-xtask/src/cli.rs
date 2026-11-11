@@ -164,6 +164,12 @@ pub enum Commands {
     CommitTrailers(crate::commit_trailers::CommitTrailersArgs),
 
     #[command(
+        name = "trusted-steps",
+        about = "Refuse a trusted-ref workflow step that runs something the PR adds (#2092)"
+    )]
+    TrustedSteps(crate::trusted_steps::TrustedStepsArgs),
+
+    #[command(
         name = "guest-copy-debt",
         about = "Ratchet guest-copy error collapses and bool copy trait methods"
     )]
@@ -326,6 +332,8 @@ pub enum CliError {
     GuestImage(#[from] crate::guest_image::GuestImageError),
     #[error(transparent)]
     CommitTrailers(#[from] crate::commit_trailers::CommitTrailersError),
+    #[error(transparent)]
+    TrustedSteps(#[from] crate::trusted_steps::TrustedStepsError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -789,6 +797,11 @@ where
         Commands::CommitTrailers(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::commit_trailers::run(&root, args, writer)?;
+            Ok(())
+        }
+        Commands::TrustedSteps(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::trusted_steps::run(&root, &args, writer)?;
             Ok(())
         }
     }

@@ -50,6 +50,7 @@ pub mod test_isolated;
 pub mod test_lanes;
 pub mod test_shards;
 pub mod test_touched;
+pub mod trusted_steps;
 pub mod workorder;
 pub mod worktree_admission;
 pub mod worktree_gc;
