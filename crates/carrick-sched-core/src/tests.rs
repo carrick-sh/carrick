@@ -5033,15 +5033,24 @@ fn a_left_first_candidate_falls_back_to_a_driven_peer() {
         .last_slot
         .store(OTHER.plus_one(), Ordering::Relaxed);
     let held = zone.slot_lock(OTHER, &HostWait).unwrap();
-    let bucket = ZoneTables::bucket_of(MM, 0x4000);
+    let (attempted, probe) = std::sync::mpsc::sync_channel(1);
     let (woken, _) = std::thread::scope(|scope| {
-        let waker = scope.spawn(|| wake_effects(&zone, 0x4000, 1, SLOT));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while zone.lock(bucket, &BoundedSpin(0)).is_some() {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let waker = scope.spawn(|| {
+            SLOT_LOCK_OBSERVER.with_borrow_mut(|observer| {
+                *observer = Some(Box::new(move |slot| {
+                    if slot == OTHER {
+                        attempted.send(()).unwrap();
+                    }
+                }));
+            });
+            let result = wake_effects(&zone, 0x4000, 1, SLOT);
+            SLOT_LOCK_OBSERVER.with_borrow_mut(|observer| *observer = None);
+            result
+        });
+        probe
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // leave_slot's locked drive change, after choice and before admission.
         zone.slot(OTHER).drive.store(0, Ordering::Release);
         drop(held);
         waker.join().unwrap()
@@ -5055,10 +5064,16 @@ fn a_left_first_candidate_falls_back_to_a_driven_peer() {
 }
 
 std::thread_local! {
+    static SLOT_LOCK_OBSERVER: std::cell::RefCell<Option<Box<dyn Fn(SlotId)>>> = const { std::cell::RefCell::new(None) };
     static SLOT_LOCK_PROBES: std::cell::RefCell<Option<Vec<SlotId>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(super) fn observe_slot_lock(slot: SlotId) {
+    SLOT_LOCK_OBSERVER.with_borrow(|observer| {
+        if let Some(observer) = observer {
+            observer(slot);
+        }
+    });
     SLOT_LOCK_PROBES.with_borrow_mut(|probes| {
         if let Some(probes) = probes {
             probes.push(slot);
