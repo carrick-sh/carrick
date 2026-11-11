@@ -3214,8 +3214,7 @@ mod base_reuse_witnesses {
         let manifest_path = bundle_dir.join("manifest.json");
         std::fs::write(&manifest_path, &manifest_bytes).unwrap();
         let obj_path = bundle_dir.join("objects").join(&elf_sha);
-        std::fs::write(&obj_path, &elf).unwrap();
-        std::fs::set_permissions(&obj_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        carrick_test_support::executable::write_executable_mode(&obj_path, &elf, 0o755);
         let archive = archive::pack(&manifest_path, &work.join("packed")).unwrap();
         PackedBundle {
             archive,
