@@ -2,7 +2,7 @@
 
 use super::native_process_runtime::{
     NativeProcessEntry, NativeProcessError, NativeProcessService, PendingSignalDelivery,
-    SignalCopyDeferral, SignalDeferOutcome,
+    SignalCopyDeferral,
 };
 use carrick_el1_abi::{BlockedMask, CurrentTask};
 use carrick_guest_arch::{ProcessContext, UserVa};
@@ -211,7 +211,7 @@ where
         sp,
         interrupted_sp,
     };
-    loop {
+    {
         let info_bytes = info.as_ref().map(|i| {
             // SAFETY: a borrowed ABI record is contiguous for its own size.
             unsafe {
@@ -260,7 +260,6 @@ where
         match setup {
             Ok(SignalFrameSetup::Installed(published_sp)) => {
                 machine.published_stack(published_sp);
-                break;
             }
             Ok(SignalFrameSetup::NotYet(_)) => {
                 let Some(deferral) = deferred else {
@@ -275,10 +274,7 @@ where
                     thread_blocked,
                     deferral,
                 ) {
-                    Ok(SignalDeferOutcome::Suspended) => {
-                        return Some(CompletionRoute::Suspended);
-                    }
-                    Ok(SignalDeferOutcome::ReadyToRebuild) => continue,
+                    Ok(()) => return Some(CompletionRoute::Suspended),
                     Err(NativeProcessError::GroupExitCustody) => {
                         return Some(machine.group_exit_custody(task));
                     }
