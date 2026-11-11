@@ -1456,9 +1456,14 @@ fn production_initial_mm_admits_one_shared_reservation_root() {
     let mappings = carrier.initial_reservation_census().expect("fork census");
     assert_eq!(
         mappings.len(),
-        plan.regions.len() + 1,
-        "fork must inherit every ELF region and the stack"
+        plan.regions.len() + 2,
+        "fork must inherit every ELF region, the built stack top and the stack's growable rest"
     );
+    let stack_top = carrick_vmm_kvm::cpl0_boot::INITIAL_STACK_TOP;
+    assert!(mappings.iter().any(|mapping| {
+        mapping.range.start() == stack_top - carrick_vmm_kvm::cpl0_boot::INITIAL_STACK_RESERVATION
+            && mapping.range.end() == stack_top - carrick_vmm_kvm::cpl0_boot::INITIAL_STACK_SIZE
+    }));
     for region in &plan.regions {
         assert!(
             mappings
