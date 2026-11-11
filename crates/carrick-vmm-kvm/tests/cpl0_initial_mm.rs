@@ -246,6 +246,78 @@ fn serial_host_native_child_clock_nanosleep_clocks_and_flags_match_linux() {
     );
 }
 
+/// #1862 single lane: x86 MM custody retains no executable yet (#1903), so
+/// a production x86 fork child's `readlinkat(AT_FDCWD, "/proc/self/exe")`
+/// routes to the shared native file family and the CPL0 lane refuses it as
+/// a counted ENOSYS: never forwarded to the host, never answered with the
+/// host's path, and the output buffer untouched (fixture exit 218).
+#[test]
+fn serial_host_native_child_readlink_exe_is_a_counted_refusal() {
+    const TEST: &str = "serial_host_native_child_readlink_exe_is_a_counted_refusal";
+    const CHILD: &str = "CARRICK_READLINK_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "10"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                TEST,
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, TEST)
+            .output()
+            .expect("bounded native readlink witness");
+        // The child must have run exactly this witness, not filtered it out.
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    // Refusals count by native ordinal, forwards by canonical ordinal.
+    const READLINKAT_X86: usize = 267;
+    const READLINKAT: usize = 78;
+    let elf = native_exit_fixture("native_child_readlink_exe.S");
+    let outcome = run_pool_fixture(&elf, 128);
+    assert_eq!(
+        outcome.run.exit_code, 218,
+        "child readlink result (218 is ENOSYS, 92 a written buffer, 91 another answer): {:?}",
+        outcome.run
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        (
+            load(&counters.refused[READLINKAT_X86]),
+            load(&counters.refused_child[READLINKAT_X86]),
+        ),
+        (1, 1),
+        "the child's readlinkat refusal is counted once, as a descendant's"
+    );
+    assert_eq!(
+        load(&counters.served[READLINKAT]),
+        1,
+        "the shared routing hands readlinkat to the native file family once"
+    );
+    let unrecognized = load(&counters.refused[512]);
+    assert_eq!(unrecognized, 0, "readlinkat is a recognized x86 call");
+    assert_eq!(
+        load(&counters.forwarded[READLINKAT]),
+        0,
+        "readlinkat is never forwarded to the host"
+    );
+}
+
 fn native_child_sleep_witness(test: &str, flags: &[&str]) {
     native_child_sleep_witness_with_exit(test, "native_child_sleep.S", flags, 8);
 }
