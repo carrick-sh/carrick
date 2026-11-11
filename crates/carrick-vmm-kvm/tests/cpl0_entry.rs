@@ -24,7 +24,8 @@ use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
     restore_native_context,
 };
-use kvm_pool_fixture::{physical_inventory, run_instrumented_pool_fixture, run_pool_fixture};
+use kvm_pool_fixture::{physical_inventory, run_instrumented_pool_fixture, run_pool_fixture,
+    try_run_instrumented_pool_fixture};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
@@ -1299,6 +1300,60 @@ fn production_anonymous_metadata_required_provisions_without_park() {
         0
     );
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// A refused replay settlement after a committed mmap is an ownership failure
+/// no errno repairs: the guest must never see EFAULT; the run fails fatally.
+#[test]
+fn production_anonymous_failed_replay_settlement_is_fatal_not_efault() {
+    const INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe1d;
+
+    let mut code = Vec::new();
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE);
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x85]); // jnz unarmed
+    let unarmed = code.len();
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05]); // mmap
+    // Reaching here means the guest observed a return: exit with 14 for
+    // EFAULT, 7 for anything else. Neither is acceptable.
+    code.extend_from_slice(&[0x48, 0x83, 0xf8, 0xf2, 0x75]); // cmp rax,-14; jne
+    code.push(0x18);
+    append_mov(&mut code, &[0x48, 0xbf], 14);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let other = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let skip = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let delta = i32::try_from(skip - (unarmed + 4)).unwrap();
+    code[unarmed..unarmed + 4].copy_from_slice(&delta.to_le_bytes());
+    let _ = other;
+
+    match try_run_instrumented_pool_fixture(&production_probe_elf(&code), 32) {
+        Err(error) => assert!(
+            error.to_string().contains("CPL0 fatal exit"),
+            "settlement refusal must be a fatal invariant: {error}"
+        ),
+        Ok(outcome) => panic!(
+            "guest survived a failed settlement with exit {} (14 = EFAULT)",
+            outcome.run.exit_code
+        ),
+    }
 }
 
 #[test]
