@@ -312,16 +312,19 @@ passing this VM-free binding alone does not close the reported abort.
 
 ### Native scheduler placement contention (#1892)
 
-An address-only wake that cannot immediately place a native waiter completes
-through the scheduler's existing wake transfer and native handback custody.
-The all-or-nothing refusal changes no waiter; the transfer claims the original
-key, mask and count under the same bucket lock. After releasing the lock,
-native placement retains each completed wait until an eligible driver returns.
-No guest operand is read and no second futex wake is needed for that completion.
+An address-only wake that cannot immediately place a native waiter still
+finishes in the ring (#1941): `wake_placed` never refuses, so the native
+adapter makes one wake under the bucket lock with the original key, mask and
+count. A waiter whose allowed slots are all busy is queued on the least loaded
+one with a reschedule. A waiter no guest slot may run is queued on the waker,
+misplaced, and the waker owes the host a boundary; there the waker's executor
+relocates it and the host routes the native handback (`place_native_handback`),
+which retains the completed wait until an eligible driver returns. No guest
+operand is read and no second futex wake is needed for that completion.
 `native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody` drives
-the production adapter with one excluded-mask waiter and two matching waiters.
-It requires exactly one counted completion, retained scheduler custody while
-the driver is away, and one completion on the driver's return. A second wake
+the production adapter with one excluded-mask waiter and two matching waiters
+whose only allowed slot is busy. It requires exactly one counted completion,
+queued on that slot, and one completion when its driver runs it. A second wake
 completes the remaining matching waiter and a third returns zero.
 
 Mapping-key authentication preserves the portal's exact owner wait. The
