@@ -1575,12 +1575,16 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         assert!(!ptr.is_null());
         Box::from_raw(ptr)
     };
-    let zone = Arc::from(zone);
+    // The fixture leaks its long-lived state so the plain `call_x86` helper
+    // below can take a `Cpl0TestService<'static>` without macros.
+    let zone_owner: &'static Arc<ZoneTables<ParkedContextWords>> =
+        Box::leak(Box::new(Arc::from(zone)));
+    let zone: &'static ZoneTables<ParkedContextWords> = zone_owner;
     let dispatcher = SyscallDispatcher::new();
     let context = dispatcher.capture_one_task_context().unwrap();
     context
         .kernel()
-        .bind_initial_birth_source(Arc::new(OwnedBirthZone::new(Arc::clone(&zone))))
+        .bind_initial_birth_source(Arc::new(OwnedBirthZone::new(Arc::clone(zone_owner))))
         .unwrap();
     let owner: &'static _ = Box::leak(Box::new(context.kernel().ipc().unwrap()));
     let files = context.resources().files();
@@ -1607,13 +1611,14 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         AddressContext<RootGpa>,
         ParkedContextWords,
     >::new()));
-    let page = Box::new(ThreadLifecyclePage::new());
-    let control = Box::new(ThreadControlSlot::new());
-    let child_page = Box::new(ThreadLifecyclePage::new());
-    let child_controls: Box<[ThreadControlSlot; 9]> =
-        Box::new(core::array::from_fn(|_| ThreadControlSlot::new()));
-    let tasks = [CurrentTask::new(), CurrentTask::new()];
-    let [task, peer_task] = &tasks;
+    let page: &'static ThreadLifecyclePage = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
+    let child_page: &'static ThreadLifecyclePage = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let child_controls: &'static [ThreadControlSlot; 9] =
+        Box::leak(Box::new(core::array::from_fn(|_| ThreadControlSlot::new())));
+    let tasks: &'static [CurrentTask; 2] =
+        Box::leak(Box::new([CurrentTask::new(), CurrentTask::new()]));
+    let [task, peer_task] = tasks;
     task.set(
         El1TaskId::from_linux_tid(root_task.id.raw()),
         generation,
@@ -1624,7 +1629,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         .thread_generation
         .store(root_thread.serial.raw(), Ordering::Release);
     task.publish_visible_pid(root_task.id.raw() as u32);
-    task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+    task.publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
     control.publish_host_birth_identity(
         carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::EntryTaskKey::from_raw(root_task.id.raw() as u64),
@@ -1659,16 +1664,16 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             generation: generation.raw(),
             affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 3,
-            lifecycle_page: &*page as *const _ as u64,
-            control_slot: &*control as *const _ as u64,
+            lifecycle_page: page as *const _ as u64,
+            control_slot: control as *const _ as u64,
         },
     )
     .unwrap();
-    let source = BornInZoneSource { zone: &zone, slot };
+    let source = BornInZoneSource { zone, slot };
     let mut service = Box::new(Cpl0TestService {
-        zone: &zone,
-        child_page: &child_page,
-        child_controls: &child_controls,
+        zone,
+        child_page,
+        child_controls,
         task: peer_task,
         owner: Arc::clone(owner),
         map,
@@ -1751,63 +1756,128 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         }
     };
 
+    /// One task's position at the production x86 dispatch entry.
+    struct X86Caller<'c> {
+        slot: SlotId,
+        file_table: u64,
+        task: &'static CurrentTask,
+        source: BornInZoneSource<'static, ParkedContextWords>,
+        origin: ServiceOrigin,
+        /// `None` before native process registration (`process = None`).
+        registered: Option<X86Registration<'c>>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct X86Registration<'c> {
+        runtime: &'c NativeProcessRuntime<'static, AddressContext<RootGpa>, ParkedContextWords>,
+        registry: &'c NativeProcessRegistry<'static, AddressContext<RootGpa>, ParkedContextWords>,
+        address: AddressContext<RootGpa>,
+        words: &'c ParkedContextWords,
+    }
+
+    struct X86Env<'e> {
+        counters: &'e Counters,
+        tasks: &'e [CurrentTask],
+        names: &'e InotifyNameCache,
+        venue: &'e IpcVenue<'static>,
+        settle: &'e dyn Fn(Option<HostFileStage>, ServiceOrigin) -> i64,
+    }
+
+    fn call_x86(
+        env: &X86Env<'_>,
+        caller: &X86Caller<'_>,
+        service: &mut Cpl0TestService<'static>,
+        native_nr: u64,
+        args: [u64; 6],
+    ) -> (CompletionRoute, i64) {
+        let fd_map_ptr = &service.fd_map[..] as *const [FdMapSlot];
+        let opens_ptr = &service.opens[..] as *const [DelegatedOpenFile];
+        let mut entry = caller.registered.map(move |r| {
+            r.runtime
+                .enter_registered(
+                    r.registry,
+                    caller.source,
+                    caller.task,
+                    r.address,
+                    r.words,
+                    service,
+                )
+                .unwrap()
+        });
+        // SAFETY: fd_map and opens live inside the caller's heap-pinned
+        // `service`, which outlives this call and is not reallocated.
+        let (fd_map, opens) = unsafe { (&*fd_map_ptr, &*opens_ptr) };
+        let mut frame = Cpl0Frame {
+            call: decode_x86_64(native_nr, args, 0x7fff_0000),
+            rax: native_nr,
+            slot: caller.slot,
+            file_table: caller.file_table,
+            fd_map,
+            opens,
+            task: caller.task,
+            venue: env.venue,
+            origin: caller.origin,
+            staged: None,
+        };
+        let process: Option<
+            &mut dyn carrick_el1_linux::lifecycle::ProcessNative<'static, ParkedContextWords>,
+        > = match &mut entry {
+            Some(entry) => Some(&mut **entry),
+            None => None,
+        };
+        let route = dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            env.counters,
+            env.tasks,
+            fd_map,
+            &[],
+            opens,
+            &[],
+            env.names,
+            None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
+            Some(env.venue),
+            None,
+            process,
+            Some(caller.source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        let staged = frame.staged.take();
+        let rax = frame.rax as i64;
+        drop(entry);
+        if route == CompletionRoute::Forward && staged.is_some() {
+            (route, (env.settle)(staged, caller.origin))
+        } else {
+            (route, rax)
+        }
+    }
+
+    let env = X86Env {
+        counters: &counters,
+        tasks,
+        names: &names,
+        venue: &venue,
+        settle: &settle_staged,
+    };
+
     // Pre-clone root runs with a published host binding (`table_of(task)`) before
     // native process registration (`process = None`); its host-opened files
     // keep the host FileTable as their owner.
-    macro_rules! call_root_pre_clone {
-        ($native_nr:expr, $args:expr) => {{
-            let native_nr: u64 = $native_nr;
-            let args: [u64; 6] = $args;
-            let Cpl0TestService { fd_map, opens, .. } = &*service;
-            let call = decode_x86_64(native_nr, args, 0x7fff_0000);
-            let mut frame = Cpl0Frame {
-                call,
-                rax: native_nr,
-                slot,
-                file_table: root_table_key,
-                fd_map,
-                opens,
-                task,
-                venue: &venue,
-                origin: ServiceOrigin::Initial,
-                staged: None,
-            };
-            let route = dispatch::dispatch_syscall_with_native::<
-                _,
-                NoCpu,
-                sched::HardwareUserWord,
-                _,
-                ParkedContextWords,
-            >(
-                &mut frame,
-                &counters,
-                &tasks,
-                fd_map,
-                &[],
-                opens,
-                &[],
-                &names,
-                None,
-                Some(&venue),
-                None,
-                None,
-                Some(source),
-                None,
-                |_| core::ptr::null_mut(),
-            );
-            let staged = frame.staged.take();
-            let rax = frame.rax as i64;
-            if route == CompletionRoute::Forward && staged.is_some() {
-                (route, settle_staged(staged, ServiceOrigin::Initial))
-            } else {
-                (route, rax)
-            }
-        }};
-    }
+    let pre_clone_root = X86Caller {
+        slot,
+        file_table: root_table_key,
+        task,
+        source,
+        origin: ServiceOrigin::Initial,
+        registered: None,
+    };
 
     // 1. Root opens /dev/null through the host -> fd 3, projected into fd-core.
     let out_path = GuestUserBuffer::from_bytes(b"/dev/null\0");
-    let (open_route, opened_fd) = call_root_pre_clone!(
+    let (open_route, opened_fd) = call_x86(
+        &env,
+        &pre_clone_root,
+        &mut service,
         257,
         [
             LINUX_AT_FDCWD,
@@ -1816,7 +1886,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             0o600,
             0,
             0,
-        ]
+        ],
     );
     assert_eq!(open_route, CompletionRoute::Forward);
     assert_eq!(opened_fd, 3);
@@ -1832,8 +1902,8 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
             source,
             task,
-            &page,
-            &control,
+            page,
+            control,
             address,
             address,
             context_words(address),
@@ -1844,61 +1914,18 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         .register_root(runtime.clone(), source, task, address)
         .unwrap();
 
-    macro_rules! call_root {
-        ($native_nr:expr, $args:expr) => {{
-            let native_nr: u64 = $native_nr;
-            let args: [u64; 6] = $args;
-            let words = context_words(address);
-            let Cpl0TestService { fd_map, opens, .. } = &*service;
-            let fd_map_ptr = fd_map as *const [FdMapSlot];
-            let opens_ptr = opens as *const [DelegatedOpenFile];
-            let mut entry = runtime
-                .enter_registered(registry, source, task, address, &words, &mut *service)
-                .unwrap();
-            let call = decode_x86_64(native_nr, args, 0x7fff_0000);
-            // SAFETY: fd_map and opens live inside heap-pinned `service` and are not reallocated.
-            let (fd_map_slice, opens_slice) = unsafe { (&*fd_map_ptr, &*opens_ptr) };
-            let mut frame = Cpl0Frame {
-                call,
-                rax: native_nr,
-                slot,
-                file_table: root_table_key,
-                fd_map: fd_map_slice,
-                opens: opens_slice,
-                task,
-                venue: &venue,
-                origin: ServiceOrigin::Initial,
-                staged: None,
-            };
-            let route = dispatch::dispatch_syscall_with_native(
-                &mut frame,
-                &counters,
-                &tasks,
-                fd_map_slice,
-                &[],
-                opens_slice,
-                &[],
-                &names,
-                None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
-                Some(&venue),
-                None,
-                Some(&mut *entry),
-                Some(source),
-                None,
-                |_| core::ptr::null_mut(),
-            );
-            let staged = frame.staged.take();
-            let rax = frame.rax as i64;
-            drop(entry);
-            if route == CompletionRoute::Forward && staged.is_some() {
-                (route, settle_staged(staged, ServiceOrigin::Initial))
-            } else {
-                (route, rax)
-            }
-        }};
-    }
+    let root_words = context_words(address);
+    let root = X86Caller {
+        registered: Some(X86Registration {
+            runtime: &runtime,
+            registry,
+            address,
+            words: &root_words,
+        }),
+        ..pre_clone_root
+    };
 
-    let (clone_route, child_pid) = call_root!(56, [17, 0, 0, 0, 0, 0]);
+    let (clone_route, child_pid) = call_x86(&env, &root, &mut service, 56, [17, 0, 0, 0, 0, 0]);
     assert_eq!(clone_route, CompletionRoute::Served);
     assert!(child_pid > 0, "x86 clone failed with {child_pid}");
     if let Some(doorbell) = task.linux.take_host_work_doorbell() {
@@ -1945,72 +1972,30 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     );
 
     let peer_source = BornInZoneSource {
-        zone: &zone,
+        zone,
         slot: peer_slot,
     };
-    macro_rules! call_child {
-        ($native_nr:expr, $args:expr) => {{
-            let native_nr: u64 = $native_nr;
-            let args: [u64; 6] = $args;
-            let Cpl0TestService { fd_map, opens, .. } = &*service;
-            let fd_map_ptr = fd_map as *const [FdMapSlot];
-            let opens_ptr = opens as *const [DelegatedOpenFile];
-            let mut child_entry = runtime
-                .enter_registered(
-                    registry,
-                    peer_source,
-                    peer_task,
-                    state.address,
-                    &state.words,
-                    &mut *service,
-                )
-                .unwrap();
-            let call = decode_x86_64(native_nr, args, 0x7fff_0000);
-            let (fd_map_slice, opens_slice) = unsafe { (&*fd_map_ptr, &*opens_ptr) };
-            let mut frame = Cpl0Frame {
-                call,
-                rax: native_nr,
-                slot: peer_slot,
-                file_table: identity.file_table,
-                fd_map: fd_map_slice,
-                opens: opens_slice,
-                task: peer_task,
-                venue: &venue,
-                origin: ServiceOrigin::Descendant,
-                staged: None,
-            };
-            let route = dispatch::dispatch_syscall_with_native(
-                &mut frame,
-                &counters,
-                &tasks,
-                fd_map_slice,
-                &[],
-                opens_slice,
-                &[],
-                &names,
-                None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
-                Some(&venue),
-                None,
-                Some(&mut *child_entry),
-                Some(peer_source),
-                None,
-                |_| core::ptr::null_mut(),
-            );
-            let staged = frame.staged.take();
-            let rax = frame.rax as i64;
-            drop(child_entry);
-            if route == CompletionRoute::Forward && staged.is_some() {
-                (route, settle_staged(staged, ServiceOrigin::Descendant))
-            } else {
-                (route, rax)
-            }
-        }};
-    }
+    let child = X86Caller {
+        slot: peer_slot,
+        file_table: identity.file_table,
+        task: peer_task,
+        source: peer_source,
+        origin: ServiceOrigin::Descendant,
+        registered: Some(X86Registration {
+            runtime: &runtime,
+            registry,
+            address: state.address,
+            words: &state.words,
+        }),
+    };
 
     // Child stats fd 1 (statx AT_EMPTY_PATH) and writes fd 1.
     let empty = GuestUserBuffer::from_bytes(b"\0");
     let statx_buf = GuestUserBuffer::zeroed(LINUX_STATX_BYTES);
-    let (stat_route, stat_ret) = call_child!(
+    let (stat_route, stat_ret) = call_x86(
+        &env,
+        &child,
+        &mut service,
         332,
         [
             1,
@@ -2019,7 +2004,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             0x7ff,
             statx_buf.arg(),
             0,
-        ]
+        ],
     );
     assert_eq!(stat_route, CompletionRoute::Forward);
     assert_eq!(
@@ -2028,7 +2013,8 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     );
 
     let msg = GuestUserBuffer::from_bytes(b"child-ok\n");
-    let (write_route, write_ret) = call_child!(1, [1, msg.arg(), 9, 0, 0, 0]);
+    let (write_route, write_ret) =
+        call_x86(&env, &child, &mut service, 1, [1, msg.arg(), 9, 0, 0, 0]);
     assert_eq!(write_route, CompletionRoute::Forward);
     assert_eq!(
         write_ret, 9,
@@ -2039,13 +2025,20 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     // Child redirects its own fd 1 to fd 3 (ring-opened NativeOpenFile with no
     // fd_map entry) and writes: stage_native_host_file must run ahead of
     // preflight_host_crossing so fd 1 is not rejected with -EBADF.
-    let (child_dup3_route, child_dup3_ret) = call_child!(292, [3, 1, 0, 0, 0, 0]);
+    let (child_dup3_route, child_dup3_ret) =
+        call_x86(&env, &child, &mut service, 292, [3, 1, 0, 0, 0, 0]);
     assert_eq!(
         (child_dup3_route, child_dup3_ret),
         (CompletionRoute::Served, 1)
     );
     let file_msg = GuestUserBuffer::from_bytes(b"redir-ok\n");
-    let (file_write_route, file_write_ret) = call_child!(1, [1, file_msg.arg(), 9, 0, 0, 0]);
+    let (file_write_route, file_write_ret) = call_x86(
+        &env,
+        &child,
+        &mut service,
+        1,
+        [1, file_msg.arg(), 9, 0, 0, 0],
+    );
     assert_eq!(
         (file_write_route, file_write_ret),
         (CompletionRoute::Forward, 9),
@@ -2054,21 +2047,21 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
 
     // Two-live-process table isolation on x86 CPL0 while both root and child remain live:
     // Child closes fd 3; root's fd 3 stays open and root can dup(3) -> 4.
-    let (_, child_close_3) = call_child!(3, [3, 0, 0, 0, 0, 0]);
+    let (_, child_close_3) = call_x86(&env, &child, &mut service, 3, [3, 0, 0, 0, 0, 0]);
     assert_eq!(child_close_3, 0);
-    let (_, child_dup_closed) = call_child!(32, [3, 0, 0, 0, 0, 0]);
+    let (_, child_dup_closed) = call_x86(&env, &child, &mut service, 32, [3, 0, 0, 0, 0, 0]);
     assert_eq!(child_dup_closed, -9, "child closed fd 3 must return -EBADF");
-    let (_, root_dup_3) = call_root!(32, [3, 0, 0, 0, 0, 0]);
+    let (_, root_dup_3) = call_x86(&env, &root, &mut service, 32, [3, 0, 0, 0, 0, 0]);
     assert_eq!(
         root_dup_3, 4,
         "child close(3) must not close live root's fd 3"
     );
     // Root closes fd 1; child's redirected fd 1 stays open and dup(1) -> 3 in child.
-    let (_, root_close_1) = call_root!(3, [1, 0, 0, 0, 0, 0]);
+    let (_, root_close_1) = call_x86(&env, &root, &mut service, 3, [1, 0, 0, 0, 0, 0]);
     assert_eq!(root_close_1, 0);
-    let (_, root_dup_closed_1) = call_root!(32, [1, 0, 0, 0, 0, 0]);
+    let (_, root_dup_closed_1) = call_x86(&env, &root, &mut service, 32, [1, 0, 0, 0, 0, 0]);
     assert_eq!(root_dup_closed_1, -9);
-    let (_, child_dup_1) = call_child!(32, [1, 0, 0, 0, 0, 0]);
+    let (_, child_dup_1) = call_x86(&env, &child, &mut service, 32, [1, 0, 0, 0, 0, 0]);
     assert_eq!(
         child_dup_1, 3,
         "root close(1) must not close live child's fd 1"
