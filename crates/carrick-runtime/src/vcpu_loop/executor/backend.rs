@@ -2388,12 +2388,26 @@ pub(crate) fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) -> Res
 /// The calling executor stops driving any slot: it parks with no guest CPU,
 /// or its loop ends. Whatever waits on its slot goes elsewhere.
 pub(crate) fn leave_driven_zone_slot() {
+    leave_driven_zone_slot_after(None);
+}
+
+/// [`leave_driven_zone_slot`] for an executor whose loop ended with
+/// `failure`. A refused leave then names that failure: the slot an executor
+/// dies on is usually unsettled because of the very exit that killed it, and
+/// a fatal naming only the slot hid the cause (#2039).
+pub(crate) fn leave_driven_zone_slot_after(failure: Option<&str>) {
     if let Some((slot, driver)) = DRIVEN_ZONE_SLOT.with(std::cell::Cell::get) {
         match carrick_kernel::el1_zone::leave_slot(slot, driver, None) {
             Ok(()) => DRIVEN_ZONE_SLOT.with(|cell| cell.set(None)),
-            Err(refused) => fail_zone_slot(format_args!(
-                "EL1 zone driver {driver} tried to park off-guest: {refused}"
-            )),
+            Err(refused) => match failure {
+                None => fail_zone_slot(format_args!(
+                    "EL1 zone driver {driver} tried to park off-guest: {refused}"
+                )),
+                Some(failure) => fail_zone_slot(format_args!(
+                    "EL1 zone driver {driver} tried to park off-guest: {refused}; \
+                     its executor stopped on: {failure}"
+                )),
+            },
         }
     }
 }
