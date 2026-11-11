@@ -1143,15 +1143,10 @@ impl<'a> MemView<'a> {
             table.retire_overlapping(self.mm_authority().mm_id.raw(), segment.start, len as u64);
         }
         // Retirement marks the range unmapped; the node and its permission
-        // remain, and the owner publishes leaves on the next touch.
-        let prot_none = segment.prot.is_empty();
-        memory.set_mapping_protection_and_sharing(
-            segment.start,
-            len,
-            prot_none,
-            !prot_none && !segment.prot.contains(LinuxProtFlags::WRITE),
-            carrick_guest_mem::MappingSharing::Private,
-        );
+        // remain, and the owner publishes leaves on the next touch. The root
+        // decides these pages, so the host keeps no fact for them and arms
+        // no new-mapping publication: nothing is published here.
+        memory.release_root_facts(segment.start, len);
         self.mark_range_nonresident(segment.start, len as u64);
         Ok(true)
     }
