@@ -2122,8 +2122,6 @@ pub struct SlotDrain {
 enum OwnerCustody {
     /// Its home slot, while an executor drives it.
     Home,
-    /// A live slot that may run it ([`ZoneSlot::is_live`]).
-    Live,
     /// A slot an executor drives, live or away on the host, on a CPU its
     /// affinity allows.
     Driven,
@@ -2139,7 +2137,6 @@ impl OwnerCustody {
         let s = zone.slot(slot);
         match self {
             Self::Home => s.driver().is_some(),
-            Self::Live => s.is_live() && zone.accepts_running(slot, rec),
             Self::Driven => s.driver().is_some() && rec.allows_cpu(s.cpu.load(Ordering::Relaxed)),
         }
     }
@@ -3496,63 +3493,36 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
-    /// The slots other than `waker` that may own `rec` when the waker may
-    /// not run it and no slot in the guest took it, in order, each with the
-    /// custody it needs (lock-free hints; [`OwnerCustody::admits`] decides
-    /// under the slot's lock): its home; else the slot it last ran on, if
-    /// live and able to run it; else the shortest live run queue that may
-    /// run it; else the slot it last ran on, else the shortest run queue of
-    /// any slot an executor drives, if its affinity allows that slot's CPU,
-    /// live or away (the custody [`Self::place_native_handback`] gives a
-    /// native handback, #1892/#1902). A live slot's driver comes back to it
-    /// at every exit, and an away one at [`Self::step_back`], so a thread
-    /// queued there runs once that slot is in the guest again
-    /// ([`Self::reschedule_owed`]). A slot nobody drives (`drive == 0`, left
-    /// by [`Self::leave_slot`]) is never an owner: no driver comes back to
-    /// it. No candidate: the waker hands the thread to the host.
-    fn owner_candidates(
-        &self,
-        rec: &ZoneRecord<C>,
+    /// Stable, distinct owner hints: home only for a homed record; otherwise
+    /// last slot followed by slot-id order. Admission is checked under each
+    /// slot lock, so losing the first driver does not hide an eligible peer.
+    fn owner_candidates<'a>(
+        &'a self,
+        rec: &'a ZoneRecord<C>,
         waker: SlotId,
-    ) -> [Option<(SlotId, OwnerCustody)>; 4] {
-        if let Some(home) = rec.home() {
-            return [
-                (home != waker).then_some((home, OwnerCustody::Home)),
-                None,
-                None,
-                None,
-            ];
-        }
-        let last = rec.last_slot().filter(|slot| *slot != waker);
-        [
-            last.filter(|slot| OwnerCustody::Live.holds(self, *slot, rec))
-                .map(|slot| (slot, OwnerCustody::Live)),
-            self.least_loaded_except(rec, false, Some(waker))
-                .map(|slot| (slot, OwnerCustody::Live)),
-            last.filter(|slot| OwnerCustody::Driven.holds(self, *slot, rec))
-                .map(|slot| (slot, OwnerCustody::Driven)),
-            self.least_loaded_driven_except(rec, waker)
-                .map(|slot| (slot, OwnerCustody::Driven)),
-        ]
-    }
-
-    /// The slot other than `except` with the shortest run queue that an
-    /// executor drives, live or away, on a CPU `rec`'s affinity allows.
-    fn least_loaded_driven_except(&self, rec: &ZoneRecord<C>, except: SlotId) -> Option<SlotId> {
-        let mut best: Option<(SlotId, u32)> = None;
-        for index in 0..ZONE_SLOTS {
-            let Some(slot) = SlotId::from_index(index) else {
-                continue;
-            };
-            if slot == except || !OwnerCustody::Driven.holds(self, slot, rec) {
-                continue;
-            }
-            let len = self.slot(slot).len.load(Ordering::Relaxed);
-            if best.is_none_or(|(_, shortest)| len < shortest) {
-                best = Some((slot, len));
-            }
-        }
-        best.map(|(slot, _)| slot)
+    ) -> impl Iterator<Item = (SlotId, OwnerCustody)> + 'a {
+        let home = rec.home();
+        let preferred = home.or(rec.last_slot()).filter(|slot| *slot != waker);
+        preferred
+            .into_iter()
+            .chain(
+                (0..ZONE_SLOTS)
+                    .filter_map(SlotId::from_index)
+                    .filter(move |slot| {
+                        home.is_none() && *slot != waker && Some(*slot) != preferred
+                    }),
+            )
+            .map(move |slot| {
+                (
+                    slot,
+                    if home.is_some() {
+                        OwnerCustody::Home
+                    } else {
+                        OwnerCustody::Driven
+                    },
+                )
+            })
+            .filter(move |(slot, custody)| custody.holds(self, *slot, rec))
     }
 
     /// Whether `slot` may run `rec` at EL0 by the address space installed on
@@ -3658,8 +3628,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 unlink();
             }
         };
-        if let Some(target) = self.placement(record, waker)
-            && target != waker
+        let target = self
+            .placement(record, waker)
+            .filter(|target| *target != waker);
+        if let Some(target) = target
             && let Some(slot_guard) = self.slot_lock(
                 target,
                 &BoundedSpin(if nonblocking { 0 } else { EL1_SLOT_LOCK_SPINS }),
@@ -3714,12 +3686,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             // a bound, the order `wake_host` uses: no slot-lock holder takes
             // a bucket lock.
             let from = Claim::Parked { seq };
-            let candidates = self.owner_candidates(rec, waker);
-            for (position, candidate) in candidates.iter().enumerate() {
-                let Some((owner, custody)) = *candidate else {
-                    continue;
-                };
-                if candidates[..position].contains(candidate) {
+            for (owner, custody) in self.owner_candidates(rec, waker) {
+                if Some(owner) == target {
                     continue;
                 }
                 let admits = || custody.holds(self, owner, rec);
