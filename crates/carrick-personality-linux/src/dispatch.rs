@@ -1174,14 +1174,14 @@ fn finish<'a, C: EntryContext + 'a>(
                     | FamilyCompletion::Handback
             ))
     {
-        if !pending.preflight_host_crossing(ordinal) {
-            return CompletionRoute::Served;
-        }
         // Only an unserved, effect-free decline is staged: Handback retains
         // its operation and AccountedForward has already run its family.
         if result == FamilyCompletion::Forward && pending.stage_native_host_file() {
             pending.record_forwarded(ordinal);
             return CompletionRoute::Forward;
+        }
+        if !pending.preflight_host_crossing(ordinal) {
+            return CompletionRoute::Served;
         }
         let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
         let crossing_set = pending.crossing_set();

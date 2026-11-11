@@ -1231,3 +1231,859 @@ fn x86_child_exec_is_staged_then_counted_enosys() {
         assert_eq!(counters.refused[native as usize].load(Ordering::Relaxed), 0);
     }
 }
+
+#[test]
+fn x86_root_shell_redirect_then_clone_serves_child_stdout_stat_and_write() {
+    use carrick_abi::{
+        LINUX_AT_EMPTY_PATH, LINUX_AT_FDCWD, LINUX_F_DUPFD, LINUX_O_CREAT, LINUX_O_TRUNC,
+        LINUX_O_WRONLY,
+    };
+    use carrick_core_abi::service::ServiceOrigin;
+    use carrick_el1_abi::{
+        BornInZoneSource, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, ThreadControlSlot,
+        ThreadIdentity, ThreadLifecyclePage, fd_map_lookup,
+    };
+    use carrick_el1_linux::file_table::admit_stdio;
+    use carrick_el1_linux::ipc::{IpcVenue, MapTables};
+    use carrick_el1_linux::native_process_runtime::{
+        NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
+        NativeProcessRuntime, NativeProcessService,
+    };
+    use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+    use carrick_hal::birth_serial::test_support::OwnedBirthZone;
+    use carrick_kernel::dispatch::SyscallDispatcher;
+    use carrick_kernel::el1_ipc::HostIpc;
+    use carrick_mmu_core::x86::owner_mmu::X86Mmu;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+    use carrick_personality_linux::native_host_file::{
+        DescriptionAccess, HostFileCall, HostFileStage, LINUX_STATX_BYTES, NativeDescriptor,
+        NativeNamespace,
+    };
+    use carrick_sched_core::{ParkedContextWords, WakeEffects, X86_XSAVE_BYTES, ZoneTables};
+    use carrick_test_support::{GuestUserBuffer, TestEl1Region};
+    use core::num::NonZeroU64;
+    use std::sync::Arc;
+
+    struct Cpl0TestService<'a> {
+        zone: &'a ZoneTables<ParkedContextWords>,
+        child_page: &'a ThreadLifecyclePage,
+        child_controls: &'a [ThreadControlSlot; 9],
+        task: &'a CurrentTask,
+        owner: Arc<HostIpc>,
+        map: &'a carrick_el1_abi::ipc_tables::IpcTableMap,
+        fd_map: [FdMapSlot; FD_MAP_CAPACITY],
+        opens: [DelegatedOpenFile; 16],
+        next_root_page: u64,
+    }
+
+    fn context_words(address: AddressContext<RootGpa>) -> ParkedContextWords {
+        ParkedContextWords::from_parts([0; 20], address, 0, 0, [0; X86_XSAVE_BYTES])
+    }
+
+    impl<'a> NativeProcessService<'a, ParkedContextWords> for Cpl0TestService<'a> {
+        type Mm = AddressContext<RootGpa>;
+        type PreparedMm = AddressContext<RootGpa>;
+        type Born = AddressContext<RootGpa>;
+
+        fn service_mm_handle(
+            &self,
+            mm: &Self::Mm,
+        ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+            self.zone
+                .spaces
+                .find(mm.mm.raw().get())
+                .ok_or(NativeProcessError::Stale)?;
+            Ok(unsafe {
+                carrick_core_abi::El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
+                        .ok_or(NativeProcessError::Stale)?,
+                    NonZeroU64::MIN,
+                )
+            })
+        }
+
+        fn prepare_mm(
+            &mut self,
+            parent: &Self::Mm,
+            _: &ParkedContextWords,
+            child: MmGeneration,
+        ) -> Result<Self::PreparedMm, NativeProcessError> {
+            assert_ne!(child, parent.mm);
+            let gpa = self.next_root_page;
+            self.next_root_page += 0x1000;
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(gpa)).unwrap(),
+                mm: child,
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            self.zone
+                .spaces
+                .publish_closed(child.raw().get(), address.root.address().raw(), 0)
+                .ok_or(NativeProcessError::Exhausted)?;
+            Ok(address)
+        }
+
+        fn prepared_mm(&self, p: &Self::PreparedMm) -> Self::Mm {
+            *p
+        }
+
+        fn prepared_context(&self, p: &Self::PreparedMm) -> AddressContext<RootGpa> {
+            *p
+        }
+
+        fn child_lifecycle(&self, _: &Self::PreparedMm) -> NativeLifecycleResources<'a> {
+            NativeLifecycleResources {
+                page: self.child_page,
+                controls: self.child_controls,
+            }
+        }
+
+        fn commit_mm(
+            &mut self,
+            p: Self::PreparedMm,
+        ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
+            Ok(p)
+        }
+
+        fn abort_mm(
+            &mut self,
+            _: Self::PreparedMm,
+        ) -> Result<(), (NativeProcessError, Self::PreparedMm)> {
+            Ok(())
+        }
+
+        fn settle_mm(&mut self, b: Self::Born) -> Result<(), (NativeProcessError, Self::Born)> {
+            self.zone
+                .spaces
+                .open(self.zone.spaces.find(b.mm.raw().get()).unwrap());
+            Ok(())
+        }
+
+        fn copy_status(
+            &mut self,
+            _: &Self::Mm,
+            _: UserVa,
+            _: LinuxWaitStatus,
+        ) -> Result<(), NativeProcessError> {
+            Ok(())
+        }
+
+        fn quarantine_prepared(&mut self, _: Self::PreparedMm) {
+            panic!("unexpected quarantine");
+        }
+
+        fn quarantine_fork(
+            &mut self,
+            _: NativeForkPreparation<'a, Self::Mm, Self::PreparedMm, ParkedContextWords>,
+        ) {
+            panic!("unexpected fork quarantine");
+        }
+
+        fn quarantine_born(&mut self, _: Self::Born) {
+            panic!("unexpected quarantine");
+        }
+
+        fn retire_mm(&mut self, _: Self::Mm) {}
+        fn wake_effects(&mut self, _: WakeEffects) {}
+        fn request_ingress_producer_boundary(&mut self) {}
+
+        fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
+            issued
+        }
+
+        fn fork_fd_table(
+            &mut self,
+            parent_table: u64,
+            child_table: u64,
+        ) -> Result<(), NativeProcessError> {
+            carrick_el1_linux::file_table::fork_native_namespace(
+                &self.fd_map,
+                &self.opens,
+                Some((self.owner.region(), self.map)),
+                parent_table,
+                child_table,
+            )
+        }
+
+        fn retire_fd_table(&mut self, table: u64) {
+            carrick_el1_linux::file_table::retire_native_namespace(
+                &self.fd_map,
+                &self.opens,
+                Some((self.owner.region(), self.map)),
+                table,
+                self.task,
+            )
+            .unwrap();
+        }
+    }
+
+    struct Cpl0Frame<'a> {
+        call: carrick_personality_linux::entry::CanonicalCall,
+        rax: u64,
+        slot: SlotId,
+        file_table: u64,
+        fd_map: &'a [FdMapSlot],
+        opens: &'a [DelegatedOpenFile],
+        task: &'a CurrentTask,
+        venue: &'a IpcVenue<'a>,
+        origin: ServiceOrigin,
+        staged: Option<HostFileStage>,
+    }
+
+    impl SyscallFrame for Cpl0Frame<'_> {
+        fn canonical_ordinal(&self) -> CanonicalNr {
+            self.call.canonical
+        }
+        fn argument(&self, index: usize) -> Option<u64> {
+            self.call.args.get(index).copied()
+        }
+        fn result(&self) -> NativeReturnWord {
+            NativeReturnWord(self.rax)
+        }
+        fn set_result(&mut self, result: NativeReturnWord) {
+            self.rax = result.0;
+        }
+        fn slot(&self) -> Option<SlotId> {
+            Some(self.slot)
+        }
+        fn user_sp(&self) -> Option<UserVa> {
+            Some(self.call.stack)
+        }
+    }
+
+    impl dispatch::GuestDispatchFrame for Cpl0Frame<'_> {
+        fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+            self.call.native
+        }
+        fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+            carrick_personality_linux::crossing::HostCrossingSet::X86
+        }
+        fn settles_owed_work_at_continuation_boundary(&self) -> bool {
+            true
+        }
+        fn may_serve_descriptor(&self) -> bool {
+            [
+                carrick_personality_linux::crossing::nr::CLOSE,
+                carrick_personality_linux::crossing::nr::DUP,
+                carrick_personality_linux::crossing::nr::DUP3,
+            ]
+            .contains(&CanonicalNr(self.call.canonical.raw()))
+                || self.call.canonical.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
+        }
+        fn preflight_host_crossing(&mut self, ordinal: u64) -> bool {
+            let read = ordinal == carrick_personality_linux::crossing::nr::READ.raw();
+            let stdio_call = read
+                || [
+                    carrick_personality_linux::crossing::nr::WRITE,
+                    carrick_personality_linux::crossing::nr::LSEEK,
+                    carrick_personality_linux::crossing::nr::PREAD64,
+                    carrick_personality_linux::crossing::nr::PWRITE64,
+                ]
+                .iter()
+                .any(|nr| nr.raw() == ordinal);
+            let guest_fd = self.call.args[0] as i32;
+            if !stdio_call || !(0..=2).contains(&guest_fd) {
+                return true;
+            }
+            let binding = fd_map_lookup(self.fd_map, self.file_table, guest_fd)
+                .and_then(|(handle, _)| handle.checked_sub(1))
+                .and_then(|index| self.opens.get(index as usize))
+                .and_then(DelegatedOpenFile::host_object);
+            if binding.is_none()
+                || (read && binding.is_some_and(|b| b.stdio_fd() != Some(guest_fd)))
+            {
+                self.rax = carrick_syscall_abi::LINUX_EBADF.guest_retval() as u64;
+                return false;
+            }
+            true
+        }
+        fn stage_native_host_file(&mut self) -> bool {
+            let Some(decoded) =
+                HostFileCall::decode(CanonicalNr::new(self.call.canonical.raw()), &self.call.args)
+            else {
+                return false;
+            };
+            let admitted = if decoded.uses_child_mutation_venue()
+                || matches!(
+                    decoded,
+                    HostFileCall::Write { .. } | HostFileCall::Writev { .. }
+                ) {
+                self.origin != ServiceOrigin::Initial
+            } else {
+                matches!(
+                    decoded,
+                    HostFileCall::Openat { .. }
+                        | HostFileCall::Faccessat { .. }
+                        | HostFileCall::Statx { .. }
+                )
+            };
+            if !admitted {
+                return false;
+            }
+            let Some(table) = carrick_el1_linux::ipc::native_table(self.venue, self.task) else {
+                return false;
+            };
+            let venue = self.venue;
+            let mut resolve = |fd| carrick_el1_linux::ipc::native_descriptor(venue, table, fd);
+            let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
+            self.staged = Some(
+                dispatch::stage_native_host_file(
+                    decoded,
+                    self.task,
+                    &carrick_el1_linux::file::HardwareValidator,
+                    &mut NativeNamespace {
+                        table,
+                        resolve: &mut resolve,
+                        releases: &mut releases,
+                    },
+                )
+                .unwrap_or(HostFileStage::InRing),
+            );
+            true
+        }
+        fn release_host_object(
+            &mut self,
+            _binding: carrick_el1_abi::HostObjectBinding,
+            _handle: u32,
+            _incarnation: u64,
+        ) -> bool {
+            true
+        }
+        fn operation_resume_pc(
+            &self,
+        ) -> Option<carrick_el1::substrate::sched::object_wait::OperationResumePc> {
+            carrick_el1::substrate::sched::object_wait::OperationResumePc::from_raw(0x4000)
+        }
+        fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
+            None
+        }
+        fn arm_frame_ref(&self) -> Option<&TrapFrame> {
+            None
+        }
+        fn arm_scheduler(&self) -> bool {
+            false
+        }
+        fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+            None
+        }
+    }
+
+    let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+    let zone = unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+        assert!(!ptr.is_null());
+        Box::from_raw(ptr)
+    };
+    let zone = Arc::from(zone);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    context
+        .kernel()
+        .bind_initial_birth_source(Arc::new(OwnedBirthZone::new(Arc::clone(&zone))))
+        .unwrap();
+    let owner: &'static _ = Box::leak(Box::new(context.kernel().ipc().unwrap()));
+    let files = context.resources().files();
+    let root_table_key = files.id().raw();
+
+    let region: &'static _ = Box::leak(Box::new(TestEl1Region::zeroed()));
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    files.publish_ipc(Arc::clone(owner), map).unwrap();
+    let tables: &'static _ = Box::leak(Box::new(MapTables(map)));
+    let venue = IpcVenue {
+        region: owner.region(),
+        tables,
+    };
+
+    let root_task = context.task().key();
+    let root_thread = context.thread().key();
+    let generation = carrick_el1_abi::SnapshotGeneration::INITIAL;
+    let registry = Box::leak(Box::new(NativeProcessRegistry::<
+        AddressContext<RootGpa>,
+        ParkedContextWords,
+    >::new()));
+    let page = Box::new(ThreadLifecyclePage::new());
+    let control = Box::new(ThreadControlSlot::new());
+    let child_page = Box::new(ThreadLifecyclePage::new());
+    let child_controls: Box<[ThreadControlSlot; 9]> =
+        Box::new(core::array::from_fn(|_| ThreadControlSlot::new()));
+    let tasks = [CurrentTask::new(), CurrentTask::new()];
+    let [task, peer_task] = &tasks;
+    task.set(
+        El1TaskId::from_linux_tid(root_task.id.raw()),
+        generation,
+        root_table_key,
+    );
+    task.mm.key.store(1, Ordering::Release);
+    task.mm
+        .thread_generation
+        .store(root_thread.serial.raw(), Ordering::Release);
+    task.publish_visible_pid(root_task.id.raw() as u32);
+    task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(root_task.id.raw() as u64),
+            carrick_core_abi::BirthSerial::of_task(root_task.serial),
+            carrick_core_abi::EntryThreadGeneration::from_raw(root_thread.serial.raw()),
+        )
+        .unwrap(),
+    );
+    let address = AddressContext {
+        root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+        mm: MmGeneration::new(NonZeroU64::MIN),
+        generation: ContextGeneration::new(NonZeroU64::MIN),
+    };
+    let slot = SlotId::new(0);
+    let peer_slot = SlotId::new(1);
+    let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+    zone.spaces.open(space);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, 1, Some(0), 1);
+    zone.enter_guest(slot);
+    zone.install_space(slot, 1).unwrap();
+    zone.drive(peer_slot, 2);
+    zone.publish_slot(peer_slot, 1, Some(1), 2);
+    zone.enter_guest(peer_slot);
+    zone.current_or_new(
+        slot,
+        ThreadIdentity {
+            tid: root_task.id.raw() as u64,
+            serial: root_thread.serial.raw(),
+            mm: 1,
+            file_table: root_table_key,
+            generation: generation.raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 3,
+            lifecycle_page: &*page as *const _ as u64,
+            control_slot: &*control as *const _ as u64,
+        },
+    )
+    .unwrap();
+    let source = BornInZoneSource { zone: &zone, slot };
+    let mut service = Box::new(Cpl0TestService {
+        zone: &zone,
+        child_page: &child_page,
+        child_controls: &child_controls,
+        task: peer_task,
+        owner: Arc::clone(owner),
+        map,
+        fd_map: [const { FdMapSlot::new() }; FD_MAP_CAPACITY],
+        opens: [const { DelegatedOpenFile::new() }; 16],
+        next_root_page: 0x2000,
+    });
+    admit_stdio(
+        &service.fd_map,
+        &service.opens,
+        &[],
+        root_table_key,
+        [true; 3],
+    );
+    zone.mm_issuer().observe_existing(address.mm);
+
+    let counters = Counters::new();
+    let names = InotifyNameCache::new();
+    let host_root_resources =
+        carrick_kernel::dispatch::resources::HostRootResources::capture(&context);
+
+    let settle_staged = |staged: Option<HostFileStage>, origin: ServiceOrigin| -> i64 {
+        match staged {
+            Some(HostFileStage::Request {
+                record,
+                output,
+                resolves_path,
+                ..
+            }) => {
+                let mut record = record.into_vec();
+                let served = if origin == ServiceOrigin::Initial {
+                    dispatcher.serve_host_root_file(&host_root_resources, &mut record)
+                } else {
+                    if resolves_path {
+                        let mut access = Vec::new();
+                        carrick_core_abi::host_file::AccessContext::encode_into(
+                            &mut access,
+                            carrick_core_abi::host_file::AccessIds::default(),
+                            0o022,
+                            None,
+                            b"/",
+                            None,
+                        )
+                        .unwrap();
+                        record = carrick_personality_linux::native_host_file::stamp_access_context(
+                            &record, &access,
+                        )
+                        .unwrap()
+                        .into_vec();
+                    }
+                    carrick_personality_linux::native_host_file::stamp_write_file_size_limit::<()>(
+                        &mut record,
+                        || Ok(u64::MAX),
+                    )
+                    .unwrap();
+                    dispatcher.serve_native_host_file(&mut record)
+                };
+                match served {
+                    Ok(_) => {
+                        let parsed = carrick_core_abi::host_file::reply(&record)
+                            .expect("served host-file record must contain a valid reply");
+                        if let Some(out) = output
+                            && !parsed.output.is_empty()
+                        {
+                            let dst = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    out.address as *mut u8,
+                                    parsed.output.len(),
+                                )
+                            };
+                            dst.copy_from_slice(parsed.output);
+                        }
+                        parsed.result
+                    }
+                    Err(_) => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+                }
+            }
+            Some(HostFileStage::Returned(res)) => res.raw(),
+            other => panic!("expected staged host-file request, got {other:?}"),
+        }
+    };
+
+    // Pre-clone root runs with a published host binding (`table_of(task)`) before
+    // native process registration (`process = None`), exercising the shared
+    // ISA-neutral fd-core routing on x86 register/canonical decode.
+    macro_rules! call_root_pre_clone {
+        ($native_nr:expr, $args:expr) => {{
+            let native_nr: u64 = $native_nr;
+            let args: [u64; 6] = $args;
+            let Cpl0TestService { fd_map, opens, .. } = &*service;
+            let call = decode_x86_64(native_nr, args, 0x7fff_0000);
+            let mut frame = Cpl0Frame {
+                call,
+                rax: native_nr,
+                slot,
+                file_table: root_table_key,
+                fd_map,
+                opens,
+                task,
+                venue: &venue,
+                origin: ServiceOrigin::Initial,
+                staged: None,
+            };
+            let route = dispatch::dispatch_syscall_with_native::<
+                _,
+                NoCpu,
+                sched::HardwareUserWord,
+                _,
+                ParkedContextWords,
+            >(
+                &mut frame,
+                &counters,
+                &tasks,
+                fd_map,
+                &[],
+                opens,
+                &[],
+                &names,
+                None,
+                Some(&venue),
+                None,
+                None,
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            let staged = frame.staged.take();
+            let rax = frame.rax as i64;
+            if route == CompletionRoute::Forward && staged.is_some() {
+                (route, settle_staged(staged, ServiceOrigin::Initial))
+            } else {
+                (route, rax)
+            }
+        }};
+    }
+
+    // 1. Root opens /dev/null -> fd 3 in shared fd-core.
+    let out_path = GuestUserBuffer::from_bytes(b"/dev/null\0");
+    let (open_route, opened_fd) = call_root_pre_clone!(
+        257,
+        [
+            LINUX_AT_FDCWD,
+            out_path.arg(),
+            LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_TRUNC,
+            0o600,
+            0,
+            0,
+        ]
+    );
+    assert_eq!(open_route, CompletionRoute::Forward);
+    assert_eq!(opened_fd, 3);
+
+    // 2. Shell builtin redirection sequence on root before clone:
+    // fcntl(1, F_DUPFD, 10) -> dup3(3, 1, 0) -> dup3(10, 1, 0) -> dup2(10, 1) -> close(10).
+    let (dupfd_route, saved_stdout) = call_root_pre_clone!(72, [1, LINUX_F_DUPFD, 10, 0, 0, 0]);
+    assert_eq!(
+        saved_stdout, 10,
+        "x86 root fcntl(1, F_DUPFD, 10) returned {saved_stdout} (ENOSYS = -38)"
+    );
+    assert_eq!(dupfd_route, CompletionRoute::Served);
+    let (redir_route, redir_ret) = call_root_pre_clone!(292, [3, 1, 0, 0, 0, 0]);
+    assert_eq!((redir_route, redir_ret), (CompletionRoute::Served, 1));
+    let (restore_route, restore_ret) = call_root_pre_clone!(292, [10, 1, 0, 0, 0, 0]);
+    assert_eq!((restore_route, restore_ret), (CompletionRoute::Served, 1));
+    // Also exercise x86 legacy dup2(10, 1).
+    let (dup2_route, dup2_ret) = call_root_pre_clone!(33, [10, 1, 0, 0, 0, 0]);
+    assert_eq!((dup2_route, dup2_ret), (CompletionRoute::Served, 1));
+    let (close_route, close_ret) = call_root_pre_clone!(3, [10, 0, 0, 0, 0, 0]);
+    assert_eq!((close_route, close_ret), (CompletionRoute::Served, 0));
+
+    // 3. Admit root and clone child through production x86 dispatch.
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
+            source,
+            task,
+            &page,
+            &control,
+            address,
+            address,
+            context_words(address),
+        )
+        .unwrap(),
+    );
+    registry
+        .register_root(runtime.clone(), source, task, address)
+        .unwrap();
+
+    macro_rules! call_root {
+        ($native_nr:expr, $args:expr) => {{
+            let native_nr: u64 = $native_nr;
+            let args: [u64; 6] = $args;
+            let words = context_words(address);
+            let Cpl0TestService { fd_map, opens, .. } = &*service;
+            let fd_map_ptr = fd_map as *const [FdMapSlot];
+            let opens_ptr = opens as *const [DelegatedOpenFile];
+            let mut entry = runtime
+                .enter_registered(registry, source, task, address, &words, &mut *service)
+                .unwrap();
+            let call = decode_x86_64(native_nr, args, 0x7fff_0000);
+            // SAFETY: fd_map and opens live inside heap-pinned `service` and are not reallocated.
+            let (fd_map_slice, opens_slice) = unsafe { (&*fd_map_ptr, &*opens_ptr) };
+            let mut frame = Cpl0Frame {
+                call,
+                rax: native_nr,
+                slot,
+                file_table: root_table_key,
+                fd_map: fd_map_slice,
+                opens: opens_slice,
+                task,
+                venue: &venue,
+                origin: ServiceOrigin::Initial,
+                staged: None,
+            };
+            let route = dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                &tasks,
+                fd_map_slice,
+                &[],
+                opens_slice,
+                &[],
+                &names,
+                None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
+                Some(&venue),
+                None,
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            let staged = frame.staged.take();
+            let rax = frame.rax as i64;
+            drop(entry);
+            if route == CompletionRoute::Forward && staged.is_some() {
+                (route, settle_staged(staged, ServiceOrigin::Initial))
+            } else {
+                (route, rax)
+            }
+        }};
+    }
+
+    let (clone_route, child_pid) = call_root!(56, [17, 0, 0, 0, 0, 0]);
+    assert_eq!(clone_route, CompletionRoute::Served);
+    assert!(child_pid > 0, "x86 clone failed with {child_pid}");
+    if let Some(doorbell) = task.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
+    let _ = task.linux.take_served_boundary();
+
+    assert!(zone.enter_idle(peer_slot, true));
+    let mut effects = WakeEffects::default();
+    assert_eq!(zone.migrate_queued(slot, &mut effects), 1);
+    zone.leave_idle(peer_slot);
+    let selected = zone.switch_in_full(peer_slot).unwrap();
+    let child_record = zone.record_ref(selected.record);
+    let state = unsafe { runtime.record_binding(child_record) }.unwrap();
+    let identity = zone.record(selected.record).identity();
+    zone.install_space(peer_slot, state.address.mm.raw().get())
+        .unwrap();
+    peer_task.set(
+        El1TaskId::from_linux_tid(i32::try_from(identity.tid).unwrap()),
+        carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+        identity.file_table,
+    );
+    peer_task
+        .mm
+        .key
+        .store(state.address.mm.raw().get(), Ordering::Release);
+    peer_task
+        .mm
+        .thread_generation
+        .store(identity.serial, Ordering::Release);
+    peer_task.publish_visible_pid(child_pid as u32);
+    peer_task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+
+    let child_table = carrick_el1_linux::ipc::native_table(&venue, peer_task).unwrap();
+    assert_eq!(
+        carrick_el1_linux::ipc::native_descriptor(&venue, child_table, 1),
+        Some(NativeDescriptor::HostBacked {
+            access: DescriptionAccess::ReadWrite,
+        }),
+    );
+    assert_eq!(
+        carrick_el1_linux::ipc::native_descriptor(&venue, child_table, 10),
+        Some(NativeDescriptor::Absent),
+    );
+
+    let peer_source = BornInZoneSource {
+        zone: &zone,
+        slot: peer_slot,
+    };
+    macro_rules! call_child {
+        ($native_nr:expr, $args:expr) => {{
+            let native_nr: u64 = $native_nr;
+            let args: [u64; 6] = $args;
+            let Cpl0TestService { fd_map, opens, .. } = &*service;
+            let fd_map_ptr = fd_map as *const [FdMapSlot];
+            let opens_ptr = opens as *const [DelegatedOpenFile];
+            let mut child_entry = runtime
+                .enter_registered(
+                    registry,
+                    peer_source,
+                    peer_task,
+                    state.address,
+                    &state.words,
+                    &mut *service,
+                )
+                .unwrap();
+            let call = decode_x86_64(native_nr, args, 0x7fff_0000);
+            let (fd_map_slice, opens_slice) = unsafe { (&*fd_map_ptr, &*opens_ptr) };
+            let mut frame = Cpl0Frame {
+                call,
+                rax: native_nr,
+                slot: peer_slot,
+                file_table: identity.file_table,
+                fd_map: fd_map_slice,
+                opens: opens_slice,
+                task: peer_task,
+                venue: &venue,
+                origin: ServiceOrigin::Descendant,
+                staged: None,
+            };
+            let route = dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                &tasks,
+                fd_map_slice,
+                &[],
+                opens_slice,
+                &[],
+                &names,
+                None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
+                Some(&venue),
+                None,
+                Some(&mut *child_entry),
+                Some(peer_source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            let staged = frame.staged.take();
+            let rax = frame.rax as i64;
+            drop(child_entry);
+            if route == CompletionRoute::Forward && staged.is_some() {
+                (route, settle_staged(staged, ServiceOrigin::Descendant))
+            } else {
+                (route, rax)
+            }
+        }};
+    }
+
+    // Child stats fd 1 (statx AT_EMPTY_PATH) and writes fd 1.
+    let empty = GuestUserBuffer::from_bytes(b"\0");
+    let statx_buf = GuestUserBuffer::zeroed(LINUX_STATX_BYTES);
+    let (stat_route, stat_ret) = call_child!(
+        332,
+        [
+            1,
+            empty.arg(),
+            LINUX_AT_EMPTY_PATH,
+            0x7ff,
+            statx_buf.arg(),
+            0,
+        ]
+    );
+    assert_eq!(stat_route, CompletionRoute::Forward);
+    assert_eq!(
+        stat_ret, 0,
+        "x86 child statx(1, AT_EMPTY_PATH) returned {stat_ret} (ENOSYS = -38)"
+    );
+
+    let msg = GuestUserBuffer::from_bytes(b"child-ok\n");
+    let (write_route, write_ret) = call_child!(1, [1, msg.arg(), 9, 0, 0, 0]);
+    assert_eq!(write_route, CompletionRoute::Forward);
+    assert_eq!(
+        write_ret, 9,
+        "x86 child write(1) returned {write_ret} (ENOSYS = -38)"
+    );
+    assert_eq!(dispatcher.stdout(), b"child-ok\n");
+
+    // Child redirects its own fd 1 to fd 3 (ring-opened NativeOpenFile with no
+    // fd_map entry) and writes: stage_native_host_file must run ahead of
+    // preflight_host_crossing so fd 1 is not rejected with -EBADF.
+    let (child_dup3_route, child_dup3_ret) = call_child!(292, [3, 1, 0, 0, 0, 0]);
+    assert_eq!(
+        (child_dup3_route, child_dup3_ret),
+        (CompletionRoute::Served, 1)
+    );
+    let file_msg = GuestUserBuffer::from_bytes(b"redir-ok\n");
+    let (file_write_route, file_write_ret) = call_child!(1, [1, file_msg.arg(), 9, 0, 0, 0]);
+    assert_eq!(
+        (file_write_route, file_write_ret),
+        (CompletionRoute::Forward, 9),
+        "x86 child write(1) after dup3(3, 1) must stage against fd-core instead of failing preflight_host_crossing"
+    );
+
+    // Two-live-process table isolation on x86 CPL0 while both root and child remain live:
+    // Child closes fd 3; root's fd 3 stays open and root can dup(3) -> 4.
+    let (_, child_close_3) = call_child!(3, [3, 0, 0, 0, 0, 0]);
+    assert_eq!(child_close_3, 0);
+    let (_, child_dup_closed) = call_child!(32, [3, 0, 0, 0, 0, 0]);
+    assert_eq!(child_dup_closed, -9, "child closed fd 3 must return -EBADF");
+    let (_, root_dup_3) = call_root!(32, [3, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        root_dup_3, 4,
+        "child close(3) must not close live root's fd 3"
+    );
+    // Root closes fd 1; child's redirected fd 1 stays open and dup(1) -> 3 in child.
+    let (_, root_close_1) = call_root!(3, [1, 0, 0, 0, 0, 0]);
+    assert_eq!(root_close_1, 0);
+    let (_, root_dup_closed_1) = call_root!(32, [1, 0, 0, 0, 0, 0]);
+    assert_eq!(root_dup_closed_1, -9);
+    let (_, child_dup_1) = call_child!(32, [1, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        child_dup_1, 3,
+        "root close(1) must not close live child's fd 1"
+    );
+}
