@@ -1090,8 +1090,12 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        // The live address context this CPU runs must be the caller's MM.
+        let live = ReservationMm::new(mm.mm.raw().get())
+            .and_then(anonymous::live_words)
+            .and_then(|words| words.context);
         if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get()
-            || carrick_el1::isa::x86::hardware_live_root().map_err(error)? != mm.root
+            || live.is_none_or(|context| context.root != mm.root)
         {
             return Err(NativeProcessError::Stale);
         }
