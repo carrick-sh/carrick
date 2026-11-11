@@ -261,7 +261,8 @@ the machine's exclusive `gate` lease across both runs' fixture restore, `just
 build`, `cargo run -p carrick-xtask -- accept --profile no-docker --phase
 signed`, and independent artifact inspection. A paired job takes about twice
 a single run (roughly 45-70 minutes; the job timeout is 240). Nested acceptance reuses that
-lease. Both runners must share their local lease path with all other gate
+lease: under an outer gate `accept` does not split its build from guest
+execution (#2013), so the executor's lease still spans the pair. Both runners must share their local lease path with all other gate
 participants on that host. A per-SHA Actions concurrency group with
 `cancel-in-progress: false` queues duplicate requests. GitHub does not expose
 `runner.name` when job concurrency is evaluated, so host serialization uses

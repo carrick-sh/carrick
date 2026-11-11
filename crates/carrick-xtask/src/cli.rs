@@ -139,6 +139,13 @@ pub enum Commands {
     #[command(hide = true)]
     LeaseSupervisor(crate::lease_supervisor::SupervisorArgs),
 
+    #[command(
+        name = "signed-phases",
+        about = "Run a signed command's build phase under the carrick lease, then its execution phase under gate",
+        long_about = "Run COMMAND twice with CARRICK_SIGNED_PHASE=build and then =execute (#2013). The build phase runs under the shared carrick lease and lists every artifact the execution phase runs in $CARRICK_SIGNED_STATE/artifacts, one `<signed|content>\t<absolute path>` line each; their identity (SHA-256 for all, plus CDHash and LC_UUID for signed Mach-O executables on macOS) is captured before that lease is released. `accept --phase signed` drives its own build and guest execution through this. The execution phase waits for gate with the ordinary lease wait, re-verifies the identity and refuses to run if any artifact changed. The two leases are never held together. Under an inherited gate both phases reuse it; under an inherited carrick lease the run is refused before building, because shared admission is never upgraded."
+    )]
+    SignedPhases(crate::signed_phase::SignedPhasesArgs),
+
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
     LeaseGuardian(crate::lease_supervisor::GuardianArgs),
@@ -309,6 +316,8 @@ pub enum CliError {
     Fixtures(#[from] crate::fixtures::FixturesError),
     #[error("host lease error: {0}")]
     HostLease(#[from] crate::host_lease::HostLeaseError),
+    #[error("{0}")]
+    SignedPhase(#[from] crate::signed_phase::SignedPhaseError),
     #[error("stress-capture: {0}")]
     StressCapture(#[from] crate::stress_capture::Error),
     #[cfg(feature = "smoke-signed")]
@@ -429,13 +438,17 @@ where
                 Some((crate::host_lease::HostLeaseMode::Carrick, true))
             }
             Commands::CheckDisk(_) => Some((crate::host_lease::HostLeaseMode::Gate, false)),
+            // Host-only compilation takes carrick; signed runs take carrick
+            // for their build and gate only for guest execution, through the
+            // signed-phase driver (#2013); guest-booting host profiles, gate.
             Commands::Accept(args) => crate::accept::validate_request_for_host(
                 args,
                 std::env::consts::OS,
                 std::env::consts::ARCH,
             )
             .ok()
-            .map(|_| (crate::host_lease::HostLeaseMode::Gate, true)),
+            .and_then(|phase| crate::accept::cli_lease(args.profile, phase))
+            .map(|mode| (mode, true)),
             Commands::Fixtures(args) => match &args.action {
                 crate::fixtures::FixturesAction::Restore { .. }
                 | crate::fixtures::FixturesAction::Prepare { .. } => {
@@ -689,6 +702,10 @@ where
         }
         Commands::LeaseSupervisor(args) => {
             let code = crate::lease_supervisor::run(args)?;
+            std::process::exit(code);
+        }
+        Commands::SignedPhases(args) => {
+            let code = crate::signed_phase::run_cli(args)?;
             std::process::exit(code);
         }
         #[cfg(target_os = "macos")]

@@ -183,9 +183,11 @@ lease MODE +CMD:
     shift
     exec {{_lease_runner}} host-lease --mode "$lease_mode" -- {{_admit}} "$@"
 
-# Run the host and/or signed landing gate under an exclusive host lease (no Docker).
-accept *ARGS:
-    {{_lease_runner}} host-lease --mode gate -- {{_admit}} {{_xtask}} accept --profile no-docker {{ARGS}}
+# Run the host and/or signed landing gate (no Docker). Host work, the release
+# build and signing hold the shared carrick lease; signed guest execution alone
+# holds exclusive gate (#2013). xtask is built under the shared lease first.
+accept *ARGS: ci-prebuild-xtask
+    {{_admit}} {{_xtask}} accept --profile no-docker {{ARGS}}
 
 # Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt.
 remote-accept *ARGS:

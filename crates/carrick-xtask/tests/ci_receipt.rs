@@ -80,6 +80,7 @@ fn receipt(steps: Vec<StepResult>) -> AcceptReceipt {
         host_identity: None,
         fixture_bundle: None,
         host_load: Default::default(),
+        signed_admission: None,
         failures: vec![],
     }
 }

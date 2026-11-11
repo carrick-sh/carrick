@@ -142,13 +142,52 @@ points are changed, invoke them through the installed supervisor in shared
 `carrick` mode. This remaining gap is recorded on #1693; these changes alone
 do not establish complete host coverage.
 
+## Signed accept holds gate only for guest execution (#2013)
+
+`accept --phase signed` (and the signed half of `--phase all`) is the one
+entry point split so far. It admits disk with `just check-disk` under
+`gate`, then runs its build and execution as two complete supervised runs
+through `carrick-xtask signed-phases`: the build phase (the host phase of
+`--phase all`, fixture verification, `just _build`, release signing) under
+shared `carrick`, and, once that supervisor and its cleanup have finished,
+the execution phase under `gate` on the ordinary `HOST_LEASE_WAIT_LIMIT`
+wait. There is no upgrade and no nesting.
+
+The build phase lists everything the guests will run that exists before
+the lease is released: the signed release binary (SHA-256, CDHash and
+LC_UUID on macOS) and every installed fixture, including
+`target/fixtures/installed.json`, the bundle's probe and guest fixtures
+and candidate-built probes (SHA-256 content hash, since a Linux ELF carries
+no code signature). After gate admission the identities are compared, and
+the fixtures are verified against their manifest again, before the first
+guest step. A change refuses execution; the receipt records both leases and
+the identities as `signed_admission`. The test executables, the carrier
+copies and the `conformance-probes` build that `scripts/test-signed.sh`
+produces are built inside the execution phase, under gate, so they never
+cross a released lease.
+
+Under an outer `gate` both phases reuse it and nothing splits (test-signed
+inside accept reuses the same gate through its own `host-lease --mode
+carrick`). Under an outer `carrick` lease signed accept is refused before
+disk admission or any build, because shared admission never becomes
+`gate`. Host-only accept phases are compilation and host tests under
+`carrick`, except the `kvm` and `el1-native` profiles, whose host steps
+boot guests and keep `gate`.
+
+`scripts/test-signed.sh`, the `signed-gate execute` pair and the
+`conformance-probes` CLI suites keep their existing leases. Each is a
+separate #2013 follow-up, landing with its own complete artifact admission
+(guest fixtures, the parity CLI) and witnesses, with an inherited gate
+preserved in the executor.
+
 ## Machine quietness and lease modes
 
 Moved from `AGENTS.md` (#2118).
 
-- **Machine quietness:** `just accept` holds the host lease in exclusive `gate`
-  mode for its entire host/signed run; `scripts/test-signed.sh` holds shared
-  `carrick` mode through build, signing, execution and scoped cleanup. Host
+- **Machine quietness:** signed `just accept` holds exclusive `gate` only for
+  guest execution and builds under shared `carrick` (see the #2013 section
+  above); `scripts/test-signed.sh` holds shared `carrick` mode through build,
+  signing, execution and scoped cleanup (its split is a #2013 follow-up). Host
   tests/compilation compete for CPU and memory too. Both refuse `yes`, `stress`
   and `stress-ng`, reporting PIDs and parent commands. Deliberate load requires
   `CARRICK_ALLOW_LOAD=1`; logs record detected load and acceptance receipts

@@ -174,12 +174,15 @@ skills `carrick-trace` and `carrick-lldb`.
 
 ## Shared machines and leases
 
-- `just accept` holds the host lease in exclusive `gate` mode, and
-  `scripts/test-signed.sh` holds shared `carrick` mode. Deliberate load needs
+- Signed `just accept` builds under shared `carrick` and holds exclusive
+  `gate` only while guests run, re-verifying the binary and fixtures after
+  admission (#2013); guest-booting host profiles (`kvm`, `el1-native`) keep
+  `gate`. `scripts/test-signed.sh` holds shared `carrick`. Deliberate load needs
   `CARRICK_ALLOW_LOAD=1` and cleans up after itself, and every `dtrace -Z`
   session is bounded.
 - Lock order: remote checkout lock, then host lease, then work. Never upgrade
-  a shared lease, and never unlink a live lock file.
+  a shared lease (release `carrick` fully, then request `gate`), and never
+  unlink a live lock file.
 - Proxmox worker VMs take their in-VM lease, never the physical host (#639).
 - Admitted checkouts key on device and inode: remove and re-add, never copy.
   → `docs/host-lease-containment-follow-up.md`, `docs/ci/mac-hvf-runner.md`.
