@@ -387,6 +387,9 @@ impl Frames {
             + self.maximum("::dispatch::arm_deliver_declined_fault_signal_with::")
             + self.maximum("::aarch64_process::deliver_declined_fault_signal_with::")
             + self.required("::aarch64_process::with_process_entry::")?;
+        // `fork_reserved` folds into `fork_owned`; should it ever be emitted
+        // on its own, both frames are live across every fork callee.
+        let fork = self.required("::fork_owned::")? + self.maximum("::fork_reserved::");
         let chains = [
             (
                 "unregistered native retirement",
@@ -422,7 +425,7 @@ impl Frames {
             (
                 "native fork publication",
                 native
-                    + self.required("::fork_owned::")?
+                    + fork
                     + self.required("::prepare_mm::")?
                     + self.maximum("::publish_fork::")
                     + self.maximum("::root::")
@@ -431,7 +434,7 @@ impl Frames {
             (
                 "native fork descriptors",
                 native
-                    + self.required("::fork_owned::")?
+                    + fork
                     + self.required("::prepare_mm::")?
                     + self.maximum("::prepare_fork::")
                     + descriptors,
@@ -439,7 +442,7 @@ impl Frames {
             (
                 "native fd inheritance",
                 native
-                    + self.required("::fork_owned::")?
+                    + fork
                     + self.required("::fork_fd_table::")?
                     + fd_fork,
             ),
@@ -447,14 +450,14 @@ impl Frames {
                 "native fd retirement",
                 ((native + delivery).max(resume)
                     + self.sum(&["::exit_with_signal::", "::exit_with_status::"]))
-                .max(native + self.required("::fork_owned::")?)
+                .max(native + fork)
                     + self.required("::retire_fd_table::")?
                     + fd_retire,
             ),
             (
                 "native fork context",
                 native
-                    + self.required("::fork_owned::")?
+                    + fork
                     + self.maximum("::fork_child_context_boxed::")
                     + allocation,
             ),
@@ -464,7 +467,7 @@ impl Frames {
             (
                 "native fork settlement",
                 native
-                    + self.required("::fork_owned::")?
+                    + fork
                     + self.required("::settle_mm::")?
                     + allocation,
             ),
@@ -1062,6 +1065,8 @@ mod tests {
             "native fork settlement",
         ];
         let mut frames = small_frames();
+        // Let the fork side, not exit, dominate fd retirement's `max`.
+        frames.0.insert("x::fork_owned::h0".to_owned(), 1000);
         let inlined = frames.check(16384, 288).unwrap();
         frames.0.insert("x::fork_reserved::h0".to_owned(), 700);
         let outlined = frames.check(16384, 288).unwrap();
