@@ -663,9 +663,9 @@ fn child_clock_copyout_repark_leaves_the_slot_before_another_process_runs() {
 /// other process's record models an ordinary runnable thread with nothing
 /// owed at its checkpoint (it was preempted, not parked by its owner), which
 /// is what the scheduler would run next on the slot.
-struct ChildResumeCpu<'a, 'b> {
-    child: RecordId,
-    inner: ResumeCpu<'a, 'b, &'static TestStockCrossing>,
+pub(super) struct ChildResumeCpu<'a, 'b> {
+    pub(super) child: RecordId,
+    pub(super) inner: ResumeCpu<'a, 'b, &'static TestStockCrossing>,
 }
 
 impl crate::sched::ThreadCpu for ChildResumeCpu<'_, '_> {

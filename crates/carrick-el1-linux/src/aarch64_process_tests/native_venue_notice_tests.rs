@@ -13,7 +13,7 @@
 //! `clock_getres`, whose ring-answered resolution goes through the venue's
 //! owned copyout (`finish_signal_output`) when the direct copy refuses; the
 //! Busy is the test's owner-access seam standing in for an owner-busy page.
-use super::native_child_clock_tests::fork_child;
+use super::native_child_clock_tests::{ChildResumeCpu, fork_child};
 use super::*;
 use std::sync::Arc;
 
@@ -81,6 +81,123 @@ fn assert_left_vacated(
         ),
         "the other record stays queued for the next entry"
     );
+}
+
+/// `clock_getres(CLOCK_MONOTONIC)`: the ring's constant 1 ms resolution.
+const RESOLUTION: [u8; 16] = {
+    let mut bytes = [0; 16];
+    let nanos = 1_000_000_u64.to_le_bytes();
+    let mut index = 0;
+    while index < 8 {
+        bytes[8 + index] = nanos[index];
+        index += 1;
+    }
+    bytes
+};
+
+/// The lane A parked on and the queued record B.
+struct Lane<'a> {
+    zone: &'static ZoneTables<Aarch64ParkedContext>,
+    slot: SlotId,
+    task: &'static CurrentTask,
+    a: RecordId,
+    b: RecordId,
+    runtime: &'a NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>,
+    registry: &'a NativeProcessRegistry<'static, Mm, Aarch64ParkedContext>,
+    service: &'a mut Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
+}
+
+/// The carrier takes the notice at the exit A left on and acknowledges the
+/// owed carrier work. A's next entry finishes the same copyout (Busy once,
+/// then success), and B runs after it, in its own space.
+fn complete_then_resume(
+    lane: Lane<'_>,
+    out: &carrick_test_support::GuestUserBuffer,
+    busy: &AtomicUsize,
+) {
+    let Lane {
+        zone,
+        slot,
+        task,
+        a,
+        b,
+        runtime,
+        registry,
+        service,
+    } = lane;
+    let notice = task.service_notice.take().unwrap().unwrap();
+    let identity = zone.record(a).identity();
+    // SAFETY: the live record A retains this control slot in fixture stock.
+    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    let queue = zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(zone.record_ref(a))
+                .unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        )
+        .unwrap();
+    // SAFETY: this fixture owns the parked member and its service queue.
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &control.service,
+            notice,
+            NonZeroU64::MIN,
+            identity,
+        )
+    }
+    .unwrap();
+    assert!(matches!(
+        ticket.request().operation,
+        carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+    ));
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(slot, &mut carrick_sched_core::WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    // B was queued first; run A ahead of it.
+    assert_eq!(zone.switch_in_full(slot).unwrap().record, b);
+    assert!(zone.requeue_preempted(slot, b).is_queued());
+    let mut cpu = ChildResumeCpu {
+        child: a,
+        inner: ResumeCpu {
+            inner: crate::sched::FakeCpu::default(),
+            runtime,
+            registry,
+            source: BornInZoneSource { zone, slot },
+            task,
+            service,
+        },
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let run_next = |cpu: &mut ChildResumeCpu<'_, '_>| {
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        let served = (crate::sched::Sched {
+            handoff: None,
+            zone,
+            slot,
+            task,
+            cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .run_next(&mut frame, 0);
+        (served, frame)
+    };
+    let (served, frame) = run_next(&mut cpu);
+    assert_eq!(served, crate::sched::Served::Returned { switched: true });
+    assert_eq!(zone.slot(slot).current(), Some(a));
+    assert_eq!(frame.x[0], 0, "clock_getres returns 0");
+    assert_eq!(out.as_bytes(), &RESOLUTION);
+    assert_eq!(busy.load(Ordering::Acquire), 2, "Busy once, then success");
+    assert!(task.service_notice.take().unwrap().is_none());
+    // A's slice ends: B, still queued, runs next in its own space.
+    assert!(zone.requeue_preempted(slot, a).is_queued());
+    let (served, _) = run_next(&mut cpu);
+    assert_eq!(served, crate::sched::Served::Returned { switched: true });
+    assert_eq!(zone.slot(slot).current(), Some(b));
+    assert_eq!(zone.installed_space(slot), zone.record(b).identity().mm);
 }
 
 /// B is the fork parent: a different mm queued on A's slot.
@@ -153,6 +270,20 @@ fn venue_copyout_repark_leaves_the_slot_before_another_mm_runs() {
     assert_eq!(busy.load(Ordering::Acquire), 1, "the copyout was Busy once");
     assert_left_vacated(route, zone, slot, fork.child_task, fork.parent);
     assert_eq!(out.as_bytes(), &[0xcc; 16], "nothing was written yet");
+    complete_then_resume(
+        Lane {
+            zone,
+            slot,
+            task: fork.child_task,
+            a: fork.child.record.id,
+            b: fork.parent,
+            runtime: &fork.runtime,
+            registry: fork.registry,
+            service: &mut service,
+        },
+        &out,
+        &busy,
+    );
 }
 
 /// B is a same-mm sibling: the fork child's ring-born worker, queued behind
@@ -185,4 +316,21 @@ pub(super) fn same_mm_worker_stays_queued(
     assert_eq!(busy.load(Ordering::Acquire), 1, "the copyout was Busy once");
     assert_left_vacated(route, zone, slot, &fixture.task, worker);
     assert_eq!(out.as_bytes(), &[0xcc; 16], "nothing was written yet");
+    let runtime = registry()
+        .for_record(zone, zone.record_ref(leader))
+        .unwrap();
+    complete_then_resume(
+        Lane {
+            zone,
+            slot,
+            task: &fixture.task,
+            a: leader,
+            b: worker,
+            runtime: &runtime,
+            registry: registry(),
+            service,
+        },
+        &out,
+        &busy,
+    );
 }
