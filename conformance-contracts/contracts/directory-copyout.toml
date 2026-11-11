@@ -1,3 +1,9 @@
+# #1733: `vcpu_loop/mod.rs` only gains a test-engine frame-COW resolver hook.
+# #1733/#2020: `vcpu_loop/binding.rs` settles the faulting MM's EL1 COW
+# completions before the EL0 fault refill (witness bound under
+# kernel.el1.fork-cow) and records ProcessExit from the identity the exit
+# reserved (witness process_exit_lifecycle_event_survives_task_retirement).
+# No change to this contract's guest semantics, bindings or budgets.
 # #1709: HvpatchProductionPhase::RetryThreadExit now selects terminal CPU
 # materialization in needs_terminal_cpu_save while remaining non-terminal in
 # is_terminal_transition (carrick-runtime::vcpu_loop::binding::tests::

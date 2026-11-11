@@ -1,3 +1,5 @@
+# #1733: `vcpu_loop/mod.rs` only gains a test-engine frame-COW resolver hook.
+# No change to this contract's guest semantics, bindings or budgets.
 # #1709: vcpu_loop/mod.rs adds only the cfg(test) CopyoutOwnerProbe
 # constructor used by the terminal memory-wait witness. Image permissions,
 # temporary signal-mask behavior and their existing bindings/budgets are

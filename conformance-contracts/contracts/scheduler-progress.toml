@@ -1,3 +1,8 @@
+# #1733/#2020: `vcpu_loop/binding.rs` settles the faulting MM's EL1 COW
+# completions before the EL0 fault refill (witness bound under
+# kernel.el1.fork-cow) and records ProcessExit from the identity the exit
+# reserved (witness process_exit_lifecycle_event_survives_task_retirement).
+# No change to this contract's guest semantics, bindings or budgets.
 # #1845: ReadinessLockCustody types the physical readiness-lock handoff in
 # sched-core::object_wait and the zone accessor in el1_zone.rs. This family's
 # operations and budgets are unchanged. The change is witnessed under
