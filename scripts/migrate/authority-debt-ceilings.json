@@ -200,6 +200,69 @@
     {
       "family": "build_time",
       "operation": "std::fs::read_to_string",
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "lane": "macos_hvf_default",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
       "owner": "carrick_vmm_kvm::build_program::cpl0_inputs::derive",
       "lane": "linux_cli",
       "ceiling": 1
