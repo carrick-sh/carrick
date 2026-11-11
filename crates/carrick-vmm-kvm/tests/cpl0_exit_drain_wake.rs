@@ -23,10 +23,7 @@ fn exit_drain_wake(flags: &[&str], affinity: u64) {
     let elf = kvm_pool_fixture::assemble_fixture("native_pipe_exit_wake.S", flags);
     let dir = tempfile::tempdir().expect("oracle directory");
     let oracle = dir.path().join("oracle");
-    std::fs::write(&oracle, &elf).expect("native oracle ELF");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o700))
-        .expect("executable oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
     let native = std::process::Command::new("timeout")
         .arg("10")
         .arg(&oracle)
