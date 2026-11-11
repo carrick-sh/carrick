@@ -262,6 +262,11 @@ pub fn notify_object<C: carrick_core_abi::EntryContext>(
     key: ObjectWaitKey,
     completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
 ) -> Result<(ObjectWakeReport, WakeEffects), ObjectWaitError> {
+    // A previous incarnation's late holder of a recycled queue must not stall
+    // a wake for an incarnation that was never bound: nobody waits on it.
+    if zone.object_incarnation_unbound(key) {
+        return Err(ObjectWaitError::Stale);
+    }
     let guard = zone.object_wait(key, &ShortLockSpin, completion)?;
     let mut effects = WakeEffects::default();
     let report = guard.notify_object(slot, &mut effects)?;
