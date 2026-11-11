@@ -3805,7 +3805,12 @@ pub(crate) mod tests {
         pub(crate) uncontended_reads: bool,
         // Frame result, result already completed when injected, restart flag.
         pub(crate) injected_signals: Vec<(Option<i64>, Option<i64>, bool)>,
+        // The frame-COW resolver (the HVF one refills the EL1 grant chain).
+        pub(crate) frame_cow_fault: Option<FrameCowFault>,
     }
+
+    pub(crate) type FrameCowFault =
+        Box<dyn FnMut(u64, u64) -> carrick_hal::CowFaultResolution + Send>;
 
     struct TestPreparedClear<'a> {
         engine: &'a mut CrashCaptureTestEngine,
@@ -4274,6 +4279,19 @@ pub(crate) mod tests {
         fn discard_terminal_syscall_continuation(&mut self) -> Result<(), TrapError> {
             self.terminal_continuation_discards += 1;
             Ok(())
+        }
+
+        fn resolve_frame_cow_fault(
+            &mut self,
+            syndrome: u64,
+            far: u64,
+        ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
+            Ok(self
+                .frame_cow_fault
+                .as_mut()
+                .map_or(carrick_hal::CowFaultResolution::NotCow, |resolve| {
+                    resolve(syndrome, far)
+                }))
         }
 
         fn mailbox_slot(&self) -> Option<usize> {
