@@ -10503,8 +10503,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if targets.is_empty() {
                 // Keep leader lookup independent of member population.
                 // Logical membership licenses a nonleader even while a host
-                // member has no live zone context; that record is only the
-                // preference for which eligible member to interrupt.
+                // member has no live zone context.
                 for task in graph.owner.tasks().values() {
                     if task.has_thread(target_pid) {
                         let resources = task.native().resources();
@@ -10608,6 +10607,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut interrupts = Vec::new();
         for (target_key, target_signals, _) in targets {
             let before = interrupts.len();
+            // kill() is process-directed: the signal sits in the process inbox
+            // and every member that could take it is kicked, whichever tid
+            // was named. If one stops being eligible before its checkpoint
+            // (blocks the signal, exits), another kicked member still takes it.
             let _ = target_signals.enqueue(target_key, signal, Some(info));
             if let Ok(row) = graph.owner.task(target_key) {
                 row.native().resources().for_each_live_signal_member(
@@ -10624,20 +10627,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                     },
                 );
-            }
-            if let Some(preferred) = preferred_member {
-                // Prefer the named member when eligible, otherwise another
-                // unblocked member. The signal stays in the process inbox:
-                // a later mask change cannot turn kill into thread-only work.
-                let recipient = interrupts[before..]
-                    .iter()
-                    .copied()
-                    .find(|record| *record == preferred)
-                    .or_else(|| interrupts.get(before).copied());
-                interrupts.truncate(before);
-                if let Some(recipient) = recipient {
-                    interrupts.push(recipient);
-                }
             }
             if interrupts.len() != before
                 && let Some(PendingContinuation::Ipc(pending)) = graph.pending.get(&target_key)
