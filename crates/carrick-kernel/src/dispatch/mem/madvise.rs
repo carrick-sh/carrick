@@ -700,6 +700,11 @@ impl<'a> MemView<'a> {
                         };
                         if step.action == Action::RestorePrivateFile {
                             this.mark_vma_dispatch(&mut host_alias_dispatch);
+                            // An admitted MM returns pages to the root node's
+                            // retained source; host setup restores bytes.
+                            if this.discard_owner_private_file_segment(cx.memory, segment)? {
+                                continue;
+                            }
                             if let Err(errno) = this.discard_private_file_segment(cx.memory, segment) {
                                 return Ok(DispatchOutcome::errno(errno));
                             }

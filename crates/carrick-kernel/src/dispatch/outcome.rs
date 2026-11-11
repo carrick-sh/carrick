@@ -1192,6 +1192,15 @@ pub enum DispatchError {
     MemoryPreparation(String),
     #[error("file mmap attempted to reacquire its own owner gate: {0:?}")]
     MmapSelfHeldOwnerGate(carrick_el1_abi::PortalOwnerWait),
+    /// Retiring a discarded private file page's frames failed after its
+    /// translation edit began: the old owner can be neither trusted nor
+    /// restored, so the run must stop rather than answer the guest.
+    #[error("private file discard retirement is indeterminate at {address:#x}+{len:#x}: {error}")]
+    PrivateFileDiscardIndeterminate {
+        address: u64,
+        len: u64,
+        error: carrick_guest_mem::MemoryError,
+    },
     #[error("host wait requires the exact outer resource scope")]
     HostWaitResourceScope,
     #[error("host wait completed after its exact thread retired")]
