@@ -882,7 +882,7 @@ fn fork_exec_probe_with_scenario(
                 UserVa::new(0x400004),
             ),
             fixture,
-            counters: &counters,
+            counters,
             is_root_process,
             editor: FixtureDiscardMapping {
                 mapping: super::native_fault_supply_tests::FixtureMapping {
@@ -954,7 +954,7 @@ fn fork_exec_probe_with_scenario(
                     &fixture.task.linux,
                     carrick_el1_abi::Action::Forward,
                     || owner,
-                    &counters,
+                    counters,
                 );
                 if is_root_process {
                     assert_eq!(
