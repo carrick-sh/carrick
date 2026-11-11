@@ -190,6 +190,38 @@ where
     Ok(result)
 }
 
+/// Map only the destination slot (`COW_COPY_WINDOW_BASE + 4096`) of the idle
+/// supervisor copy pair while the caller owns the exact-MM editor, invoke
+/// `write` with that alias VA, then restore and drain before returning.
+pub fn with_cow_write_alias<W, R>(
+    words: &W,
+    root: RootGpa,
+    destination: FrameGpa,
+    write: impl FnOnce(u64) -> R,
+) -> Result<R, DescriptorOutcome>
+where
+    W: LiveDescriptorWords + ?Sized,
+{
+    let refused = DescriptorOutcome::Refused;
+    let pair = pair(words, root).map_err(refused)?;
+    if !frame_valid(destination) || pair.tables.contains(&destination.raw()) {
+        return Err(refused(DescriptorRefusal::WrongBacking));
+    }
+    let after = destination.raw() | PRESENT | WRITE | NX | ACCESSED | DIRTY;
+    if words.compare_exchange(pair.addresses[1], 0, after) != Ok(true) {
+        return Err(refused(DescriptorRefusal::Contended));
+    }
+    words.publish_barrier();
+    words.invalidate_range(COW_COPY_WINDOW_BASE, COW_COPY_WINDOW_LEN);
+    let result = write(COW_COPY_WINDOW_BASE + 4096);
+    if !restore(words, &[(pair.addresses[1], after)]) {
+        return Err(DescriptorOutcome::Indeterminate(
+            DescriptorRefusal::Contended,
+        ));
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -345,5 +377,37 @@ mod tests {
                 assert_eq!((words.read(0x4000), words.read(0x4008)), (0, 0));
             }
         }
+    }
+
+    #[test]
+    fn private_write_alias_maps_destination_slot_only_and_restores_before_completion() {
+        let words = Words::new();
+        provision_cow_copy_window(&words, root(0x1000), tables()).unwrap();
+        words.loads.set(0);
+        words.exchanges.set(0);
+        words.drains.set(0);
+        assert_eq!(
+            with_cow_write_alias(&words, root(0x1000), FrameGpa::new(0x2_0000_0000), |to| {
+                assert_eq!(to, COW_COPY_WINDOW_BASE + 4096);
+                assert_eq!(words.read(0x4000), 0);
+                assert_eq!(
+                    words.read(0x4008),
+                    0x2_0000_0000 | PRESENT | WRITE | NX | ACCESSED | DIRTY
+                );
+                assert_eq!(words.drains.get(), 1);
+                41
+            }),
+            Ok(41)
+        );
+        assert_eq!((words.read(0x4000), words.read(0x4008)), (0, 0));
+        assert_eq!(words.exchanges.get(), 2);
+        assert_eq!(words.drains.get(), 2);
+
+        assert!(
+            with_cow_write_alias(&words, root(0x1000), FrameGpa::new(0x2000), |_| {
+                panic!("table frame must be refused as write-alias destination")
+            })
+            .is_err()
+        );
     }
 }
