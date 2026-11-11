@@ -2883,11 +2883,61 @@ fn arm_root_ring_born_tgkill_before_first_entry_queues_signal_once() {
     );
 }
 
-#[test]
-#[ignore = "red on main: host-issued first clone, paused slice 2 of #1974 (assert_eq! at born_thread_entry_tests.rs:1460)"]
-fn arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry() {
-    let mut h = setup_arm_root_two_live_threads_and_peer();
+/// The host side of an empty-pool clone's "not now" (#1974 slice 2b): the
+/// carrier consumes the parked caller's exact `CarrierWork` notice, settles
+/// its owed host work (`stock`: the host ledger's replenish, emulated here by
+/// stocking the page the way the ledger does), then acknowledges the exact
+/// service ticket and notifies the member's service queue.
+fn answer_clone_carrier_work(
+    env: MultiSlotEnv,
+    slot: SlotId,
+    control: &'static ThreadControlSlot,
+    record: RecordId,
+    stock: impl FnOnce(),
+) {
+    let zone = env.fixture.zone;
+    let reference = zone.record_ref(record);
+    let notice = env.tasks[slot.index()]
+        .service_notice
+        .take()
+        .expect("readable service notice")
+        .expect("the parked clone published its carrier work");
+    assert_eq!(notice.record, reference, "the clone caller's own notice");
+    stock();
+    let key = carrick_sched_core::object_wait::ObjectWaitKey::native_service(reference).unwrap();
+    let complete: &dyn Fn(
+        carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Aarch64ParkedContext>,
+    ) = &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned);
+    let queue = zone
+        .object_wait(key, &carrick_sched_core::ShortLockSpin, complete)
+        .unwrap();
+    // SAFETY: the fixture retains this exact record and authenticates its
+    // notice while holding the same service queue as production intake.
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &control.service,
+            notice,
+            NonZeroU64::MIN,
+            zone.record(record).identity(),
+        )
+    }
+    .unwrap();
+    drop(queue);
+    ticket
+        .complete(true)
+        .unwrap_or_else(|_| panic!("clone carrier-work ticket was cancelled"));
+    zone.object_wait(key, &carrick_sched_core::ShortLockSpin, complete)
+        .unwrap()
+        .notify_object(slot, &mut Default::default())
+        .unwrap();
+}
+
+/// An ARM root clone on an empty ring pool parks: no `ClonePoolEmpty`
+/// decline, no host-issued Forward, the caller's execution lease released and
+/// the host asked for stock. Returns the parked caller's record.
+fn clone_on_empty_pool_parks(h: &mut ArmRootTwoThreadHarness) -> RecordId {
     let f = h.env.fixture;
+    let root_record = f.zone.slot(SlotId::new(0)).current().unwrap();
     let counters = carrick_el1_abi::Counters::new();
     let (route, _, _) = h.env.clone_thread(
         SlotId::new(0),
@@ -2896,18 +2946,82 @@ fn arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry() {
         &counters,
         &mut h.root_cpu,
     );
-    assert_eq!(
+    assert_ne!(
         route,
         carrick_personality_linux::dispatch::CompletionRoute::Forward,
-        "empty ring pool must decline clone to the host"
+        "an empty ring pool is \"not now\", never a host-issued birth"
     );
     assert_eq!(
         counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
             .load(Ordering::Relaxed),
-        1
+        0
     );
+    assert_ne!(
+        f.zone.slot(SlotId::new(0)).current(),
+        Some(root_record),
+        "the waiting clone released its execution lease"
+    );
+    root_record
+}
 
-    let _host_child_control = publish_host_born_sibling_only(f, 44);
+/// The parked caller is selected again and reruns its exact clone in ring.
+/// Returns `(clone result, PARENT_SETTID word, born record)`.
+fn rerun_clone_in_ring(
+    h: &mut ArmRootTwoThreadHarness,
+    root_record: RecordId,
+) -> (i64, u32, RecordId) {
+    let f = h.env.fixture;
+    assert!(
+        f.zone.slot(SlotId::new(0)).current() == Some(root_record)
+            || h.env.switch_in(SlotId::new(0), &mut h.root_cpu) == carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        f.zone.slot(SlotId::new(0)).current(),
+        Some(root_record),
+        "the woken clone caller is selected again"
+    );
+    let counters = carrick_el1_abi::Counters::new();
+    let (route, clone_rc, ptid) = h.env.clone_thread(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &counters,
+        &mut h.root_cpu,
+    );
+    assert_ne!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward
+    );
+    assert_eq!(
+        counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
+            .load(Ordering::Relaxed),
+        0
+    );
+    (
+        clone_rc,
+        ptid,
+        f.zone.runnable_head(SlotId::new(0)).unwrap(),
+    )
+}
+
+/// The #1974 window: the first ARM root clone finds the ring pool empty. It
+/// waits for the host to stock the pool instead of becoming a host-issued
+/// birth, then completes in ring; `tgkill` and a peer process's `kill(tid)`
+/// on the just-cloned thread succeed before its first entry, and the signal
+/// is delivered exactly once.
+#[test]
+fn arm_empty_pool_clone_waits_for_stock_then_child_accepts_tgkill_and_peer_kill() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let root_record = clone_on_empty_pool_parks(&mut h);
+    let mut born_control = None;
+    answer_clone_carrier_work(h.env, SlotId::new(0), f.control, root_record, || {
+        born_control = Some(stock_arm_root_pool_identity(f, 44, 1));
+    });
+    let born_control = born_control.unwrap();
+    let (clone_rc, ptid, born_record) = rerun_clone_in_ring(&mut h, root_record);
+    assert_eq!((clone_rc, ptid), (44, 44), "clone completes in ring");
+
     let tgkill_rc = h.env.tgkill(
         SlotId::new(0),
         f.page,
@@ -2922,12 +3036,174 @@ fn arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry() {
         h.peer_control,
         &mut h.peer_cpu,
         44,
-        SIGUSR2_NUM,
+        SIGUSR1_NUM,
     );
     assert_eq!(
         (tgkill_rc, peer_kill_rc),
         (0, 0),
-        "host-issued ClonePoolEmpty thread before first entry must accept both tgkill and peer kill(tid)"
+        "the ring-born child before first entry accepts tgkill and peer kill(tid)"
+    );
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(1),
+            f.page,
+            h.sib_control,
+            &mut h.sib_cpu,
+            SIGUSR1_NUM
+        ),
+        -11,
+        "a thread-directed signal is not the sibling's"
+    );
+    let _ = h.env.tasks[0].linux.take_host_work_doorbell();
+    assert!(
+        f.zone
+            .requeue_preempted(SlotId::new(0), root_record)
+            .is_queued()
+    );
+    assert_eq!(
+        h.env.switch_in(SlotId::new(0), &mut h.root_cpu),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(f.zone.slot(SlotId::new(0)).current(), Some(born_record));
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(0),
+            f.page,
+            born_control,
+            &mut h.root_cpu,
+            SIGUSR1_NUM
+        ),
+        SIGUSR1_NUM as i64,
+        "SIGUSR1 delivered to the child"
+    );
+    assert_eq!(
+        h.env.poll_sig(
+            SlotId::new(0),
+            f.page,
+            born_control,
+            &mut h.root_cpu,
+            SIGUSR1_NUM
+        ),
+        -11,
+        "standard signals coalesce: delivered exactly once"
+    );
+}
+
+/// "Busy once, then success": the pool is empty once, the host stocks it, and
+/// the same clone completes in ring with a ring-born child (a zone record
+/// bound to the stocked control), never a `ClonePoolEmpty` Forward.
+#[test]
+fn arm_empty_pool_clone_busy_once_then_ring_born() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let root_record = clone_on_empty_pool_parks(&mut h);
+    assert!(
+        h.env.tasks[0].linux.has_pending_host_work(),
+        "the waiting clone asked the host to stock its pool"
+    );
+    let mut born_control = None;
+    answer_clone_carrier_work(h.env, SlotId::new(0), f.control, root_record, || {
+        born_control = Some(stock_arm_root_pool_identity(f, 44, 1));
+    });
+    let born_control = born_control.unwrap();
+    let (clone_rc, _, born_record) = rerun_clone_in_ring(&mut h, root_record);
+    assert_eq!(clone_rc, 44);
+    assert_ne!(born_record, root_record);
+    assert_eq!(
+        born_control.zone_record(),
+        Some(f.zone.record_ref(born_record)),
+        "the child is ring-born: its control names its zone record"
+    );
+    assert_eq!(
+        f.zone.record(born_record).identity().control_slot,
+        born_control as *const _ as u64
+    );
+}
+
+/// Two live threads: while the clone caller waits for stock, its vCPU is free
+/// and a sibling on another vCPU keeps making progress.
+#[test]
+fn arm_empty_pool_clone_wait_leaves_sibling_running() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let root_record = clone_on_empty_pool_parks(&mut h);
+    assert_eq!(
+        f.zone.slot(SlotId::new(0)).current(),
+        None,
+        "no execution lease is held by the waiting clone"
+    );
+    for _ in 0..3 {
+        let counters = carrick_el1_abi::Counters::new();
+        let mut gettid = carrick_el1_abi::TrapFrame::default();
+        gettid.x[8] = 178;
+        h.env.call(
+            SlotId::new(1),
+            f.page,
+            h.sib_control,
+            &counters,
+            &mut gettid,
+            &mut h.sib_cpu,
+        );
+        assert_eq!(gettid.x[0], 43, "the sibling keeps running");
+    }
+    let mut born_control = None;
+    answer_clone_carrier_work(h.env, SlotId::new(0), f.control, root_record, || {
+        born_control = Some(stock_arm_root_pool_identity(f, 44, 1));
+    });
+    let (clone_rc, _, _) = rerun_clone_in_ring(&mut h, root_record);
+    assert_eq!(clone_rc, 44);
+}
+
+/// Lost wakeup: stock that lands after the clone observed the empty pool but
+/// before the host consumed its request is not missed; the rerun after the
+/// carrier's reply probes the pool again.
+#[test]
+fn arm_empty_pool_clone_sees_stock_published_before_its_request_is_served() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let root_record = clone_on_empty_pool_parks(&mut h);
+    // The stock lands first; the carrier then finds nothing left to stock.
+    let born_control = stock_arm_root_pool_identity(f, 44, 1);
+    answer_clone_carrier_work(h.env, SlotId::new(0), f.control, root_record, || {});
+    let (clone_rc, _, born_record) = rerun_clone_in_ring(&mut h, root_record);
+    assert_eq!(clone_rc, 44);
+    assert_eq!(
+        born_control.zone_record(),
+        Some(f.zone.record_ref(born_record))
+    );
+}
+
+/// No infinite wait: when the host answers without stocking (`RLIMIT_NPROC`,
+/// tid exhaustion), the rerun keeps today's host-issued answer for that call.
+#[test]
+fn arm_empty_pool_clone_unstocked_answer_falls_back_to_host_once() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let root_record = clone_on_empty_pool_parks(&mut h);
+    answer_clone_carrier_work(h.env, SlotId::new(0), f.control, root_record, || {});
+    if f.zone.slot(SlotId::new(0)).current() != Some(root_record) {
+        assert_eq!(
+            h.env.switch_in(SlotId::new(0), &mut h.root_cpu),
+            carrick_el1_abi::Action::Served
+        );
+    }
+    let counters = carrick_el1_abi::Counters::new();
+    let (route, _, _) = h.env.clone_thread(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &counters,
+        &mut h.root_cpu,
+    );
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "a host that could not stock answers this clone itself"
+    );
+    assert_eq!(
+        counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
+            .load(Ordering::Relaxed),
+        1
     );
 }
 
