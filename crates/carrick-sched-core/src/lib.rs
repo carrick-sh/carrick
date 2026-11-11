@@ -1677,15 +1677,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> BucketGuard<'_, C> {
 pub struct WakeEffects {
     /// One bit per slot to send a reschedule SGI to ([`ZoneSlot::sgi_target`]).
     pub sgi: [u64; ZONE_SLOT_WORDS],
-    /// A woken thread no other slot may run was queued on the waker's own
-    /// slot although the waker may not run it now (its address space needs
-    /// the waker's executor, or its affinity changed while it waited); the
-    /// waker must exit to the host. A thread another slot may run is never
-    /// misplaced: it goes to that slot ([`ZoneTables::wake_placed`]).
+    /// A woken thread that no other slot owns was queued on the waker's own
+    /// slot, which may not run it at EL0 now but whose executor serves it:
+    /// its address space needs the waker's executor, or it is homed on the
+    /// waker's slot. The waker must exit to the host. A thread another slot
+    /// owns is never misplaced: it goes to that slot, and one whose
+    /// affinity excludes the waker's CPU goes to the host
+    /// ([`ZoneTables::wake_placed`]).
     pub misplaced: bool,
-    /// A woken `futex_waitv` waiter (a host park) went to the carrier's
-    /// completion chain; the waker must exit to the host boundary that
-    /// settles the chain and hands the waiter to its continuation.
+    /// A woken waiter went to the carrier's completion chain: a
+    /// `futex_waitv` waiter (a host park), or one no slot an executor drives
+    /// may run whose affinity excludes the waker's CPU. The waker must exit
+    /// to the host boundary that settles the chain and hands the waiter to
+    /// its continuation.
     pub handed_to_host: bool,
     /// The waker's own run queue gained a thread.
     pub queued_own: bool,
@@ -2091,6 +2095,42 @@ pub struct SlotDrain {
     pub current: Option<RecordId>,
     /// The record of the host-loaded thread, if EL1 parked it.
     pub host_record: Option<RecordId>,
+}
+
+/// The custody a slot other than the waker gives a thread an EL1 wake
+/// queues there ([`ZoneTables::owner_candidates`]). Read lock-free it is a
+/// hint; under the slot's lock, which every drive change holds, it decides.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+enum OwnerCustody {
+    /// Its home slot, while an executor drives it.
+    Home,
+    /// A live slot that may run it ([`ZoneSlot::is_live`]).
+    Live,
+    /// A slot an executor drives, live or away on the host, on a CPU its
+    /// affinity allows.
+    Driven,
+}
+
+impl OwnerCustody {
+    fn holds<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        self,
+        zone: &ZoneTables<C>,
+        slot: SlotId,
+        rec: &ZoneRecord<C>,
+    ) -> bool {
+        let s = zone.slot(slot);
+        match self {
+            Self::Home => s.driver().is_some(),
+            Self::Live => s.is_live() && zone.accepts_running(slot, rec),
+            Self::Driven => s.driver().is_some() && rec.allows_cpu(s.cpu.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 /// How [`ZoneTables::place_in_guest`] ended.
@@ -2722,7 +2762,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         from: Claim,
     ) -> Option<HostPlacement> {
         let Placement::Placed(placement) =
-            self.requeue_claimed(slot, record, from, &SpinForever, |_| {})
+            self.requeue_claimed(slot, record, from, &SpinForever, || true, |_| {})
         else {
             return None;
         };
@@ -2736,21 +2776,28 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     /// Queue `record`, moved from claim `from`, on `slot` whether or not the
-    /// slot is in the guest, waiting for its lock by `wait`. `claimed` runs
-    /// after the claim swap, before the record is visible on the queue.
-    /// [`HostPlacement::resched`]: the slot runs a thread or sleeps in WFI
-    /// and owes a reschedule; the caller delivers it in its own venue.
+    /// slot is in the guest, waiting for its lock by `wait`. `admits` decides
+    /// under that lock, which every drive change holds ([`ZoneSlot::drive`]),
+    /// whether the slot still takes it ([`Placement::NoSlot`] if not).
+    /// `claimed` runs after the claim swap, before the record is visible on
+    /// the queue. [`HostPlacement::resched`]: the slot runs a thread or
+    /// sleeps in WFI and owes a reschedule; the caller delivers it in its own
+    /// venue.
     fn requeue_claimed(
         &self,
         slot: SlotId,
         record: RecordId,
         from: Claim,
         wait: &impl LockWait<C>,
+        admits: impl FnOnce() -> bool,
         claimed: impl FnOnce(&ZoneRecord<C>),
     ) -> Placement {
         let Some(guard) = self.slot_lock(slot, wait) else {
             return Placement::NoSlot;
         };
+        if !admits() {
+            return Placement::NoSlot;
+        }
         let rec = self.record(record);
         if !rec.cas(
             from,
@@ -3238,13 +3285,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// is in the guest. When no slot in the guest may take it now, or the
     /// slot it planned changed meanwhile, a thread the waker may run goes on
     /// the waker's own run queue (which is unbounded); any other goes on the
-    /// slot that owns it ([`Self::owner_slot`]: home, last or an eligible
-    /// slot, busy, contended or stopped at a host exit), whose driver runs
-    /// it when that slot is in the guest again. Only a thread no slot but
-    /// the waker's may run stays on the waker's queue, reported
-    /// [`WakeEffects::misplaced`]. A
-    /// `futex_waitv` waiter (only the host parks one) goes to the carrier's
-    /// completion chain ([`WakeEffects::handed_to_host`]).
+    /// slot that owns it ([`Self::owner_candidates`]: home, last or an
+    /// eligible slot an executor drives, busy, contended or stopped at a
+    /// host exit, re-checked under that slot's lock), whose driver runs it
+    /// when that slot is in the guest again. A thread no other slot owns
+    /// stays on the waker's queue, reported [`WakeEffects::misplaced`], only
+    /// when the waker's executor may serve it (its CPU is one the thread's
+    /// affinity allows); otherwise it goes to the carrier's completion
+    /// chain, as a `futex_waitv` waiter (only the host parks one) does
+    /// ([`WakeEffects::handed_to_host`]).
     ///
     /// An EL1 wake is never refused (#1941): a refused wake used to forward,
     /// and a ring-owned fork child has no host task to serve a forward, so
@@ -3339,15 +3388,34 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         entry_id: u32,
         effects: &mut WakeEffects,
     ) -> bool {
+        self.hand_parked_to_host(record, seq, index, effects, || {
+            self.unlink(guard, entry_id);
+            self.drop_entry(self.record(record), entry_id);
+        })
+    }
+
+    /// EL1 wakes the parked `record` (park `seq`, waitv `index`) to its
+    /// thread's host continuation: it takes the record's transfer, runs
+    /// `unlink_wait` (removing the woken wait entry) and queues the record on
+    /// the carrier's completion chain, which the host boundary the waker
+    /// then owes ([`WakeEffects::handed_to_host`]) settles
+    /// ([`Self::take_completion_handbacks`]). False: another claimant took
+    /// the park first.
+    fn hand_parked_to_host(
+        &self,
+        record: RecordId,
+        seq: u32,
+        index: u64,
+        effects: &mut WakeEffects,
+        unlink_wait: impl FnOnce(),
+    ) -> bool {
         let Some(transfer) =
             self.begin_host_transfer(self.record_ref(record), Claim::Parked { seq })
         else {
             return false;
         };
-        let rec = self.record(record);
-        self.mark_woken(rec, index);
-        self.unlink(guard, entry_id);
-        self.drop_entry(rec, entry_id);
+        self.mark_woken(self.record(record), index);
+        unlink_wait();
         self.defer_completion_handback(transfer);
         effects.handed_to_host = true;
         self.counters.el1_wakes.fetch_add(1, Ordering::Relaxed);
@@ -3357,7 +3425,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Where EL1 on `waker` may queue `record` now: `Some(waker)` for its own
     /// run queue, `Some(other)` for another slot, `None` if no slot in the
     /// guest may run it (lock-free hint; the claim re-checks under the
-    /// slot's lock and otherwise queues it on the waker, misplaced).
+    /// slot's lock and otherwise queues it on the slot that owns it, the
+    /// waker's misplaced, or the host).
     pub fn placement(&self, record: RecordId, waker: SlotId) -> Option<SlotId> {
         let rec = self.record(record);
         if let Some(home) = rec.home() {
@@ -3383,26 +3452,95 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.least_loaded_except(rec, true, Some(waker))
     }
 
-    /// The slot other than `waker` that owns `rec` when the waker may not
-    /// run it and no slot in the guest took it: its home; else the slot it
-    /// last ran on, if live and able to run it; else the shortest live run
-    /// queue that may run it; else the slot it last ran on, if its affinity
-    /// allows that slot's CPU, live or not (the custody
-    /// [`Self::place_native_handback`] gives a native handback,
-    /// #1892/#1902). A live slot's driver comes back to it at every exit,
-    /// and an away one at [`Self::step_back`], so a thread queued there runs
-    /// once that slot is in the guest again ([`Self::reschedule_owed`]).
-    /// `None`: no slot but the waker's may run it.
-    fn owner_slot(&self, rec: &ZoneRecord<C>, waker: SlotId) -> Option<SlotId> {
+    /// After an EL1 wake queued the unhomed `rec` on `owner`, a slot whose
+    /// driver is away: kick every live slot its affinity allows, which may
+    /// have become live on that CPU since the choice (a driver stepped back,
+    /// or drives another slot there), so its idle loop steals the thread
+    /// sooner than the away driver returns. The kick
+    /// `route_native_handback` gives a native handback queued on a slot
+    /// that is not live (#1892/#1902). A slot in the guest gets the SGI; a
+    /// stopped one raises its owed reschedule on re-entry.
+    fn kick_peers_of_away_owner(
+        &self,
+        rec: &ZoneRecord<C>,
+        owner: SlotId,
+        effects: &mut WakeEffects,
+    ) {
+        if rec.home().is_some() || self.slot(owner).is_live() {
+            return;
+        }
+        for index in 0..ZONE_SLOTS {
+            let Some(slot) = SlotId::from_index(index) else {
+                continue;
+            };
+            let s = self.slot(slot);
+            if slot == owner || !s.is_live() || !rec.allows_cpu(s.cpu.load(Ordering::Relaxed)) {
+                continue;
+            }
+            self.owe_resched(slot);
+            if matches!(s.state(), SlotState::Running | SlotState::IdleWfi) {
+                effects.push_sgi(slot);
+            }
+        }
+    }
+
+    /// The slots other than `waker` that may own `rec` when the waker may
+    /// not run it and no slot in the guest took it, in order, each with the
+    /// custody it needs (lock-free hints; [`OwnerCustody::admits`] decides
+    /// under the slot's lock): its home; else the slot it last ran on, if
+    /// live and able to run it; else the shortest live run queue that may
+    /// run it; else the slot it last ran on, else the shortest run queue of
+    /// any slot an executor drives, if its affinity allows that slot's CPU,
+    /// live or away (the custody [`Self::place_native_handback`] gives a
+    /// native handback, #1892/#1902). A live slot's driver comes back to it
+    /// at every exit, and an away one at [`Self::step_back`], so a thread
+    /// queued there runs once that slot is in the guest again
+    /// ([`Self::reschedule_owed`]). A slot nobody drives (`drive == 0`, left
+    /// by [`Self::leave_slot`]) is never an owner: no driver comes back to
+    /// it. No candidate: the waker hands the thread to the host.
+    fn owner_candidates(
+        &self,
+        rec: &ZoneRecord<C>,
+        waker: SlotId,
+    ) -> [Option<(SlotId, OwnerCustody)>; 4] {
         if let Some(home) = rec.home() {
-            return (home != waker).then_some(home);
+            return [
+                (home != waker).then_some((home, OwnerCustody::Home)),
+                None,
+                None,
+                None,
+            ];
         }
         let last = rec.last_slot().filter(|slot| *slot != waker);
-        last.filter(|slot| self.slot(*slot).is_live() && self.accepts_running(*slot, rec))
-            .or_else(|| self.least_loaded_except(rec, false, Some(waker)))
-            .or_else(|| {
-                last.filter(|slot| rec.allows_cpu(self.slot(*slot).cpu.load(Ordering::Relaxed)))
-            })
+        [
+            last.filter(|slot| OwnerCustody::Live.holds(self, *slot, rec))
+                .map(|slot| (slot, OwnerCustody::Live)),
+            self.least_loaded_except(rec, false, Some(waker))
+                .map(|slot| (slot, OwnerCustody::Live)),
+            last.filter(|slot| OwnerCustody::Driven.holds(self, *slot, rec))
+                .map(|slot| (slot, OwnerCustody::Driven)),
+            self.least_loaded_driven_except(rec, waker)
+                .map(|slot| (slot, OwnerCustody::Driven)),
+        ]
+    }
+
+    /// The slot other than `except` with the shortest run queue that an
+    /// executor drives, live or away, on a CPU `rec`'s affinity allows.
+    fn least_loaded_driven_except(&self, rec: &ZoneRecord<C>, except: SlotId) -> Option<SlotId> {
+        let mut best: Option<(SlotId, u32)> = None;
+        for index in 0..ZONE_SLOTS {
+            let Some(slot) = SlotId::from_index(index) else {
+                continue;
+            };
+            if slot == except || !OwnerCustody::Driven.holds(self, slot, rec) {
+                continue;
+            }
+            let len = self.slot(slot).len.load(Ordering::Relaxed);
+            if best.is_none_or(|(_, shortest)| len < shortest) {
+                best = Some((slot, len));
+            }
+        }
+        best.map(|(slot, _)| slot)
     }
 
     /// Whether `slot` may run `rec` at EL0 by the address space installed on
@@ -3545,47 +3683,74 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 return true;
             }
         }
+        let waker_cpu_allowed = rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed));
         let runs_on_waker = home.is_none_or(|home| home == waker)
             && self.runs_mm_of(waker, rec)
-            && rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed));
-        if !runs_on_waker && let Some(owner) = self.owner_slot(rec, waker) {
+            && waker_cpu_allowed;
+        if !runs_on_waker && home != Some(waker) {
             // The waker may not run it, and no slot in the guest took it
-            // now: queue it on the slot that may run it, busy, contended or
+            // now: queue it on the slot that owns it, busy, contended or
             // stopped at a host exit, never on the waker's queue, which no
-            // host boundary relocates (#1961 review; `migrate_queued` moves
-            // only unhomed threads, and only to idle slots in the guest).
-            // This is the custody `place_native_handback` gives a native
-            // handback (#1892/#1902). The waker holds the bucket lock and
-            // takes the slot lock without a bound, the order `wake_host`
-            // uses: no slot-lock holder takes a bucket lock.
-            let claimed = |rec: &ZoneRecord<C>| {
-                self.mark_woken(rec, index);
-                unlink_wait();
-            };
+            // host boundary relocates and whose CPU may be one its affinity
+            // excludes (#1961 review). This is the custody
+            // `place_native_handback` gives a native handback (#1892/#1902).
+            // Each candidate's custody is re-checked under its slot lock,
+            // which every drive change holds, so a slot its driver left
+            // meanwhile is never chosen; each is tried once, never retried.
+            // The waker holds the bucket lock and takes the slot lock without
+            // a bound, the order `wake_host` uses: no slot-lock holder takes
+            // a bucket lock.
             let from = Claim::Parked { seq };
-            let placed = if nonblocking {
-                self.requeue_claimed(owner, record, from, &BoundedSpin(0), claimed)
-            } else {
-                self.requeue_claimed(owner, record, from, &SpinForever, claimed)
-            };
-            match placed {
-                Placement::Placed(placement) => {
-                    if placement.resched {
-                        effects.push_sgi(placement.slot);
-                    }
-                    self.counters.el1_wakes.fetch_add(1, Ordering::Relaxed);
-                    self.counters
-                        .el1_cross_wakes
-                        .fetch_add(1, Ordering::Relaxed);
-                    return true;
+            let candidates = self.owner_candidates(rec, waker);
+            for (position, candidate) in candidates.iter().enumerate() {
+                let Some((owner, custody)) = *candidate else {
+                    continue;
+                };
+                if candidates[..position].contains(candidate) {
+                    continue;
                 }
-                Placement::Lost => return false,
-                Placement::NoSlot => {}
+                let admits = || custody.holds(self, owner, rec);
+                let claimed = |rec: &ZoneRecord<C>| {
+                    self.mark_woken(rec, index);
+                    unlink_wait();
+                };
+                let placed = if nonblocking {
+                    self.requeue_claimed(owner, record, from, &BoundedSpin(0), admits, claimed)
+                } else {
+                    self.requeue_claimed(owner, record, from, &SpinForever, admits, claimed)
+                };
+                match placed {
+                    Placement::Placed(placement) => {
+                        if placement.resched {
+                            effects.push_sgi(placement.slot);
+                        }
+                        self.kick_peers_of_away_owner(rec, owner, effects);
+                        self.counters.el1_wakes.fetch_add(1, Ordering::Relaxed);
+                        self.counters
+                            .el1_cross_wakes
+                            .fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                    Placement::Lost => return false,
+                    Placement::NoSlot => {}
+                }
+            }
+            if home.is_some() || !waker_cpu_allowed {
+                if nonblocking {
+                    // The caller hands it to its host continuation itself.
+                    return false;
+                }
+                // No slot an executor drives may run it, and the waker's
+                // CPU may not either (its affinity excludes it, or its home
+                // slot has no driver): its thread resumes through the host,
+                // as a `futex_waitv` waiter does, never queued where no
+                // driver or allowed CPU would run it (#1961 review).
+                return self.hand_parked_to_host(record, seq, index, effects, unlink_wait);
             }
         }
         // The waker's own run queue: the placement chose it, or the chosen
-        // slot changed since the plan and the waker may run it, or no slot
-        // may run it at all.
+        // slot changed since the plan and the waker may run it, or no other
+        // slot owns it and the waker's executor may serve it on this CPU.
         let slot_guard = if nonblocking {
             self.slot_lock(waker, &BoundedSpin(0))
         } else {
@@ -4094,6 +4259,83 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// executor to discard (nothing is switched in).
     pub fn switch_in(&self, slot: SlotId) -> Option<RecordId> {
         self.switch_in_full(slot).map(|switched| switched.record)
+    }
+
+    /// [`Self::switch_in_full`] for a CPU that runs whatever it switches
+    /// in, with no host exit to move a thread it may not run (x86 CPL0):
+    /// never a thread whose affinity excludes `slot`'s CPU (narrowed while
+    /// it was queued). Such a thread goes to the slot that owns it
+    /// ([`Self::owner_candidates`], re-checked under that slot's lock), its
+    /// reschedule in `effects`, and the next head is tried. With no owner it
+    /// goes back to the head of the queue and this returns `None`: no CPU an
+    /// executor drives may run it.
+    pub fn switch_in_admitted(
+        &self,
+        slot: SlotId,
+        effects: &mut WakeEffects,
+    ) -> Option<SwitchedIn> {
+        let cpu = self.slot(slot).cpu.load(Ordering::Relaxed);
+        // Each refused head leaves this queue for good: at most its length.
+        for _ in 0..=self.slot(slot).queued() {
+            let switched = self.switch_in_full(slot)?;
+            let rec = self.record(switched.record);
+            if rec.allows_cpu(cpu) {
+                return Some(switched);
+            }
+            if !self.move_to_owner(slot, switched.record, effects) {
+                self.unswitch(slot, switched.record);
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Move `record`, which [`Self::switch_in_full`] just switched in on
+    /// `slot` although its affinity excludes that CPU, to the run queue of
+    /// the slot that owns it. False: no slot an executor drives may run
+    /// it, or a host request claimed it meanwhile; it is still switched in.
+    fn move_to_owner(&self, slot: SlotId, record: RecordId, effects: &mut WakeEffects) -> bool {
+        let rec = self.record(record);
+        let from @ Claim::OnCpu { slot: on, .. } = rec.claim() else {
+            return false;
+        };
+        if on != slot {
+            return false;
+        }
+        let candidates = self.owner_candidates(rec, slot);
+        for (position, candidate) in candidates.iter().enumerate() {
+            let Some((owner, custody)) = *candidate else {
+                continue;
+            };
+            if candidates[..position].contains(candidate) {
+                continue;
+            }
+            match self.requeue_claimed(
+                owner,
+                record,
+                from,
+                &SpinForever,
+                || custody.holds(self, owner, rec),
+                |_| {
+                    let s = self.slot(slot);
+                    if s.current.load(Ordering::Acquire) == record.raw() {
+                        s.current.store(NIL, Ordering::Release);
+                    }
+                },
+            ) {
+                Placement::Placed(placement) => {
+                    if placement.resched {
+                        effects.push_sgi(placement.slot);
+                    }
+                    self.kick_peers_of_away_owner(rec, owner, effects);
+                    self.counters.el1_migrations.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Placement::Lost => return false,
+                Placement::NoSlot => {}
+            }
+        }
+        false
     }
 
     /// [`Self::switch_in`] with what the caller must apply.
