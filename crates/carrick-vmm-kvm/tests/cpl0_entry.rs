@@ -3122,3 +3122,257 @@ fn production_pipe_metadata_stays_in_the_ring_namespace() {
     assert!(outcome.run.stdout.is_empty());
     assert!(outcome.run.stderr.is_empty());
 }
+
+/// Witness 3 & 5 (#2070): CPL0 x86 signal-frame copy encountering address-space
+/// owner contention (`INJECT_ROOT_BUSY_ONCE`) or transient service refusal
+/// (`INJECT_OWNED_COPY_BUSY_ONCE`) must park on the existing continuation,
+/// keep the dequeued signal owned without forcing SIGSEGV, and deliver the
+/// original handler once after resume.
+fn run_production_signal_frame_contention_probe(busy_service_mode: bool) {
+    const INJECT_ROOT_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe10;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+    const INJECT_OWNED_COPY_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe1b;
+    const INJECT_OWNED_COPY_CENSUS: u64 = 0xffff_ffff_ffff_fe1c;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+
+    code.extend_from_slice(&[0x48, 0xbc]); // movabs rsp, stack
+    let stack_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    for offset in (0x4000_u64..=0xe000).step_by(0x1000) {
+        append_mov(&mut code, &[0x48, 0xb8], IMAGE_BASE + offset);
+        code.extend_from_slice(&[0xc6, 0x00, 0x5a]);
+    }
+
+    append_mov(&mut code, &[0x48, 0xbf], 10);
+    code.extend_from_slice(&[0x48, 0xbe]);
+    let action_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xd2]);
+    append_mov(&mut code, &[0x49, 0xba], 8);
+    append_mov(&mut code, &[0x48, 0xb8], 13);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+
+    append_mov(&mut code, &[0x48, 0xb8], 39);
+    code.extend_from_slice(&[0x0f, 0x05, 0x49, 0x89, 0xc4]);
+
+    let inject = if busy_service_mode {
+        INJECT_OWNED_COPY_BUSY_ONCE
+    } else {
+        INJECT_ROOT_BUSY_ONCE
+    };
+    append_mov(&mut code, &[0x48, 0xb8], inject);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    append_mov(&mut code, &[0x48, 0xbe], 10);
+    append_mov(&mut code, &[0x48, 0xb8], 62);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+
+    code.extend_from_slice(&[0x48, 0xb8]);
+    let check_counter_ptr = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x8b, 0x00]);
+    append_result_check(&mut code, &mut failures, 1);
+
+    if busy_service_mode {
+        append_mov(&mut code, &[0x48, 0xb8], INJECT_OWNED_COPY_CENSUS);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&0x0000_0001_0000_0002_u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x39, 0xc8, 0x0f, 0x85]);
+        failures.push(code.len());
+        code.extend_from_slice(&0_i32.to_le_bytes());
+    } else {
+        append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        append_result_check(&mut code, &mut failures, 1);
+    }
+
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let handler = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&[0x48, 0xb8]);
+    let handler_counter_ptr = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xff, 0x00, 0xc3]);
+    let restorer = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&[0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
+    while code.len() % 8 != 0 {
+        code.push(0x90);
+    }
+    let counter = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    let action = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&handler.to_le_bytes());
+    code.extend_from_slice(&0x8400_0000_u64.to_le_bytes());
+    code.extend_from_slice(&restorer.to_le_bytes());
+    code.extend_from_slice(&0_u64.to_le_bytes());
+
+    let stack_top = IMAGE_BASE + 0xe000;
+    code[stack_pointer..stack_pointer + 8].copy_from_slice(&stack_top.to_le_bytes());
+    code[action_pointer..action_pointer + 8].copy_from_slice(&action.to_le_bytes());
+    code[check_counter_ptr..check_counter_ptr + 8].copy_from_slice(&counter.to_le_bytes());
+    code[handler_counter_ptr..handler_counter_ptr + 8].copy_from_slice(&counter.to_le_bytes());
+
+    let outcome = run_instrumented_pool_fixture(&production_probe_elf(&code), 64);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "busy_service_mode={busy_service_mode} signal frame contention must park and deliver once (exit={})",
+        outcome.run.exit_code
+    );
+}
+
+#[test]
+fn production_signal_frame_owner_wait_parks_and_delivers_once() {
+    run_production_signal_frame_contention_probe(false);
+}
+
+#[test]
+fn production_signal_frame_busy_once_retains_and_delivers_once() {
+    run_production_signal_frame_contention_probe(true);
+}
+
+/// Witness 4 (#2070): A genuine fault on the signal stack (unmapped or PROT_READ)
+/// still forces SIGSEGV with Linux's SI_KERNEL (si_code == 128, si_addr == 0).
+#[test]
+fn production_signal_frame_real_fault_delivers_sigsegv_si_kernel() {
+    for read_only in [false, true] {
+        let mut code = Vec::new();
+        let mut failures = Vec::new();
+
+        code.extend_from_slice(&[0x48, 0xbc]);
+        let stack_pointer = code.len();
+        code.extend_from_slice(&0_u64.to_le_bytes());
+        for offset in (0x4000_u64..=0xe000).step_by(0x1000) {
+            append_mov(&mut code, &[0x48, 0xb8], IMAGE_BASE + offset);
+            code.extend_from_slice(&[0xc6, 0x00, 0x5a]);
+        }
+
+        code.extend_from_slice(&[0x48, 0xbf]);
+        let altstack_pointer = code.len();
+        code.extend_from_slice(&0_u64.to_le_bytes());
+        code.extend_from_slice(&[0x31, 0xf6]);
+        append_mov(&mut code, &[0x48, 0xb8], 131);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        append_result_check(&mut code, &mut failures, 0);
+
+        append_mov(&mut code, &[0x48, 0xbf], 11);
+        code.extend_from_slice(&[0x48, 0xbe]);
+        let segv_action_pointer = code.len();
+        code.extend_from_slice(&0_u64.to_le_bytes());
+        code.extend_from_slice(&[0x31, 0xd2]);
+        append_mov(&mut code, &[0x49, 0xba], 8);
+        append_mov(&mut code, &[0x48, 0xb8], 13);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        append_result_check(&mut code, &mut failures, 0);
+
+        append_mov(&mut code, &[0x48, 0xbf], 10);
+        code.extend_from_slice(&[0x48, 0xbe]);
+        let usr1_action_pointer = code.len();
+        code.extend_from_slice(&0_u64.to_le_bytes());
+        code.extend_from_slice(&[0x31, 0xd2]);
+        append_mov(&mut code, &[0x49, 0xba], 8);
+        append_mov(&mut code, &[0x48, 0xb8], 13);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        append_result_check(&mut code, &mut failures, 0);
+
+        append_mov(&mut code, &[0x48, 0xb8], 39);
+        code.extend_from_slice(&[0x0f, 0x05, 0x49, 0x89, 0xc4]);
+
+        if read_only {
+            append_mov(&mut code, &[0x48, 0xbf], IMAGE_BASE + 0xa000);
+            append_mov(&mut code, &[0x48, 0xbe], 0x4000);
+            append_mov(&mut code, &[0x48, 0xba], 1);
+            append_mov(&mut code, &[0x48, 0xb8], 10);
+            code.extend_from_slice(&[0x0f, 0x05]);
+            append_result_check(&mut code, &mut failures, 0);
+            append_mov(&mut code, &[0x48, 0xbc], IMAGE_BASE + 0xe000);
+        } else {
+            append_mov(&mut code, &[0x48, 0xbc], 0x7000_0000);
+        }
+
+        code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+        append_mov(&mut code, &[0x48, 0xbe], 10);
+        append_mov(&mut code, &[0x48, 0xb8], 62);
+        code.extend_from_slice(&[0x0f, 0x05]);
+
+        let failure = code.len();
+        append_mov(&mut code, &[0x48, 0xbf], 9);
+        append_mov(&mut code, &[0x48, 0xb8], 231);
+        code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+
+        let segv_handler = IMAGE_BASE + code.len() as u64;
+        code.extend_from_slice(&[0x48, 0x83, 0xff, 11, 0x0f, 0x85]);
+        failures.push(code.len());
+        code.extend_from_slice(&0_i32.to_le_bytes());
+        code.extend_from_slice(&[0x81, 0x7e, 0x08, 0x80, 0x00, 0x00, 0x00, 0x0f, 0x85]);
+        failures.push(code.len());
+        code.extend_from_slice(&0_i32.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x83, 0x7e, 0x10, 0x00, 0x0f, 0x85]);
+        failures.push(code.len());
+        code.extend_from_slice(&0_i32.to_le_bytes());
+        append_mov(&mut code, &[0x48, 0xbf], 7);
+        append_mov(&mut code, &[0x48, 0xb8], 231);
+        code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+
+        for branch in failures {
+            let delta = i32::try_from(failure as isize - (branch as isize + 4)).unwrap();
+            code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+        }
+
+        let usr1_handler = IMAGE_BASE + code.len() as u64;
+        code.extend_from_slice(&[0xbf, 8, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
+        let restorer = IMAGE_BASE + code.len() as u64;
+        code.extend_from_slice(&[0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
+        while code.len() % 8 != 0 {
+            code.push(0x90);
+        }
+        let segv_action = IMAGE_BASE + code.len() as u64;
+        code.extend_from_slice(&segv_handler.to_le_bytes());
+        code.extend_from_slice(&0x0c00_0004_u64.to_le_bytes());
+        code.extend_from_slice(&restorer.to_le_bytes());
+        code.extend_from_slice(&0_u64.to_le_bytes());
+
+        let usr1_action = IMAGE_BASE + code.len() as u64;
+        code.extend_from_slice(&usr1_handler.to_le_bytes());
+        code.extend_from_slice(&0x0400_0000_u64.to_le_bytes());
+        code.extend_from_slice(&restorer.to_le_bytes());
+        code.extend_from_slice(&0_u64.to_le_bytes());
+
+        let altstack_record = IMAGE_BASE + code.len() as u64;
+        code.extend_from_slice(&(IMAGE_BASE + 0x4000).to_le_bytes());
+        code.extend_from_slice(&0_u64.to_le_bytes());
+        code.extend_from_slice(&0x4000_u64.to_le_bytes());
+
+        let initial_sp = IMAGE_BASE + 0x9000;
+        code[stack_pointer..stack_pointer + 8].copy_from_slice(&initial_sp.to_le_bytes());
+        code[altstack_pointer..altstack_pointer + 8]
+            .copy_from_slice(&altstack_record.to_le_bytes());
+        code[segv_action_pointer..segv_action_pointer + 8]
+            .copy_from_slice(&segv_action.to_le_bytes());
+        code[usr1_action_pointer..usr1_action_pointer + 8]
+            .copy_from_slice(&usr1_action.to_le_bytes());
+
+        let outcome = run_pool_fixture(&production_probe_elf(&code), 64);
+        assert_eq!(
+            outcome.run.exit_code, 7,
+            "read_only={read_only} real signal stack fault must deliver SIGSEGV with SI_KERNEL (exit={})",
+            outcome.run.exit_code
+        );
+    }
+}
