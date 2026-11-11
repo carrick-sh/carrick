@@ -146,9 +146,7 @@ fn root_sigprocmask_reads_untouched_readonly_file_mapping() {
     let watchdog = crate::common::Watchdog::start(std::time::Duration::from_secs(45));
     let dir = tempfile::tempdir().expect("signal copy fixture directory");
     let executable = dir.path().join("signal-copy");
-    std::fs::write(&executable, signal_copy_elf()).expect("generated signal-copy ELF");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::executable::write_executable(&executable, signal_copy_elf());
     let mut mask = vec![0u8; 4096];
     mask[..8].copy_from_slice(&512u64.to_le_bytes());
     std::fs::write(dir.path().join("mask"), mask).expect("readonly file-backed mask");

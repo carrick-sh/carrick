@@ -173,7 +173,6 @@ fn cross_toolchain_installs_restore_their_package_cache_first() {
 #[cfg(target_os = "linux")]
 fn warm_apt_cache_installs_without_contacting_the_mirror() {
     // #615: a crawling mirror failed `portable` seven times in one day.
-    use std::os::unix::fs::PermissionsExt;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let script = root.join("scripts/ci/apt-cached-install.sh");
     let temp = tempfile::tempdir().unwrap();
@@ -195,8 +194,7 @@ fn warm_apt_cache_installs_without_contacting_the_mirror() {
         ),
     ] {
         let path = bin.join(name);
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        carrick_test_support::executable::write_executable(&path, body);
     }
     let cache = temp.path().join("apt-cross");
     let run = |packages: &[&str]| {
@@ -875,7 +873,7 @@ fn compiler_cache_start_falls_back_only_on_transient_reader_faults() {
     // every call is logged, so no test reaches a real bucket.
     let stub_dir = tempfile::tempdir().unwrap();
     let stub = stub_dir.path().join("sccache");
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &stub,
         "#!/bin/sh\n\
          echo \"$* idle=$SCCACHE_IDLE_TIMEOUT\" >> \"$STUB_LOG\"\n\
@@ -887,11 +885,7 @@ fn compiler_cache_start_falls_back_only_on_transient_reader_faults() {
          *) echo 'sccache: error: Server startup failed: cache storage failed to read: \
          Unexpected (temporary) at read => S3Error { code: \"InternalError\" }' >&2; exit 2 ;;\n\
          esac\n",
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(&stub).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    std::fs::set_permissions(&stub, perms).unwrap();
+    );
     let run = |answer: &str, mode: &str, bin: &std::path::Path| {
         let temp = tempfile::tempdir().unwrap();
         let env_file = temp.path().join("env");
@@ -1044,15 +1038,13 @@ fn local_compiler_cache_start_replaces_only_a_stale_socket() {
     let log = dir.path().join("calls");
     let fake = dir.path().join("sccache");
     // `--show-stats` succeeds only when $FAKE_LIVE exists.
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &fake,
         format!(
             "#!/bin/sh\necho \"$*\" >> {}\ncase \"$1\" in --show-stats) [ -e \"$FAKE_LIVE\" ];; --start-server) exit 0;; esac\n",
             log.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    );
     let socket = dir.path().join("job.sock");
     let live = dir.path().join("live");
     let start = |calls: &str| {
