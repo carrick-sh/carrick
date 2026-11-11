@@ -1796,6 +1796,87 @@ mod icmp_ping_tests {
     };
     use carrick_guest_mem::GuestMemory;
 
+    fn parse_ping_group_range(contents: &str) -> Option<std::ops::RangeInclusive<u32>> {
+        let mut parts = contents.split_whitespace();
+        let lo: u32 = parts.next()?.parse().ok()?;
+        let hi: u32 = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(lo..=hi)
+    }
+
+    fn ping_group_range_excludes_gids(contents: &str, gids: &[u32]) -> Option<bool> {
+        let range = parse_ping_group_range(contents)?;
+        Some(!gids.iter().any(|gid| range.contains(gid)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_ping_socket_excluded_range(outcome: &DispatchOutcome) -> Option<String> {
+        if !matches!(outcome, DispatchOutcome::Errno { errno } if *errno == linux_errno::EACCES) {
+            return None;
+        }
+        let raw = std::fs::read_to_string("/proc/sys/net/ipv4/ping_group_range").ok()?;
+        // SAFETY: getegid takes no arguments and is always safe to call.
+        let egid = unsafe { libc::getegid() };
+        let mut gids = vec![egid];
+        // SAFETY: getgroups(0, null) queries the supplementary group count without writing.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count > 0 {
+            let mut supp = vec![0 as libc::gid_t; count as usize];
+            // SAFETY: supp has capacity `count` matching the first argument.
+            let n = unsafe { libc::getgroups(count, supp.as_mut_ptr()) };
+            if n > 0 {
+                supp.truncate(n as usize);
+                gids.extend(supp);
+            }
+        }
+        if ping_group_range_excludes_gids(&raw, &gids) == Some(true) {
+            Some(raw.trim().to_owned())
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn linux_ping_socket_excluded_range(_outcome: &DispatchOutcome) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn ping_group_range_parsing_covers_in_range_out_of_range_and_malformed() {
+        // In range (direct egid, boundary, and supplementary group).
+        assert_eq!(
+            ping_group_range_excludes_gids("0\t2147483647\n", &[990]),
+            Some(false)
+        );
+        assert_eq!(
+            ping_group_range_excludes_gids("990 990\n", &[990]),
+            Some(false)
+        );
+        assert_eq!(
+            ping_group_range_excludes_gids("100 200\n", &[990, 150]),
+            Some(false)
+        );
+
+        // Out of range (including Linux's default disabled range `1\t0`).
+        assert_eq!(
+            ping_group_range_excludes_gids("1\t0\n", &[0, 990]),
+            Some(true)
+        );
+        assert_eq!(
+            ping_group_range_excludes_gids("100 200\n", &[99, 201]),
+            Some(true)
+        );
+
+        // Malformed inputs.
+        assert_eq!(ping_group_range_excludes_gids("", &[990]), None);
+        assert_eq!(ping_group_range_excludes_gids("1\n", &[990]), None);
+        assert_eq!(ping_group_range_excludes_gids("abc def\n", &[990]), None);
+        assert_eq!(ping_group_range_excludes_gids("-1 10\n", &[990]), None);
+        assert_eq!(ping_group_range_excludes_gids("1 2 3\n", &[990]), None);
+    }
+
     #[test]
     fn loopback_echo_reply_is_queued_with_valid_checksum() {
         let dispatcher = SyscallDispatcher::new();
@@ -1805,7 +1886,15 @@ mod icmp_ping_tests {
             LINUX_IPPROTO_ICMP,
         ) {
             DispatchOutcome::Returned { value } => value as i32,
-            other => panic!("ping socket creation failed: {other:?}"),
+            other => {
+                if let Some(range) = linux_ping_socket_excluded_range(&other) {
+                    eprintln!(
+                        "host facility unavailable: Linux ping socket (net.ipv4.ping_group_range={range}); skipping"
+                    );
+                    return;
+                }
+                panic!("ping socket creation failed: {other:?}");
+            }
         };
         assert_eq!(
             dispatcher.socket_guest_protocol(fd),
