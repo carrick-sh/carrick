@@ -199,8 +199,23 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
         let Some(venue) = self.host_file else {
             return false;
         };
-        self.staged =
-            crate::native_host_file::stage(&self.call, venue.task, venue.cpu_slot, venue.origin);
+        let (files, file_table) = (self.files, self.file_table);
+        // The carrier's file table delegates the run's stdio streams to host
+        // objects; their transfers keep that route.
+        let delegated = |fd: i32| {
+            fd_map_lookup(files.fd_map(), file_table, fd)
+                .and_then(|(handle, _)| handle.checked_sub(1))
+                .and_then(|index| files.opens().get(index as usize))
+                .and_then(DelegatedOpenFile::host_object)
+                .is_some()
+        };
+        self.staged = crate::native_host_file::stage(
+            &self.call,
+            venue.task,
+            venue.cpu_slot,
+            venue.origin,
+            delegated,
+        );
         self.staged.is_some()
     }
 
