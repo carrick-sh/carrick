@@ -353,7 +353,7 @@ mod anonymous_refusal_tests {
         use carrick_el1::memory::AnonymousCallView;
         use carrick_personality_linux::entry::{decode_aarch64, decode_x86_64};
         let args = [0x100000, 0x3000, 1, 0, 0, 0];
-        for (arm_nr, x86_nr) in [(222, 9), (226, 10), (215, 11)] {
+        for (arm_nr, x86_nr) in [(222, 9), (226, 10), (215, 11), (233, 28)] {
             let arm = decode_aarch64(arm_nr, args, 0x8000);
             let x86 = decode_x86_64(x86_nr, args, 0x8000);
             let pc = carrick_guest_arch::UserVa::new(0x40004);
