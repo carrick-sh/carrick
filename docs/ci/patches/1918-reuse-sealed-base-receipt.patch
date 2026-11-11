@@ -1,0 +1,79 @@
+diff --git a/.github/workflows/signed-gate.yml b/.github/workflows/signed-gate.yml
+index 6da524439..f42fc7a5e 100644
+--- a/.github/workflows/signed-gate.yml
++++ b/.github/workflows/signed-gate.yml
+@@ -228,6 +228,22 @@ jobs:
+           sets=("$RUNNER_TEMP"/candidate-probes/*/*.tar.gz)
+           test "${#sets[@]}" -le 1
+           printf 'candidate=%s\n' "${sets[0]:-}" >> "$GITHUB_OUTPUT"
++      # Look up a sealed base receipt on this exact Mac before `execute` (#1918).
++      # Only this step receives GH_TOKEN; `execute` below still gets no API
++      # credential. Any miss exits zero without writing base-seal.json so
++      # `execute` runs PairSide::Base in-job as today.
++      - name: Look up reusable sealed base receipt for this Mac
++        if: needs.authorize.outputs.main != 'true'
++        shell: bash
++        env:
++          GH_TOKEN: ${{ github.token }}
++          CARRICK_SIGNED_FIXTURE_BUNDLE: ${{ steps.fixture.outputs.bundle }}
++        run: |
++          set -euo pipefail
++          rm -rf "$RUNNER_TEMP/reused-base"
++          cargo run --locked -p carrick-xtask -- signed-gate reuse-lookup \
++            --request "$RUNNER_TEMP/request/request.json" \
++            --output "$RUNNER_TEMP/reused-base"
+       # Both runs restore the merge base's trusted bundle; a candidate whose
+       # fixture inputs differ is refused rather than served by its own build,
+       # except for added probes, served to the candidate run only (#1980).
+@@ -244,9 +260,14 @@ jobs:
+           if [ -n "$CANDIDATE_PROBES" ]; then
+             candidate=(--candidate-probes "$CANDIDATE_PROBES")
+           fi
++          reuse=()
++          if [ -f "$RUNNER_TEMP/reused-base/base-seal.json" ]; then
++            reuse=(--reuse-base "$RUNNER_TEMP/reused-base")
++          fi
+           cargo run --locked -p carrick-xtask -- signed-gate execute \
+             --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/signed-result" \
+-            ${candidate[@]+"${candidate[@]}"}
++            ${candidate[@]+"${candidate[@]}"} \
++            ${reuse[@]+"${reuse[@]}"}
+       - name: Upload paired receipts, artifact identities and step logs
+         if: always()
+         uses: actions/upload-artifact@v4
+@@ -300,6 +321,35 @@ jobs:
+           path: ${{ runner.temp }}/signed-result/candidate.json
+           if-no-files-found: error
+           retention-days: 90
++      - name: Download base fixture bundle for reusable main baseline
++        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'
++        uses: actions/download-artifact@v4
++        with:
++          name: signed-base-fixtures-${{ github.run_attempt }}
++          path: ${{ runner.temp }}/signed-fixtures
++      - name: Prepare admitted reusable base receipt
++        id: reuse_base
++        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'
++        shell: bash
++        run: |
++          set -euo pipefail
++          shopt -s nullglob
++          bundles=("$RUNNER_TEMP"/signed-fixtures/*.tar.gz)
++          test "${#bundles[@]}" -eq 1
++          cargo run --locked -p carrick-xtask -- signed-gate prepare-reuse-upload \
++            --request "$RUNNER_TEMP/request/request.json" \
++            --results "$RUNNER_TEMP/signed-result" \
++            --fixture-bundle "${bundles[0]}" \
++            --run-id "${{ github.run_id }}" \
++            --output "$RUNNER_TEMP/signed-base-reuse"
++      - name: Publish admitted reusable base receipt
++        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success' && steps.reuse_base.outputs.artifact_name != ''
++        uses: actions/upload-artifact@v4
++        with:
++          name: ${{ steps.reuse_base.outputs.artifact_name }}
++          path: ${{ runner.temp }}/signed-base-reuse/
++          if-no-files-found: error
++          retention-days: 30
+       - name: Upload comparison and publication log
+         if: always()
+         uses: actions/upload-artifact@v4

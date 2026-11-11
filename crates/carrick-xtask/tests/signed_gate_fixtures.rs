@@ -276,3 +276,105 @@ fn signed_workflow_keeps_manual_requests_owner_only() {
     assert!(condition.contains("github.repository == 'carrick-sh/carrick'"));
     assert!(condition.contains("github.event.label.name == 'gate:signed'"));
 }
+
+/// #1918: `gate` looks up a reusable base receipt on the assigned Mac in a
+/// separate step that receives `GH_TOKEN`, while `execute` still receives no
+/// token; `publish` uploads the reusable base only for admitted `Main` runs.
+#[test]
+fn signed_gate_reuses_sealed_base_on_mac_with_token_isolated_from_execute() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let patch = root.join("docs/ci/patches/1918-reuse-sealed-base-receipt.patch");
+    let text = if patch.exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .current_dir(temp.path())
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init failed in tempdir");
+        let wf_dir = temp.path().join(".github/workflows");
+        fs::create_dir_all(&wf_dir).unwrap();
+        fs::copy(
+            root.join(".github/workflows/signed-gate.yml"),
+            wf_dir.join("signed-gate.yml"),
+        )
+        .unwrap();
+        let applied = std::process::Command::new("git")
+            .current_dir(temp.path())
+            .args(["apply", patch.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            applied.status.success(),
+            "1918 workflow patch failed to apply cleanly: {}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        fs::read_to_string(wf_dir.join("signed-gate.yml")).unwrap()
+    } else {
+        fs::read_to_string(root.join(".github/workflows/signed-gate.yml")).unwrap()
+    };
+    let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
+    let jobs = &docs[0]["jobs"];
+
+    let gate_steps = jobs["gate"]["steps"].as_vec().unwrap();
+    let lookup_pos = gate_steps
+        .iter()
+        .position(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.contains("signed-gate reuse-lookup"))
+        })
+        .expect("gate job must run signed-gate reuse-lookup");
+    let exec_pos = gate_steps
+        .iter()
+        .position(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.contains("signed-gate execute"))
+        })
+        .expect("gate job must run signed-gate execute");
+    assert!(
+        lookup_pos < exec_pos,
+        "reuse-lookup must run before signed-gate execute"
+    );
+
+    let lookup_step = &gate_steps[lookup_pos];
+    assert_eq!(
+        lookup_step["env"]["GH_TOKEN"].as_str(),
+        Some("${{ github.token }}"),
+        "only reuse-lookup receives GH_TOKEN on the gate Mac"
+    );
+    let exec_step = &gate_steps[exec_pos];
+    assert!(
+        exec_step["env"]["GH_TOKEN"].is_badvalue()
+            && exec_step["env"]["GITHUB_TOKEN"].is_badvalue(),
+        "signed-gate execute must never receive an API token"
+    );
+    assert!(
+        exec_step["run"].as_str().unwrap().contains("--reuse-base"),
+        "signed-gate execute must accept verified --reuse-base directory"
+    );
+
+    let publish_steps = jobs["publish"]["steps"].as_vec().unwrap();
+    let prep = publish_steps
+        .iter()
+        .find(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.contains("signed-gate prepare-reuse-upload"))
+        })
+        .expect("publish job must prepare reusable base for admitted Main runs");
+    assert_eq!(
+        prep["if"].as_str(),
+        Some("needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'")
+    );
+    let upload = publish_steps
+        .iter()
+        .find(|s| s["name"].as_str() == Some("Publish admitted reusable base receipt"))
+        .expect("publish job must upload admitted reusable base receipt");
+    assert!(
+        upload["if"].as_str().unwrap().contains(
+            "needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'"
+        )
+    );
+}

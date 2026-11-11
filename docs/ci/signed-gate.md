@@ -27,8 +27,13 @@ candidate, on the same Mac in the same job and under the same exclusive
 identity, and publication compares the candidate only with this paired base.
 A pair whose host or fixture evidence still differs is reported as
 **INCOMPARABLE BASE — BLOCKED**, never as NEW (an incomplete base is not
-that case; see below). No stored receipt from another
-run or host is downloaded.
+that case; see below). No receipt from another host, macOS build, fixture
+bundle or toolchain is ever used. When an admitted `main` run of
+`signed-gate.yml` already published a sealed `signed-base-reuse-<base>-<key_sha256>`
+artifact for the exact same Mac, macOS build, fixture bundle, `rust-toolchain.toml`
+and `scripts/entitlements.plist` (#1918), `reuse-lookup` verifies the seal on
+that Mac before tokenless `execute` runs and reuses the `base/` evidence; any
+miss or verification doubt falls back to executing `PairSide::Base` in-job.
 
 **Fixture authority comes from main, never from the candidate** (#1889).
 The `base-fixtures` job runs trusted `main` code that finds the
