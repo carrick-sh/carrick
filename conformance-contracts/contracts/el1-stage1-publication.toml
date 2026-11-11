@@ -1,3 +1,6 @@
+# #1733: `vcpu_loop/signal.rs` adds `exclude_settling_guest_cow`, a held
+# use of the existing `exclude_el1_editor` settlement for the EL0 COW refill.
+# No change to this contract's guest semantics, bindings or budgets.
 # #1394: additional ABI bookkeeping witness only; existing semantic and
 # work-budget bindings remain authoritative. Census publication reads counters
 # after executor join and does not alter this contract's guest operation.
