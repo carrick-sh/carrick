@@ -369,6 +369,13 @@ impl PendingAddressSpaceRetirement {
         self.tid
     }
 
+    #[cfg(test)]
+    pub(crate) fn lifecycle_event(
+        &self,
+    ) -> Option<carrick_observability::probes::HvpatchGuestLifecycle> {
+        self.lifecycle_event
+    }
+
     pub(crate) fn take_root_retirement_ticket(
         &mut self,
     ) -> Result<Option<Stage1RootRetirementTicket>, String> {
