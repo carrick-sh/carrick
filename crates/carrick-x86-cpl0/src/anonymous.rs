@@ -239,9 +239,9 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                     )
                     .is_err()
                 {
-                    return DelegatedStep::Served(SyscallResult::from_errno(
-                        carrick_syscall_abi::LINUX_EFAULT,
-                    ));
+                    // The edit is already committed and the refusal is an
+                    // ownership failure no errno repairs: fatal, as on ARM.
+                    fatal_reservation();
                 }
                 DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
