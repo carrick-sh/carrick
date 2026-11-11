@@ -1065,12 +1065,13 @@ pub(super) fn finish_native_service(
         carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
     ) {
         let doorbell = carrick_el1_abi::take_host_work_doorbell(usize::from(service.slot().raw()));
-        carrick_kernel::el1_delegation::settle_carrier_work_boundary(
+        let reply = carrick_kernel::el1_delegation::settle_carrier_work(
             kernel,
-            service.request().identity.birth.record,
+            carrick_el1_abi::zone_tables(),
+            &service.request(),
             doorbell,
         );
-        service.acknowledge_work()?
+        service.acknowledge_work(reply)?
     } else if matches!(
         service.request().operation,
         carrick_core_abi::service::ServiceOperation::Exec { .. }

@@ -8,9 +8,7 @@ pub const SERVED_FORWARD_WORK: u32 = 3;
 /// The doorbell retains the terminal publisher's slot until host settlement.
 /// One LinuxTaskState belongs to one slot, so concurrent publications OR the
 /// same source, while ordinary work preserves it. No per-task ABI field moves.
-/// Protocol 3 adds the thread-stock demand cause (bit 2).
-pub const HOST_WORK_PROTOCOL: u64 = 3;
-const THREAD_STOCK_WORK: u32 = 4;
+pub const HOST_WORK_PROTOCOL: u64 = 2;
 const TERMINAL_WORK_SLOT_SHIFT: u32 = 8;
 const TERMINAL_WORK_SLOT_MASK: u32 = 0x1ff << TERMINAL_WORK_SLOT_SHIFT;
 
@@ -48,11 +46,6 @@ impl HostWorkDoorbell {
     }
     pub fn native_signal_wake(&self) -> bool {
         self.0 & 2 != 0
-    }
-    /// A ring thread clone found its unmanaged pool empty and waits in its
-    /// carrier work for the host ledger to stock it (#1974).
-    pub fn thread_stock_demand(&self) -> bool {
-        self.0 & THREAD_STOCK_WORK != 0
     }
     /// The settling boundary has delivered the owed work.
     pub fn settled(self) {}
@@ -115,12 +108,6 @@ impl LinuxTaskState {
     /// Preserve this cause when ordinary host work is published concurrently.
     pub fn mark_native_signal_work(&self) {
         self.pending_host_work.fetch_or(2, Ordering::Release);
-    }
-    /// An unmanaged ring clone found its pool empty: its carrier work owes
-    /// the host ledger's stock before the clone reruns in ring (#1974).
-    pub fn mark_thread_stock_work(&self) {
-        self.pending_host_work
-            .fetch_or(THREAD_STOCK_WORK, Ordering::Release);
     }
     /// A native terminal release owes the enrolled host record owner a recheck.
     /// Its stopped slot retains the exact terminal identity through Free;
@@ -268,27 +255,6 @@ mod host_work_tests {
             assert_eq!(work.native_terminal_slot(), None);
             work.settled();
         }
-    }
-
-    #[test]
-    fn thread_stock_demand_survives_other_causes_until_consumed() {
-        let state = LinuxTaskState::new();
-        state.mark_thread_stock_work();
-        state.mark_native_signal_work();
-        state.mark_pending_host_work();
-        state.mark_native_terminal_work(carrick_sched_core::SlotId::new(3));
-        let doorbell = state.take_host_work_doorbell().unwrap();
-        assert!(doorbell.thread_stock_demand());
-        assert!(doorbell.native_signal_wake());
-        assert_eq!(
-            doorbell.native_terminal_slot(),
-            Some(carrick_sched_core::SlotId::new(3))
-        );
-        doorbell.settled();
-        state.mark_pending_host_work();
-        let doorbell = state.take_host_work_doorbell().unwrap();
-        assert!(!doorbell.thread_stock_demand());
-        doorbell.settled();
     }
 
     #[test]

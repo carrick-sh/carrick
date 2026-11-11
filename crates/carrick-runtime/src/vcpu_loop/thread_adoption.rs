@@ -1085,4 +1085,138 @@ mod tests {
         drop(fork_permit);
         scheduler.close();
     }
+
+    /// #1974 host half, through production pieces: `bind_executable_thread_births`
+    /// installs the real `ProcessThreadAdoptionFactory`, and a singleton
+    /// holds no stock. The shared `settle_carrier_work` (what the ARM
+    /// carrier's `finish_native_service` calls) then answers a `CarrierWork`
+    /// request from the process's exact zone member: plain work is only
+    /// `Delivered` and stocks nothing; a thread-stock demand stocks the pool
+    /// through the factory's real `reserve` and answers `Stocked`, so a ring
+    /// claim succeeds; a stale requester is `Unstockable`.
+    #[test]
+    fn carrier_work_stock_demand_stocks_the_exact_requester_through_the_real_factory() {
+        use carrick_core_abi::service::{
+            CarrierDemand, CarrierWorkReply, ServiceBirth, ServiceIdentity, ServiceOperation,
+            ServiceOrigin, ServiceRequest,
+        };
+        use carrick_el1_abi::Lifecycle as _;
+        let (_, scheduler, kernel, owner, process, _) =
+            test_carrier_graph_with_dispatcher!(72_531, SyscallDispatcher::new());
+        let owner_state = state(&kernel, &owner, 1_001);
+        let mut cpu = executor::tests::task_state(&owner, 1_001);
+        cpu.asid_generation = process.asid_generation();
+        let GuestCpuState::Aarch64V1(registers) = &mut cpu.cpu else {
+            panic!("architecture");
+        };
+        Arc::make_mut(registers).asid_generation = process.asid_generation();
+        let page = owner.thread().control_lease().lifecycle();
+        assert!(page.serves_threads(), "the fixture serves ring threads");
+        bind_executable_thread_births(
+            &kernel,
+            &owner_state,
+            &owner,
+            cpu,
+            Some(BackendBirthTemplate::Test),
+        )
+        .unwrap();
+        let ledger = owner.kernel();
+        let standing = || {
+            ledger
+                .standing_thread_identities(owner.task().key().id)
+                .len()
+        };
+        assert_eq!(standing(), 0, "a bound singleton is not demand");
+
+        let zone = {
+            let layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+            // SAFETY: all-zero is the valid empty zone.
+            unsafe {
+                let ptr = std::alloc::alloc_zeroed(layout).cast::<carrick_el1_abi::ZoneTables>();
+                assert!(!ptr.is_null());
+                Box::from_raw(ptr)
+            }
+        };
+        let key = owner.thread().key();
+        let record = zone
+            .alloc_record(carrick_sched_core::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+                serial: key.serial.raw(),
+                mm: 4,
+                generation: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        let request = |demand, record: carrick_sched_core::RecordRef| ServiceRequest {
+            identity: ServiceIdentity {
+                birth: ServiceBirth {
+                    origin: ServiceOrigin::Initial,
+                    process: carrick_sched_core::process::TaskKey {
+                        id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                            core::num::NonZeroI32::new(1).unwrap(),
+                        ),
+                        serial: carrick_sched_core::process::TaskSerial::from_registry_allocation(
+                            core::num::NonZeroU64::MIN,
+                        ),
+                    },
+                    thread: carrick_core_abi::EntryThreadGeneration::from_raw(key.serial.raw()),
+                    record,
+                    // SAFETY: a synthetic, never-reused MM identity naming no
+                    // memory; the host half reads only the requester record.
+                    mm: unsafe {
+                        carrick_core_abi::El1MmHandle::from_admitted_owner(
+                            core::num::NonZeroU64::MIN,
+                            carrick_core_abi::ReservationMm::new(4).unwrap(),
+                            core::num::NonZeroU64::MIN,
+                        )
+                    },
+                },
+                execution: carrick_el1_abi::SnapshotGeneration::INITIAL,
+                sequence: core::num::NonZeroU64::MIN,
+            },
+            operation: ServiceOperation::CarrierWork {
+                entry: carrick_sched_core::object_wait::OwnerEntry::Syscall,
+                demand,
+            },
+            fault_sequence: None,
+        };
+        let exact = zone.record_ref(record);
+        let stale = carrick_sched_core::RecordRef {
+            id: exact.id,
+            incarnation: exact.incarnation + 1,
+        };
+        let settle = |demand, record| {
+            carrick_kernel::el1_delegation::settle_carrier_work(
+                ledger,
+                Some(&zone),
+                &request(demand, record),
+                None,
+            )
+        };
+        assert_eq!(
+            settle(CarrierDemand::Work, exact),
+            CarrierWorkReply::Delivered
+        );
+        assert_eq!(standing(), 0, "plain carrier work is not stock demand");
+        assert_eq!(
+            settle(CarrierDemand::ThreadStock, stale),
+            CarrierWorkReply::Unstockable,
+            "a requester no longer exact in the zone"
+        );
+        assert_eq!(standing(), 0);
+        assert_eq!(
+            settle(CarrierDemand::ThreadStock, exact),
+            CarrierWorkReply::Stocked
+        );
+        assert_eq!(
+            standing(),
+            carrick_core::lifecycle::stock::DEFAULT_THREAD_POOL_DEPTH,
+            "stocked through the real factory's reserve"
+        );
+        assert!(
+            page.claim_any().is_ok(),
+            "the clone's rerun claims a stocked entry"
+        );
+        scheduler.close();
+    }
 }

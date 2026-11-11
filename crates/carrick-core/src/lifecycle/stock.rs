@@ -21,6 +21,16 @@ pub fn replenish(stock: &mut impl ThreadStock, depth: usize) {
     }
 }
 
+/// Whether `page` holds an issued, unclaimed (`Reserved`) entry: stock a ring
+/// clone can claim now. A host stocker's answer to a waiting clone (#1974) is
+/// this, read after its replenish, never the size of its own ledger.
+pub fn claimable(page: &dyn Lifecycle) -> bool {
+    (0..page.entry_count()).any(|index| {
+        page.state(index)
+            .is_some_and(|(_, state)| state == super::EntryState::Reserved)
+    })
+}
+
 /// Identities retained by a stock owner until both lifecycle exit and the final
 /// control pin have settled. `I` owns the adapter's namespace reservation.
 pub struct StockEntries<I> {

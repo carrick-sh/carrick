@@ -2884,21 +2884,20 @@ fn arm_root_ring_born_tgkill_before_first_entry_queues_signal_once() {
     );
 }
 
-/// How the carrier learns that a `CarrierWork` request owes thread stock.
-/// Today the demand is a cause bit in the requester's slot doorbell.
+/// How the carrier learns that a `CarrierWork` request owes thread stock:
+/// from the exact request it claimed, never from a shared slot word.
 fn carrier_stock_demand(
-    env: MultiSlotEnv,
-    slot: SlotId,
-    _request: &carrick_core_abi::service::ServiceRequest,
+    _env: MultiSlotEnv,
+    _slot: SlotId,
+    request: &carrick_core_abi::service::ServiceRequest,
 ) -> bool {
-    env.tasks[slot.index()]
-        .linux
-        .take_host_work_doorbell()
-        .is_some_and(|doorbell| {
-            let demand = doorbell.thread_stock_demand();
-            doorbell.settled();
-            demand
-        })
+    matches!(
+        request.operation,
+        carrick_core_abi::service::ServiceOperation::CarrierWork {
+            demand: carrick_core_abi::service::CarrierDemand::ThreadStock,
+            ..
+        }
+    )
 }
 
 /// The host side of an empty-pool clone's "not now" (#1974 slice 2b): the
@@ -2945,8 +2944,19 @@ fn answer_clone_carrier_work(
         "the carrier sees the clone's stock demand"
     );
     stock();
+    // The host's answer rule (`carrick_kernel::el1_delegation::settle_carrier_work`):
+    // stocked iff the page holds claimable stock after its replenish.
+    let reply = if carrick_core::lifecycle::stock::claimable(env.fixture.page) {
+        carrick_core_abi::service::CarrierWorkReply::Stocked
+    } else {
+        carrick_core_abi::service::CarrierWorkReply::Unstockable
+    };
     ticket
-        .complete(true)
+        .complete(
+            reply
+                .supplied_for(carrick_core_abi::service::CarrierDemand::ThreadStock)
+                .unwrap(),
+        )
         .unwrap_or_else(|_| panic!("clone carrier-work ticket was cancelled"));
     zone.object_wait(key, &carrick_sched_core::ShortLockSpin, complete)
         .unwrap()
@@ -3678,14 +3688,11 @@ fn arm_host_only_empty_pool_clone_stays_host_issued() {
     );
     assert!(
         h.env.tasks[0]
-            .linux
-            .take_host_work_doorbell()
-            .is_none_or(|doorbell| {
-                let demand = doorbell.thread_stock_demand();
-                doorbell.settled();
-                !demand
-            }),
-        "no stock demand for a page the host never stocks"
+            .service_notice
+            .take()
+            .expect("readable service notice")
+            .is_none(),
+        "no carrier work, so no stock demand, for a page the host never stocks"
     );
 }
 

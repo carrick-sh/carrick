@@ -909,7 +909,10 @@ pub(super) fn native_service_operation(
         // This operation owns the work until its exact carrier reply. Do not
         // manufacture the vector's independent host-work doorbell: a reply
         // consumed in ring would otherwise leave that doorbell armed forever.
-        return Some(ServiceOperation::CarrierWork { entry });
+        return Some(ServiceOperation::CarrierWork {
+            entry,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
+        });
     }
     if action != Action::Forward {
         return None;
@@ -919,6 +922,7 @@ pub(super) fn native_service_operation(
             .has_pending_host_work()
             .then_some(ServiceOperation::CarrierWork {
                 entry: OwnerEntry::Exception,
+                demand: carrick_core_abi::service::CarrierDemand::Work,
             });
     }
     match (frame.esr >> 26) & 0x3f {

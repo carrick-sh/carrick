@@ -467,7 +467,8 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
             assert!(matches!(
                 ticket.request().operation,
                 carrick_core_abi::service::ServiceOperation::CarrierWork {
-                    entry: carrick_sched_core::object_wait::OwnerEntry::Syscall
+                    entry: carrick_sched_core::object_wait::OwnerEntry::Syscall,
+                    demand: carrick_core_abi::service::CarrierDemand::Work,
                 }
             ));
             drop(queue);
