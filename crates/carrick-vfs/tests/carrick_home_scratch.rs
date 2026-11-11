@@ -59,6 +59,18 @@ fn census(root: &Path) -> BTreeMap<PathBuf, u64> {
     out
 }
 
+/// The `carrick run` shape: extract, then leave through `process::exit`,
+/// which runs no `Drop` and joins no worker. Only run by the test below.
+#[test]
+#[ignore = "child process of runs_keep_all_state_under_carrick_home_and_release_it"]
+fn exiting_run_child() {
+    let layer = PathBuf::from(std::env::var_os("CARRICK_TEST_LAYER").expect("layer"));
+    let mut backend = HostFsBackend::new().expect("scratch backend");
+    backend.extract_layers(&[layer]).expect("extract");
+    std::mem::forget(backend);
+    std::process::exit(0);
+}
+
 #[test]
 fn runs_keep_all_state_under_carrick_home_and_release_it() {
     let carrick_home = tempfile::tempdir().unwrap();
@@ -89,6 +101,14 @@ fn runs_keep_all_state_under_carrick_home_and_release_it() {
 
     assert!(run(&bad).is_err(), "the injected layer error must surface");
     run(&good).expect("good layer extracts after the failure");
+
+    // A process that exits without dropping its backend still releases it.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "exiting_run_child"])
+        .env("CARRICK_TEST_LAYER", &good)
+        .status()
+        .unwrap();
+    assert!(status.success(), "exiting run child failed: {status}");
 
     assert_eq!(
         census(home.path()),

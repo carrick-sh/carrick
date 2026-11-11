@@ -574,17 +574,7 @@ fn resolve_scratch_root_from(
     // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick. (No
     // diskutil: a host without the conventional mount almost certainly has no
     // carrick volume, and an exotic mount can be pointed at via $CARRICK_HOME.)
-    let home = carrick_home
-        .map(PathBuf::from)
-        .or_else(|| {
-            home.map(|h| {
-                let mut p = PathBuf::from(h);
-                p.push(".carrick");
-                p
-            })
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp/carrick"));
-    home.join("scratch")
+    carrick_spec::carrick_home_from(carrick_home, home).join("scratch")
 }
 
 /// The default writable-layer backend when the user passes no `--fs`.
