@@ -1027,6 +1027,8 @@ fn zombie_process_is_reported_dead_by_liveness_helper() {
 
 // Signed runs (#2013): build under carrick, execute under gate, one artifact.
 const SIGNED_PHASE_FIXTURE: &str = "signed_phase_fixture";
+const SIGNED_PHASE_DETACHED_FIXTURE: &str = "signed_phase_detached_descendant_fixture";
+const SIGNED_PHASE_CONTENDER_FIXTURE: &str = "signed_phase_gate_contender_fixture";
 const SIGNED_PHASE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[test]
@@ -1078,6 +1080,169 @@ fn signed_phase_fixture() {
     .unwrap();
 }
 
+#[test]
+#[ignore = "detached execute-descendant fixture, invoked by the signed-phases custody regression"]
+fn signed_phase_detached_descendant_fixture() {
+    signed_phase_fixture();
+    let phase = std::env::var(carrick_xtask::signed_phase::PHASE_ENV).unwrap();
+    if phase != "execute" {
+        return;
+    }
+    let log_path = std::path::PathBuf::from(std::env::var_os("SIGNED_PHASE_LOG").unwrap());
+    let run_dir = log_path.parent().unwrap();
+    let mut cmd = Command::new("/bin/sleep");
+    cmd.arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe and detaches the bounded descendant
+    // into its own session/process group so it outlives the execute command.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let descendant = cmd.spawn().unwrap();
+    let pid = descendant.id() as libc::pid_t;
+    std::mem::forget(descendant);
+    // SAFETY: getsid has no preconditions for a live process ID.
+    assert_eq!(
+        unsafe { libc::getsid(pid) },
+        pid,
+        "execute descendant must run in its own session"
+    );
+    let pid_tmp = run_dir.join("descendant.pid.tmp");
+    let pid_path = run_dir.join("descendant.pid");
+    std::fs::write(&pid_tmp, format!("{pid}\n")).unwrap();
+    std::fs::rename(&pid_tmp, &pid_path).unwrap();
+
+    // Hold the execute command until the independent contender subprocess is
+    // actively observing the lock across command exit and supervisor cleanup.
+    let ready_path = run_dir.join("contender.ready");
+    let deadline = std::time::Instant::now() + SIGNED_PHASE_BOUND;
+    while !ready_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for contender readiness before exiting execute command"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[ignore = "independent gate contender subprocess, invoked by the signed-phases custody regression"]
+fn signed_phase_gate_contender_fixture() {
+    use std::io::BufRead;
+    use std::os::fd::AsRawFd;
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mode = lines.next().unwrap().unwrap();
+    let lock_path = std::path::PathBuf::from(lines.next().unwrap().unwrap());
+    let report_path = std::path::PathBuf::from(lines.next().unwrap().unwrap());
+    let lock = std::fs::File::open(&lock_path).unwrap();
+
+    match mode.as_str() {
+        "probe" => {
+            let wait_ms: u64 = lines.next().unwrap().unwrap().parse().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+            let mut admitted = false;
+            loop {
+                // SAFETY: lock owns an independent open file description on the lock file.
+                let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc == 0 {
+                    // SAFETY: immediately release our probe lock.
+                    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+                    admitted = true;
+                    break;
+                }
+                let err = std::io::Error::last_os_error().raw_os_error();
+                assert!(
+                    matches!(err, Some(libc::EWOULDBLOCK) | Some(libc::EINTR)),
+                    "unexpected flock probe error: {err:?}"
+                );
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let tmp = report_path.with_extension("tmp");
+            std::fs::write(&tmp, if admitted { "admitted\n" } else { "refused\n" }).unwrap();
+            std::fs::rename(&tmp, &report_path).unwrap();
+        }
+        "watch" => {
+            let pid: libc::pid_t = lines.next().unwrap().unwrap().parse().unwrap();
+            let ready_path = std::path::PathBuf::from(lines.next().unwrap().unwrap());
+            // Confirm refusal before letting the execute command exit.
+            for _ in 0..3 {
+                let (alive, rc) = observe_exclusion(
+                    // SAFETY: probe signal 0 only on the execute fixture's descendant PID.
+                    || unsafe { libc::kill(pid, 0) == 0 },
+                    // SAFETY: independent open file description.
+                    || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                );
+                assert_eq!(
+                    rc, -1,
+                    "contender admitted while execute command was still holding gate"
+                );
+                assert!(alive, "execute descendant {pid} died before command exit");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            let deadline = std::time::Instant::now() + SIGNED_PHASE_BOUND;
+            // SAFETY: hard kernel bound so a blocking flock never outlives the test bound.
+            unsafe {
+                libc::alarm(SIGNED_PHASE_BOUND.as_secs() as libc::c_uint);
+            }
+            let ready_tmp = ready_path.with_extension("tmp");
+            std::fs::write(&ready_tmp, "ready\n").unwrap();
+            std::fs::rename(&ready_tmp, &ready_path).unwrap();
+
+            let mut kill_errno = 0;
+            let (alive_at_admission, lock_rc) = observe_exclusion(
+                || {
+                    // SAFETY: signal 0 probes existence (including unreaped zombies) without signalling.
+                    let ok = unsafe { libc::kill(pid, 0) == 0 };
+                    if !ok {
+                        kill_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    }
+                    ok
+                },
+                || loop {
+                    // SAFETY: independent open file description; wakes immediately on last unlock/close.
+                    let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+                    if rc == 0
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break rc;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "contender interrupted past deadline waiting for gate release"
+                    );
+                },
+            );
+            assert_eq!(lock_rc, 0, "contender failed to acquire gate after release");
+            // SAFETY: release probe flock and disarm the watchdog alarm.
+            unsafe {
+                libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
+                libc::alarm(0);
+            }
+            let tmp = report_path.with_extension("tmp");
+            std::fs::write(
+                &tmp,
+                format!("admitted=true alive_at_admission={alive_at_admission} kill_errno={kill_errno}\n"),
+            )
+            .unwrap();
+            std::fs::rename(&tmp, &report_path).unwrap();
+        }
+        other => panic!("unknown contender mode: {other}"),
+    }
+}
+
 /// A signed host executable whose identity depends on `tag`. On macOS it
 /// is a real ad-hoc-signed Mach-O (a copy of `/usr/bin/true` signed with
 /// `codesign -s -` under identifier `tag`), so the production identity
@@ -1113,6 +1278,10 @@ impl SignedPhaseRun {
     }
 
     fn start(dir: tempfile::TempDir, outer: Option<&HostLease>) -> Self {
+        Self::start_fixture(dir, outer, SIGNED_PHASE_FIXTURE)
+    }
+
+    fn start_fixture(dir: tempfile::TempDir, outer: Option<&HostLease>, fixture: &str) -> Self {
         let lock = Self::lock(dir.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
         command
@@ -1121,7 +1290,7 @@ impl SignedPhaseRun {
             .arg(dir.path().join("state"))
             .arg("--")
             .arg(std::env::current_exe().unwrap())
-            .args(["--exact", SIGNED_PHASE_FIXTURE, "--ignored", "--nocapture"])
+            .args(["--exact", fixture, "--ignored", "--nocapture"])
             .env_remove("CARRICK_HOST_LEASE_SOCKET")
             .env("CARRICK_HOST_LEASE_PATH", &lock)
             .env("SIGNED_PHASE_ARTIFACT", dir.path().join("artifact"))
@@ -1338,6 +1507,205 @@ fn signed_phases_refuse_an_inherited_shared_lease_before_building() {
     );
     assert_eq!(run.phases(), "", "nothing builds without a path to gate");
     drop(shared);
+}
+
+#[cfg(test)]
+fn spawn_gate_contender_subprocess(stdin_payload: &str) -> std::process::Child {
+    use std::io::Write;
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            SIGNED_PHASE_CONTENDER_FIXTURE,
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env_remove("CARRICK_HOST_LEASE_FD")
+        .env_remove("CARRICK_HOST_LEASE_MODE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin_payload.as_bytes())
+        .unwrap();
+    child
+}
+
+#[cfg(test)]
+fn wait_contender_subprocess(mut child: std::process::Child) {
+    let deadline = std::time::Instant::now() + SIGNED_PHASE_BOUND;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            if !status.success() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "gate contender subprocess failed ({status}): stdout={}, stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "gate contender subprocess timed out: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+fn probe_gate_from_subprocess(
+    lock_path: &std::path::Path,
+    report_path: &std::path::Path,
+    wait_ms: u64,
+) -> String {
+    let _ = std::fs::remove_file(report_path);
+    let payload = format!(
+        "probe\n{}\n{}\n{wait_ms}\n",
+        lock_path.display(),
+        report_path.display()
+    );
+    let child = spawn_gate_contender_subprocess(&payload);
+    wait_contender_subprocess(child);
+    std::fs::read_to_string(report_path)
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn signed_phases_retain_gate_until_detached_execute_descendant_is_reaped() {
+    struct CustodyWitnessCleanup {
+        watch: Option<std::process::Child>,
+        unreaped_descendant: Option<libc::pid_t>,
+    }
+    impl Drop for CustodyWitnessCleanup {
+        fn drop(&mut self) {
+            if let Some(mut watch) = self.watch.take() {
+                let _ = watch.kill();
+                let _ = watch.wait();
+            }
+            if let Some(pid) = self.unreaped_descendant.take() {
+                // SAFETY: only signalled if signed-phases aborted before reaping its descendant.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    let mut run = SignedPhaseRun::start_fixture(
+        tempfile::tempdir().unwrap(),
+        None,
+        SIGNED_PHASE_DETACHED_FIXTURE,
+    );
+    run.until("execute descendant pid", |run| {
+        run.read("descendant.pid")
+            .trim()
+            .parse::<libc::pid_t>()
+            .is_ok()
+    });
+    let descendant_pid: libc::pid_t = run.read("descendant.pid").trim().parse().unwrap();
+    let mut guard = CustodyWitnessCleanup {
+        watch: None,
+        unreaped_descendant: Some(descendant_pid),
+    };
+    let lock_path = SignedPhaseRun::lock(run.dir.path());
+    let probe_report = run.dir.path().join("contender-probe.report");
+
+    // (1a) While the detached execute descendant is alive and signed-phases is
+    // still running, repeated independent contender processes are refused.
+    for attempt in 0..3 {
+        // SAFETY: signal 0 probes existence of the execute descendant.
+        assert_eq!(
+            unsafe { libc::kill(descendant_pid, 0) },
+            0,
+            "execute descendant {descendant_pid} died before contention probe {attempt}"
+        );
+        assert!(
+            run.child.try_wait().unwrap().is_none(),
+            "signed-phases exited before contention probe {attempt}"
+        );
+        let verdict = probe_gate_from_subprocess(&lock_path, &probe_report, 100);
+        assert_eq!(
+            verdict, "refused",
+            "independent gate contender admitted on probe {attempt} while descendant {descendant_pid} was alive"
+        );
+    }
+
+    // (1b) Start the continuous contender subprocess BEFORE the execute command
+    // exits so it observes the exact command-exit -> cancel/reap -> unlock window.
+    let watch_report = run.dir.path().join("contender-watch.report");
+    let ready_path = run.dir.path().join("contender.ready");
+    let watch_payload = format!(
+        "watch\n{}\n{}\n{descendant_pid}\n{}\n",
+        lock_path.display(),
+        watch_report.display(),
+        ready_path.display()
+    );
+    guard.watch = Some(spawn_gate_contender_subprocess(&watch_payload));
+
+    let (status, run) = run.finish();
+    // SAFETY: probe whether the supervisor cancelled and reaped the descendant.
+    let post_exit_kill = unsafe { libc::kill(descendant_pid, 0) };
+    let post_exit_errno = std::io::Error::last_os_error().raw_os_error();
+    if post_exit_kill != 0 && post_exit_errno == Some(libc::ESRCH) {
+        guard.unreaped_descendant = None;
+    }
+
+    wait_contender_subprocess(guard.watch.take().unwrap());
+    assert!(status.success(), "stderr: {}", run.read("stderr.log"));
+    assert_eq!(
+        run.phases(),
+        "build mode=carrick shared=ok\nexecute mode=gate shared=blocked\n"
+    );
+
+    let report = std::fs::read_to_string(&watch_report).unwrap();
+    let mut alive_at_admission = None;
+    let mut kill_errno = None;
+    for token in report.split_whitespace() {
+        if let Some((key, value)) = token.split_once('=') {
+            match key {
+                "alive_at_admission" => alive_at_admission = Some(value.parse::<bool>().unwrap()),
+                "kill_errno" => kill_errno = Some(value.parse::<i32>().unwrap()),
+                _ => {}
+            }
+        }
+    }
+    let alive_at_admission = alive_at_admission.expect("alive_at_admission in contender report");
+    let kill_errno = kill_errno.expect("kill_errno in contender report");
+    assert!(
+        !alive_at_admission && kill_errno == libc::ESRCH,
+        "gate lease released before execute descendant {descendant_pid} was cancelled and reaped (alive_at_admission={alive_at_admission}, kill_errno={kill_errno})"
+    );
+
+    // (2) After signed-phases exits, the descendant is gone (ESRCH) and a fresh
+    // independent contender process is admitted.
+    assert_eq!(
+        post_exit_kill, -1,
+        "execute descendant {descendant_pid} survived signed-phases exit"
+    );
+    assert_eq!(
+        post_exit_errno,
+        Some(libc::ESRCH),
+        "expected ESRCH for reaped execute descendant {descendant_pid}, got {post_exit_errno:?}"
+    );
+    let post_verdict = probe_gate_from_subprocess(&lock_path, &probe_report, 1000);
+    assert_eq!(
+        post_verdict, "admitted",
+        "fresh gate contender refused after signed-phases exited and reaped descendant"
+    );
 }
 
 /// A committed checkout whose `check-disk` recipe records its admission
