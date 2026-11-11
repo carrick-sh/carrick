@@ -11176,11 +11176,16 @@ mod tests {
         use carrick_el1_linux::mm_portal::test_support::{ROOT, Region, admit_notified};
         use std::num::NonZeroU64;
 
-        /// The carrier's settlement, reduced to the pool bookkeeping.
+        /// The carrier's settlement, reduced to the pool bookkeeping. The
+        /// installation is process-wide and outlives this test: later serial
+        /// tests exclude editors with no EL1 region, so it settles nothing
+        /// there.
         struct FreeCompletions;
         impl carrick_el1_abi::CowGrantSettlement for FreeCompletions {
             fn settle(&self, excluded: &ExcludedEditor<'_>) {
-                let pool = carrick_el1_abi::cow_grant_pool_host().unwrap();
+                let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
+                    return;
+                };
                 let completions: Vec<_> = pool.completions(excluded).collect();
                 for completion in completions {
                     assert!(pool.finish(excluded, &completion.grant));
