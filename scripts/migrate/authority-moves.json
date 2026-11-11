@@ -111,6 +111,10 @@
     {
       "owner": "carrick_runtime::deadline_driver::DeadlineDriver::start",
       "issue": 1977
+    },
+    {
+      "owner": "carrick_el1_image::build_program::read_depfile",
+      "issue": 2059
     }
   ],
   "terminal_custody": []
