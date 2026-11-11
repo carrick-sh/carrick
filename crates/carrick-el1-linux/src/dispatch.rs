@@ -3616,11 +3616,18 @@ impl<
                 task,
                 validator: &file::HardwareValidator,
             };
-            return process
-                .native_futex(call, &mut copy)
-                .map_or(FamilyCompletion::Forward, |outcome| {
-                    lifecycle::lifecycle_effect(&outcome)
-                });
+            let Some(outcome) = process.native_futex(call, &mut copy) else {
+                return FamilyCompletion::Forward;
+            };
+            // The futex family publishes an immediate result in its frame,
+            // as ARM's `serve_futex_operation` writes x0: the shared
+            // completion installs none for it. Without this an x86
+            // FUTEX_WAKE returned its own syscall number (202).
+            if let lifecycle::LifecycleOutcome::Returned { result, .. } = &outcome {
+                self.frame
+                    .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
+            }
+            return lifecycle::lifecycle_effect(&outcome);
         }
         let mut operation = self
             .process
