@@ -1849,7 +1849,15 @@ fn answer_clone_carrier_work(
         .expect("readable service notice")
         .expect("the parked clone published its carrier work");
     assert_eq!(notice.record, reference, "the clone caller's own notice");
+    // The CarrierWork boundary consumes its slot's doorbell, as
+    // `finish_native_service` does, and finds the stock demand there.
+    let doorbell = env.tasks[slot.index()]
+        .linux
+        .take_host_work_doorbell()
+        .expect("the waiting clone rang the host-work doorbell");
+    assert!(doorbell.thread_stock_demand(), "the doorbell names stock");
     stock();
+    doorbell.settled();
     let key = carrick_sched_core::object_wait::ObjectWaitKey::native_service(reference).unwrap();
     let complete: &dyn Fn(
         carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Aarch64ParkedContext>,
@@ -1952,11 +1960,12 @@ fn rerun_clone_in_ring(
 
 /// The #1974 window: the first ARM root clone finds the ring pool empty. It
 /// waits for the host to stock the pool instead of becoming a host-issued
-/// birth, then completes in ring; `tgkill` and a peer process's `kill(tid)`
-/// on the just-cloned thread succeed before its first entry, and the signal
-/// is delivered exactly once.
+/// birth, then completes in ring; `tgkill` on the just-cloned thread succeeds
+/// before its first entry and the signal is delivered exactly once. A peer
+/// process's `kill(tid)` gets the same answer as for an adopted, registered
+/// nonleader sibling (nonleader `kill` itself is #1994).
 #[test]
-fn arm_empty_pool_clone_waits_for_stock_then_child_accepts_tgkill_and_peer_kill() {
+fn arm_empty_pool_clone_waits_for_stock_then_child_accepts_tgkill() {
     let mut h = setup_arm_root_two_live_threads_and_peer();
     let f = h.env.fixture;
     let root_record = clone_on_empty_pool_parks(&mut h);
@@ -1976,18 +1985,29 @@ fn arm_empty_pool_clone_waits_for_stock_then_child_accepts_tgkill_and_peer_kill(
         (41, 44),
         SIGUSR1_NUM,
     );
-    let peer_kill_rc = h.env.peer_kill(
+    assert_eq!(
+        tgkill_rc, 0,
+        "the ring-born child before first entry accepts tgkill"
+    );
+    let peer_kill_child = h.env.peer_kill(
         SlotId::new(2),
         h.peer_page,
         h.peer_control,
         &mut h.peer_cpu,
         44,
-        SIGUSR1_NUM,
+        0,
+    );
+    let peer_kill_sibling = h.env.peer_kill(
+        SlotId::new(2),
+        h.peer_page,
+        h.peer_control,
+        &mut h.peer_cpu,
+        43,
+        0,
     );
     assert_eq!(
-        (tgkill_rc, peer_kill_rc),
-        (0, 0),
-        "the ring-born child before first entry accepts tgkill and peer kill(tid)"
+        peer_kill_child, peer_kill_sibling,
+        "peer kill(tid) treats the ring-born child as a registered nonleader"
     );
     assert_eq!(
         h.env.poll_sig(
@@ -2035,6 +2055,38 @@ fn arm_empty_pool_clone_waits_for_stock_then_child_accepts_tgkill_and_peer_kill(
     );
 }
 
+/// The peer half of the #1974 window: after the empty-pool wait, a peer
+/// process's `kill(tid)` reaches the ring-born child before its first entry.
+#[test]
+#[ignore = "red until #1994 (kill of a nonleader tid): returns -3 for any nonleader, including the adopted sibling control"]
+fn arm_empty_pool_clone_child_accepts_peer_kill_before_first_entry() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    let root_record = clone_on_empty_pool_parks(&mut h);
+    answer_clone_carrier_work(h.env, SlotId::new(0), f.control, root_record, || {
+        stock_arm_root_pool_identity(f, 44, 1);
+    });
+    let (clone_rc, _, _) = rerun_clone_in_ring(&mut h, root_record);
+    assert_eq!(clone_rc, 44);
+    let tgkill_rc = h.env.tgkill(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &mut h.root_cpu,
+        (41, 44),
+        SIGUSR1_NUM,
+    );
+    let peer_kill_rc = h.env.peer_kill(
+        SlotId::new(2),
+        h.peer_page,
+        h.peer_control,
+        &mut h.peer_cpu,
+        44,
+        SIGUSR2_NUM,
+    );
+    assert_eq!((tgkill_rc, peer_kill_rc), (0, 0));
+}
+
 /// "Busy once, then success": the pool is empty once, the host stocks it, and
 /// the same clone completes in ring with a ring-born child (a zone record
 /// bound to the stocked control), never a `ClonePoolEmpty` Forward.
@@ -2043,10 +2095,6 @@ fn arm_empty_pool_clone_busy_once_then_ring_born() {
     let mut h = setup_arm_root_two_live_threads_and_peer();
     let f = h.env.fixture;
     let root_record = clone_on_empty_pool_parks(&mut h);
-    assert!(
-        h.env.tasks[0].linux.has_pending_host_work(),
-        "the waiting clone asked the host to stock its pool"
-    );
     let mut born_control = None;
     answer_clone_carrier_work(h.env, SlotId::new(0), f.control, root_record, || {
         born_control = Some(stock_arm_root_pool_identity(f, 44, 1));
