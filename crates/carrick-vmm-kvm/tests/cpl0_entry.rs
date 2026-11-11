@@ -3874,3 +3874,43 @@ die:
     );
     assert_eq!(outcome.run.terminating_signal, None);
 }
+
+/// #2095: the leader's fork holds its process's birth reservation
+/// (`reserve_birth`, held by the fixture image at MM preparation) while the
+/// worker thread on the other CPU calls blocking `wait4` for an exited child.
+/// Contention is "not now": the worker parks on the reservation's release
+/// and reaps the zombie, never failing with -EAGAIN. The worker's park
+/// releases the held fork; on a failed wait the worker releases it itself.
+#[test]
+fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
+    const CHILD_ENV: &str = "CARRICK_WAIT_BIRTH_CONTENTION_CHILD";
+    const TEST_NAME: &str =
+        "production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation";
+    if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(TEST_NAME)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "30"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, TEST_NAME)
+            .output()
+            .expect("bounded x86 birth contention witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded x86 birth contention witness failed: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture("native_wait_birth_contention.S", &[]);
+    let outcome = run_instrumented_pool_fixture(&elf, 128);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "worker wait4 under a held birth reservation (100 + n reports errno n, \
+         111 = EAGAIN): {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
