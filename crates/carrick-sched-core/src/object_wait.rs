@@ -1707,9 +1707,11 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
             if let Claim::Parked { seq } = rec.claim() {
                 // Readiness is already committed by the object. Even when no
                 // slot in the guest admits it now, queue the owned operation
-                // on the slot that owns it (`ZoneTables::owner_slot`); only a
-                // waiter no slot but the waker's may run stays on the waker,
-                // reported via WakeEffects::misplaced.
+                // on the slot that owns it (`ZoneTables::owner_candidates`).
+                // A waiter no other slot owns stays on the waker, reported
+                // via WakeEffects::misplaced, only when the waker's executor
+                // may serve it; one whose affinity excludes the waker's CPU
+                // goes to the host (WakeEffects::handed_to_host).
                 if self
                     .zone
                     .claim_for_el1(record, seq, 0, waker, effects, || self.unlink(record))
