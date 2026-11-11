@@ -4426,4 +4426,642 @@ raise SystemExit('unexpected gh invocation: ' + repr(args))
             }
         }
     }
+
+    fn recompress_bundle_archive(src: &Path, dst: &Path) {
+        use flate2::{Compression, read::MultiGzDecoder, write::GzEncoder};
+        use std::io::{Read, Write};
+
+        let mut tar_bytes = Vec::new();
+        MultiGzDecoder::new(std::fs::File::open(src).unwrap())
+            .read_to_end(&mut tar_bytes)
+            .unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+        encoder.write_all(&tar_bytes).unwrap();
+        let gz_bytes = encoder.finish().unwrap();
+        std::fs::write(dst, gz_bytes).unwrap();
+    }
+
+    /// Witness A (#1918 review M1): holding every other key input constant and
+    /// varying one `SignedHostIdentity` component at a time (`runner_name`,
+    /// `hardware_model`, `product_build`) must change both the canonical digest
+    /// (`BaseReuseKey::key_sha256`) and the artifact name
+    /// (`signed-base-reuse-<base>-<key_sha256>`), and the three variants must
+    /// be pairwise distinct across `compute_base_reuse_key`,
+    /// `prepare-reuse-upload`, and `reuse-lookup`.
+    #[test]
+    fn host_identity_components_each_change_canonical_reuse_key_and_artifact_name() {
+        let bench = ReuseBench::new();
+        let base_key = compute_base_reuse_key(
+            &bench.repo,
+            &bench.base,
+            bench.host.clone(),
+            &bench.bundle.archive,
+        )
+        .unwrap();
+        let base_digest = base_key.key_sha256().unwrap();
+        let base_artifact = base_key.artifact_name().unwrap();
+        assert_eq!(
+            base_artifact,
+            format!("signed-base-reuse-{}-{base_digest}", bench.base)
+        );
+
+        let base_receipt = bench.receipt_for(&bench.base);
+        let (published_base_name, base_art_dir) =
+            bench.publish_main_reusable_artifact(500, &base_receipt);
+        assert_eq!(published_base_name, base_artifact);
+
+        bench.write_gh_state(
+            vec![bench.trusted_main_run(500)],
+            vec![json!({
+                "id": 9001,
+                "name": published_base_name,
+                "expired": false,
+                "workflow_run": { "id": 500 },
+                "dir": base_art_dir,
+            })],
+        );
+        let group_request = Request {
+            kind: RequestKind::MergeGroup,
+            prs: vec![42],
+            sha: bench.head.clone(),
+            base: bench.base.clone(),
+        };
+
+        let host_variants = [
+            (
+                "runner_name",
+                SignedHostIdentity {
+                    runner_name: "carrick-gate-mac-2".into(),
+                    ..bench.host.clone()
+                },
+            ),
+            (
+                "hardware_model",
+                SignedHostIdentity {
+                    hardware_model: "Mac14,9".into(),
+                    ..bench.host.clone()
+                },
+            ),
+            (
+                "product_build",
+                SignedHostIdentity {
+                    product_build: "24E999".into(),
+                    ..bench.host.clone()
+                },
+            ),
+        ];
+
+        let mut observed = Vec::new();
+        for (idx, (component, alt_host)) in host_variants.into_iter().enumerate() {
+            let alt_key = compute_base_reuse_key(
+                &bench.repo,
+                &bench.base,
+                alt_host.clone(),
+                &bench.bundle.archive,
+            )
+            .unwrap();
+            let mut expected_other_fields = base_key.clone();
+            expected_other_fields.host_identity = alt_host.clone();
+            assert_eq!(
+                alt_key, expected_other_fields,
+                "{component}: non-host key input unexpectedly changed"
+            );
+
+            let alt_digest = alt_key.key_sha256().unwrap();
+            let alt_artifact = alt_key.artifact_name().unwrap();
+            assert_eq!(
+                alt_artifact,
+                format!("signed-base-reuse-{}-{alt_digest}", bench.base),
+                "{component}: artifact_name must follow signed-base-reuse-<base>-<key_sha256>"
+            );
+            assert_ne!(
+                alt_digest, base_digest,
+                "{component}: varying host_identity.{component} must change key_sha256"
+            );
+            assert_ne!(
+                alt_artifact, base_artifact,
+                "{component}: varying host_identity.{component} must change artifact_name"
+            );
+
+            let mut alt_receipt = bench.receipt_for(&bench.base);
+            alt_receipt.host_identity = Some(alt_host.clone());
+            let (published_alt_name, _) =
+                bench.publish_main_reusable_artifact(510 + idx as u64, &alt_receipt);
+            assert_eq!(published_alt_name, alt_artifact, "{component}");
+            assert_ne!(
+                published_alt_name, published_base_name,
+                "{component}: prepare-reuse-upload emitted unchanged artifact_name"
+            );
+
+            let lookup_dir = bench.dir.path().join(format!("host-name-miss-{component}"));
+            let lookup = bench.run_lookup(
+                &group_request,
+                &bench.bundle.archive,
+                &alt_host,
+                &lookup_dir,
+            );
+            assert!(lookup.status.success(), "{component}");
+            assert!(
+                !lookup_dir.join("base-seal.json").exists(),
+                "{component}: reuse-lookup must miss when host_identity.{component} differs"
+            );
+            let stderr = String::from_utf8_lossy(&lookup.stderr);
+            assert!(
+                stderr.contains("NoMatchingArtifact") && stderr.contains(&alt_artifact),
+                "{component}: expected NoMatchingArtifact for {alt_artifact}, got: {stderr}"
+            );
+
+            observed.push((component, alt_digest, alt_artifact));
+        }
+
+        assert_eq!(observed.len(), 3);
+        for i in 0..observed.len() {
+            for j in (i + 1)..observed.len() {
+                assert_ne!(
+                    observed[i].1, observed[j].1,
+                    "key_sha256 collision between {} and {}",
+                    observed[i].0, observed[j].0
+                );
+                assert_ne!(
+                    observed[i].2, observed[j].2,
+                    "artifact_name collision between {} and {}",
+                    observed[i].0, observed[j].0
+                );
+            }
+        }
+    }
+
+    /// Witness B1 (#1918 review M3, `compare_reuse_keys` half): an archive-only
+    /// mismatch (recompressed `.tar.gz` of the identical tar stream: every
+    /// other `BaseReuseKey` field is equal, only `fixture_archive_sha256`
+    /// differs) misses at `reuse-lookup` and `execute_pair` (`PairSide::Base`
+    /// runs), naming `fixture_archive_sha256`.
+    #[test]
+    fn archive_only_key_mismatch_misses_and_names_fixture_archive_sha256() {
+        let bench = ReuseBench::new();
+        let recompressed_archive = bench.dir.path().join("recompressed-bundle.tar.gz");
+        recompress_bundle_archive(&bench.bundle.archive, &recompressed_archive);
+
+        let live_key = compute_base_reuse_key(
+            &bench.repo,
+            &bench.base,
+            bench.host.clone(),
+            &bench.bundle.archive,
+        )
+        .unwrap();
+        let alt_archive_key = compute_base_reuse_key(
+            &bench.repo,
+            &bench.base,
+            bench.host.clone(),
+            &recompressed_archive,
+        )
+        .unwrap();
+        assert_ne!(
+            alt_archive_key.fixture_archive_sha256,
+            live_key.fixture_archive_sha256
+        );
+        let mut expected_equal = live_key.clone();
+        expected_equal.fixture_archive_sha256 = alt_archive_key.fixture_archive_sha256.clone();
+        assert_eq!(
+            alt_archive_key, expected_equal,
+            "recompressed archive must leave manifest, inputs, content, and all other key fields equal"
+        );
+        assert_ne!(
+            alt_archive_key.key_sha256().unwrap(),
+            live_key.key_sha256().unwrap()
+        );
+        assert_ne!(
+            alt_archive_key.artifact_name().unwrap(),
+            live_key.artifact_name().unwrap()
+        );
+
+        let base_receipt = bench.receipt_for(&bench.base);
+        let cand_receipt = bench.receipt_for(&bench.head);
+        let (control_art_name, control_art_dir) =
+            bench.publish_main_reusable_artifact(500, &base_receipt);
+
+        let group_request = Request {
+            kind: RequestKind::MergeGroup,
+            prs: vec![42],
+            sha: bench.head.clone(),
+            base: bench.base.clone(),
+        };
+
+        bench.write_gh_state(
+            vec![bench.trusted_main_run(500)],
+            vec![json!({
+                "id": 9001,
+                "name": control_art_name,
+                "expired": false,
+                "workflow_run": { "id": 500 },
+                "dir": control_art_dir,
+            })],
+        );
+        let control_reuse = bench.dir.path().join("control-archive-reuse");
+        let control_lookup = bench.run_lookup(
+            &group_request,
+            &bench.bundle.archive,
+            &bench.host,
+            &control_reuse,
+        );
+        assert!(control_lookup.status.success());
+        assert!(control_reuse.join("base-seal.json").exists());
+
+        // Pre-download lookup name miss when serving exact artifact names.
+        let archive_name_miss_dir = bench.dir.path().join("archive-only-name-miss");
+        let archive_name_miss = bench.run_lookup(
+            &group_request,
+            &recompressed_archive,
+            &bench.host,
+            &archive_name_miss_dir,
+        );
+        assert!(archive_name_miss.status.success());
+        assert!(!archive_name_miss_dir.join("base-seal.json").exists());
+        let name_miss_stderr = String::from_utf8_lossy(&archive_name_miss.stderr);
+        assert!(
+            name_miss_stderr.contains("NoMatchingArtifact")
+                && name_miss_stderr.contains(&alt_archive_key.artifact_name().unwrap()),
+            "expected NoMatchingArtifact for recompressed archive key, got: {name_miss_stderr}"
+        );
+
+        // Post-download lookup key check (serving control_art_dir across names)
+        // must specifically name `fixture_archive_sha256` when every other field matches.
+        bench.write_gh_state(
+            vec![bench.trusted_main_run(500)],
+            vec![json!({
+                "id": 9001,
+                "name": control_art_name,
+                "expired": false,
+                "serve_for_any_name": true,
+                "workflow_run": { "id": 500 },
+                "dir": control_art_dir,
+            })],
+        );
+        let archive_key_miss_dir = bench.dir.path().join("archive-only-key-miss");
+        let archive_key_miss = bench.run_lookup(
+            &group_request,
+            &recompressed_archive,
+            &bench.host,
+            &archive_key_miss_dir,
+        );
+        assert!(archive_key_miss.status.success());
+        assert!(!archive_key_miss_dir.join("base-seal.json").exists());
+        let key_miss_stderr = String::from_utf8_lossy(&archive_key_miss.stderr);
+        assert!(
+            key_miss_stderr.contains("KeyFieldMismatch")
+                && key_miss_stderr.contains("fixture_archive_sha256"),
+            "archive-only mismatch must report KeyFieldMismatch on fixture_archive_sha256, got: {key_miss_stderr}"
+        );
+
+        // Execution (`execute_pair` / `--reuse-base` install path) misses and runs PairSide::Base.
+        let archive_exec_out = bench.dir.path().join("archive-only-exec");
+        std::fs::create_dir_all(&archive_exec_out).unwrap();
+        let archive_exec_ctx = ReuseExecutionContext {
+            root: &bench.repo,
+            bundle: &recompressed_archive,
+            host_identity: Some(bench.host.clone()),
+            reuse_dir: &control_reuse,
+        };
+        let mut archive_exec_sides = Vec::new();
+        execute_pair(
+            &group_request,
+            &archive_exec_out,
+            Some(&archive_exec_ctx),
+            |run| {
+                archive_exec_sides.push(run.side);
+                let r = if run.side == PairSide::Base {
+                    &base_receipt
+                } else {
+                    &cand_receipt
+                };
+                write_run_evidence(&run.output, run.receipt_name, r);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            archive_exec_sides,
+            [PairSide::Base, PairSide::Candidate],
+            "archive-only mismatch must miss and run PairSide::Base"
+        );
+        let archive_exec_seal: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(archive_exec_out.join("base-seal.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            archive_exec_seal["reuse"].is_null(),
+            "archive-only miss must seal fresh in-job base without reuse metadata"
+        );
+    }
+
+    /// Witness B2 (#1918 review M3, `verify_receipt_matches_key` half): a
+    /// coherent sealed receipt with a populated `fixture_bundle` whose
+    /// `archive_sha256` alone disagrees with the live bundle/key is refused at
+    /// `prepare-reuse-upload`, misses at `reuse-lookup` and `execute_pair`
+    /// (`PairSide::Base` runs), and fails closed at `publish`, each naming
+    /// `fixture_bundle.archive_sha256`, while a matching coherent
+    /// `fixture_bundle` receipt is accepted across all four boundaries
+    /// (control).
+    #[test]
+    fn receipt_fixture_bundle_archive_disagreement_refuses_upload_lookup_execute_and_publish() {
+        let bench = ReuseBench::new();
+        let recompressed_archive = bench.dir.path().join("recompressed-bundle.tar.gz");
+        recompress_bundle_archive(&bench.bundle.archive, &recompressed_archive);
+
+        let live_key = compute_base_reuse_key(
+            &bench.repo,
+            &bench.base,
+            bench.host.clone(),
+            &bench.bundle.archive,
+        )
+        .unwrap();
+        let alt_archive_key = compute_base_reuse_key(
+            &bench.repo,
+            &bench.base,
+            bench.host.clone(),
+            &recompressed_archive,
+        )
+        .unwrap();
+        assert_ne!(
+            alt_archive_key.fixture_archive_sha256,
+            live_key.fixture_archive_sha256
+        );
+
+        let make_bundle_receipt = |archive_path: &Path, archive_sha256: &str| {
+            carrick_xtask::accept::FixtureBundleReceipt {
+                source: "local".into(),
+                path: archive_path.to_string_lossy().into_owned(),
+                captured_path: archive_path.to_string_lossy().into_owned(),
+                identity: bench.bundle.manifest_sha256.clone(),
+                archive_sha256: archive_sha256.to_owned(),
+            }
+        };
+
+        // Control: coherent receipt with populated `fixture_bundle` matching live bundle/key.
+        let mut matching_base_receipt = bench.receipt_for(&bench.base);
+        matching_base_receipt.fixture_bundle = Some(make_bundle_receipt(
+            &bench.bundle.archive,
+            &live_key.fixture_archive_sha256,
+        ));
+        let mut matching_cand_receipt = bench.receipt_for(&bench.head);
+        matching_cand_receipt.fixture_bundle = Some(make_bundle_receipt(
+            &bench.bundle.archive,
+            &live_key.fixture_archive_sha256,
+        ));
+
+        let (control_art_name, control_art_dir) =
+            bench.publish_main_reusable_artifact(500, &matching_base_receipt);
+        assert_eq!(control_art_name, live_key.artifact_name().unwrap());
+
+        let group_request = Request {
+            kind: RequestKind::MergeGroup,
+            prs: vec![42],
+            sha: bench.head.clone(),
+            base: bench.base.clone(),
+        };
+
+        bench.write_gh_state(
+            vec![bench.trusted_main_run(500)],
+            vec![json!({
+                "id": 9001,
+                "name": control_art_name,
+                "expired": false,
+                "workflow_run": { "id": 500 },
+                "dir": control_art_dir,
+            })],
+        );
+        let control_reuse = bench.dir.path().join("control-fb-reuse");
+        let control_lookup = bench.run_lookup(
+            &group_request,
+            &bench.bundle.archive,
+            &bench.host,
+            &control_reuse,
+        );
+        assert!(
+            control_lookup.status.success(),
+            "control lookup failed: {}",
+            String::from_utf8_lossy(&control_lookup.stderr)
+        );
+        assert!(
+            control_reuse.join("base-seal.json").exists(),
+            "control lookup must accept matching populated fixture_bundle: {}",
+            String::from_utf8_lossy(&control_lookup.stderr)
+        );
+
+        let control_results = bench.dir.path().join("control-fb-results");
+        std::fs::create_dir_all(&control_results).unwrap();
+        let control_ctx = ReuseExecutionContext {
+            root: &bench.repo,
+            bundle: &bench.bundle.archive,
+            host_identity: Some(bench.host.clone()),
+            reuse_dir: &control_reuse,
+        };
+        let mut control_sides = Vec::new();
+        execute_pair(
+            &group_request,
+            &control_results,
+            Some(&control_ctx),
+            |run| {
+                control_sides.push(run.side);
+                write_run_evidence(&run.output, run.receipt_name, &matching_cand_receipt);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            control_sides,
+            [PairSide::Candidate],
+            "matching populated fixture_bundle must reuse base without running PairSide::Base"
+        );
+        let (control_passed, control_comment, _, _) =
+            bench.publish_group(&group_request, &control_results);
+        assert!(
+            control_passed,
+            "control publish must pass: {control_comment}"
+        );
+        assert!(
+            control_comment.contains("reused base receipt 9001 from run 500"),
+            "control comment missing reuse provenance: {control_comment}"
+        );
+
+        // Disagreeing receipt: populated `fixture_bundle` whose `archive_sha256`
+        // alone disagrees with the live bundle/key.
+        let mut disagreeing_base_receipt = matching_base_receipt.clone();
+        disagreeing_base_receipt
+            .fixture_bundle
+            .as_mut()
+            .unwrap()
+            .archive_sha256 = alt_archive_key.fixture_archive_sha256.clone();
+
+        // (a) `prepare-reuse-upload` refuses to stage a receipt whose `fixture_bundle.archive_sha256`
+        // disagrees with `--fixture-bundle`.
+        let bad_main_dir = bench.dir.path().join("bad-fb-main");
+        let bad_main_results = bad_main_dir.join("results");
+        std::fs::create_dir_all(&bad_main_results).unwrap();
+        write_run_evidence(
+            &bad_main_results,
+            "candidate.json",
+            &disagreeing_base_receipt,
+        );
+        let bad_main_req = bad_main_dir.join("request.json");
+        std::fs::write(
+            &bad_main_req,
+            serde_json::to_vec(&Request {
+                kind: RequestKind::Main,
+                prs: vec![],
+                sha: bench.base.clone(),
+                base: bench.base.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let bad_prep_out = bad_main_dir.join("staged");
+        let bad_prep = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["--root", &bench.repo.to_string_lossy()])
+            .args(["signed-gate", "prepare-reuse-upload", "--request"])
+            .arg(&bad_main_req)
+            .arg("--results")
+            .arg(&bad_main_results)
+            .arg("--fixture-bundle")
+            .arg(&bench.bundle.archive)
+            .args(["--run-id", "555", "--output"])
+            .arg(&bad_prep_out)
+            .output()
+            .unwrap();
+        assert!(
+            !bad_prep.status.success(),
+            "prepare-reuse-upload must refuse disagreeing fixture_bundle.archive_sha256"
+        );
+        let bad_prep_stderr = String::from_utf8_lossy(&bad_prep.stderr);
+        assert!(
+            bad_prep_stderr.contains("ReceiptKeyInconsistent")
+                && bad_prep_stderr.contains("fixture_bundle.archive_sha256"),
+            "prepare-reuse-upload must name fixture_bundle.archive_sha256, got: {bad_prep_stderr}"
+        );
+
+        // Build a coherent sealed reuse directory (`files` inventory matches `base/base.json`,
+        // `reuse.key` and `reuse.key_sha256` match `live_key`) where ONLY
+        // `base.json`'s `fixture_bundle.archive_sha256` disagrees.
+        let copy_dir = |src: &Path, dst: &Path| {
+            let status = Command::new("cp")
+                .args(["-R", &src.to_string_lossy(), &dst.to_string_lossy()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        let coherent_bad_fb_reuse = bench.dir.path().join("coherent-bad-fb-reuse");
+        copy_dir(&control_reuse, &coherent_bad_fb_reuse);
+        std::fs::write(
+            coherent_bad_fb_reuse.join("base/base.json"),
+            serde_json::to_vec_pretty(&disagreeing_base_receipt).unwrap(),
+        )
+        .unwrap();
+        let bad_fb_seal_path = coherent_bad_fb_reuse.join("base-seal.json");
+        let mut bad_fb_seal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&bad_fb_seal_path).unwrap()).unwrap();
+        bad_fb_seal["files"] = json!(inventory(&coherent_bad_fb_reuse.join("base")));
+        std::fs::write(
+            &bad_fb_seal_path,
+            serde_json::to_vec_pretty(&bad_fb_seal).unwrap(),
+        )
+        .unwrap();
+
+        // (b) `reuse-lookup` rejects the coherent package on `fixture_bundle.archive_sha256`.
+        bench.write_gh_state(
+            vec![bench.trusted_main_run(500)],
+            vec![json!({
+                "id": 9001,
+                "name": control_art_name,
+                "expired": false,
+                "workflow_run": { "id": 500 },
+                "dir": coherent_bad_fb_reuse,
+            })],
+        );
+        let bad_fb_lookup_dir = bench.dir.path().join("bad-fb-lookup-out");
+        let bad_fb_lookup = bench.run_lookup(
+            &group_request,
+            &bench.bundle.archive,
+            &bench.host,
+            &bad_fb_lookup_dir,
+        );
+        assert!(bad_fb_lookup.status.success());
+        assert!(
+            !bad_fb_lookup_dir.join("base-seal.json").exists(),
+            "reuse-lookup must reject disagreeing fixture_bundle.archive_sha256"
+        );
+        let bad_fb_lookup_stderr = String::from_utf8_lossy(&bad_fb_lookup.stderr);
+        assert!(
+            bad_fb_lookup_stderr.contains("ReceiptKeyInconsistent")
+                && bad_fb_lookup_stderr.contains("fixture_bundle.archive_sha256"),
+            "reuse-lookup must name fixture_bundle.archive_sha256, got: {bad_fb_lookup_stderr}"
+        );
+
+        // (c) `execute_pair` (`--reuse-base` install path) rejects the coherent package
+        // and runs `PairSide::Base` in-job.
+        let bad_fb_exec_out = bench.dir.path().join("bad-fb-exec-out");
+        std::fs::create_dir_all(&bad_fb_exec_out).unwrap();
+        let bad_fb_exec_ctx = ReuseExecutionContext {
+            root: &bench.repo,
+            bundle: &bench.bundle.archive,
+            host_identity: Some(bench.host.clone()),
+            reuse_dir: &coherent_bad_fb_reuse,
+        };
+        let mut bad_fb_exec_sides = Vec::new();
+        execute_pair(
+            &group_request,
+            &bad_fb_exec_out,
+            Some(&bad_fb_exec_ctx),
+            |run| {
+                bad_fb_exec_sides.push(run.side);
+                let r = if run.side == PairSide::Base {
+                    &matching_base_receipt
+                } else {
+                    &matching_cand_receipt
+                };
+                write_run_evidence(&run.output, run.receipt_name, r);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            bad_fb_exec_sides,
+            [PairSide::Base, PairSide::Candidate],
+            "disagreeing fixture_bundle.archive_sha256 must miss and run PairSide::Base"
+        );
+        let bad_fb_exec_seal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bad_fb_exec_out.join("base-seal.json")).unwrap())
+                .unwrap();
+        assert!(bad_fb_exec_seal["reuse"].is_null());
+
+        // (d) `publish` refuses a coherent reuse seal whose base receipt's
+        // `fixture_bundle.archive_sha256` disagrees with `reuse.key.fixture_archive_sha256`.
+        let bad_fb_publish_results = bench.dir.path().join("bad-fb-publish-results");
+        copy_dir(&control_results, &bad_fb_publish_results);
+        std::fs::write(
+            bad_fb_publish_results.join("base/base.json"),
+            serde_json::to_vec_pretty(&disagreeing_base_receipt).unwrap(),
+        )
+        .unwrap();
+        let pub_seal_path = bad_fb_publish_results.join("base-seal.json");
+        let mut pub_seal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pub_seal_path).unwrap()).unwrap();
+        pub_seal["files"] = json!(inventory(&bad_fb_publish_results.join("base")));
+        std::fs::write(
+            &pub_seal_path,
+            serde_json::to_vec_pretty(&pub_seal).unwrap(),
+        )
+        .unwrap();
+
+        let (bad_pub_passed, bad_pub_comment, _, _) =
+            bench.publish_group(&group_request, &bad_fb_publish_results);
+        assert!(
+            !bad_pub_passed,
+            "publish must fail closed on disagreeing fixture_bundle.archive_sha256: {bad_pub_comment}"
+        );
+        assert!(
+            bad_pub_comment.contains("ReceiptKeyInconsistent")
+                && bad_pub_comment.contains("fixture_bundle.archive_sha256"),
+            "publish comment must name fixture_bundle.archive_sha256, got: {bad_pub_comment}"
+        );
+    }
 }
