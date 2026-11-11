@@ -95,6 +95,7 @@ embed = [
   "carrick-vmm-kvm::cpl0_entry::production_clone_thread_runs_and_exits_without_ending_parent (production image and executor pool; guest clone, parent/child handshake, child raw exit and surviving parent; red on ENOSYS(38), green through the production pool after native lifecycle and root-stock admission)",
   "carrick-vmm-kvm::cpl0_fork_e2e (real KVM; fork/COW/wait4/rusage and issued child PID; lifecycle sidecar placement red/green)",
   "carrick-vmm-kvm::cpl0_entry::production_two_threads_blocking_wait4_reap_distinct_children (#2071: real KVM production CPL0 image and executor pool; two threads of one process block in wait4 on distinct forked children and each reaps its exact child without EAGAIN)",
+  "carrick-vmm-kvm::cpl0_entry::production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation (#2095: real KVM CPL0 test image; the leader's fork is held inside its birth reservation until the worker's wait4 for an exited child parks, then the release wakes it to reap the zombie without EAGAIN)",
 ]
 
 # Post-exec process forks use a distinct child lifecycle page and require no
@@ -159,6 +160,8 @@ vm_free = [
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::{arm_two_threads_blocking_wait4_reap_distinct_children,arm_two_threads_blocking_wait4_any_one_reaps_other_blocks_then_echild,arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release,arm_wait4_child_exits_between_two_waiters_parking_rescans_without_lost_wake,arm_msgrcv_and_sibling_wait4_do_not_block_each_other} (#2071: per-member child-wait and vfork continuations in PendingTable; concurrent blocking wait4/waitid, vfork suspension alongside a parked sibling waiter, inter-park child exit rescan, and SysV msgrcv independence)",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::{arm_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation,arm_wait4_reaps_zombie_while_sibling_vfork_holds_birth_reservation} (#2095: a sibling on a second vCPU calls blocking wait4 for an exited child while the forking thread holds its birth reservation inside the stock loan crossing; the wait parks and reaps after the release, and a vfork caller stays suspended)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::{reap_refused_by_sibling_birth_parks_then_reaps,host_request_during_wait4_park_yields_then_reparks,host_request_during_vfork_park_yields_then_reparks} (#2095: Busy once, then success for the reap refused by a sibling birth and for a child-wait or vfork park refused by a host request)",
 ]
 
 [bindings.unresolved]
