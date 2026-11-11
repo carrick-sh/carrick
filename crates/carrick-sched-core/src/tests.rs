@@ -1400,6 +1400,50 @@ fn an_excluded_waiter_no_driven_slot_may_run_goes_to_the_host() {
     }
 }
 
+/// A thread whose bound affinity this venue cannot read (a host-only
+/// binding read in CPL0, here a guest-only one read on the host) is placed
+/// nowhere by affinity, but no CPU refuses it either: the wake keeps it on
+/// the waker's queue for the waker's executor, never on the completion
+/// chain (which x86 never settles).
+#[test]
+fn an_unreadable_affinity_excludes_no_cpu() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let authority = crate::affinity::AffinityAuthority::new();
+    authority.initialize(1 << 1);
+    // SAFETY: the authority outlives the zone's use of the record; the host
+    // venue never reads the guest alias.
+    let source = unsafe {
+        AffinitySource::from_aliases(
+            0,
+            core::ptr::from_ref(&authority).expose_provenance() as u64,
+        )
+    };
+    assert!(source.is_bound() && source.load().is_none());
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x4000), &HostWait)
+        .unwrap();
+    let thread = zone
+        .alloc_record(ThreadIdentity {
+            affinity_source: source,
+            ..identity(3)
+        })
+        .unwrap();
+    let seq = zone.next_seq(thread);
+    zone.enqueue(&guard, thread, seq, MM, 0x4000, u32::MAX, 0)
+        .unwrap();
+    zone.publish_park(thread, seq);
+    drop(guard);
+    let (woken, effects) = wake_effects(&zone, 0x4000, 1, SLOT);
+    assert_eq!(woken, [thread]);
+    assert_eq!(
+        zone.record(thread).claim(),
+        Claim::Queued { slot: SLOT, seq },
+        "kept on the waker for its executor, not handed to the host"
+    );
+    assert!(effects.queued_own && !effects.handed_to_host);
+}
+
 /// #1961 second review, P0-2 (the #1892/#1902 kick): a floating thread
 /// queued on the slot whose driver is away on the host gets every live slot
 /// its affinity allows kicked, which may have become live on its CPU since

@@ -1089,6 +1089,18 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         cpu_plus_one == 0 || mask == 0 || cpu_plus_one > 64 || mask & (1 << (cpu_plus_one - 1)) != 0
     }
 
+    /// Whether this thread's affinity, readable in this venue, excludes the
+    /// guest CPU `cpu_plus_one`. An affinity this venue cannot read (a bound
+    /// source with no alias here) grants no placement ([`Self::allows_cpu`])
+    /// but excludes nothing either: it never makes a CPU refuse the thread.
+    fn excludes_cpu(&self, cpu_plus_one: u32) -> bool {
+        let source = self.affinity_source();
+        if source.is_bound() && source.load().is_none() {
+            return false;
+        }
+        !self.allows_cpu(cpu_plus_one)
+    }
+
     fn ready_host_claim(&self, seq: u32) -> Claim {
         if self.needs_host_first_entry() {
             Claim::FirstEntryHost {
@@ -3683,7 +3695,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 return true;
             }
         }
-        let waker_cpu_allowed = rec.allows_cpu(self.slot(waker).cpu.load(Ordering::Relaxed));
+        let waker_cpu = self.slot(waker).cpu.load(Ordering::Relaxed);
+        let waker_cpu_allowed = rec.allows_cpu(waker_cpu);
         let runs_on_waker = home.is_none_or(|home| home == waker)
             && self.runs_mm_of(waker, rec)
             && waker_cpu_allowed;
@@ -3735,7 +3748,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     Placement::NoSlot => {}
                 }
             }
-            if home.is_some() || !waker_cpu_allowed {
+            if home.is_some() || rec.excludes_cpu(waker_cpu) {
                 if nonblocking {
                     // The caller hands it to its host continuation itself.
                     return false;
@@ -4278,8 +4291,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // Each refused head leaves this queue for good: at most its length.
         for _ in 0..=self.slot(slot).queued() {
             let switched = self.switch_in_full(slot)?;
-            let rec = self.record(switched.record);
-            if rec.allows_cpu(cpu) {
+            if !self.record(switched.record).excludes_cpu(cpu) {
                 return Some(switched);
             }
             if !self.move_to_owner(slot, switched.record, effects) {
