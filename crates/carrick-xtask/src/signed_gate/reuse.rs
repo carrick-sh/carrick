@@ -227,8 +227,15 @@ pub fn compute_base_reuse_key(
         .map_err(|e| ReuseMissReason::FixtureBundleInvalid(e.to_string()))?;
     let unpacked = crate::fixtures::archive::unpack_bundle(bundle_path)
         .map_err(|e| ReuseMissReason::FixtureBundleInvalid(e.to_string()))?;
-    let manifest = crate::fixtures::inspect_bundle(unpacked.manifest())
+    // `resolve_bundle` on an explicit path runs the publisher's own
+    // manifest and object-integrity check; the manifest it admitted is
+    // then parsed here.
+    crate::fixtures::resolve_bundle(root, &base_sha, Some(unpacked.manifest()))
         .map_err(|e| ReuseMissReason::FixtureBundleInvalid(e.to_string()))?;
+    let manifest: crate::fixtures::Manifest = std::fs::read(unpacked.manifest())
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+        .map_err(ReuseMissReason::FixtureBundleInvalid)?;
     let bundle_head = String::from(manifest.source_head.clone());
     if bundle_head != base_sha {
         return Err(ReuseMissReason::FixtureBundleInvalid(format!(
