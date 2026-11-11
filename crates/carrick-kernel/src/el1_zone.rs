@@ -1071,7 +1071,11 @@ pub fn hand_back_completions() {
 /// (`el1_delegation::deliver_boundary_wakes`), exactly like the owed IPC
 /// wakes the same doorbell stands for (#641).
 pub(crate) fn hand_back_completions_in(zone: &ZoneTables) {
-    zone.take_completion_handbacks(&HostLockWait, &mut publish_handback);
+    zone.take_completion_handbacks(&HostLockWait, &mut |record| {
+        publish_handback_in_zone(zone, record, &mut |record| {
+            deliver_handback_event(HandbackEvent::Ready(record));
+        });
+    });
 }
 
 /// Force `slot`'s vCPU out of the guest WITHOUT host work: a host placement
