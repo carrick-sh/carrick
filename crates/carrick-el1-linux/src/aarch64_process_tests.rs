@@ -16016,6 +16016,7 @@ fn futex_owner_wait_episode(
         on_copy_complete: None,
         native_ipc: None,
         refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
         on_signal_clock: None,
     };
     let handle = service.service_mm_handle(&fixture.address).unwrap();

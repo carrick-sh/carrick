@@ -480,6 +480,7 @@ fn fork_exec_probe_with_departure(
         on_copy_complete: None,
         native_ipc: Some(owner.region()),
         refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
         on_signal_clock: None,
     };
     let counters = carrick_el1_abi::Counters::new();
@@ -1022,6 +1023,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
         on_copy_complete: None,
         native_ipc: Some(owner.region()),
         refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
         on_signal_clock: None,
     };
     let counters = carrick_el1_abi::Counters::new();

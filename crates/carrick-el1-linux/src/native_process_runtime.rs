@@ -11091,6 +11091,7 @@ mod tests {
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
+                waker_slot: carrick_sched_core::SlotId::new(0),
                 on_signal_clock: None,
             };
             let mut parent = runtime
@@ -11352,6 +11353,7 @@ mod tests {
                     child_copy_error_at: None,
                     on_copy_complete: None,
                     native_ipc: None,
+                    waker_slot: carrick_sched_core::SlotId::new(0),
                     on_signal_clock: None,
                 };
                 let mut entry = runtimes[index]
@@ -11474,6 +11476,7 @@ mod tests {
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
+                waker_slot: carrick_sched_core::SlotId::new(0),
                 on_signal_clock: None,
             },
             Physical {
@@ -11490,6 +11493,7 @@ mod tests {
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
+                waker_slot: carrick_sched_core::SlotId::new(0),
                 on_signal_clock: None,
             },
         ];
@@ -11874,6 +11878,7 @@ mod tests {
                         child_copy_error_at: None,
                         on_copy_complete: None,
                         native_ipc: None,
+                        waker_slot: carrick_sched_core::SlotId::new(0),
                         on_signal_clock: None,
                     };
                     let mut entry = runtime
@@ -11938,6 +11943,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -12090,6 +12096,7 @@ mod tests {
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
+                waker_slot: carrick_sched_core::SlotId::new(0),
                 on_signal_clock: None,
             };
             let mut entry = runtime
@@ -12338,6 +12345,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let observed = crate::common_entry::execution_binding(&thread);
@@ -12662,6 +12670,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut process = runtime
@@ -12893,6 +12902,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         use carrick_personality_linux::signal::{ProcessSignals, SignalWaitOutcome};
@@ -13253,6 +13263,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -13373,6 +13384,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -13523,6 +13535,7 @@ mod tests {
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
+                waker_slot: carrick_sched_core::SlotId::new(0),
                 on_signal_clock: None,
             };
             assert!(zone.slot(slot).current().is_none());
@@ -13804,6 +13817,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -14038,6 +14052,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let parent = TaskKey {
@@ -14673,6 +14688,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         use carrick_personality_linux::signal::ProcessSignals;
@@ -14779,6 +14795,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut parent_entry = runtime
@@ -14880,6 +14897,7 @@ mod tests {
                         child_copy_error_at: None,
                         on_copy_complete: None,
                         native_ipc: None,
+                        waker_slot: carrick_sched_core::SlotId::new(0),
                         on_signal_clock: None,
                     };
                     let mut entry = runtime
@@ -14931,6 +14949,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -15110,6 +15129,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let parent = TaskKey {
@@ -15311,6 +15331,7 @@ mod tests {
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
+                waker_slot: carrick_sched_core::SlotId::new(0),
                 on_signal_clock: None,
             };
             let root = TaskKey {
@@ -15555,6 +15576,7 @@ mod tests {
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
+                waker_slot: carrick_sched_core::SlotId::new(0),
                 on_signal_clock: None,
             };
             let parent = TaskKey {
@@ -15837,6 +15859,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -16083,6 +16106,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -16194,6 +16218,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -16335,6 +16360,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -16442,6 +16468,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -16603,6 +16630,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -17057,6 +17085,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -17257,6 +17286,7 @@ mod tests {
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         };
         use carrick_personality_linux::ipc::{IpcOutcome, ProcessIpcVenue};

@@ -1232,18 +1232,33 @@ fn a_home_record_runs_only_on_its_home_slot() {
         "the loaded thread runs its record"
     );
 
-    // Stopped at a host exit: the wake still finishes in the ring (#1941).
-    // The thread is queued on the waker's slot, misplaced, and the waker's
-    // host exit hands it over.
+    // Stopped at a host exit: the wake still finishes in the ring (#1941),
+    // and the thread still goes home, where its executor runs it on its way
+    // back to the guest. Never on the waker's slot, which would run it on
+    // the wrong vCPU and which no host boundary relocates (#1961 review).
     let home = el1_park(&zone, OTHER, 9, 0x3000, 0);
     zone.leave_guest(OTHER, &HostWait);
     let (woken, effects) = wake_effects(&zone, 0x3000, 1, SLOT);
     assert_eq!(woken, [home]);
     assert_eq!(
         zone.record(home).claim(),
-        Claim::Queued { slot: SLOT, seq: 2 }
+        Claim::Queued {
+            slot: OTHER,
+            seq: 2
+        }
     );
-    assert!(effects.queued_own && effects.misplaced && effects.owes_host_boundary());
+    assert!(!effects.queued_own && !effects.owes_host_boundary());
+    assert_eq!(
+        effects.sgi_slots().count(),
+        0,
+        "a stopped slot takes no SGI"
+    );
+    assert_eq!(zone.counters.el1_misplaced.load(Ordering::Relaxed), 0);
+    zone.enter_guest(OTHER);
+    assert_eq!(zone.switch_in_full(SLOT), None, "never run on the waker");
+    let switched = zone.switch_in_full(OTHER).unwrap();
+    assert_eq!(switched.record, home);
+    assert!(switched.home);
 }
 
 fn park_pinned(zone: &ZoneTables, tid: u64, uaddr: u64, affinity: u64) -> (RecordId, u32) {
@@ -1286,8 +1301,10 @@ fn el1_queues_a_pinned_thread_on_its_busy_cpu() {
 
 /// A floating thread whose affinity excludes the waker's CPU, with no slot
 /// in the guest that may run it, is still woken in the ring (#1941): queued
-/// on the waker's slot and reported misplaced, for the waker's host exit to
-/// relocate. An idle slot of its CPU takes it directly.
+/// on the live slot of its CPU, stopped at a host exit, whose driver runs it
+/// when it comes back (#1961 review). Only a thread no slot may run at all
+/// stays on the waker's slot, misplaced. An idle slot of its CPU takes it
+/// directly.
 #[test]
 fn el1_honours_affinity_for_floating_threads() {
     let zone = zone();
@@ -1301,10 +1318,22 @@ fn el1_honours_affinity_for_floating_threads() {
     assert_eq!(woken, [pinned], "an EL1 wake is never refused");
     assert_eq!(
         zone.record(pinned).claim(),
+        Claim::Queued { slot: OTHER, seq }
+    );
+    assert!(!effects.queued_own && !effects.owes_host_boundary());
+    assert_eq!(zone.switch_in_full(SLOT), None, "never run on the waker");
+    // No slot of CPU 2 exists: the waker's own queue is the last resort.
+    let (unrunnable, seq) = park_pinned(&zone, 5, 0x4200, 1 << 2);
+    let (woken, effects) = wake_effects(&zone, 0x4200, 1, SLOT);
+    assert_eq!(woken, [unrunnable]);
+    assert_eq!(
+        zone.record(unrunnable).claim(),
         Claim::Queued { slot: SLOT, seq }
     );
     assert!(effects.queued_own && effects.misplaced);
     // CPU 1's slot returns and idles: it takes the next pinned thread.
+    assert_eq!(zone.switch_in_full(OTHER).unwrap().record, pinned);
+    zone.clear_current(OTHER);
     zone.enter_guest(OTHER);
     assert!(!zone.enter_idle(OTHER, false));
     let (pinned, seq) = park_pinned(&zone, 4, 0x4100, 1 << 1);

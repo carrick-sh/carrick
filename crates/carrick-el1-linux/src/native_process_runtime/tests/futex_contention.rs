@@ -192,6 +192,7 @@ fn episode<C: ProcessContext + 'static, B: carrick_mmu_core::owner_mmu::OwnerFor
         on_copy_complete: None,
         native_ipc: None,
         refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
         on_signal_clock: None,
     };
     let handle = service.service_mm_handle(&fixture.address).unwrap();
@@ -526,6 +527,7 @@ fn clear_tid_stopped_join_driver<C, B>(
         on_copy_complete: None,
         native_ipc: None,
         refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
         on_signal_clock: None,
     };
     FUTEX_MAPPING.with(|slot| slot.set(Some(Ok(true))));
@@ -594,6 +596,10 @@ fn clear_tid_stopped_join_driver<C, B>(
     };
     let counters = carrick_el1_abi::Counters::new();
     let names = carrick_el1_abi::InotifyNameCache::new();
+    // The exiting member's entry runs on its own slot, as its production
+    // service does.
+    service.waker_slot = child_slot;
+    crate::sched::object_wait::clear_test_wake_trace();
     {
         let mut entry = fixture
             .runtime
@@ -661,27 +667,31 @@ fn clear_tid_stopped_join_driver<C, B>(
     assert_eq!(control.clear_child_tid(), 0);
     assert_eq!(service.tid_writes, [(1, 0x1000, 0)]);
     // The joiner's only driver is away: the wake still finished in the ring
-    // (#1941), queuing it on the exiting member's slot, misplaced.
+    // (#1941), and the production wake queued the joiner on that driver's
+    // slot, which owns it and serves it at `step_back`. Nothing is left on
+    // the exiting member's slot for a host boundary to relocate (#1961
+    // review: no shipping boundary relocates a waker's queue).
     assert!(
         matches!(
             zone.record(fixture.record.id).claim(),
-            Claim::Queued { slot, .. } if slot == child_slot
+            Claim::Queued { slot, .. } if slot == fixture.slot
         ),
-        "schedule must actually withhold the only eligible driver"
+        "the joiner waits on its own driver's slot: {:?}",
+        zone.record(fixture.record.id).claim()
     );
-    // The waker owes the host a boundary for that misplaced joiner. Model it
-    // with the shipping owners: the waker's executor relocates its queue, and
-    // the host routes the native handback (`route_native_handback_in_zone`
-    // calls `place_native_handback`), retaining the ring owner.
-    zone.relocate(
-        child_slot,
-        None,
-        &mut |record, discard| {
-            assert!(!discard);
-            assert!(zone.place_native_handback(record).is_some());
-        },
-        &mut |_| {},
+    assert_eq!(zone.slot(child_slot).queued(), 0);
+    assert_eq!(zone.counters.el1_misplaced.load(Ordering::Acquire), 0);
+    // The waker's production effects ring no doorbell, on its slot or any
+    // other, and send no SGI: the joiner's slot is stopped, and its driver
+    // owes itself the reschedule on re-entry (`reschedule_owed`).
+    assert_eq!(
+        crate::sched::object_wait::test_host_work_trace(),
+        [],
+        "no host boundary owed for the joiner"
     );
+    assert_eq!(crate::sched::object_wait::test_wake_trace(), []);
+    assert!(zone.reschedule_owed(fixture.slot));
+    service.waker_slot = fixture.slot;
     // Fixed scheduler steps only: no polling or host blocking waits. The guest
     // wait above is timed, and returning the driver consumes one completion.
     zone.step_back(fixture.slot, 1);
