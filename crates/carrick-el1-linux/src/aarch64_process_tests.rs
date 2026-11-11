@@ -1456,6 +1456,48 @@ impl Fixture {
         leader: ThreadIdentity,
         arena_len: u64,
     ) -> Self {
+        Self::with_identity_arena_and_import(root_gpa, asid, page, control, leader, arena_len, None)
+    }
+    /// [`Self::new`] whose MM also imports `anonymous` as private anonymous
+    /// memory: host memory the VM-free fixture dereferences as user memory,
+    /// so its words are both readable here and owned by the MM's mapping.
+    #[cfg(test)]
+    fn with_private_anonymous(
+        root_gpa: u64,
+        asid: carrick_guest_arch::Asid,
+        anonymous: carrick_el1_abi::ReservationRange,
+    ) -> Self {
+        let page: &'static ThreadLifecyclePage = Box::leak(Box::new(ThreadLifecyclePage::new()));
+        let control = Box::leak(Box::new(ThreadControlSlot::new()));
+        Self::with_identity_arena_and_import(
+            root_gpa,
+            asid,
+            page,
+            control,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: page as *const _ as u64,
+                control_slot: control as *const _ as u64,
+            },
+            0x1000_0000,
+            Some(anonymous),
+        )
+    }
+    fn with_identity_arena_and_import(
+        root_gpa: u64,
+        asid: carrick_guest_arch::Asid,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        leader: ThreadIdentity,
+        arena_len: u64,
+        anonymous: Option<carrick_el1_abi::ReservationRange>,
+    ) -> Self {
         let file_table = leader.file_table;
         // The host records the leader's birth identity when it allocates the
         // control slot. Its process serial is independent of the snapshot.
@@ -1601,6 +1643,15 @@ impl Fixture {
                 true,
             )
             .unwrap();
+        if let Some(anonymous) = anonymous {
+            owner
+                .import(
+                    anonymous,
+                    carrick_el1_abi::ReservationProtection::READ_WRITE,
+                    true,
+                )
+                .unwrap();
+        }
         drop(owner);
         super::aarch64_process::Portal::for_zone(NonZeroU64::MIN, table, zone)
             .root_any(mm, 0)
@@ -7043,6 +7094,100 @@ fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
     fixture.zone.clear_current(fixture.slot);
     assert_eq!(fixture.page.state(entry.index()), state);
     assert!(leader_sees_thread(fixture, &mut service, 42));
+}
+
+/// glibc's `pthread_join` (#2124), on the production AArch64 entry with the
+/// ARM scheduler: the joiner waits on the child's CLEARTID word with shared
+/// `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` (op 265), NULL timeout and
+/// `FUTEX_BITSET_MATCH_ANY`, as the Docker oracle traced it. The child's raw
+/// `exit` clears the word and its clear-child-tid wake must release the
+/// joiner with 0. Before the fix, op 265 was not admitted on ARM: it was
+/// forwarded and answered ENOSYS, which glibc treats as fatal.
+#[test]
+fn arm_glibc_pthread_join_shared_bitset_wait_wakes_on_child_exit() {
+    // The joined CLEARTID word lives in private anonymous memory (glibc's
+    // thread descriptor sits in the mmap'd thread stack).
+    let mut words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
+        0x4000,
+    )));
+    let tid_word = words.arg();
+    let fixture = Box::leak(Box::new(Fixture::with_private_anonymous(
+        0x10000,
+        asid(1),
+        carrick_el1_abi::ReservationRange::new(tid_word, tid_word + 0x4000).unwrap(),
+    )));
+    let (control, child) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    // CLONE_CHILD_SETTID published the child's tid in the joined word.
+    words.set::<u32>(0, 42);
+    let mut join = carrick_el1_abi::TrapFrame::default();
+    join.x[8] = crate::sched::SYS_FUTEX as u64;
+    join.x[0] = tid_word;
+    join.x[1] = 265;
+    join.x[2] = 42;
+    join.x[5] = 0xffff_ffff;
+    let route =
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut join, &mut cpu).unwrap();
+    assert_ne!(
+        join.x[0] as i64, -38,
+        "ENOSYS aborts glibc: the futex facility returned an unexpected error code"
+    );
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served,
+        "the join parks in ring; it is never forwarded"
+    );
+    // The joiner's own record (the leader, tid 41) parked on the word.
+    let leader = (1..carrick_sched_core::ZONE_RECORDS as u32)
+        .filter_map(carrick_sched_core::RecordId::from_raw)
+        .find(|&id| {
+            fixture.zone.record(id).identity().tid == 41
+                && matches!(
+                    fixture.zone.record(id).claim(),
+                    carrick_sched_core::Claim::Parked { .. }
+                )
+        })
+        .expect("the joiner is parked on the CLEARTID word");
+    // The park ran the queued child on this slot.
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child.id));
+
+    run_as(fixture, 42, 12, 102, control);
+    control.set_clear_child_tid(tid_word);
+    let mut exit = carrick_el1_abi::TrapFrame::default();
+    exit.x[8] = 93;
+    arm_call_with_cpu(fixture, control, &mut service, &mut exit, &mut cpu).unwrap();
+    assert_eq!(words.get::<u32>(0), 0, "exit cleared the CLEARTID word");
+    assert!(
+        matches!(
+            fixture.zone.record(leader).claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ),
+        "the clear-child-tid wake released the joiner, found {:?}",
+        fixture.zone.record(leader).claim()
+    );
+    // The slot runs the woken joiner next, with the futex's completion.
+    run_as_leader(fixture);
+    let counters = carrick_el1_abi::Counters::new();
+    let mut resumed = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        }
+        .run_ready(&mut resumed),
+        Some(crate::sched::Served::Returned { switched: true })
+    );
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(leader));
+    assert_eq!(resumed.x[0], 0, "pthread_join's futex returns 0");
 }
 
 #[test]
