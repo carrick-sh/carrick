@@ -761,22 +761,14 @@ fn native_clear_tid_stopped_join_driver_aarch64() {
         TIMED_SHARED_WAIT,
     );
 }
+/// The x86 CPL0 native futex entry. AArch64 EL1 serves futex on its
+/// scheduler instead; its witness drives that production entry
+/// (`aarch64_process_tests::arm_glibc_pthread_join_shared_bitset_wait_wakes_on_child_exit`).
 #[test]
 fn native_glibc_pthread_join_shared_bitset_wait_x86() {
     clear_tid_stopped_join_driver::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
         words,
         carrick_personality_linux::crossing::HostCrossingSet::X86,
-        GLIBC_PTHREAD_JOIN_WAIT,
-    );
-}
-#[test]
-fn native_glibc_pthread_join_shared_bitset_wait_aarch64() {
-    clear_tid_stopped_join_driver::<
-        carrick_sched_core::Aarch64ParkedContext,
-        carrick_mmu_core::owner_mmu::Aarch64Mmu,
-    >(
-        arm_words,
-        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
         GLIBC_PTHREAD_JOIN_WAIT,
     );
 }
