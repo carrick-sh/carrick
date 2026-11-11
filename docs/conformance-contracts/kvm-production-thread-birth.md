@@ -93,9 +93,10 @@ The native syscall and clear-child-tid callers share `wake_native_futex`.
 It makes one `wake_placed` call, which never refuses (#1941), without
 changing the caller's MM, key, mask or count. A joiner no guest slot may run
 now is queued, inside that same wake, on the slot that owns it
-(`ZoneTables::owner_slot`: its home, else the slot it last ran on, else an
-eligible live slot), stopped or busy, the custody `place_native_handback`
-gives a native handback. Its driver runs it when it is in the guest again.
+(`ZoneTables::owner_candidates`: its home, else the slot it last ran on,
+else an eligible slot an executor drives, re-checked under the slot lock),
+stopped or busy, the custody `place_native_handback` gives a native
+handback. Its driver runs it when it is in the guest again.
 No host boundary relocates a waker's run queue, so the waker never keeps it
 (#1961 review). No new queue, poll or retry is introduced.
 The existing syscall adapter's mask/count witness remains authoritative;

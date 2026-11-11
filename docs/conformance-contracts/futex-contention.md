@@ -317,10 +317,11 @@ finishes in the ring (#1941): `wake_placed` never refuses, so the native
 adapter makes one wake under the bucket lock with the original key, mask and
 count. A waiter whose allowed slots are all busy is queued on the least loaded
 one with a reschedule. A waiter no guest slot may run now is queued, in the
-same wake, on the slot that owns it (`ZoneTables::owner_slot`), stopped,
-contended or busy: the custody the host's `place_native_handback` gives a
-native handback, which retains the completed wait until an eligible driver
-returns. No guest operand is read and no second futex wake is needed for that
+same wake, on the slot that owns it (`ZoneTables::owner_candidates`),
+stopped, contended or busy, while an executor drives it: the custody the
+host's `place_native_handback` gives a native handback, which retains the
+completed wait until an eligible driver returns. With no such slot, and the
+waker's CPU excluded by its affinity, it goes to the host. No guest operand is read and no second futex wake is needed for that
 completion.
 `native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody` drives
 the production adapter with one excluded-mask waiter and two matching waiters
@@ -415,15 +416,25 @@ all busy is queued on the least loaded of them with a reschedule SGI, the
 choice the host's `place_in_guest` makes. A waiter no guest slot may run
 now (its only slot stopped at a host exit, or that slot's run-queue lock
 contended) is queued on the slot that owns it, chosen by
-`ZoneTables::owner_slot`: its home; else the slot it last ran on, if live
-and able to run it; else the shortest live run queue that may run it; else
-the slot it last ran on if its affinity allows that CPU. The waker takes
-that slot's lock without a bound, the order (bucket, then slot) the host's
-`wake_host` already uses. A slot in the guest gets a reschedule SGI; a
-stopped slot's driver raises its owed reschedule before it runs the vCPU
-again (`ZoneTables::reschedule_owed`), and an away driver at `step_back`.
-Only a thread no slot but the waker's may run is queued on the waker's own
-slot and reported misplaced, for the waker's executor. A `futex_waitv`
+`ZoneTables::owner_candidates`: its home while an executor drives it; else
+the slot it last ran on, if live and able to run it; else the shortest live
+run queue that may run it; else the slot it last ran on, else the shortest
+queue of any slot an executor drives (live or away), if its affinity allows
+that CPU. A slot nobody drives (`drive == 0`, after `leave_slot`) is never
+chosen. Each candidate's custody is re-checked under its slot lock, which
+every drive change holds, and a refused one falls to the next; none is
+retried. The waker takes that slot's lock without a bound, the order
+(bucket, then slot) the host's `wake_host` already uses. A slot in the
+guest gets a reschedule SGI; a stopped slot's driver raises its owed
+reschedule before it runs the vCPU again (`ZoneTables::reschedule_owed`),
+and an away driver at `step_back`. A thread queued on an away slot also
+owes every live slot of its CPUs a reschedule, the #1892/#1902 kick
+(`kick_peers_of_away_owner`). A thread no other slot owns is queued on the
+waker's own slot and reported misplaced only when the waker's CPU is one
+its affinity allows, so the waker's executor serves it (its address space
+needs that executor, or it is homed there). One whose affinity excludes
+the waker's CPU goes to the host through the carrier completion chain
+(`handed_to_host`), as a `futex_waitv` waiter does. A `futex_waitv`
 waiter, which only the host parks, is claimed into a transfer, its woken entry
 is unlinked under the bucket lock, and it goes to the carrier completion
 chain; the host boundary the waker then owes unlinks its other entries and
@@ -497,10 +508,11 @@ on PR head `adb6aec667`):
 - `native_futex_wake_queues_a_waiter_pinned_to_a_busy_cpu_in_ring`: the wake
   completes in ring, queues the waiter on its busy slot and sends one kick
   (`el1_sgis`, was 0).
-- `native_futex_wake_of_a_waiter_on_a_stopped_cpu_owes_a_host_boundary`: the
-  waiter's only CPU has no slot an executor drives and it never ran
-  elsewhere, so no slot but the waker's may hold it. It is queued misplaced
-  on the waker's slot and the waker has pending host work (was false).
+- `native_futex_wake_of_a_waiter_no_driven_cpu_may_run_goes_to_the_host`
+  (formerly `..._on_a_stopped_cpu_owes_a_host_boundary`): the waiter's only
+  CPU has no slot an executor drives. It goes to the host through the
+  completion chain, never onto the waker's slot, and the waker has pending
+  host work (was false). See the second review below.
 
 ### Misplaced waiters are placed by the wake itself (#1961 review)
 
@@ -519,14 +531,16 @@ x86 resume or an ARM tick but moves only unhomed threads, and only to idle
 slots in the guest, so it cannot cover a homed waiter or a stopped slot.
 
 `claim_for_el1` now places such a waiter, in the same wake and under the
-same bucket lock, on the slot that owns it (`ZoneTables::owner_slot`, see
+same bucket lock, on the slot that owns it (`ZoneTables::owner_candidates`, see
 above), whatever that slot's state, through `requeue_claimed`, the queue
 step the host's `requeue_on` and `place_native_handback` already use. This
 restores the #1892/#1902 custody (home, else last slot) that the removed
 `wake_host` + `place_native_handback` second pass gave, in the one wake
 path, for every EL1 waker on both ISAs: native futex and clear-child-tid
 wakes, `Sched::wake_word`, x86 `NativeLane::wake_word` and object-wait
-readiness. Only a waiter no slot but the waker's may run stays misplaced.
+readiness. A waiter no other slot owns stays misplaced on the waker only
+when the waker's executor may serve it; see the next section for one whose
+affinity excludes the waker's CPU.
 
 Witnesses (red on PR #1961 head `2e4ffdf78`, green after):
 
@@ -560,6 +574,49 @@ Witnesses (red on PR #1961 head `2e4ffdf78`, green after):
     replace `native_kill_wake_to_a_busy_home_marks_fresh_host_work` and
     `native_exit_wake_to_a_busy_home_is_misplaced_and_owes_the_host`, which
     asserted that misplacement.
+
+### Owner custody is checked under the slot lock (#1961 second review)
+
+The confirming review of `e773bf06c` found two defects in that placement.
+First, a waiter no other slot owned, whose affinity excluded the waker's
+CPU, was still queued on the waker's slot, `misplaced`: x86 switched it in
+on the forbidden CPU, and ARM bounced it between `switch_in_full` and
+`unswitch` (`NeedsHost`) while `take_service_head_for_executor` found
+nothing. Second, `owner_slot` read slot liveness without the slot lock, its
+last arm never checked the driver, and `requeue_claimed` took the lock
+without re-checking either, so a waiter could land on a slot its driver had
+left (`leave_slot` stores `drive = 0` under that lock) and stay there; the
+#1892/#1902 kick of live peers was lost too.
+
+Now each owner candidate carries the custody it needs (`OwnerCustody`:
+home driven, live and able to run it, or driven on an allowed CPU), which
+`requeue_claimed` re-checks under the slot lock; a waiter no driven slot
+may run and the waker's CPU may not run goes to the host through the
+completion chain. As defense in depth, x86's two switch sites
+(`native_execution::schedule`, `NativeLane::switch_next`) use
+`ZoneTables::switch_in_admitted`, which never switches in a thread whose
+affinity excludes the CPU (narrowed while it was queued): it goes to the
+slot that owns it, with its kick. x86's WORK boundary does not settle the
+completion chain; every x86 CPU's slot is driven from boot, so an x86 waiter
+reaches it only if its affinity names no CPU with a slot.
+
+Witnesses (red with only the production fix reverted, green after):
+
+- `carrick-sched-core`: `an_excluded_waiter_no_driven_slot_may_run_goes_to_the_host`
+  (last slot the waker's or a left one; red `Queued { slot: SlotId(3) }`,
+  the waker), `a_slot_left_between_choice_and_lock_never_strands_the_waiter`
+  (two threads: the test holds the chosen slot's lock while the waker spins
+  on it, then performs `leave_slot`'s locked step; red `Queued { slot:
+  SlotId(5) }`, the left slot),
+  `an_excluded_waiter_queued_on_an_away_slot_kicks_live_peers_of_its_cpu`
+  (red: no kick) and `el1_honours_affinity_for_floating_threads`.
+- ARM, `forked_child_futex_wake_hands_a_waiter_no_driven_vcpu_may_run_to_the_host`
+  (through `dispatch_arm_syscall_with_native_process`, two live threads of a
+  fork child): red `Queued { slot: SlotId(0) }`, the waker's slot.
+- x86, `native_futex_wake_of_a_waiter_no_driven_cpu_may_run_goes_to_the_host`
+  and the two-live-thread
+  `switch_never_runs_a_thread_whose_affinity_excludes_the_cpu` (red with
+  `switch_next` back on `switch_in_full`: the excluded thread ran on CPU 0).
 
 The x86 KVM futex witness also exposed an x86 result defect, older than
 this change: the x86 native futex branch of the EL1 pending families
