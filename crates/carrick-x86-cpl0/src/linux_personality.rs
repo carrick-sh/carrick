@@ -454,6 +454,8 @@ pub(crate) fn deliver_signal_on_syscall_return(
     fpstate: &XsaveArea,
 ) -> Option<CompletionRoute> {
     let (_, control) = task.lifecycle_refs()?;
+    #[cfg(feature = "test-support")]
+    crate::test_support::block_sigusr1_at_checkpoint(control);
     carrick_el1_linux::signal_delivery::deliver_signal_on_syscall_return(
         task,
         control,
