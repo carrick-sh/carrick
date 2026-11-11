@@ -19,6 +19,11 @@ pub const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
         "nativeprefixwrite",
         "case_native_prefix_write_child_inherited_file",
     ),
+    // Signed fork+exec-child witness for native madvise discard (#1846).
+    (
+        "nativeexecmadvise",
+        "case_native_exec_child_madvise_dontneed_discards",
+    ),
     ("bridge_compose_client", "conformance_bridge_compose_pair"),
     ("bridge_compose_server", "conformance_bridge_compose_pair"),
     ("bridge_dns_epoll_wake", "conformance_bridge_dns_epoll_wake"),

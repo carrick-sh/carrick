@@ -1438,6 +1438,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "nativeexecmadvise": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "case_native_exec_child_madvise_dontneed_discards"
+  },
   "nativeprefixwrite": {
     "class": "conformance",
     "excluded": false,
