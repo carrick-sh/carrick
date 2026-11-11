@@ -8158,3 +8158,6 @@ fn delegated_outside_hint_host_demotion_strips_outside_layout_provenance() {
     );
     assert!(memory.protect_log.borrow().is_empty());
 }
+
+#[path = "delegated_tests/private_file_owner.rs"]
+mod private_file_owner;
