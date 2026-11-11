@@ -1,0 +1,12 @@
+schema = "carrick.conformance-exemption.v1"
+base = "a88314ade20f6e8e49d890f5baa4a1d2b795942c"
+head = "b9c97ee086228c4259448b8ac24a5b4c09cc0118"
+contracts = [
+  "diagnostics.syscall-refusal",
+  "kernel.native.entropy",
+  "runtime.image-entrypoint",
+]
+paths = [
+  "crates/carrick-runtime/src/prepare.rs",
+]
+rationale = "The exact diff only touches the #[cfg(test)] mod tests in crates/carrick-runtime/src/prepare.rs: a test-only PROCESS_CARRIER_TEST_LOCK static, the _exclusive guard field on the test guard, and one lock acquisition in process_carrier_test_guard_isolates_leaked_and_concurrent_prepare_leases. No production function, syscall argument, return value or guest operation changes, so no guest-visible behaviour or cost changes. The change only stops two parallel-partition tests from racing on process-wide carrier state (#2086)."
