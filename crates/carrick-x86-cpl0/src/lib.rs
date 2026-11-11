@@ -50,6 +50,33 @@ mod test_support {
     /// has already committed.
     pub const INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe1d;
     pub const INJECT_PEER_IDLE_RELEASE_ONCE: u64 = 0xffff_ffff_ffff_fe18;
+    /// The calling member blocks SIGUSR1 at the signal checkpoint of its
+    /// second syscall return from now (the first is this call's own return).
+    /// A `kill` issued right after therefore sees the member eligible when it
+    /// enumerates recipients and ineligible by the time it reaches its
+    /// checkpoint: the interleaving the guest cannot order deterministically.
+    pub const INJECT_BLOCK_SIGUSR1_AT_SECOND_CHECKPOINT: u64 = 0xffff_ffff_ffff_fe1d;
+    const SIGUSR1_BIT: u64 = 1 << 9;
+    /// Address of the armed member's control slot, or 0.
+    static BLOCK_CONTROL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static BLOCK_CHECKPOINTS_LEFT: core::sync::atomic::AtomicU8 =
+        core::sync::atomic::AtomicU8::new(0);
+
+    /// Run at every syscall-return signal checkpoint, before delivery.
+    pub fn block_sigusr1_at_checkpoint(control: &carrick_el1_abi::ThreadControlSlot) {
+        let address = control as *const carrick_el1_abi::ThreadControlSlot as usize;
+        if BLOCK_CONTROL.load(Ordering::Acquire) != address {
+            return;
+        }
+        if BLOCK_CHECKPOINTS_LEFT.fetch_sub(1, Ordering::AcqRel) == 1 {
+            BLOCK_CONTROL.store(0, Ordering::Release);
+            let blocked = control.blocked().0 | SIGUSR1_BIT;
+            let _ = control.store_blocked_then_read_pending(
+                carrick_personality_linux::abi::thread::BlockedMask(blocked),
+                control.pending(),
+            );
+        }
+    }
     // Test-only actor ordering: armed by CPU0's fixture syscall; CPU0
     // publishes Parked before requesting CPU1's scheduler to release it.
     // The production object-wait queue and notification choose the wake target.
@@ -191,6 +218,18 @@ mod test_support {
                 .compare_exchange(0, RELEASE_ARMED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
                 .then_some(0),
+            INJECT_BLOCK_SIGUSR1_AT_SECOND_CHECKPOINT => {
+                // SAFETY: dispatch runs on the CPU that owns this task binding.
+                let task =
+                    unsafe { &*(binding.task_address as *const carrick_el1_abi::CurrentTask) };
+                let (_, control) = task.lifecycle_refs()?;
+                BLOCK_CHECKPOINTS_LEFT.store(2, Ordering::Release);
+                BLOCK_CONTROL.store(
+                    control as *const carrick_el1_abi::ThreadControlSlot as usize,
+                    Ordering::Release,
+                );
+                Some(0)
+            }
             INJECT_ROOT_BUSY_ONCE => {
                 carrick_core::mm::reservation::inject_root_busy_once().then_some(0)
             }

@@ -607,9 +607,22 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
     assert_eq!(outcome.physical.robust_list_head(0).unwrap(), 0x2345);
 }
 
+/// Test-support ordinal; see `carrick-x86-cpl0`'s `test_support`.
+const INJECT_BLOCK_SIGUSR1_AT_SECOND_CHECKPOINT: u64 = 0xffff_ffff_ffff_fe1d;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloneProbe {
+    Plain,
+    /// The parent sends signal 0 to the child's tid.
+    KillSignalZero,
+    /// The child sends SIGUSR1 to its own tid, then blocks it before its
+    /// checkpoint; the parked parent must be the member that takes it.
+    KillKicksEveryMember,
+}
+
 /// A real guest birth, handshake and nonfinal raw exit. No fixture-image
 /// ordinals, preseeded members or host-answered clone can satisfy this probe.
-fn production_thread_clone_probe(probe_nonleader: bool) -> Vec<u8> {
+fn production_thread_clone_probe(mode: CloneProbe) -> Vec<u8> {
     fn mov(code: &mut Vec<u8>, register: &[u8], value: u64) {
         code.extend_from_slice(register);
         code.extend_from_slice(&value.to_le_bytes());
@@ -667,12 +680,32 @@ fn production_thread_clone_probe(probe_nonleader: bool) -> Vec<u8> {
     failures.push(branch(&mut code, 0x85));
     code.extend_from_slice(&[0x4c, 0x39, 0xf0]); // cmp rax,r14 (distinct tids)
     failures.push(branch(&mut code, 0x84));
-    if probe_nonleader {
+    if mode == CloneProbe::KillSignalZero {
         // The child stays live behind the existing bounded handshake.
         // kill(child_tid, 0) must accept a nonleader namespace TID.
         code.extend_from_slice(&[0x4c, 0x89, 0xef]); // rdi = r13 (child tid)
         mov(&mut code, &[0x48, 0xbe], 0);
         mov(&mut code, &[0x48, 0xb8], 62);
+        code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0]);
+        failures.push(branch(&mut code, 0x85));
+    }
+    let mut handler_fixups = Vec::new();
+    if mode == CloneProbe::KillKicksEveryMember {
+        // sigaction {handler, SA_RESTORER, restorer, mask} at data+0x40.
+        for (offset, flags) in [(0x40_u8, false), (0x50, true)] {
+            code.extend_from_slice(&[0x48, 0x8d, 0x05]); // lea rax,[rip+target]
+            handler_fixups.push(code.len());
+            code.extend_from_slice(&0_i32.to_le_bytes());
+            code.extend_from_slice(&[0x49, 0x89, 0x44, 0x24, offset]);
+            if flags {
+                code.extend_from_slice(&[0x49, 0xc7, 0x44, 0x24, 0x48, 0, 0, 0, 0x04]);
+            }
+        }
+        mov(&mut code, &[0x48, 0xbf], 10); // SIGUSR1
+        code.extend_from_slice(&[0x49, 0x8d, 0xb4, 0x24, 0x40, 0, 0, 0]);
+        mov(&mut code, &[0x48, 0xba], 0);
+        mov(&mut code, &[0x49, 0xba], 8);
+        mov(&mut code, &[0x48, 0xb8], 13);
         code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0]);
         failures.push(branch(&mut code, 0x85));
     }
@@ -683,6 +716,26 @@ fn production_thread_clone_probe(probe_nonleader: bool) -> Vec<u8> {
     mov(&mut code, &[0x48, 0xba], 1);
     mov(&mut code, &[0x48, 0xb8], 202);
     code.extend_from_slice(&[0x0f, 0x05]);
+    if mode == CloneProbe::KillKicksEveryMember {
+        // The parent stays in user mode, SIGUSR1 unblocked, making no
+        // syscall (so no signal checkpoint of its own). Only a kick can pull
+        // it into the kernel to run the handler. The spin bound is a failure
+        // deadline, not a poll: a kill that kicks the parent ends it at once.
+        mov(&mut code, &[0x48, 0xb9], 1 << 33);
+        let spin = code.len();
+        code.extend_from_slice(&[0x41, 0x83, 0x7c, 0x24, 0x10, 1]); // handler count == 1
+        let done = branch(&mut code, 0x84);
+        code.extend_from_slice(&[0x48, 0xff, 0xc9]); // dec rcx
+        let again = branch(&mut code, 0x85);
+        target(&mut code, again, spin);
+        let out = code.len();
+        target(&mut code, done, out);
+        code.extend_from_slice(&[0x41, 0x83, 0x7c, 0x24, 0x10, 1]);
+        failures.push(branch(&mut code, 0x85));
+        mov(&mut code, &[0x48, 0xbf], 7);
+        mov(&mut code, &[0x48, 0xb8], 231);
+        code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    }
     // Join the child using its CHILD_CLEARTID word and the same deadline.
     code.extend_from_slice(&[0x4c, 0x89, 0xe7, 0x4c, 0x89, 0xea]);
     wait(&mut code);
@@ -710,6 +763,27 @@ fn production_thread_clone_probe(probe_nonleader: bool) -> Vec<u8> {
     failures.push(branch(&mut code, 0x85));
     mov(&mut code, &[0x48, 0xb8], 186);
     code.extend_from_slice(&[0x0f, 0x05, 0x41, 0x89, 0x44, 0x24, 8]);
+    if mode == CloneProbe::KillKicksEveryMember {
+        // kill(own tid, SIGUSR1) with this member eligible when recipients
+        // are enumerated and SIGUSR1 blocked again before its checkpoint.
+        code.extend_from_slice(&[0x41, 0x8b, 0x7c, 0x24, 8]); // edi = own tid
+        mov(
+            &mut code,
+            &[0x48, 0xb8],
+            INJECT_BLOCK_SIGUSR1_AT_SECOND_CHECKPOINT,
+        );
+        code.extend_from_slice(&[0x0f, 0x05]);
+        code.extend_from_slice(&[0x41, 0x8b, 0x7c, 0x24, 8]);
+        mov(&mut code, &[0x48, 0xbe], 10);
+        mov(&mut code, &[0x48, 0xb8], 62);
+        code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0]);
+        failures.push(branch(&mut code, 0x85));
+        // Stay parked (bounded) with SIGUSR1 blocked until the parent ends
+        // the process.
+        code.extend_from_slice(&[0x49, 0x8d, 0x7c, 0x24, 0x18]);
+        mov(&mut code, &[0x48, 0xba], 0);
+        wait(&mut code);
+    }
     mov(&mut code, &[0x48, 0xbf], 0);
     mov(&mut code, &[0x48, 0xb8], 60); // raw exit: only this thread dies
     code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
@@ -725,12 +799,20 @@ fn production_thread_clone_probe(probe_nonleader: bool) -> Vec<u8> {
     mov(&mut code, &[0x48, 0xbf], 9);
     mov(&mut code, &[0x48, 0xb8], 231);
     code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    if let [handler_at, restorer_at] = handler_fixups[..] {
+        let here = code.len();
+        target(&mut code, handler_at, here);
+        code.extend_from_slice(&[0x41, 0xff, 0x44, 0x24, 0x10, 0xc3]); // inc [data+0x10]; ret
+        let here = code.len();
+        target(&mut code, restorer_at, here);
+        code.extend_from_slice(&[0xb8, 15, 0, 0, 0, 0x0f, 0x05]); // rt_sigreturn
+    }
     production_probe_elf(&code)
 }
 
 #[test]
 fn production_clone_thread_runs_and_exits_without_ending_parent() {
-    let outcome = run_pool_fixture(&production_thread_clone_probe(false), 32);
+    let outcome = run_pool_fixture(&production_thread_clone_probe(CloneProbe::Plain), 32);
     assert_eq!(
         outcome.run.exit_code, 7,
         "guest clone/lifecycle failed (clone errors are reported as errno numbers)"
@@ -749,10 +831,32 @@ fn production_clone_thread_runs_and_exits_without_ending_parent() {
 
 #[test]
 fn production_kill_probe_resolves_a_live_nonleader_tid() {
-    let outcome = run_pool_fixture(&production_thread_clone_probe(true), 32);
+    let outcome = run_pool_fixture(
+        &production_thread_clone_probe(CloneProbe::KillSignalZero),
+        32,
+    );
     assert_eq!(
         outcome.run.exit_code, 7,
         "kill(nonleader_tid, 0) must succeed"
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// `kill(tid, SIGUSR1)` names a nonleader that is eligible when recipients are
+/// enumerated and has blocked SIGUSR1 before its own checkpoint. The signal
+/// stays in the process inbox, so the only way the parent, spinning in user
+/// mode with no checkpoint of its own, runs the handler is that the kill
+/// kicked it too. A named-only kick leaves it spinning until its bound
+/// expires, which the probe reports as exit 9.
+#[test]
+fn production_kill_nonleader_tid_kicks_every_eligible_member() {
+    let outcome = run_instrumented_pool_fixture(
+        &production_thread_clone_probe(CloneProbe::KillKicksEveryMember),
+        64,
+    );
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "the parked sibling must be interrupted and consume SIGUSR1 once"
     );
     assert_eq!(outcome.run.terminating_signal, None);
 }
