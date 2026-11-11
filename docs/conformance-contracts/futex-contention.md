@@ -598,6 +598,16 @@ waker for its executor. x86's WORK boundary does not settle the completion
 chain; every x86 CPU's slot is driven from boot, so an x86 waiter reaches it
 only if its affinity names no CPU with a slot.
 
+Wake fallback enumerates the last slot followed by slot-id order. Only
+currently driven, allowed hints are probed, and admission is checked again
+under the slot lock. The initial placement target is excluded from fallback,
+so each distinct slot is locked at most once under the bucket/object-wait
+lock. A first candidate losing its driver cannot hide a driven peer. The
+`claim_for_el1_probes_a_busy_candidate_only_once` binding counts lock probes
+and then admits the same parked operation after release;
+`a_left_first_candidate_falls_back_to_a_driven_peer` bounds coordination at
+slot-lock entry and removes the first driver before locked admission.
+
 The review also suggested guarding x86's switch (`native_execution::schedule`,
 `NativeLane::switch_next`) against a thread whose affinity excludes the CPU.
 That guard cannot land yet: x86 KVM production publishes records with
