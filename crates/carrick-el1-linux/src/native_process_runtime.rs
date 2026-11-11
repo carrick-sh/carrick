@@ -1087,10 +1087,6 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     page: &'a ThreadLifecyclePage,
     members: Vec<NativeMember<'a, C>>,
     thread_stock: Option<thread_stock::NativeThreadStock<'a, C>>,
-    /// Unmanaged clone callers whose carrier work asked the host ledger for
-    /// stock (#1974); a caller's rerun that still finds the pool empty takes
-    /// the host's answer instead of asking again.
-    host_stock_demands: Vec<RecordRef>,
     mm: M,
     address: AddressContext<RootGpa>,
     interrupted_child_waits: BTreeMap<RecordRef, InterruptedChildWait<C>>,
@@ -1427,6 +1423,18 @@ struct MemberWaitState<'a> {
     relative_futex_wait: Option<carrick_personality_linux::sched::RelativeFutexWait>,
     wait: Option<MemberWait<'a>>,
     suspend_mask: Option<carrick_signal_core::policy::SigBlockMask>,
+    /// The carrier's answer to this member's last unmanaged thread-stock
+    /// demand, retained from its `CarrierWork` completion to the clone's
+    /// rerun (#1974), like `relative_futex_wait` across the same retry.
+    thread_stock_reply: Option<carrick_core_abi::service::CarrierWorkReply>,
+}
+impl MemberWaitState<'_> {
+    fn is_empty(&self) -> bool {
+        self.relative_futex_wait.is_none()
+            && self.wait.is_none()
+            && self.suspend_mask.is_none()
+            && self.thread_stock_reply.is_none()
+    }
 }
 
 // Every continuation remains separately typed and keyed, while one tree
@@ -1641,10 +1649,38 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     ) -> Option<carrick_personality_linux::sched::RelativeFutexWait> {
         let state = self.pending.member_mut(record)?;
         let operation = state.relative_futex_wait.take();
-        if state.wait.is_none() && state.suspend_mask.is_none() {
+        if state.is_empty() {
             self.pending.remove_member(record);
         }
         operation
+    }
+
+    /// A retiring member's retained per-call state goes with it: its
+    /// relative futex wait and any thread-stock answer its rerun never read.
+    fn retire_member_retained(&mut self, record: &RecordRef) {
+        let _ = self.take_relative_futex_wait(record);
+        let _ = self.take_thread_stock_reply(record);
+    }
+
+    #[inline(never)]
+    fn retain_thread_stock_reply(
+        &mut self,
+        record: RecordRef,
+        reply: carrick_core_abi::service::CarrierWorkReply,
+    ) {
+        self.member_wait_state(record).thread_stock_reply = Some(reply);
+    }
+
+    fn take_thread_stock_reply(
+        &mut self,
+        record: &RecordRef,
+    ) -> Option<carrick_core_abi::service::CarrierWorkReply> {
+        let state = self.pending.member_mut(record)?;
+        let reply = state.thread_stock_reply.take();
+        if state.is_empty() {
+            self.pending.remove_member(record);
+        }
+        reply
     }
 
     fn has_member_wait(&self, record: &RecordRef) -> bool {
@@ -1669,7 +1705,7 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     fn take_member_wait(&mut self, record: &RecordRef) -> Option<MemberWait<'a>> {
         let state = self.pending.member_mut(record)?;
         let wait = state.wait.take();
-        if state.suspend_mask.is_none() && state.relative_futex_wait.is_none() {
+        if state.is_empty() {
             self.pending.remove_member(record);
         }
         wait
@@ -1697,7 +1733,7 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     ) -> Option<carrick_signal_core::policy::SigBlockMask> {
         let state = self.pending.member_mut(record)?;
         let mask = state.suspend_mask.take();
-        if state.wait.is_none() && state.relative_futex_wait.is_none() {
+        if state.is_empty() {
             self.pending.remove_member(record);
         }
         mask
@@ -1975,7 +2011,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             }
         }
         for (_, record, _, control_addr) in &completed {
-            let _ = graph.take_relative_futex_wait(record);
+            graph.retire_member_retained(record);
             graph
                 .pending
                 .remove_member_child_waits(&process, *control_addr);
@@ -3211,7 +3247,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         record: RecordRef,
     ) {
         let mut state = self.state.lock();
-        let _ = runtime.graph.lock().take_relative_futex_wait(&record);
+        runtime.graph.lock().retire_member_retained(&record);
         let carrier = core::ptr::from_ref(runtime.zone).addr();
         let key = state.members.iter().find_map(|(key, member)| {
             (key.carrier == carrier && member.process == process && member.record == record)
@@ -3242,10 +3278,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         };
         for key in members {
             if let Some(member) = state.members.remove(&key) {
-                let _ = runtime
-                    .graph
-                    .lock()
-                    .take_relative_futex_wait(&member.record);
+                runtime.graph.lock().retire_member_retained(&member.record);
                 state
                     .records
                     .remove(&Self::record_key(runtime.zone, member.record));
@@ -4095,7 +4128,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             page,
             members,
             thread_stock: None,
-            host_stock_demands: Vec::new(),
             mm,
             address,
             interrupted_child_waits: BTreeMap::new(),
@@ -8201,7 +8233,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 expected_host,
             }],
             thread_stock: Some(thread_stock),
-            host_stock_demands: Vec::new(),
             mm: self.service.prepared_mm(&prepared),
             address,
             interrupted_child_waits: BTreeMap::new(),
@@ -8520,6 +8551,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             operation,
             carrick_core_abi::service::ServiceOperation::CarrierWork {
                 entry: OwnerEntry::Syscall,
+                demand: carrick_core_abi::service::CarrierDemand::Work,
             },
             None,
         );

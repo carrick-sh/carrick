@@ -176,16 +176,21 @@ impl NativeService {
         self.complete(false)
     }
 
-    /// The carrier delivered the completed instruction's owed work. Its
-    /// result remains exclusively in the ring continuation.
-    pub fn acknowledge_work(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
-        if !matches!(
-            self.request().operation,
-            carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
-        ) {
+    /// The carrier delivered the completed instruction's owed work and
+    /// answers the request's own demand with `reply`. The syscall's result
+    /// remains exclusively in the ring continuation; a reply that does not
+    /// answer this request's demand is refused as stale.
+    pub fn acknowledge_work(
+        self,
+        reply: carrick_core_abi::service::CarrierWorkReply,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let carrick_core_abi::service::ServiceOperation::CarrierWork { demand, .. } =
+            self.request().operation
+        else {
             return Err(stale());
-        }
-        self.complete(true)
+        };
+        let supplied = reply.supplied_for(demand).ok_or_else(stale)?;
+        self.complete(supplied)
     }
 
     pub fn slot(&self) -> carrick_sched_core::SlotId {
