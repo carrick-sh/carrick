@@ -3976,6 +3976,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 
     /// Take `slot`'s run-queue lock, waiting per `wait`.
     pub fn slot_lock(&self, slot: SlotId, wait: &impl LockWait<C>) -> Option<SlotGuard<'_, C>> {
+        #[cfg(test)]
+        tests::observe_slot_lock(slot);
         let lock = &self.slot(slot).lock;
         let mut attempt: u32 = 0;
         loop {
