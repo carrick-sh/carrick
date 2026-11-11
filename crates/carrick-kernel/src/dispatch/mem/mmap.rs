@@ -237,6 +237,39 @@ impl MmapRequest {
 /// Linux sealed system mappings (EPERM), while callers retain NOREPLACE's
 /// EEXIST collision result. Lengths are page-rounded by the syscall boundary.
 /// No VMA lookup or backend work is needed: the reserved ABI span is fixed.
+/// The file length of a description an admitted MM's private mapping can
+/// retain as its owner source, or `None` for a description the retained
+/// source reader does not serve. The length classifies the beyond-EOF tail
+/// exactly as the eager snapshot did.
+fn owner_private_file_len(description: &OpenDescription) -> Option<Result<u64, LinuxErrno>> {
+    let io_errno = |error: std::io::Error| {
+        error
+            .raw_os_error()
+            .map(crate::host_to_linux_errno)
+            .unwrap_or(linux_errno::EIO)
+    };
+    match description {
+        OpenDescription::HostFile {
+            host_fd, metadata, ..
+        } if metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::File => {
+            host_fd_file_len(host_fd.raw()).map(Ok)
+        }
+        // Reopening /proc/self/exe retains the executable object, not a
+        // HostFile description.
+        OpenDescription::ProcExecutable { executable, .. } => Some(
+            executable
+                .source()
+                .len()
+                .map(|len| len as u64)
+                .map_err(io_errno),
+        ),
+        OpenDescription::File { contents, .. } => Some(contents.len()),
+        OpenDescription::SyntheticFile { contents, .. } => Some(Ok(contents.len() as u64)),
+        OpenDescription::InMemoryFile { contents, .. } => Some(Ok(contents.read().len() as u64)),
+        _ => None,
+    }
+}
+
 fn overlaps_clock_stub(address: u64, length: u64) -> Result<bool, LinuxErrno> {
     address.checked_add(length).ok_or(LINUX_ENOMEM)?;
     Ok(super::overlaps_el0_clock_stub(address, length))
@@ -1387,11 +1420,14 @@ impl<'a> MemView<'a> {
                 && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && !map_flags.contains(LinuxMmapFlags::GROWSDOWN)
                 && mmap_file_backed_lowering_enabled();
+            // An admitted MM's owner refuses every transfer while this
+            // mutation holds its gate, so no private file mapping of it may
+            // initialize through UserWrite. Every description the retained
+            // source reader serves (`snapshot_private_mmap_description`)
+            // takes source custody instead, POPULATE and LOCKED included:
+            // their residency and lock accounting are metadata (#1141).
             let owner_file_eligible = map_sharing == MmapSharing::Private
-                && !map_flags.intersects(
-                    LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::GROWSDOWN
-                        | LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED,
-                )
+                && !map_flags.intersects(LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::GROWSDOWN)
                 && this.mem().lock().delegated_root().is_some();
             // Inspect the description once for both venues. Retaining an owner
             // source does not introduce another file-description authority.
@@ -1399,17 +1435,10 @@ impl<'a> MemView<'a> {
                 this.open_file(fd.0).and_then(|open_file| {
                     let description = crate::kernel::FileDescription::inspect(&open_file.description)?;
                     let lowering = file_lowering_enabled && description.shared_alias_host_fd().is_some();
-                    let owner_len = match &*description {
-                        OpenDescription::HostFile { host_fd, metadata, .. }
-                            if owner_file_eligible && metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::File =>
-                                host_fd_file_len(host_fd.raw()).map(Ok),
-                        // Reopening /proc/self/exe retains the executable
-                        // object, not a HostFile description. Its source is
-                        // already readable by the same private backing venue.
-                        // Eager UserWrite here would reacquire our own MM gate.
-                        OpenDescription::ProcExecutable { executable, .. } if owner_file_eligible =>
-                            Some(executable.source().len().map(|len| len as u64)),
-                        _ => None,
+                    let owner_len = if owner_file_eligible {
+                        owner_private_file_len(&description)
+                    } else {
+                        None
                     };
                     Some((lowering, owner_len))
                 }).unwrap_or((false, None))
@@ -1418,12 +1447,9 @@ impl<'a> MemView<'a> {
             };
             let owner_file_candidate_len = match owner_file_candidate_len.transpose() {
                 Ok(length) => length,
-                Err(error) => return Ok(request.refused_by(
-                    MmapRefusal::Internal("executable length could not be read during mmap"),
-                    error.raw_os_error()
-                        .map(crate::host_to_linux_errno)
-                        .unwrap_or(linux_errno::EIO),
-                    format_args!("{error}"),
+                Err(errno) => return Ok(request.refused(
+                    MmapRefusal::Internal("file length could not be read during mmap"),
+                    errno,
                 )),
             };
             // A plain private anonymous mapping a delegated root can own
@@ -2417,9 +2443,13 @@ impl<'a> MemView<'a> {
                         // redispatch would close our gate again before copying.
                         return Err(DispatchError::MmapSelfHeldOwnerGate(*wait));
                     }
-                    // Eager self-reacquisition needs the excluded editor (#1141);
-                    // foreign waits need retained address/source custody, not
-                    // numeric syscall redispatch (#1124).
+                    // The mutation guard excluded every other editor of an
+                    // admitted MM before this syscall ran, so an owner wait
+                    // here is that guard's own gate, never foreign
+                    // contention. Every description the retained source
+                    // reader serves took source custody above; only the
+                    // residual eager shapes (device, packet-ring and alias
+                    // placements of an admitted MM) still reach this copy.
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("file content could not be copied into the mapping"),

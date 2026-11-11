@@ -1388,8 +1388,8 @@ fn admitted_proc_executable_private_mmap_avoids_its_own_gate() {
     assert!(tail[37..].iter().all(|byte| *byte == 0));
 }
 
-/// Eager population cannot use lazy owner custody yet. A refusal must keep
-/// main's syscall errno rather than ending the carrier (#1133 review).
+/// Eager population uses the retained owner source too, under the real HAL
+/// exclusion registration (#1133 review, #1141).
 #[test]
 fn admitted_private_host_file_populate_self_held_gate_is_not_fatal() {
     use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause};
@@ -1427,15 +1427,25 @@ fn admitted_private_host_file_populate_self_held_gate_is_not_fatal() {
             LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | extra_flags.bits(),
             FILE_FD,
         );
+        // Eager population takes the same retained source custody as any
+        // private file map: no owner copy under the held gate, no errno and
+        // no carrier fatal (#1141).
         assert_eq!(
             outcome,
-            DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM
+            DispatchOutcome::Returned {
+                value: address as i64
             }
         );
-        assert_eq!(memory.write_calls.get(), 1);
-        assert_eq!(memory.write_bytes_total.get(), 0);
-        assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
+        assert_eq!(memory.write_calls.get(), 0);
+        let source = root
+            .lock()
+            .mapping(address)
+            .and_then(|mapping| mapping.host_backing)
+            .expect("eager private file map retains its owner source");
+        assert_eq!(
+            &dispatcher.mem_view().read_host_backing(source, 12).unwrap(),
+            b"file payload"
+        );
         drop(held);
         spaces.lower(index);
     }
