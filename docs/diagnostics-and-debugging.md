@@ -703,7 +703,7 @@ default per-host sccache configuration, the `CARRICK_SCCACHE=0` hatch, and
 
 ## Gotchas for agents
 
-Moved from `AGENTS.md` (#2118); complements [Gotchas](#gotchas-the-authoritative-methodology-lives-in-the-carrick-trace-skill) above.
+Moved from `AGENTS.md` (#2118); complements the Gotchas section above.
 
 - **`carrick trace` should fail closed on these traps:**
   - **Listed ≠ firing; FBT can't see local symbols** (`fbt::vm_fault:entry`
