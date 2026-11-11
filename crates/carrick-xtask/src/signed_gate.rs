@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+pub mod reuse;
+pub use reuse::{
+    BaseReuseKey, ReuseExecutionContext, ReuseMissReason, ReuseSealMetadata,
+    compute_base_reuse_key, trusted_reuse_run,
+};
+
 // Only the owner may request a signed gate. The carrick-workers App is held
 // by agents and worker VMs; admitting it would let agent-written code run on a
 // gate runner at the agent's own request (#654).
@@ -67,6 +73,17 @@ pub enum SignedGateAction {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Look up and verify a sealed base receipt on this exact gate Mac before
+    /// `execute`. Any miss or verification doubt logs a [`ReuseMissReason`] and
+    /// exits zero without writing a reuse directory.
+    ReuseLookup {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, env = "CARRICK_SIGNED_FIXTURE_BUNDLE")]
+        fixture_bundle: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Run the merge base and the candidate on macOS, each in a new detached
     /// worktree, under one exclusive host lease and one fixture bundle.
     Execute {
@@ -82,6 +99,9 @@ pub enum SignedGateAction {
         /// the bundle to the candidate run only.
         #[arg(long)]
         candidate_probes: Option<PathBuf>,
+        /// Verified reusable base directory produced by `reuse-lookup`.
+        #[arg(long)]
+        reuse_base: Option<PathBuf>,
     },
     /// Compare on a hosted runner and publish a PR comment and commit status.
     Publish {
@@ -93,6 +113,20 @@ pub enum SignedGateAction {
         run_url: String,
         #[arg(long)]
         execution_result: String,
+    },
+    /// Package an admitted, complete `Main` gate result under its canonical
+    /// [`BaseReuseKey`] for upload as `signed-base-reuse-<base>-<key_sha256>`.
+    PrepareReuseUpload {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        results: PathBuf,
+        #[arg(long)]
+        fixture_bundle: PathBuf,
+        #[arg(long)]
+        run_id: u64,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -1232,6 +1266,7 @@ fn execute(
     output: &Path,
     bundle: &Path,
     candidate_probes: Option<&Path>,
+    reuse_base: Option<&Path>,
 ) -> Result<(), ReceiptError> {
     if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
         return Err(fail("requires macOS ARM64"));
@@ -1258,7 +1293,14 @@ fn execute(
             return Err(error);
         }
     };
-    execute_pair(&request, &output, |run| {
+    let host_identity = crate::accept::SignedHostIdentity::capture();
+    let reuse_ctx = reuse_base.map(|reuse_dir| ReuseExecutionContext {
+        root,
+        bundle: &bundle,
+        host_identity,
+        reuse_dir,
+    });
+    execute_pair(&request, &output, reuse_ctx.as_ref(), |run| {
         execute_one(
             root,
             &lease,
@@ -1281,6 +1323,7 @@ fn execute(
 pub fn execute_pair(
     request: &Request,
     output: &Path,
+    reuse: Option<&ReuseExecutionContext<'_>>,
     mut run: impl FnMut(&PairedRun) -> Result<(), ReceiptError>,
 ) -> Result<(), ReceiptError> {
     let result = (|| {
@@ -1288,19 +1331,37 @@ pub fn execute_pair(
         if request.kind != RequestKind::Main {
             let base_dir = output.join(BASE_DIR);
             fs::create_dir_all(&base_dir).map_err(|e| fail(e.to_string()))?;
-            run(&PairedRun {
-                side: PairSide::Base,
-                commit: request.base.clone(),
-                fixture_publisher: request.base.clone(),
-                output: base_dir.clone(),
-                receipt_name: BASE_RECEIPT,
-            })
-            .map_err(|error| fail(format!("paired base {}: {error}", request.base)))?;
-            // An incomplete base is advisory (#2045): the candidate still
-            // runs, and `publish` derives the base gap again from the receipt.
-            // Seal the base now, before any candidate code runs. The
-            // expected inventory lives only in this process's memory.
-            sealed = Some((base_dir.clone(), evidence_inventory(&base_dir)?));
+            let reused = match reuse {
+                Some(ctx) => match reuse::try_install_reused_base(ctx, &request.base, &base_dir) {
+                    Ok((files, meta)) => Some((files, meta)),
+                    Err(reason) => {
+                        eprintln!("signed-gate: base reuse miss ({reason}); executing paired base");
+                        if base_dir.exists() {
+                            fs::remove_dir_all(&base_dir).map_err(|e| fail(e.to_string()))?;
+                        }
+                        fs::create_dir_all(&base_dir).map_err(|e| fail(e.to_string()))?;
+                        None
+                    }
+                },
+                None => None,
+            };
+            if let Some((files, meta)) = reused {
+                sealed = Some((base_dir, files, Some(meta)));
+            } else {
+                run(&PairedRun {
+                    side: PairSide::Base,
+                    commit: request.base.clone(),
+                    fixture_publisher: request.base.clone(),
+                    output: base_dir.clone(),
+                    receipt_name: BASE_RECEIPT,
+                })
+                .map_err(|error| fail(format!("paired base {}: {error}", request.base)))?;
+                // An incomplete base is advisory (#2045): the candidate still
+                // runs, and `publish` derives the base gap again from the receipt.
+                // Seal the base now, before any candidate code runs. The
+                // expected inventory lives only in this process's memory.
+                sealed = Some((base_dir.clone(), evidence_inventory(&base_dir)?, None));
+            }
         }
         run(&PairedRun {
             side: PairSide::Candidate,
@@ -1309,13 +1370,14 @@ pub fn execute_pair(
             output: output.to_path_buf(),
             receipt_name: CANDIDATE_RECEIPT,
         })?;
-        if let Some((base_dir, files)) = sealed {
+        if let Some((base_dir, files, reuse)) = sealed {
             // The candidate run, including its worktree cleanup, is over:
             // the base evidence must be byte-for-byte what was sealed.
             verify_inventory(&base_dir, &files)?;
             let record = BaseSeal {
                 base: request.base.clone(),
                 files,
+                reuse,
             };
             write_fresh(
                 &output.join(BASE_SEAL),
@@ -1334,9 +1396,11 @@ pub fn execute_pair(
 /// base run and the candidate run. Publication compares it with what it loads.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BaseSeal {
-    base: String,
-    files: std::collections::BTreeMap<String, String>,
+pub(crate) struct BaseSeal {
+    pub(crate) base: String,
+    pub(crate) files: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reuse: Option<ReuseSealMetadata>,
 }
 
 /// SHA-256 of every regular file under `dir`, keyed by `/`-separated relative
@@ -1418,7 +1482,7 @@ fn verify_inventory(
 }
 
 /// Check the published paired base against the executor's sealed record.
-fn verify_base_seal(results: &Path, base: &str) -> Result<(), ReceiptError> {
+fn verify_base_seal(results: &Path, base: &str) -> Result<Option<ReuseSealMetadata>, ReceiptError> {
     let record: BaseSeal = read_json(&results.join(BASE_SEAL))
         .and_then(|value| serde_json::from_value(value).map_err(|e| fail(e.to_string())))
         .map_err(|error| fail(format!("base evidence seal: {error}")))?;
@@ -1428,7 +1492,8 @@ fn verify_base_seal(results: &Path, base: &str) -> Result<(), ReceiptError> {
             record.base
         )));
     }
-    verify_inventory(&results.join(BASE_DIR), &record.files)
+    verify_inventory(&results.join(BASE_DIR), &record.files)?;
+    Ok(record.reuse)
 }
 
 /// Replace whatever is at `path` (including a planted symlink) with a new file.
@@ -1679,18 +1744,23 @@ fn publish(
         }
         let candidate = load(&results.join(CANDIDATE_RECEIPT))?;
         let mut base_gaps = Vec::new();
-        // Compare only with the base executed in this run, on the same Mac and
-        // with the same fixture bundle. A stored receipt from another host is
-        // never a substitute; comparability is still checked below.
-        let (base, base_evidence) = if request.kind == RequestKind::Main {
-            (candidate.clone(), Ok(()))
+        // Compare only with the base executed on the same Mac and with the
+        // same fixture bundle (either in this run or from a verified same-host
+        // sealed reuse artifact, #1918). A receipt from another host is never
+        // a substitute; comparability is still checked below.
+        let (base, base_evidence, reused_provenance) = if request.kind == RequestKind::Main {
+            (candidate.clone(), Ok(()), None)
         } else {
             let dir = results.join(BASE_DIR);
-            verify_base_seal(results, &request.base)?;
+            let reuse = verify_base_seal(results, &request.base)?;
             let base = load(&dir.join(BASE_RECEIPT))?;
+            let provenance = reuse
+                .as_ref()
+                .map(|meta| reuse::verify_published_reuse_seal(meta, &request.base, &base))
+                .transpose()?;
             base_gaps = paired_base_gaps(&base, accept_exit(&dir)?);
             let evidence = admit_evidence(&dir, &base).map(|_| ());
-            (base, evidence)
+            (base, evidence, provenance)
         };
         if request.kind == RequestKind::Main {
             validate_receipt(&base, &request.base)?;
@@ -1708,10 +1778,17 @@ fn publish(
             candidate.host_identity, candidate.fixture_validation
         ));
         if request.kind != RequestKind::Main {
-            body.push_str(&format!(
-                "Paired base `{}` ran on the same host in this job.\n",
-                request.base
-            ));
+            if let Some((artifact_id, source_run_id)) = reused_provenance {
+                body.push_str(&format!(
+                    "Paired base `{}`: reused base receipt {artifact_id} from run {source_run_id} on the same host.\n",
+                    request.base
+                ));
+            } else {
+                body.push_str(&format!(
+                    "Paired base `{}` ran on the same host in this job.\n",
+                    request.base
+                ));
+            }
         }
         if let Err(error) = &base_evidence {
             body.push_str(&format!("\nBase evidence admission failed: {error}\n"));
@@ -1912,17 +1989,24 @@ pub fn run(root: &Path, args: SignedGateArgs) -> Result<(), ReceiptError> {
             bundle,
             output,
         } => candidate_probes(root, &request, &bundle, &output),
+        SignedGateAction::ReuseLookup {
+            request,
+            fixture_bundle,
+            output,
+        } => reuse::reuse_lookup(root, &request, &fixture_bundle, &output),
         SignedGateAction::Execute {
             request,
             output,
             fixture_bundle,
             candidate_probes,
+            reuse_base,
         } => execute(
             root,
             &request,
             &output,
             &fixture_bundle,
             candidate_probes.as_deref(),
+            reuse_base.as_deref(),
         ),
         SignedGateAction::Publish {
             request,
@@ -1930,6 +2014,16 @@ pub fn run(root: &Path, args: SignedGateArgs) -> Result<(), ReceiptError> {
             run_url,
             execution_result,
         } => publish(&request, &results, &run_url, &execution_result),
+        SignedGateAction::PrepareReuseUpload {
+            request,
+            results,
+            fixture_bundle,
+            run_id,
+            output,
+        } => {
+            reuse::prepare_reuse_upload(root, &request, &results, &fixture_bundle, run_id, &output)
+                .map(drop)
+        }
     }
 }
 

@@ -2533,7 +2533,7 @@ fn execute_pair_admits_a_base_without_populations_and_still_runs_the_candidate()
     };
     let dir = tempfile::tempdir().unwrap();
     let mut ran = Vec::new();
-    execute_pair(&request, dir.path(), |run| {
+    execute_pair(&request, dir.path(), None, |run| {
         ran.push(run.receipt_name);
         let receipt = if run.receipt_name == "base.json" {
             base_killed_before_reporting(&run.commit)
@@ -2547,7 +2547,7 @@ fn execute_pair_admits_a_base_without_populations_and_still_runs_the_candidate()
     assert_eq!(ran, ["base.json", "candidate.json"]);
 
     let dir = tempfile::tempdir().unwrap();
-    let result = execute_pair(&request, dir.path(), |run| {
+    let result = execute_pair(&request, dir.path(), None, |run| {
         let receipt = base_killed_before_reporting(&run.commit);
         write_run_evidence(&run.output, run.receipt_name, &receipt);
         validate_side_receipt(run.side, &receipt, &run.commit)
@@ -2567,7 +2567,7 @@ fn execute_pair_still_runs_the_candidate_when_the_base_is_incomplete() {
     };
     let dir = tempfile::tempdir().unwrap();
     let mut ran = Vec::new();
-    execute_pair(&request, dir.path(), |run| {
+    execute_pair(&request, dir.path(), None, |run| {
         ran.push(run.receipt_name);
         let mut receipt = admitted(&run.commit);
         if run.receipt_name == "base.json" {
@@ -2670,7 +2670,7 @@ fn candidate_phase_mutation_of_paired_base_evidence_is_refused() {
     for (label, tamper) in tampers {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path();
-        let result = execute_pair(&request, output, |run| {
+        let result = execute_pair(&request, output, None, |run| {
             if run.receipt_name == "base.json" {
                 write_run_evidence(&run.output, run.receipt_name, &admitted(&request.base));
             } else {
@@ -2768,7 +2768,7 @@ fn both_paired_runs_restore_the_trusted_base_fixture_bundle() {
         };
         let dir = tempfile::tempdir().unwrap();
         let mut seen = Vec::new();
-        execute_pair(&request, dir.path(), |run| {
+        execute_pair(&request, dir.path(), None, |run| {
             seen.push((run.commit.clone(), run.fixture_publisher.clone()));
             let head = run.commit.clone();
             write_run_evidence(&run.output, run.receipt_name, &admitted(&head));
@@ -3129,4 +3129,1301 @@ fn incomplete_evidence_still_blocks() {
     next.steps[0].name = "replacement".into();
     let diff = compare(&base, &next).unwrap();
     assert!(diff.blocking.contains("missing-step:el1-embed"));
+}
+
+#[cfg(unix)]
+mod base_reuse_witnesses {
+    use super::*;
+    use carrick_xtask::accept::SignedHostIdentity;
+    use carrick_xtask::fixtures::{
+        BuildPolicy, Executable, GuestTarget, Manifest, Toolchain, archive,
+    };
+    use carrick_xtask::signed_gate::{
+        PairSide, Request, RequestKind, ReuseExecutionContext, compute_base_reuse_key,
+        execute_pair, trusted_reuse_run,
+    };
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    fn arm64_musl_elf(tag: &[u8]) -> Vec<u8> {
+        let mut elf = vec![0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize = 64
+        elf.extend_from_slice(tag);
+        elf
+    }
+
+    fn git_cmd(cwd: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    struct PackedBundle {
+        archive: PathBuf,
+        manifest_sha256: String,
+        inputs_sha256: String,
+        content_sha256: String,
+    }
+
+    fn pack_test_bundle(
+        work: &Path,
+        source_head: &str,
+        tag: &[u8],
+        input_seed: &str,
+    ) -> PackedBundle {
+        let elf = arm64_musl_elf(tag);
+        let elf_sha = format!("{:x}", Sha256::digest(&elf));
+        let src_sha = format!("{:x}", Sha256::digest(input_seed.as_bytes()));
+        let manifest = Manifest {
+            schema: "carrick.fixtures.v3".into(),
+            source_head: source_head.to_string().try_into().unwrap(),
+            compiler_inputs: vec!["probe.rs".into()],
+            sources: [("probe.rs".into(), src_sha.try_into().unwrap())].into(),
+            build_policy: BuildPolicy::default(),
+            toolchain: Toolchain {
+                rustc: "rustc 1.96.0".into(),
+                cargo: "cargo 1.96.0".into(),
+                gnu_linker: "aarch64-linux-gnu-gcc".into(),
+            },
+            executables: vec![Executable {
+                path: "conformance-probes/target/aarch64-unknown-linux-musl/release/probe".into(),
+                target: GuestTarget::Musl,
+                sha256: elf_sha.clone().try_into().unwrap(),
+            }],
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest_bytes));
+        let bundle_dir = work.join("bundle-src").join(&manifest_sha256);
+        std::fs::create_dir_all(bundle_dir.join("objects")).unwrap();
+        let manifest_path = bundle_dir.join("manifest.json");
+        std::fs::write(&manifest_path, &manifest_bytes).unwrap();
+        let obj_path = bundle_dir.join("objects").join(&elf_sha);
+        std::fs::write(&obj_path, &elf).unwrap();
+        std::fs::set_permissions(&obj_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let archive = archive::pack(&manifest_path, &work.join("packed")).unwrap();
+        PackedBundle {
+            archive,
+            manifest_sha256,
+            inputs_sha256: String::from(manifest.input_identity().unwrap()),
+            content_sha256: String::from(manifest.content_identity().unwrap()),
+        }
+    }
+
+    struct ReuseBench {
+        dir: tempfile::TempDir,
+        repo: PathBuf,
+        bin: PathBuf,
+        artifacts_root: PathBuf,
+        base: String,
+        head: String,
+        host: SignedHostIdentity,
+        bundle: PackedBundle,
+    }
+
+    impl ReuseBench {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().join("repo");
+            std::fs::create_dir_all(repo.join("scripts")).unwrap();
+            git_cmd(&repo, &["init", "-q", "-b", "main"]);
+            git_cmd(&repo, &["config", "user.name", "Reuse Test"]);
+            git_cmd(&repo, &["config", "user.email", "reuse@example.test"]);
+            std::fs::write(
+                repo.join("rust-toolchain.toml"),
+                b"[toolchain]\nchannel = \"1.96.0\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                repo.join("scripts/entitlements.plist"),
+                b"<plist><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+            )
+            .unwrap();
+            git_cmd(
+                &repo,
+                &["add", "rust-toolchain.toml", "scripts/entitlements.plist"],
+            );
+            git_cmd(&repo, &["commit", "-q", "-m", "base"]);
+            let base = git_cmd(&repo, &["rev-parse", "HEAD"]);
+
+            std::fs::write(repo.join("README.md"), b"candidate change\n").unwrap();
+            git_cmd(&repo, &["add", "README.md"]);
+            git_cmd(&repo, &["commit", "-q", "-m", "candidate"]);
+            let head = git_cmd(&repo, &["rev-parse", "HEAD"]);
+
+            let host = SignedHostIdentity {
+                runner_name: "carrick-gate-mac-1".into(),
+                hardware_model: "Mac15,12".into(),
+                product_build: "24D70".into(),
+            };
+            let bundle = pack_test_bundle(&dir.path().join("b1"), &base, b"v1", "seed-1");
+
+            let bin = dir.path().join("bin");
+            let artifacts_root = dir.path().join("gh-artifacts");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&artifacts_root).unwrap();
+
+            // Shims for SignedHostIdentity::capture() and GitHub API/artifact transport.
+            std::fs::write(
+                bin.join("sysctl"),
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "-n" ] && [ "${2:-}" = "hw.model" ]; then
+  printf '%s\n' "${TEST_HW_MODEL:-Mac15,12}"
+  exit 0
+fi
+exit 1
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(bin.join("sysctl"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+
+            std::fs::write(
+                bin.join("sw_vers"),
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "-buildVersion" ]; then
+  printf '%s\n' "${TEST_PRODUCT_BUILD:-24D70}"
+  exit 0
+fi
+exit 1
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(bin.join("sw_vers"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+
+            std::fs::write(
+                bin.join("gh"),
+                r#"#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys, urllib.parse
+args = sys.argv[1:]
+if '--method' in args and args[args.index('--method') + 1] == 'POST':
+    with open(os.environ['TEST_POSTS'], 'a') as out:
+        out.write(json.dumps({'endpoint': args[args.index('POST') + 1], 'body': json.load(sys.stdin)}) + '\n')
+    sys.exit(0)
+
+state = json.loads(pathlib.Path(os.environ['TEST_GH_STATE']).read_text())
+
+if args[:2] == ['run', 'download']:
+    run_id = int(args[2])
+    assert args[args.index('--repo') + 1] == 'carrick-sh/carrick', args
+    name = args[args.index('--name') + 1]
+    dest = pathlib.Path(args[args.index('--dir') + 1])
+    for art in state['artifacts']:
+        if art['workflow_run']['id'] == run_id and (art['name'] == name or art.get('serve_for_any_name', False)) and not art.get('expired', False):
+            src = pathlib.Path(art['dir'])
+            dest.mkdir(parents=True, exist_ok=True)
+            for item in src.iterdir():
+                target = dest / item.name
+                if item.is_symlink():
+                    os.symlink(os.readlink(item), target)
+                elif item.is_dir():
+                    shutil.copytree(item, target, symlinks=True)
+                else:
+                    shutil.copy2(item, target)
+            sys.exit(0)
+    raise SystemExit(f'no downloadable artifact for run {run_id} name {name}')
+
+if args[0] == 'api':
+    endpoint = args[-1]
+    if '/actions/artifacts?' in endpoint:
+        query = urllib.parse.parse_qs(endpoint.split('?', 1)[1])
+        wanted = query.get('name', [''])[0]
+        rows = [
+            {
+                'id': art['id'],
+                'name': art['name'],
+                'expired': art.get('expired', False),
+                'workflow_run': art['workflow_run'],
+            }
+            for art in state['artifacts']
+            if art['name'] == wanted or art.get('serve_for_any_name', False)
+        ]
+        print(json.dumps([{'artifacts': rows}]))
+        sys.exit(0)
+    if '/actions/runs/' in endpoint:
+        run_id = int(endpoint.split('/actions/runs/')[1].split('/')[0])
+        for run in state['runs']:
+            if run['id'] == run_id:
+                print(json.dumps(run))
+                sys.exit(0)
+        raise SystemExit(f'unknown run {run_id}')
+
+raise SystemExit('unexpected gh invocation: ' + repr(args))
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+
+            Self {
+                dir,
+                repo,
+                bin,
+                artifacts_root,
+                base,
+                head,
+                host,
+                bundle,
+            }
+        }
+
+        fn path_env(&self) -> String {
+            format!(
+                "{}:{}",
+                self.bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            )
+        }
+
+        fn receipt_for(&self, commit: &str) -> AcceptReceipt {
+            let mut r = admitted(commit);
+            r.host_identity = Some(self.host.clone());
+            let fv = r.fixture_validation.as_mut().unwrap();
+            fv.checkout_head = commit.to_string().try_into().unwrap();
+            fv.bundle_source_head = self.base.clone().try_into().unwrap();
+            fv.manifest_sha256 = self.bundle.manifest_sha256.clone().try_into().unwrap();
+            fv.inputs_sha256 = self.bundle.inputs_sha256.clone().try_into().unwrap();
+            fv.content_sha256 = Some(self.bundle.content_sha256.clone().try_into().unwrap());
+            r
+        }
+
+        fn write_gh_state(&self, runs: Vec<serde_json::Value>, artifacts: Vec<serde_json::Value>) {
+            std::fs::write(
+                self.dir.path().join("gh-state.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "runs": runs,
+                    "artifacts": artifacts,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        fn trusted_main_run(&self, run_id: u64) -> serde_json::Value {
+            json!({
+                "id": run_id,
+                "path": ".github/workflows/signed-gate.yml",
+                "head_branch": "main",
+                "head_sha": self.base,
+                "event": "push",
+                "status": "completed",
+                "repository": { "full_name": "carrick-sh/carrick" },
+                "head_repository": { "full_name": "carrick-sh/carrick" },
+                "actor": { "login": "github-merge-queue[bot]" },
+                "triggering_actor": { "login": "github-merge-queue[bot]" }
+            })
+        }
+
+        fn publish_main_reusable_artifact(
+            &self,
+            run_id: u64,
+            receipt: &AcceptReceipt,
+        ) -> (String, PathBuf) {
+            let main_dir = self.dir.path().join(format!("main-run-{run_id}"));
+            let results = main_dir.join("results");
+            std::fs::create_dir_all(&results).unwrap();
+            write_run_evidence(&results, "candidate.json", receipt);
+            let req_path = main_dir.join("request.json");
+            std::fs::write(
+                &req_path,
+                serde_json::to_vec(&Request {
+                    kind: RequestKind::Main,
+                    prs: vec![],
+                    sha: self.base.clone(),
+                    base: self.base.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+            let posts = main_dir.join("posts.jsonl");
+            let pub_out = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                .env("PATH", self.path_env())
+                .env("TEST_POSTS", &posts)
+                .env_remove("GITHUB_STEP_SUMMARY")
+                .args(["--root", &self.repo.to_string_lossy()])
+                .args(["signed-gate", "publish", "--request"])
+                .arg(&req_path)
+                .args(["--results"])
+                .arg(&results)
+                .args([
+                    "--run-url",
+                    "https://github.com/carrick-sh/carrick/actions/runs/500",
+                    "--execution-result",
+                    "success",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                pub_out.status.success(),
+                "main publish failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&pub_out.stdout),
+                String::from_utf8_lossy(&pub_out.stderr)
+            );
+
+            let gh_output = main_dir.join("github-output.txt");
+            let artifact_dir = self.artifacts_root.join(format!("artifact-{run_id}"));
+            let prep = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                .env("GITHUB_OUTPUT", &gh_output)
+                .args(["--root", &self.repo.to_string_lossy()])
+                .args(["signed-gate", "prepare-reuse-upload", "--request"])
+                .arg(&req_path)
+                .arg("--results")
+                .arg(&results)
+                .arg("--fixture-bundle")
+                .arg(&self.bundle.archive)
+                .args(["--run-id", &run_id.to_string(), "--output"])
+                .arg(&artifact_dir)
+                .output()
+                .unwrap();
+            assert!(
+                prep.status.success(),
+                "prepare-reuse-upload failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&prep.stdout),
+                String::from_utf8_lossy(&prep.stderr)
+            );
+            let out_text = std::fs::read_to_string(&gh_output).unwrap();
+            let artifact_name = out_text
+                .lines()
+                .find_map(|l| l.strip_prefix("artifact_name="))
+                .expect("prepare-reuse-upload must write artifact_name to GITHUB_OUTPUT")
+                .to_string();
+            (artifact_name, artifact_dir)
+        }
+
+        fn run_lookup(
+            &self,
+            request: &Request,
+            bundle: &Path,
+            host: &SignedHostIdentity,
+            out_dir: &Path,
+        ) -> std::process::Output {
+            let req_path = self.dir.path().join("lookup-request.json");
+            std::fs::write(&req_path, serde_json::to_vec(request).unwrap()).unwrap();
+            Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                .env("PATH", self.path_env())
+                .env("TEST_GH_STATE", self.dir.path().join("gh-state.json"))
+                .env("RUNNER_NAME", &host.runner_name)
+                .env("TEST_HW_MODEL", &host.hardware_model)
+                .env("TEST_PRODUCT_BUILD", &host.product_build)
+                .args(["--root", &self.repo.to_string_lossy()])
+                .args(["signed-gate", "reuse-lookup", "--request"])
+                .arg(&req_path)
+                .arg("--fixture-bundle")
+                .arg(bundle)
+                .arg("--output")
+                .arg(out_dir)
+                .output()
+                .unwrap()
+        }
+
+        fn publish_group(
+            &self,
+            request: &Request,
+            results: &Path,
+        ) -> (bool, String, serde_json::Value, String) {
+            let req_path = results.join("publish-request.json");
+            std::fs::write(&req_path, serde_json::to_vec(request).unwrap()).unwrap();
+            let posts = results.join("posts.jsonl");
+            let _ = std::fs::remove_file(&posts);
+            let out = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                .env("PATH", self.path_env())
+                .env("TEST_POSTS", &posts)
+                .env_remove("GITHUB_STEP_SUMMARY")
+                .args(["--root", &self.repo.to_string_lossy()])
+                .args(["signed-gate", "publish", "--request"])
+                .arg(&req_path)
+                .arg("--results")
+                .arg(results)
+                .args([
+                    "--run-url",
+                    "https://github.com/carrick-sh/carrick/actions/runs/777",
+                    "--execution-result",
+                    "success",
+                ])
+                .output()
+                .unwrap();
+            let comment = std::fs::read_to_string(results.join("comment.md")).unwrap_or_default();
+            let diff = std::fs::read(results.join("diff.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let status_desc = std::fs::read_to_string(&posts)
+                .unwrap_or_default()
+                .lines()
+                .rev()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|p| {
+                    p["endpoint"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("/statuses/")
+                })
+                .and_then(|p| p["body"]["description"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            (out.status.success(), comment, diff, status_desc)
+        }
+    }
+
+    /// Round-trip witness (#1918): a `Main` push run publishes under the exact
+    /// key `reuse-lookup` computes, untrusted/expired runs are ignored,
+    /// `execute_pair` skips `PairSide::Base` (runner count == candidate only),
+    /// and `publish` reports the reused artifact and run ID instead of claiming
+    /// the base ran in this job.
+    #[test]
+    fn reuse_round_trip_from_main_skips_base_execution_and_records_provenance() {
+        let bench = ReuseBench::new();
+        let base_receipt = bench.receipt_for(&bench.base);
+        let (artifact_name, artifact_dir) =
+            bench.publish_main_reusable_artifact(500, &base_receipt);
+
+        let expected_key = compute_base_reuse_key(
+            &bench.repo,
+            &bench.base,
+            bench.host.clone(),
+            &bench.bundle.archive,
+        )
+        .expect("compute_base_reuse_key");
+        assert_eq!(expected_key.artifact_name().unwrap(), artifact_name);
+
+        // Verify `trusted_reuse_run` admits push to main and owner dispatch, and rejects untrusted runs.
+        let trusted_push = bench.trusted_main_run(500);
+        assert!(trusted_reuse_run(&trusted_push, &bench.base));
+        let mut owner_dispatch = trusted_push.clone();
+        owner_dispatch["event"] = json!("workflow_dispatch");
+        owner_dispatch["head_sha"] = json!("f".repeat(40));
+        owner_dispatch["actor"] = json!({ "login": "tjfontaine" });
+        owner_dispatch["triggering_actor"] = json!({ "login": "tjfontaine" });
+        assert!(trusted_reuse_run(&owner_dispatch, &bench.base));
+
+        let mut untrusted_runs = Vec::new();
+        let mut untrusted_artifacts = Vec::new();
+        for (idx, (label, tweak)) in [
+            (
+                "wrong_workflow",
+                json!({"path": ".github/workflows/ci.yml"}),
+            ),
+            ("wrong_branch", json!({"head_branch": "feat/untrusted"})),
+            ("wrong_event", json!({"event": "pull_request_target"})),
+            (
+                "wrong_repo",
+                json!({"repository": {"full_name": "attacker/carrick"}}),
+            ),
+            (
+                "wrong_head_repo",
+                json!({"head_repository": {"full_name": "attacker/carrick"}}),
+            ),
+            ("wrong_push_sha", json!({"head_sha": "c".repeat(40)})),
+            (
+                "bot_dispatch",
+                json!({
+                    "event": "workflow_dispatch",
+                    "actor": {"login": "carrick-workers[bot]"},
+                    "triggering_actor": {"login": "carrick-workers[bot]"}
+                }),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let run_id = 600 + idx as u64;
+            let mut run = trusted_push.clone();
+            run["id"] = json!(run_id);
+            for (k, v) in tweak.as_object().unwrap() {
+                run[k] = v.clone();
+            }
+            assert!(
+                !trusted_reuse_run(&run, &bench.base),
+                "{label}: untrusted run admitted"
+            );
+            let planted = bench.dir.path().join(format!("planted-{idx}"));
+            std::fs::create_dir_all(&planted).unwrap();
+            std::fs::write(planted.join("base-seal.json"), b"poisoned").unwrap();
+            untrusted_runs.push(run);
+            untrusted_artifacts.push(json!({
+                "id": 9500 + idx as u64,
+                "name": artifact_name,
+                "expired": false,
+                "workflow_run": { "id": run_id },
+                "dir": planted,
+            }));
+        }
+        // Also plant a newer expired artifact on the trusted run.
+        untrusted_artifacts.push(json!({
+            "id": 9999,
+            "name": artifact_name,
+            "expired": true,
+            "workflow_run": { "id": 500 },
+            "dir": bench.dir.path().join("missing-expired"),
+        }));
+
+        let mut runs = untrusted_runs;
+        runs.push(trusted_push);
+        let mut artifacts = untrusted_artifacts;
+        artifacts.push(json!({
+            "id": 9001,
+            "name": artifact_name,
+            "expired": false,
+            "workflow_run": { "id": 500 },
+            "dir": artifact_dir,
+        }));
+        bench.write_gh_state(runs, artifacts);
+
+        let group_request = Request {
+            kind: RequestKind::MergeGroup,
+            prs: vec![42],
+            sha: bench.head.clone(),
+            base: bench.base.clone(),
+        };
+        let reuse_dir = bench.dir.path().join("reused-base");
+        let lookup = bench.run_lookup(
+            &group_request,
+            &bench.bundle.archive,
+            &bench.host,
+            &reuse_dir,
+        );
+        assert!(
+            lookup.status.success(),
+            "reuse-lookup exited nonzero: {}",
+            String::from_utf8_lossy(&lookup.stderr)
+        );
+        assert!(
+            reuse_dir.join("base-seal.json").exists(),
+            "reuse-lookup did not write verified base-seal.json; stderr={}",
+            String::from_utf8_lossy(&lookup.stderr)
+        );
+
+        let results = bench.dir.path().join("group-results");
+        std::fs::create_dir_all(&results).unwrap();
+        let ctx = ReuseExecutionContext {
+            root: &bench.repo,
+            bundle: &bench.bundle.archive,
+            host_identity: Some(bench.host.clone()),
+            reuse_dir: &reuse_dir,
+        };
+        let mut executed_sides = Vec::new();
+        execute_pair(&group_request, &results, Some(&ctx), |run| {
+            executed_sides.push(run.side);
+            write_run_evidence(
+                &run.output,
+                run.receipt_name,
+                &bench.receipt_for(&run.commit),
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            executed_sides,
+            [PairSide::Candidate],
+            "PairSide::Base must NOT run when a matching sealed receipt is reused"
+        );
+
+        let (passed, comment, _diff, _desc) = bench.publish_group(&group_request, &results);
+        assert!(passed, "published group failed: {comment}");
+        assert!(
+            comment.contains("reused base receipt 9001 from run 500"),
+            "missing reuse provenance in comment: {comment}"
+        );
+        assert!(
+            !comment.contains("ran on the same host in this job."),
+            "reused base must not falsely claim in-job base execution: {comment}"
+        );
+    }
+
+    /// Key-field mismatch witness (#1918): mismatching ANY key field (base SHA,
+    /// runner_name, hardware_model, product_build, fixture archive/inputs/content,
+    /// rust-toolchain.toml hash, entitlements.plist hash, hypervisor_entitlement,
+    /// dof_present, profile, phase) is a logged miss that runs `PairSide::Base`.
+    #[test]
+    fn reuse_misses_and_runs_base_on_every_key_field_mismatch() {
+        let bench = ReuseBench::new();
+        let base_receipt = bench.receipt_for(&bench.base);
+        let (artifact_name, artifact_dir) =
+            bench.publish_main_reusable_artifact(500, &base_receipt);
+
+        // Prepare a valid downloaded reuse_dir first so we can also test
+        // spoofing/collision and direct execute_pair key verification per field.
+        bench.write_gh_state(
+            vec![bench.trusted_main_run(500)],
+            vec![json!({
+                "id": 9001,
+                "name": artifact_name,
+                "expired": false,
+                "workflow_run": { "id": 500 },
+                "dir": artifact_dir,
+            })],
+        );
+        let base_request = Request {
+            kind: RequestKind::MergeGroup,
+            prs: vec![42],
+            sha: bench.head.clone(),
+            base: bench.base.clone(),
+        };
+        let valid_reuse = bench.dir.path().join("valid-reuse");
+        let ok = bench.run_lookup(
+            &base_request,
+            &bench.bundle.archive,
+            &bench.host,
+            &valid_reuse,
+        );
+        assert!(ok.status.success());
+        assert!(
+            valid_reuse.join("base-seal.json").exists(),
+            "baseline lookup must succeed before field-mismatch mutations"
+        );
+
+        // Alternate git commits for base_sha, toolchain, and entitlements changes.
+        git_cmd(
+            &bench.repo,
+            &["checkout", "-q", "-b", "alt-toolchain", &bench.base],
+        );
+        std::fs::write(
+            bench.repo.join("rust-toolchain.toml"),
+            b"[toolchain]\nchannel = \"1.97.0\"\n",
+        )
+        .unwrap();
+        git_cmd(&bench.repo, &["add", "rust-toolchain.toml"]);
+        git_cmd(&bench.repo, &["commit", "-q", "-m", "alt toolchain"]);
+        let toolchain_sha = git_cmd(&bench.repo, &["rev-parse", "HEAD"]);
+
+        git_cmd(
+            &bench.repo,
+            &["checkout", "-q", "-b", "alt-entitlements", &bench.base],
+        );
+        std::fs::write(
+            bench.repo.join("scripts/entitlements.plist"),
+            b"<plist><dict><key>com.apple.security.hypervisor</key><true/><key>extra</key><true/></dict></plist>\n",
+        )
+        .unwrap();
+        git_cmd(&bench.repo, &["add", "scripts/entitlements.plist"]);
+        git_cmd(&bench.repo, &["commit", "-q", "-m", "alt entitlements"]);
+        let entitlements_sha = git_cmd(&bench.repo, &["rev-parse", "HEAD"]);
+        git_cmd(&bench.repo, &["checkout", "-q", "main"]);
+
+        let alt_archive_bundle = pack_test_bundle(
+            &bench.dir.path().join("b-alt-elf"),
+            &bench.base,
+            b"v2",
+            "seed-1",
+        );
+        let alt_inputs_bundle = pack_test_bundle(
+            &bench.dir.path().join("b-alt-in"),
+            &bench.base,
+            b"v1",
+            "seed-2",
+        );
+        let toolchain_bundle = pack_test_bundle(
+            &bench.dir.path().join("b-tc"),
+            &toolchain_sha,
+            b"v1",
+            "seed-1",
+        );
+        let entitlements_bundle = pack_test_bundle(
+            &bench.dir.path().join("b-ent"),
+            &entitlements_sha,
+            b"v1",
+            "seed-1",
+        );
+
+        // Serve the original artifact even if a different name is requested,
+        // proving field-by-field comparison refuses name collisions too.
+        bench.write_gh_state(
+            vec![
+                bench.trusted_main_run(500),
+                {
+                    let mut r = bench.trusted_main_run(501);
+                    r["head_sha"] = json!(toolchain_sha);
+                    r
+                },
+                {
+                    let mut r = bench.trusted_main_run(502);
+                    r["head_sha"] = json!(entitlements_sha);
+                    r
+                },
+            ],
+            vec![json!({
+                "id": 9001,
+                "name": artifact_name,
+                "expired": false,
+                "serve_for_any_name": true,
+                "workflow_run": { "id": 500 },
+                "dir": artifact_dir,
+            })],
+        );
+
+        let copy_dir = |src: &Path, dst: &Path| {
+            let status = Command::new("cp")
+                .args(["-R", &src.to_string_lossy(), &dst.to_string_lossy()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        // 1. Live environment/input mismatches against the valid seal.
+        let env_cases: Vec<(&str, String, PathBuf, SignedHostIdentity)> = vec![
+            (
+                "base_sha",
+                toolchain_sha.clone(),
+                toolchain_bundle.archive.clone(),
+                bench.host.clone(),
+            ),
+            (
+                "host_identity.runner_name",
+                bench.base.clone(),
+                bench.bundle.archive.clone(),
+                SignedHostIdentity {
+                    runner_name: "carrick-gate-mac-2".into(),
+                    ..bench.host.clone()
+                },
+            ),
+            (
+                "host_identity.hardware_model",
+                bench.base.clone(),
+                bench.bundle.archive.clone(),
+                SignedHostIdentity {
+                    hardware_model: "Mac14,9".into(),
+                    ..bench.host.clone()
+                },
+            ),
+            (
+                "host_identity.product_build",
+                bench.base.clone(),
+                bench.bundle.archive.clone(),
+                SignedHostIdentity {
+                    product_build: "24E999".into(),
+                    ..bench.host.clone()
+                },
+            ),
+            (
+                "fixture_archive_sha256",
+                bench.base.clone(),
+                alt_archive_bundle.archive.clone(),
+                bench.host.clone(),
+            ),
+            (
+                "fixture_inputs_sha256",
+                bench.base.clone(),
+                alt_inputs_bundle.archive.clone(),
+                bench.host.clone(),
+            ),
+        ];
+
+        for (field, req_base, bundle_path, host) in env_cases {
+            let req = Request {
+                kind: RequestKind::MergeGroup,
+                prs: vec![42],
+                sha: bench.head.clone(),
+                base: req_base.clone(),
+            };
+            let out_lookup = bench.dir.path().join(format!("miss-lookup-{field}"));
+            let lookup = bench.run_lookup(&req, &bundle_path, &host, &out_lookup);
+            assert!(lookup.status.success(), "{field}: reuse-lookup must exit 0");
+            assert!(
+                !out_lookup.join("base-seal.json").exists(),
+                "{field}: reuse-lookup must not write base-seal.json on mismatch"
+            );
+            let stderr = String::from_utf8_lossy(&lookup.stderr);
+            assert!(
+                stderr.contains("base reuse miss"),
+                "{field}: expected logged miss reason, got stderr={stderr}"
+            );
+
+            let out_exec = bench.dir.path().join(format!("miss-exec-{field}"));
+            std::fs::create_dir_all(&out_exec).unwrap();
+            let ctx = ReuseExecutionContext {
+                root: &bench.repo,
+                bundle: &bundle_path,
+                host_identity: Some(host.clone()),
+                reuse_dir: &valid_reuse,
+            };
+            let mut sides = Vec::new();
+            execute_pair(&req, &out_exec, Some(&ctx), |run| {
+                sides.push(run.side);
+                write_run_evidence(
+                    &run.output,
+                    run.receipt_name,
+                    &bench.receipt_for(&run.commit),
+                );
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                sides,
+                [PairSide::Base, PairSide::Candidate],
+                "{field}: mismatch must fall back to executing PairSide::Base"
+            );
+        }
+
+        // 2. Sealed-key field mutations (toolchain, entitlements, hypervisor, dof, profile, phase).
+        for (field, mutate_key) in [
+            (
+                "rust_toolchain_sha256",
+                (|k: &mut serde_json::Value| k["rust_toolchain_sha256"] = json!("9".repeat(64)))
+                    as fn(&mut serde_json::Value),
+            ),
+            ("entitlements_sha256", |k| {
+                k["entitlements_sha256"] = json!("8".repeat(64));
+            }),
+            ("hypervisor_entitlement", |k| {
+                k["hypervisor_entitlement"] = json!(false);
+            }),
+            ("dof_present", |k| {
+                k["dof_present"] = json!(false);
+            }),
+            ("profile", |k| {
+                k["profile"] = json!("linux-portable");
+            }),
+            ("phase", |k| {
+                k["phase"] = json!("host");
+            }),
+        ] {
+            let mutated_dir = bench.dir.path().join(format!("mutated-key-{field}"));
+            copy_dir(&valid_reuse, &mutated_dir);
+            let seal_path = mutated_dir.join("base-seal.json");
+            let mut seal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&seal_path).unwrap()).unwrap();
+            mutate_key(&mut seal["reuse"]["key"]);
+            let canonical = serde_json::to_string(&seal["reuse"]["key"]).unwrap();
+            seal["reuse"]["key_sha256"] =
+                json!(format!("{:x}", Sha256::digest(canonical.as_bytes())));
+            std::fs::write(&seal_path, serde_json::to_vec_pretty(&seal).unwrap()).unwrap();
+
+            // Serve this mutated seal via fake gh and check reuse-lookup names the field.
+            bench.write_gh_state(
+                vec![bench.trusted_main_run(500)],
+                vec![json!({
+                    "id": 9010,
+                    "name": artifact_name,
+                    "expired": false,
+                    "workflow_run": { "id": 500 },
+                    "dir": mutated_dir,
+                })],
+            );
+            let lookup_out = bench.dir.path().join(format!("lookup-keymut-{field}"));
+            let lookup = bench.run_lookup(
+                &base_request,
+                &bench.bundle.archive,
+                &bench.host,
+                &lookup_out,
+            );
+            assert!(lookup.status.success());
+            assert!(!lookup_out.join("base-seal.json").exists(), "{field}");
+            let stderr = String::from_utf8_lossy(&lookup.stderr);
+            assert!(
+                stderr.contains("KeyFieldMismatch") && stderr.contains(field),
+                "{field}: expected KeyFieldMismatch naming {field}, got: {stderr}"
+            );
+
+            let out_exec = bench.dir.path().join(format!("exec-keymut-{field}"));
+            std::fs::create_dir_all(&out_exec).unwrap();
+            let ctx = ReuseExecutionContext {
+                root: &bench.repo,
+                bundle: &bench.bundle.archive,
+                host_identity: Some(bench.host.clone()),
+                reuse_dir: &mutated_dir,
+            };
+            let mut sides = Vec::new();
+            execute_pair(&base_request, &out_exec, Some(&ctx), |run| {
+                sides.push(run.side);
+                write_run_evidence(
+                    &run.output,
+                    run.receipt_name,
+                    &bench.receipt_for(&run.commit),
+                );
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                sides,
+                [PairSide::Base, PairSide::Candidate],
+                "{field}: mutated key must fall back to running PairSide::Base"
+            );
+        }
+
+        // Verify toolchain_sha & entitlements_sha actually produce distinct keys via compute_base_reuse_key!
+        let k_base = compute_base_reuse_key(
+            &bench.repo,
+            &bench.base,
+            bench.host.clone(),
+            &bench.bundle.archive,
+        )
+        .unwrap();
+        let k_tc = compute_base_reuse_key(
+            &bench.repo,
+            &toolchain_sha,
+            bench.host.clone(),
+            &toolchain_bundle.archive,
+        )
+        .unwrap();
+        let k_ent = compute_base_reuse_key(
+            &bench.repo,
+            &entitlements_sha,
+            bench.host.clone(),
+            &entitlements_bundle.archive,
+        )
+        .unwrap();
+        assert_ne!(k_base.rust_toolchain_sha256, k_tc.rust_toolchain_sha256);
+        assert_ne!(k_base.entitlements_sha256, k_ent.entitlements_sha256);
+    }
+
+    /// Tampered and stale seal witness (#1918): changed file, added file,
+    /// removed file, symlink, wrong base in record, or stale seal for another
+    /// key are refused as misses on lookup/execute (running `PairSide::Base`),
+    /// candidate mutation after reuse installation fails `execute_pair`, and a
+    /// tampered/stale reuse seal in `signed-result` fails `publish` closed.
+    #[test]
+    fn reuse_refuses_tampered_or_stale_seals_on_lookup_execute_and_publish() {
+        let bench = ReuseBench::new();
+        let base_receipt = bench.receipt_for(&bench.base);
+        let (artifact_name, artifact_dir) =
+            bench.publish_main_reusable_artifact(500, &base_receipt);
+        bench.write_gh_state(
+            vec![bench.trusted_main_run(500)],
+            vec![json!({
+                "id": 9001,
+                "name": artifact_name,
+                "expired": false,
+                "workflow_run": { "id": 500 },
+                "dir": artifact_dir,
+            })],
+        );
+        let request = Request {
+            kind: RequestKind::MergeGroup,
+            prs: vec![42],
+            sha: bench.head.clone(),
+            base: bench.base.clone(),
+        };
+        let valid_reuse = bench.dir.path().join("valid-reuse");
+        bench.run_lookup(&request, &bench.bundle.archive, &bench.host, &valid_reuse);
+        assert!(valid_reuse.join("base-seal.json").exists());
+
+        let copy_dir = |src: &Path, dst: &Path| {
+            let status = Command::new("cp")
+                .args(["-R", &src.to_string_lossy(), &dst.to_string_lossy()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        type SealTamper = fn(&Path);
+        let tampers: [(&str, &str, SealTamper); 6] = [
+            ("changed_file", "InventoryTampered", |dir| {
+                std::fs::write(dir.join("base/steps/el1-embed.log"), b"forged log").unwrap();
+            }),
+            ("added_file", "InventoryTampered", |dir| {
+                std::fs::write(dir.join("base/planted.txt"), b"extra").unwrap();
+            }),
+            ("removed_file", "InventoryTampered", |dir| {
+                std::fs::remove_file(dir.join("base/steps/el1-embed.log")).unwrap();
+            }),
+            ("symlink_in_base", "InventoryTampered", |dir| {
+                std::os::unix::fs::symlink("/etc/hosts", dir.join("base/link")).unwrap();
+            }),
+            ("wrong_base_in_record", "SealBaseMismatch", |dir| {
+                let p = dir.join("base-seal.json");
+                let mut v: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+                v["base"] = json!("d".repeat(40));
+                std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+            }),
+            ("stale_seal_for_other_key", "KeyFieldMismatch", |dir| {
+                let p = dir.join("base-seal.json");
+                let mut v: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+                v["reuse"]["key_sha256"] = json!("e".repeat(64));
+                std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+            }),
+        ];
+
+        for (label, expected_variant, tamper) in tampers {
+            let tampered = bench.dir.path().join(format!("tamper-{label}"));
+            copy_dir(&valid_reuse, &tampered);
+            tamper(&tampered);
+
+            bench.write_gh_state(
+                vec![bench.trusted_main_run(500)],
+                vec![json!({
+                    "id": 9100,
+                    "name": artifact_name,
+                    "expired": false,
+                    "workflow_run": { "id": 500 },
+                    "dir": tampered,
+                })],
+            );
+            let out_lookup = bench.dir.path().join(format!("lookup-{label}"));
+            let lookup =
+                bench.run_lookup(&request, &bench.bundle.archive, &bench.host, &out_lookup);
+            assert!(lookup.status.success(), "{label}");
+            assert!(!out_lookup.join("base-seal.json").exists(), "{label}");
+            let stderr = String::from_utf8_lossy(&lookup.stderr);
+            assert!(
+                stderr.contains(expected_variant),
+                "{label}: expected {expected_variant} in {stderr}"
+            );
+
+            let out_exec = bench.dir.path().join(format!("exec-{label}"));
+            std::fs::create_dir_all(&out_exec).unwrap();
+            let ctx = ReuseExecutionContext {
+                root: &bench.repo,
+                bundle: &bench.bundle.archive,
+                host_identity: Some(bench.host.clone()),
+                reuse_dir: &tampered,
+            };
+            let mut sides = Vec::new();
+            execute_pair(&request, &out_exec, Some(&ctx), |run| {
+                sides.push(run.side);
+                write_run_evidence(
+                    &run.output,
+                    run.receipt_name,
+                    &bench.receipt_for(&run.commit),
+                );
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                sides,
+                [PairSide::Base, PairSide::Candidate],
+                "{label}: tampered seal must miss and run PairSide::Base"
+            );
+        }
+
+        // Candidate-phase mutation of installed reused base evidence must fail hard.
+        let out_cand_tamper = bench.dir.path().join("cand-tamper");
+        std::fs::create_dir_all(&out_cand_tamper).unwrap();
+        let ctx = ReuseExecutionContext {
+            root: &bench.repo,
+            bundle: &bench.bundle.archive,
+            host_identity: Some(bench.host.clone()),
+            reuse_dir: &valid_reuse,
+        };
+        let err = execute_pair(&request, &out_cand_tamper, Some(&ctx), |run| {
+            write_run_evidence(
+                &run.output,
+                run.receipt_name,
+                &bench.receipt_for(&run.commit),
+            );
+            std::fs::write(out_cand_tamper.join("base/injected.txt"), b"bad").unwrap();
+            Ok(())
+        });
+        assert!(
+            err.is_err(),
+            "candidate mutation of reused base must fail execute_pair"
+        );
+
+        // Hosted `publish` re-verifies the reuse seal and fails closed on stale/tampered reuse metadata.
+        let clean_results = bench.dir.path().join("publish-tamper-base");
+        std::fs::create_dir_all(&clean_results).unwrap();
+        execute_pair(&request, &clean_results, Some(&ctx), |run| {
+            write_run_evidence(
+                &run.output,
+                run.receipt_name,
+                &bench.receipt_for(&run.commit),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        for (label, mutate_seal) in [
+            (
+                "wrong_key_sha256",
+                (|v: &mut serde_json::Value| v["reuse"]["key_sha256"] = json!("f".repeat(64)))
+                    as fn(&mut serde_json::Value),
+            ),
+            ("missing_artifact_id", |v| {
+                v["reuse"].as_object_mut().unwrap().remove("artifact_id");
+            }),
+            ("stale_host_in_key", |v| {
+                v["reuse"]["key"]["host_identity"]["runner_name"] = json!("other-mac");
+                let c = serde_json::to_string(&v["reuse"]["key"]).unwrap();
+                v["reuse"]["key_sha256"] = json!(format!("{:x}", Sha256::digest(c.as_bytes())));
+            }),
+        ] {
+            let case_results = bench.dir.path().join(format!("pub-tamper-{label}"));
+            copy_dir(&clean_results, &case_results);
+            let p = case_results.join("base-seal.json");
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            mutate_seal(&mut v);
+            std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+            let (passed, comment, _, _) = bench.publish_group(&request, &case_results);
+            assert!(
+                !passed,
+                "{label}: publish must fail closed on tampered reuse seal, got PASS: {comment}"
+            );
+        }
+    }
+
+    /// Verdict-equivalence witness (#1918 + #2045): publishing with a reused
+    /// base receipt produces identical `diff.json` and pass/fail as a freshly
+    /// computed paired base across passing, blocking-regression, and
+    /// incomplete/advisory-base (#2045) scenarios.
+    #[test]
+    fn reused_receipt_verdict_equals_fresh_paired_base_verdict() {
+        let bench = ReuseBench::new();
+        let request = Request {
+            kind: RequestKind::MergeGroup,
+            prs: vec![77],
+            sha: bench.head.clone(),
+            base: bench.base.clone(),
+        };
+
+        let complete_base = bench.receipt_for(&bench.base);
+        let (art_name, art_dir) = bench.publish_main_reusable_artifact(500, &complete_base);
+        bench.write_gh_state(
+            vec![bench.trusted_main_run(500)],
+            vec![json!({
+                "id": 9001,
+                "name": art_name,
+                "expired": false,
+                "workflow_run": { "id": 500 },
+                "dir": art_dir,
+            })],
+        );
+        let complete_reuse = bench.dir.path().join("complete-reuse");
+        bench.run_lookup(
+            &request,
+            &bench.bundle.archive,
+            &bench.host,
+            &complete_reuse,
+        );
+        assert!(complete_reuse.join("base-seal.json").exists());
+
+        // Also build a sealed reuse directory whose base receipt is incomplete (#2045)
+        // to prove `paired_base_gaps` is derived afresh and never cached.
+        let mut advisory_base = bench.receipt_for(&bench.base);
+        advisory_base.steps[2].not_run_tests = vec!["el1::unrun_a".into(), "el1::unrun_b".into()];
+        let advisory_reuse = bench.dir.path().join("advisory-reuse");
+        std::fs::create_dir_all(advisory_reuse.join("base")).unwrap();
+        write_run_evidence(&advisory_reuse.join("base"), "base.json", &advisory_base);
+        let key = compute_base_reuse_key(
+            &bench.repo,
+            &bench.base,
+            bench.host.clone(),
+            &bench.bundle.archive,
+        )
+        .unwrap();
+        let files = inventory(&advisory_reuse.join("base"));
+        std::fs::write(
+            advisory_reuse.join("base-seal.json"),
+            serde_json::to_vec_pretty(&json!({
+                "base": bench.base,
+                "files": files,
+                "reuse": {
+                    "key": key,
+                    "key_sha256": key.key_sha256().unwrap(),
+                    "source_run_id": 501u64,
+                    "artifact_id": 9002u64,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let clean_candidate = bench.receipt_for(&bench.head);
+        let mut regressing_candidate = bench.receipt_for(&bench.head);
+        regressing_candidate.steps[2]
+            .failed_tests
+            .push("embed::introduced_regression".into());
+
+        for (label, base_r, cand_r, reuse_dir, expect_pass) in [
+            (
+                "clean_pass",
+                &complete_base,
+                &clean_candidate,
+                &complete_reuse,
+                true,
+            ),
+            (
+                "introduced_regression",
+                &complete_base,
+                &regressing_candidate,
+                &complete_reuse,
+                false,
+            ),
+            (
+                "advisory_incomplete_base_passes",
+                &advisory_base,
+                &clean_candidate,
+                &advisory_reuse,
+                true,
+            ),
+            (
+                "advisory_incomplete_base_with_regression_blocks",
+                &advisory_base,
+                &regressing_candidate,
+                &advisory_reuse,
+                false,
+            ),
+        ] {
+            let fresh_out = bench.dir.path().join(format!("fresh-{label}"));
+            std::fs::create_dir_all(&fresh_out).unwrap();
+            execute_pair(&request, &fresh_out, None, |run| {
+                let r = if run.side == PairSide::Base {
+                    base_r
+                } else {
+                    cand_r
+                };
+                write_run_evidence(&run.output, run.receipt_name, r);
+                Ok(())
+            })
+            .unwrap();
+
+            let reused_out = bench.dir.path().join(format!("reused-{label}"));
+            std::fs::create_dir_all(&reused_out).unwrap();
+            let ctx = ReuseExecutionContext {
+                root: &bench.repo,
+                bundle: &bench.bundle.archive,
+                host_identity: Some(bench.host.clone()),
+                reuse_dir,
+            };
+            let mut reused_sides = Vec::new();
+            execute_pair(&request, &reused_out, Some(&ctx), |run| {
+                reused_sides.push(run.side);
+                write_run_evidence(&run.output, run.receipt_name, cand_r);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(reused_sides, [PairSide::Candidate], "{label}");
+
+            let (fresh_pass, fresh_comment, fresh_diff, fresh_desc) =
+                bench.publish_group(&request, &fresh_out);
+            let (reused_pass, reused_comment, reused_diff, reused_desc) =
+                bench.publish_group(&request, &reused_out);
+
+            assert_eq!(fresh_pass, expect_pass, "{label} fresh: {fresh_comment}");
+            assert_eq!(
+                reused_pass, fresh_pass,
+                "{label} pass mismatch:\nreused={reused_comment}\nfresh={fresh_comment}"
+            );
+            assert_eq!(reused_diff, fresh_diff, "{label} diff.json mismatch");
+            assert_eq!(
+                reused_desc, fresh_desc,
+                "{label} status description mismatch"
+            );
+            assert!(fresh_comment.contains("ran on the same host in this job."));
+            assert!(!reused_comment.contains("ran on the same host in this job."));
+            assert!(reused_comment.contains("reused base receipt "));
+            if label.starts_with("advisory_incomplete_base") {
+                assert!(reused_comment.contains("Advisory: the paired base is incomplete"));
+            }
+        }
+    }
 }
