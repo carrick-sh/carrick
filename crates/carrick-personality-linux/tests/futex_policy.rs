@@ -124,3 +124,38 @@ fn untimed_realtime_bitset_wait_uses_the_same_private_wait_owner() {
         assert_eq!(venue.waits, 1, "an unserved variant must not enroll");
     }
 }
+
+/// Every shared spelling of an admitted PRIVATE op is a candidate for the
+/// private-anonymous key, including glibc's `pthread_join` wait (#2124:
+/// shared `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME`, op 265). PRIVATE
+/// spellings and unadmitted shared variants are never candidates.
+#[test]
+fn shared_candidates_cover_every_admitted_private_spelling() {
+    let call = |op, timeout, mask| FutexCall {
+        args: [0x1000, op, 42, timeout, 0, mask],
+    };
+    for (shared, private) in [(0, 128), (1, 129), (9, 137), (10, 138), (265, 393)] {
+        let candidate = call(shared, 0, 0xffff_ffff)
+            .shared_private_candidate()
+            .unwrap_or_else(|| panic!("shared op {shared} must be a candidate"));
+        assert_eq!(candidate.args[1], private);
+        assert!(candidate.admitted());
+        assert!(
+            call(private, 0, 0xffff_ffff)
+                .shared_private_candidate()
+                .is_none()
+        );
+    }
+    for (op, timeout, mask) in [
+        (265, 0x2000, 0xffff_ffff), // absolute realtime deadline
+        (9, 0x2000, 0xffff_ffff),   // absolute monotonic deadline
+        (9, 0, 0),                  // empty bitset
+        (256, 0, 0xffff_ffff),      // clock flag on plain WAIT
+        (6, 0, 0),                  // FUTEX_LOCK_PI
+    ] {
+        assert!(
+            call(op, timeout, mask).shared_private_candidate().is_none(),
+            "op {op} timeout {timeout:#x} mask {mask:#x}"
+        );
+    }
+}

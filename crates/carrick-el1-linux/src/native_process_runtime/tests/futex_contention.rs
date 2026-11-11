@@ -403,6 +403,7 @@ impl crate::dispatch::GuestDispatchFrame for ExitFrame {
 fn clear_tid_stopped_join_driver<C, B>(
     make: impl Fn(AddressContext<RootGpa>) -> C,
     isa: carrick_personality_linux::crossing::HostCrossingSet,
+    join: [u64; 6],
 ) where
     C: ProcessContext + crate::dispatch::DispatchContext + 'static,
     B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
@@ -554,12 +555,7 @@ fn clear_tid_stopped_join_driver<C, B>(
             )
             .unwrap();
         assert!(matches!(
-            entry.native_futex(
-                FutexCall {
-                    args: [0x1000, 0, 42, 0x2000, 0, 0],
-                },
-                &mut copy
-            ),
+            entry.native_futex(FutexCall { args: join }, &mut copy),
             Some(LifecycleOutcome::Transferred { .. })
         ));
         assert!(entry.take_handoff_receipt().is_some());
@@ -700,16 +696,20 @@ fn clear_tid_stopped_join_driver<C, B>(
     let selected = zone.switch_in_full(fixture.slot).unwrap();
     assert_eq!(selected.record, fixture.record.id);
     assert_eq!(selected.result, Some(0));
-    assert_eq!(
-        zone.expire_timer(
-            fixture.slot,
-            2000,
-            carrick_personality_linux::sched::ETIMEDOUT_RESULT,
-            &|owned| { crate::sched::object_wait::deliver_host_completion(owned.zone(), owned) },
-        ),
-        Ok(false),
-        "the old timed wait must not complete a second time",
-    );
+    if join[3] != 0 {
+        assert_eq!(
+            zone.expire_timer(
+                fixture.slot,
+                2000,
+                carrick_personality_linux::sched::ETIMEDOUT_RESULT,
+                &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                },
+            ),
+            Ok(false),
+            "the old timed wait must not complete a second time",
+        );
+    }
     assert_eq!(zone.timer_node_count(), 0);
     let mut entry = fixture
         .runtime
@@ -741,11 +741,19 @@ fn clear_tid_stopped_join_driver<C, B>(
     FUTEX_MAPPING.with(|slot| slot.set(None));
 }
 
+/// A timed shared `FUTEX_WAIT` on the clear-child-tid word.
+const TIMED_SHARED_WAIT: [u64; 6] = [0x1000, 0, 42, 0x2000, 0, 0];
+/// glibc's `pthread_join` wait as traced in the Docker oracle (#2124): shared
+/// `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` (op 265), no timeout, and
+/// `FUTEX_BITSET_MATCH_ANY`. Linux answers 0 once the exit clears the tid.
+const GLIBC_PTHREAD_JOIN_WAIT: [u64; 6] = [0x1000, 265, 42, 0, 0, 0xffff_ffff];
+
 #[test]
 fn native_clear_tid_stopped_join_driver_x86() {
     clear_tid_stopped_join_driver::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
         words,
         carrick_personality_linux::crossing::HostCrossingSet::X86,
+        TIMED_SHARED_WAIT,
     );
 }
 #[test]
@@ -756,6 +764,26 @@ fn native_clear_tid_stopped_join_driver_aarch64() {
     >(
         arm_words,
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+        TIMED_SHARED_WAIT,
+    );
+}
+#[test]
+fn native_glibc_pthread_join_shared_bitset_wait_x86() {
+    clear_tid_stopped_join_driver::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words,
+        carrick_personality_linux::crossing::HostCrossingSet::X86,
+        GLIBC_PTHREAD_JOIN_WAIT,
+    );
+}
+#[test]
+fn native_glibc_pthread_join_shared_bitset_wait_aarch64() {
+    clear_tid_stopped_join_driver::<
+        carrick_sched_core::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(
+        arm_words,
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+        GLIBC_PTHREAD_JOIN_WAIT,
     );
 }
 
