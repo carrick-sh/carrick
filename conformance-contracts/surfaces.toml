@@ -394,6 +394,7 @@ surfaces = [
   { path = "crates/carrick-el1/src/file.rs", contract = "kernel.el1.inotify" },
   { path = "crates/carrick-el1/src/file.rs", contract = "kernel.futex.contention" },
   { path = "crates/carrick-el1/src/file.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-el1/src/isa/aarch64.rs", contract = "kernel.mm.anonymous-discard" },
   { path = "crates/carrick-el1/src/isa/aarch64.rs", contract = "kernel.scheduler.runnable-progress" },
   { path = "crates/carrick-el1/src/isa/aarch64.rs", contract = "process.native.terminal-child" },
   { path = "crates/carrick-el1/src/isa/x86/context_resume.rs", contract = "core.entry.completion" },

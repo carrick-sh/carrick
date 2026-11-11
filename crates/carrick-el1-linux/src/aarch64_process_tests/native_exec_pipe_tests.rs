@@ -2944,7 +2944,7 @@ fn consume_injected_sigint(
 }
 
 /// Linux control only: this is not Carrick guest-memory or signed evidence.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 #[test]
 fn serial_host_linux_exec_child_v8_memory_control() {
     use std::{process::Command, time::Duration};
