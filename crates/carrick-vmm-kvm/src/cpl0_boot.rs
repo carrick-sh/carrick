@@ -1482,6 +1482,20 @@ impl Cpl0Carrier {
                             .union(carrick_el1_abi::ReservationNodeFlags::IMAGE),
                     )?;
                 }
+                // Below the stack the carrier built, the rest of the stack
+                // reservation is private anonymous memory the ring supplies
+                // on first touch, as Linux grows the stack VMA (#1714: a
+                // fixed 64 KiB stack faulted CPython's compiler).
+                model.import_with(
+                    ReservationRange::new(
+                        stack_top - INITIAL_STACK_RESERVATION,
+                        stack_top - INITIAL_STACK_SIZE,
+                    )
+                    .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
+                    carrick_el1_abi::ReservationProtection::READ_WRITE,
+                    carrick_el1_abi::ReservationNodeFlags::ANONYMOUS_PRIVATE
+                        .union(carrick_el1_abi::ReservationNodeFlags::GROWSDOWN),
+                )?;
                 model.finish_import()?;
                 model.insert_opaque(
                     ReservationRange::new(stack_top - INITIAL_STACK_SIZE, stack_top)

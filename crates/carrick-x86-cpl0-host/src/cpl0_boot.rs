@@ -75,6 +75,12 @@ pub const DYNAMIC_GRANT_GPA: u64 = IPC_WINDOW_GPA + carrick_el1_abi::EL1_IPC_SIZ
 pub const INITIAL_MM_KEY: u64 = 301;
 pub const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
 pub const INITIAL_STACK_SIZE: u64 = 0x1_0000;
+/// The initial stack's whole reservation: Linux's default `RLIMIT_STACK`
+/// (8 MiB), as on ARM. The carrier builds only the top
+/// [`INITIAL_STACK_SIZE`] (argv, envp, auxv); the rest is supplied on first
+/// touch, as Linux grows the stack VMA.
+pub const INITIAL_STACK_RESERVATION: u64 = carrick_mem::memory::LINUX_STACK_SIZE;
+const _: () = assert!(INITIAL_STACK_RESERVATION > INITIAL_STACK_SIZE);
 // Place mmap at the next boundary after the image, preserving low-image space.
 pub const INITIAL_ARENA_ALIGNMENT: u64 = 1024 * 1024 * 1024;
 pub const COUNTERS_OFFSET: u64 = 0x1_0000;
@@ -375,7 +381,7 @@ pub fn initial_reservation_layout(
 ) -> Result<LinuxReservationLayout, TrapError> {
     let stack_base = stack_top
         .raw()
-        .checked_sub(INITIAL_STACK_SIZE)
+        .checked_sub(INITIAL_STACK_RESERVATION)
         .filter(|_| stack_top.raw() <= carrick_guest_arch::USER_CEILING)
         .ok_or_else(|| fail("initial stack layout"))?;
     let stack = ReservationRange::new(stack_base, stack_top.raw())
@@ -3688,7 +3694,7 @@ mod cpl0_layout_tests {
             0x2000_0000,
             0x4000_0000,
             0x4000_1000,
-            INITIAL_STACK_TOP - INITIAL_STACK_SIZE - 8192,
+            INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION - 8192,
         ] {
             let layout = initial_reservation_layout(
                 UserVa::new(initial_break),
@@ -3704,11 +3710,14 @@ mod cpl0_layout_tests {
                 assert_eq!(layout.heap.len(), 0x4000_0000 - initial_break);
                 assert_eq!(
                     layout.arena.len(),
-                    INITIAL_STACK_TOP - INITIAL_STACK_SIZE - 0x4000_0000
+                    INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION - 0x4000_0000
                 );
             }
             assert_eq!(layout.heap.end(), layout.arena.start());
-            assert_eq!(layout.arena.end(), INITIAL_STACK_TOP - INITIAL_STACK_SIZE);
+            assert_eq!(
+                layout.arena.end(),
+                INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION
+            );
             assert_eq!(layout.address_limit, address_limit);
             assert_eq!(layout.data_limit, data_limit);
             assert_eq!(layout.external_address_bytes, 0);
@@ -3718,7 +3727,7 @@ mod cpl0_layout_tests {
 
     #[test]
     fn initial_reservations_refuse_stack_collision_unaligned_and_exhausted_ranges() {
-        let stack_base = INITIAL_STACK_TOP - INITIAL_STACK_SIZE;
+        let stack_base = INITIAL_STACK_TOP - INITIAL_STACK_RESERVATION;
         for initial_break in [
             0x40_1001,
             stack_base - 4096,
@@ -3740,7 +3749,7 @@ mod cpl0_layout_tests {
         }
         for stack_top in [
             0,
-            INITIAL_STACK_SIZE - 4096,
+            INITIAL_STACK_RESERVATION - 4096,
             INITIAL_STACK_TOP + 1,
             u64::MAX,
         ] {
