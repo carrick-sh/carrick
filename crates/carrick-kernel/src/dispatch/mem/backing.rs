@@ -1098,6 +1098,62 @@ impl<'a> MemView<'a> {
         snapshot_private_mmap_description(description, offset, length, self.linux_page_size())
     }
 
+    /// Discard an admitted MM's private file pages back to their root
+    /// node's retained source. The owner refuses every byte transfer while
+    /// this mutation holds the MM's gate, and needs none: retiring the
+    /// private frames leaves the node, its protection and its source, so the
+    /// next touch supplies the file's current bytes at the node's offset,
+    /// exactly as the first touch did. `false` when any page of `segment` is
+    /// not such a node (host setup restores its own bytes below).
+    fn discard_owner_private_file_segment(
+        &self,
+        memory: &mut impl CurrentMmMemory,
+        segment: &MadviseCoveredSegment,
+    ) -> Result<bool, LinuxErrno> {
+        let Some(root) = self.mem().lock().delegated_root().cloned() else {
+            return Ok(false);
+        };
+        let mut cursor = segment.start;
+        for node in MemState::root_mappings(&root, segment.start, segment.end) {
+            if node.anonymous || node.host_backing.is_none() || node.range.start() > cursor {
+                return Ok(false);
+            }
+            cursor = cursor.max(node.range.end());
+        }
+        if cursor < segment.end {
+            return Ok(false);
+        }
+        let len = usize::try_from(segment.end - segment.start).map_err(|_| LINUX_ENOMEM)?;
+        match memory.retire_mapping(GuestVa::new(segment.start), len) {
+            Ok(()) => {}
+            // Every predecessor translation and frame is intact: a host
+            // mapping failure, not contention.
+            Err(carrick_guest_mem::MappingRetirementError::Clean(_)) => return Err(LINUX_ENOMEM),
+            Err(carrick_guest_mem::MappingRetirementError::Indeterminate(error)) => {
+                carrick_fatal!(
+                    "dispatch::private_file_discard",
+                    "private file discard retirement is indeterminate at {:#x}+{len:#x}: {error}",
+                    segment.start
+                );
+            }
+        }
+        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            table.retire_overlapping(self.mm_authority().mm_id.raw(), segment.start, len as u64);
+        }
+        // Retirement marks the range unmapped; the node and its permission
+        // remain, and the owner publishes leaves on the next touch.
+        let prot_none = segment.prot.is_empty();
+        memory.set_mapping_protection_and_sharing(
+            segment.start,
+            len,
+            prot_none,
+            !prot_none && !segment.prot.contains(LinuxProtFlags::WRITE),
+            carrick_guest_mem::MappingSharing::Private,
+        );
+        self.mark_range_nonresident(segment.start, len as u64);
+        Ok(true)
+    }
+
     /// Restore mapped file identity, including after fd close or pathname
     /// replacement. A direct view returns mutable pages to clean-page tracking;
     /// byte-backed engines use the existing snapshot lowering.
@@ -1106,6 +1162,9 @@ impl<'a> MemView<'a> {
         memory: &mut impl CurrentMmMemory,
         segment: &MadviseCoveredSegment,
     ) -> Result<(), LinuxErrno> {
+        if self.discard_owner_private_file_segment(memory, segment)? {
+            return Ok(());
+        }
         let mut sources: Vec<_> = self
             .mem()
             .lock()

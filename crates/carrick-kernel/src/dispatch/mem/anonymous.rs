@@ -585,7 +585,11 @@ impl MemState {
     }
 
     /// Every committed root mapping overlapping `[start, end)`.
-    fn root_mappings(root: &DelegatedRoot, start: u64, end: u64) -> Vec<Mapping> {
+    pub(in crate::dispatch::mem) fn root_mappings(
+        root: &DelegatedRoot,
+        start: u64,
+        end: u64,
+    ) -> Vec<Mapping> {
         let mut mappings = Vec::new();
         root.with_root(|model| {
             model.observe_range(reservation_range(start, end)?, &mut |mapping| {
@@ -2429,7 +2433,14 @@ impl MemView<'_> {
             return Ok(None);
         }
         let mappings = MemState::root_mappings(root, old_address, old_end);
-        if !mappings.iter().any(|mapping| mapping.anonymous) {
+        // A retained private file node is root-editable too: the root moves
+        // it with its source offset, and no host row describes it (#1124).
+        let retained_file =
+            |mapping: &Mapping| !mapping.anonymous && mapping.host_backing.is_some();
+        if !mappings
+            .iter()
+            .any(|mapping| mapping.anonymous || retained_file(mapping))
+        {
             return Ok(None);
         }
         // mremap(2) EFAULT: the old range must be one mapping; a hole or
@@ -2445,6 +2456,11 @@ impl MemView<'_> {
             return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
         }
         let node = *node;
+        let file_node = retained_file(&node);
+        // mremap(2) EINVAL: MREMAP_DONTUNMAP is for private anonymous memory.
+        if dontunmap && file_node {
+            return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL)));
+        }
         if move_fixed {
             let in_layout = new_address
                 .checked_add(new_size)
@@ -2547,9 +2563,9 @@ impl MemView<'_> {
                 }).map(Some);
             }
             ReservationOperation::Prepare if !dontunmap => {
-                self.mremap_root_extend(cx, proposed, old_address, locked)
+                self.mremap_root_extend(cx, proposed, old_address, locked, file_node)
             }
-            _ => self.mremap_root_move(cx, proposed, source, dontunmap, locked),
+            _ => self.mremap_root_move(cx, proposed, source, dontunmap, locked, file_node),
         };
         self.settle_host_venue(cx, outcome, |outcome, request| {
             matches!(outcome, DispatchOutcome::Returned { value }
@@ -2596,6 +2612,31 @@ impl MemView<'_> {
         self.mem().lock().mmap_writable_high
     }
 
+    /// The retained private file source naming exactly `[start, end)`, at
+    /// the offset of `start`.
+    fn private_file_source(&self, start: u64, end: u64) -> Option<PrivateFileMapEntry> {
+        self.mem()
+            .lock()
+            .private_file_maps
+            .iter()
+            .find(|entry| entry.start <= start && end <= entry.end)
+            .and_then(|entry| entry.clip(start, end))
+    }
+
+    /// In-place growth of a retained private file mapping keeps one source
+    /// association over the whole grown range.
+    fn extend_private_file_source(&self, start: u64, end: u64) {
+        let mem_authority = self.mem();
+        let mut mem = mem_authority.lock();
+        if let Some(entry) = mem
+            .private_file_maps
+            .iter_mut()
+            .find(|entry| entry.start <= start && start < entry.end)
+        {
+            entry.end = entry.end.max(end);
+        }
+    }
+
     fn populate_locked<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
@@ -2615,13 +2656,16 @@ impl MemView<'_> {
         proposed: ReservationRequest,
         old_address: u64,
         locked: bool,
+        file_node: bool,
     ) -> Result<DispatchOutcome, DispatchError> {
         let permit = cx.mm_mutation.host_alias_permit();
         let mut dispatch = self.begin_conditional_vma_dispatch(&permit);
         let memory = &mut *cx.memory;
         let extension = proposed.range;
         let prot = LinuxProtFlags::from_bits_retain(proposed.protection.bits());
-        let stale = extension.start() < self.writable_high();
+        // A file extension is supplied from the node's source on first
+        // touch: there is no stale content to scrub and no owner write.
+        let stale = !file_node && extension.start() < self.writable_high();
         if let Err(errno) =
             self.publish_fresh_anonymous(memory, extension.start(), extension.len(), prot, stale)
         {
@@ -2631,6 +2675,9 @@ impl MemView<'_> {
             && let Err(errno) = self.populate_locked(memory, extension.start(), extension.len())
         {
             return Ok(DispatchOutcome::errno(errno));
+        }
+        if file_node {
+            self.extend_private_file_source(old_address, extension.end());
         }
         self.mark_vma_dispatch(&mut dispatch);
         Ok(DispatchOutcome::returned_u64_or_errno(old_address))
@@ -2646,6 +2693,7 @@ impl MemView<'_> {
         source: ReservationRange,
         dontunmap: bool,
         locked: bool,
+        file_node: bool,
     ) -> Result<DispatchOutcome, DispatchError> {
         let permit = cx.mm_mutation.host_alias_permit();
         let mut dispatch = self.begin_conditional_vma_dispatch(&permit);
@@ -2677,8 +2725,18 @@ impl MemView<'_> {
             // Monotonic: a later reuse of these bytes is zeroed.
             mem.mmap_writable_high = mem.mmap_writable_high.max(destination.end());
         }
+        // The file association moves with the node (the root already moved
+        // its source identity): later discard restores the moved offset.
+        let moved_source = file_node
+            .then(|| self.private_file_source(source.start(), source.end()))
+            .flatten();
         if !dontunmap {
             self.remove_mapping_metadata(source.start(), source.len());
+        }
+        if let Some(mut entry) = moved_source {
+            entry.start = destination.start();
+            entry.end = destination.end();
+            self.mem().lock().private_file_maps.push(entry);
         }
         if locked
             && let Err(errno) = self.populate_locked(memory, destination.start(), destination.len())
