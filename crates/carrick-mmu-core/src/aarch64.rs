@@ -2100,6 +2100,14 @@ pub fn user_executable_output(descriptor: u64) -> Option<(u64, u64)> {
         .then_some((descriptor & PA_MASK_4KIB, PT_PAGE))
 }
 
+/// Whether a terminal descriptor is currently EL0-executable or retains an
+/// EL1 execute ceiling that a subsequent in-ring `mprotect` could re-enable
+/// without host I-cache maintenance.
+pub fn terminal_descriptor_may_execute(descriptor: u64) -> bool {
+    user_executable_output(descriptor).is_some()
+        || (descriptor & SW_EL1_PRIVATE != 0 && descriptor & SW_EL1_MAY_EXEC != 0)
+}
+
 /// Whether storing `new` over the live word `old` newly makes an output range
 /// executable at EL0, and which: an unchanged executable output (a permission
 /// or attribute change on the same frame) publishes nothing new.
