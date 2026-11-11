@@ -10668,3 +10668,146 @@ fn reap_refused_by_sibling_birth_parks_then_reaps() {
     }
     assert_eq!(reap_service.copies, vec![LinuxWaitStatus::exited(5)]);
 }
+
+/// #2095, publication arm: a host requester claims a running native child
+/// (OnCpu -> OnCpuRequested, as in #1467) while it parks a blocking `wait4`
+/// or a `vfork` suspension. Park admission refusing for that request is
+/// contention: the child leaves through its owner checkpoint with its wait
+/// retained, never -EAGAIN and never an unsuspended vfork. Busy once, then
+/// success: after the host hands the child back, its next owner entry
+/// reruns the retained wait, which parks.
+#[cfg(test)]
+fn host_request_during_child_wait_park(vfork: bool) {
+    use carrick_sched_core::{Claim, Handback, HostClaim, ShortLockSpin};
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let (record, address, words) = capacity.select().unwrap();
+    assert_ne!(record, fixture.record);
+    assert!(fixture.zone.record(record.id).is_native_owned());
+    let mut service = fixture.service();
+    service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+        ThreadControlSlot::new()
+    })));
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &words,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::NoPending)
+    ));
+    let grandchild = if vfork {
+        None
+    } else {
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("fork did not return");
+        };
+        assert!(result.raw() > 0, "fork result {}", result.raw());
+        Some(result.raw())
+    };
+    // The host requests this exact running child before it parks.
+    assert_eq!(
+        fixture
+            .zone
+            .claim_for_host(record, None, Handback::Control, &ShortLockSpin, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            }),
+        HostClaim::El1Held { slot: fixture.slot }
+    );
+    let outcome = match grandchild {
+        Some(pid) => entry.wait4(
+            ProcessWaitPid::from_syscall_argument(pid as u64),
+            UserVa::new(0x1000),
+            LinuxWaitOptions::empty(),
+            UserVa::new(0),
+        ),
+        None => entry.fork(ProcessForkChildTid {
+            parent: ProcessForkParent::SuspendedUntilExecOrExit,
+            ..ProcessForkChildTid::NONE
+        }),
+    };
+    assert!(
+        matches!(outcome, LifecycleOutcome::Transferred { .. }),
+        "a host request during the park must yield, not return {:?}",
+        match outcome {
+            LifecycleOutcome::Returned { result, .. } => Some(result.raw()),
+            _ => None,
+        }
+    );
+    assert!(entry.take_handoff_receipt().is_some());
+    drop(entry);
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert!(fixture.zone.record(record.id).requires_native_entry());
+
+    // The stopped executor honours the request and hands the record back.
+    let mut wanted = alloc::vec::Vec::new();
+    fixture
+        .zone
+        .take_host_wanted(fixture.slot, &mut |wanted_record| {
+            wanted.push(wanted_record)
+        });
+    assert_eq!(wanted.as_slice(), &[record]);
+    assert!(fixture.zone.place_native_handback(record).is_some());
+
+    // Its next owner entry reruns the retained wait, which now parks.
+    let (again, address, words) = loop {
+        let selected = capacity.select().unwrap();
+        if selected.0 == record {
+            break selected;
+        }
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, selected.0.id)
+                .is_queued()
+        );
+    };
+    assert_eq!(again, record);
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &words,
+            &mut service,
+        )
+        .unwrap();
+    let resumed = entry.resume_checkpoint(|_| Ok(None));
+    assert!(
+        matches!(resumed, Ok(NativeResume::Left(None))),
+        "the retained wait must repark after the handback"
+    );
+    drop(entry);
+    assert!(matches!(
+        fixture.zone.record(record.id).claim(),
+        Claim::Parked { .. }
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn host_request_during_wait4_park_yields_then_reparks() {
+    host_request_during_child_wait_park(false);
+}
+
+#[cfg(test)]
+#[test]
+fn host_request_during_vfork_park_yields_then_reparks() {
+    host_request_during_child_wait_park(true);
+}
