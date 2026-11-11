@@ -120,10 +120,7 @@ impl ImageStore {
     }
 
     pub fn default_for_user() -> Self {
-        let root = std::env::var_os("CARRICK_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".carrick")))
-            .unwrap_or_else(|| PathBuf::from(".carrick"));
+        let root = carrick_spec::carrick_home();
         Self::new(root)
     }
 

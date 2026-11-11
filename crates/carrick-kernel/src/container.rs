@@ -299,13 +299,13 @@ impl Default for RunConfig {
 /// The registry root: `<scratch>/containers` (per-user, case-sensitive). Each
 /// container lives in `<root>/<id>/`.
 pub fn registry_root() -> PathBuf {
-    // The APFS scratch root (a case-sensitive, fast-clone volume) is a macOS
-    // host concept; on Linux fall back to a tempdir-based root.
+    // The scratch root lives under the one carrick home on every host; on
+    // macOS it may instead be the dedicated case-sensitive APFS volume.
     #[cfg(target_os = "macos")]
     let base = carrick_vfs::apfs::preferred_scratch_root()
-        .unwrap_or_else(|_| std::env::temp_dir().join("carrick"));
+        .unwrap_or_else(|_| carrick_spec::carrick_home().join("scratch"));
     #[cfg(not(target_os = "macos"))]
-    let base = std::env::temp_dir().join("carrick");
+    let base = carrick_spec::carrick_home().join("scratch");
     base.join("containers")
 }
 

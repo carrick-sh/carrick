@@ -1458,3 +1458,26 @@ mod tests {
 }
 
 pub mod syscall_census;
+
+/// The one root every piece of carrick host state lives under: the image
+/// store (`images/`, `blobs/`), per-run scratch (`scratch/`), the layer cache
+/// and scratch trash. `carrick_home` is `$CARRICK_HOME`, `home` is `$HOME`;
+/// with neither set the root is `/tmp/carrick`.
+pub fn carrick_home_from(
+    carrick_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    carrick_home
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.map(|home| std::path::PathBuf::from(home).join(".carrick")))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/carrick"))
+}
+
+/// [`carrick_home_from`] over the process environment.
+pub fn carrick_home() -> std::path::PathBuf {
+    carrick_home_from(
+        std::env::var_os("CARRICK_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
