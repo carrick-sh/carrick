@@ -9994,10 +9994,10 @@ fn arm_caught_signal_returns_then_reexecutes_parked_anonymous_edit() {
         "anonymous edit interruption never returns EINTR"
     );
     assert!(
-        crate::mm_portal::complete_anonymous_edit_replay(
+        carrick_core::wait::complete_anonymous_edit_replay(
             fixture.zone,
             fixture.slot,
-            &fixture.task,
+            fixture.task.mm.key.load(Ordering::Acquire),
         )
         .unwrap(),
         "successful replay must consume its anonymous operation"
