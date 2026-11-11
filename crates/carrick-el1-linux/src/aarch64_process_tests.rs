@@ -14820,13 +14820,13 @@ fn arm_kill_nonleader_recipient(blocked: bool) {
         )
         .unwrap();
     let mut trace = crate::sched::object_wait::test_wake_trace();
-    trace.sort();
+    trace.sort_by_key(|(_, target)| *target);
     let mut expected = if blocked {
         vec![(fixture.slot, 0x1000)]
     } else {
         vec![(fixture.slot, 0x1000), (sender_slot, 0x2000)]
     };
-    expected.sort();
+    expected.sort_by_key(|(_, target)| *target);
     assert_eq!(
         trace, expected,
         "every eligible member is kicked: the named member and its unblocked siblings"
