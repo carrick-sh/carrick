@@ -1538,11 +1538,12 @@ ci-results:
          (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"])["lint-domains"]
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
-         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint-clippy" and .key != "lint-gates" and .key != "xtask-tests-build" and .key != "lint-domains"))
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "trusted-steps" and .key != "lint-clippy" and .key != "lint-gates" and .key != "xtask-tests-build" and .key != "lint-domains"))
            | if ($root.changes.outputs.heavy // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and
          (.["commit-trailers"].result == "success") and
+         (.["trusted-steps"].result == "success") and
          (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]).actionlint
            | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
              else .result == "skipped" end)
