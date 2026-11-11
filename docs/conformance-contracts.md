@@ -279,3 +279,15 @@ retained IPC token cannot authorize retrying the separately staged exec
 bridge. The bridge keeps its current outcome; retaining staged service input
 before adding an exec retry is follow-up #1116. This slice makes no new exec
 or vfork acceptance claim.
+
+### VFS rename and namespace admission
+
+Moved from `AGENTS.md` (#2118).
+
+- **A successful host rename isn't necessarily a move** (two hardlinks to one
+  inode: both names survive). Keep the no-op distinct through backend, layered
+  rootfs and dispatcher — a published move/whiteout hides or deletes a valid
+  source. Namespace admission spans identity checks, host op and cache/event
+  publication (stat snapshots don't substitute); archive admission first, with
+  archive rollback and core-file publication in the same authority. Test
+  physical names, cached lookup, a lower layer and `RENAME_NOREPLACE`.

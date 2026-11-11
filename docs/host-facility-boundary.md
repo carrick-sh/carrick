@@ -182,3 +182,15 @@ The table now carries `Authority { Guest, Host, Hybrid }` alongside
 Phase 0 therefore makes the current local boundary explicit and drift-gated.
 It does not prove cross-platform census completeness, semantic containment, or
 the absence of raw host operations outside a future typed facade.
+
+## Porting rules
+
+Moved from `AGENTS.md` (#2118).
+
+- Go's `mem_linux.go` vs `mem_darwin.go` (BSD) is a dual-port oracle: translate
+  INTENT, not mechanism. Never trade an ABI guarantee for speed — find the lever that removes the work.
+
+- Host-owned → native mechanism (`sendfile`, `kqueue`, `__ulock`) via `libc`,
+  not ad-hoc `extern "C"` (exception: `applevisor-sys`).
+
+A lint for ad-hoc `extern "C"` is a follow-up candidate.

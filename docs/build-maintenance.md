@@ -255,3 +255,47 @@ The performance arm materializer still derives a new standalone driver lockfile
 with `cargo generate-lockfile --offline` during preparation. That operation
 necessarily creates a lockfile; the subsequent driver build is locked and
 offline. Dependency-free test workspaces instead seed explicit lockfiles.
+
+## Signing
+
+Moved from `AGENTS.md` (Rule 0, #2118).
+
+Bare `cargo build` drops `com.apple.security.hypervisor` → `carrick run` dies
+with **`HV_DENIED` (`0xfae94007`)**.
+
+- **Build/run via `just build` / `just run`** ([`scripts/build-signed.sh`](scripts/build-signed.sh)
+  re-applies `scripts/entitlements.plist`). `cargo build`/`just check` =
+  compile-check only.
+- **After changing `carrick-runtime`, rebuild `-p carrick-cli` and re-sign** —
+  the lib alone doesn't relink `target/release/carrick`. Confirm:
+  `strings target/release/carrick | grep <your-marker>`.
+- **Test executables are unsigned too** — the entitlement must be on the
+  process calling `hv_vm_create` (`target/debug/deps/<crate>-<hash>`).
+  `carrick-embed` guest tests run only via `just test-embed` →
+  [`scripts/test-signed.sh`](scripts/test-signed.sh) (signs via
+  [`scripts/lib/post-link-sign.sh`](scripts/lib/post-link-sign.sh), serial,
+  unentitled negative control). `HV_DENIED` there is a FAILURE
+  (`EmbedError::Entitlement`), never a skip. Any test that boots a VM is
+  `#[ignore]`d and run only by a signed recipe (e.g. `just test-hvf-trap-engine`);
+  never skip on a failed `hv_vm_create`.
+
+`just check` is a compile-check only: it builds unsigned.
+
+## Commands
+
+The [`justfile`](../justfile) is the source of truth for commands; its comments explain each recipe and mark the ones that codesign. Run `just --list` for the index.
+`just test-embed` is not part of `just ci`; it runs in the merge queue on the self-hosted cloudmac lane.
+
+**Toolchain:** pin, edition, members, `deny`ed lints: [`rust-toolchain.toml`](rust-toolchain.toml) and
+[`Cargo.toml`](Cargo.toml). CI uses moving `@stable`, which can flag lints
+your pin doesn't — `rustup update stable`.
+
+## Git hazards
+
+- **NEVER `git stash`** — repo-global across worktrees; a sibling's `pop`
+  landed in the wrong tree and dropped the entry (recovery: `git fsck --no-reflog`,
+  `git stash store -m <msg> <sha>`). Commit on your branch instead; for a
+  "before", commit then `git checkout` the base. Indices shift silently —
+  `stash@{0}` is never safe (same class as the shared-tree `rsync` hazard).
+
+A worktree removed after its PR merges also loses its `target/`: remove the worktree and `target/` on every host (`git worktree remove --force <path>` and prune). See [Worktree cleanup](#worktree-cleanup).
