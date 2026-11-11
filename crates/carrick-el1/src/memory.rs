@@ -1279,27 +1279,7 @@ impl AnonymousDiscardEditor for HardwareAnonymousEditor {
                     unsafe {
                         core::ptr::write_bytes(alias_va as *mut u8, 0, PAGE_SIZE as usize);
                         if executable {
-                            let ctr: u64;
-                            core::arch::asm!(
-                                "mrs {}, ctr_el0",
-                                out(reg) ctr,
-                                options(nomem, nostack),
-                            );
-                            let dline = (4usize << ((ctr >> 16) & 0xf)).clamp(4, 4096);
-                            for offset in (0..PAGE_SIZE as usize).step_by(dline) {
-                                core::arch::asm!(
-                                    "dc cvau, {}",
-                                    in(reg) alias_va + offset as u64,
-                                    options(nostack),
-                                );
-                            }
-                            core::arch::asm!(
-                                "dsb ish",
-                                "ic ialluis",
-                                "dsb ish",
-                                "isb",
-                                options(nostack),
-                            );
+                            crate::isa::aarch64::clean_executable_alias_page(alias_va);
                         }
                     }
                 },
