@@ -7142,13 +7142,22 @@ fn arm_glibc_pthread_join_shared_bitset_wait_wakes_on_child_exit() {
     assert_eq!(resumed.x[0], 0, "pthread_join's futex returns 0");
 }
 
-/// The same join while another lane holds the MM root: authenticating the
-/// shared word's mapping is contention, never an errno and never a park on
-/// an unauthenticated key. The syscall retries on the holder's release with
-/// its registers intact (`Suspended`); the futex-entry owner-wait episodes
-/// cover the resumed rerun.
+/// A shared futex on an owned word while another lane holds the MM root:
+/// authenticating the word's mapping is contention, never an errno and
+/// never a wait or wake on an unauthenticated key. The syscall retries on
+/// the holder's release with its registers intact (`Suspended`); the
+/// futex-entry owner-wait episodes cover the resumed rerun. glibc's join
+/// wait (op 265) authenticates after policy decodes it, a shared
+/// `FUTEX_WAKE` (op 1) before policy, since a wake always finishes once
+/// served.
 #[test]
-fn arm_glibc_pthread_join_mapping_owner_held_retries_the_syscall() {
+fn arm_shared_futex_mapping_owner_held_retries_the_syscall() {
+    shared_futex_mapping_owner_held([0, 265, 42, 0, 0, 0xffff_ffff]);
+    shared_futex_mapping_owner_held([0, 1, 1, 0, 0, 0]);
+}
+
+#[cfg(test)]
+fn shared_futex_mapping_owner_held(args: [u64; 6]) {
     let words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
         0x4000,
     )));
@@ -7164,16 +7173,14 @@ fn arm_glibc_pthread_join_mapping_owner_held_retries_the_syscall() {
         ..Default::default()
     };
     words.set::<u32>(0, 42);
-    let mut join = carrick_el1_abi::TrapFrame::default();
-    join.x[8] = crate::sched::SYS_FUTEX as u64;
-    join.x[0] = tid_word;
-    join.x[1] = 265;
-    join.x[2] = 42;
-    join.x[5] = 0xffff_ffff;
+    let mut call = carrick_el1_abi::TrapFrame::default();
+    call.x[8] = crate::sched::SYS_FUTEX as u64;
+    call.x[..6].copy_from_slice(&args);
+    call.x[0] = tid_word;
     // A word outside private anonymous memory has no shared-private key: the
     // shared op stays unrouted, as before.
     let unowned = carrick_test_support::GuestUserBuffer::from_value(42_u32);
-    let mut elsewhere = join;
+    let mut elsewhere = call;
     elsewhere.x[0] = unowned.arg();
     assert_eq!(
         arm_call_with_cpu(
@@ -7184,9 +7191,20 @@ fn arm_glibc_pthread_join_mapping_owner_held_retries_the_syscall() {
             &mut cpu
         )
         .unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::Forward
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "op {}",
+        args[1]
     );
-    let saved = join;
+    if args[1] == 1 {
+        // An owned word with no waiter: served in ring, waking nobody.
+        let mut wake = call;
+        assert_eq!(
+            arm_call_with_cpu(fixture, fixture.control, &mut service, &mut wake, &mut cpu).unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Served
+        );
+        assert_eq!(wake.x[0], 0);
+    }
+    let saved = call;
     let portal = super::aarch64_process::Portal::for_zone(
         NonZeroU64::MIN,
         fixture.region.table(),
@@ -7194,14 +7212,15 @@ fn arm_glibc_pthread_join_mapping_owner_held_retries_the_syscall() {
     );
     let held = portal.root_any(ReservationMm::new(1).unwrap(), 1).unwrap();
     let route =
-        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut join, &mut cpu).unwrap();
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut call, &mut cpu).unwrap();
     drop(held);
     assert_eq!(
         route,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended,
-        "a held mapping owner retries the syscall"
+        "a held mapping owner retries op {}",
+        args[1]
     );
-    assert_eq!(join.x, saved.x, "no errno: the retry reruns the same call");
+    assert_eq!(call.x, saved.x, "no errno: the retry reruns the same call");
     assert!(
         (1..carrick_sched_core::ZONE_RECORDS as u32)
             .filter_map(carrick_sched_core::RecordId::from_raw)

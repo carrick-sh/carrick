@@ -126,29 +126,34 @@ struct Adapter<'a, 's, 'm, C: ThreadCpu, U: UserWord> {
     frame: &'a mut TrapFrame,
     refusal: Option<FutexRefusal>,
     operation: &'a mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
-    /// Set for a shared candidate: its key is the shared-private one, after
-    /// this authority admits the word's mapping.
-    shared: Option<&'a mut SharedFutexMapping<'m>>,
+    /// A shared candidate keys shared-private.
+    shared: bool,
+    /// A shared wait's mapping authority, run once policy decoded its
+    /// relative expiry. A shared wake was authenticated before policy.
+    authenticate: Option<&'a mut SharedFutexMapping<'m>>,
 }
 impl<C: ThreadCpu, U: UserWord> Adapter<'_, '_, '_, C, U> {
     /// The scheduler key of `address`: the shared-private key for an
     /// authenticated shared word, the private key otherwise. `None` leaves
     /// the call unserved (a mapping the authority refuses, or its retry).
     fn key(&mut self, address: UserVa) -> Option<u64> {
-        let Some(authenticate) = self.shared.as_deref_mut() else {
+        if !self.shared {
             return MmFutexKey::private(address).map(MmFutexKey::scheduler_address);
-        };
-        let retained = self.operation.as_ref().map(|wait| RelativeFutexWait {
-            deadline: wait.deadline,
-        });
-        match authenticate(address, retained) {
-            Ok(true) => MmFutexKey::shared_private(address).map(MmFutexKey::scheduler_address),
-            Ok(false) => None,
-            Err(outcome) => {
-                self.refusal = Some(FutexRefusal::Mapping(outcome));
-                None
+        }
+        if let Some(authenticate) = self.authenticate.as_deref_mut() {
+            let retained = self.operation.as_ref().map(|wait| RelativeFutexWait {
+                deadline: wait.deadline,
+            });
+            match authenticate(address, retained) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(outcome) => {
+                    self.refusal = Some(FutexRefusal::Mapping(outcome));
+                    return None;
+                }
             }
         }
+        MmFutexKey::shared_private(address).map(MmFutexKey::scheduler_address)
     }
 }
 impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
@@ -360,7 +365,7 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
         };
         // The same candidate rule as x86's native entry (`serve_native_futex`).
         let candidate = shared.is_some().then(|| call.shared_private_candidate());
-        let shared = match candidate.flatten() {
+        let mut authenticate = match candidate.flatten() {
             Some(candidate) => {
                 call = candidate;
                 shared
@@ -370,12 +375,25 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
         if !call.admitted() {
             return Ok(None);
         }
+        let shared = authenticate.is_some();
+        // A wake has no expiry to retain and finishes once policy runs, so
+        // its mapping is authenticated first (as #1941 does on x86).
+        if matches!(call.args[1], FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE)
+            && let Some(authenticate) = authenticate.take()
+        {
+            match authenticate(UserVa::new(call.args[0]), None) {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(outcome) => return Err(FutexRefusal::Mapping(outcome)),
+            }
+        }
         let mut adapter = Adapter {
             sched: self,
             frame,
             refusal: None,
             operation,
             shared,
+            authenticate,
         };
         let served = ::carrick_personality_linux::sched::serve_futex(call, &mut adapter);
         match adapter.refusal {
