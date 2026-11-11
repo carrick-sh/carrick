@@ -1,6 +1,7 @@
 /* #1714: glibc's loader as the run root. It opens a library in the ring
  * namespace, reads, preads, seeks and stats it there, reports through
- * writev, and narrows its own RELRO page with mprotect. Each failed step
+ * writev, narrows its own RELRO page with mprotect, and writes a file it
+ * creates under its own RLIMIT_FSIZE. Each failed step
  * exits with its number; the native oracle exits 0. */
 .global _start
 .text
@@ -100,6 +101,38 @@ _start:
     mov $20, %edi
     test %rax, %rax
     jne exit
+
+    mov $-100, %edi                 /* openat(AT_FDCWD, out, O_RDWR|O_CREAT|O_TRUNC, 0600) */
+    lea out(%rip), %rsi
+    mov $0x242, %edx
+    mov $0600, %r10d
+    mov $257, %eax
+    syscall
+    mov $21, %edi
+    test %rax, %rax
+    js exit
+    mov %rax, %r12
+
+    mov %r12, %rdi                  /* write(fd, "data", 4) == 4: the root's RLIMIT_FSIZE */
+    lea data(%rip), %rsi
+    mov $4, %edx
+    mov $1, %eax
+    syscall
+    mov $22, %edi
+    cmp $4, %rax
+    jne exit
+
+    mov %r12, %rdi                  /* pread64(fd, buf, 4, 0) == 4, "data" */
+    lea buf(%rip), %rsi
+    mov $4, %edx
+    xor %r10d, %r10d
+    mov $17, %eax
+    syscall
+    mov $23, %edi
+    cmp $4, %rax
+    jne exit
+    cmpb $0x64, buf(%rip)
+    jne exit
     xor %edi, %edi
 exit:
     mov $231, %eax
@@ -107,6 +140,8 @@ exit:
     ud2
 .section .rodata
 name: .asciz FILE_PATH
+out: .asciz OUT_PATH
+data: .ascii "data"
 empty: .asciz ""
 wv0: .ascii "wv-"
 wv1: .ascii "ok\n"

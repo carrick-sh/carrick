@@ -2440,7 +2440,9 @@ fn serial_host_root_loader_reads_stats_and_protects_through_the_ring() {
     let path = dir.path().join("library");
     std::fs::write(&path, b"loader library").expect("loader source file");
     let define = format!("-DFILE_PATH=\"{}\"", path.display());
-    let elf = native_exit_fixture_with_flags("native_root_loader_io.S", &[&define]);
+    let out = dir.path().join("written");
+    let out_define = format!("-DOUT_PATH=\"{}\"", out.display());
+    let elf = native_exit_fixture_with_flags("native_root_loader_io.S", &[&define, &out_define]);
     let oracle = dir.path().join("oracle");
     carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
     let native = std::process::Command::new("timeout")
@@ -2450,6 +2452,7 @@ fn serial_host_root_loader_reads_stats_and_protects_through_the_ring() {
         .expect("bounded native loader control");
     assert!(native.status.success(), "native result: {native:?}");
     assert_eq!(native.stdout, b"wv-ok\n");
+    std::fs::remove_file(&out).expect("native control output");
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     dispatcher.set_fs_backend(Box::new(
         carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
@@ -2479,10 +2482,11 @@ fn serial_host_root_loader_reads_stats_and_protects_through_the_ring() {
         (outcome.run.exit_code, refused.as_slice()),
         (0, &[][..]),
         "exit is the failed step (11 read, 15/16 fstat, 17 newfstatat, 18 writev, \
-         19 mprotect); refusals are (x86 nr, count): {:?}",
+         19 mprotect, 22 write); refusals are (x86 nr, count): {:?}",
         outcome.run
     );
     assert_eq!(outcome.run.stdout, native.stdout);
+    assert_eq!(std::fs::read(&out).expect("guest output"), b"data");
     assert!(!outcome.run.trap_limit_hit);
 }
 
