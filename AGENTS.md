@@ -69,10 +69,12 @@ Docker oracle. The scoreboard is the fast smoke check.
 
 ## Engineering rules
 
-- **Guest-visible change → conformance contract.** Use
+- **Guest-visible change → conformance contract.** In Carrick,
+  guest-visible correctness includes Linux semantics and non-pathological
+  cost. Use
   [`carrick-conformance-contract`](.agents/skills/carrick-conformance-contract/SKILL.md)
-  and add a red-first contract when none exists. A semantic pass doesn't
-  excuse a budget or ratio failure. Never weaken budgets, add retries or
+  and add a red-first contract when none exists. A semantic pass cannot excuse
+  a budget or ratio failure. Never weaken budgets, add retries or
   timeouts, poll, or serialize as a fix. → [`docs/conformance-contracts.md`](docs/conformance-contracts.md).
 - **The compat zone is ours.** Guest AF_UNIX, ptys, pipes, futexes, pgrps and
   sessions, signals, identity, rlimits and the netns view live in Carrick's
