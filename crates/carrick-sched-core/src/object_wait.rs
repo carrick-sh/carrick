@@ -2426,6 +2426,21 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             attempt = attempt.saturating_add(1);
         }
     }
+    /// Lock-free: `key`'s incarnation has no bound queue, so no waiter can be
+    /// enrolled on it. A recycled index whose queue still carries an older
+    /// incarnation's generation (or none) is the case; its lock belongs to
+    /// the previous incarnation's parties and is never taken for `key`.
+    ///
+    /// Sound for a notifier that published its state change before asking: a
+    /// waiter binds the queue before it probes (inside the same object-lock
+    /// section), so a bind this read misses is followed by a probe that
+    /// observes the change, and no wake is lost.
+    pub fn object_incarnation_unbound(&self, key: ObjectWaitKey) -> bool {
+        self.object_queue(key.index as usize)
+            .generation
+            .load(Ordering::Acquire)
+            < key.generation
+    }
     pub fn completion_enabled(&self, key: ObjectWaitKey) -> bool {
         self.object_queue(key.index as usize)
             .completion_mode
