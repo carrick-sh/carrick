@@ -259,9 +259,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 native_entropy(record).map_err(|_| fail("native entropy record invalid"))?;
                 true
             }
-            // The shared owner retains the operation and reruns preparation
-            // after this physical checkpoint; Busy never becomes an errno.
-            ServiceOperation::CarrierWork { .. } => true,
+            ServiceOperation::CarrierWork { demand, .. } => carrier_work_supplied(demand),
             ServiceOperation::Fault(_) => {
                 let slot = self
                     .grant_portal()?
@@ -401,5 +399,46 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .complete(served.is_ok())
             .map_err(|_| fail("native host file acknowledgment"))?;
         Ok(())
+    }
+}
+
+/// The CPL0 carrier's answer to a `CarrierWork` request.
+fn carrier_work_supplied(_demand: carrick_core_abi::service::CarrierDemand) -> bool {
+    // The shared owner retains the operation and reruns preparation
+    // after this physical checkpoint; Busy never becomes an errno.
+    true
+}
+
+#[cfg(test)]
+mod carrier_work_tests {
+    use carrick_core_abi::service::{CarrierDemand, CarrierWorkReply, ServiceResult};
+
+    fn reply(demand: CarrierDemand) -> Option<CarrierWorkReply> {
+        let result = if super::carrier_work_supplied(demand) {
+            ServiceResult::Supplied
+        } else {
+            ServiceResult::Refused
+        };
+        CarrierWorkReply::for_result(demand, result)
+    }
+
+    /// Plain carrier work is delivered and its operation reruns.
+    #[test]
+    fn cpl0_carrier_work_is_delivered() {
+        assert_eq!(
+            reply(CarrierDemand::Work),
+            Some(CarrierWorkReply::Delivered)
+        );
+    }
+
+    /// #1974: the CPL0 carrier has no thread-stock owner, so a stock demand
+    /// is answered `Unstockable` (today's host answer), never acknowledged
+    /// as `Stocked` without stock.
+    #[test]
+    fn cpl0_thread_stock_demand_is_never_stocked_without_stock() {
+        assert_eq!(
+            reply(CarrierDemand::ThreadStock),
+            Some(CarrierWorkReply::Unstockable)
+        );
     }
 }
