@@ -858,25 +858,6 @@ pub struct LinuxX8664EpollEvent {
     ::zerocopy::Immutable,
     ::zerocopy::Unaligned,
 )]
-pub struct LinuxPollFd {
-    pub fd: i32,
-    pub events: i16,
-    pub revents: i16,
-}
-
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
 pub struct LinuxMsghdr {
     pub name: u64,
     pub namelen: u32,
