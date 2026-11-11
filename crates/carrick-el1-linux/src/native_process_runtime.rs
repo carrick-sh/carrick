@@ -7972,7 +7972,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         self.publish_channel(&channel)
     }
-    #[inline(never)]
+    /// The body of `fork_owned`, folded into its frame: the build's fork
+    /// chains charge `fork_owned` across every fork callee, so this frame
+    /// must not be emitted on its own.
+    #[inline(always)]
     fn fork_reserved(&mut self, child_tid: ProcessForkChildTid) -> Result<u32, NativeProcessError> {
         let reservation = self.fork_reserve()?;
         let prepared =
