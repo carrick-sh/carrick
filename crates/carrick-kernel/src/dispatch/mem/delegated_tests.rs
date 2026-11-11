@@ -8227,7 +8227,7 @@ mod private_file_owner {
 
     fn madvise(
         dispatcher: &mut SyscallDispatcher,
-        memory: &mut CountingMmapMemory,
+        memory: &mut impl carrick_guest_mem::CurrentMmMemory,
         address: u64,
         len: u64,
     ) -> DispatchOutcome {
@@ -8613,5 +8613,537 @@ mod private_file_owner {
             [3],
             "the other process keeps its retained source"
         );
+    }
+
+    /// The ARM engine's publication facts the dispatcher must keep straight
+    /// (`carrick-aarch64/src/engine.rs`), over the counting backend:
+    /// `set_mapping_protection_and_sharing` arms a new-mapping publication
+    /// that the next protection edit of exactly that range consumes, and a
+    /// new-mapping edit over a live guest leaf is refused
+    /// (`check_vacant_for_new_mapping`, surfaced as a host mapping error). A
+    /// host `protect_range` with access installs zero-filled sparse leaves
+    /// (`ensure_sparse_mmap_backing`); `protect_owner_reserved_range` does
+    /// not. A guest touch leaves a resident leaf, and retirement removes
+    /// leaves and marks the range unmapped. Host permission facts live in a
+    /// real `MemoryProtections` registry.
+    struct EngineModel {
+        inner: CountingMmapMemory,
+        protections: carrick_guest_mem::protections::MemoryProtections,
+        pending_new_mapping: Option<(u64, usize)>,
+        leaves: std::collections::BTreeMap<u64, Leaf>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Leaf {
+        /// A guest touch's private frame.
+        Resident,
+        /// Host sparse backing, zero-filled.
+        HostZero,
+    }
+
+    impl EngineModel {
+        fn new() -> Self {
+            Self {
+                inner: arena_memory(),
+                protections: Default::default(),
+                pending_new_mapping: None,
+                leaves: Default::default(),
+            }
+        }
+
+        fn pages(address: u64, len: usize) -> impl Iterator<Item = u64> {
+            (address..address + len as u64).step_by(PAGE as usize)
+        }
+
+        fn drop_leaves(&mut self, address: u64, len: usize) {
+            for page in Self::pages(address, len) {
+                self.leaves.remove(&page);
+            }
+        }
+
+        fn publish(
+            &mut self,
+            address: u64,
+            len: usize,
+            prot: u64,
+            owner_reserved: bool,
+        ) -> Result<(), MemoryError> {
+            let new_mapping = self.pending_new_mapping.take() == Some((address, len));
+            if new_mapping
+                && Self::pages(address, len)
+                    .any(|page| self.leaves.get(&page) == Some(&Leaf::Resident))
+            {
+                return Err(MemoryError::HostMap(format!(
+                    "new mapping over a live leaf at {address:#x}+{len:#x}"
+                )));
+            }
+            if !owner_reserved && prot & RWX != 0 {
+                for page in Self::pages(address, len) {
+                    if !self.leaves.contains_key(&page) {
+                        self.leaves.insert(page, Leaf::HostZero);
+                        self.inner.zero_backing(page, PAGE as usize)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    const RWX: u64 = LINUX_PROT_READ | LINUX_PROT_WRITE | crate::linux_abi::LINUX_PROT_EXEC;
+
+    impl carrick_guest_mem::GuestMemory for EngineModel {
+        fn zero_pending_backing(
+            &mut self,
+            pending: carrick_el1_abi::ReservationRequest,
+        ) -> Result<(), MemoryError> {
+            self.inner.zero_pending_backing(pending)
+        }
+
+        fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
+            Some(carrick_guest_mem::LegacyProtectionRead::borrowed(
+                &self.protections,
+            ))
+        }
+
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.inner.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.inner.write_bytes_raw(address, bytes)
+        }
+
+        fn zero_anonymous_reuse(
+            &mut self,
+            address: u64,
+            len: usize,
+            sharing: carrick_guest_mem::MappingSharing,
+        ) -> Result<(), MemoryError> {
+            self.inner.zero_anonymous_reuse(address, len, sharing)
+        }
+
+        fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+            self.inner.zero_backing(address, len)
+        }
+
+        fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+            self.inner.unmap_range(address, len)?;
+            self.drop_leaves(address, len);
+            Ok(())
+        }
+
+        fn retire_mapping(
+            &mut self,
+            address: GuestVa,
+            len: usize,
+        ) -> Result<(), carrick_guest_mem::MappingRetirementError> {
+            self.unmap_range(address.raw(), len)
+                .map_err(carrick_guest_mem::MappingRetirementError::Indeterminate)?;
+            self.set_unmapped(address.raw(), len, true);
+            Ok(())
+        }
+
+        fn protect_owner_reserved_range(
+            &mut self,
+            address: u64,
+            len: usize,
+            prot: u64,
+        ) -> Result<(), MemoryError> {
+            self.inner
+                .protect_owner_reserved_range(address, len, prot)?;
+            self.publish(address, len, prot, true)
+        }
+
+        fn protect_range(
+            &mut self,
+            address: u64,
+            len: usize,
+            prot: u64,
+        ) -> Result<(), MemoryError> {
+            self.inner.protect_range(address, len, prot)?;
+            self.publish(address, len, prot, false)
+        }
+
+        fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+            self.protections.set_no_access(address, len, no_access);
+        }
+
+        fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
+            self.protections.set_no_write(address, len, no_write);
+        }
+
+        fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+            self.protections.set_unmapped(address, len, unmapped);
+        }
+
+        fn set_mapping_protection(
+            &mut self,
+            address: u64,
+            len: usize,
+            no_access: bool,
+            no_write: bool,
+        ) {
+            self.protections
+                .set_mapping_protection(address, len, no_access, no_write);
+        }
+
+        fn set_mapping_sharing(
+            &mut self,
+            address: u64,
+            len: usize,
+            sharing: carrick_guest_mem::MappingSharing,
+        ) {
+            self.protections.set_mapping_sharing(address, len, sharing);
+        }
+
+        fn set_mapping_protection_and_sharing(
+            &mut self,
+            address: u64,
+            len: usize,
+            no_access: bool,
+            no_write: bool,
+            sharing: carrick_guest_mem::MappingSharing,
+        ) {
+            self.pending_new_mapping = Some((address, len));
+            self.protections
+                .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
+        }
+    }
+
+    impl carrick_guest_mem::CurrentMmMemory for EngineModel {}
+
+    /// The byte a guest load of `address` observes: a live leaf's frame, or
+    /// (no leaf) a first-touch fault the owner supplies from the root node's
+    /// retained source.
+    fn guest_read(
+        dispatcher: &SyscallDispatcher,
+        root: &Root,
+        memory: &EngineModel,
+        address: u64,
+    ) -> u8 {
+        if memory.leaves.contains_key(&(address & !(PAGE - 1))) {
+            memory.inner.read_bytes_raw(address, 1).unwrap()[0]
+        } else {
+            source_bytes(dispatcher, root, address, 1)[0]
+        }
+    }
+
+    /// A guest store to `address`: a first touch copies the page from the
+    /// root node's retained source into a private resident frame.
+    fn guest_write(
+        dispatcher: &SyscallDispatcher,
+        root: &Root,
+        memory: &mut EngineModel,
+        address: u64,
+        byte: u8,
+    ) {
+        let page = address & !(PAGE - 1);
+        if !memory.leaves.contains_key(&page) {
+            let bytes = source_bytes(dispatcher, root, page, PAGE);
+            memory.inner.write_bytes_raw(page, &bytes).unwrap();
+        }
+        memory.leaves.insert(page, Leaf::Resident);
+        memory.inner.write_bytes_raw(address, &[byte]).unwrap();
+    }
+
+    fn mprotect(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut impl carrick_guest_mem::CurrentMmMemory,
+        address: u64,
+        len: u64,
+        prot: u64,
+    ) -> DispatchOutcome {
+        call(
+            dispatcher,
+            memory,
+            SYS_MPROTECT,
+            [address, len, prot, 0, 0, 0],
+        )
+    }
+
+    /// A private file map of an admitted MM publishes no host leaves, so its
+    /// `mmap` must not arm a new-mapping publication either: the guest touches
+    /// the page, and a later `mprotect` of the whole mapping edits that live
+    /// leaf instead of failing the vacancy check with `ENOMEM`.
+    #[test]
+    fn admitted_private_file_mmap_leaves_no_new_mapping_armed_for_mprotect() {
+        let mut dispatcher = SyscallDispatcher::new();
+        install_host_file_fd(&dispatcher, FILE_FD, &pages(2));
+        let root = Root::admit(&dispatcher);
+        let mut memory = EngineModel::new();
+        let file = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            0,
+            2 * PAGE,
+            RW,
+            LINUX_MAP_PRIVATE,
+            FILE_FD,
+        )) as u64;
+        guest_write(&dispatcher, &root, &mut memory, file, 0x41);
+
+        assert_eq!(
+            mprotect(
+                &mut dispatcher,
+                &mut memory,
+                file,
+                2 * PAGE,
+                LINUX_PROT_READ
+            ),
+            DispatchOutcome::Returned { value: 0 },
+            "mprotect of a touched private file map is not ENOMEM"
+        );
+        assert_eq!(guest_read(&dispatcher, &root, &memory, file), 0x41);
+        assert_eq!(guest_read(&dispatcher, &root, &memory, file + PAGE), 2);
+    }
+
+    /// `MADV_DONTNEED` of a retained private file page returns it to the root
+    /// node and leaves no host fact behind: no new-mapping publication armed
+    /// across syscalls (a later `mprotect` of the re-touched page is not
+    /// `ENOMEM`) and no host permission fact over a root-decided page (a
+    /// `PROT_READ` node keeps no host `no_write` the root never sees change).
+    #[test]
+    fn admitted_private_file_discard_then_mprotect_then_read() {
+        let mut dispatcher = SyscallDispatcher::new();
+        install_host_file_fd(&dispatcher, FILE_FD, &pages(4));
+        let root = Root::admit(&dispatcher);
+        let mut memory = EngineModel::new();
+        let file = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            0,
+            2 * PAGE,
+            RW,
+            LINUX_MAP_PRIVATE,
+            FILE_FD,
+        )) as u64;
+        let read_only = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            0,
+            2 * PAGE,
+            LINUX_PROT_READ,
+            LINUX_MAP_PRIVATE,
+            FILE_FD,
+        )) as u64;
+        guest_write(&dispatcher, &root, &mut memory, file + PAGE, 0x52);
+
+        hold_own_gate(&memory.inner, &root);
+        assert_eq!(
+            madvise(&mut dispatcher, &mut memory, file + PAGE, PAGE),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            madvise(&mut dispatcher, &mut memory, read_only, PAGE),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        memory.inner.owner_gate.set(None);
+        let facts = &memory.protections;
+        assert!(
+            !facts.range_no_write(read_only, PAGE as usize)
+                && !facts.range_no_access(read_only, PAGE as usize)
+                && !facts.range_unmapped(read_only, 2 * PAGE as usize),
+            "a discarded root-owned page keeps no host permission fact"
+        );
+        assert!(!facts.range_unmapped(file, 2 * PAGE as usize));
+
+        // The discarded page faults back in from the file, then is dirtied.
+        assert_eq!(guest_read(&dispatcher, &root, &memory, file + PAGE), 2);
+        guest_write(&dispatcher, &root, &mut memory, file + PAGE, 0x53);
+        assert_eq!(
+            mprotect(
+                &mut dispatcher,
+                &mut memory,
+                file + PAGE,
+                PAGE,
+                LINUX_PROT_READ
+            ),
+            DispatchOutcome::Returned { value: 0 },
+            "mprotect after a discard is not ENOMEM"
+        );
+        assert_eq!(memory.read_bytes(file + PAGE, 1).unwrap(), [0x53]);
+        assert_eq!(guest_read(&dispatcher, &root, &memory, file), 1);
+        assert_eq!(guest_read(&dispatcher, &root, &memory, read_only), 1);
+    }
+
+    /// In-place `mremap` growth of a retained private file node extends the
+    /// node over the next file pages: the guest's first read past the old end
+    /// faults to the owner and reads the file, not a zero-filled host leaf.
+    #[test]
+    fn admitted_private_file_mremap_growth_reads_file_bytes_past_the_old_end() {
+        let mut dispatcher = SyscallDispatcher::new();
+        install_host_file_fd(&dispatcher, FILE_FD, &pages(4));
+        let root = Root::admit(&dispatcher);
+        let mut memory = EngineModel::new();
+        let file = LINUX_MMAP_BASE + 8 * PAGE;
+        assert_eq!(
+            host_mmap(
+                &mut dispatcher,
+                &mut memory,
+                file,
+                2 * PAGE,
+                RW,
+                FIXED_PRIVATE,
+                FILE_FD,
+            ),
+            DispatchOutcome::Returned { value: file as i64 }
+        );
+        guest_write(&dispatcher, &root, &mut memory, file + PAGE, 0x62);
+        let writes = memory.inner.write_calls.get();
+        hold_own_gate(&memory.inner, &root);
+
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MREMAP,
+                [file, 2 * PAGE, 4 * PAGE, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: file as i64 },
+            "a retained private file node grows in place"
+        );
+        memory.inner.owner_gate.set(None);
+        assert_eq!(memory.inner.write_calls.get(), writes, "no owner write");
+        assert_eq!(
+            root.node(file).map(|node| (node.0, node.1, node.2)),
+            Some((file, file + 4 * PAGE, false))
+        );
+        for page in 2..4 {
+            assert_eq!(
+                memory.leaves.get(&(file + page * PAGE)),
+                None,
+                "grown page {page} publishes no host leaf"
+            );
+            assert_eq!(
+                guest_read(&dispatcher, &root, &memory, file + page * PAGE),
+                page as u8 + 1,
+                "grown page {page} reads the file"
+            );
+        }
+        assert!(!memory.protections.range_unmapped(file, 4 * PAGE as usize));
+        assert_eq!(guest_read(&dispatcher, &root, &memory, file + PAGE), 0x62);
+        assert_eq!(guest_read(&dispatcher, &root, &memory, file), 1);
+    }
+
+    /// `mremap` shrink of a retained private file node releases exactly the
+    /// removed tail (its private frame and its node), keeps the head's source,
+    /// and a regrowth reads the file again rather than the old dirty tail.
+    #[test]
+    fn admitted_private_file_mremap_shrink_releases_exactly_the_tail() {
+        let mut dispatcher = SyscallDispatcher::new();
+        install_host_file_fd(&dispatcher, FILE_FD, &pages(4));
+        let root = Root::admit(&dispatcher);
+        let mut memory = EngineModel::new();
+        let file = LINUX_MMAP_BASE + 8 * PAGE;
+        assert_eq!(
+            host_mmap(
+                &mut dispatcher,
+                &mut memory,
+                file,
+                4 * PAGE,
+                RW,
+                FIXED_PRIVATE,
+                FILE_FD,
+            ),
+            DispatchOutcome::Returned { value: file as i64 }
+        );
+        guest_write(&dispatcher, &root, &mut memory, file + PAGE, 0x71);
+        guest_write(&dispatcher, &root, &mut memory, file + 3 * PAGE, 0x73);
+        memory.inner.unmap_log.borrow_mut().clear();
+        hold_own_gate(&memory.inner, &root);
+
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MREMAP,
+                [file, 4 * PAGE, 2 * PAGE, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: file as i64 }
+        );
+        memory.inner.owner_gate.set(None);
+        assert_eq!(
+            memory.inner.unmap_log.borrow().as_slice(),
+            [(file + 2 * PAGE, 2 * PAGE as usize)],
+            "exactly the removed tail retires"
+        );
+        assert_eq!(root.node(file + 2 * PAGE), None);
+        assert_eq!(
+            root.node(file).map(|node| (node.0, node.1)),
+            Some((file, file + 2 * PAGE))
+        );
+        assert!(!memory.protections.range_unmapped(file, 2 * PAGE as usize));
+        assert_eq!(memory.leaves.get(&(file + PAGE)), Some(&Leaf::Resident));
+        assert_eq!(memory.leaves.get(&(file + 3 * PAGE)), None);
+        assert_eq!(guest_read(&dispatcher, &root, &memory, file + PAGE), 0x71);
+        assert_eq!(source_bytes(&dispatcher, &root, file, 1), [1]);
+
+        hold_own_gate(&memory.inner, &root);
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MREMAP,
+                [file, 2 * PAGE, 4 * PAGE, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: file as i64 }
+        );
+        memory.inner.owner_gate.set(None);
+        assert_eq!(
+            guest_read(&dispatcher, &root, &memory, file + 3 * PAGE),
+            4,
+            "the regrown tail reads the file, not the discarded dirty page"
+        );
+    }
+
+    /// `MAP_LOCKED` private file maps keep main's eager venue: #1141 owns
+    /// the lock transfer and eager population under the held exclusion. Under
+    /// the MM's own gate main refuses the eager copy with `ENOMEM` (#2133)
+    /// and charges no lock, so `munlock`, `MADV_DONTNEED` and `mremap` of the
+    /// range meet no mapping and answer as main does.
+    #[test]
+    fn admitted_private_file_map_locked_keeps_main_lock_accounting() {
+        let mut dispatcher = SyscallDispatcher::new();
+        install_host_file_fd(&dispatcher, FILE_FD, &pages(4));
+        let root = Root::admit(&dispatcher);
+        let mut memory = arena_memory();
+        let file = LINUX_MMAP_BASE + 8 * PAGE;
+        hold_own_gate(&memory, &root);
+        let steps = [
+            host_mmap(
+                &mut dispatcher,
+                &mut memory,
+                file,
+                4 * PAGE,
+                RW,
+                FIXED_PRIVATE | carrick_abi::LINUX_MAP_LOCKED,
+                FILE_FD,
+            ),
+            call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MUNLOCK,
+                [file, 4 * PAGE, 0, 0, 0, 0],
+            ),
+            madvise(&mut dispatcher, &mut memory, file, PAGE),
+            mremap(
+                &mut dispatcher,
+                &mut memory,
+                [file, 4 * PAGE, 2 * PAGE, 0, 0],
+            ),
+        ];
+        assert_eq!(
+            steps,
+            [
+                DispatchOutcome::errno(LINUX_ENOMEM),
+                DispatchOutcome::errno(LINUX_ENOMEM),
+                DispatchOutcome::errno(LINUX_ENOMEM),
+                DispatchOutcome::errno(LINUX_EFAULT),
+            ],
+            "mmap, munlock, MADV_DONTNEED and mremap answer as main"
+        );
+        assert_eq!(locked_memory(&dispatcher), []);
+        assert_eq!(root.node(file), None);
+        assert_eq!(memory.write_bytes_total.get(), 0);
     }
 }
