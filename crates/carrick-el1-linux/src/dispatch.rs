@@ -3625,17 +3625,37 @@ impl<
         {
             let orig_x0 = frame.x[0];
             let served = {
+                // The admitted process owns the shared-private rule (#2124),
+                // as for x86's native entry: a shared word keys
+                // shared-private only on its MM's private anonymous memory.
+                let process = self.process.as_deref_mut().filter(|process| {
+                    process.binding() == super::common_entry::execution_binding(task)
+                });
+                let mut authenticate = process.map(|process| {
+                    move |address, retained| process.futex_shared_private(address, retained)
+                });
                 let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-                sched.serve_futex_operation(frame, &mut operation)
+                sched.serve_futex_operation(
+                    frame,
+                    &mut operation,
+                    authenticate
+                        .as_mut()
+                        .map(|authenticate| authenticate as &mut sched::SharedFutexMapping<'_>),
+                )
             };
             let disposition = match served {
                 Ok(served) => served.map_or(ipc::IpcServed::Forward, ipc::IpcServed::from),
-                Err(carrick_core::user_copy::CopyOutcome::Fault) => {
+                Err(sched::FutexRefusal::Mapping(outcome)) => {
+                    return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+                }
+                Err(sched::FutexRefusal::Copy(carrick_core::user_copy::CopyOutcome::Fault)) => {
                     return FamilyCompletion::Complete(
                         carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
                     );
                 }
-                Err(carrick_core::user_copy::CopyOutcome::NotYet(request)) => {
+                Err(sched::FutexRefusal::Copy(carrick_core::user_copy::CopyOutcome::NotYet(
+                    request,
+                ))) => {
                     let Some(process) = self.process.as_deref_mut() else {
                         return FamilyCompletion::Forward;
                     };
@@ -3653,7 +3673,7 @@ impl<
                     }
                     return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
                 }
-                Err(carrick_core::user_copy::CopyOutcome::Done) => {
+                Err(sched::FutexRefusal::Copy(carrick_core::user_copy::CopyOutcome::Done)) => {
                     invalid_completion(NativeInvariant::EntryBinding)
                 }
             };

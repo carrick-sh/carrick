@@ -8635,6 +8635,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     ) -> Option<LifecycleOutcome> {
         self.serve_native_futex(call, copy)
     }
+    fn futex_shared_private(
+        &mut self,
+        address: UserVa,
+        retained: Option<carrick_personality_linux::sched::RelativeFutexWait>,
+    ) -> Result<bool, LifecycleOutcome> {
+        self.authenticate_shared_futex(address, retained)
+    }
     fn enqueue_thread(
         &mut self,
         record: RecordRef,
