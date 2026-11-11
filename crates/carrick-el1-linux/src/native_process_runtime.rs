@@ -7682,22 +7682,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn fork_owned(&mut self, child_tid: ProcessForkChildTid) -> Result<u32, NativeProcessError> {
         let forked = self.fork_reserved(child_tid);
         // Every path through the birth has released or rolled back its
-        // reservation by now. A sibling's wait that found it held parked on
-        // this process's channel: publish it so that wait reruns (#2095).
-        let contended = self.runtime.graph.lock().birth_waiters.remove(&self.key);
-        if contended {
-            let channel = self
-                .runtime
-                .graph
-                .lock()
+        // reservation by now.
+        self.release_birth_waiters()?;
+        forked
+    }
+    /// A sibling's wait that found this process's birth reservation held
+    /// parked on the process channel (#2095): publish it so that wait reruns.
+    /// Called once the reservation is released or rolled back.
+    fn release_birth_waiters(&mut self) -> Result<(), NativeProcessError> {
+        let channel = {
+            let mut graph = self.runtime.graph.lock();
+            if !graph.birth_waiters.remove(&self.key) {
+                return Ok(());
+            }
+            graph
                 .owner
                 .task(self.key)
                 .ok()
                 .and_then(|row| row.native().resources().channel.clone())
-                .ok_or(NativeProcessError::Quarantined)?;
-            self.publish_channel(&channel)?;
-        }
-        forked
+                .ok_or(NativeProcessError::Quarantined)?
+        };
+        self.publish_channel(&channel)
     }
     #[inline(never)]
     fn fork_reserved(&mut self, child_tid: ProcessForkChildTid) -> Result<u32, NativeProcessError> {

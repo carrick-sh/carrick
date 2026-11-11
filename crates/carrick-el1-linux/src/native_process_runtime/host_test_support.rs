@@ -404,13 +404,16 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn copy_status(
         &mut self,
         _: &Self::Mm,
-        _: UserVa,
+        address: UserVa,
         status: LinuxWaitStatus,
     ) -> Result<(), NativeProcessError> {
         if self.refuse_copy {
             return Err(NativeProcessError::Fault);
         };
         self.copies.push(status);
+        if let Some(hook) = &mut self.on_copy_complete {
+            hook(address);
+        }
         Ok(())
     }
     fn copy_signal_bytes(
@@ -10488,4 +10491,180 @@ fn native_zone_poll_signal_before_enrolment_completes_eintr_and_delivers_once() 
             .is_some(),
         "retiring the adapter token must release the pinned reader description"
     );
+}
+
+/// #2095, consuming arm: the waiter's scan selects an exited child, then a
+/// sibling's birth reserves the process topology while the waiter copies the
+/// child's status, so the reap (`consume_wait`) refuses with `Busy`. Busy
+/// once, then success: the waiter parks on its own channel instead of
+/// returning -EAGAIN, and the birth's release notification reruns it to reap
+/// the child with its exact status.
+#[cfg(test)]
+#[test]
+fn reap_refused_by_sibling_birth_parks_then_reaps() {
+    use carrick_sched_core::Claim;
+    // The sibling thread takes tid 42 before the root forks its child.
+    let process = native_exec_fixture();
+    let sibling = add_service_sibling(&process, None);
+    let capacity: &'static NativeServiceCapacityFixture = Box::leak(Box::new(
+        NativeServiceCapacityFixture::from_fixture(process, 1),
+    ));
+    let fixture = &capacity.fixture;
+    let root_record = fixture.record;
+
+    // The only child exits 5; the root's wait4(-1) wakes to reap it.
+    let (child, child_address, child_words) = capacity.select().unwrap();
+    assert_ne!(child, root_record);
+    // The sibling's host-issued tid shifts this child's task id past its
+    // namespace pid, which `select` assumes equal: publish the namespace pid.
+    let child_namespace_pid = {
+        let key = fixture
+            .registry
+            .state
+            .lock()
+            .members
+            .values()
+            .find(|member| member.record == child)
+            .unwrap()
+            .process;
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(key)
+            .unwrap()
+            .metadata()
+            .namespace_pid
+    };
+    fixture.task.publish_visible_pid(child_namespace_pid);
+    let child_pid = i64::from(child_namespace_pid);
+    let mut child_service = fixture.service();
+    let mut exiting = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            child_address,
+            &child_words,
+            &mut child_service,
+        )
+        .unwrap();
+    assert!(matches!(
+        exiting.exit_group(5),
+        LifecycleOutcome::Transferred { .. }
+    ));
+    drop(exiting);
+
+    // The sibling member, live on its own slot, is the birth owner.
+    let sibling_service: &'static mut Physical<'static> = Box::leak(Box::new(fixture.service()));
+    let sibling_words: &'static ParkedContextWords = Box::leak(Box::new(words(fixture.address)));
+    let sibling_entry: &'static mut _ = Box::leak(Box::new(
+        fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: sibling.slot,
+                },
+                sibling.task,
+                fixture.address,
+                sibling_words,
+                sibling_service,
+            )
+            .unwrap(),
+    ));
+    let sibling_entry: *mut _ = &mut **sibling_entry;
+    let held = std::rc::Rc::new(core::cell::RefCell::new(None));
+    let held_by_copy = held.clone();
+
+    let (root, root_address, root_words) = capacity.select().unwrap();
+    assert_eq!(root, root_record);
+    let mut root_service = fixture.service();
+    root_service.on_copy_complete = Some(Box::new(move |_| {
+        if held_by_copy.borrow().is_none() {
+            // SAFETY: the leaked sibling entry runs on its own slot; this
+            // hook is its only user while the root's entry copies status.
+            let birth = unsafe { &mut *sibling_entry }.fork_reserve().unwrap();
+            *held_by_copy.borrow_mut() = Some(birth);
+        }
+    }));
+    let mut waiter = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            root_address,
+            &root_words,
+            &mut root_service,
+        )
+        .unwrap();
+    let parked = waiter.resume_checkpoint(|_| Ok(None));
+    assert!(
+        matches!(parked, Ok(NativeResume::Left(None))),
+        "a reap refused by a sibling's birth must park, not fail: {:?}",
+        parked.as_ref().map(|resume| match resume {
+            NativeResume::Returned(result) => result.raw(),
+            _ => 0,
+        })
+    );
+    drop(waiter);
+    assert!(held.borrow().is_some(), "the birth held during the reap");
+    assert!(matches!(
+        fixture.zone.record(root.id).claim(),
+        Claim::Parked { .. }
+    ));
+    assert_eq!(root_service.copies, vec![LinuxWaitStatus::exited(5)]);
+
+    // The birth rolls back and publishes its release, as `fork_owned` does.
+    let birth = held.borrow_mut().take().unwrap();
+    assert!(
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .rollback_birth(&birth.permit)
+    );
+    drop(birth);
+    // SAFETY: the hook above has run and released its use of the entry.
+    let sibling_entry = unsafe { &mut *sibling_entry };
+    sibling_entry.release_birth_waiters().unwrap();
+    assert!(!matches!(
+        fixture.zone.record(root.id).claim(),
+        Claim::Parked { .. }
+    ));
+
+    // The woken root reruns its wait and reaps the child.
+    let (again, address, words) = capacity.select().unwrap();
+    assert_eq!(again, root);
+    let mut reap_service = fixture.service();
+    let mut waiter = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            address,
+            &words,
+            &mut reap_service,
+        )
+        .unwrap();
+    match waiter.resume_checkpoint(|_| Ok(None)) {
+        Ok(NativeResume::Returned(result)) => assert_eq!(result.raw(), child_pid),
+        _ => panic!("the released waiter did not reap its child"),
+    }
+    assert_eq!(reap_service.copies, vec![LinuxWaitStatus::exited(5)]);
 }
