@@ -1949,10 +1949,7 @@ fn zone_pipe_poll_wake_with_affinity(flags: &[&str], affinity: u64) {
     let elf = native_exit_fixture_with_flags("native_pipe_poll_wake.S", flags);
     let dir = tempfile::tempdir().expect("oracle directory");
     let oracle = dir.path().join("oracle");
-    std::fs::write(&oracle, &elf).expect("native oracle ELF");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o700))
-        .expect("executable oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
     let native = std::process::Command::new("timeout")
         .arg("10")
         .arg(&oracle)
@@ -2100,10 +2097,7 @@ fn private_file_fixture_with(cow: bool, scenario: &[&str], open_flags: u64) {
     }
     let elf = native_exit_fixture_with_flags("native_private_file.S", &oracle_flags);
     let oracle = dir.path().join("oracle");
-    std::fs::write(&oracle, &elf).expect("native oracle ELF");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o700))
-        .expect("executable oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
     let native = std::process::Command::new("timeout")
         .arg("10")
         .arg(&oracle)
@@ -2259,10 +2253,7 @@ fn loader_reopen_with_publication(contended: bool) {
     let define = format!("-DFILE_PATH=\"{}\"", path.display());
     let elf = native_exit_fixture_with_flags("native_loader_reopen.S", &[&define]);
     let oracle = dir.path().join("oracle");
-    std::fs::write(&oracle, &elf).expect("native oracle ELF");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o700))
-        .expect("executable oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
     let native = std::process::Command::new("timeout")
         .arg("10")
         .arg(&oracle)

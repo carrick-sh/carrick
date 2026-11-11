@@ -5,7 +5,7 @@ mod cargo_env;
 
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -182,8 +182,10 @@ fn unavailable_explicit_sccache_runs_real_cargo_recipe_with_one_notice() {
 impl Build {
     fn wrapper(&self, path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "#!/bin/sh\nprintf 'wrapped\\n' >> \"$CACHE_WITNESS_TRACE\"\nif [ \"$1\" = --show-stats ]; then printf 'cache statistics witness\\n'; exit 0; fi\nexec \"$@\"\n").unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        carrick_test_support::executable::write_executable(
+            path,
+            "#!/bin/sh\nprintf 'wrapped\\n' >> \"$CACHE_WITNESS_TRACE\"\nif [ \"$1\" = --show-stats ]; then printf 'cache statistics witness\\n'; exit 0; fi\nexec \"$@\"\n",
+        );
     }
 
     fn trace(&self) -> PathBuf {
@@ -448,12 +450,10 @@ fn signed_gate_recipes_remove_ambient_target_overrides() {
     let build = Build::new();
     symlink(find("env"), build.root.path().join("bin/env")).unwrap();
     let runner = build.root.path().join("scripts/test-signed.sh");
-    fs::write(
+    carrick_test_support::executable::write_executable(
         &runner,
         "#!/bin/sh\ntest \"${CARRICK_TEST_TARGET+x}\" != x\n",
-    )
-    .unwrap();
-    fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     for recipe in [
         "test-embed",
         "test-hvf",
@@ -483,8 +483,10 @@ fn artifact_serves_admission_and_direct_xtask_calls_without_cargo_bootstrap() {
     symlink(find("bash"), build.root.path().join("bin/bash")).unwrap();
     let artifact = build.root.path().join("xtask artifact");
     let log = build.root.path().join("calls");
-    fs::write(&artifact, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$XTASK_LOG\"\nif [ \"$1\" = worktree-run ]; then shift 2; exec \"$@\"; fi\n").unwrap();
-    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::executable::write_executable(
+        &artifact,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$XTASK_LOG\"\nif [ \"$1\" = worktree-run ]; then shift 2; exec \"$@\"; fi\n",
+    );
     for (recipe, args) in [
         ("ci-prebuild-xtask", vec![]),
         ("xtask", vec!["authority-debt"]),
@@ -549,7 +551,11 @@ fn real_artifact_admission_uses_the_shared_package_environment_scrub() {
     );
     symlink(git, build.root.path().join("bin/git")).unwrap();
     let artifact = build.root.path().join("real xtask artifact");
-    fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &artifact).unwrap();
+    carrick_test_support::executable::copy_executable(
+        env!("CARGO_BIN_EXE_carrick-xtask"),
+        &artifact,
+        0o755,
+    );
     let justfile = build.root.path().join("justfile");
     let mut recipes = fs::read_to_string(&justfile).unwrap();
     recipes.push_str(r#"
@@ -598,7 +604,7 @@ fn clippy_recipes_keep_production_features_and_fail_closed_on_discovery() {
     }
     let cargo = build.root.path().join("bin/cargo");
     fs::remove_file(&cargo).unwrap();
-    fs::write(
+    carrick_test_support::executable::write_executable(
         &cargo,
         r#"#!/bin/sh
 while [ "$#" -gt 0 ]; do
@@ -621,16 +627,12 @@ case "$1" in
  *) echo "unexpected cargo invocation: $*" >&2; exit 97 ;;
 esac
 "#,
-    )
-    .unwrap();
-    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let artifact = build.root.path().join("xtask artifact");
-    fs::write(
+    carrick_test_support::executable::write_executable(
         &artifact,
         "#!/bin/sh\nif [ \"$1\" = worktree-run ]; then shift 2; exec \"$@\"; fi\nexit 98\n",
-    )
-    .unwrap();
-    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let log = build.root.path().join("clippy.log");
     let run = |mode| {
         build
@@ -677,12 +679,10 @@ esac
 fn recipes_inherit_offline_only_after_cache_preparation() {
     let dir = tempfile::tempdir().unwrap();
     let cargo = dir.path().join("cargo");
-    fs::write(
+    carrick_test_support::executable::write_executable(
         &cargo,
         "#!/bin/sh\nprintf '%s\\n' \"${CARGO_NET_OFFLINE-unset}\" \"$@\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/build-env.sh");
     for prepared in [false, true] {
         let mut command = Command::new(find("sh"));

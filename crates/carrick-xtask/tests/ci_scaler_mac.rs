@@ -152,8 +152,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, u32) {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let exe = root.path().join("xtask");
-    std::fs::write(&exe, "#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::executable::write_executable(&exe, "#!/bin/sh\n");
     let state_root = root.path().join("run");
     std::fs::create_dir(&state_root).unwrap();
     std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -660,6 +659,7 @@ fn exempt_agents_are_real_root_owned_apple_paths_with_launchd_parent() {
     std::os::unix::fs::symlink(&real, &alias).unwrap();
     assert!(!exempt_agent(Some(&alias), 1, &[alias.to_str().unwrap()]));
     let copy = dir.path().join("distnoted");
+    // nosemgrep: carrick-test-executable-write-then-exec -- inspected, never executed
     std::fs::copy(&real, &copy).unwrap();
     let copy_text = copy.to_str().unwrap();
     if unsafe { libc::geteuid() } != 0 {

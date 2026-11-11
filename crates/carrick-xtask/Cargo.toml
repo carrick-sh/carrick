@@ -50,3 +50,5 @@ carrick-portable = { path = "../carrick-portable" }
 [dev-dependencies]
 # The sysroot test imports the EL1 image build script and its ABI image limit.
 carrick-el1-abi = { path = "../carrick-el1-abi" }
+# Tests write executables through its race-free helper (#1814).
+carrick-test-support = { path = "../carrick-test-support" }

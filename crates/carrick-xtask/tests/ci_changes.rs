@@ -558,10 +558,7 @@ fn draft_pr_runs_cheap_linux_checks_and_its_ci_ok_cannot_land() {
 fn write_mock_gh(bin_dir: &Path, body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
     let gh_path = bin_dir.join("gh");
-    fs::write(&gh_path, body).expect("write mock gh");
-    let mut perms = fs::metadata(&gh_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&gh_path, perms).unwrap();
+    carrick_test_support::executable::write_executable(&gh_path, body);
     let old_path = std::env::var("PATH").unwrap_or_default();
     format!("{}:{old_path}", bin_dir.display())
 }
@@ -1094,12 +1091,10 @@ fn a_superseded_cancelled_run_passes_ci_ok_and_any_other_cancel_stays_red() {
     // recipe's own filter: `actions/runs/<id>` reads this run's fixture,
     // anything else the runs list.
     let gh = dir.path().join("gh");
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &gh,
         "#!/bin/sh\nfile=\"$FAKE_RUNS\"\ncase \"$2\" in */actions/runs/[0-9]*) file=\"$FAKE_SELF\";; esac\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --jq ]; then shift; exec jq -r \"$1\" \"$file\"; fi; shift; done\nexit 1\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    );
     // `at` is the minute after 03:00 at which a run's latest attempt began.
     let run = |id: u64, conclusion: Option<&str>, at: u32| {
         serde_json::json!({"id": id, "event": "pull_request", "conclusion": conclusion,

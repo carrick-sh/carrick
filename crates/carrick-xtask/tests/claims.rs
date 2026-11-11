@@ -252,12 +252,10 @@ fn concurrent_acquires_have_exactly_one_winner() {
 }
 
 fn install_pre_push_hook(client_dir: &Path, script: &str) {
-    use std::os::unix::fs::PermissionsExt;
     let hooks = client_dir.join(".git/hooks");
     std::fs::create_dir_all(&hooks).unwrap();
     let hook = hooks.join("pre-push");
-    std::fs::write(&hook, script).unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::executable::write_executable(&hook, script);
 }
 
 #[test]
@@ -655,7 +653,6 @@ fn lease_ttl_beyond_policy_cap_is_refused_and_corrupt_refs_are_skipped_by_heads_
 
 #[test]
 fn sorted_hot_lock_failure_rolls_back_only_our_locks() {
-    use std::os::unix::fs::PermissionsExt;
     let remote = Remote::new();
     let bare = remote.bare_dir();
     git(&bare, &["config", "core.logAllRefUpdates", "always"]);
@@ -688,12 +685,10 @@ fn sorted_hot_lock_failure_rolls_back_only_our_locks() {
     // aborts the entire transaction so the first ref (`refs/claims/hot/a`) is
     // never created on the remote.
     let update_hook = bare.join("hooks/update");
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &update_hook,
         "#!/bin/sh\nset -eu\nif [ \"$1\" = \"refs/claims/hot/z2\" ]; then exit 1; fi\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&update_hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let out2 = remote
         .command(0)
         .args(["acquire", ISSUE, "--lease"])
@@ -715,19 +710,16 @@ fn sorted_hot_lock_failure_rolls_back_only_our_locks() {
 #[test]
 fn repo_pre_push_hook_skips_claims_only_and_runs_on_branch_or_mixed_pushes() {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     let hook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.githooks/pre-push");
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let log = dir.path().join("just.log");
     let fake_just = bin.join("just");
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &fake_just,
         format!("#!/bin/sh\necho \"$*\" >> \"{}\"\nexit 42\n", log.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_just, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let path_env = std::env::join_paths(
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )

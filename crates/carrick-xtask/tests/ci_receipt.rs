@@ -335,15 +335,13 @@ mod serial_host {
 
     #[test]
     fn parent_receipt_is_used_and_missing_parent_is_visible_without_ancestor_fallback() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let fake_gh = bin.join("gh");
-        std::fs::write(
-        &fake_gh,
-        r#"#!/usr/bin/env python3
+        carrick_test_support::executable::write_executable(
+            &fake_gh,
+            r#"#!/usr/bin/env python3
 import json, os, pathlib, shutil, sys
 main, head, middle = (os.environ[k] for k in ('CHAIN_MAIN', 'CHAIN_HEAD', 'CHAIN_MIDDLE'))
 args = sys.argv[1:]
@@ -373,11 +371,7 @@ elif args[:2] == ['run', 'download']:
 else:
     raise SystemExit(f'unexpected gh invocation: {args}')
 "#,
-    )
-    .unwrap();
-        let mut permissions = std::fs::metadata(&fake_gh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_gh, permissions).unwrap();
+        );
 
         let main = "a".repeat(40);
         let head = "b".repeat(40);
@@ -2003,14 +1997,13 @@ mod ancestor_selection {
         records: &[serde_json::Value],
         wait_minutes: u64,
     ) -> (std::process::Output, String, String) {
-        use std::os::unix::fs::PermissionsExt;
         let fixture = h.dir.path().join("api.json");
         std::fs::write(&fixture, serde_json::to_vec(records).unwrap()).unwrap();
         std::fs::write(fixture.with_extension("state"), "{}").unwrap();
         let bin = h.dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let gh = bin.join("gh");
-        std::fs::write(
+        carrick_test_support::executable::write_executable(
             &gh,
             r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
@@ -2036,9 +2029,7 @@ elif '/artifacts?' in endpoint:
 else:
     raise SystemExit('unexpected gh request')
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let summary = h.dir.path().join("summary.md");
         let output_file = h.dir.path().join("outputs.txt");
         std::fs::write(&summary, "").unwrap();
@@ -2234,8 +2225,6 @@ else:
 
     #[test]
     fn serial_host_pr_and_merge_group_el1_native_gate_refuses_new_failure_against_receipted_main() {
-        use std::os::unix::fs::PermissionsExt;
-
         let ci_yaml = prelanding_workflow();
         let ci_docs = yaml_rust2::YamlLoader::load_from_str(&ci_yaml).unwrap();
         let gate_steps = ci_docs[0]["jobs"]["el1-native-gate"]["steps"]
@@ -2513,7 +2502,7 @@ else:
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let gh = bin.join("gh");
-        std::fs::write(
+        carrick_test_support::executable::write_executable(
             &gh,
             r#"#!/usr/bin/env python3
 import json, os, pathlib, shutil, sys
@@ -2535,9 +2524,7 @@ elif "/artifacts?" in endpoint:
 else:
     raise SystemExit(f"unexpected gh invocation: {args}")
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
 
         // Select baseline via both `--before-sha` (workflow rollout compatibility)
@@ -3367,7 +3354,6 @@ fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
 
 #[test]
 fn kvm_workflow_rejects_zero_execution_but_preserves_named_failures() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let workflow = ".github/workflows/kernel-runtime.yml";
@@ -3403,8 +3389,10 @@ fn kvm_workflow_rejects_zero_execution_but_preserves_named_failures() {
     let bin = root.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let just = bin.join("just");
-    std::fs::write(&just, "#!/bin/sh\nif [ \"$1\" = accept ]; then\n  cp \"$SOURCE_RECEIPT\" target/ci-receipts/receipt.json\n  exit 101\nfi\nif [ \"$1\" = xtask ]; then\n  shift\n  exec \"$XTASK\" \"$@\"\nfi\nexit 99\n").unwrap();
-    std::fs::set_permissions(&just, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::executable::write_executable(
+        &just,
+        "#!/bin/sh\nif [ \"$1\" = accept ]; then\n  cp \"$SOURCE_RECEIPT\" target/ci-receipts/receipt.json\n  exit 101\nfi\nif [ \"$1\" = xtask ]; then\n  shift\n  exec \"$XTASK\" \"$@\"\nfi\nexit 99\n",
+    );
     let path = std::env::join_paths(
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )

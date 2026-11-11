@@ -31,6 +31,7 @@ toml.workspace = true
 [dev-dependencies]
 carrick-vmm-kvm = { path = ".", features = ["test-fixtures"] }
 carrick-vfs = { path = "../carrick-vfs" }
+carrick-test-support = { path = "../carrick-test-support" }
 carrick-x86-cpl0-host = { path = "../carrick-x86-cpl0-host", features = ["test-support"] }
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
 carrick-xtask = { path = "../carrick-xtask" }

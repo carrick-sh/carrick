@@ -447,7 +447,6 @@ fn el1_files_exit_group_stress() {
 /// neither task exits or writes a reply before the leader closes the group.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_terminal_guest() -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
     let code: &[u32] = &[
         0xd10083ff, // sub sp, sp, #32
         0x910003f3, // mov x19, sp
@@ -519,8 +518,7 @@ fn native_terminal_guest() -> tempfile::TempDir {
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("native-terminal");
-    std::fs::write(&path, elf).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::executable::write_executable(&path, elf);
     dir
 }
 
