@@ -2550,3 +2550,48 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
     );
     assert_eq!(after_unmask.elr, 0x40_0200);
 }
+
+/// Out of scope stays as it was: a HostOnly page (seccomp/ptrace authority)
+/// has no Reserved entry, so its claim also reports an empty pool, but the
+/// host will never stock it. Its clone stays host-issued at once, with no
+/// carrier round trip and no stock demand.
+#[test]
+fn arm_host_only_empty_pool_clone_stays_host_issued() {
+    let mut h = setup_arm_root_two_live_threads_and_peer();
+    let f = h.env.fixture;
+    carrick_el1_abi::Lifecycle::decline_to_host(f.page);
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::gate(f.page),
+        carrick_el1_abi::GateState::HostOnly
+    );
+    let root_record = f.zone.slot(SlotId::new(0)).current().unwrap();
+    let counters = carrick_el1_abi::Counters::new();
+    let (route, _, _) = h.env.clone_thread(
+        SlotId::new(0),
+        f.page,
+        f.control,
+        &counters,
+        &mut h.root_cpu,
+    );
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "a HostOnly clone is the host's"
+    );
+    assert_eq!(
+        f.zone.slot(SlotId::new(0)).current(),
+        Some(root_record),
+        "no wait: the caller keeps its lease"
+    );
+    assert!(
+        h.env.tasks[0]
+            .linux
+            .take_host_work_doorbell()
+            .is_none_or(|doorbell| {
+                let demand = doorbell.thread_stock_demand();
+                doorbell.settled();
+                !demand
+            }),
+        "no stock demand for a page the host never stocks"
+    );
+}
