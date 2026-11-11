@@ -995,6 +995,17 @@ pub struct SignalFrameParams {
     pub mask: carrick_signal_core::policy::SigBlockMask,
 }
 
+/// Outcome of attempting to write a signal handler frame onto the user stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalFrameSetup {
+    /// Frame bytes and handler entry state are published at this stack pointer.
+    Installed(carrick_guest_arch::UserVa),
+    /// User-stack write could not proceed yet due to address-space or service
+    /// contention; machine registers were left untouched so the caller can park
+    /// and rebuild after the holder releases.
+    NotYet(carrick_core::user_copy::GuestCopyRequest),
+}
+
 pub trait SignalBackend: carrick_guest_arch::ArchTypes {
     fn setup_signal_frame<'a>(
         &mut self,
@@ -1002,8 +1013,11 @@ pub trait SignalBackend: carrick_guest_arch::ArchTypes {
         params: SignalFrameParams,
         siginfo: Option<&'a [u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(carrick_guest_arch::UserVa, &[u8]) -> bool,
-    ) -> Result<carrick_guest_arch::UserVa, Self::Error>;
+        copy_out: &mut dyn FnMut(
+            carrick_guest_arch::UserVa,
+            &[u8],
+        ) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<SignalFrameSetup, Self::Error>;
 
     fn restore_signal_frame(
         &mut self,

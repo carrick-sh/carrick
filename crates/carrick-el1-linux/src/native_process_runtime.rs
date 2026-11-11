@@ -722,6 +722,17 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         self.copy_signal_bytes(mm, address, bytes)
     }
+    /// Exact-MM signal-frame output for retained handler-setup continuations.
+    fn copy_signal_frame_bytes(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        self.copy_signal_bytes(mm, address, bytes)
+    }
+    /// Hook invoked once an owner-wait suspension has enrolled and parked.
+    fn note_owner_wait_parked(&mut self) {}
     fn prepare_owned_write(
         &mut self,
         _mm: &Self::Mm,
@@ -984,6 +995,53 @@ impl<C: ProcessContext> Drop for InterruptedChildWait<C> {
     }
 }
 
+/// A dequeued signal handler continuation retained on the exact member record
+/// while its stack frame write waits on address-space contention (#2070).
+pub(crate) struct PendingSignalDelivery {
+    expected_host: carrick_core::terminal::ThreadBirthIdentity,
+    pub(crate) sig: carrick_signal_core::policy::Signal,
+    pub(crate) info: Option<carrick_syscall_abi::LinuxSiginfo>,
+    pub(crate) action: carrick_signal_core::policy::Action,
+    pub(crate) saved_mask: carrick_signal_core::policy::SigBlockMask,
+    pub(crate) thread_blocked: carrick_signal_core::policy::SigBlockMask,
+}
+impl PendingSignalDelivery {
+    pub(crate) fn new(
+        expected_host: carrick_core::terminal::ThreadBirthIdentity,
+        sig: carrick_signal_core::policy::Signal,
+        info: Option<carrick_syscall_abi::LinuxSiginfo>,
+        action: carrick_signal_core::policy::Action,
+        saved_mask: carrick_signal_core::policy::SigBlockMask,
+        thread_blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Self {
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
+        Self {
+            expected_host,
+            sig,
+            info,
+            action,
+            saved_mask,
+            thread_blocked,
+        }
+    }
+}
+impl Drop for PendingSignalDelivery {
+    fn drop(&mut self) {
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
+    }
+}
+
+pub(crate) enum SignalCopyDeferral {
+    Portal(carrick_core_abi::PortalOwnerWait),
+    Service,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignalDeferOutcome {
+    Suspended,
+    ReadyToRebuild,
+}
+
 /// One record's retained private-mapping byte sources: the one its next
 /// exact `mmap` retry consumes, and any it will not (a reply replaced before
 /// its retry, or one whose retry changed its arguments), which that retry
@@ -1030,6 +1088,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     mm: M,
     address: AddressContext<RootGpa>,
     interrupted_child_waits: BTreeMap<RecordRef, InterruptedChildWait<C>>,
+    pending_signal_deliveries: BTreeMap<RecordRef, Box<PendingSignalDelivery>>,
     /// Private file byte sources the host-file venue retained for one
     /// record's `mmap`, consumed by that record's next delegated mmap.
     map_stash: BTreeMap<RecordRef, MapStash>,
@@ -1847,6 +1906,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 carrick_signal_core::wait::clear_non_interrupting_for(key.task.id().raw());
                 let resources = row.native_mut().resources_mut();
                 resources.interrupted_child_waits.remove(record);
+                resources.pending_signal_deliveries.remove(record);
                 // A thread that died between the venue's reply and its retry:
                 // its sources stay in the carrier until the MM is torn down.
                 resources.map_stash.remove(record);
@@ -2178,6 +2238,21 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             resources.interrupted_child_waits.remove(&old_record);
             resources.map_stash.remove(&old_record);
         }
+        if old_record != reference {
+            if let Some(pending) = resources.pending_signal_deliveries.remove(&old_record)
+                && pending.expected_host == host_identity
+            {
+                resources
+                    .pending_signal_deliveries
+                    .insert(reference, pending);
+            }
+        } else if resources
+            .pending_signal_deliveries
+            .get(&old_record)
+            .is_some_and(|pending| pending.expected_host != host_identity)
+        {
+            resources.pending_signal_deliveries.remove(&old_record);
+        }
         if old_record != reference
             && let Some(projection) = &resources.members[member_index].signal_projection
         {
@@ -2312,6 +2387,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .native()
                 .resources()
                 .interrupted_child_waits
+                .contains_key(&record)
+            || row
+                .native()
+                .resources()
+                .pending_signal_deliveries
                 .contains_key(&record)
             || member.control.forwarded_wait_mask_armed()
         {
@@ -2923,6 +3003,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 if replaced {
                     let resources = row.native_mut().resources_mut();
                     resources.interrupted_child_waits.remove(&old_record);
+                    resources.pending_signal_deliveries.remove(&old_record);
                     resources.map_stash.remove(&old_record);
                 }
             } else if let Some((retained, pending)) = prepared_member {
@@ -3951,6 +4032,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             mm,
             address,
             interrupted_child_waits: BTreeMap::new(),
+            pending_signal_deliveries: BTreeMap::new(),
             map_stash: BTreeMap::new(),
             pending_child_tid: None,
             signals,
@@ -4654,6 +4736,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                 .resources()
                 .interrupted_child_waits
                 .contains_key(&self.record)
+            || row
+                .native()
+                .resources()
+                .pending_signal_deliveries
+                .contains_key(&self.record)
         {
             return true;
         }
@@ -5306,12 +5393,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .resources()
             .mm
             .clone();
-        self.service
-            .copy_signal_bytes(&mm, address, bytes)
-            .map_err(|error| match error {
-                NativeProcessError::OwnerWait(_) => NativeProcessError::Fault,
-                other => other,
-            })
+        self.service.copy_signal_frame_bytes(&mm, address, bytes)
     }
     #[inline(never)]
     fn suspend_adapter_operation(
@@ -6726,6 +6808,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if first_close {
                 let resources = row.native_mut().resources_mut();
                 resources.interrupted_child_waits.clear();
+                resources.pending_signal_deliveries.clear();
                 resources.map_stash.clear();
                 let admission = match &operation {
                     PendingCloseOperation::Exit { .. } => {
@@ -7988,6 +8071,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             mm: self.service.prepared_mm(&prepared),
             address,
             interrupted_child_waits: BTreeMap::new(),
+            pending_signal_deliveries: BTreeMap::new(),
             map_stash: BTreeMap::new(),
             pending_child_tid: child_tid.set.then_some(child_tid.address),
             signals,
@@ -9009,10 +9093,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
             });
             for record in &retired {
-                task.native_mut()
-                    .resources_mut()
-                    .interrupted_child_waits
-                    .remove(record);
+                let resources = task.native_mut().resources_mut();
+                resources.interrupted_child_waits.remove(record);
+                resources.pending_signal_deliveries.remove(record);
             }
         }
         drop(graph);
