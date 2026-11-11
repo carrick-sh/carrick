@@ -2426,6 +2426,66 @@ fn loader_reopen_with_publication(contended: bool) {
     assert!(witness.guest_refusal_families.is_empty());
 }
 
+/// #1714: glibc's dynamic loader as the run root, on the production CPL0
+/// path. The root opens a library in its ring namespace, then reads, preads,
+/// seeks, `fstat`s (x86's 144-byte record) and `AT_EMPTY_PATH`-stats that
+/// descriptor there, reports through `writev`, and narrows a page of its own
+/// ELF image with the RELRO `mprotect`. Before the fix every descriptor call
+/// went to the host table (EBADF, exit 11), `writev` and the image
+/// `mprotect` were counted ENOSYS (exit 18, 19), and every staged output came
+/// back EFAULT.
+#[test]
+fn serial_host_root_loader_reads_stats_and_protects_through_the_ring() {
+    let dir = tempfile::tempdir().expect("loader file directory");
+    let path = dir.path().join("library");
+    std::fs::write(&path, b"loader library").expect("loader source file");
+    let define = format!("-DFILE_PATH=\"{}\"", path.display());
+    let elf = native_exit_fixture_with_flags("native_root_loader_io.S", &[&define]);
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("bounded native loader control");
+    assert!(native.status.success(), "native result: {native:?}");
+    assert_eq!(native.stdout, b"wv-ok\n");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        128,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .expect("production loader runtime");
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let refused: Vec<(usize, u64)> = counters
+        .refused
+        .iter()
+        .enumerate()
+        .map(|(nr, counter)| (nr, counter.load(std::sync::atomic::Ordering::Acquire)))
+        .filter(|(_, count)| *count != 0)
+        .collect();
+    assert_eq!(
+        (outcome.run.exit_code, refused.as_slice()),
+        (0, &[][..]),
+        "exit is the failed step (11 read, 15/16 fstat, 17 newfstatat, 18 writev, \
+         19 mprotect); refusals are (x86 nr, count): {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.stdout, native.stdout);
+    assert!(!outcome.run.trap_limit_hit);
+}
+
 /// Run `test` in a separate `timeout`-bounded process: a parked guest need
 /// not consume the pool's exit budget, so a lost wake must not hang CI.
 fn bounded_witness(test: &str, witness: impl FnOnce()) {
