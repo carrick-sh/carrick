@@ -663,6 +663,7 @@ name = "carrick-syscall-abi"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
+ "carrick-guest-arch",
  "serde",
  "zerocopy",
 ]
