@@ -321,6 +321,10 @@ struct TestStockCrossing {
     settlements_aborted: AtomicUsize,
     reserved_custody_rows: AtomicUsize,
     refuse_reserve: std::sync::Mutex<Option<ForkStockRefusal>>,
+    /// Runs once inside the next fork's stock loan crossing: the forking
+    /// caller still holds its birth reservation, as a real vCPU's synchronous
+    /// crossing does while sibling vCPUs keep running.
+    on_loan: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     commit_fault: std::sync::Mutex<CommitFault>,
     pending_loan: std::sync::Mutex<Option<ForkStockLoan>>,
@@ -411,6 +415,7 @@ impl TestStockCrossing {
             settlements_aborted: AtomicUsize::new(0),
             reserved_custody_rows: AtomicUsize::new(0),
             refuse_reserve: std::sync::Mutex::new(None),
+            on_loan: std::sync::Mutex::new(None),
             #[cfg(test)]
             commit_fault: std::sync::Mutex::new(CommitFault::None),
             pending_loan: std::sync::Mutex::new(None),
@@ -628,6 +633,10 @@ impl ForkStockCrossing for TestStockCrossing {
         let tag = unsafe { *(record_gpa as *const u64) };
         match ForkStockKind::decode(tag) {
             Some(ForkStockKind::Loan) => {
+                let on_loan = self.on_loan.lock().unwrap().take();
+                if let Some(hook) = on_loan {
+                    hook();
+                }
                 let loans = self.loans_requested.fetch_add(1, Ordering::AcqRel) + 1;
                 let exchange = unsafe { &mut *(record_gpa as *mut ForkStockExchange) };
                 let req = exchange.request().ok_or(NativeProcessError::Invalid)?;
