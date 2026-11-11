@@ -4973,3 +4973,83 @@ fn unhoming_a_native_root_cannot_cancel_carrier_deadline_custody() {
     );
     assert_eq!(zone.timer_node_count(), 0);
 }
+
+#[test]
+fn native_handback_without_an_allowed_driver_stays_host_owned() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    zone.leave_guest(OTHER, &HostWait);
+    assert!(zone.leave_slot(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    for last in [None, Some(SLOT), Some(OTHER)] {
+        let (record, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
+        let reference = zone.record_ref(record);
+        zone.record(record).native_owned.store(1, Ordering::Release);
+        zone.record(record)
+            .last_slot
+            .store(last.map_or(0, SlotId::plus_one), Ordering::Relaxed);
+        wake_effects(&zone, 0x4000, 1, SLOT);
+        zone.take_completion_handbacks(&HostWait, &mut |_| {});
+        assert_eq!(
+            zone.place_native_handback(reference),
+            None,
+            "no admitted native slot"
+        );
+        assert_eq!(zone.record(record).claim(), Claim::Host { seq });
+        assert_eq!(zone.slot(SLOT).queued(), 0);
+        assert_eq!(zone.slot(OTHER).queued(), 0);
+        zone.free_record(record);
+    }
+}
+
+#[test]
+fn claim_for_el1_busy_once_then_success() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let (record, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
+    let held = zone.slot_lock(OTHER, &HostWait).unwrap();
+    let mut effects = WakeEffects::default();
+    assert!(!zone.claim_for_el1_with_wait((record, seq, 0), SLOT, &mut effects, || {}, true));
+    assert_eq!(zone.record(record).claim(), Claim::Parked { seq });
+    drop(held);
+    assert!(zone.claim_for_el1_with_wait((record, seq, 0), SLOT, &mut effects, || {}, true));
+    assert_eq!(
+        zone.record(record).claim(),
+        Claim::Queued { slot: OTHER, seq }
+    );
+}
+
+#[test]
+fn a_left_first_candidate_falls_back_to_a_driven_peer() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    enter(&zone, THIRD, 1);
+    zone.leave_guest(OTHER, &HostWait);
+    zone.leave_guest(THIRD, &HostWait);
+    let (record, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
+    zone.record(record)
+        .last_slot
+        .store(OTHER.plus_one(), Ordering::Relaxed);
+    let held = zone.slot_lock(OTHER, &HostWait).unwrap();
+    let bucket = ZoneTables::bucket_of(MM, 0x4000);
+    let (woken, _) = std::thread::scope(|scope| {
+        let waker = scope.spawn(|| wake_effects(&zone, 0x4000, 1, SLOT));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while zone.lock(bucket, &BoundedSpin(0)).is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        zone.slot(OTHER).drive.store(0, Ordering::Release);
+        drop(held);
+        waker.join().unwrap()
+    });
+    assert_eq!(woken, [record]);
+    assert_eq!(
+        zone.record(record).claim(),
+        Claim::Queued { slot: THIRD, seq },
+        "second driven allowed candidate"
+    );
+}
