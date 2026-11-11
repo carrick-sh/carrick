@@ -315,6 +315,11 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
         None
     }
     fn retain_relative_futex_wait(&mut self, _operation: crate::sched::RelativeFutexWait) {}
+    /// A syscall entry begins. Answers retained for the rerun of this
+    /// thread's last call (the carrier's thread-stock reply, #1974) belong
+    /// to exactly this entry: whatever syscall it is, no later entry sees
+    /// them.
+    fn scope_rerun_answers_to_entry(&mut self) {}
     /// Prepare an unavailable input and retain its exact syscall until ready.
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
     /// Observe preparation without changing continuation ownership or policy.
@@ -459,8 +464,6 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     fn await_unmanaged_thread_stock(&mut self) -> Option<LifecycleOutcome> {
         None
     }
-    /// The unmanaged clone claimed a pool entry: its stock demand is settled.
-    fn unmanaged_thread_stock_claimed(&mut self) {}
     fn retire_thread_verdict(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}
     fn route_host_thread_exit(
         &mut self,
@@ -593,7 +596,6 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn await_unmanaged_thread_stock(&mut self) -> Option<LifecycleOutcome> {
         None
     }
-    fn unmanaged_thread_stock_claimed(&mut self) {}
 
     fn arguments(&self) -> [u64; 6];
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa;
@@ -1310,12 +1312,7 @@ fn serve_clone<'a>(
     };
     let claimed = loop {
         match page.claim_any() {
-            Ok(claimed) => {
-                if !managed {
-                    native.unmanaged_thread_stock_claimed();
-                }
-                break claimed;
-            }
+            Ok(claimed) => break claimed,
             Err(TransitionError::GateClosed(_)) => {
                 // A speculative claim may have been observed by an exit before
                 // the gate check backed it out. That rollback also owes a wake.
