@@ -614,10 +614,24 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
         SignalFrameWaitMode::BusyOnceParksThenDelivers => None,
     };
 
-    let refused_once = core::cell::Cell::new(false);
+    // A released-before-probe holder is refused on every attempt until
+    // `RELEASED_REFUSALS` are spent: a checkpoint that rebuilt in place would
+    // spend them all inside one lease.
+    const RELEASED_REFUSALS: usize = 64;
+    let refusals_left = std::rc::Rc::new(core::cell::Cell::new(match mode {
+        SignalFrameWaitMode::OwnerWaitReleasedBeforeProbe => RELEASED_REFUSALS,
+        _ => 1,
+    }));
+    let frame_copy_attempts = std::rc::Rc::new(core::cell::Cell::new(0usize));
     crate::aarch64_process::TEST_OWNER_ACCESS.with(|hook| {
+        let refusals_left = refusals_left.clone();
+        let frame_copy_attempts = frame_copy_attempts.clone();
         *hook.borrow_mut() = Some(Box::new(move |_, _, _, bytes, _| {
-            if bytes.is_some() && !refused_once.replace(true) {
+            if bytes.is_some() {
+                frame_copy_attempts.set(frame_copy_attempts.get() + 1);
+            }
+            if bytes.is_some() && refusals_left.get() > 0 {
+                refusals_left.set(refusals_left.get() - 1);
                 return Some(Err(match mode {
                     SignalFrameWaitMode::OwnerWaitParksThenDelivers
                     | SignalFrameWaitMode::OwnerWaitReleasedBeforeProbe => {
@@ -682,11 +696,70 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
     let first_action = run_checkpoint(&mut service, &mut frame);
     match mode {
         SignalFrameWaitMode::OwnerWaitReleasedBeforeProbe => {
+            // Each checkpoint makes one frame-copy attempt, then returns its
+            // owned continuation and releases the lease; the released holder
+            // resumes through normal re-entry, never an in-place rebuild.
+            let mut action = first_action;
+            let mut checkpoints = 1;
             assert_eq!(
-                first_action,
-                carrick_el1_abi::Action::Served,
-                "post-enrolment probe must deliver inline when holder already released (got elr={:#x})",
-                frame.elr
+                frame_copy_attempts.get(),
+                1,
+                "the first checkpoint lease made more than one frame-copy attempt"
+            );
+            while action != carrick_el1_abi::Action::Served {
+                assert_eq!(
+                    action,
+                    carrick_el1_abi::Action::Idle,
+                    "released holder must park the checkpoint (elr={:#x})",
+                    frame.elr
+                );
+                assert_eq!(
+                    frame_copy_attempts.get(),
+                    checkpoints,
+                    "one checkpoint lease made more than one frame-copy attempt"
+                );
+                assert!(
+                    fixture.zone.slot(fixture.slot).current().is_none(),
+                    "a released-holder wait must release the vCPU execution lease"
+                );
+                assert_eq!(
+                    fixture.zone.runnable_head(fixture.slot),
+                    Some(owner_record),
+                    "the checkpoint must re-enter through the scheduler"
+                );
+                assert!(checkpoints <= RELEASED_REFUSALS, "re-entry never converged");
+                let counters = carrick_el1_abi::Counters::new();
+                let mut cpu = ResumeCpu {
+                    inner: crate::sched::FakeCpu {
+                        ttbr: (ttbr0, ttbr0),
+                        ..Default::default()
+                    },
+                    runtime: &runtime,
+                    registry: registry(),
+                    source,
+                    task,
+                    service: &mut service,
+                };
+                assert_eq!(
+                    (Sched {
+                        handoff: None,
+                        zone: fixture.zone,
+                        slot: fixture.slot,
+                        task,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                        counters: &counters,
+                    })
+                    .run_next(&mut frame, 0),
+                    Served::Returned { switched: true }
+                );
+                action = run_checkpoint(&mut service, &mut frame);
+                checkpoints += 1;
+            }
+            assert_eq!(
+                frame_copy_attempts.get(),
+                RELEASED_REFUSALS + 1,
+                "every refusal costs exactly one attempt in its own lease"
             );
         }
         SignalFrameWaitMode::OwnerWaitParksThenDelivers => {
