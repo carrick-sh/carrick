@@ -11036,6 +11036,107 @@ mod tests {
         scheduler.close();
     }
 
+    /// #2020: the terminal owner retires the task from the live graph
+    /// before it records the ProcessExit lifecycle event, so building the
+    /// event from a live-graph lookup always failed ("hvpatch lifecycle
+    /// record disappeared") and the event was lost. Drive the production
+    /// terminal entry to completion and require the event, with the exact
+    /// identity the task had while it was live.
+    #[test]
+    fn process_exit_lifecycle_event_survives_task_retirement() {
+        let (_runtime, scheduler, kernel, root, process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_741, SyscallDispatcher::new());
+        root.thread()
+            .set_affinity(carrick_hal::CpuAffinity::from_words(&[1]));
+        let live = root
+            .kernel()
+            .task_identity(root.task().key().id)
+            .expect("the exiting task is live before its terminal");
+        let tid = ThreadId::synthetic_for_tests(72_741);
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(tid)),
+            Arc::new(FutexTable::new()),
+            Arc::new(NoopPlatformFutex),
+            Arc::new(|_| Arc::new(NoopPlatformFutex)),
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+        let mut engine = CrashCaptureTestEngine::default();
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let registration = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let reject_descendant = |_, _| unreachable!();
+        let mut submission = executor::ExecutorSubmissionContext {
+            registration: Some(&registration),
+            scheduler: &scheduler,
+            publish_test_descendant: &reject_descendant,
+            current: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::new(Some(running.take_lease())),
+            exec_replacement: None,
+        };
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+
+        let outcome =
+            VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(&kernel, 7, None, 0, false)));
+        let mut exit = job.begin_persistent_process_terminal(
+            &mut engine,
+            PersistentTerminal::from_outcome(outcome),
+            root.retain_exact(),
+        );
+        for _ in 0..8 {
+            if !matches!(exit, executor::ExecutorExit::Yielded) {
+                break;
+            }
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+            exit = job
+                .poll_with_engine_typed(&mut engine, &mut control)
+                .unwrap();
+        }
+        assert!(
+            matches!(exit, executor::ExecutorExit::Exited),
+            "the process terminal completes: {exit:?}"
+        );
+        assert!(!root.kernel().task_key_is_live(root.task().key()));
+        let retirement = job
+            .pending_terminal_retirement
+            .as_ref()
+            .expect("the terminal owner begins its address-space retirement");
+        let event = retirement
+            .lifecycle_event()
+            .expect("the ProcessExit lifecycle event is recorded");
+        assert_eq!(
+            event.phase(),
+            carrick_observability::probes::HvpatchGuestLifecyclePhase::ProcessExit
+        );
+        assert_eq!(event.pid(), live.task.id.raw());
+        assert_eq!(
+            event.ppid(),
+            live.parent.map_or(0, |parent| parent.id.raw())
+        );
+        assert_eq!(event.task_serial(), live.task.serial.raw());
+        assert_eq!(event.mm(), live.mm.raw());
+        assert_eq!(event.detail(), 7);
+
+        let lease = submission.take_execution_lease().unwrap();
+        running.restore_lease(lease).unwrap();
+        scheduler.settle_exited(running).unwrap();
+        scheduler.close();
+    }
+
     /// The forkexecstorm wedge: the parked executor's barrier callback woke
     /// only on `Released`, while `publish_quiesce_event` consumes every
     /// one-shot listener on ANY event. A `Raised` from the next fork on a
