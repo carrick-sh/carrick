@@ -218,6 +218,7 @@ impl HostRootResources {
                 context.resources().fs_context(),
             ),
             limits: Arc::clone(context.task()),
+            files: context.resources().files(),
         })
     }
 }
@@ -225,6 +226,7 @@ impl HostRootResources {
 pub struct HostRootResourceSnapshot {
     filesystem: NativeFsAuthority,
     limits: crate::kernel::TaskRef,
+    files: Arc<crate::kernel::FileTable>,
 }
 
 impl HostRootResourceSnapshot {
@@ -234,6 +236,12 @@ impl HostRootResourceSnapshot {
 
     pub fn rlimits(&self) -> crate::kernel::RlimitSet {
         self.limits.rlimits()
+    }
+
+    /// The root's own host-table description at `fd`, if any.
+    pub(crate) fn host_description(&self, fd: i32) -> Option<Arc<crate::kernel::FileDescription>> {
+        let number = crate::kernel::FileSlotNumber::for_open_fd(fd).ok()?;
+        Some(self.files.slot(number)?.description)
     }
 }
 

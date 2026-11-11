@@ -1210,6 +1210,13 @@ impl IpcPhysicalHold {
         })
     }
 
+    /// Whether this hold projects `description`: the host table's own
+    /// description of the same physical file, whose offset is the one Linux
+    /// shares between every descriptor of it.
+    pub(crate) fn projects(&self, description: &FileDescription) -> bool {
+        Arc::ptr_eq(&self.physical, &description.common.physical)
+    }
+
     /// Project only the physical byte source. The projection cannot reach the
     /// publication pin, so retaining it never keeps its own IPC resource alive.
     /// The caller owns a pinned resource for the entire admission.
