@@ -317,7 +317,10 @@ fn native_child_entropy_witness(test: &str, flags: &[&str]) {
 /// by x86 `pipe2`: a live host party of the recycled slot's previous
 /// incarnation holds both of its lanes in the production native zone for
 /// the whole run, and `pipe2` still returns the pair (3, 4) on the popped
-/// slot without waiting for it. Write/read on that pair is #1756.
+/// slot without waiting for it. The fixture then closes both
+/// ends: a release's wake for a lane never bound to the new incarnation
+/// (#2082) takes no lock either, so the previous incarnation's holder cannot
+/// stall it. Write/read on that pair is #1756.
 #[test]
 fn native_pipe2_takes_no_readiness_lane_lock_held_by_a_previous_incarnation() {
     use carrick_el1_abi::ipc::{IpcBacking, pipe::End};
@@ -1844,28 +1847,30 @@ fn in_zone_child_host_read_is_refused_not_served_under_root_context() {
     );
 }
 
-/// #1756 slice 1 no-change witness: x86 builds no IPC execution capability
-/// yet, so the shared transfer engine never runs for an x86 `write` to an
-/// in-ring pipe. The child's `write` to the pipe's write end stays the
-/// explicit refusal it was before the seam: typed and
-/// counted for its native ordinal, before any forward token is taken.
-/// Slice 4 constructs the capability and turns this run green.
+/// #1756: x86 builds no IPC execution capability yet, so the shared transfer
+/// engine never runs for an x86 `write` to an in-ring pipe. Since #1935/#1954
+/// (`4c73badd1`) the native stage admits that write and keeps an in-zone fd
+/// in ring (`native_stage::tests::write_to_in_zone_pipe_stays_in_ring`), so
+/// the unserved write is answered in ring as a counted ENOSYS (-38) instead
+/// of reaching the forward-authority check as a typed `HostTaskContext`
+/// refusal. The child's `write` must therefore return ENOSYS: it must not
+/// complete (exit 0), and it must not be served under another task's
+/// authority. Slice 4 constructs the capability and turns this run green.
 #[test]
-fn in_zone_child_pipe_write_without_ipc_execution_stays_refused() {
+fn in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring() {
     let elf = native_exit_fixture("native_pipe_child_write.S");
-    let failure = match try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER) {
-        Ok(outcome) => panic!(
-            "an x86 in-ring pipe write completed without an IPC execution binding: exit {} \
-             (child write errno, or 90 pipe2 / 91 fork-wait)",
-            outcome.run.exit_code
-        ),
-        Err(failure) => failure,
-    };
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "the in-ring pipe write must be answered in ring, not refused at the \
+                 forward-authority check: {:?} ({})",
+                failure.authority_refusals, failure.error
+            )
+        });
     assert_eq!(
-        failure.authority_refusals,
-        vec![carrick_runtime::prepare::ForwardAuthorityRefusal::HostTaskContext { native: 1 }],
-        "unexpected refusal error: {}",
-        failure.error
+        outcome.run.exit_code, 38,
+        "child write errno (0 means the write completed without an IPC execution \
+         binding, 38 is ENOSYS, 90 pipe2 / 91 fork-wait failed)"
     );
 }
 
