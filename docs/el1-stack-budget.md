@@ -363,3 +363,18 @@ the same continuation and terminal exit, checking that the claim is released,
 physical settlement happens once and the live parent's translation survives.
 The pre-fix allocation entered the native run-failure boundary instead of
 parking. This VM-free witness does not replace signed fault/COW execution.
+
+## Why the budget exists (#338)
+
+Moved from `AGENTS.md` (#2118).
+
+- **Ring stack overflow** once overwrote a neighbour CPU's stack (#338:
+  by-value records on the exit chain, `publish_exit` alone 0x2190). Each
+  16 KiB EL1 stack now sits above a 16 KiB unmapped guard, and each CPL0
+  stack above a 4 KiB one (#369). An EL1 overflow fails the run with
+  `TrapError::El1StackOverflow`, which names the CPU and the stack slot. A
+  bare "guest executed at EL1" is some other corruption. The one
+  frame-budget checker is `crates/carrick-el1-image/frame_budget.rs`, and
+  it fails the image build on an oversized frame or entry envelope (CPL0
+  coverage: #956). No large by-value locals or return values on EL1/CPL0
+  paths: box or borrow.

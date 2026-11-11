@@ -483,3 +483,31 @@ xtask lives in `target/lease-tools` so the debug-tree prune cannot remove it.
 See [build admission and remaining direct-script limits](../host-lease-containment-follow-up.md#disk-admission-and-build-leases-1693)
 for the lock order, standalone build admission, and the direct signed-script
 bootstrap gap still requiring closure before cloudmac returns to the pool.
+
+## CI lanes and shared cloudmac
+
+Moved from `AGENTS.md` (#2118), updated for later decisions.
+
+- **Lanes:** hosted Linux/macOS jobs in `ci.yml`. Heavy pull requests run the
+  full macOS suite; same-repo PRs run it on the self-hosted `carrick-macos-ci`
+  runners (a non-admin `ci` user on carrick-m4 and on cloudmac; #650), forks on hosted
+  `macos-15`. Merge groups run `macos-build`, `macos-clippy` and
+  `macos-authority` as skew and compiler-authority checks on the self-hosted
+  `carrick-macos-queue` runners (#1976). The HVF lane of `kernel-runtime.yml`
+  is nightly (#2060) and on owner dispatch. Since 137a177a22 (2026-10-11),
+  `ci.yml` has no push trigger. The nightly schedule reruns the full suite on
+  hosted macOS. The signed gate stays on cloudmac. Land on a failure-set diff
+  against main (`NEW=[]`), not an absolute zero; `NEW=[]` is evidence only
+  when every step is itemized and every binary finished (#352/#353).
+- **cloudmac is shared with CI:** the persistent `carrick-hvf` runner
+  (`hvf-kernel`), the `carrick-macos-ci` PR runner (`ci` user) and director
+  gates (`remote-accept`, `just accept`) run on separate internal APFS volumes
+  (`carrick-hvf`, `carrick-ci` and `carrick-gate`; check the current quota
+  with `diskutil`, it has been changed since this was written), with
+  cold/cached `rentamac` data (`sccache`, fixtures, evidence) on external USB
+  `/Volumes/carrick`. Serialize build-heavy and signed work through
+  `/tmp/carrick-host-lease.lock` (`carrick-macos-ci` holds shared
+  `just lease carrick`; `hvf-kernel` and director gates hold exclusive
+  `gate`). Worktree admission keys on the checkout root's device+inode: never
+  copy or cross-volume move an admitted checkout; remove and re-add it.
+- Never shut down cloudmac; it is shared with CI.

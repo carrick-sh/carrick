@@ -700,3 +700,48 @@ batch aggregation, `carrick trace` is the live stream.
 See [build caches and worktree maintenance](build-maintenance.md) for the
 default per-host sccache configuration, the `CARRICK_SCCACHE=0` hatch, and
 `just worktree-gc` dry-run and removal rules.
+
+## Gotchas for agents
+
+Moved from `AGENTS.md` (#2118); complements [Gotchas](#gotchas-the-authoritative-methodology-lives-in-the-carrick-trace-skill) above.
+
+- **`carrick trace` should fail closed on these traps:**
+  - **Listed ≠ firing; FBT can't see local symbols** (`fbt::vm_fault:entry`
+    never fires — trap path calls local `_vm_fault_internal`). Silent probe →
+    check the KDK dSYM for a local twin
+    (`nm -a …kernel.release.t8132.dSYM/…`, compare addresses). `handle_user_abort`/`arm_fast_fault`
+    are FBT-blacklisted: sample, don't bracket.
+  - **Frames can be symbolizer aliases** (`IORWLockUnlock` IS `lck_rw_done`,
+    `IORWLockRead` IS `lck_rw_lock_shared`, `IOLockLock` IS `lck_mtx_lock`) —
+    confirm by address. Addresses and details for both:
+    [`docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md`](docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md).
+  - **Zero events = probe didn't fire**, never "didn't happen" — error out.
+  - **`execname` scoping breaks across differently named arms** — key on
+    carrick USDT lifecycle probes under `dtrace -Z`.
+  - **Qualify provider ABIs live** (`sched:::preempt` absent on macOS;
+    `vminfo:::as_fault` arg2 = exact 16 KiB page base).
+  - **Live-guest USDT/pid tracing is allowed** (`dtrace -Z` arms future
+    processes). Fasttrap detach once leaked `SIGTRAP` and killed a build — let
+    sessions end on their own; prefer kernel providers on unrepeatable runs.
+  - **Declare perturbation** (a 2M-events/run probe can double `sys`); cite
+    only same-instrument ratios.
+- **Logging perturbs races; USDT doesn't.** `RUST_LOG=…=debug` hid a
+  page-table race (shifted vCPU admission timing); `carrick trace -s scripts/dtrace/hvpatch-stage1-arena.d`
+  reproduced it 2/3 and named the culprit. Probe lifecycles (bind, install,
+  replace, absent) with the authority POINTER as an argument to follow recycled addresses
+  across incarnations.
+- **Hangs:** `hvpatch-guest-syscall-flow.d` shows per-pid/tid parking
+  (`nanosleep`/`exit_group` always look parked; 45 s bound). Wedged carrier:
+  `sudo lldb -p <carrier> --batch -o "thread backtrace all"` on the CLI's
+  CHILD (no password needed) — all executors in a condvar = lost wake.
+
+## Performance
+
+- **Qualify the completed workload before optimizing** — service probes omit
+  EL1/engine fast paths; CLI counters may cover only the wrapper (inotify09: 3M
+  add + 3M remove watches, one host seek). Need live request/completion
+  closure; counts ≠ critical path; keep uninstrumented A/B and native-I/O
+  controls. `--profile hvpatch-inotify09-population` fits only that case.
+
+- **Complexity tests need adversarial rows** (huge rows, mixed widths); run the affected ecosystem row standalone before landing a perf refactor.
+- **Perf claims need a controlled single-variable run on a quiet host** (heterogeneous cores; sweeps move work) — else "suggests", never "confirmed".

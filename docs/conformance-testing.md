@@ -666,3 +666,106 @@ cases and missing cases/files. Shards cannot bless a shared baseline, claim HVF
 closure, or combine with the oracle-fill maintenance command. This host-only
 oracle infrastructure does not establish Carrick x86 guest-execution parity;
 that remains a separate runtime binding and gate.
+
+## Rules for agents
+
+Moved from `AGENTS.md` (#2118). The oracle is native arm64 Docker Linux; skills: `ltp-conformance`, `carrick-trace`.
+
+- **Re-signing changes identity without relinking** (PID-bearing temp name).
+  Keep the probe-tested artifact; use `just --no-deps conformance smoke` then
+  `just --no-deps conformance full`, checking SHA/CDHash each rung. LC_UUID
+  alone is insufficient.
+- **`just build` replaces the binary under live runs** — build only with no guest alive (stale binary after a merge: 28/126 gating failures in one run).
+- **Invoke suites like the harness** (`/bin/sh -c`, `--max-traps` off); direct
+  exec hangs as PID 1. `while read` loops: guest stdin from `/dev/null`.
+- **Oracle is native arm64 only** — never a Rosetta `linux/amd64` container;
+  ask the user for a native x86 box.
+- **Cross-platform lanes:** `--lane kvm-local|bhyve-local|nvmm-local` (inject
+  `--platform linux/amd64`, set `CARRICK_INSECURE_REGISTRIES`). Build off macOS
+  with `cargo build -p carrick-cli --no-default-features --features platform-<linux|freebsd|netbsd>`
+  (`platform-macos` → E0433; `build-signed.sh` is macOS-only). x86 excuses go
+  in `baseline.kvm.jsonl`. No registry: `ssh -R 5005:<registry-host>:5005 <box>`.
+  **Shared tree:** sync only your files, `md5`-verify deps — no blanket
+  `rsync crates/`.
+
+
+**Reading results**
+- **No output = died before flushing, not "did not run".** Read BOTH
+  `target/conformance/raw/<run-id>.err` and `.out` with `grep -a` (new
+  `tst_test` API → stderr, old → stdout, flushed only in `tst_exit()`). Only
+  the `--user "root"` banner = CRASH. Recover via `run -t` or `stdbuf -o0`;
+  exit 134 = abort, 139 = SIGSEGV.
+- **An inversion can be an under-privileged ORACLE** — twelve xattr suites
+  were misfiled (`security.*` needs `CAP_SYS_ADMIN`; oracle TBROKed). Granting
+  what `.needs_root`/`.needs_devfs` implies via `docker_flags` (like fanotify,
+  add_key) is correct, not gate-bending. Confirm with/without the cap first.
+- **Concurrent agents contaminate runs** — same failures on rebuilt unmodified
+  main = contamination (~2 h nearly lost). Check `[starved]` vs `[blocked]`
+  before filing a hang.
+- **Missing ledger metadata ≠ never ran.** Audit row run IDs and both raw
+  streams; preserve the original error/provenance gap — a supplementary diagnostic can't repair the ledger or confer
+  acceptance.
+- **LTP parity ≠ workload coverage** — no LTP case pushes `brk` past 4 MiB; a
+  bhyve bug crashing 100% of cpython hid behind ~70% LTP. Rank by ecosystems
+  (go/cpython/node, `--ecosystem`).
+- **Attribute a REGRESSION before fixing:** does Docker fail it, does the
+  pre-change binary, what did the baseline say? Sample bisect points ≥2×;
+  suspect the PROBE first. Examples (`cpython-socket`, `expectcontinue`) in the
+  ltp-conformance skill.
+- **Syscall shape from `bpftrace` inside the oracle** (Docker-only phase),
+  never guest `strace` (perturbs). Recipe in the ltp-conformance skill.
+- **Probe/ecosystem example:** no LTP case pushes `brk` past 4 MiB; a bhyve bug crashing 100% of cpython hid behind ~70% LTP (LTP parity ≠ workload coverage).
+
+**Probes**
+- **New probes go in `carrick-conformance-next`** (in-process via
+  `carrick-embed`, committed source-hash-validated oracle). No new `carrick run`
+  subprocess probes or routine `carrick-cli --test conformance`, except
+  `scripts/conformance/retained-generic-probes.txt`, audited topology/service
+  runners lacking embed APIs, and the one CLI process-boundary contract. Gate:
+  `just conformance-probes`; `scripts/conformance/check-next-strategy.py`
+  (in `lint-domains`) enforces it.
+- **Red-first:** `git checkout <pre-fix> -- <file>`, rebuild signed, DIFF;
+  restore, MATCH; record false lines in the commit. Passing immediately proves
+  nothing.
+- **Signed fixture bundles** are admitted by input identity, not by commit.
+  Publish with `just fixtures-publish <SHA>` on a Linux host, then
+  `just fixtures-restore <bundle>` / `just fixtures-verify <bundle>` on the
+  Mac. Changed fixture inputs need a rebuilt bundle. Rules and receipts:
+  [`docs/signed-fixtures.md`](docs/signed-fixtures.md#input-identity).
+- **Report errno NUMBERS** (`seek_data_negative_errno = errno`) — Linux said
+  ENXIO where EINVAL was assumed; ESPIPE for `pwrite` on either pipe end, not
+  EBADF.
+- **Bound every wait** (`poll`, 5 s) — a lost signal = false line, not a hang.
+  Native oracle fixtures too: run under `timeout 10`, bound every blocking
+  call, and `IPC_RMID`/`io_destroy` on every exit path.
+- Libc-only probes cross-compile locally
+  (`cargo build --target aarch64-unknown-linux-{musl,gnu}` in
+  `conformance-probes`, copy to `conformance-probes/target/<triple>/release/`); Docker is then only
+  the bless.
+- **Source hashes don't prove executable freshness** — rebuild both ARM64 libc
+  probe sets, inventory and hash executables before reading diffs.
+- Run `cargo test -p carrick-cli --test conformance conformance_probes` from the
+  **repo root** (elsewhere: all lanes SKIP, `ok` in 0.04s). Logs need `grep -a`.
+
+
+## Oracle cache
+
+**Oracle cache** (`scripts/conformance/oracle-cache.jsonl`)
+- Key = suite *declaration* (`OracleKey`: image, cmd, env, `docker_platform`,
+  verdict…), not digest. Changing a determinant field invalidates every key →
+  `0 cached oracle(s)`, full Docker pass, rewrite: **commit it** if on the
+  canonical box with correct images, else `git checkout` it. Force:
+  `--refresh-oracle`.
+- Mutable image tag changed → cached ecosystem rows non-authoritative: verify
+  row population and digests, run both phases serially with
+  `--refresh-oracle`, machine-count every row.
+
+### Scheduler fixtures
+
+- **Scheduler fixtures own their CPU topology.** Set task affinity to the
+  fixture's policy before cloning; inheriting host CPU counts can strand a
+  bound executor on small hosted runners. Bound actor coordination waits.
+
+### Host unit/integration test wiring
+
+- Ungated tests are not tests: `carrick-cli` has no lib target, and in-file `mod tests` required explicit `--bin carrick` wiring in `just test` to run.

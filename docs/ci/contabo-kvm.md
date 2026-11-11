@@ -662,3 +662,11 @@ not run a second provisioner during this maintenance operation.
 
 The controller and sweep require root on the selected PVE node to invoke
 `pvesh` and `pvesm free` and to take PVE's per-VMID lock files.
+
+## Lease reminders and KVM evidence
+
+Moved from `AGENTS.md` (#2118).
+
+- Never restore a worker's disabled `/etc/carrick/host-lease.toml` to work around a test; leases are per VM (owner decision [#639](https://github.com/carrick-sh/carrick/issues/639), supersedes #565). Broker config and its restricted SSH account are retired by the owner.
+- `just test-kvm` runs every `kvm`-lane test target (Linux x86_64, real `/dev/kvm`, `CARRICK_REQUIRE_KVM=1`: no skips). Lanes live in `[package.metadata.carrick.test-lanes]`; `test-lanes check` (in `lint-domains`) fails on a test target no gate runs.
+- **KVM evidence comes from the merge queue** (PRs never run `kvm-tests`, so an admin merge has none). The `kvm-tests` lane produces a receipt and `kvm-gate` fails on NEW failures against the merge-group base. A targeted KVM test to debug a specific defect runs under `just lease gate` on a worker VM that owns its lease.

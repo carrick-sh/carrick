@@ -141,3 +141,22 @@ still bootstrap xtask before their internal admission. Until those entry
 points are changed, invoke them through the installed supervisor in shared
 `carrick` mode. This remaining gap is recorded on #1693; these changes alone
 do not establish complete host coverage.
+
+## Machine quietness and lease modes
+
+Moved from `AGENTS.md` (#2118).
+
+- **Machine quietness:** `just accept` holds the host lease in exclusive `gate`
+  mode for its entire host/signed run; `scripts/test-signed.sh` holds shared
+  `carrick` mode through build, signing, execution and scoped cleanup. Host
+  tests/compilation compete for CPU and memory too. Both refuse `yes`, `stress`
+  and `stress-ng`, reporting PIDs and parent commands. Deliberate load requires
+  `CARRICK_ALLOW_LOAD=1`; logs record detected load and acceptance receipts
+  include it. Contention fails explicitly after `HOST_LEASE_WAIT_LIMIT` (one
+  hour), never skips. `CARRICK_HOST_LEASE_PATH` changes the lock file for tests;
+  every participant on a gate host must use the same path. Never unlink a live
+  lock file. Quietness is for **performance measurement**, where load changes
+  the measured number; a **correctness** verdict (signed EL1 suites, smoke,
+  conformance) must hold under host load (owner, 2026-11-01, #231). Never wait
+  for a quiet box or re-run before one: a verdict that changes with load is a
+  kernel defect, filed `flaky`.

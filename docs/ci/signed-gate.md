@@ -338,3 +338,7 @@ xtask lives in `target/lease-tools` so the debug-tree prune cannot remove it.
 See [build admission and remaining direct-script limits](../host-lease-containment-follow-up.md#disk-admission-and-build-leases-1693)
 for the lock order, standalone build admission, and the direct signed-script
 bootstrap gap still requiring closure before cloudmac returns to the pool.
+
+## Note on `just test-embed`
+
+Moved from `AGENTS.md` (#2118): `just test-embed` is not in `just ci`; it runs in the merge queue on the self-hosted cloudmac lane.

@@ -307,3 +307,26 @@ test is convenience, not runtime proof. See
   ring, LLDB, and crash evidence
 - [syscalls-emulation-map.md](syscalls-emulation-map.md) — syscall support map
 - [`../crates/README.md`](../crates/README.md) — workspace crate map
+
+## Where key subsystems live
+
+Moved from `AGENTS.md` (#2118).
+
+- **Kernel semantics loop** — `crates/carrick-kernel-example` (scripted processes/threads on the public kernel API); [README](crates/carrick-kernel-example/README.md), [suite docs](docs/conformance-testing.md#kernel-semantics-suite).
+- **Trap/dispatch** — `crates/carrick-vmm-hvf/src/trap.rs`; x86 `crates/carrick-x86/src/engine.rs`; `crates/carrick-kernel/src/dispatch/mod.rs` (`SyscallDispatcher`); metadata `crates/carrick-abi/src/syscall.rs`, arch tables in `carrick-hal`.
+- **VFS** — `crates/carrick-kernel/src/dispatch/fs.rs`, mounts `crates/carrick-kernel/src/vfs/`, model `crates/carrick-vfs/src/` (OCI layer merge; `--fs host` cap-std: [`docs/fs-host-capstd-amplification.md`](docs/fs-host-capstd-amplification.md)).
+- **Memory** — `crates/carrick-mem/src/memory.rs` (guest VA layout, ELF loading, boot page tables and trampolines); mmap arena `crates/carrick-kernel/src/dispatch/mem.rs`.
+- **Signals** — `crates/carrick-kernel/src/dispatch/signal.rs` (signum translation, sigreturn trampoline).
+- **Threads/futex** — `carrick-thread`; fork barrier `crates/carrick-vmm-hvf/src/fork_quiesce.rs`. Bounded executor pool with reclaimable vCPU leases: fork admission wins before waiting for a child lease; fork joins exec/exit cancellation; losers lower to `EAGAIN`; a long blocking wait releases its lease even if capacity looks spare.
+- **epoll/sockets** — `carrick-host-bsd` (kqueue), `carrick-host-linux` (epoll); `crates/carrick-kernel/src/dispatch/net.rs` (synthetic `AF_NETLINK`, AF_UNIX path-hash registry).
+- **ptrace/pty** — `docs/ptrace-darwin-design.md` (Phase 1); `crates/carrick-kernel/src/pty_relay.rs`, `crates/carrick-runtime/src/interactive_supervisor.rs`, `crates/carrick-kernel/src/vfs/devpts.rs`.
+- **x86/Rosetta** — `linux/amd64` via in-guest Linux Rosetta (`docs/rosetta.md`).
+- **Event ring** — always-on lock-free fork/socket/epoll ring `crates/carrick-kernel/src/event_ring.rs`, read via `scripts/carrick_lldb.py`; for HVPatch the authoritative ring and thread census live in the VM carrier.
+
+## HVPatch memory
+
+- **HVPatch memory is non-identity:**
+  - guest VA, stage-1 IPA, global-frame IPA and host-owner generation are distinct domains — never cross-feed lookups; authenticate via live stage-1 translation + exact owner generation;
+  - hidden mmap reservations are metadata, backed privately on demand — no per-mm 32 GiB arena, no VM-wide shared-zero COW source;
+  - stage-1, stage-2 and frame-inventory publication = one rollback-capable transaction;
+  - coalescing needs the output address aligned for the parent block — contiguous children aren't enough; masking an unaligned IPA maps wrong bytes.

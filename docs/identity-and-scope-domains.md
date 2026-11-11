@@ -312,3 +312,19 @@ without a safety net.
 When the execution model changes, the dangerous code is not the code that breaks.
 It is the code that keeps compiling, keeps passing, and keeps explaining itself in
 terms of a model that no longer exists.
+
+## Exit topology and fork-coherent authorities
+
+Moved from `AGENTS.md` (#2118).
+
+- **Exit reserves topology, not a live participant's thread membership.** The
+  exiting task, a child or an adopter can finish an already admitted EL1 birth
+  or nonfinal exit while the graph is reserved. An owned participant transition
+  accounts for those revision changes and retains topology-publication
+  headroom; a captured broad revision or closing a live participant's gate is
+  wrong. Test two live threads, late Born/ExitedInZone publication, drop and
+  exhaustion.
+
+- Lanes forking real host processes need durable fork-coherent authorities
+  (xattrs, inherited fds, host bookkeeping), not private `HashMap`s; shared code
+  takes a typed backend authority.
