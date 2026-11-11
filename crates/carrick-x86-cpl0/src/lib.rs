@@ -55,7 +55,7 @@ mod test_support {
     /// A `kill` issued right after therefore sees the member eligible when it
     /// enumerates recipients and ineligible by the time it reaches its
     /// checkpoint: the interleaving the guest cannot order deterministically.
-    pub const INJECT_BLOCK_SIGUSR1_AT_SECOND_CHECKPOINT: u64 = 0xffff_ffff_ffff_fe1d;
+    pub const INJECT_BLOCK_SIGUSR1_AT_SECOND_CHECKPOINT: u64 = 0xffff_ffff_ffff_fe1e;
     const SIGUSR1_BIT: u64 = 1 << 9;
     /// Address of the armed member's control slot, or 0.
     static BLOCK_CONTROL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
