@@ -119,6 +119,7 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
         on_copy_complete: None,
         native_ipc: None,
         refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
         on_signal_clock: None,
     };
     {

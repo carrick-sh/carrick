@@ -26,8 +26,36 @@ std::thread_local! {
 }
 
 #[cfg(any(test, feature = "host-test"))]
+std::thread_local! {
+    /// The pending-host-work doorbells a host-test native wake rang, by
+    /// slot (`None`: every slot), bounded like [`NATIVE_WAKE_TRACE`].
+    static NATIVE_HOST_WORK_TRACE: std::cell::RefCell<std::collections::VecDeque<Option<SlotId>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(any(test, feature = "host-test"))]
 pub fn clear_test_wake_trace() {
     NATIVE_WAKE_TRACE.with(|trace| trace.borrow_mut().clear());
+    NATIVE_HOST_WORK_TRACE.with(|trace| trace.borrow_mut().clear());
+}
+
+/// The pending-host-work doorbells host-test native wakes rang since the
+/// last [`clear_test_wake_trace`]: the marks production rings on the
+/// waker's or venue's current task (`None`: every slot).
+#[cfg(any(test, feature = "host-test"))]
+pub fn test_host_work_trace() -> std::vec::Vec<Option<SlotId>> {
+    NATIVE_HOST_WORK_TRACE.with(|trace| trace.borrow().iter().copied().collect())
+}
+
+#[cfg(any(test, feature = "host-test"))]
+fn record_test_host_work(slot: Option<SlotId>) {
+    NATIVE_HOST_WORK_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        if trace.len() == NATIVE_WAKE_TRACE_LIMIT {
+            trace.pop_front();
+        }
+        trace.push_back(slot);
+    });
 }
 
 #[cfg(any(test, feature = "host-test"))]
@@ -183,7 +211,10 @@ pub fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
         effects,
         false,
         record_test_wake,
-        (|_slot| {}, || {}),
+        (
+            |slot| record_test_host_work(Some(slot)),
+            || record_test_host_work(None),
+        ),
     );
     #[cfg(all(not(any(test, feature = "host-test")), not(target_os = "none")))]
     let _ = (zone, venue, effects);

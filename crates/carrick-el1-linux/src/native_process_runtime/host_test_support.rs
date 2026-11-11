@@ -115,6 +115,11 @@ pub struct Physical<'a, C: ProcessContext = ParkedContextWords> {
     pub native_ipc: Option<carrick_el1_abi::ipc::IpcRegion<'a>>,
     pub refuse_copy: bool,
     pub on_signal_clock: Option<Box<dyn FnMut() + 'a>>,
+    /// The slot whose entry this service serves, as a production service
+    /// carries its own (`Aarch64NativeProcessService::slot`): the waker's
+    /// venue for its wake effects. A test that runs an entry on another
+    /// slot sets it first.
+    pub waker_slot: SlotId,
 }
 struct HostExecSlot<'a, C: ProcessContext> {
     zone: &'a ZoneTables<C>,
@@ -606,7 +611,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         if effects.queued_own {
             self.tid_wakes += 1;
         }
-        crate::sched::object_wait::deliver_wake_effects(self.zone, SlotId::new(0), effects);
+        crate::sched::object_wait::deliver_wake_effects(self.zone, self.waker_slot, effects);
     }
     fn request_ingress_producer_boundary(&mut self) {}
 }
@@ -814,6 +819,7 @@ impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
             on_copy_complete: None,
             native_ipc: None,
             refuse_copy: false,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         }
     }
@@ -1403,6 +1409,7 @@ impl NativeOwnerSignalFixture {
             on_copy_complete: None,
             native_ipc: None,
             refuse_copy: false,
+            waker_slot: carrick_sched_core::SlotId::new(0),
             on_signal_clock: None,
         }
     }

@@ -166,6 +166,7 @@ fn resident_signal_work_return(
         on_copy_complete: None,
         native_ipc: None,
         refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
         on_signal_clock: None,
     };
     {
