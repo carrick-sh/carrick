@@ -160,6 +160,98 @@ impl LinuxStatFields {
     }
 }
 
+/// Linux x86_64 `struct stat` written by legacy syscalls `stat(2)`,
+/// `fstat(2)`, and `lstat(2)`.
+///
+/// This is deliberately separate from [`LinuxStat`], which is carrick's
+/// canonical asm-generic/aarch64 layout. The two layouts place `st_mode` and
+/// `st_nlink` at different offsets, so x86 legacy metadata syscalls must use
+/// this record writer instead of the canonical `newfstatat(2)` writer.
+#[repr(C, packed)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
+pub struct LinuxX8664Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub __pad0: i32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub __reserved: [i64; 3],
+}
+
+impl LinuxX8664Stat {
+    /// Encode the same facts as the asm-generic stat writer in x86 wire order.
+    pub const fn from_fields(fields: &LinuxStatFields) -> Self {
+        Self {
+            st_dev: 1,
+            st_ino: fields.ino,
+            st_nlink: fields.nlink as u64,
+            st_mode: fields.mode,
+            st_uid: fields.uid,
+            st_gid: fields.gid,
+            __pad0: 0,
+            st_rdev: fields.rdev,
+            st_size: fields.size as i64,
+            st_blksize: 4096,
+            st_blocks: fields.blocks() as i64,
+            st_atime: fields.atime.0,
+            st_atime_nsec: fields.atime.1,
+            st_mtime: fields.mtime.0,
+            st_mtime_nsec: fields.mtime.1,
+            st_ctime: fields.ctime.0,
+            st_ctime_nsec: fields.ctime.1,
+            __reserved: [0; 3],
+        }
+    }
+
+    /// The x86_64 record of an asm-generic `struct stat` the carrier
+    /// replied with: the same facts, in x86 wire order.
+    pub const fn from_generic(stat: &LinuxStat) -> Self {
+        Self {
+            st_dev: stat.st_dev,
+            st_ino: stat.st_ino,
+            st_nlink: stat.st_nlink as u64,
+            st_mode: stat.st_mode,
+            st_uid: stat.st_uid,
+            st_gid: stat.st_gid,
+            __pad0: 0,
+            st_rdev: stat.st_rdev,
+            st_size: stat.st_size,
+            st_blksize: stat.st_blksize as i64,
+            st_blocks: stat.st_blocks,
+            st_atime: stat.st_atime,
+            st_atime_nsec: stat.st_atime_nsec as i64,
+            st_mtime: stat.st_mtime,
+            st_mtime_nsec: stat.st_mtime_nsec as i64,
+            st_ctime: stat.st_ctime,
+            st_ctime_nsec: stat.st_ctime_nsec as i64,
+            __reserved: [0; 3],
+        }
+    }
+}
+
 impl LinuxStat {
     /// The canonical (asm-generic/aarch64) `struct stat` for `fields`.
     pub const fn from_fields(fields: &LinuxStatFields) -> Self {
