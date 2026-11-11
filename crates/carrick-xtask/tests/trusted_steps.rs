@@ -5,7 +5,7 @@
 
 #![allow(clippy::expect_used)]
 
-use carrick_xtask::trusted_steps::{GitTree, Tree, TrustedStepsError, check};
+use carrick_xtask::trusted_steps::{GitTree, Tree, TrustedStepsError, check, check_report};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -181,10 +181,9 @@ fn landing_the_subcommand_first_passes() {
 }
 
 #[test]
-fn changed_script_and_missing_recipe_are_refused_but_untrusted_steps_are_not() {
+fn absent_script_and_missing_recipe_are_refused_but_untrusted_steps_are_not() {
     let run = "scripts/ci/a.sh --x\n          just nope\n          just build\n          just xtask signed-gate bogus";
     let mut tree = MemTree::with_base().fork_head();
-    tree.put("base", "scripts/ci/a.sh", "old");
     tree.put("head", "scripts/ci/a.sh", "new");
     tree.put("head", ".github/workflows/t.yml", &trusted_workflow(run));
     let msgs = messages(&tree);
@@ -199,6 +198,165 @@ fn changed_script_and_missing_recipe_are_refused_but_untrusted_steps_are_not() {
     // The same steps after a checkout of the PR's own merge ref are fine.
     let untrusted = trusted_workflow(run).replace("ref: main", "ref: ${{ github.sha }}");
     tree.put("head", ".github/workflows/t.yml", &untrusted);
+    assert_eq!(messages(&tree), Vec::<String>::new());
+}
+
+/// The merge group runs base's tree, so editing a script base already has is
+/// not a failure: it warns that base's copy runs until the PR lands.
+#[test]
+fn changed_existing_script_warns_without_failing() {
+    let mut tree = MemTree::with_base().fork_head();
+    tree.put("base", "scripts/ci/a.sh", "old");
+    tree.put("head", "scripts/ci/a.sh", "new");
+    tree.put(
+        "head",
+        ".github/workflows/t.yml",
+        &trusted_workflow("scripts/ci/a.sh --x"),
+    );
+    let report = check_report(&tree, "base", "head").expect("check runs");
+    assert_eq!(report.violations, vec![]);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert_eq!(
+        report.warnings[0].to_string(),
+        "trusted step gate/go will run base's copy of scripts/ci/a.sh until this PR lands"
+    );
+}
+
+/// After #2091 and #2064 land, a PR that edits only `xtask-prebuilt.sh` must
+/// pass (with warnings), not demand the separate PR it already is.
+#[test]
+fn editing_only_a_script_trusted_steps_already_run_passes_with_warnings() {
+    let mut tree = MemTree::with_base();
+    tree.put("base", ".github/workflows/signed-gate.yml", HEAD_2064_WF);
+    tree.put("base", "scripts/ci/xtask-prebuilt.sh", PREBUILT_SH);
+    let mut tree = tree.fork_head();
+    tree.put(
+        "head",
+        "scripts/ci/xtask-prebuilt.sh",
+        &format!("{PREBUILT_SH}\n# comment only\n"),
+    );
+    let report = check_report(&tree, "base", "head").expect("check runs");
+    assert_eq!(report.violations, vec![], "{:?}", report.violations);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.path == "scripts/ci/xtask-prebuilt.sh"),
+        "{:?}",
+        report.warnings
+    );
+}
+
+/// A workflow with a trusted checkout at `selector` and `baseline` and no
+/// checkout at the workspace root, like the `ci-receipt gate` steps.
+fn two_checkout_workflow(working_directory: &str, run: &str) -> String {
+    format!(
+        "name: t\non: push\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          path: selector\n          ref: main\n      - uses: actions/checkout@v4\n        with:\n          path: baseline\n          ref: ${{{{ steps.select.outputs.base_sha }}}}\n      - name: gate\n        working-directory: {working_directory}\n        run: |\n          {run}\n"
+    )
+}
+
+#[test]
+fn expression_working_directory_is_not_skipped() {
+    for wd in [
+        "${{ steps.select.outputs.source == 'main' && 'selector' || 'baseline' }}",
+        "${{ inputs.dir }}",
+    ] {
+        let mut tree = MemTree::with_base().fork_head();
+        tree.put(
+            "head",
+            ".github/workflows/t.yml",
+            &two_checkout_workflow(wd, "target/release/carrick-xtask signed-gate brand-new"),
+        );
+        let msgs = messages(&tree);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("carrick-xtask signed-gate brand-new")),
+            "{wd}: {msgs:#?}"
+        );
+        // The same step with a subcommand base has passes.
+        tree.put(
+            "head",
+            ".github/workflows/t.yml",
+            &two_checkout_workflow(wd, "target/release/carrick-xtask signed-gate execute"),
+        );
+        assert_eq!(messages(&tree), Vec::<String>::new(), "{wd}");
+    }
+}
+
+#[test]
+fn expression_working_directory_naming_only_untrusted_checkouts_is_skipped() {
+    let mut tree = MemTree::with_base().fork_head();
+    let wf = two_checkout_workflow(
+        "${{ x && 'pr' || 'pr2' }}",
+        "target/release/carrick-xtask signed-gate brand-new",
+    )
+    .replace("path: selector", "path: pr")
+    .replace("path: baseline", "path: pr2")
+    .replace("ref: main", "ref: ${{ github.sha }}")
+    .replace(
+        "ref: ${{ steps.select.outputs.base_sha }}",
+        "ref: ${{ github.sha }}",
+    );
+    tree.put("head", ".github/workflows/t.yml", &wf);
+    assert_eq!(messages(&tree), Vec::<String>::new());
+}
+
+/// Each invocation shape the first review found slipping through.
+#[test]
+fn invocation_shapes_that_once_slipped_through_are_refused() {
+    let shapes = [
+        "cargo run -p carrick-xtask --locked -- signed-gate brand-new",
+        "cargo run --locked -p carrick-xtask --features smoke-signed -- signed-gate brand-new",
+        "cargo run --package carrick-xtask -- signed-gate brand-new",
+        "cargo run --package=carrick-xtask -- signed-gate brand-new",
+        "target/release/carrick-xtask --root . signed-gate brand-new",
+        "\"$CARRICK_XTASK_BIN\" --root \"$GITHUB_WORKSPACE\" signed-gate brand-new",
+        "cargo build --locked --release -p carrick-xtask && target/release/carrick-xtask signed-gate brand-new",
+        "if test -x target/release/carrick-xtask; then target/release/carrick-xtask signed-gate brand-new; fi",
+        "if true; then\n          :\n          else target/release/carrick-xtask signed-gate brand-new\n          fi",
+        "for i in 1; do target/release/carrick-xtask signed-gate brand-new; done",
+        "FOO=1 target/release/carrick-xtask signed-gate brand-new",
+        "FOO=1 BAR=2 $CARRICK_XTASK_BIN signed-gate brand-new",
+        "FOO=1 just xtask signed-gate brand-new",
+        "CARRICK_DISK_FLOOR_GIB=35 just brand-new",
+        "FOO=1 scripts/ci/added.sh",
+        "FOO=1 bash scripts/ci/added.sh",
+    ];
+    for shape in shapes {
+        let mut tree = MemTree::with_base().fork_head();
+        tree.put("head", "scripts/ci/added.sh", "new");
+        tree.put(
+            "head",
+            ".github/workflows/t.yml",
+            &trusted_workflow(&shape.replace('\n', "\n          ")),
+        );
+        let msgs = messages(&tree);
+        assert_eq!(msgs.len(), 1, "{shape}: {msgs:#?}");
+        assert!(
+            msgs[0].contains("brand-new") || msgs[0].contains("added.sh"),
+            "{shape}: {msgs:#?}"
+        );
+    }
+}
+
+#[test]
+fn folded_scalar_run_is_analyzed() {
+    let wf = "name: t\non: push\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: main\n      - name: go\n        run: >-\n          cargo build --locked --release -p carrick-xtask &&\n          target/release/carrick-xtask signed-gate brand-new\n";
+    let mut tree = MemTree::with_base().fork_head();
+    tree.put("head", ".github/workflows/t.yml", wf);
+    let msgs = messages(&tree);
+    assert_eq!(msgs.len(), 1, "{msgs:#?}");
+    assert!(msgs[0].contains("signed-gate brand-new"));
+}
+
+#[test]
+fn cargo_build_of_xtask_is_not_an_invocation() {
+    let mut tree = MemTree::with_base().fork_head();
+    tree.put(
+        "head",
+        ".github/workflows/t.yml",
+        &trusted_workflow("cargo build --locked -p carrick-xtask brand-new"),
+    );
     assert_eq!(messages(&tree), Vec::<String>::new());
 }
 
