@@ -728,7 +728,11 @@ pub(crate) use carrick_kernel::exec_helpers::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(feature = "platform-macos"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     use carrick_guest_mem::GuestMemory as _;
 
     #[cfg(feature = "platform-linux")]
