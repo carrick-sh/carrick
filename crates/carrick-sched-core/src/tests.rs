@@ -5053,3 +5053,47 @@ fn a_left_first_candidate_falls_back_to_a_driven_peer() {
         "second driven allowed candidate"
     );
 }
+
+std::thread_local! {
+    static SLOT_LOCK_PROBES: std::cell::RefCell<Option<Vec<SlotId>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn observe_slot_lock(slot: SlotId) {
+    SLOT_LOCK_PROBES.with_borrow_mut(|probes| {
+        if let Some(probes) = probes {
+            probes.push(slot);
+        }
+    });
+}
+
+#[test]
+fn claim_for_el1_probes_a_busy_candidate_only_once() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let (record, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
+    let held = zone.slot_lock(OTHER, &HostWait).unwrap();
+    SLOT_LOCK_PROBES.with_borrow_mut(|probes| *probes = Some(Vec::new()));
+    let result = zone.claim_for_el1_with_wait(
+        (record, seq, 0),
+        SLOT,
+        &mut WakeEffects::default(),
+        || {},
+        true,
+    );
+    let probes = SLOT_LOCK_PROBES.with_borrow_mut(Option::take).unwrap();
+    assert!(!result);
+    assert_eq!(
+        probes,
+        [OTHER],
+        "one probe per distinct slot under the object lock"
+    );
+    drop(held);
+    assert!(zone.claim_for_el1_with_wait(
+        (record, seq, 0),
+        SLOT,
+        &mut WakeEffects::default(),
+        || {},
+        true
+    ));
+}
