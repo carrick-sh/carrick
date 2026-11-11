@@ -1178,6 +1178,48 @@ fn signal_stack_real_fault_forces_sigsegv_with_oracle_si_code_128() {
     }
 }
 
+/// How long one blocking wait may last before the test fails. It bounds a
+/// lost wake; it is not a throughput budget, so it restarts for every wait.
+const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Host-thread analogue of the carrier's idle wait for the two-thread
+/// witness. Each thread publishes after every attempt, served or refused,
+/// which is after any editor or reservation guard it held has been released
+/// and its production wake delivered. A thread that was refused blocks until its
+/// predicate holds; there is no spinning or sleeping, and a wake that never
+/// comes fails the test at `WAIT_BOUND`.
+struct ReleaseSignal {
+    published: std::sync::Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+
+impl ReleaseSignal {
+    fn new() -> Self {
+        Self {
+            published: std::sync::Mutex::new(0),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn publish(&self) {
+        *self.published.lock().unwrap() += 1;
+        self.changed.notify_all();
+    }
+
+    fn seen(&self) -> u64 {
+        *self.published.lock().unwrap()
+    }
+
+    fn wait_until(&self, what: &str, mut ready: impl FnMut(u64) -> bool) {
+        let guard = self.published.lock().unwrap();
+        let (_guard, result) = self
+            .changed
+            .wait_timeout_while(guard, WAIT_BOUND, |count| !ready(*count))
+            .unwrap();
+        assert!(!result.timed_out(), "{what}: release never arrived");
+    }
+}
+
 #[test]
 fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv() {
     use carrick_core::mm::transaction::{SelectionVenues, UserWriteRequest, UserWriteVenue};
@@ -1485,7 +1527,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
     let done = core::sync::atomic::AtomicBool::new(false);
     let mmap_cycles = AtomicUsize::new(0);
     let parked_waits = AtomicUsize::new(0);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let releases = ReleaseSignal::new();
 
     std::thread::scope(|scope| {
         let done_ref = &done;
@@ -1497,6 +1539,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
         }
         let _stop_mapper = StopMapper(done_ref);
         let mmap_cycles_ref = &mmap_cycles;
+        let releases_ref = &releases;
         let leader_slot = fixture.slot;
         let mapper_tables = &fixture.tables;
         let mapper_zone = fixture.zone;
@@ -1517,10 +1560,6 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                 tables: mapper_tables,
             };
             while !done_ref.load(Ordering::Acquire) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "timed out in concurrent mmap/munmap thread"
-                );
                 let access = crate::sched::object_wait::space_access(mapper_zone, sibling_slot);
                 let mut map_frame = carrick_el1_abi::TrapFrame {
                     esr: 0x5600_0000,
@@ -1530,7 +1569,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                 };
                 map_frame.x[8] = 222;
                 map_frame.x[..6].copy_from_slice(&[0, 4096, 3, 0x22, u64::MAX, 0]);
-                if carrick_el1::memory::serve_delegated_anonymous(
+                let mapped = carrick_el1::memory::serve_delegated_anonymous(
                     &mut map_frame,
                     &counters,
                     sibling_task,
@@ -1538,8 +1577,8 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                     mapper_reservations,
                     &mut memory,
                     None,
-                ) == carrick_el1::memory::DelegatedAnonymous::Served
-                {
+                );
+                if mapped == carrick_el1::memory::DelegatedAnonymous::Served {
                     let mapped_va = map_frame.x[0];
                     assert!(
                         (mapped_va as i64) > 0,
@@ -1576,11 +1615,8 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                         carrick_el1_abi::Action::Served
                     );
                     assert_eq!(map_frame.elr, 0x50_0004);
+                    releases_ref.publish();
                     loop {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "timed out in concurrent munmap retry"
-                        );
                         let access =
                             crate::sched::object_wait::space_access(mapper_zone, sibling_slot);
                         let mut unmap_frame = carrick_el1_abi::TrapFrame {
@@ -1636,8 +1672,16 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                                 assert_eq!(unmap_frame.elr, 0x50_0004);
                                 break;
                             }
-                            carrick_el1::memory::DelegatedAnonymous::Contended(_) => {
-                                std::thread::yield_now();
+                            carrick_el1::memory::DelegatedAnonymous::Contended(cause) => {
+                                // Refused with nothing held: block until the
+                                // other thread completes an operation.
+                                // A refused attempt may itself drop guards and wake the peer.
+                                releases_ref.publish();
+                                let seen = releases_ref.seen();
+                                releases_ref.wait_until(
+                                    &format!("munmap of {mapped_va:#x} refused on {cause:?}"),
+                                    |now| now > seen || done_ref.load(Ordering::Acquire),
+                                );
                             }
                             other => {
                                 panic!("unexpected munmap outcome {other:?} for {mapped_va:#x}");
@@ -1645,17 +1689,23 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                         }
                     }
                     mmap_cycles_ref.fetch_add(1, Ordering::Release);
-                    std::thread::yield_now();
+                    releases_ref.publish();
+                } else if let carrick_el1::memory::DelegatedAnonymous::Contended(cause) = mapped {
+                    // A refused attempt may itself drop guards and wake the peer.
+                    releases_ref.publish();
+                    let seen = releases_ref.seen();
+                    releases_ref.wait_until(&format!("mmap refused on {cause:?}"), |now| {
+                        now > seen || done_ref.load(Ordering::Acquire)
+                    });
                 } else {
-                    std::thread::yield_now();
+                    panic!("unexpected mmap outcome {mapped:?}");
                 }
             }
         });
 
-        while mmap_cycles.load(Ordering::Acquire) == 0 {
-            assert!(std::time::Instant::now() < deadline, "mapper never started");
-            std::thread::yield_now();
-        }
+        releases.wait_until("mapper never started", |_| {
+            mmap_cycles.load(Ordering::Acquire) > 0
+        });
 
         let venue = core::cell::RefCell::new(StackWriteVenue {
             prepared: NoopPreparedResolver,
@@ -1713,10 +1763,6 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
             fixture.address,
         ));
         for index in 0..1_000 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out delivering signal {index}/1000"
-            );
             {
                 with_process_entry(
                     source,
@@ -1747,10 +1793,6 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                 ..Default::default()
             };
             loop {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "timed out waiting for signal {index} owner-wait wake"
-                );
                 *saved = Aarch64ParkedContext::ZERO;
                 crate::sched::ThreadCpu::save(
                     &mut crate::sched::FakeCpu::default(),
@@ -1778,6 +1820,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                     },
                 )
                 .unwrap();
+                releases.publish();
                 match action {
                     carrick_el1_abi::Action::Served => break,
                     carrick_el1_abi::Action::Idle => {
@@ -1819,15 +1862,15 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                                 .unwrap();
                             drop(queue);
                         }
-                        while fixture.zone.runnable_head(fixture.slot) != Some(owner_record)
-                            && fixture.zone.runnable_head(sibling_slot) != Some(owner_record)
-                        {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "signal {index} parked on contention was never woken"
-                            );
-                            std::thread::yield_now();
-                        }
+                        releases.wait_until(
+                            &format!("signal {index} parked on contention was never woken"),
+                            |_| {
+                                matches!(
+                                    fixture.zone.record(owner_record).claim(),
+                                    carrick_sched_core::Claim::Queued { .. }
+                                )
+                            },
+                        );
                         let mut cpu = ResumeCpu {
                             inner: crate::sched::FakeCpu {
                                 ttbr: (ttbr0, ttbr0),
@@ -1869,6 +1912,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
         }
 
         done.store(true, Ordering::Release);
+        releases.publish();
         mapper.join().unwrap();
     });
     assert!(mmap_cycles.load(Ordering::Acquire) > 0);
