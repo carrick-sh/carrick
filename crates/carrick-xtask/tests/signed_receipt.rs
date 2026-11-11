@@ -3150,8 +3150,8 @@ mod base_reuse_witnesses {
         BuildPolicy, Executable, GuestTarget, Manifest, Toolchain, archive,
     };
     use carrick_xtask::signed_gate::{
-        PairSide, Request, RequestKind, ReuseExecutionContext, compute_base_reuse_key,
-        execute_pair, trusted_reuse_run,
+        PairSide, Request, RequestKind, ReuseExecutionContext, ReuseMissReason,
+        compute_base_reuse_key, execute_pair, trusted_reuse_run,
     };
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
@@ -4450,6 +4450,54 @@ raise SystemExit('unexpected gh invocation: ' + repr(args))
         encoder.write_all(&tar_bytes).unwrap();
         let gz_bytes = encoder.finish().unwrap();
         std::fs::write(dst, gz_bytes).unwrap();
+    }
+
+    /// The reuse key admits a base bundle only after the publisher's own
+    /// object-integrity check: an archive whose object bytes no longer match
+    /// the manifest's hash is refused, not keyed.
+    #[test]
+    fn reuse_key_refuses_a_bundle_whose_objects_are_corrupt() {
+        use flate2::{Compression, read::MultiGzDecoder, write::GzEncoder};
+        use std::io::Read;
+
+        let bench = ReuseBench::new();
+        let corrupt = bench.dir.path().join("corrupt.tar.gz");
+        let mut source = tar::Archive::new(MultiGzDecoder::new(
+            std::fs::File::open(&bench.bundle.archive).unwrap(),
+        ));
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        for entry in source.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let mut header = entry.header().clone();
+            let path = entry.path().unwrap().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if path.components().any(|c| c.as_os_str() == "objects")
+                && header.entry_type().is_file()
+            {
+                let last = bytes.len() - 1;
+                bytes[last] ^= 0xff;
+            }
+            builder
+                .append_data(&mut header, &path, bytes.as_slice())
+                .unwrap();
+        }
+        std::fs::write(&corrupt, builder.into_inner().unwrap().finish().unwrap()).unwrap();
+
+        let refused =
+            compute_base_reuse_key(&bench.repo, &bench.base, bench.host.clone(), &corrupt)
+                .expect_err("corrupt bundle objects must be refused");
+        assert!(
+            matches!(refused, ReuseMissReason::FixtureBundleInvalid(_)),
+            "{refused:?}"
+        );
+        compute_base_reuse_key(
+            &bench.repo,
+            &bench.base,
+            bench.host.clone(),
+            &bench.bundle.archive,
+        )
+        .expect("intact bundle is accepted");
     }
 
     /// Witness A (#1918 review M1): holding every other key input constant and
