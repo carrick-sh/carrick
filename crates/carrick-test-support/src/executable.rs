@@ -60,11 +60,15 @@ pub fn copy_executable(from: impl AsRef<Path>, to: impl AsRef<Path>, mode: u32) 
 }
 
 fn replace_target(path: &Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => panic!("replace {}: {e}", path.display()),
-    }
+    std::fs::remove_file(path)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .unwrap();
 }
 
 fn finish(mut child: std::process::Child, path: &Path, mode: u32) {

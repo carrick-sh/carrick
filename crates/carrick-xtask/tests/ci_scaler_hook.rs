@@ -357,7 +357,7 @@ fn serial_host_hvf_job_started_refuses_env_overrides_and_writable_or_non_root_xt
     let spy_xtask = bin.join("spy-xtask");
     write_executable(
         &spy_xtask,
-        &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
         0o755,
     );
 
