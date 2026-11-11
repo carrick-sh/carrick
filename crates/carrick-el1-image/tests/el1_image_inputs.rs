@@ -277,6 +277,47 @@ fn emitted_watch_list_covers_every_path_dependency_of_el1_image() {
     }
 }
 
+/// The neutral owner crates the image links. `personality_boundary`'s
+/// `image_build_tracks_neutral_owner_inputs` pins this list by name.
+const NEUTRAL_OWNER_CRATES: [&str; 4] = [
+    "carrick-core",
+    "carrick-core-abi",
+    "carrick-personality-api",
+    "carrick-personality-linux",
+];
+
+fn assert_neutral_owners_watched(emitted: &[PathBuf]) {
+    for dependency in NEUTRAL_OWNER_CRATES {
+        for input in ["src", "Cargo.toml"] {
+            let declared = PathBuf::from(format!("../{dependency}/{input}"));
+            assert!(
+                emitted.contains(&declared),
+                "image can retain stale {dependency}/{input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn emitted_watch_list_tracks_neutral_owner_crates() {
+    let output_path = Path::new(env!("OUT_DIR"))
+        .parent()
+        .expect("Cargo build-script directory")
+        .join("output");
+    let build_output = std::fs::read_to_string(&output_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", output_path.display()));
+    let emitted = emitted_raw_rerun_paths(&build_output);
+    assert_neutral_owners_watched(&emitted);
+
+    // Negative control: dropping carrick-core from the emitted inputs fails.
+    let without_core: Vec<PathBuf> = emitted
+        .into_iter()
+        .filter(|path| !path.starts_with("../carrick-core/"))
+        .collect();
+    let dropped = std::panic::catch_unwind(|| assert_neutral_owners_watched(&without_core));
+    assert!(dropped.is_err(), "dropping carrick-core must be detected");
+}
+
 #[test]
 fn derived_watch_list_matches_real_el1_depfile_and_rejects_omitted_crate() {
     let manifest = manifest_dir();
