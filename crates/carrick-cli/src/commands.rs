@@ -102,6 +102,18 @@ use crate::trace_cli::{
     trace_drop_credentials, trace_sudo_argv,
 };
 
+/// `--store` names the one root all carrick state lives under, so the scratch,
+/// layer cache and trash (which resolve `CARRICK_HOME`, see
+/// `carrick_spec::carrick_home`) follow it instead of the environment's root.
+/// Children inherit the pinned value. Runs before any thread is spawned.
+pub(crate) fn pin_carrick_home_to_store(store: Option<&std::path::Path>) {
+    if let Some(root) = store {
+        // SAFETY: called at the top of `run_cli`, before the runtime or any
+        // helper thread exists, as with the other start-up `set_var`s here.
+        unsafe { std::env::set_var("CARRICK_HOME", root) };
+    }
+}
+
 pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     // The `proc` provider exposes zeroed `pr_start` on current Darwin. Query
     // `PROC_PIDTBSDINFO` only inside the enabled USDT closure so normal CLI
@@ -114,6 +126,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     // opened `ImageStore`.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let store_path = store.clone();
+    pin_carrick_home_to_store(store.as_deref());
     let store = store
         .map(ImageStore::new)
         .unwrap_or_else(ImageStore::default_for_user);
@@ -3225,4 +3238,45 @@ fn build_launch_request(
         stop_timeout: run_args.stop_timeout,
         volumes_from: run_args.volumes_from.clone(),
     })
+}
+
+#[cfg(test)]
+mod store_root_tests {
+    /// `--store` without `CARRICK_HOME` in the environment (and with a
+    /// different one) puts scratch under the store root. In a child process
+    /// because it rewrites the environment.
+    #[test]
+    #[ignore = "child of store_flag_pins_the_scratch_root"]
+    fn store_flag_child() {
+        let store = std::path::PathBuf::from(std::env::var_os("CARRICK_TEST_STORE").unwrap());
+        super::pin_carrick_home_to_store(Some(&store));
+        assert_eq!(carrick_spec::carrick_home(), store);
+        // macOS prefers a dedicated APFS volume when one is mounted.
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            carrick_vfs::fs_backend::default_scratch_root().unwrap(),
+            store.join("scratch")
+        );
+    }
+
+    #[test]
+    fn store_flag_pins_the_scratch_root() {
+        let store = tempfile::tempdir().unwrap();
+        for env_home in [None, Some("/nonexistent/other-home")] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "commands::store_root_tests::store_flag_child",
+                ])
+                .env("CARRICK_TEST_STORE", store.path())
+                .env_remove("CARRICK_HOME");
+            if let Some(home) = env_home {
+                command.env("CARRICK_HOME", home);
+            }
+            let status = command.status().unwrap();
+            assert!(status.success(), "CARRICK_HOME={env_home:?}: {status}");
+        }
+    }
 }
