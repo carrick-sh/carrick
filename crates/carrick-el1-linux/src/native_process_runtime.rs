@@ -1036,12 +1036,6 @@ pub(crate) enum SignalCopyDeferral {
     Service,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SignalDeferOutcome {
-    Suspended,
-    ReadyToRebuild,
-}
-
 /// One record's retained private-mapping byte sources: the one its next
 /// exact `mmap` retry consumes, and any it will not (a reply replaced before
 /// its retry, or one whose retry changed its arguments), which that retry

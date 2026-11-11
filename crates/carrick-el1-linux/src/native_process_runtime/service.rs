@@ -927,7 +927,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         saved_mask: carrick_signal_core::policy::SigBlockMask,
         thread_blocked: carrick_signal_core::policy::SigBlockMask,
         deferral: SignalCopyDeferral,
-    ) -> Result<SignalDeferOutcome, NativeProcessError> {
+    ) -> Result<(), NativeProcessError> {
         {
             let mut graph = self.runtime.graph.lock();
             let resources = graph
@@ -978,14 +978,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 if let Some(status) = status {
                     self.root_exit = Some(status);
                 }
-                Ok(SignalDeferOutcome::Suspended)
+                Ok(())
             }
             Ok(NativeResume::Returned(_)) | Ok(NativeResume::NoPending) => {
-                let reclaimed = self
-                    .take_pending_signal_delivery()
-                    .ok_or(NativeProcessError::Quarantined)?;
-                *info = reclaimed.info;
-                Ok(SignalDeferOutcome::ReadyToRebuild)
+                // The holder released before the post-enrolment probe. The
+                // retained delivery stays; leave through the owner
+                // checkpoint so the next entry rebuilds it under a fresh
+                // lease rather than looping inside this one.
+                if !matches!(self.begin_return_work()?, NativeResume::Left(_)) {
+                    let _ = self.take_pending_signal_delivery();
+                    return Err(NativeProcessError::Quarantined);
+                }
+                Ok(())
             }
             Ok(_) => {
                 let _ = self.take_pending_signal_delivery();

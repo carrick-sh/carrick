@@ -722,12 +722,40 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
                     fixture.zone.slot(fixture.slot).current().is_none(),
                     "a released-holder wait must release the vCPU execution lease"
                 );
-                assert_eq!(
-                    fixture.zone.runnable_head(fixture.slot),
-                    Some(owner_record),
-                    "the checkpoint must re-enter through the scheduler"
-                );
                 assert!(checkpoints <= RELEASED_REFUSALS, "re-entry never converged");
+                // The owner checkpoint re-enters on the carrier's ACK, the
+                // same path a transient Busy takes.
+                let notice = fixture
+                    .task
+                    .service_notice
+                    .take()
+                    .expect("service_notice cell")
+                    .expect("CarrierWork service notice published");
+                let queue = fixture
+                    .zone
+                    .object_wait(
+                        carrick_sched_core::object_wait::ObjectWaitKey::native_service(member)
+                            .unwrap(),
+                        &carrick_sched_core::ShortLockSpin,
+                        &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                        },
+                    )
+                    .unwrap();
+                let ticket = unsafe {
+                    carrick_core_abi::service::ServiceCell::claim_notice(
+                        &fixture.control.service,
+                        notice,
+                        NonZeroU64::MIN,
+                        fixture.zone.record(owner_record).identity(),
+                    )
+                }
+                .unwrap();
+                assert!(ticket.complete(true).is_ok());
+                queue
+                    .notify_object(fixture.slot, &mut WakeEffects::default())
+                    .unwrap();
+                drop(queue);
                 let counters = carrick_el1_abi::Counters::new();
                 let mut cpu = ResumeCpu {
                     inner: crate::sched::FakeCpu {
