@@ -77,6 +77,69 @@ mod test_support {
             );
         }
     }
+
+    /// Hold the next native birth inside its topology reservation (#2095),
+    /// at its MM preparation, until the waiter below parks or releases it.
+    pub const INJECT_HOLD_NEXT_BIRTH: u64 = 0xffff_ffff_ffff_fe1f;
+    /// 1 once the armed birth holds its reservation (and the calling member
+    /// becomes the waiter whose park releases it), else 0.
+    pub const INJECT_BIRTH_HELD: u64 = 0xffff_ffff_ffff_fe20;
+    /// Release a held birth from its waiter's own call; 0 also when the
+    /// waiter's park already released it.
+    pub const INJECT_RELEASE_HELD_BIRTH: u64 = 0xffff_ffff_ffff_fe21;
+    const BIRTH_ARMED: u8 = 1;
+    const BIRTH_HELD: u8 = 2;
+    const BIRTH_RELEASED: u8 = 3;
+    /// About seconds of spinning: a waiter that never parks or releases
+    /// fails the run instead of hanging it.
+    const BIRTH_HOLD_SPINS: u64 = 1 << 32;
+    static BIRTH_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    static BIRTH_WAITER: carrick_el1::lock::SpinLock<Option<carrick_sched_core::RecordRef>> =
+        carrick_el1::lock::SpinLock::new(None);
+
+    /// Called by the native birth after `reserve_birth`, before MM
+    /// preparation, on the forking member's CPU.
+    pub fn hold_armed_birth() {
+        if BIRTH_HOLD
+            .compare_exchange(BIRTH_ARMED, BIRTH_HELD, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let mut spins = 0_u64;
+        while BIRTH_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
+            spins += 1;
+            if spins > BIRTH_HOLD_SPINS {
+                carrick_x86_carrier::entry::fatal_boot();
+            }
+            core::hint::spin_loop();
+        }
+        BIRTH_HOLD.store(0, Ordering::Release);
+    }
+
+    /// Called on each scheduler entry: the registered waiter has parked, so
+    /// its contended wait is owned by the birth's release notification.
+    pub fn release_birth_on_park(
+        source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+    ) {
+        let waiter = *BIRTH_WAITER.lock();
+        if let Some(record) = waiter
+            && matches!(
+                source.zone.record(record.id).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            )
+            && BIRTH_HOLD
+                .compare_exchange(
+                    BIRTH_HELD,
+                    BIRTH_RELEASED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            *BIRTH_WAITER.lock() = None;
+        }
+    }
     // Test-only actor ordering: armed by CPU0's fixture syscall; CPU0
     // publishes Parked before requesting CPU1's scheduler to release it.
     // The production object-wait queue and notification choose the wake target.
@@ -277,6 +340,31 @@ mod test_support {
                     *armed = Some((record, execution));
                     0
                 })
+            }
+            INJECT_HOLD_NEXT_BIRTH => BIRTH_HOLD
+                .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
+            INJECT_BIRTH_HELD => {
+                if BIRTH_HOLD.load(Ordering::Acquire) != BIRTH_HELD {
+                    return Some(0);
+                }
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                let zone = carrick_x86_carrier::native_execution::source(slot).zone;
+                *BIRTH_WAITER.lock() = Some(zone.record_ref(zone.slot(slot).current()?));
+                Some(1)
+            }
+            INJECT_RELEASE_HELD_BIRTH => {
+                *BIRTH_WAITER.lock() = None;
+                let _ = BIRTH_HOLD.compare_exchange(
+                    BIRTH_HELD,
+                    BIRTH_RELEASED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                Some(0)
             }
             INJECT_OWNED_COPY_BUSY_ONCE => {
                 (!OWNED_COPY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)

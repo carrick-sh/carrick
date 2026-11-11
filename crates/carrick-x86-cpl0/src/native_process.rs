@@ -772,6 +772,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         if !words.authenticates(*parent) {
             return Err(NativeProcessError::Stale);
         }
+        // The caller's birth reservation is held from here until publication.
+        #[cfg(feature = "test-support")]
+        crate::test_support::hold_armed_birth();
         let owner = portal()?;
         let _ = drain_retired_spaces(&owner, self.worker());
         let mm = ReservationMm::new(parent.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
