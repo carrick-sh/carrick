@@ -13,7 +13,14 @@ use super::{
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
     process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata, NativeProcessCustody},
 };
-use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use carrick_el1::lock::SpinLock;
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, EntryHandoffReceipt, EntryIdentity, EntryRef, ExecutionBinding,
@@ -48,7 +55,7 @@ use carrick_sched_core::process::{
         ClaimKind, InternalIdentity, NamespaceTable, SerialAllocator, VisibleIdentity,
         VisibleNamespace,
     },
-    wait::{TaskWakeGeneration, WaitJobControl, WaitPrecheck, WaitQuery, WaitSelection},
+    wait::{TaskWakeGeneration, WaitJobControl, WaitQuery, WaitSelection},
 };
 use carrick_sched_core::{
     Handback, RecordRef, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
@@ -1165,7 +1172,12 @@ struct PendingWait {
     query: WaitQuery,
     status: UserVa,
     output: PendingWaitOutput,
-    precheck: WaitPrecheck,
+    /// The caller's channel generation sampled under the graph guard that
+    /// selected this park: a registry `WaitPrecheck`, or the scan that found
+    /// a sibling's birth reservation held. Only a later publication wakes it.
+    observed: TaskWakeGeneration,
+    /// A contended `WNOHANG` wait reruns as `WNOHANG` once released.
+    nohang: bool,
     channel: Arc<WaitChannel>,
 }
 #[derive(Clone, Copy)]
@@ -1630,6 +1642,11 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     /// child and naming the parent. The child's exec commit or exit removes
     /// its row before publishing the parent's channel.
     vfork_parents: BTreeMap<TaskKey, TaskKey>,
+    /// Processes whose child wait found their own birth reservation held by
+    /// a sibling's in-flight fork and parked on the process channel (#2095).
+    /// The fork owner removes its row after releasing or rolling back the
+    /// reservation and publishes that channel.
+    birth_waiters: BTreeSet<TaskKey>,
 }
 impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     fn take_relative_futex_wait(
@@ -4237,6 +4254,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 uts,
                 ipc,
                 vfork_parents: BTreeMap::new(),
+                birth_waiters: BTreeSet::new(),
             }),
             zone: source.zone,
             exec_capability,
@@ -4950,6 +4968,25 @@ fn map_wait_owner_error<E>(
         _ => NativeProcessError::Stale,
     }
 }
+/// Whether a wait owner refused only because `caller`'s own topology is
+/// reserved: a sibling's in-flight birth (`reserve_birth`), whose owner
+/// publishes the caller's channel after release. Contention is "not now".
+fn wait_reserved_by_sibling_birth<E>(
+    error: &super::process_owner::GuestProcessError<E>,
+    caller: TaskKey,
+) -> bool {
+    matches!(
+        error,
+        super::process_owner::GuestProcessError::Wait(
+            carrick_sched_core::process::wait::WaitError::Busy(task),
+        ) if *task == caller.id
+    )
+}
+/// One step of a child wait refused by a sibling's birth reservation.
+enum ContendedWait {
+    Rescan,
+    Done(LifecycleOutcome),
+}
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
@@ -5251,7 +5288,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut rescan = None;
         loop {
             let (selection, mm, channel) = {
-                let graph = self.runtime.graph.lock();
+                let mut graph = self.runtime.graph.lock();
                 let row = graph
                     .owner
                     .task(self.key)
@@ -5264,12 +5301,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .as_ref()
                     .ok_or(NativeProcessError::Stale)?
                     .clone();
+                // Sampled under the guard that observes any reservation: its
+                // release and publication both follow this section.
+                let observed = channel.generation.generation();
                 let selected = match rescan.take() {
-                    Some(selected) => selected,
-                    None => native_process_entry::scan_wait(&graph.owner, self.key, query)
-                        .map_err(map_wait_owner_error)?,
+                    Some(selected) => Ok(selected),
+                    None => native_process_entry::scan_wait(&graph.owner, self.key, query),
                 };
-                (selected, mm, channel)
+                match selected {
+                    Ok(selected) => (selected, mm, channel),
+                    Err(error) if wait_reserved_by_sibling_birth(&error, self.key) => {
+                        graph.birth_waiters.insert(self.key);
+                        drop(graph);
+                        match self
+                            .park_contended_wait(query, status, nohang, output, channel, observed)?
+                        {
+                            ContendedWait::Rescan => continue,
+                            ContendedWait::Done(outcome) => return Ok(outcome),
+                        }
+                    }
+                    Err(error) => return Err(map_wait_owner_error(error)),
+                }
             };
             match selection {
                 WaitWork::Status(copy) => {
@@ -5310,9 +5362,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }
                     let consumed = {
                         let mut graph = self.runtime.graph.lock();
-                        copied
-                            .consume(&mut graph.owner)
-                            .map_err(map_wait_owner_error)?
+                        let observed = channel.generation.generation();
+                        match copied.consume(&mut graph.owner) {
+                            Ok(consumed) => consumed,
+                            Err(error) if wait_reserved_by_sibling_birth(&error, self.key) => {
+                                graph.birth_waiters.insert(self.key);
+                                drop(graph);
+                                // The rerun copies the selected status again.
+                                match self.park_contended_wait(
+                                    query, status, nohang, output, channel, observed,
+                                )? {
+                                    ContendedWait::Rescan => continue,
+                                    ContendedWait::Done(outcome) => return Ok(outcome),
+                                }
+                            }
+                            Err(error) => return Err(map_wait_owner_error(error)),
+                        }
                     };
                     let consumed = match consumed {
                         CopiedWaitOutcome::Consumed(consumed) => consumed,
@@ -5372,7 +5437,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             query,
                             status,
                             output,
-                            precheck,
+                            observed: precheck.wake_generation(),
+                            nohang: false,
                             channel,
                         }),
                     )? {
@@ -5389,6 +5455,46 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
             }
         }
+    }
+    /// A sibling's in-flight birth holds this process's topology reservation
+    /// (#2095). Keep the owned wait parked on the process channel that the
+    /// birth owner publishes after its release, then rerun the scan. Linux
+    /// would reap or sleep here, never fail: this is "not now".
+    #[inline(never)]
+    fn park_contended_wait(
+        &mut self,
+        query: WaitQuery,
+        status: UserVa,
+        nohang: bool,
+        output: PendingWaitOutput,
+        channel: Arc<WaitChannel>,
+        observed: TaskWakeGeneration,
+    ) -> Result<ContendedWait, NativeProcessError> {
+        let ch = channel.clone();
+        let parked = self.park_continuation(
+            &ch,
+            observed,
+            PendingChildContinuation::Wait(PendingWait {
+                caller: self.key,
+                owner: self.continuation_owner(),
+                query,
+                status,
+                output,
+                observed,
+                nohang,
+                channel,
+            }),
+        )?;
+        Ok(match parked {
+            ContinuationPark::Rescan => ContendedWait::Rescan,
+            ContinuationPark::Interrupted => {
+                ContendedWait::Done(returned(carrick_syscall_abi::LINUX_EINTR.guest_retval()))
+            }
+            ContinuationPark::Parked => ContendedWait::Done(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            }),
+        })
     }
     /// Suspend a vfork(2) parent after its child is published (clone(2):
     /// "the calling process is suspended until the child releases its
@@ -5901,8 +6007,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return match pending {
                 PendingChildContinuation::Wait(pending) => {
                     if pending.caller != self.key
-                        || pending.channel.generation.generation()
-                            == pending.precheck.wake_generation()
+                        || pending.channel.generation.generation() == pending.observed
                     {
                         self.runtime.graph.lock().pending.insert_child_wait(
                             self.key,
@@ -5912,8 +6017,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         return Some(self.fail(NativeProcessError::Stale));
                     }
                     Some(
-                        match self.wait_query(pending.query, pending.status, false, pending.output)
-                        {
+                        match self.wait_query(
+                            pending.query,
+                            pending.status,
+                            pending.nohang,
+                            pending.output,
+                        ) {
                             Ok(outcome) => outcome,
                             Err(error) => self.fail(error),
                         },
@@ -7797,6 +7906,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// in their own frame, before and after it.
     #[inline(never)]
     fn fork_owned(&mut self, child_tid: ProcessForkChildTid) -> Result<u32, NativeProcessError> {
+        let forked = self.fork_reserved(child_tid);
+        // Every path through the birth has released or rolled back its
+        // reservation by now. A sibling's wait that found it held parked on
+        // this process's channel: publish it so that wait reruns (#2095).
+        let contended = self.runtime.graph.lock().birth_waiters.remove(&self.key);
+        if contended {
+            let channel = self
+                .runtime
+                .graph
+                .lock()
+                .owner
+                .task(self.key)
+                .ok()
+                .and_then(|row| row.native().resources().channel.clone())
+                .ok_or(NativeProcessError::Quarantined)?;
+            self.publish_channel(&channel)?;
+        }
+        forked
+    }
+    #[inline(never)]
+    fn fork_reserved(&mut self, child_tid: ProcessForkChildTid) -> Result<u32, NativeProcessError> {
         let reservation = self.fork_reserve()?;
         let prepared =
             match self
