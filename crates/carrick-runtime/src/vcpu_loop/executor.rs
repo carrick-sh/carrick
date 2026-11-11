@@ -199,7 +199,7 @@ where
     }
     // Report the original failure before releasing slot custody: a refused
     // release must not hide the boundary that stopped this driver.
-    backend::leave_driven_zone_slot();
+    backend::leave_driven_zone_slot_after(failure.as_deref());
     if !startup_sent {
         let message = failure
             .clone()
