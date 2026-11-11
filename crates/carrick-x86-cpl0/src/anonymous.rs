@@ -28,7 +28,6 @@ pub(super) struct X86AnonymousVenue<'a> {
     source: BornInZoneSource<'static, ParkedContextWords>,
     saved: ParkedContextWords,
     handoff: Option<carrick_el1_abi::EntryHandoffReceipt<ParkedContextWords>>,
-    resumed: Option<carrick_sched_core::object_wait::OperationToken>,
     retry: bool,
 }
 impl<'a> X86AnonymousVenue<'a> {
@@ -41,27 +40,12 @@ impl<'a> X86AnonymousVenue<'a> {
         saved: ParkedContextWords,
     ) -> Option<Self> {
         let frame = crate::anonymous_call(*call, slot, UserVa::new(return_pc))?;
-        let resumed = source
-            .zone
-            .slot(source.slot)
-            .current()
-            .or_else(|| source.zone.slot(source.slot).host_record())
-            .and_then(|record| {
-                carrick_core::wait::take_object_operation(
-                    source.zone,
-                    source.slot,
-                    source.zone.record(record).identity(),
-                )
-                .ok()
-                .flatten()
-            });
         Some(Self {
             frame,
             task,
             source,
             saved,
             handoff: None,
-            resumed,
             retry: false,
         })
     }
@@ -280,7 +264,22 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         let index = zone.spaces.find(mm.raw())?;
         let access = space_access(zone, slot, crate::native_process::release);
         let owner = NonZeroU64::new(slot.index() as u64 + 1)?;
-        let resumed = self.resumed.take();
+        // Take the retained operation only now that this call is an anonymous
+        // edit: any other syscall's operation (a timed poll's park) stays on
+        // its record for the call's own owner to resume.
+        let resumed = zone
+            .slot(slot)
+            .current()
+            .or_else(|| zone.slot(slot).host_record())
+            .and_then(|record| {
+                carrick_core::wait::take_object_operation(
+                    zone,
+                    slot,
+                    zone.record(record).identity(),
+                )
+                .ok()
+                .flatten()
+            });
         let saved = self.saved;
         let task = self.task;
         let frame = &self.frame;
