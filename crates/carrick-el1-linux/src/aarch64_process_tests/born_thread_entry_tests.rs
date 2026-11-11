@@ -778,3 +778,1074 @@ fn arm_declined_fault_returns_a_quarantined_delivery_refusal() {
     assert!(owner_wait.is_none());
     assert_eq!(frame, before, "a refused delivery leaves the frame");
 }
+
+struct ProductionProcessHarness {
+    fixture: &'static Fixture,
+    task: &'static CurrentTask,
+    dispatch_service: Aarch64NativeProcessService<'static, TestStockCrossing>,
+    resume_service: Aarch64NativeProcessService<'static, TestStockCrossing>,
+    parent_record: RecordId,
+    _parent_page: &'static ThreadLifecyclePage,
+    _parent_control: &'static ThreadControlSlot,
+    _parent_pid: u32,
+}
+
+impl ProductionProcessHarness {
+    fn new() -> Self {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        fixture.zone.spaces.set_idle_ttbr(0x30000);
+        let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+        let spare_pages: Vec<u64> = (0..28).map(|i| 0x14000 + i * 0x1000).collect();
+        let mut dispatch_service = Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&spare_pages),
+        )
+        .with_words(words);
+        let resume_service = Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&[]),
+        )
+        .with_words(words);
+        let mut cpu = crate::sched::FakeCpu::default();
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 220;
+        frame.x[0] = 17;
+        arm_call_with_cpu(
+            fixture,
+            fixture.control,
+            &mut dispatch_service,
+            &mut frame,
+            &mut cpu,
+        )
+        .unwrap();
+        assert!(frame.x[0] as i64 > 0, "fork result {}", frame.x[0] as i64);
+        let parent_record = fixture.zone.runnable_head(fixture.slot).unwrap();
+        let parent_identity = fixture.zone.record(parent_record).identity();
+        // SAFETY: the native owner retains its lifecycle page and control slot.
+        let parent_page =
+            unsafe { &*(parent_identity.lifecycle_page as *const ThreadLifecyclePage) };
+        // SAFETY: see above.
+        let parent_control =
+            unsafe { &*(parent_identity.control_slot as *const ThreadControlSlot) };
+        let task: &'static CurrentTask = &fixture.task;
+        fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+        task.mm.key.store(0, Ordering::Release);
+        assert_eq!(
+            switch_in(fixture, task, &mut cpu, &mut frame),
+            carrick_el1_abi::Action::Served
+        );
+        assert_eq!(
+            fixture.zone.slot(fixture.slot).current(),
+            Some(parent_record)
+        );
+        let parent_pid = task.visible_pid().expect("published parent pid");
+        dispatch_service.task = task;
+        Self {
+            fixture,
+            task,
+            dispatch_service,
+            resume_service,
+            parent_record,
+            _parent_page: parent_page,
+            _parent_control: parent_control,
+            _parent_pid: parent_pid,
+        }
+    }
+
+    fn settle_doorbells(&self) {
+        if let Some(work) = self.task.linux.take_host_work_doorbell() {
+            work.settled();
+        }
+        let _ = self.task.linux.take_served_boundary();
+    }
+
+    fn find_record_by_tid(&self, tid: u64) -> Option<RecordId> {
+        (0..carrick_sched_core::ZONE_RECORDS as u32)
+            .filter_map(RecordId::from_raw)
+            .find(|&r| self.fixture.zone.record(r).identity().tid == tid)
+    }
+
+    /// Dispatch a syscall for the currently loaded record on `fixture.slot`
+    /// through the production ARM vector adapter with `ProductionResumeCpu` so
+    /// a parked call switches in and resumes the next runnable record.
+    fn call_current(
+        &mut self,
+        frame: &mut carrick_el1_abi::TrapFrame,
+        cpu: &mut crate::sched::FakeCpu,
+    ) -> carrick_personality_linux::dispatch::CompletionRoute {
+        self.settle_doorbells();
+        let current = self.fixture.zone.slot(self.fixture.slot).current().unwrap();
+        let identity = self.fixture.zone.record(current).identity();
+        // SAFETY: the native owner retains its lifecycle page and control slot.
+        let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+        // SAFETY: see above.
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        // SAFETY: `current` is the slot's active record.
+        let saved = unsafe { *self.fixture.zone.record(current).ctx_mut() };
+        let ttbr0 = saved
+            .address_context()
+            .expect("native record address context")
+            .root
+            .address()
+            .raw();
+        cpu.ttbr.0 = ttbr0;
+        frame.esr = 0x15 << 26;
+        frame.slot = u64::from(self.fixture.slot.raw());
+        let mut resume_cpu = ProductionResumeCpu {
+            inner: core::mem::take(cpu),
+            service: &mut self.resume_service,
+        };
+        let counters = carrick_el1_abi::Counters::new();
+        let cache = carrick_el1_abi::InotifyNameCache::new();
+        let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+            frame,
+            &counters,
+            core::slice::from_ref(self.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: self.fixture.zone,
+                cpu: &mut resume_cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(&LoadedVenue),
+            page,
+            control,
+            &saved.native,
+            ttbr0,
+            &mut self.dispatch_service,
+            |_| core::ptr::null_mut(),
+        )
+        .expect("production ARM native process dispatch");
+        *cpu = core::mem::take(&mut resume_cpu.inner);
+        self.settle_doorbells();
+        route
+    }
+
+    fn switch_next(
+        &mut self,
+        cpu: &mut crate::sched::FakeCpu,
+        frame: &mut carrick_el1_abi::TrapFrame,
+    ) -> carrick_el1_abi::Action {
+        self.settle_doorbells();
+        let mut switch = ProductionResumeCpu {
+            inner: core::mem::take(cpu),
+            service: &mut self.resume_service,
+        };
+        let counters = carrick_el1_abi::Counters::new();
+        let mut handoff = None;
+        let mut zone = crate::dispatch::Zone {
+            tables: self.fixture.zone,
+            cpu: &mut switch,
+            user: &crate::sched::HardwareUserWord,
+        };
+        let action = super::super::dispatch::native_scheduler(
+            &mut zone,
+            self.task,
+            &counters,
+            self.fixture.slot,
+            &mut handoff,
+        )
+        .idle_entry(frame, 0);
+        *cpu = core::mem::take(&mut switch.inner);
+        self.settle_doorbells();
+        action
+    }
+
+    fn spawn_thread(
+        &mut self,
+        stack: &carrick_test_support::GuestUserBuffer,
+        cpu: &mut crate::sched::FakeCpu,
+    ) -> (u32, RecordId) {
+        let mut clone = carrick_el1_abi::TrapFrame::default();
+        clone.x[8] = 220;
+        clone.x[..5].copy_from_slice(&[
+            THREAD_FLAGS,
+            stack.arg() + 4096,
+            stack.arg(),
+            stack.arg() + 128,
+            stack.arg() + 4,
+        ]);
+        self.call_current(&mut clone, cpu);
+        let tid = clone.x[0] as i64;
+        assert!(tid > 0, "thread clone failed: {tid}");
+        let record = self
+            .find_record_by_tid(tid as u64)
+            .expect("queued thread record");
+        (tid as u32, record)
+    }
+
+    fn fork_child(&mut self, cpu: &mut crate::sched::FakeCpu) -> (u32, RecordId) {
+        let mut fork = carrick_el1_abi::TrapFrame::default();
+        fork.x[8] = 220;
+        fork.x[0] = 17;
+        self.call_current(&mut fork, cpu);
+        let pid = fork.x[0] as i64;
+        assert!(pid > 0, "fork failed: {pid}");
+        let record = self
+            .find_record_by_tid(pid as u64)
+            .expect("queued child record");
+        (pid as u32, record)
+    }
+
+    fn exit_current_child(
+        &mut self,
+        code: u8,
+        cpu: &mut crate::sched::FakeCpu,
+        frame: &mut carrick_el1_abi::TrapFrame,
+    ) {
+        let current = self.fixture.zone.slot(self.fixture.slot).current().unwrap();
+        // SAFETY: `current` is the slot's active child record.
+        let address = unsafe { *self.fixture.zone.record(current).ctx_mut() }
+            .address_context()
+            .expect("child address context");
+        *self.dispatch_service.crossing.zone.lock().unwrap() = Some(self.fixture.zone);
+        *self.dispatch_service.crossing.child.lock().unwrap() = Some((
+            super::super::common_entry::execution_binding(self.task),
+            address,
+        ));
+        *frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 94;
+        frame.x[0] = u64::from(code);
+        self.call_current(frame, cpu);
+        if self
+            .fixture
+            .zone
+            .slot(self.fixture.slot)
+            .current()
+            .is_none()
+        {
+            assert_eq!(
+                self.switch_next(cpu, frame),
+                carrick_el1_abi::Action::Served
+            );
+        }
+    }
+
+    fn with_current_entry<R>(
+        &mut self,
+        cpu: &mut crate::sched::FakeCpu,
+        run: impl FnOnce(&mut dyn carrick_personality_linux::lifecycle::ProcessNative) -> R,
+    ) -> R {
+        self.settle_doorbells();
+        let current = self.fixture.zone.slot(self.fixture.slot).current().unwrap();
+        let identity = self.fixture.zone.record(current).identity();
+        // SAFETY: the native owner retains its lifecycle page and control slot.
+        let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+        // SAFETY: see above.
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        // SAFETY: `current` is the slot's active record.
+        let saved = unsafe { *self.fixture.zone.record(current).ctx_mut() };
+        let ttbr0 = saved
+            .address_context()
+            .expect("native record address context")
+            .root
+            .address()
+            .raw();
+        cpu.ttbr.0 = ttbr0;
+        let source = BornInZoneSource {
+            zone: self.fixture.zone,
+            slot: self.fixture.slot,
+        };
+        let out = super::super::aarch64_process::with_process_entry(
+            source,
+            self.task,
+            &saved.native,
+            ttbr0,
+            page,
+            control,
+            &mut self.dispatch_service,
+            |entry| run(entry),
+        )
+        .expect("with_process_entry");
+        self.settle_doorbells();
+        out
+    }
+
+    fn msgget_current(&mut self, key: i32, msgflg: i32, cpu: &mut crate::sched::FakeCpu) -> i32 {
+        self.with_current_entry(cpu, |entry| {
+            entry
+                .as_ipc_venue()
+                .expect("native IPC venue")
+                .msgget(key, msgflg)
+                .expect("msgget")
+        })
+    }
+
+    fn msgrcv_current(
+        &mut self,
+        msqid: i32,
+        msgp: u64,
+        msgsz: usize,
+        msgtyp: i64,
+        msgflg: i32,
+        cpu: &mut crate::sched::FakeCpu,
+        switched_frame: &mut carrick_el1_abi::TrapFrame,
+    ) -> Result<carrick_personality_linux::ipc::IpcOutcome, i64> {
+        let result = self.with_current_entry(cpu, |entry| {
+            entry
+                .as_ipc_venue()
+                .expect("native IPC venue")
+                .msgrcv(msqid, UserVa::new(msgp), msgtyp, msgflg, msgsz)
+                .map(|(outcome, _)| outcome)
+        });
+        if matches!(
+            result,
+            Ok(carrick_personality_linux::ipc::IpcOutcome::Suspended)
+        ) && self
+            .fixture
+            .zone
+            .slot(self.fixture.slot)
+            .current()
+            .is_none()
+        {
+            assert_eq!(
+                self.switch_next(cpu, switched_frame),
+                carrick_el1_abi::Action::Served
+            );
+        }
+        result
+    }
+
+    fn msgsnd_current(
+        &mut self,
+        msqid: i32,
+        mtype: i64,
+        mtext: &[u8],
+        msgflg: i32,
+        cpu: &mut crate::sched::FakeCpu,
+    ) -> Result<carrick_personality_linux::ipc::IpcOutcome, i64> {
+        self.with_current_entry(cpu, |entry| {
+            entry
+                .as_ipc_venue()
+                .expect("native IPC venue")
+                .msgsnd(msqid, mtype, mtext, msgflg)
+        })
+    }
+}
+
+/// #2071 witness 1: two members of one native process call blocking `wait4` on
+/// different children through the production ARM dispatch entry. Both park (the
+/// second never receives `-11` / `-EAGAIN`), a first child exit wakes both so
+/// the non-matching waiter rescans and stays parked, and each reaps its own
+/// child with exact exit status.
+#[test]
+fn arm_two_threads_blocking_wait4_reap_distinct_children() {
+    let mut harness = ProductionProcessHarness::new();
+    let mut cpu = crate::sched::FakeCpu::default();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    let (_sibling_tid, sibling) = harness.spawn_thread(&stack, &mut cpu);
+    let (child_a_pid, child_a) = harness.fork_child(&mut cpu);
+    let (child_b_pid, child_b) = harness.fork_child(&mut cpu);
+    let status_a = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+    let status_b = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+
+    // Leader calls blocking wait4(child_a): parks and switches to `sibling`.
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 260;
+    frame.x[0] = u64::from(child_a_pid);
+    frame.x[1] = status_a.arg();
+    harness.call_current(&mut frame, &mut cpu);
+    assert!(matches!(
+        harness.fixture.zone.record(harness.parent_record).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(sibling)
+    );
+
+    // Sibling calls blocking wait4(child_b): must park too, never return -11.
+    let mut sibling_frame = carrick_el1_abi::TrapFrame::default();
+    sibling_frame.x[8] = 260;
+    sibling_frame.x[0] = u64::from(child_b_pid);
+    sibling_frame.x[1] = status_b.arg();
+    harness.call_current(&mut sibling_frame, &mut cpu);
+    assert!(
+        matches!(
+            harness.fixture.zone.record(sibling).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ),
+        "second thread wait4 failed to park (x0 = {})",
+        sibling_frame.x[0] as i64
+    );
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_a)
+    );
+
+    // child_a exits with status 11, waking both waiters onto the run queue
+    // behind child_b. Preempt child_b so both waiters run while child_b lives.
+    let mut exit_frame = carrick_el1_abi::TrapFrame::default();
+    harness.exit_current_child(11, &mut cpu, &mut exit_frame);
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_b)
+    );
+    assert!(
+        harness
+            .fixture
+            .zone
+            .requeue_preempted(harness.fixture.slot, child_b)
+            .is_queued()
+    );
+
+    // Leader switches in and completes wait4(child_a) -> child_a_pid.
+    let mut resumed_leader = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut resumed_leader),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(harness.parent_record)
+    );
+    assert_eq!(resumed_leader.x[0], u64::from(child_a_pid));
+    assert_eq!(
+        status_a.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(11 << 8).raw()
+    );
+
+    // Preempt leader so sibling runs next: child_b is still running, so
+    // sibling's resume rescans, re-parks, and switches to child_b!
+    assert!(
+        harness
+            .fixture
+            .zone
+            .requeue_preempted(harness.fixture.slot, harness.parent_record)
+            .is_queued()
+    );
+    let mut resumed_sibling = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut resumed_sibling),
+        carrick_el1_abi::Action::Served
+    );
+    assert!(matches!(
+        harness.fixture.zone.record(sibling).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_b)
+    );
+
+    // child_b exits with status 22, waking sibling.
+    harness.exit_current_child(22, &mut cpu, &mut exit_frame);
+    if harness.fixture.zone.slot(harness.fixture.slot).current() == Some(harness.parent_record) {
+        assert!(
+            harness
+                .fixture
+                .zone
+                .requeue_preempted(harness.fixture.slot, harness.parent_record)
+                .is_queued()
+        );
+        assert_eq!(
+            harness.switch_next(&mut cpu, &mut resumed_sibling),
+            carrick_el1_abi::Action::Served
+        );
+    } else {
+        resumed_sibling = exit_frame;
+    }
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(sibling)
+    );
+    assert_eq!(resumed_sibling.x[0], u64::from(child_b_pid));
+    assert_eq!(
+        status_b.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(22 << 8).raw()
+    );
+}
+
+/// #2071 witness 2: two members both call `wait4(-1)`; when one child exits
+/// while another remains, exactly one waiter reaps and the other stays parked;
+/// when the final child exits with both waiters parked in `wait4(-1)`, one
+/// reaps and the other gets `-ECHILD` (`-10`).
+#[test]
+fn arm_two_threads_blocking_wait4_any_one_reaps_other_blocks_then_echild() {
+    let mut harness = ProductionProcessHarness::new();
+    let mut cpu = crate::sched::FakeCpu::default();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    let (_sibling_tid, sibling) = harness.spawn_thread(&stack, &mut cpu);
+    let (child_a_pid, child_a) = harness.fork_child(&mut cpu);
+    let (child_b_pid, child_b) = harness.fork_child(&mut cpu);
+    let status_leader = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+    let status_sibling = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+
+    // Both leader and sibling call blocking wait4(-1).
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 260;
+    frame.x[0] = u64::MAX;
+    frame.x[1] = status_leader.arg();
+    harness.call_current(&mut frame, &mut cpu);
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(sibling)
+    );
+
+    let mut sibling_frame = carrick_el1_abi::TrapFrame::default();
+    sibling_frame.x[8] = 260;
+    sibling_frame.x[0] = u64::MAX;
+    sibling_frame.x[1] = status_sibling.arg();
+    harness.call_current(&mut sibling_frame, &mut cpu);
+    assert!(
+        matches!(
+            harness.fixture.zone.record(sibling).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ),
+        "second wait4(-1) failed to park (x0 = {})",
+        sibling_frame.x[0] as i64
+    );
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_a)
+    );
+
+    // child_a exits(13) while child_b is still alive.
+    let mut exit_frame = carrick_el1_abi::TrapFrame::default();
+    harness.exit_current_child(13, &mut cpu, &mut exit_frame);
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_b)
+    );
+    assert!(
+        harness
+            .fixture
+            .zone
+            .requeue_preempted(harness.fixture.slot, child_b)
+            .is_queued()
+    );
+
+    // First woken waiter reaps child_a; second woken waiter rescans, sees
+    // child_b still running, and stays parked!
+    let mut resumed_first = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut resumed_first),
+        carrick_el1_abi::Action::Served
+    );
+    let first_waiter = harness
+        .fixture
+        .zone
+        .slot(harness.fixture.slot)
+        .current()
+        .unwrap();
+    assert_eq!(resumed_first.x[0], u64::from(child_a_pid));
+
+    // Re-enter wait4(-1) on the first waiter so BOTH waiters are parked when
+    // the last child (child_b) exits: switching away runs the second waiter's
+    // woken resume, which re-parks on child_b and switches to child_b!
+    let mut rewait = carrick_el1_abi::TrapFrame::default();
+    rewait.x[8] = 260;
+    rewait.x[0] = u64::MAX;
+    rewait.x[1] = if first_waiter == harness.parent_record {
+        status_leader.arg()
+    } else {
+        status_sibling.arg()
+    };
+    harness.call_current(&mut rewait, &mut cpu);
+    assert!(matches!(
+        harness.fixture.zone.record(harness.parent_record).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    assert!(matches!(
+        harness.fixture.zone.record(sibling).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_b)
+    );
+
+    // Now the last child (child_b) exits(19): one waiter reaps child_b_pid,
+    // and the remaining waiter gets -ECHILD (-10).
+    harness.exit_current_child(19, &mut cpu, &mut exit_frame);
+    let winner_result = exit_frame.x[0] as i64;
+    assert_eq!(winner_result, i64::from(child_b_pid));
+
+    let winner = harness
+        .fixture
+        .zone
+        .slot(harness.fixture.slot)
+        .current()
+        .unwrap();
+    assert!(
+        harness
+            .fixture
+            .zone
+            .requeue_preempted(harness.fixture.slot, winner)
+            .is_queued()
+    );
+    let mut loser_frame = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut loser_frame),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        loser_frame.x[0] as i64, -10,
+        "remaining wait4(-1) waiter with no children left must return -ECHILD (-10)"
+    );
+}
+
+/// #2071 witness 3: `vfork` (`CLONE_VM | CLONE_VFORK | SIGCHLD`) from one
+/// thread while a sibling is parked in a blocking `wait4` must suspend the
+/// `vfork` caller until its child execs or exits (never return unsuspended on
+/// `Busy`).
+#[test]
+fn arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release() {
+    let mut harness = ProductionProcessHarness::new();
+    let mut cpu = crate::sched::FakeCpu::default();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    let vfork_stack = carrick_test_support::GuestUserBuffer::zeroed(4096);
+    let (_sibling_tid, sibling) = harness.spawn_thread(&stack, &mut cpu);
+    let (child_a_pid, child_a) = harness.fork_child(&mut cpu);
+    let status_a = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+    let status_vfork = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+
+    // Leader parks in blocking wait4(child_a), switching to sibling.
+    let mut wait_frame = carrick_el1_abi::TrapFrame::default();
+    wait_frame.x[8] = 260;
+    wait_frame.x[0] = u64::from(child_a_pid);
+    wait_frame.x[1] = status_a.arg();
+    harness.call_current(&mut wait_frame, &mut cpu);
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(sibling)
+    );
+
+    // Sibling calls clone(CLONE_VM | CLONE_VFORK | SIGCHLD = 0x4111): must
+    // park (suspend) until vfork_child releases it, NOT return unsuspended!
+    let mut vfork_frame = carrick_el1_abi::TrapFrame::default();
+    vfork_frame.x[8] = 220;
+    vfork_frame.x[0] = 0x4111;
+    vfork_frame.x[1] = vfork_stack.arg() + 4096;
+    harness.call_current(&mut vfork_frame, &mut cpu);
+    assert!(
+        matches!(
+            harness.fixture.zone.record(sibling).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ),
+        "vfork caller returned unsuspended while sibling was parked in wait4 (x0 = {})",
+        vfork_frame.x[0] as i64
+    );
+
+    // Preempt child_a to run the queued vfork_child, which exits(31) and
+    // releases sibling's vfork suspension while leader stays parked on child_a.
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_a)
+    );
+    assert!(
+        harness
+            .fixture
+            .zone
+            .requeue_preempted(harness.fixture.slot, child_a)
+            .is_queued()
+    );
+    let mut switched = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut switched),
+        carrick_el1_abi::Action::Served
+    );
+    let vfork_child = harness
+        .fixture
+        .zone
+        .slot(harness.fixture.slot)
+        .current()
+        .unwrap();
+    let vfork_child_pid = harness.fixture.zone.record(vfork_child).identity().tid as u32;
+    assert_ne!(vfork_child, child_a);
+    assert_ne!(vfork_child, sibling);
+
+    let mut exit_frame = carrick_el1_abi::TrapFrame::default();
+    harness.exit_current_child(31, &mut cpu, &mut exit_frame);
+    if harness.fixture.zone.slot(harness.fixture.slot).current() == Some(child_a) {
+        assert!(
+            harness
+                .fixture
+                .zone
+                .requeue_preempted(harness.fixture.slot, child_a)
+                .is_queued()
+        );
+        assert_eq!(
+            harness.switch_next(&mut cpu, &mut switched),
+            carrick_el1_abi::Action::Served
+        );
+    } else {
+        switched = exit_frame;
+    }
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(sibling)
+    );
+    assert_eq!(switched.x[0], u64::from(vfork_child_pid));
+    assert!(
+        matches!(
+            harness.fixture.zone.record(harness.parent_record).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ),
+        "leader waiting for child_a must remain parked when vfork_child exits"
+    );
+
+    // Sibling reaps vfork_child, then child_a exits and leader reaps child_a.
+    let mut reap_vfork = carrick_el1_abi::TrapFrame::default();
+    reap_vfork.x[8] = 260;
+    reap_vfork.x[0] = u64::from(vfork_child_pid);
+    reap_vfork.x[1] = status_vfork.arg();
+    harness.call_current(&mut reap_vfork, &mut cpu);
+    assert_eq!(reap_vfork.x[0], u64::from(vfork_child_pid));
+    assert_eq!(
+        status_vfork.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(31 << 8).raw()
+    );
+
+    assert!(
+        harness
+            .fixture
+            .zone
+            .requeue_preempted(harness.fixture.slot, sibling)
+            .is_queued()
+    );
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut switched),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_a)
+    );
+    harness.exit_current_child(17, &mut cpu, &mut exit_frame);
+    if harness.fixture.zone.slot(harness.fixture.slot).current() == Some(sibling) {
+        assert!(
+            harness
+                .fixture
+                .zone
+                .requeue_preempted(harness.fixture.slot, sibling)
+                .is_queued()
+        );
+        assert_eq!(
+            harness.switch_next(&mut cpu, &mut exit_frame),
+            carrick_el1_abi::Action::Served
+        );
+    }
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(harness.parent_record)
+    );
+    assert_eq!(exit_frame.x[0], u64::from(child_a_pid));
+    assert_eq!(
+        status_a.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(17 << 8).raw()
+    );
+}
+
+/// #2071 witness 5: a child exits between the first waiter parking and the
+/// second waiter parking (while the first waiter's continuation row is still
+/// retained before its resume checkpoint runs, and across channel generation
+/// advancement); both waiters must re-scan and complete without `-EAGAIN` or
+/// lost wakeups.
+#[test]
+fn arm_wait4_child_exits_between_two_waiters_parking_rescans_without_lost_wake() {
+    let mut harness = ProductionProcessHarness::new();
+    let mut cpu = crate::sched::FakeCpu::default();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    let (_sibling_tid, sibling) = harness.spawn_thread(&stack, &mut cpu);
+    let (child_a_pid, child_a) = harness.fork_child(&mut cpu);
+    let (child_b_pid, child_b) = harness.fork_child(&mut cpu);
+    let status_a = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+    let status_b = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+
+    // Waiter 1 (leader) parks in wait4(child_a); slot switches to sibling.
+    let mut wait_a = carrick_el1_abi::TrapFrame::default();
+    wait_a.x[8] = 260;
+    wait_a.x[0] = u64::from(child_a_pid);
+    wait_a.x[1] = status_a.arg();
+    harness.call_current(&mut wait_a, &mut cpu);
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(sibling)
+    );
+
+    // Before Waiter 2 (sibling) parks, child_a runs and exits(29)! That wakes
+    // Waiter 1 from Parked to Queued while Waiter 1's continuation row is
+    // STILL retained in PendingTable, and advances the process channel
+    // generation before Waiter 2 parks.
+    assert!(
+        harness
+            .fixture
+            .zone
+            .requeue_preempted(harness.fixture.slot, sibling)
+            .is_queued()
+    );
+    let mut switched = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut switched),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_a)
+    );
+    let mut exit_frame = carrick_el1_abi::TrapFrame::default();
+    harness.exit_current_child(29, &mut cpu, &mut exit_frame);
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_b)
+    );
+    assert!(
+        harness
+            .fixture
+            .zone
+            .requeue_preempted(harness.fixture.slot, child_b)
+            .is_queued()
+    );
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut switched),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(sibling)
+    );
+    assert!(matches!(
+        harness.fixture.zone.record(harness.parent_record).claim(),
+        carrick_sched_core::Claim::Queued { .. }
+    ));
+
+    let mut wait_b = carrick_el1_abi::TrapFrame::default();
+    wait_b.x[8] = 260;
+    wait_b.x[0] = u64::from(child_b_pid);
+    wait_b.x[1] = status_b.arg();
+    harness.call_current(&mut wait_b, &mut cpu);
+    assert!(
+        matches!(
+            harness.fixture.zone.record(sibling).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ),
+        "second waiter failed to park after child_a exited between parks (x0 = {})",
+        wait_b.x[0] as i64
+    );
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(harness.parent_record)
+    );
+    assert_eq!(wait_b.x[0], u64::from(child_a_pid));
+    assert_eq!(
+        status_a.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(29 << 8).raw()
+    );
+
+    assert!(
+        harness
+            .fixture
+            .zone
+            .requeue_preempted(harness.fixture.slot, harness.parent_record)
+            .is_queued()
+    );
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut switched),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(child_b)
+    );
+    harness.exit_current_child(37, &mut cpu, &mut exit_frame);
+    if harness.fixture.zone.slot(harness.fixture.slot).current() == Some(harness.parent_record) {
+        assert!(
+            harness
+                .fixture
+                .zone
+                .requeue_preempted(harness.fixture.slot, harness.parent_record)
+                .is_queued()
+        );
+        assert_eq!(
+            harness.switch_next(&mut cpu, &mut exit_frame),
+            carrick_el1_abi::Action::Served
+        );
+    }
+    assert_eq!(
+        harness.fixture.zone.slot(harness.fixture.slot).current(),
+        Some(sibling)
+    );
+    assert_eq!(exit_frame.x[0], u64::from(child_b_pid));
+    assert_eq!(
+        status_b.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(37 << 8).raw()
+    );
+}
+
+/// #2071 cross-operation witness: a thread parked in SysV `msgrcv` must not
+/// cause a sibling's blocking `wait4` to fail with `-EAGAIN`, nor vice versa.
+#[test]
+fn arm_msgrcv_and_sibling_wait4_do_not_block_each_other() {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MsgBuf {
+        mtype: i64,
+        mtext: [u8; 8],
+    }
+
+    for msgrcv_first in [true, false] {
+        let mut harness = ProductionProcessHarness::new();
+        let mut cpu = crate::sched::FakeCpu::default();
+        let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+        let (_sibling_tid, sibling) = harness.spawn_thread(&stack, &mut cpu);
+        let (child_pid, child) = harness.fork_child(&mut cpu);
+        let status = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+        let rx_buf = carrick_test_support::GuestUserBuffer::from_value(MsgBuf {
+            mtype: 0,
+            mtext: [0; 8],
+        });
+        let qid = harness.msgget_current(0, 0o1600, &mut cpu);
+
+        if msgrcv_first {
+            // Leader parks in blocking msgrcv(qid, rx_buf, 8, 0, 0).
+            let mut rcv_switched = carrick_el1_abi::TrapFrame::default();
+            let rcv =
+                harness.msgrcv_current(qid, rx_buf.arg(), 8, 0, 0, &mut cpu, &mut rcv_switched);
+            assert!(
+                matches!(
+                    rcv,
+                    Ok(carrick_personality_linux::ipc::IpcOutcome::Suspended)
+                ),
+                "leader msgrcv must suspend: {rcv:?}"
+            );
+            assert!(matches!(
+                harness.fixture.zone.record(harness.parent_record).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
+            assert_eq!(
+                harness.fixture.zone.slot(harness.fixture.slot).current(),
+                Some(sibling)
+            );
+
+            // Sibling calls blocking wait4(child_pid): must park, NOT -11!
+            let mut wait = carrick_el1_abi::TrapFrame::default();
+            wait.x[8] = 260;
+            wait.x[0] = u64::from(child_pid);
+            wait.x[1] = status.arg();
+            harness.call_current(&mut wait, &mut cpu);
+            assert!(
+                matches!(
+                    harness.fixture.zone.record(sibling).claim(),
+                    carrick_sched_core::Claim::Parked { .. }
+                ),
+                "sibling wait4 blocked by parked msgrcv (x0 = {})",
+                wait.x[0] as i64
+            );
+            assert_eq!(
+                harness.fixture.zone.slot(harness.fixture.slot).current(),
+                Some(child)
+            );
+
+            // Child exits(41) -> wakes sibling's wait4, leaving leader parked in msgrcv.
+            let mut exit_frame = carrick_el1_abi::TrapFrame::default();
+            harness.exit_current_child(41, &mut cpu, &mut exit_frame);
+            assert_eq!(
+                harness.fixture.zone.slot(harness.fixture.slot).current(),
+                Some(sibling)
+            );
+            assert_eq!(exit_frame.x[0], u64::from(child_pid));
+            assert!(matches!(
+                harness.fixture.zone.record(harness.parent_record).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
+
+            // Sibling sends message -> wakes leader's msgrcv.
+            assert!(matches!(
+                harness.msgsnd_current(qid, 1, b"carrick!", 0, &mut cpu),
+                Ok(carrick_personality_linux::ipc::IpcOutcome::Returned(_))
+            ));
+            assert!(
+                harness
+                    .fixture
+                    .zone
+                    .requeue_preempted(harness.fixture.slot, sibling)
+                    .is_queued()
+            );
+            let mut resumed = carrick_el1_abi::TrapFrame::default();
+            assert_eq!(
+                harness.switch_next(&mut cpu, &mut resumed),
+                carrick_el1_abi::Action::Served
+            );
+            assert_eq!(resumed.x[0], 8);
+            assert_eq!(rx_buf.get::<MsgBuf>(0).mtext, *b"carrick!");
+        } else {
+            // Leader parks in blocking wait4(child_pid) first.
+            let mut wait = carrick_el1_abi::TrapFrame::default();
+            wait.x[8] = 260;
+            wait.x[0] = u64::from(child_pid);
+            wait.x[1] = status.arg();
+            harness.call_current(&mut wait, &mut cpu);
+            assert_eq!(
+                harness.fixture.zone.slot(harness.fixture.slot).current(),
+                Some(sibling)
+            );
+
+            // Sibling calls blocking msgrcv: must park, NOT -11!
+            let mut rcv_switched = carrick_el1_abi::TrapFrame::default();
+            let rcv =
+                harness.msgrcv_current(qid, rx_buf.arg(), 8, 0, 0, &mut cpu, &mut rcv_switched);
+            assert!(
+                matches!(
+                    rcv,
+                    Ok(carrick_personality_linux::ipc::IpcOutcome::Suspended)
+                ),
+                "sibling msgrcv blocked by parked wait4: {rcv:?}"
+            );
+            assert!(matches!(
+                harness.fixture.zone.record(sibling).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
+            assert_eq!(
+                harness.fixture.zone.slot(harness.fixture.slot).current(),
+                Some(child)
+            );
+
+            // Child exits(43) -> wakes leader's wait4, leaving sibling parked in msgrcv.
+            let mut exit_frame = carrick_el1_abi::TrapFrame::default();
+            harness.exit_current_child(43, &mut cpu, &mut exit_frame);
+            assert_eq!(
+                harness.fixture.zone.slot(harness.fixture.slot).current(),
+                Some(harness.parent_record)
+            );
+            assert_eq!(exit_frame.x[0], u64::from(child_pid));
+            assert!(matches!(
+                harness.fixture.zone.record(sibling).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
+
+            // Leader sends message -> wakes sibling's msgrcv.
+            assert!(matches!(
+                harness.msgsnd_current(qid, 1, b"carrick!", 0, &mut cpu),
+                Ok(carrick_personality_linux::ipc::IpcOutcome::Returned(_))
+            ));
+            assert!(
+                harness
+                    .fixture
+                    .zone
+                    .requeue_preempted(harness.fixture.slot, harness.parent_record)
+                    .is_queued()
+            );
+            let mut resumed = carrick_el1_abi::TrapFrame::default();
+            assert_eq!(
+                harness.switch_next(&mut cpu, &mut resumed),
+                carrick_el1_abi::Action::Served
+            );
+            assert_eq!(resumed.x[0], 8);
+            assert_eq!(rx_buf.get::<MsgBuf>(0).mtext, *b"carrick!");
+        }
+    }
+}
