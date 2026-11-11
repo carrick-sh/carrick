@@ -730,3 +730,157 @@ impl crate::sched::ThreadCpu for ChildResumeCpu<'_, '_> {
         self.inner.own_sgi_target()
     }
 }
+
+/// Drive one owned exit of a production native fork child through the
+/// shipping decision (`native_service_decision`) and begin
+/// (`begin_native_service`) bodies, exactly as the bare-metal
+/// `arm_native_service_exit` does for a `Forward` boundary, and return the
+/// operation it published to the carrier. The frame still holds a clock
+/// call's number and arguments in `x8`/`x0`/`x1`, as it does for the
+/// instructions after `clock_gettime` returns.
+fn child_exit_operation(
+    esr: u64,
+    far: u64,
+    nr: u64,
+    host_work: bool,
+) -> carrick_core_abi::service::ServiceOperation {
+    use crate::native_process_runtime::{NativeResume, NativeThreadGroupOwner};
+
+    let ForkChild {
+        fixture,
+        source,
+        runtime,
+        registry,
+        child_task,
+        child,
+        crossing,
+        words,
+        ..
+    } = fork_child();
+    let counters: &'static carrick_el1_abi::Counters =
+        Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    let out = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(16)));
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr,
+        far,
+        elr: 0x400008,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    frame.x[8] = nr;
+    frame.x[0] = 1;
+    frame.x[1] = out.arg();
+    frame.x[2] = 0;
+    if host_work {
+        child_task.linux.mark_pending_host_work();
+    }
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        child_task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        crossing,
+    )
+    .with_words(words);
+    let mut entry = runtime
+        .enter_registered(
+            registry,
+            source,
+            child_task,
+            child.address,
+            &child.words,
+            &mut child_service,
+        )
+        .unwrap();
+    let begin = match crate::dispatch::native_service_decision(
+        &mut frame,
+        child_task,
+        carrick_el1_abi::Action::Forward,
+        None,
+        counters,
+        || NativeThreadGroupOwner::ForkChild,
+        |_| None,
+    ) {
+        crate::dispatch::NativeServiceDecision::Begin(begin) => begin,
+        crate::dispatch::NativeServiceDecision::Reply(result) => {
+            panic!("the ring answered {result} for a non-syscall exit")
+        }
+        crate::dispatch::NativeServiceDecision::Action(action) => {
+            panic!("the ring finished a non-syscall exit with {action:?}")
+        }
+        crate::dispatch::NativeServiceDecision::Decline => {
+            panic!("an owned native exit must publish its operation")
+        }
+    };
+    let (result, _) = crate::dispatch::begin_native_service(
+        &mut *entry,
+        frame.x[8],
+        begin,
+        None,
+        counters,
+        counters,
+        || None,
+    );
+    assert!(matches!(result.unwrap(), NativeResume::Left(None)));
+    drop(entry);
+    let notice = child_task.service_notice.take().unwrap().unwrap();
+    // SAFETY: the live child retains this control slot in fixture-owned stock.
+    let child_control = unsafe {
+        &*(child_task.metadata.control_slot.load(Ordering::Acquire) as *const ThreadControlSlot)
+    };
+    // SAFETY: this fixture owns the parked member and its service queue.
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &child_control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(child.record.id).identity(),
+        )
+    }
+    .unwrap();
+    assert_eq!(out.as_bytes(), &[0; 16], "nothing reads a clock into x1");
+    ticket.request().operation
+}
+
+/// #2039: a data abort is not a syscall. A native child that faults on a
+/// page the carrier must supply while `x8` still names `clock_gettime` (as
+/// it does for the instructions after the call returns) publishes the owner
+/// fault, never a clock sample: a sample answered there writes into
+/// whatever `x1` holds, overwrites `x0`, and resumes the faulting
+/// instruction with the fault unsupplied.
+#[test]
+fn child_data_abort_with_clock_registers_publishes_its_fault() {
+    use carrick_core_abi::service::ServiceOperation;
+    const FAR: u64 = 0x5000_0010;
+    // EC 0x24 (lower-EL data abort), IL, WnR, level-3 translation fault.
+    let esr = (0x24 << 26) | (1 << 25) | (1 << 6) | 0x07;
+    for nr in [CLOCK_GETTIME, GETTIMEOFDAY] {
+        let operation = child_exit_operation(esr, FAR, nr, false);
+        let ServiceOperation::Fault(fault) = operation else {
+            panic!("a data abort with clock registers ({nr}) published {operation:?}");
+        };
+        assert_eq!(fault.address.raw(), FAR);
+        assert_eq!(fault.access, carrick_guest_arch::Access::Write);
+    }
+}
+
+/// #2039: an EL0 IRQ that carries host work is the carrier-work boundary,
+/// whatever the interrupted thread's registers hold.
+#[test]
+fn child_host_work_irq_with_clock_registers_publishes_carrier_work() {
+    use carrick_core_abi::service::ServiceOperation;
+    use carrick_sched_core::object_wait::OwnerEntry;
+    for nr in [CLOCK_GETTIME, GETTIMEOFDAY] {
+        let operation = child_exit_operation(0, 0, nr, true);
+        assert!(
+            matches!(
+                operation,
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Exception
+                }
+            ),
+            "a host-work IRQ with clock registers ({nr}) published {operation:?}"
+        );
+    }
+}
