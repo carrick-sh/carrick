@@ -1340,6 +1340,9 @@ where
                 .into());
             }
         };
+        // Retirement removes the task from the live graph; the exit record
+        // below takes the identity the exit reserved (#2020).
+        let exit_identity = graph_exit.identity();
         let notification_kernel = Arc::clone(&self.kernel);
         let publish_result =
             match self
@@ -1440,7 +1443,8 @@ where
                 });
             drop(registry);
         }
-        let process_exit_event = process.record_process_exit_begin(exit_code, self.state.this_tid);
+        let process_exit_event =
+            process.record_process_exit_begin(exit_code, self.state.this_tid, exit_identity);
         if let Some(work) = self.external_exec.take() {
             let out = self.kernel.dispatcher.stdout();
             let err = self.kernel.dispatcher.stderr();
