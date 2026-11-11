@@ -1,3 +1,6 @@
+# #2020: `hvpatch/mod.rs` builds the ProcessExit lifecycle event from the
+# exit-reserved identity; no carrier window or mapping change.
+# No change to this contract's guest semantics, bindings or budgets.
 # #1733 (core capture reads under its own exclusion): the AArch64 engine
 # replaces read_core_bytes with CoreMemorySource mechanics (stage-1
 # output, backing copy, untouched-zero leaf check). Only core capture's
