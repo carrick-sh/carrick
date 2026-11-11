@@ -680,7 +680,12 @@ impl Drop for HostFsBackend {
             // (docs/perf-results/container-lifecycle-split.jsonl) - pure wall
             // the user waits through for a tree nobody will read again.
             if let Some(scratch) = self._scratch.take() {
-                let _ = defer_remove_tree(scratch.keep());
+                let path = scratch.keep();
+                LIVE_SCRATCH
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|live| *live != path);
+                let _ = defer_remove_tree(path);
             }
             if let Some(path) = self._attached_cleanup_path.take() {
                 let _ = defer_remove_tree(path);
@@ -1241,13 +1246,50 @@ fn discover_orphans_after_root_lock(
     discover_orphans(scratch_root, limit)
 }
 
-/// Finish this run's scratch reclamation before the process exits, so a
-/// `--rm` (or any) run leaves no scratch behind and trash from earlier
-/// failed or interrupted runs does not accumulate. The deferred-removal
-/// worker has no shutdown join (exit latency is deliberate while the guest
-/// runs), so a short-lived process otherwise abandons its queue and each run
-/// leaks its whole image tree. Call once, after the guest has exited and its
-/// output is flushed.
+/// Scratch roots this process has created backends under, and the pid that
+/// registered the exit hook (a forked helper inheriting the hook must not run
+/// the owner's reclamation).
+static SCRATCH_ROOTS_IN_USE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// Per-run scratch trees this process created and has not yet retired. A run
+/// that leaves through `process::exit` never drops its backend, so the exit
+/// hook retires these itself.
+static LIVE_SCRATCH: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static EXIT_HOOK_OWNER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record `scratch_root` for exit-time reclamation and arm the process exit
+/// hook once. Every `carrick run` path ends in `std::process::exit`, which
+/// skips `Drop` and never joins the deferred-removal worker.
+fn note_scratch_root_in_use(scratch_root: &Path) {
+    static ARM: std::sync::Once = std::sync::Once::new();
+    {
+        let mut roots = SCRATCH_ROOTS_IN_USE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !roots.iter().any(|root| root == scratch_root) {
+            roots.push(scratch_root.to_path_buf());
+        }
+    }
+    ARM.call_once(|| {
+        EXIT_HOOK_OWNER.store(std::process::id(), std::sync::atomic::Ordering::Relaxed);
+        extern "C" fn at_exit() {
+            if EXIT_HOOK_OWNER.load(std::sync::atomic::Ordering::Relaxed) == std::process::id() {
+                finish_scratch_cleanup();
+            }
+        }
+        // SAFETY: `at_exit` is a plain `extern "C"` fn with no captured state.
+        unsafe {
+            libc::atexit(at_exit);
+        }
+    });
+}
+
+/// Finish scratch reclamation before the process exits, so a `--rm` (or any)
+/// run leaves no scratch behind and trash from earlier failed or interrupted
+/// runs does not accumulate. The deferred-removal worker has no shutdown join
+/// (exit latency is deliberate while the guest runs), so a short-lived
+/// process otherwise abandons its queue and each run leaks its whole image
+/// tree. Runs automatically at process exit once a backend exists; callable
+/// earlier to settle the state deterministically.
 pub fn finish_scratch_cleanup() {
     let (reply, done) = std::sync::mpsc::sync_channel(1);
     if let Some(sender) = scratch_cleanup_sender().sender.as_ref()
@@ -1255,7 +1297,23 @@ pub fn finish_scratch_cleanup() {
     {
         let _ = done.recv();
     }
-    if let Ok(root) = default_scratch_root() {
+    let live = std::mem::take(
+        &mut *LIVE_SCRATCH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    for path in live {
+        // Detach an overlay first, exactly as `Drop` does, so the reclaim
+        // cannot descend into a live mount.
+        #[cfg(target_os = "linux")]
+        unmount_overlay_at(&path.join("merged"));
+        let _ = rename_scratch_to_trash(&path);
+    }
+    let roots = SCRATCH_ROOTS_IN_USE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for root in roots {
         reclaim_scratch_root(&root);
     }
 }
@@ -1312,6 +1370,7 @@ impl HostFsBackend {
 
     pub fn new_in(scratch_root: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(scratch_root)?;
+        note_scratch_root_in_use(scratch_root);
         let root_lock_path = scratch_root.join(".carrick.sweep.lock");
         let root_lock_file = std::fs::OpenOptions::new()
             .create(true)
@@ -1325,6 +1384,10 @@ impl HostFsBackend {
 
         let scratch = tempfile::TempDir::new_in(scratch_root)?;
         let lock = acquire_lockfile(scratch.path())?;
+        LIVE_SCRATCH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(scratch.path().to_path_buf());
         drop(root_guard);
         let scratch_c = std::ffi::CString::new(scratch.path().as_os_str().as_encoded_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -7326,7 +7389,7 @@ pub fn default_scratch_root() -> std::io::Result<PathBuf> {
     // Prefer the dedicated carrick APFS volume (case-sensitive, isolated,
     // throw-away-able via `carrick volume delete`) when it exists. The
     // user lays it down once via `carrick volume create`; without it we
-    // fall back to `~/.carrick/scratch`, which on a standard macOS
+    // fall back to `<carrick home>/scratch`, which on a standard macOS
     // install is on the case-INSENSITIVE boot volume and will cause the
     // dispatcher's case-sensitivity probe to demote us to MemoryBackend.
     #[cfg(target_os = "macos")]
@@ -7335,14 +7398,7 @@ pub fn default_scratch_root() -> std::io::Result<PathBuf> {
     }
     #[allow(unreachable_code)]
     {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("TMPDIR").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let mut path = home;
-        path.push(".carrick");
-        path.push("scratch");
-        Ok(path)
+        Ok(carrick_spec::carrick_home().join("scratch"))
     }
 }
 
