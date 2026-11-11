@@ -2458,13 +2458,20 @@ impl<'a> MemView<'a> {
                     ));
                 }
             }
-            memory.set_mapping_protection_and_sharing(
-                address,
-                length_usize,
-                prot_none,
-                !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
-                map_sharing.guest_mapping_sharing(),
-            );
+            // An owner-backed private file map publishes nothing: the root
+            // decides its pages, and the venue settle releases their host
+            // facts. Recording them would arm a new-mapping publication no
+            // `protect_range` here consumes, failing a later edit of a
+            // touched page.
+            if !owner_file_backed {
+                memory.set_mapping_protection_and_sharing(
+                    address,
+                    length_usize,
+                    prot_none,
+                    !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
+                    map_sharing.guest_mapping_sharing(),
+                );
+            }
             // Make the requested protection guest-visible (also restores RW for
             // a reused range). prot==0 here means file-backed PROT_NONE.
             // Unconditional: reserve across the whole arena; fatal only in-arena.
