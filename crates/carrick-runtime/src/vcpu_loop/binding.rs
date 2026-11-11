@@ -1105,6 +1105,19 @@ where
         }
     }
 
+    /// Offer an EL0 abort to the engine's frame-COW resolver. The resolver
+    /// may refill the MM's EL1 COW grant chain, which needs room only
+    /// settlement makes: settle the MM's completions first and keep EL1
+    /// excluded until the resolver returns (#1733).
+    fn resolve_el0_frame_cow_fault(
+        &mut self,
+        engine: &mut E,
+        syndrome: u64,
+        far: u64,
+    ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
+        engine.resolve_frame_cow_fault(syndrome, far)
+    }
+
     fn finalize_persistent_process_terminal(
         &mut self,
         engine: &mut E,
@@ -5632,7 +5645,7 @@ where
                 if let carrick_hal::CowFaultResolution::Resolved {
                     translation,
                     arm_generation,
-                } = engine.resolve_frame_cow_fault(syndrome, far)?
+                } = self.resolve_el0_frame_cow_fault(engine, syndrome, far)?
                 {
                     if let Some(mm_key) = self.state.zone_mm {
                         signal::cancel_frame_grant_request(
@@ -11138,6 +11151,186 @@ mod tests {
         let lease = submission.take_execution_lease().unwrap();
         running.restore_lease(lease).unwrap();
         scheduler.settle_exited(running).unwrap();
+        scheduler.close();
+    }
+
+    /// #1733: after fork, EL1 resolves an owner MM's copy-on-write writes
+    /// with grants and leaves each completion USED in the MM's 64-record
+    /// probe chain until the host settles it. Only an exclusion of the MM's
+    /// EL1 editor settles, and the EL0 fault arm offered the fault to the
+    /// engine's refill without one, so a parent that wrote more than a
+    /// chain's worth of COW pages found the chain full: the refill published
+    /// nothing and the host denied the write (SIGSEGV after correct output
+    /// in `py-fork`/`py-subproc`). The fault arm must settle first and keep
+    /// EL1 excluded while the resolver refills.
+    #[test]
+    fn serial_host_el0_cow_fault_refills_a_chain_full_of_used_grants() {
+        use carrick_el1_abi::{
+            COW_GRANT_PROBES, COW_GRANT_SIZE, CowGrantCompletion, CowGrantPurpose, ExcludedEditor,
+        };
+        use carrick_el1_linux::mm_portal::test_support::{ROOT, Region, admit_notified};
+        use std::num::NonZeroU64;
+
+        /// The carrier's settlement, reduced to the pool bookkeeping.
+        struct FreeCompletions;
+        impl carrick_el1_abi::CowGrantSettlement for FreeCompletions {
+            fn settle(&self, excluded: &ExcludedEditor<'_>) {
+                let pool = carrick_el1_abi::cow_grant_pool_host().unwrap();
+                let completions: Vec<_> = pool.completions(excluded).collect();
+                for completion in completions {
+                    assert!(pool.finish(excluded, &completion.grant));
+                }
+            }
+            fn release(&self, _: &ExcludedEditor<'_>) {}
+        }
+        struct ClearRegion;
+        impl Drop for ClearRegion {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+            }
+        }
+        fn backing(n: u64) -> carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+            let id = NonZeroU64::new(n).unwrap();
+            carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                frame_id: id,
+                mapping_id: id,
+                owner_generation: id,
+                inventory_revision: id,
+            }
+        }
+        const GRANT_BASE: u64 = 0x40_0000_0000;
+        const VA: u64 = 0x40_0000_0000;
+
+        let (_runtime, scheduler, kernel, root, process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_751, SyscallDispatcher::new());
+        let mm = root.shared().mm().id();
+        // The forked child: a second live process with its own MM, whose
+        // completions share the carrier-wide pool with the parent's.
+        let child =
+            root.kernel()
+                .reserve_fork(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
+                    .unwrap(),
+                    "cow-child".to_owned(),
+                    None,
+                )
+                .unwrap()
+                .prepare_reference(ThreadId::synthetic_for_tests(72_752))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_parts()
+                .unwrap()
+                .0;
+        let child_mm = child.shared().mm().id();
+        assert_ne!(child_mm, mm);
+        let region = Box::leak(Box::new(Region::new()));
+        admit_notified(region, mm.raw(), ROOT, 1, 0);
+        admit_notified(region, child_mm.raw(), ROOT + 0x4000_0000, 1, 0);
+        carrick_el1_abi::record_el1_region_host_ptr(region.ptr.as_ptr() as usize);
+        let _clear_region = ClearRegion;
+        carrick_kernel::kernel::mm_occupancy::install_guest_cow_settlement(Arc::new(
+            FreeCompletions,
+        ));
+        let zone: &'static carrick_el1_abi::ZoneTables = region.zone();
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            let pool = carrick_el1_abi::cow_grant_pool_host().unwrap();
+            let index = zone
+                .spaces
+                .find(mm.raw())
+                .expect("the MM's space is published");
+            // EL1 used every grant of the parent's chain (64 USED
+            // completions) and a few of the live child's.
+            let used = |key: u64, n: u64| {
+                let ipa = GRANT_BASE + n * COW_GRANT_SIZE;
+                pool.publish(key, ipa, backing(n + 1)).unwrap();
+                let grant = pool.claim(key).unwrap();
+                assert!(pool.complete(&CowGrantCompletion {
+                    purpose: CowGrantPurpose::UserWrite,
+                    grant,
+                    span_va: VA + n * COW_GRANT_SIZE,
+                    span_len: COW_GRANT_SIZE,
+                    old_ipa: 0x80_0000_0000 + n * COW_GRANT_SIZE,
+                    new_ipa: grant.physical_ipa,
+                }));
+            };
+            for n in 0..COW_GRANT_PROBES as u64 {
+                used(mm.raw(), n);
+            }
+            for n in 0..4 {
+                used(child_mm.raw(), 0x100 + n);
+            }
+            let child_completions = || pool.has_completions_for(child_mm.raw());
+            let refill_ipa = GRANT_BASE + COW_GRANT_PROBES as u64 * COW_GRANT_SIZE;
+            assert!(
+                pool.publish(mm.raw(), refill_ipa, backing(1_000)).is_none(),
+                "the chain is full of USED completions"
+            );
+
+            // The HVF resolver's first step: refill the chain for EL1 to
+            // retry the write. Record what it found.
+            let observed = Arc::new(Mutex::new(None));
+            let record = Arc::clone(&observed);
+            let mut engine = CrashCaptureTestEngine {
+                frame_cow_fault: Some(Box::new(move |_, _| {
+                    let excluded =
+                        zone.spaces.gate(index) != 0 && zone.spaces.active_editor(index).is_none();
+                    let published = pool.publish(mm.raw(), refill_ipa, backing(1_000)).is_some();
+                    *record.lock() = Some((excluded, published));
+                    carrick_hal::CowFaultResolution::NotCow
+                })),
+                ..Default::default()
+            };
+            let tid = ThreadId::synthetic_for_tests(72_751);
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                Arc::new(ThreadRegistry::new(tid)),
+                Arc::new(FutexTable::new()),
+                Arc::new(NoopPlatformFutex),
+                Arc::new(|_| Arc::new(NoopPlatformFutex)),
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(root.thread())),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                tid,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.zone_mm = Some(mm.raw());
+            let mut job =
+                suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+            // A data abort, write, permission fault at level 3, from EL0.
+            let syndrome = (0x24 << 26) | (1 << 25) | (1 << 6) | 0x0f;
+            let _ = job
+                .resolve_el0_frame_cow_fault(&mut engine, syndrome, VA + 0x10)
+                .unwrap();
+
+            assert_eq!(
+                *observed.lock(),
+                Some((true, true)),
+                "(EL1 excluded, refill published) while the resolver ran"
+            );
+            assert!(
+                !pool.has_completions_for(mm.raw()),
+                "every completion of the parent was settled"
+            );
+            assert!(
+                child_completions(),
+                "the child's completions belong to the child's settlement"
+            );
+            assert!(child.exact_thread_is_live() && root.exact_thread_is_live());
+            assert_eq!(
+                zone.spaces.gate(index),
+                0,
+                "the exclusion ends with the resolver"
+            );
+        });
         scheduler.close();
     }
 
