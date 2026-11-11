@@ -2037,7 +2037,11 @@ fn zone_pipe_poll_finite_timeout_expires() {
 
 #[test]
 fn zone_pipe_ppoll_finite_timeout_writer_close_wins() {
-    zone_pipe_poll_wake(&["-DWAKE_BY_CLOSE", "-DNO_CHILD_SLEEP", "-DFINITE_TIMEOUT_LONG"]);
+    zone_pipe_poll_wake(&[
+        "-DWAKE_BY_CLOSE",
+        "-DNO_CHILD_SLEEP",
+        "-DFINITE_TIMEOUT_LONG",
+    ]);
 }
 
 #[test]
