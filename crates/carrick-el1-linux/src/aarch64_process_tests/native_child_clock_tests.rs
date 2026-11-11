@@ -97,18 +97,24 @@ fn child_clock_call(nr: u64, x0: u64, x1: u64, clock: &Arc<ClockDomain>, served:
     result.raw()
 }
 
-/// Stage one clock call from a production native fork child through ring
-/// dispatch and its begin body, serve it as the carrier does, and wake the
-/// parked child.
-fn serve_child_clock(
-    nr: u64,
-    x0: u64,
-    x1: u64,
-    clock: &Arc<ClockDomain>,
-    served: &mut u32,
-) -> ChildClock {
-    use crate::native_process_runtime::{NativeResume, NativeThreadGroupOwner};
-    use carrick_personality_linux::dispatch::CompletionRoute;
+/// A production native fork child, switched in and running on the fixture
+/// slot with its own address space installed; the parent (a different mm)
+/// is queued behind it on the same slot.
+pub(super) struct ForkChild {
+    pub(super) fixture: &'static Fixture,
+    pub(super) source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    pub(super) runtime: Arc<NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>>,
+    pub(super) registry: &'static NativeProcessRegistry<'static, Mm, Aarch64ParkedContext>,
+    pub(super) child_task: &'static CurrentTask,
+    pub(super) child: crate::native_process_runtime::NativeRecordBinding<Mm, Aarch64ParkedContext>,
+    pub(super) parent: RecordId,
+    pub(super) crossing: &'static TestStockCrossing,
+    pub(super) words:
+        &'static (dyn carrick_mmu_core::live_descriptor_words::LiveDescriptorWords + 'static),
+}
+
+pub(super) fn fork_child() -> ForkChild {
+    use crate::native_process_runtime::NativeThreadGroupOwner;
 
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let source = BornInZoneSource {
@@ -178,6 +184,43 @@ fn serve_child_clock(
         registry.thread_group_owner(fixture.zone, page, child_task.visible_pid().unwrap()),
         NativeThreadGroupOwner::ForkChild,
     );
+    ForkChild {
+        fixture,
+        source,
+        runtime,
+        registry,
+        child_task,
+        child,
+        parent: parent_binding.record.id,
+        crossing,
+        words,
+    }
+}
+
+/// Stage one clock call from a production native fork child through ring
+/// dispatch and its begin body, serve it as the carrier does, and wake the
+/// parked child.
+fn serve_child_clock(
+    nr: u64,
+    x0: u64,
+    x1: u64,
+    clock: &Arc<ClockDomain>,
+    served: &mut u32,
+) -> ChildClock {
+    use crate::native_process_runtime::{NativeResume, NativeThreadGroupOwner};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+
+    let ForkChild {
+        fixture,
+        source,
+        runtime,
+        registry,
+        child_task,
+        child,
+        parent,
+        crossing,
+        words,
+    } = fork_child();
     let counters: &'static carrick_el1_abi::Counters =
         Box::leak(Box::new(carrick_el1_abi::Counters::new()));
     let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
@@ -196,9 +239,9 @@ fn serve_child_clock(
         fixture.zone,
         fixture.region.table(),
         NonZeroU64::MIN,
-        &*crossing,
+        crossing,
     )
-    .with_words(&*words);
+    .with_words(words);
     let mut entry = runtime
         .enter_registered(
             registry,
@@ -321,7 +364,7 @@ fn serve_child_clock(
         registry,
         child_task,
         child,
-        parent: parent_binding.record.id,
+        parent,
         service: child_service,
         counters,
     }))
