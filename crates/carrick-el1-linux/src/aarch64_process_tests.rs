@@ -14830,16 +14830,34 @@ fn arm_kill_nonleader_recipient(blocked: bool) {
             SignalInfo::Generated(None),
         )
         .unwrap();
-    let (slot, target) = if blocked {
-        (fixture.slot, 0x1000)
+    let mut trace = crate::sched::object_wait::test_wake_trace();
+    trace.sort();
+    let mut expected = if blocked {
+        vec![(fixture.slot, 0x1000)]
     } else {
-        (sender_slot, 0x2000)
+        vec![(fixture.slot, 0x1000), (sender_slot, 0x2000)]
     };
+    expected.sort();
     assert_eq!(
-        crate::sched::object_wait::test_wake_trace(),
-        [(slot, target)],
-        "one eligible recipient: named member first, sibling when blocked"
+        trace, expected,
+        "every eligible member is kicked: the named member and its unblocked siblings"
     );
+    if !blocked {
+        // The named member stops being eligible before its checkpoint. The
+        // sibling that was kicked must still own the process-directed signal.
+        control.init_blocked(carrick_el1_abi::BlockedMask(signal.bit()));
+        let (got, _, _) = entry
+            .take_deliverable(carrick_signal_core::policy::SigBlockMask::NONE)
+            .expect("the kicked sibling must receive the signal");
+        assert_eq!(got, signal);
+        assert!(
+            entry
+                .take_deliverable(carrick_signal_core::policy::SigBlockMask::NONE)
+                .is_none(),
+            "the signal is delivered exactly once"
+        );
+        return;
+    }
     // A tkill substitution would leave this pending signal private to the
     // named sibling. Blocking the caller now must expose shared custody.
     fixture
