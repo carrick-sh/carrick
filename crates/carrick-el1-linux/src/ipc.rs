@@ -5481,6 +5481,7 @@ mod tests {
         canonical: carrick_syscall_abi::CanonicalNr,
         native: u64,
         queries: Vec<(usize, i32)>,
+        during_wait: Option<Box<dyn FnOnce()>>,
     }
     impl X86PollFrame {
         fn new(native: u64, args: [u64; 5]) -> Self {
@@ -5494,6 +5495,7 @@ mod tests {
                 canonical: carrick_syscall_abi::nr::PPOLL,
                 native,
                 queries: Vec::new(),
+                during_wait: None,
             }
         }
         fn close(slot: SlotId, fd: i32) -> Self {
@@ -5508,6 +5510,7 @@ mod tests {
                 canonical: carrick_personality_linux::crossing::nr::CLOSE,
                 native: 3,
                 queries: Vec::new(),
+                during_wait: None,
             }
         }
     }
@@ -5571,6 +5574,9 @@ mod tests {
             _: crate::dispatch::PollSignalMask,
         ) -> Option<i64> {
             self.queries.push((entries.len(), timeout_ms));
+            if let Some(mutation) = self.during_wait.take() {
+                mutation();
+            }
             for entry in entries.iter_mut() {
                 entry.revents = entry.events & LINUX_POLLOUT;
             }
@@ -6126,6 +6132,143 @@ mod tests {
 
     const ZERO_TIMESPEC: [i64; 2] = [0, 0];
     const UNMAPPED: u64 = 0xffff_ffff_ffff_f000;
+
+    #[test]
+    fn x86_shared_poll_preserves_fields_changed_during_host_wait() {
+        let w = world();
+        let tables = delegated();
+        let file_table = w.task.linux.file_table.load(Ordering::Acquire).max(1);
+        let mut pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        crate::file_table::admit_host_fd(
+            &tables.fd_map,
+            &tables.opens,
+            &tables.objects,
+            file_table,
+            4,
+            pipe[1],
+            0,
+        )
+        .unwrap();
+        let fds = GuestUserBuffer::from_value(PollFd {
+            fd: 4,
+            events: LINUX_POLLOUT,
+            revents: 0,
+        });
+        let address = fds.arg();
+        let mut frame = X86PollFrame::new(
+            carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
+            [address, 1, 1000, 0, 0],
+        );
+        frame.during_wait = Some(Box::new(move || {
+            // SAFETY: the live guest buffer contains this pollfd throughout dispatch.
+            unsafe {
+                (address as *mut i32).write_unaligned(-1);
+                ((address + 4) as *mut i16).write_unaligned(LINUX_POLLIN);
+            }
+        }));
+        let route = dispatch_poll(&w, &mut frame, None, &tables);
+        let published = fds.get::<PollFd>(0);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert_eq!(route, CompletionRoute::Served);
+        assert_eq!(frame.queries, [(1, 1000)]);
+        assert_eq!(frame.frame.x[0] as i64, 1);
+        assert_eq!(published.fd, -1);
+        assert_eq!(published.events, LINUX_POLLIN);
+        assert_eq!(published.revents, LINUX_POLLOUT);
+    }
+
+    #[test]
+    fn arm_immediate_poll_writes_only_the_writable_revents_page() {
+        let w = world();
+        let tables = delegated();
+        let mut fds = GuestUserBuffer::zeroed(4104);
+        let record_offset = 4096 - 6;
+        fds.write(
+            record_offset,
+            PollFd {
+                fd: -1,
+                events: LINUX_POLLIN,
+                revents: 0x7777,
+            },
+        );
+        let record = fds.arg_at(record_offset);
+        let boundary = fds.arg_at(4096);
+        carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |address, len, access| {
+                access != carrick_guest_arch::Access::Write
+                    || address.raw() >= boundary
+                    || address.raw() + len.raw() <= record
+            }));
+        });
+        let timeout = zero_timespec();
+        let mut frame = TrapFrame::default();
+        frame.x[..5].copy_from_slice(&[record, 1, timeout.arg(), 0, 0]);
+        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+        let route = dispatch_poll(&w, &mut frame, None, &tables);
+        carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+            *hook.borrow_mut() = None;
+        });
+        let published: PollFd = fds.read(record_offset);
+        assert_eq!(route, CompletionRoute::Served);
+        assert_eq!(frame.x[0] as i64, 0);
+        assert_eq!(published.fd, -1);
+        assert_eq!(published.events, LINUX_POLLIN);
+        assert_eq!(published.revents, 0);
+    }
+
+    #[test]
+    fn immediate_poll_copyout_scales_as_one_revents_field_per_entry() {
+        let w = world();
+        let tables = delegated();
+        let timeout = zero_timespec();
+        for count in [1, 8, 64] {
+            for x86 in [false, true] {
+                let fds = GuestUserBuffer::from_values(&vec![
+                    PollFd {
+                        fd: -1,
+                        events: LINUX_POLLIN,
+                        revents: 0x7777,
+                    };
+                    count
+                ]);
+                let writes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let observed = writes.clone();
+                carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |address, len, access| {
+                        if access == carrick_guest_arch::Access::Write {
+                            observed.borrow_mut().push((address.raw(), len.raw()));
+                        }
+                        true
+                    }));
+                });
+                let route = if x86 {
+                    let mut frame = X86PollFrame::new(
+                        carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
+                        [fds.arg(), count as u64, 0, 0, 0],
+                    );
+                    dispatch_poll(&w, &mut frame, None, &tables)
+                } else {
+                    let mut frame = TrapFrame::default();
+                    frame.x[..5].copy_from_slice(&[fds.arg(), count as u64, timeout.arg(), 0, 0]);
+                    frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+                    dispatch_poll(&w, &mut frame, None, &tables)
+                };
+                carrick_el1::substrate::file::TEST_USER_ACCESS.with(|hook| {
+                    *hook.borrow_mut() = None;
+                });
+                assert_eq!(route, CompletionRoute::Served);
+                let expected: Vec<_> = (0..count)
+                    .map(|index| (fds.arg() + (index * 8 + 6) as u64, 2))
+                    .collect();
+                assert_eq!(*writes.borrow(), expected, "x86={x86}, count={count}");
+                assert!((0..count).all(|index| revents(&fds, index) == 0));
+            }
+        }
+    }
 
     /// ppoll(2)/poll(2): nfds above the caller's soft RLIMIT_NOFILE is
     /// EINVAL; at the limit the set is served. Linux reads the timespec and

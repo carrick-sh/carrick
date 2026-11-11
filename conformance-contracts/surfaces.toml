@@ -1322,6 +1322,7 @@ surfaces = [
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_loader_reopen.S", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_pipe2.S", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_pipe_poll_wake.S", contract = "kernel.el1.poll-select-owner" },
+  { path = "crates/carrick-vmm-kvm/tests/fixtures/native_poll_revents_only.S", contract = "kernel.el1.poll-select-owner" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_private_file.S", contract = "kernel.mm.private-file-fixed-replacement" },
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_redirect_write.S", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs", contract = "x86.run-elf.poll" },
