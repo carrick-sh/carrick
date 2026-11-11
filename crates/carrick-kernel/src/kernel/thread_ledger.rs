@@ -1288,9 +1288,16 @@ impl Kernel {
     /// pool empty and waits in carrier work for stock (#1974). That clone is
     /// the demand [`Self::prepare_executable_thread_births`] defers for a
     /// singleton, so stock the member's process as its first host clone
-    /// would. Stocking nothing (no standing depth, `RLIMIT_NPROC`, exhaustion)
-    /// leaves the clone's rerun to the host-issued answer.
-    pub fn stock_thread_births_on_demand(&self, member: &carrick_sched_core::ThreadIdentity) {
+    /// would, through the same [`ThreadLedger::replenish`]. The answer is
+    /// `Stocked` iff the member's page then holds claimable stock (stocked
+    /// now, or already); stocking nothing (no standing depth, `RLIMIT_NPROC`,
+    /// exhaustion, a closed gate, an unknown or stale member) is
+    /// `Unstockable`, and the clone's rerun takes the host-issued answer.
+    pub fn stock_thread_births_on_demand(
+        &self,
+        member: &carrick_sched_core::ThreadIdentity,
+    ) -> carrick_core_abi::service::CarrierWorkReply {
+        use carrick_core_abi::service::CarrierWorkReply;
         let Some(kernel) = self
             .registry()
             .thread_ledger()
@@ -1298,7 +1305,7 @@ impl Kernel {
             .get()
             .and_then(Weak::upgrade)
         else {
-            return;
+            return CarrierWorkReply::Unstockable;
         };
         let state = self.registry().settled().read();
         let Some((record, thread)) = state.tasks.values().find_map(|record| {
@@ -1314,27 +1321,32 @@ impl Kernel {
                 })
                 .map(|thread| (record, thread))
         }) else {
-            return;
+            return CarrierWorkReply::Unstockable;
         };
-        if !thread.control_lease().lifecycle().serves_threads()
-            || record
+        let page = thread.control_lease().lifecycle();
+        if page.serves_threads()
+            && record
                 .task
                 .thread_adoption_factory()
-                .is_none_or(|factory| !factory.executable_births())
+                .is_some_and(|factory| factory.executable_births())
         {
-            return;
+            let context = KernelContext::from_parts(
+                kernel,
+                record.task.clone(),
+                thread.clone(),
+                record.task.shared(),
+                thread.resources(),
+                record.revision,
+            );
+            self.registry()
+                .thread_ledger()
+                .replenish(self, &state, &context);
         }
-        let context = KernelContext::from_parts(
-            kernel,
-            record.task.clone(),
-            thread.clone(),
-            record.task.shared(),
-            thread.resources(),
-            record.revision,
-        );
-        self.registry()
-            .thread_ledger()
-            .replenish(self, &state, &context);
+        if carrick_core::lifecycle::stock::claimable(&*page) {
+            CarrierWorkReply::Stocked
+        } else {
+            CarrierWorkReply::Unstockable
+        }
     }
 
     /// Retire unused standing birth reservations after scheduler admission
@@ -2272,9 +2284,16 @@ mod tests {
                 .len()
         };
         assert_eq!((standing(&root), standing(&peer)), (0, 0), "singletons");
-        kernel.stock_thread_births_on_demand(&member(&root, 1));
+        use carrick_core_abi::service::CarrierWorkReply;
+        assert_eq!(
+            kernel.stock_thread_births_on_demand(&member(&root, 1)),
+            CarrierWorkReply::Unstockable
+        );
         assert_eq!((standing(&root), standing(&peer)), (0, 0), "stale member");
-        kernel.stock_thread_births_on_demand(&member(&root, 0));
+        assert_eq!(
+            kernel.stock_thread_births_on_demand(&member(&root, 0)),
+            CarrierWorkReply::Stocked
+        );
         assert_eq!(
             (standing(&root), standing(&peer)),
             (super::DEFAULT_THREAD_POOL_DEPTH, 0),
@@ -2289,7 +2308,10 @@ mod tests {
             "the ring clone's rerun claims a stocked entry"
         );
         kernel.registry().thread_ledger().set_pool_depth_for_test(0);
-        kernel.stock_thread_births_on_demand(&member(&peer, 0));
+        assert_eq!(
+            kernel.stock_thread_births_on_demand(&member(&peer, 0)),
+            CarrierWorkReply::Unstockable
+        );
         assert_eq!(standing(&peer), 0, "no standing depth, no stock");
     }
 

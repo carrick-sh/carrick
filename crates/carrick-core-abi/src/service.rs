@@ -136,8 +136,11 @@ pub enum ServiceOperation {
         ordinal: NativeOrdinal,
     },
     /// Deliver carrier work before resuming the exact saved instruction context.
+    /// `demand` names anything else the carrier owes this exact requester
+    /// before its reply; it travels with the request, never in a shared word.
     CarrierWork {
         entry: OwnerEntry,
+        demand: CarrierDemand,
     },
     /// Prepare one executable image from a bounded payload in guest memory.
     /// The exact service birth/MM authenticates the stage-1 translation; this
@@ -162,6 +165,73 @@ pub enum ServiceOperation {
         capability: crate::clock::ClockCapabilityId,
         payload: ClockPayloadDescriptor,
     },
+}
+
+/// What a [`ServiceOperation::CarrierWork`] request asks of the carrier
+/// beyond delivering its owed carrier work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CarrierDemand {
+    /// Only the carrier work the requester's boundary owes.
+    Work,
+    /// The requester's thread birth found its host-stocked pool empty and
+    /// waits: stock the requester's own process before replying.
+    ThreadStock,
+}
+impl CarrierDemand {
+    const fn encode(self) -> u64 {
+        match self {
+            Self::Work => 0,
+            Self::ThreadStock => 1,
+        }
+    }
+    const fn decode(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Work),
+            1 => Some(Self::ThreadStock),
+            _ => None,
+        }
+    }
+}
+
+/// The carrier's typed answer to a [`ServiceOperation::CarrierWork`]
+/// request. On the wire a stocked or delivered answer is
+/// [`ServiceResult::Supplied`] and an unstockable one
+/// [`ServiceResult::Refused`]; the request's [`CarrierDemand`] tells them
+/// apart, so each answer is valid only for its own demand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CarrierWorkReply {
+    /// [`CarrierDemand::Work`]: the owed carrier work was delivered.
+    Delivered,
+    /// [`CarrierDemand::ThreadStock`]: the requester's pool holds stock the
+    /// ring can claim (stocked now, or already). A rerun that finds it
+    /// empty again lost it to a sibling and waits again.
+    Stocked,
+    /// [`CarrierDemand::ThreadStock`]: the carrier can stock nothing for
+    /// this process (no standing depth, `RLIMIT_NPROC`, exhaustion, a closed
+    /// gate or a stale requester). The rerun takes the host's own answer.
+    Unstockable,
+}
+impl CarrierWorkReply {
+    /// Whether this answer acknowledges as supplied, or `None` when it is
+    /// not an answer to `demand`.
+    pub const fn supplied_for(self, demand: CarrierDemand) -> Option<bool> {
+        match (demand, self) {
+            (CarrierDemand::Work, Self::Delivered)
+            | (CarrierDemand::ThreadStock, Self::Stocked) => Some(true),
+            (CarrierDemand::ThreadStock, Self::Unstockable) => Some(false),
+            _ => None,
+        }
+    }
+    /// The answer an acknowledged `demand` request carried, or `None` for a
+    /// result no carrier answer produces (the ring treats that as broken).
+    pub const fn for_result(demand: CarrierDemand, result: ServiceResult) -> Option<Self> {
+        match (demand, result) {
+            (CarrierDemand::Work, ServiceResult::Supplied) => Some(Self::Delivered),
+            (CarrierDemand::ThreadStock, ServiceResult::Supplied) => Some(Self::Stocked),
+            (CarrierDemand::ThreadStock, ServiceResult::Refused) => Some(Self::Unstockable),
+            _ => None,
+        }
+    }
 }
 
 /// One bounded ring-owned clock-resource record ([`crate::clock`]).
@@ -1300,8 +1370,8 @@ impl ServiceCell {
             }
             ServiceOperation::Fault(fault) => (1, fault_bits(fault), fault.address.raw()),
             ServiceOperation::Crossing { ordinal } => (2, ordinal.raw(), 0),
-            ServiceOperation::CarrierWork { entry } => {
-                (3, u64::from(entry == OwnerEntry::Syscall), 0)
+            ServiceOperation::CarrierWork { entry, demand } => {
+                (3, u64::from(entry == OwnerEntry::Syscall), demand.encode())
             }
             ServiceOperation::Exception(exception) => {
                 (4, exception.kind.encode(), exception.address.raw())
@@ -1452,15 +1522,15 @@ impl ServiceCell {
                 2 => ServiceOperation::Crossing {
                     ordinal: NativeOrdinal::new(first),
                 },
-                3 if first <= 1 && cell.words[11].load(Ordering::Relaxed) == 0 => {
-                    ServiceOperation::CarrierWork {
-                        entry: if first == 1 {
-                            OwnerEntry::Syscall
-                        } else {
-                            OwnerEntry::Exception
-                        },
-                    }
-                }
+                3 if first <= 1 => ServiceOperation::CarrierWork {
+                    entry: if first == 1 {
+                        OwnerEntry::Syscall
+                    } else {
+                        OwnerEntry::Exception
+                    },
+                    demand: CarrierDemand::decode(cell.words[11].load(Ordering::Relaxed))
+                        .ok_or(ServiceError::Stale)?,
+                },
                 4 => ServiceOperation::Exception(NativeException {
                     kind: NativeExceptionKind::decode(first).ok_or(ServiceError::Stale)?,
                     address: carrick_guest_arch::UserVa::new(
@@ -1588,11 +1658,11 @@ impl ServiceCell {
                 cell.words[9].load(Ordering::Relaxed) == 2
                     && cell.words[10].load(Ordering::Relaxed) == ordinal.raw()
             }
-            ServiceOperation::CarrierWork { entry } => {
+            ServiceOperation::CarrierWork { entry, demand } => {
                 cell.words[9].load(Ordering::Relaxed) == 3
                     && cell.words[10].load(Ordering::Relaxed)
                         == u64::from(entry == OwnerEntry::Syscall)
-                    && cell.words[11].load(Ordering::Relaxed) == 0
+                    && cell.words[11].load(Ordering::Relaxed) == demand.encode()
             }
             ServiceOperation::Exception(exception) => {
                 cell.words[9].load(Ordering::Relaxed) == 4
@@ -2912,6 +2982,77 @@ mod tests {
             assert!(ticket.complete(false).is_ok());
             assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Refused));
         }
+    }
+
+    /// #1974: a thread-stock demand travels in the exact request, and its
+    /// typed answer comes back through the same ticket. Each answer is valid
+    /// only for its own demand.
+    #[test]
+    fn carrier_work_demand_and_reply_round_trip_through_notice_claim() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        for (demand, reply, result) in [
+            (
+                CarrierDemand::Work,
+                CarrierWorkReply::Delivered,
+                ServiceResult::Supplied,
+            ),
+            (
+                CarrierDemand::ThreadStock,
+                CarrierWorkReply::Stocked,
+                ServiceResult::Supplied,
+            ),
+            (
+                CarrierDemand::ThreadStock,
+                CarrierWorkReply::Unstockable,
+                ServiceResult::Refused,
+            ),
+        ] {
+            let operation = ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Syscall,
+                demand,
+            };
+            let request = cell
+                .publish(owner, SnapshotGeneration::INITIAL, operation, None)
+                .unwrap();
+            let member = carrick_sched_core::ThreadIdentity {
+                tid: 1,
+                serial: owner.thread.raw(),
+                mm: owner.mm.mm().raw(),
+                generation: SnapshotGeneration::INITIAL.raw(),
+                ..Default::default()
+            };
+            // SAFETY: the local cell and synthetic exact member remain alive
+            // for the claim and use the same immutable birth identity.
+            let ticket = unsafe {
+                ServiceCell::claim_notice(
+                    &cell,
+                    request.identity.into(),
+                    owner.mm.carrier(),
+                    member,
+                )
+            }
+            .unwrap();
+            assert_eq!(ticket.request().operation, operation, "demand survives");
+            let supplied = reply.supplied_for(demand).unwrap();
+            assert!(ticket.complete(supplied).is_ok());
+            let consumed = cell.consume(request.identity).unwrap();
+            assert_eq!(consumed, result);
+            assert_eq!(CarrierWorkReply::for_result(demand, consumed), Some(reply));
+        }
+        assert_eq!(
+            CarrierWorkReply::Stocked.supplied_for(CarrierDemand::Work),
+            None
+        );
+        assert_eq!(
+            CarrierWorkReply::Delivered.supplied_for(CarrierDemand::ThreadStock),
+            None
+        );
+        assert_eq!(
+            CarrierWorkReply::for_result(CarrierDemand::Work, ServiceResult::Refused),
+            None
+        );
     }
 
     fn supply_window(owner: ServiceBirth) -> crate::PortalGrantWindow {

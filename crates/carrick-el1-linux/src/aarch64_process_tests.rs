@@ -15519,6 +15519,7 @@ fn closed_gate_service_entry(retained_ipc: bool) {
                 assert!(fixture.zone.record(record.id).has_adapter_operation());
                 ServiceOperation::CarrierWork {
                     entry: carrick_sched_core::object_wait::OwnerEntry::Syscall,
+                    demand: carrick_core_abi::service::CarrierDemand::Work,
                 }
             } else {
                 ServiceOperation::Crossing {

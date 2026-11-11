@@ -341,6 +341,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool, prefi
                 let result = entry.begin_service(
                     carrick_core_abi::service::ServiceOperation::CarrierWork {
                         entry: carrick_sched_core::object_wait::OwnerEntry::Exception,
+                        demand: carrick_core_abi::service::CarrierDemand::Work,
                     },
                     None,
                 );

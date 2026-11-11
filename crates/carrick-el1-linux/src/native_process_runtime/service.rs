@@ -687,6 +687,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return self.begin_service_inner(
                         ServiceOperation::CarrierWork {
                             entry: OwnerEntry::Syscall,
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
                         },
                         None,
                         Some(wait),
@@ -698,6 +699,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return self.begin_service_inner(
                         ServiceOperation::CarrierWork {
                             entry: OwnerEntry::Syscall,
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
                         },
                         None,
                         None,
@@ -723,6 +725,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             return self.begin_service_inner(
                                 ServiceOperation::CarrierWork {
                                     entry: OwnerEntry::Syscall,
+                                    demand: carrick_core_abi::service::CarrierDemand::Work,
                                 },
                                 None,
                                 Some(wait),
@@ -734,6 +737,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             return self.begin_service_inner(
                                 ServiceOperation::CarrierWork {
                                     entry: OwnerEntry::Syscall,
+                                    demand: carrick_core_abi::service::CarrierDemand::Work,
                                 },
                                 None,
                                 None,
@@ -882,6 +886,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let outcome = self.begin_service_inner(
             ServiceOperation::CarrierWork {
                 entry: OwnerEntry::Syscall,
+                demand: carrick_core_abi::service::CarrierDemand::Work,
             },
             None,
             None,
@@ -956,6 +961,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 (
                     ServiceOperation::CarrierWork {
                         entry: OwnerEntry::Syscall,
+                        demand: carrick_core_abi::service::CarrierDemand::Work,
                     },
                     None,
                     Some(wait),
@@ -966,6 +972,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 (
                     ServiceOperation::CarrierWork {
                         entry: OwnerEntry::Syscall,
+                        demand: carrick_core_abi::service::CarrierDemand::Work,
                     },
                     None,
                     None,
@@ -1331,6 +1338,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return self.begin_service_inner(
                         ServiceOperation::CarrierWork {
                             entry: OwnerEntry::Syscall,
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
                         },
                         None,
                         None,
@@ -1342,6 +1350,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return self.begin_service_inner(
                         ServiceOperation::CarrierWork {
                             entry: OwnerEntry::Syscall,
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
                         },
                         None,
                         Some(wait),
@@ -1837,7 +1846,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => {
                     OwnerEntry::Exception
                 }
-                ServiceOperation::CarrierWork { entry } => entry,
+                ServiceOperation::CarrierWork { entry, .. } => entry,
                 _ => OwnerEntry::Syscall,
             }
         };
@@ -1974,7 +1983,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             | ServiceOperation::HostFile { .. }
             | ServiceOperation::Entropy { .. }
             | ServiceOperation::Clock { .. } => OwnerEntry::Syscall,
-            ServiceOperation::CarrierWork { entry } => entry,
+            ServiceOperation::CarrierWork { entry, .. } => entry,
         };
         let mut completion = None;
         let mut completed_pending = None;
@@ -3033,7 +3042,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             | ServiceOperation::HostFile { .. }
                             | ServiceOperation::Entropy { .. }
                             | ServiceOperation::Clock { .. } => OwnerEntry::Syscall,
-                            ServiceOperation::CarrierWork { entry } => entry,
+                            ServiceOperation::CarrierWork { entry, .. } => entry,
                         }
                     });
             }
@@ -3224,6 +3233,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 };
             }
             if retry_syscall_after_supply {
+                if let ServiceOperation::CarrierWork {
+                    demand: demand @ carrick_core_abi::service::CarrierDemand::ThreadStock,
+                    ..
+                } = request.operation
+                {
+                    // The clone reruns either way; its retained answer tells
+                    // that rerun whether an empty pool waits again (#1974).
+                    if result != ServiceResult::Cancelled {
+                        self.retain_thread_stock_reply(
+                            carrick_core_abi::service::CarrierWorkReply::for_result(demand, result)
+                                .ok_or(NativeProcessError::Quarantined)?,
+                        );
+                    }
+                    return Ok(NativeResume::RetrySyscall);
+                }
                 if result != ServiceResult::Supplied {
                     let _ = ProcessNative::take_relative_futex_wait(self);
                 }
