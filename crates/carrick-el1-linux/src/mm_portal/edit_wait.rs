@@ -42,6 +42,7 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
             AnonymousCall::Munmap | AnonymousCall::Mremap | AnonymousCall::Mprotect => {
                 rounded(frame.x[0], frame.x[1])
             }
+            AnonymousCall::Madvise if frame.x[1] != 0 => rounded(frame.x[0], frame.x[1]),
             AnonymousCall::Mmap if frame.x[3] & (0x10 | 0x100000) != 0 => {
                 rounded(frame.x[0], frame.x[1])
             }
@@ -157,30 +158,38 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
                 }
                 Err(_) => return None,
             };
-            use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall};
-            let decision = decide_reservation_syscall(frame, task, &mut root, None);
-            match decision {
-                ReservationDisposition::Unavailable(
-                    carrick_el1::memory::reservations::Refusal::PreparedConflict,
-                ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
-                ReservationDisposition::Unavailable(
-                    carrick_el1::memory::reservations::Refusal::Busy,
-                ) => return Some(Some(SpaceWaitCause::PendingEdit)),
-                ReservationDisposition::Unavailable(
-                    carrick_el1::memory::reservations::Refusal::MetadataRequired,
-                ) => {
-                    if root.provision_metadata(metadata).is_err() {
-                        return None;
-                    }
-                    return Some(None);
+            if let Some(conflict) =
+                carrick_el1::memory::probe_discard_root_conflict(frame, &mut root)
+            {
+                if let Some(cause) = conflict {
+                    return Some(Some(cause));
                 }
-                ReservationDisposition::Unavailable(_) => return None,
-                ReservationDisposition::Work(pending) => {
-                    if pending.cancel(&mut root).is_err() {
-                        return None;
+            } else {
+                use carrick_el1::memory::{ReservationDisposition, decide_reservation_syscall};
+                let decision = decide_reservation_syscall(frame, task, &mut root, None);
+                match decision {
+                    ReservationDisposition::Unavailable(
+                        carrick_el1::memory::reservations::Refusal::PreparedConflict,
+                    ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
+                    ReservationDisposition::Unavailable(
+                        carrick_el1::memory::reservations::Refusal::Busy,
+                    ) => return Some(Some(SpaceWaitCause::PendingEdit)),
+                    ReservationDisposition::Unavailable(
+                        carrick_el1::memory::reservations::Refusal::MetadataRequired,
+                    ) => {
+                        if root.provision_metadata(metadata).is_err() {
+                            return None;
+                        }
+                        return Some(None);
                     }
+                    ReservationDisposition::Unavailable(_) => return None,
+                    ReservationDisposition::Work(pending) => {
+                        if pending.cancel(&mut root).is_err() {
+                            return None;
+                        }
+                    }
+                    ReservationDisposition::Return(_) | ReservationDisposition::Forward => {}
                 }
-                ReservationDisposition::Return(_) | ReservationDisposition::Forward => {}
             }
             drop(root);
             match zone

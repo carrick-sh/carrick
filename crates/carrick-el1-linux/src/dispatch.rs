@@ -3782,6 +3782,48 @@ impl<
             return DelegatedStep::NotDelegated;
         };
         let access = carrick_el1::substrate::sched::object_wait::space_access(zone.tables, slot);
+        if carrick_personality_linux::dispatch::AnonymousCall::from_canonical(
+            self.frame.canonical_ordinal(),
+        ) == Some(carrick_personality_linux::dispatch::AnonymousCall::Madvise)
+        {
+            if self
+                .process
+                .as_ref()
+                .is_none_or(|process| process.is_root_process())
+            {
+                return DelegatedStep::NotDelegated;
+            }
+            return match memory::serve_delegated_discard(
+                match self.frame.arm_frame() {
+                    Some(frame) => frame,
+                    None => {
+                        self.frame.record_isa_unsupported_forward();
+                        return DelegatedStep::NotDelegated;
+                    }
+                },
+                self.counters,
+                task,
+                access,
+                memory::reservations::shared_guest(),
+                &mut memory::HardwareAnonymousEditor,
+            ) {
+                memory::DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
+                memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
+                memory::DelegatedAnonymous::Served => {
+                    if carrick_core::wait::complete_anonymous_edit_replay(
+                        zone.tables,
+                        slot,
+                        task.mm.key.load(Ordering::Acquire),
+                    )
+                    .is_err()
+                    {
+                        invalid_completion(NativeInvariant::EntryBinding);
+                    }
+                    DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
+                }
+                memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
+            };
+        }
         // A private file mmap the host-file venue already retained a byte
         // source for: this is its exact retry.
         let take = self
