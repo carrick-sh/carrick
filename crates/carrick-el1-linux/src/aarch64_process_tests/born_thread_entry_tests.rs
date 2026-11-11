@@ -1417,7 +1417,7 @@ fn arm_root_ring_born_tgkill_before_first_entry_queues_signal_once() {
 }
 
 #[test]
-#[ignore = "red on main: host-issued first clone, paused slice 2 of #1974 (assert_eq! at born_thread_entry_tests.rs:1460)"]
+#[ignore = "red: host-issued ClonePoolEmpty birth has no ring record, member or tid mapping before first entry; needs #1974 slice 2 admission design (assert_eq! at born_thread_entry_tests.rs:1460 reads (-3, -3))"]
 fn arm_host_issued_clone_pool_empty_tgkill_and_peer_kill_before_first_entry() {
     let mut h = setup_arm_root_two_live_threads_and_peer();
     let f = h.env.fixture;
