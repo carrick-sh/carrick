@@ -1425,7 +1425,9 @@ struct MemberWaitState<'a> {
     suspend_mask: Option<carrick_signal_core::policy::SigBlockMask>,
     /// The carrier's answer to this member's last unmanaged thread-stock
     /// demand, retained from its `CarrierWork` completion to the clone's
-    /// rerun (#1974), like `relative_futex_wait` across the same retry.
+    /// rerun (#1974). The next syscall entry moves it out whatever that
+    /// syscall is; a signal frame or teardown discards it with
+    /// `relative_futex_wait` (`discard_rerun_answers`).
     thread_stock_reply: Option<carrick_core_abi::service::CarrierWorkReply>,
 }
 impl MemberWaitState<'_> {
@@ -4307,10 +4309,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 .pending
                 .exit(&key)
                 .is_some_and(|pending| core::ptr::eq(pending.caller.control(), control));
-        let relative_futex_pending = graph
-            .pending
-            .member(&source.zone.record_ref(record))
-            .is_some_and(|state| state.relative_futex_wait.is_some());
+        let retained = graph.pending.member(&source.zone.record_ref(record));
+        let relative_futex_pending =
+            retained.is_some_and(|state| state.relative_futex_wait.is_some());
+        let thread_stock_pending = retained.is_some_and(|state| state.thread_stock_reply.is_some());
         drop(graph);
         Ok(NativeProcessEntry {
             runtime: self,
@@ -4338,6 +4340,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             slot,
             owner_continuation,
             relative_futex_pending,
+            thread_stock_pending,
+            thread_stock_reply: None,
             signal_work_deferred: false,
             copyout_ready: None,
             adapter_ready: None,
@@ -4365,6 +4369,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             owner_continuation,
             relative_futex_pending,
+            thread_stock_pending,
         } = self.authenticate_registered(registry, source, current, address, words)?;
         Ok(Box::new(NativeProcessEntry {
             runtime: self,
@@ -4392,6 +4397,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             slot: Some(member_control),
             owner_continuation,
             relative_futex_pending,
+            thread_stock_pending,
+            thread_stock_reply: None,
             signal_work_deferred: false,
             copyout_ready: None,
             adapter_ready: None,
@@ -4478,10 +4485,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .pending
             .exit(&member.process)
             .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
-        let relative_futex_pending = graph
-            .pending
-            .member(&record_ref)
-            .is_some_and(|state| state.relative_futex_wait.is_some());
+        let retained = graph.pending.member(&record_ref);
+        let relative_futex_pending =
+            retained.is_some_and(|state| state.relative_futex_wait.is_some());
+        let thread_stock_pending = retained.is_some_and(|state| state.thread_stock_reply.is_some());
         drop(graph);
         Ok(AuthenticatedProcessEntry {
             binding,
@@ -4491,6 +4498,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             owner_continuation,
             relative_futex_pending,
+            thread_stock_pending,
         })
     }
     /// The cwd and root of the root's child `visible`, or of the root.
@@ -4672,6 +4680,7 @@ struct AuthenticatedProcessEntry<'a> {
     calling_tid: u32,
     owner_continuation: bool,
     relative_futex_pending: bool,
+    thread_stock_pending: bool,
 }
 
 pub struct NativeProcessEntry<
@@ -4706,6 +4715,11 @@ pub struct NativeProcessEntry<
     owner_continuation: bool,
     // Absence is captured under admission's graph guard; custody stays in the row.
     relative_futex_pending: bool,
+    // Captured the same way for a retained thread-stock answer (#1974).
+    thread_stock_pending: bool,
+    // The retained answer this entry's syscall may read, moved out of the
+    // member row when the entry began; it dies with the entry.
+    thread_stock_reply: Option<carrick_core_abi::service::CarrierWorkReply>,
     // A shared return checkpoint observed real work before a concurrent host
     // could drain its doorbell. Keep that refusal with this admitted owner.
     signal_work_deferred: bool,
@@ -4911,7 +4925,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.run_failure.take()
     }
     fn run_failed(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> LifecycleOutcome {
-        let _ = ProcessNative::take_relative_futex_wait(self);
+        self.discard_rerun_answers();
         self.run_failure = Some(reason);
         if let Some(record) = self
             .source
@@ -5481,12 +5495,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .clone();
         self.service.copy_syscall_output(&mm, address, bytes)
     }
+    /// Everything this member retained for the rerun of its last call (a
+    /// relative futex wait, a thread-stock answer) is void once anything
+    /// other than that rerun runs: a signal frame, an exit, a run failure.
+    pub(super) fn discard_rerun_answers(&mut self) {
+        let _ = ProcessNative::take_relative_futex_wait(self);
+        let _ = self.take_retained_thread_stock_reply();
+        self.thread_stock_reply = None;
+    }
     pub fn copy_signal_frame(
         &mut self,
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
-        let _ = ProcessNative::take_relative_futex_wait(self);
+        self.discard_rerun_answers();
         let mm = self
             .runtime
             .graph
@@ -6461,7 +6483,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         status: carrick_sched_core::process::TerminationStatus,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
-        let _ = ProcessNative::take_relative_futex_wait(self);
+        self.discard_rerun_answers();
         let page = self
             .runtime
             .graph
@@ -6887,7 +6909,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         operation: PendingCloseOperation<'a>,
     ) -> Result<(&'a ThreadLifecyclePage, Arc<WaitChannel>), NativeProcessError> {
-        let _ = ProcessNative::take_relative_futex_wait(self);
+        self.discard_rerun_answers();
         let incoming_exec = matches!(&operation, PendingCloseOperation::Exec(_));
         let member_status = match &operation {
             PendingCloseOperation::Exit { status, .. } => status.to_termination_status(),
@@ -8469,6 +8491,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .member_wait_state(self.record)
             .relative_futex_wait = Some(operation);
     }
+    fn scope_rerun_answers_to_entry(&mut self) {
+        self.thread_stock_reply = self.take_retained_thread_stock_reply();
+    }
     fn wait_guest_copy(
         &mut self,
         request: carrick_core::user_copy::GuestCopyRequest,
@@ -8936,9 +8961,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         self.await_unmanaged_thread_stock()
             .unwrap_or_else(|error| Some(self.run_failed(error.run_failure_reason())))
     }
-    fn unmanaged_thread_stock_claimed(&mut self) {
-        NativeProcessEntry::unmanaged_thread_stock_claimed(self);
-    }
     fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         self.retire_thread_verdict(verdict);
     }
@@ -9240,7 +9262,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     fn retire_thread_identity(&mut self, tid: u32) {
-        let _ = ProcessNative::take_relative_futex_wait(self);
+        self.discard_rerun_answers();
         let mut graph = self.runtime.graph.lock();
         let mut retired = Vec::new();
         if let Ok(task) = graph.owner.task_mut(self.key) {
