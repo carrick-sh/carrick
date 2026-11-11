@@ -16663,6 +16663,284 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
 }
 
 #[test]
+fn arm_root_host_backed_descriptors_keep_one_owner() {
+    use carrick_abi::{
+        LINUX_AT_FDCWD, LINUX_F_DUPFD, LINUX_F_GETFL, LINUX_F_GETLK, LINUX_F_SETFL, LINUX_F_SETLK,
+        LINUX_F_WRLCK, LINUX_O_APPEND, LINUX_O_CREAT, LINUX_O_NONBLOCK, LINUX_O_TRUNC,
+        LINUX_O_WRONLY, LinuxFlock64,
+    };
+    use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
+    use std::sync::Arc;
+
+    struct HostPointerMemory;
+    impl GuestMemory for HostPointerMemory {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if address == 0 {
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            // SAFETY: test passes live GuestUserBuffer host addresses.
+            let slice = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
+            Ok(slice.to_vec())
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            if address == 0 {
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                });
+            }
+            // SAFETY: test passes live GuestUserBuffer host addresses.
+            let slice = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, bytes.len()) };
+            slice.copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for HostPointerMemory {}
+
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner: &'static _ = Box::leak(Box::new(context.kernel().ipc().unwrap()));
+    let files = context.resources().files();
+
+    let root_table_key = files.id().raw();
+    let fixture: &'static Fixture = Box::leak(Box::new(Fixture::with_file_table(
+        0x10000,
+        asid(1),
+        root_table_key,
+    )));
+
+    let map = unsafe {
+        &*fixture
+            .region
+            .ptr
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    files.publish_ipc(Arc::clone(owner), map).unwrap();
+
+    let pages: Vec<_> = (0..16).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = Box::new(TestStockCrossing::new(&pages));
+    crossing.ipc = Some((Arc::clone(owner), map));
+    let crossing: &'static TestStockCrossing = Box::leak(crossing);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let tables: &'static _ = Box::leak(Box::new(crate::ipc::MapTables(map)));
+    let venue = crate::ipc::IpcVenue {
+        region: owner.region(),
+        tables,
+    };
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        crossing,
+    )
+    .with_words(words);
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let mut host_mem = HostPointerMemory;
+    let reporter = carrick_kernel::compat::CompatReporter::default();
+
+    let mut call_root = |nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            elr: 0x4000,
+            slot: u64::from(fixture.slot.raw()),
+            ..Default::default()
+        };
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        let route =
+            super::dispatch::dispatch_arm_syscall_with_native_process(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &cache,
+                None::<
+                    crate::dispatch::Zone<
+                        '_,
+                        crate::sched::FakeCpu,
+                        crate::sched::HardwareUserWord,
+                    >,
+                >,
+                Some(&venue),
+                Some(fixture),
+                fixture.page,
+                fixture.control,
+                &ThreadCtx::ZERO,
+                ttbr0,
+                &mut service,
+                |_| core::ptr::null_mut(),
+            )
+            .unwrap();
+        let ret = if route == CompletionRoute::Forward {
+            match dispatcher
+                .dispatch(
+                    &context,
+                    carrick_kernel::dispatch::SyscallRequest::new(
+                        nr,
+                        carrick_kernel::compat::SyscallArgs(args),
+                    ),
+                    &mut host_mem,
+                    &reporter,
+                )
+                .unwrap()
+            {
+                carrick_kernel::dispatch::DispatchOutcome::Returned { value } => value,
+                carrick_kernel::dispatch::DispatchOutcome::Errno { errno } => errno.guest_retval(),
+                other => panic!("unexpected host dispatch outcome for nr={nr}: {other:?}"),
+            }
+        } else {
+            frame.x[0] as i64
+        };
+        (route, ret)
+    };
+
+    // The run root's host-opened descriptions keep the host FileTable as their
+    // one owner (#1410 review P0-1..P0-4): its redirect reaches its own
+    // writes, close releases the host fd, and fcntl reports and changes the
+    // host description, including record locks the ring does not serve.
+    let tmp = GuestUserBuffer::from_bytes(b"/tmp\0");
+    let (_, made) = call_root(34, [LINUX_AT_FDCWD, tmp.arg(), 0o777, 0, 0, 0]);
+    assert!(made == 0 || made == -17, "mkdir /tmp: {made}");
+    let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-1410-redirect-target\0");
+    // Reads the redirect target back through a fresh root descriptor.
+    let mut read_target = |call_root: &mut dyn FnMut(u64, [u64; 6]) -> (CompletionRoute, i64)| {
+        let (_, fd) = call_root(56, [LINUX_AT_FDCWD, path.arg(), 0, 0, 0, 0]);
+        if fd < 0 {
+            return format!("<reopen failed: {fd}>").into_bytes();
+        }
+        let buf = GuestUserBuffer::zeroed(64);
+        let (_, n) = call_root(63, [fd as u64, buf.arg(), 64, 0, 0, 0]);
+        call_root(57, [fd as u64, 0, 0, 0, 0, 0]);
+        if n < 0 {
+            return format!("<read failed: {n}>").into_bytes();
+        }
+        buf.as_bytes()[..n as usize].to_vec()
+    };
+    let (_, file_fd) = call_root(
+        56,
+        [
+            LINUX_AT_FDCWD,
+            path.arg(),
+            LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_TRUNC,
+            0o600,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(file_fd, 3);
+
+    // Every observation is checked, so a regression reports each broken
+    // owner rule at once instead of the first.
+    let mut mismatches = Vec::new();
+    let mut expect = |what: &str, got: i64, want: i64| {
+        if got != want {
+            mismatches.push(format!("{what}: got {got}, want {want}"));
+        }
+    };
+
+    // P0-4: F_GETFL reports the host description's access mode.
+    expect(
+        "F_GETFL on an O_WRONLY host file",
+        call_root(25, [3, LINUX_F_GETFL, 0, 0, 0, 0]).1,
+        LINUX_O_WRONLY as i64,
+    );
+
+    // P0-3: record locks on a host file are served, as on main.
+    let lock = GuestUserBuffer::from_value(LinuxFlock64 {
+        l_type: LINUX_F_WRLCK as i16,
+        ..Default::default()
+    });
+    expect(
+        "F_GETLK on a host file",
+        call_root(25, [3, LINUX_F_GETLK, lock.arg(), 0, 0, 0]).1,
+        0,
+    );
+    expect(
+        "F_SETLK on a host file",
+        call_root(25, [3, LINUX_F_SETLK, lock.arg(), 0, 0, 0]).1,
+        0,
+    );
+
+    // P0-1: the shell's save/redirect/restore reaches the root's own write.
+    expect(
+        "fcntl(1, F_DUPFD, 10)",
+        call_root(25, [1, LINUX_F_DUPFD, 10, 0, 0, 0]).1,
+        10,
+    );
+    expect("dup3(3, 1)", call_root(24, [3, 1, 0, 0, 0, 0]).1, 1);
+    let redirected = GuestUserBuffer::from_bytes(b"redirected\n");
+    expect(
+        "redirected write(1)",
+        call_root(64, [1, redirected.arg(), 11, 0, 0, 0]).1,
+        11,
+    );
+    expect("dup3(10, 1)", call_root(24, [10, 1, 0, 0, 0, 0]).1, 1);
+    expect("close(10)", call_root(57, [10, 0, 0, 0, 0, 0]).1, 0);
+    let restored = GuestUserBuffer::from_bytes(b"restored\n");
+    expect(
+        "restored write(1)",
+        call_root(64, [1, restored.arg(), 9, 0, 0, 0]).1,
+        9,
+    );
+    let contents = read_target(&mut call_root);
+
+    // P0-4: F_SETFL reaches the host description.
+    let append_nonblock = LINUX_O_APPEND | LINUX_O_NONBLOCK;
+    expect(
+        "F_SETFL O_APPEND|O_NONBLOCK",
+        call_root(25, [3, LINUX_F_SETFL, append_nonblock, 0, 0, 0]).1,
+        0,
+    );
+    expect(
+        "F_GETFL after F_SETFL",
+        call_root(25, [3, LINUX_F_GETFL, 0, 0, 0, 0]).1,
+        (LINUX_O_WRONLY | append_nonblock) as i64,
+    );
+
+    // P0-2: close releases the host fd; a later write is EBADF.
+    expect("close(3)", call_root(57, [3, 0, 0, 0, 0, 0]).1, 0);
+    let late = GuestUserBuffer::from_bytes(b"late\n");
+    expect(
+        "write(3) after close",
+        call_root(64, [3, late.arg(), 5, 0, 0, 0]).1,
+        carrick_syscall_abi::LINUX_EBADF.guest_retval(),
+    );
+    let final_contents = read_target(&mut call_root);
+    drop(call_root);
+    let stdout = dispatcher.stdout();
+    for (what, got, want) in [
+        ("target after restore", contents, &b"redirected\n"[..]),
+        ("target after close", final_contents, &b"redirected\n"[..]),
+        ("run stdout", stdout, &b"restored\n"[..]),
+    ] {
+        if got != want {
+            mismatches.push(format!(
+                "{what}: got {:?}, want {:?}",
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(want)
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "root host-backed descriptors left their one owner:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+#[test]
 fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
     use carrick_abi::{
         LINUX_AT_FDCWD, LINUX_F_DUPFD, LINUX_O_CREAT, LINUX_O_TRUNC, LINUX_O_WRONLY, LinuxStat,
@@ -16937,27 +17215,35 @@ fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
             &mut |_| 0,
         );
         match stage {
-            Some(HostFileStage::Request {
-                mut record, output, ..
-            }) => match dispatcher.serve_native_host_file(&mut record) {
-                Ok(_) => {
-                    let parsed = carrick_core_abi::host_file::reply(&record)
-                        .expect("served host-file record must contain a valid reply");
-                    if let Some(out) = output
-                        && !parsed.output.is_empty()
-                    {
-                        let dst = unsafe {
-                            core::slice::from_raw_parts_mut(
-                                out.address as *mut u8,
-                                parsed.output.len(),
-                            )
-                        };
-                        dst.copy_from_slice(parsed.output);
+            Some(HostFileStage::Request { record, output, .. }) => {
+                // The production carrier stamps the writer's RLIMIT_FSIZE
+                // (`service.rs`); an unstamped write reads as a finite 0.
+                let mut record = record.into_vec();
+                carrick_personality_linux::native_host_file::stamp_write_file_size_limit::<()>(
+                    &mut record,
+                    || Ok(u64::MAX),
+                )
+                .unwrap();
+                match dispatcher.serve_native_host_file(&mut record) {
+                    Ok(_) => {
+                        let parsed = carrick_core_abi::host_file::reply(&record)
+                            .expect("served host-file record must contain a valid reply");
+                        if let Some(out) = output
+                            && !parsed.output.is_empty()
+                        {
+                            let dst = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    out.address as *mut u8,
+                                    parsed.output.len(),
+                                )
+                            };
+                            dst.copy_from_slice(parsed.output);
+                        }
+                        parsed.result
                     }
-                    parsed.result
+                    Err(_) => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
                 }
-                Err(_) => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
-            },
+            }
             Some(HostFileStage::Returned(res)) => res.raw(),
             other => panic!("unexpected child stage for nr={nr}: {other:?}"),
         }
@@ -16980,12 +17266,12 @@ fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
     assert_eq!(
         (dupfd_route, redir_route, restore_route, close_route),
         (
-            CompletionRoute::Served,
-            CompletionRoute::Served,
-            CompletionRoute::Served,
-            CompletionRoute::Served,
+            CompletionRoute::Forward,
+            CompletionRoute::Forward,
+            CompletionRoute::Forward,
+            CompletionRoute::Forward,
         ),
-        "root dup/fcntl/close must be served in ring"
+        "root host-backed dup/fcntl/close keep the host FileTable as their one owner"
     );
     assert_ne!(child_identity.file_table, root_table_key);
     registry().unregister_root_for_test(&runtime);
@@ -17103,118 +17389,6 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
     );
     let mut cpu = crate::sched::FakeCpu::default();
 
-    // Also create a second independent live root process (never cloned) with its own
-    // published host-binding table in the same HostIpc + IpcTableMap, proving both
-    // root/root and root/child table isolation through production ARM dispatch.
-    let table_b = carrick_kernel::el1_ipc::HostTable::create(Arc::clone(owner), 64, 8).unwrap();
-    for stdio_fd in 0..=2 {
-        owner
-            .install_host_description(
-                table_b.id(),
-                Box::new(stdio_fd),
-                carrick_el1_abi::ipc::fd::AccessMode::ReadWrite,
-                carrick_el1_abi::ipc::fd::StatusFlags::default(),
-                false,
-            )
-            .unwrap();
-    }
-    let root_b_actual_key = 7;
-    map.publish(root_b_actual_key, table_b.id().to_raw())
-        .unwrap();
-    let page_b = Box::leak(Box::new(ThreadLifecyclePage::new()));
-    let control_b = Box::leak(Box::new(ThreadControlSlot::new()));
-    let fixture_b: &'static Fixture = Box::leak(Box::new(Fixture::with_identity(
-        0x30000,
-        asid(2),
-        page_b,
-        control_b,
-        ThreadIdentity {
-            tid: 77,
-            serial: 202,
-            mm: 2,
-            file_table: root_b_actual_key,
-            generation: 22,
-            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
-            affinity: 1,
-            lifecycle_page: page_b as *const _ as u64,
-            control_slot: control_b as *const _ as u64,
-        },
-    )));
-    let words_b = Box::leak(Box::new(fixture_b.tables.live(&fixture_b.maintenance)));
-    let mut service_b = Aarch64NativeProcessService::with_crossing(
-        &fixture_b.task,
-        fixture_b.slot,
-        fixture_b.zone,
-        fixture_b.region.table(),
-        NonZeroU64::MIN,
-        crossing,
-    )
-    .with_words(words_b);
-    let ttbr0_b = (u64::from(asid(2).raw()) << 48) | fixture_b.address.root.address().raw();
-    let mut call_root_b = |nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
-        let mut frame = carrick_el1_abi::TrapFrame {
-            esr: 0x15 << 26,
-            elr: 0x400c,
-            slot: u64::from(fixture_b.slot.raw()),
-            ..Default::default()
-        };
-        frame.x[..6].copy_from_slice(&args);
-        frame.x[8] = nr;
-        let route =
-            super::dispatch::dispatch_arm_syscall_with_native_process(
-                &mut frame,
-                &counters,
-                core::slice::from_ref(&fixture_b.task),
-                crossing.fd_map(),
-                &[],
-                crossing.open_table(),
-                &[],
-                &cache,
-                None::<
-                    crate::dispatch::Zone<
-                        '_,
-                        crate::sched::FakeCpu,
-                        crate::sched::HardwareUserWord,
-                    >,
-                >,
-                Some(&venue),
-                Some(fixture_b),
-                fixture_b.page,
-                fixture_b.control,
-                &ThreadCtx::ZERO,
-                ttbr0_b,
-                &mut service_b,
-                |_| core::ptr::null_mut(),
-            )
-            .unwrap();
-        (route, frame.x[0] as i64)
-    };
-
-    // Uncloned root_b serves dup/fcntl/close in-ring in its own table without
-    // touching root_a or child.
-    assert_eq!(
-        call_root_b(23, [1, 0, 0, 0, 0, 0]),
-        (CompletionRoute::Served, 3),
-        "live uncloned root_b dup(1) must serve in-ring -> fd 3"
-    );
-    assert_eq!(
-        call_root_b(57, [1, 0, 0, 0, 0, 0]),
-        (CompletionRoute::Served, 0),
-        "live uncloned root_b close(1) with fd 3 retained must complete in-ring without host work"
-    );
-    assert_eq!(
-        call_root_b(57, [0, 0, 0, 0, 0, 0]),
-        (CompletionRoute::WithWork, 0),
-        "live uncloned root_b close(0) must retire last reference in-ring and ring release work"
-    );
-    let _ = fixture_b.task.linux.take_served_boundary();
-    assert!(fixture_b.task.linux.take_host_work_doorbell().is_some());
-    assert_eq!(
-        call_root_b(25, [0, LINUX_F_GETFD, 0, 0, 0, 0]),
-        (CompletionRoute::Served, -9),
-        "root_b fd 0 must be closed (-EBADF)"
-    );
-
     let mut call_process = |target: &super::native_process_runtime::NativeRecordBinding<
         AddressContext<RootGpa>,
         Aarch64ParkedContext,
@@ -17320,15 +17494,5 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
         (CompletionRoute::Served, LINUX_FD_CLOEXEC as i64)
     );
 
-    if let Ok(runtime_b) = registry().for_entry(
-        BornInZoneSource {
-            zone: fixture_b.zone,
-            slot: fixture_b.slot,
-        },
-        &fixture_b.task,
-        fixture_b.address,
-    ) {
-        registry().unregister_root_for_test(&runtime_b);
-    }
     registry().unregister_root_for_test(&runtime);
 }

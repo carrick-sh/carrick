@@ -297,7 +297,11 @@ host_crossings! {
     Getrandom = nr::GETRANDOM, false, Permanent;
     EpollCtl = nr::EPOLL_CTL, false, Temporary;
     EpollPwait = nr::EPOLL_PWAIT, true, Temporary;
+    Dup = nr::DUP, false, Temporary;
+    Dup3 = nr::DUP3, false, Temporary;
+    Fcntl = nr::FCNTL, false, Temporary;
     InotifyInit1 = nr::INOTIFY_INIT1, false, Temporary;
+    Close = nr::CLOSE, false, Temporary;
     Signalfd4 = nr::SIGNALFD4, false, Temporary;
     TimerfdCreate = nr::TIMERFD_CREATE, false, Temporary;
     TimerfdSettime = nr::TIMERFD_SETTIME, false, Temporary;
@@ -579,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 115);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 119);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
@@ -594,10 +598,6 @@ mod tests {
             nr::PIPE2,
             nr::EVENTFD2,
             nr::EPOLL_CREATE1,
-            nr::DUP,
-            nr::DUP3,
-            nr::FCNTL,
-            nr::CLOSE,
             CanonicalNr(27), // inotify_add_watch
             CanonicalNr(28), // inotify_rm_watch
             nr::PPOLL,

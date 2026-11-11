@@ -199,6 +199,16 @@ impl Served {
     }
 }
 
+/// The standard stream a host-duplicated stdio description names, if any.
+fn duplicated_stdio_stream(description: &crate::kernel::FileDescription) -> Option<i32> {
+    description
+        .inspect_kind(|open| match open {
+            super::OpenDescription::HostPipe { stdio_stream, .. } => *stdio_stream,
+            _ => None,
+        })
+        .flatten()
+}
+
 fn outcome_result(outcome: DispatchOutcome) -> i64 {
     match outcome {
         DispatchOutcome::Returned { value } => value,
@@ -543,12 +553,26 @@ impl SyscallDispatcher {
                     Some(reference) => self.native_map_reference(reference),
                     None => Served::Refused,
                 },
-                HostFileOp::Write | HostFileOp::SetFdTimes | HostFileOp::Ftruncate => match file
-                    .retain_io()
-                {
-                    Some(lease) => {
-                        self.serve_native_open_file(header, lease.description(), input, capacity)
-                    }
+                // A root that saved and restored a stdio stream through the
+                // host (`fcntl(1, F_DUPFD)`, `dup3`) leaves its children a
+                // duplicated stream. Writes go to the run's stdio sink, as the
+                // host write path does for the same description (#1410).
+                HostFileOp::Write
+                | HostFileOp::SetFdTimes
+                | HostFileOp::Ftruncate
+                | HostFileOp::Fstat
+                | HostFileOp::Statx => match file.retain_io() {
+                    Some(lease) => match duplicated_stdio_stream(lease.description()) {
+                        Some(stream) if header.op == HostFileOp::Write => {
+                            self.serve_native_stdio(header, stream, input)
+                        }
+                        _ => self.serve_native_open_file(
+                            header,
+                            lease.description(),
+                            input,
+                            capacity,
+                        ),
+                    },
                     None => Served::Refused,
                 },
                 _ => Served::Refused,

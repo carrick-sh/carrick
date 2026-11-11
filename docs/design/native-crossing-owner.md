@@ -278,3 +278,35 @@ after a readable prefix, and an initial write with its ring table
 withdrawn.
 Namespace mutation cores, real shell redirect-and-restore, decoded-x86
 runtime coverage beyond write/writev, and signed evidence remain unfinished.
+
+## Root redirect-and-restore slice (#1410)
+
+A run root's host-opened descriptions, including its implicit stdio, have
+one owner: the host `FileTable`, which projects each slot into the root's
+fd-core table. The root's `dup`, `dup3`, `fcntl` and `close` on such a
+description therefore keep their host route (`fcntl` stays a `Temporary`
+crossing), so the root's own forwarded I/O, record locks and status flags
+all see the same table. Only zone-releasable descriptions and constructors
+are served in the ring for a root that does not own its namespace.
+
+When a shell saves and restores stdout through the host (`fcntl(1,
+F_DUPFD, 10)`, `dup3(3, 1)`, `dup3(10, 1)`, `close(10)`), fd 1 becomes a
+host-duplicated stdio description, and a forked child inherits it as an
+`IpcPhysicalHold`. The carrier venue serves `fstat` and `statx` on that
+hold from the inherited description and sends `write` to the run's stdio
+sink when the description names a standard stream, as the host write path
+does. Before this, both returned -ENOSYS in the child.
+
+On x86 the shared completion owner now offers a declined call to the
+venue's staging before `preflight_host_crossing`, so a native child's
+`write(1)` is staged instead of being refused with EBADF by the root's
+delegated stdio check.
+
+Witnesses (VM-free, production dispatch):
+`arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write`
+(-38 before), `arm_root_host_backed_descriptors_keep_one_owner` (root
+redirect, write after close, `F_GETFL`/`F_SETFL`, `F_GETLK`/`F_SETLK`), and
+`x86_clone_child_serves_stdout_stat_write_and_own_redirect`. x86 root
+redirection is not yet expressible: x86 routes no `fcntl` (no host
+crossing and no ring server), so a root `fcntl(1, F_DUPFD, 10)` is
+-ENOSYS on x86, as it was before this slice.
