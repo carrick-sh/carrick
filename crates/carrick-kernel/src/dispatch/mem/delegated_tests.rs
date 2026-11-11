@@ -1388,8 +1388,8 @@ fn admitted_proc_executable_private_mmap_avoids_its_own_gate() {
     assert!(tail[37..].iter().all(|byte| *byte == 0));
 }
 
-/// Eager population uses the retained owner source too, under the real HAL
-/// exclusion registration (#1133 review, #1141).
+/// Eager population cannot use lazy owner custody yet. A refusal must keep
+/// main's syscall errno rather than ending the carrier (#1133 review).
 #[test]
 fn admitted_private_host_file_populate_self_held_gate_is_not_fatal() {
     use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause};
@@ -1427,25 +1427,15 @@ fn admitted_private_host_file_populate_self_held_gate_is_not_fatal() {
             LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | extra_flags.bits(),
             FILE_FD,
         );
-        // Eager population takes the same retained source custody as any
-        // private file map: no owner copy under the held gate, no errno and
-        // no carrier fatal (#1141).
         assert_eq!(
             outcome,
-            DispatchOutcome::Returned {
-                value: address as i64
+            DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM
             }
         );
-        assert_eq!(memory.write_calls.get(), 0);
-        let source = root
-            .lock()
-            .mapping(address)
-            .and_then(|mapping| mapping.host_backing)
-            .expect("eager private file map retains its owner source");
-        assert_eq!(
-            &dispatcher.mem_view().read_host_backing(source, 12).unwrap(),
-            b"file payload"
-        );
+        assert_eq!(memory.write_calls.get(), 1);
+        assert_eq!(memory.write_bytes_total.get(), 0);
+        assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
         drop(held);
         spaces.lower(index);
     }
@@ -8265,8 +8255,8 @@ mod private_file_owner {
 
     /// Every file description a private mapping can name (the in-memory
     /// `/opt/carrick/el1-sched` fixture of #1103's TLB tests, synthetic, overlay
-    /// and host files, and host files under `MAP_POPULATE` and `MAP_LOCKED`)
-    /// maps under the MM's own gate without one owner copy.
+    /// and host files) maps under the MM's own gate without one owner copy.
+    /// `MAP_POPULATE` and `MAP_LOCKED` keep main's eager venue (#1141).
     #[test]
     fn admitted_private_file_mmap_of_every_description_never_copies_under_its_own_gate() {
         let payload: Vec<u8> = (0..PAGE as usize + 37)
@@ -8311,14 +8301,7 @@ mod private_file_owner {
             };
             returned(dispatcher.fs_view().install_fd(description, 0)) as i32
         };
-        for (kind, extra) in [
-            ("in-memory", 0),
-            ("synthetic", 0),
-            ("overlay", 0),
-            ("host", 0),
-            ("host", carrick_abi::LINUX_MAP_POPULATE),
-            ("host", carrick_abi::LINUX_MAP_LOCKED),
-        ] {
+        for kind in ["in-memory", "synthetic", "overlay", "host"] {
             let mut dispatcher = SyscallDispatcher::new();
             let fd = install(&dispatcher, kind);
             let root = Root::admit(&dispatcher);
@@ -8332,13 +8315,13 @@ mod private_file_owner {
                     address,
                     2 * PAGE,
                     RW,
-                    FIXED_PRIVATE | extra,
+                    FIXED_PRIVATE,
                     fd,
                 ),
                 DispatchOutcome::Returned {
                     value: address as i64
                 },
-                "{kind} flags={extra:#x}: a self-held gate is not ENOMEM"
+                "{kind}: a self-held gate is not ENOMEM"
             );
             assert_eq!(
                 memory.write_calls.get(),
@@ -8353,9 +8336,6 @@ mod private_file_owner {
             let tail = source_bytes(&dispatcher, &root, address + PAGE, PAGE);
             assert_eq!(&tail[..37], &payload[PAGE as usize..], "{kind}");
             assert!(tail[37..].iter().all(|byte| *byte == 0), "{kind}");
-            if extra == carrick_abi::LINUX_MAP_LOCKED {
-                assert_eq!(locked_memory(&dispatcher), [(address, address + 2 * PAGE)]);
-            }
         }
     }
 
