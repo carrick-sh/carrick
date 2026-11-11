@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic)]
+#![cfg_attr(not(test), allow(clippy::expect_used, clippy::panic))]
 
 mod frame_budget;
 
@@ -400,6 +400,12 @@ fn read_depfile(path: &Path) -> Result<String, String> {
         .map_err(|error| format!("failed to read EL1 dep-info {}: {error}", path.display()))
 }
 
+fn is_windows_drive_prefix(token: &str, next: Option<char>) -> bool {
+    token.len() == 1
+        && token.as_bytes()[0].is_ascii_alphabetic()
+        && matches!(next, Some('/' | '\\'))
+}
+
 /// Parse a Makefile-style `.d` dep-info file into its prerequisite paths.
 ///
 /// Handles `\`-continued lines (`\\\n` and `\\\r\n`), `\ ` escaped spaces,
@@ -426,9 +432,7 @@ pub(crate) fn parse_depfile(text: &str) -> Vec<PathBuf> {
                     _ => current.push('\\'),
                 },
                 ':' if !in_prerequisites
-                    && !(current.len() == 1
-                        && current.as_bytes()[0].is_ascii_alphabetic()
-                        && matches!(chars.peek(), Some('/' | '\\'))) =>
+                    && !is_windows_drive_prefix(&current, chars.peek().copied()) =>
                 {
                     current.clear();
                     in_prerequisites = true;
