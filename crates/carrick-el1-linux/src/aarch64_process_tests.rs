@@ -7059,7 +7059,7 @@ fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
 fn arm_glibc_pthread_join_shared_bitset_wait_wakes_on_child_exit() {
     // The joined CLEARTID word lives in private anonymous memory (glibc's
     // thread descriptor sits in the mmap'd thread stack).
-    let mut words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
+    let words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
         0x4000,
     )));
     let tid_word = words.arg();

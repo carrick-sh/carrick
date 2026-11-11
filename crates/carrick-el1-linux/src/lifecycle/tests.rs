@@ -221,6 +221,52 @@ impl World {
         )
     }
 
+    /// glibc's `pthread_join` wait on the CLEARTID `word` (shared
+    /// `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME`, op 265, as the Docker
+    /// oracle traced it, #2124), served with the admitted process's
+    /// shared-private authority. The exit's wake is a shared wake: Linux
+    /// never releases a PRIVATE waiter with it.
+    fn join(&mut self, frame: &mut TrapFrame, word: &GuestUserValue<u32>, tid: u32) -> Action {
+        let args = [word.arg(), 265, u64::from(tid), 0, 0, 0xffff_ffff];
+        assert_guest_args(&args);
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = SYS_FUTEX as u64;
+        frame.slot = SLOT_IDX as u64;
+        frame.esr = 0x5600_0000;
+        let mut owner = IdentityOwner(crate::common_entry::execution_binding(self.task()));
+        let names = InotifyNameCache::new();
+        match crate::dispatch::dispatch_syscall_with_native::<
+            _,
+            FakeCpu,
+            HardwareUserWord,
+            _,
+            carrick_sched_core::Aarch64ParkedContext,
+        >(
+            frame,
+            &self.counters,
+            &self.tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            Some(Zone {
+                tables: &self.zone,
+                cpu: &mut self.cpu,
+                user: &HardwareUserWord,
+            }),
+            None,
+            Some(&*self.venue),
+            Some(&mut owner),
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        ) {
+            CompletionRoute::Served => Action::Served,
+            route => panic!("join was not served in ring: {route:?}"),
+        }
+    }
+
     fn call_native(&mut self, frame: &mut TrapFrame, nr: usize, args: &[u64]) -> Action {
         assert_guest_args(args);
         frame.x[..args.len()].copy_from_slice(args);
@@ -1522,11 +1568,7 @@ fn clone_then_join(w: &mut World, word: &GuestUserValue<u32>) -> TrapFrame {
         elr: 0x5000,
         ..TrapFrame::default()
     };
-    let action = w.call(
-        &mut frame,
-        SYS_FUTEX,
-        &[word.arg(), 128, u64::from(CHILD_VISIBLE), 0],
-    );
+    let action = w.join(&mut frame, word, CHILD_VISIBLE);
     assert_eq!(action, Action::Served);
     assert_eq!(
         w.task().execution.task.load(Ordering::Relaxed),
@@ -2352,6 +2394,14 @@ impl<C: carrick_el1_abi::EntryContext> ProcessNative<'_, C> for IdentityOwner {
     fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
         self.0
     }
+    /// Test guest user buffers stand in for private anonymous memory.
+    fn futex_shared_private(
+        &mut self,
+        _: UserVa,
+        _: Option<carrick_personality_linux::sched::RelativeFutexWait>,
+    ) -> Result<bool, LifecycleOutcome> {
+        Ok(true)
+    }
     fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
         panic!("unexpected fork")
     }
@@ -2475,14 +2525,7 @@ fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
         elr: 0x5000,
         ..Default::default()
     };
-    assert_eq!(
-        w.call(
-            &mut frame,
-            SYS_FUTEX,
-            &[word.arg(), 128, u64::from(CHILD_VISIBLE), 0]
-        ),
-        Action::Served
-    );
+    assert_eq!(w.join(&mut frame, &word, CHILD_VISIBLE), Action::Served);
     assert_eq!(
         w.task().execution.task.load(Ordering::Relaxed),
         u64::from(CHILD_TID)
