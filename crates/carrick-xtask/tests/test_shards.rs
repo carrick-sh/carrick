@@ -361,7 +361,11 @@ fn workspace_capture_with_artifact_and_no_cargo_environment() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let directory = tempfile::tempdir().unwrap();
     let artifact = directory.path().join("xtask artifact");
-    std::fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &artifact).unwrap();
+    carrick_test_support::executable::copy_executable(
+        env!("CARGO_BIN_EXE_carrick-xtask"),
+        &artifact,
+        0o755,
+    );
     let output = clean_command(&artifact)
         .args(["--root", root.to_str().unwrap(), "check-test-shards"])
         .env("CARRICK_XTASK_BIN", &artifact)
@@ -404,7 +408,6 @@ fn capture_refuses_unlocked_or_online_cargo_before_execution() {
 
 #[test]
 fn cache_preparation_failure_is_infrastructure_and_offline_gate_never_fetches() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("repo");
     let fixture = root.join("fixtures/probe");
@@ -415,8 +418,10 @@ fn cache_preparation_failure_is_infrastructure_and_offline_gate_never_fetches() 
     std::fs::create_dir(&bin).unwrap();
     let cargo = bin.join("cargo");
     let log = dir.path().join("calls");
-    std::fs::write(&cargo, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\necho 'missing registry cache' >&2\nexit 101\n").unwrap();
-    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::executable::write_executable(
+        &cargo,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\necho 'missing registry cache' >&2\nexit 101\n",
+    );
     // The fixture-only fake repository needs a real index for --prepare's scan.
     assert!(
         Command::new("git")

@@ -359,7 +359,6 @@ fn baseline_admission_requires_every_population_identity_and_scoped_cleanup() {
 #[cfg(unix)]
 #[test]
 fn actions_prepare_and_publish_use_the_paired_base_and_fail_closed() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -417,16 +416,22 @@ fn actions_prepare_and_publish_use_the_paired_base_and_fail_closed() {
         .unwrap()
         .trim()
         .to_owned();
-    std::fs::write(&git_shim, format!(r#"#!/usr/bin/env python3
+    carrick_test_support::executable::write_executable(
+        &git_shim,
+        format!(
+            r#"#!/usr/bin/env python3
 import os, sys
 args = [os.environ['TEST_GRAPH'] if a == 'https://github.com/carrick-sh/carrick.git' else a for a in sys.argv[1:]]
 if args[:2] == ['ls-remote', '--refs'] and os.environ.get('TEST_HIDE_QUEUE_REFS'):
     raise SystemExit(0)
 os.execv({real_git:?}, ['git'] + args)
-"#)).unwrap();
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+"#
+        ),
+    );
     let gh = bin.join("gh");
-    std::fs::write(&gh, r#"#!/usr/bin/env python3
+    carrick_test_support::executable::write_executable(
+        &gh,
+        r#"#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
 base, head = os.environ['TEST_BASE_SHA'], os.environ['TEST_HEAD_SHA']
@@ -457,8 +462,8 @@ elif args[0] == 'api':
         raise SystemExit('unexpected API endpoint: '+endpoint)
 else:
     raise SystemExit('unexpected gh invocation: '+repr(args))
-"#).unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+"#,
+    );
     let base = admitted(&a);
     let event = dir.path().join("event.json");
     std::fs::write(&event, json!({"repository":{"full_name":"carrick-sh/carrick"},"inputs":{"pr":"123","sha":b.clone()}}).to_string()).unwrap();
@@ -1353,7 +1358,6 @@ fn historical_fixture_evidence_does_not_invent_hash_work_status() {
 #[cfg(unix)]
 #[test]
 fn merge_group_rejects_bases_without_first_parent_main_ancestry() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -1438,14 +1442,12 @@ fn merge_group_rejects_bases_without_first_parent_main_ancestry() {
         .trim()
         .to_owned();
     let git_shim = bin.join("git");
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &git_shim,
         format!(
             "#!/usr/bin/env python3\nimport os, sys\nargs = [os.environ['TEST_GRAPH'] if a == 'https://github.com/carrick-sh/carrick.git' else a for a in sys.argv[1:]]\nos.execv({real_git:?}, ['git'] + args)\n"
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let baselines = dir.path().join("baselines");
     std::fs::create_dir(&baselines).unwrap();
@@ -1458,7 +1460,7 @@ fn merge_group_rejects_bases_without_first_parent_main_ancestry() {
     }
 
     let gh = bin.join("gh");
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &gh,
         format!(
             r#"#!/usr/bin/env python3
@@ -1505,9 +1507,7 @@ else:
     raise SystemExit('unexpected gh invocation: ' + repr(args))
 "#
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let run_prepare = |label: &str, base_sha: &str, head_sha: &str, pr_num: u64| {
         let head_ref = format!("refs/heads/gh-readonly-queue/main/pr-{pr_num}-{label}");
@@ -1612,7 +1612,6 @@ else:
 #[cfg(unix)]
 #[test]
 fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -1675,14 +1674,12 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
         .trim()
         .to_owned();
     let git_shim = bin.join("git");
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &git_shim,
         format!(
             "#!/usr/bin/env python3\nimport os, sys\nargs = [os.environ['TEST_GRAPH'] if a == 'https://github.com/carrick-sh/carrick.git' else a for a in sys.argv[1:]]\nif args[:2] == ['ls-remote', '--refs'] and os.environ.get('TEST_HIDE_QUEUE_REFS') == '1': raise SystemExit(0)\nos.execv({real_git:?}, ['git'] + args)\n"
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let base_receipt = admitted(&a);
     let baseline_path = dir.path().join("base-a.json");
@@ -1754,7 +1751,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
     .unwrap();
 
     let gh = bin.join("gh");
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &gh,
         r#"#!/usr/bin/env python3
 import json, os, pathlib, shutil, sys
@@ -1789,9 +1786,7 @@ elif args[0] == 'api':
 else:
     raise SystemExit('unexpected gh invocation: ' + repr(args))
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let run_prepare_output = |label: &str, head_ref: &str, base_sha: &str, head_sha: &str| {
         let event_path = dir.path().join(format!("event-{label}.json"));
@@ -2170,11 +2165,10 @@ struct PublishBench {
 #[cfg(unix)]
 impl PublishBench {
     fn new() -> Self {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        std::fs::write(
+        carrick_test_support::executable::write_executable(
             bin.join("gh"),
             r#"#!/usr/bin/env python3
 import json, os, sys
@@ -2185,9 +2179,7 @@ if '--method' in args and args[args.index('--method')+1] == 'POST':
 else:
     raise SystemExit('unexpected gh invocation: '+repr(args))
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let bench = Self {
             dir,
             base: "a".repeat(40),
@@ -2800,11 +2792,10 @@ fn both_paired_runs_restore_the_trusted_base_fixture_bundle() {
 #[cfg(unix)]
 #[test]
 fn base_fixtures_come_only_from_an_authenticated_main_run_of_the_base() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         bin.join("gh"),
         r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
@@ -2860,9 +2851,7 @@ elif args[0] == 'api':
 else:
     raise SystemExit('unexpected gh invocation: ' + repr(args))
 "#,
-    )
-    .unwrap();
-    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let base = "a".repeat(40);
     let request = dir.path().join("request.json");
     std::fs::write(

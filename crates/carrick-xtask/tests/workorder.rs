@@ -263,7 +263,6 @@ fn provenance_requires_current_authorized_labels_and_unedited_order() {
 #[cfg(unix)]
 mod serial_host {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
 
@@ -303,7 +302,7 @@ mod serial_host {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workorder_github_api.json");
         let log_path = dir.path().join("posted.jsonl");
         let fake_gh = bin_dir.join("gh");
-        std::fs::write(
+        carrick_test_support::executable::write_executable(
             &fake_gh,
             r#"#!/usr/bin/env python3
 import json, os, sys
@@ -350,9 +349,7 @@ elif method in ('POST', 'PATCH') and '/labels' in endpoint:
 else:
     raise SystemExit(f'unexpected gh call: {args}')
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let path_env = std::env::join_paths(
             std::iter::once(bin_dir)

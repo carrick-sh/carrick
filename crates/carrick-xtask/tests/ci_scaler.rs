@@ -1459,8 +1459,6 @@ fn template_separates_loop_worker_and_runner_accounts() {
 
 #[test]
 fn cloudmac_hvf_workflow_enforces_disk_admission_before_checkout_and_signed_gate() {
-    use std::os::unix::fs::PermissionsExt;
-
     let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
     assert!(
         !kernel.contains("mac-jit") && !kernel.contains("docs/ci/mac-jit.md"),
@@ -1538,12 +1536,10 @@ fn cloudmac_hvf_workflow_enforces_disk_admission_before_checkout_and_signed_gate
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(&workspace).unwrap();
     let df_stub = bin_dir.join("df");
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &df_stub,
         "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/disk3s1 200000000 100000 %s 50%% /Volumes/carrick-hvf\\n' \"$STUB_AVAIL_KIB\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&df_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let path_env = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
 
     let run_admission = |avail_kib: &str, ws: Option<&std::path::Path>| {

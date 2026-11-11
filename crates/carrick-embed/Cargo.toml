@@ -70,6 +70,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 carrick-fatal = { path = "../carrick-fatal" }
+carrick-test-support = { path = "../carrick-test-support" }
 carrick-thread = { path = "../carrick-thread", features = ["test-support"] }
 # Signed first-entry witnesses arm runtime/kernel hooks only in test builds.
 carrick-runtime = { path = "../carrick-runtime", default-features = false, features = ["test-support"] }

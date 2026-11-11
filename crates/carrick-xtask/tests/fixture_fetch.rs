@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Fixture dependencies must already be prepared before publishing.
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 fn repo() -> PathBuf {
@@ -52,15 +51,13 @@ fn serial_host_fetch_requires_prepared_cache_without_network_fallback() {
     let log = bin.path().join("log");
     let cargo = bin.path().join("cargo");
     // A warm cache: every invocation must remain locked and offline.
-    std::fs::write(
+    carrick_test_support::executable::write_executable(
         &cargo,
         format!(
             "#!/bin/sh\nprintf '%s %s\\n' \"$CARGO_NET_OFFLINE\" \"$*\" >> '{}'\nexit 0\n",
             log.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let old = std::env::var_os("PATH").unwrap();
     let mut paths = vec![bin.path().to_path_buf()];
     paths.extend(std::env::split_paths(&old));

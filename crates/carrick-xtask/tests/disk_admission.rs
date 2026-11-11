@@ -3,7 +3,6 @@ use carrick_xtask::host_lease::{HostLease, HostLeaseMode};
 use std::{
     fs,
     io::{BufRead, BufReader},
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Stdio},
     time::Duration,
@@ -12,8 +11,10 @@ use yaml_rust2::YamlLoader;
 
 fn command(root: &Path) -> Command {
     let df = root.join("df");
-    fs::write(&df, "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted\\n'\ncat \"$DISK_ROW\"\n").unwrap();
-    fs::set_permissions(df, fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::executable::write_executable(
+        &df,
+        "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted\\n'\ncat \"$DISK_ROW\"\n",
+    );
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
     cmd.args(["check-disk", "--floor-gib", "20"])
         .current_dir(root)

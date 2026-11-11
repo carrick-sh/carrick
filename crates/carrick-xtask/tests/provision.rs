@@ -7,7 +7,6 @@ use carrick_xtask::provision::{
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -167,10 +166,7 @@ fn create_mock_elf(path: &Path, is_aarch64: bool, is_static: bool) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
     }
-    fs::write(path, &data).unwrap();
-    let mut perms = fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).unwrap();
+    carrick_test_support::executable::write_executable(path, &data);
 }
 
 fn setup_disposable_env(root: &Path) {

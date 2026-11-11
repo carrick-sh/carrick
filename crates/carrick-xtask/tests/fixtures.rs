@@ -205,6 +205,13 @@ fn write(root: &Path, path: &str, bytes: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
 }
+/// [`write`] for a file the test later executes or hashes as an executable,
+/// created race-free (`carrick_test_support::executable`, #1814).
+fn write_exec(root: &Path, path: &str, bytes: &[u8]) {
+    let path = root.join(path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    carrick_test_support::executable::write_executable(path, bytes);
+}
 /// The reviewed (registry-only) build-code list; the synthetic fixture graph
 /// has no registry packages, so it is empty unless a test adds `extra`.
 fn write_reviewed_build_code(root: &Path, extra: &[serde_json::Value]) {
@@ -435,12 +442,7 @@ impl Fixture {
             let data = elf(target, index as u8);
             let digest = hash(&data);
             let name: String = digest.clone().into();
-            write(store.path(), &format!("objects/{name}"), &data);
-            fs::set_permissions(
-                store.path().join("objects").join(name),
-                fs::Permissions::from_mode(0o755),
-            )
-            .unwrap();
+            write_exec(store.path(), &format!("objects/{name}"), &data);
             executables.push(Executable {
                 path,
                 target,
@@ -541,12 +543,7 @@ fn compare_bundles_accepts_identical_and_rejects_changed_executables() {
     executable.sha256 = hash(&changed);
     let digest: String = executable.sha256.clone().into();
     let path = executable.path.clone();
-    write(f.store.path(), &format!("objects/{digest}"), &changed);
-    fs::set_permissions(
-        f.store.path().join("objects").join(digest),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    write_exec(f.store.path(), &format!("objects/{digest}"), &changed);
     f.republish();
     let unequal = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
         .current_dir(f.repo.path())
@@ -1223,8 +1220,7 @@ fn copy_bundle(from: &Path, to: &Path) {
     for entry in fs::read_dir(from.join("objects")).unwrap() {
         let entry = entry.unwrap();
         let destination = to.join("objects").join(entry.file_name());
-        fs::copy(entry.path(), &destination).unwrap();
-        fs::set_permissions(destination, fs::Permissions::from_mode(0o755)).unwrap();
+        carrick_test_support::executable::copy_executable(entry.path(), &destination, 0o755);
     }
 }
 
@@ -1426,7 +1422,7 @@ impl Preparation {
         fs::create_dir(&lock).unwrap();
         let bin = scratch.path().join("bin");
         fs::create_dir(&bin).unwrap();
-        write(
+        write_exec(
             &bin,
             "cargo",
             br#"#!/bin/sh
@@ -1444,7 +1440,7 @@ shift
 exec "$FIXTURE_TEST_XTASK" "$@"
 "#,
         );
-        write(&bin, "just", br#"#!/bin/sh
+        write_exec(&bin, "just", br#"#!/bin/sh
 if [ "$1" = accept ]; then
     "$FIXTURE_TEST_XTASK" fixtures verify --receipt "$FIXTURE_TEST_ACCEPTED_DIR/validation.json" || exit $?
     "$FIXTURE_TEST_XTASK" host-lease --mode gate -- true || exit $?
@@ -1474,9 +1470,6 @@ else
     exec "$FIXTURE_TEST_JUST" --justfile "$FIXTURE_TEST_JUSTFILE" --working-directory "$PWD" "$@"
 fi
 "#);
-        for name in ["cargo", "just"] {
-            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
-        }
         Self {
             scratch,
             archive,
@@ -1838,7 +1831,7 @@ fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution
     let mut f = Fixture::new();
     // The fake cleanup helper is still a build input: commit it before creating
     // the exact-SHA bundle/checkout instead of relying on untracked admission.
-    write(
+    write_exec(
         f.repo.path(),
         "scripts/sudo/kill.sh",
         br#"#!/bin/sh
@@ -1847,11 +1840,6 @@ fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution
 printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
 "#,
     );
-    fs::set_permissions(
-        f.repo.path().join("scripts/sudo/kill.sh"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
     git(f.repo.path(), &["add", "scripts/sudo/kill.sh"]);
     git(
         f.repo.path(),
@@ -1866,7 +1854,7 @@ printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
     // Only Linux compilation, signing and HVF execution are replaced here.
     // Run the workflow's actual shell, just lease/restore recipes, archive
     // extraction, source validation and signed fixture preflight.
-    write(&p.bin, "just", br#"#!/bin/sh
+    write_exec(&p.bin, "just", br#"#!/bin/sh
 case "$1" in
     fixtures-publish)
         [ "$2" = "$GITHUB_SHA" ] || exit 94
@@ -1883,15 +1871,12 @@ case "$1" in
     *) exec "$FIXTURE_TEST_JUST" --justfile "$FIXTURE_TEST_JUSTFILE" --working-directory "$PWD" "$@" ;;
 esac
 "#);
-    write(
+    write_exec(
         &p.bin,
         "codesign",
         b"#!/bin/sh\nprintf 'com.apple.security.hypervisor\\n'\n",
     );
-    write(&p.bin, "otool", b"#!/bin/sh\nprintf '__dof_carrick\\n'\n");
-    for name in ["just", "codesign", "otool"] {
-        fs::set_permissions(p.bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    write_exec(&p.bin, "otool", b"#!/bin/sh\nprintf '__dof_carrick\\n'\n");
     let executions = p.scratch.path().join("executions");
     let cleaned = p.scratch.path().join("cleaned");
     let sha = git(&p.checkout, &["rev-parse", "HEAD"]);
@@ -2148,7 +2133,7 @@ fn check_remote_accept_cli(remote_bundle: bool, invalid_receipt: bool) {
     // Only the SSH network boundary is replaced. Real Git and rsync servers
     // execute in scratch; detached acceptance is joined to avoid test polling.
     // The checkout lock's keeper runs through this fake session too.
-    write(
+    write_exec(
         &p.bin,
         "ssh",
         br#"#!/bin/sh
@@ -2173,12 +2158,11 @@ esac
 exec sh -c "$script"
 "#,
     );
-    fs::set_permissions(p.bin.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let real_rsync = Command::new("sh")
         .args(["-c", "command -v rsync"])
         .output()
         .unwrap();
-    write(
+    write_exec(
         &p.bin,
         "rsync",
         br#"#!/bin/sh
@@ -2190,7 +2174,6 @@ fi
 exec "$FIXTURE_TEST_RSYNC" "$@"
 "#,
     );
-    fs::set_permissions(p.bin.join("rsync"), fs::Permissions::from_mode(0o755)).unwrap();
     let mut cli = p.command(env!("CARGO_BIN_EXE_carrick-xtask"));
     cli.env("FIXTURE_TEST_REQUIRE_PROVENANCE", "1");
     cli.env(
@@ -2640,16 +2623,11 @@ fn replacing_shared_archive_after_verification_restores_captured_bytes() {
     let replacement = elf(f.manifest.executables[0].target, 240);
     let digest = hash(&replacement);
     let object_name: String = digest.clone().into();
-    write(
+    write_exec(
         f.store.path(),
         &format!("objects/{object_name}"),
         &replacement,
     );
-    fs::set_permissions(
-        f.store.path().join("objects").join(&object_name),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
     f.manifest.executables[0].sha256 = digest;
     f.republish();
     let output = CanonicalTempDir::new();
@@ -3784,8 +3762,7 @@ fn publish_candidate_set(f: &Fixture, names: &[&str], store: &Path) -> PathBuf {
             let data = elf(target, 100 + index as u8);
             let digest = hash(&data);
             let object = objects.join(String::from(digest.clone()));
-            fs::write(&object, &data).unwrap();
-            fs::set_permissions(&object, fs::Permissions::from_mode(0o755)).unwrap();
+            carrick_test_support::executable::write_executable(&object, &data);
             executables.push(Executable {
                 path: name.executable(target),
                 target,
@@ -4342,15 +4319,13 @@ fn serial_host_banned_added_probe_is_refused_before_any_cargo_fetch() {
     let bin = tempfile::tempdir().unwrap();
     let log = bin.path().join("cargo.log");
     let cargo = bin.path().join("cargo");
-    fs::write(
+    carrick_test_support::executable::write_executable(
         &cargo,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
             log.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let old = std::env::var_os("PATH").unwrap();
     let paths = std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&old));
     // SAFETY: this clean-environment child runs only this test (`--exact`).
