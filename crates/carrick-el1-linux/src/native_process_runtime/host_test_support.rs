@@ -11549,7 +11549,14 @@ fn host_request_during_child_wait_park(vfork: bool) {
     assert!(entry.take_handoff_receipt().is_some());
     drop(entry);
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
-    assert!(fixture.zone.record(record.id).requires_native_entry());
+    // The native owner, not the host, resumes the retained wait.
+    assert_eq!(
+        fixture.zone.record(record.id).resume_disposition(),
+        carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(
+            carrick_sched_core::object_wait::OwnerEntry::Syscall
+        )
+    );
+    assert!(fixture.zone.record(record.id).needs_native_handback());
 
     // The stopped executor honours the request and hands the record back.
     let mut wanted = alloc::vec::Vec::new();
