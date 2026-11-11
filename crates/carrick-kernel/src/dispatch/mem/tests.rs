@@ -71,6 +71,10 @@ pub struct CountingMmapMemory {
     shared_scrub_calls: Cell<usize>,
     pub(crate) refuse_shared_scrub: bool,
     pub(crate) write_refusal: Cell<Option<carrick_el1_abi::PortalOwnerWait>>,
+    /// The admitted owner portal's answer while this MM's gate is raised,
+    /// including by the syscall's own mutation guard: every owner transfer,
+    /// read or write, refuses on `Gate` until the gate is lowered.
+    pub(crate) owner_gate: Cell<Option<carrick_el1_abi::PortalOwnerWait>>,
     pub(crate) defer_anon: bool,
     pub(crate) discard_anon: bool,
     pub(crate) fail_protect_non_zero: Cell<bool>,
@@ -137,6 +141,7 @@ impl CountingMmapMemory {
             shared_scrub_calls: Cell::new(0),
             refuse_shared_scrub: false,
             write_refusal: Cell::new(None),
+            owner_gate: Cell::new(None),
             defer_anon: false,
             discard_anon: false,
             fail_protect_non_zero: Cell::new(false),
@@ -321,13 +326,16 @@ impl GuestMemory for CountingMmapMemory {
 
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         let offset = self.range_offset(address, length)?;
+        if let Some(wait) = self.owner_gate.get() {
+            return Err(MemoryError::OwnerWait(wait));
+        }
         Ok(self.bytes[offset..offset + length].to_vec())
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let offset = self.range_offset(address, bytes.len())?;
         self.write_calls.set(self.write_calls.get() + 1);
-        if let Some(wait) = self.write_refusal.take() {
+        if let Some(wait) = self.write_refusal.take().or(self.owner_gate.get()) {
             return Err(MemoryError::OwnerWait(wait));
         }
         self.write_bytes_total
