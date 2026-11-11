@@ -1,10 +1,13 @@
 //! One native process signal selection and handler-publication owner for both ISAs.
 
-use super::native_process_runtime::{NativeProcessEntry, NativeProcessError, NativeProcessService};
+use super::native_process_runtime::{
+    NativeProcessEntry, NativeProcessError, NativeProcessService, PendingSignalDelivery,
+    SignalCopyDeferral, SignalDeferOutcome,
+};
 use carrick_el1_abi::{BlockedMask, CurrentTask};
 use carrick_guest_arch::{ProcessContext, UserVa};
 use carrick_personality_linux::dispatch::CompletionRoute;
-use carrick_personality_linux::signal::{ProcessSignals, SignalBackend};
+use carrick_personality_linux::signal::{ProcessSignals, SignalBackend, SignalFrameSetup};
 use carrick_signal_core::policy::{self, SigBlockMask, Signal};
 
 /// Machine-specific register operations surrounding the shared selection.
@@ -29,6 +32,14 @@ pub trait SignalMachine<C> {
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute;
     /// Reflect the successfully published frame in a saved execution context.
     fn published_stack(&mut self, _sp: UserVa) {}
+    /// Copy the current pre-handler return frame into the parked context before
+    /// suspending on address-space contention.
+    fn sync_parked_context(
+        &self,
+        _frame: &<Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+        _ctx: &mut C,
+    ) {
+    }
 }
 
 pub fn deliver_signal_on_syscall_return<'a, M, C, S, A>(
@@ -56,59 +67,45 @@ where
         return None;
     }
 
-    let mut thread_blocked =
-        SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(slot.blocked().0));
-    let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
-    slot.init_blocked(BlockedMask(saved_mask.signals().bits()));
-    // Every completed checkpoint consumes this exact member's interrupted wait,
-    // including a handler without SA_RESTART. It cannot leak into a later SVC.
-    let mut interrupted_child_wait = process.take_interrupted_child_wait();
-    let mut rewind_interrupted_wait =
-        |_process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
-         frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
-         machine: &mut A| {
-            if let Some(original) = interrupted_child_wait.take() {
-                Some(machine.restart(frame, original.as_ref()))
-            } else {
-                machine.restart_forwarded(frame)
-            }
+    let (sig, mut info, action, saved_mask, thread_blocked) = if let Some(retained) =
+        process.take_pending_signal_delivery()
+    {
+        let PendingSignalDelivery {
+            sig,
+            info,
+            action,
+            saved_mask,
+            thread_blocked,
+            ..
+        } = *retained;
+        (sig, info, action, saved_mask, thread_blocked)
+    } else {
+        let mut thread_blocked = SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(slot.blocked().0),
+        );
+        let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
+        slot.init_blocked(BlockedMask(saved_mask.signals().bits()));
+        // Every completed checkpoint consumes this exact member's interrupted wait,
+        // including a handler without SA_RESTART. It cannot leak into a later SVC.
+        let mut interrupted_child_wait = process.take_interrupted_child_wait();
+        let mut rewind_interrupted_wait =
+            |_process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
+             frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+             machine: &mut A| {
+                if let Some(original) = interrupted_child_wait.take() {
+                    Some(machine.restart(frame, original.as_ref()))
+                } else {
+                    machine.restart_forwarded(frame)
+                }
+            };
+        let Some((sig, info, action)) =
+            process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)
+        else {
+            let _ = rewind_interrupted_wait(process, frame, machine);
+            return None;
         };
-    let Some((sig, info, action)) =
-        process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)
-    else {
-        let _ = rewind_interrupted_wait(process, frame, machine);
-        return None;
-    };
-    match action.disposition {
-        policy::Disposition::Ignore => {
-            if carrick_signal_core::wait::interrupted_wait(
-                carrick_signal_core::wait::RestartClass::IfSaRestart,
-                carrick_signal_core::wait::WaitProgress::Blocked,
-                None,
-            ) == carrick_signal_core::wait::WaitDecision::Continue
-            {
-                let _ = rewind_interrupted_wait(process, frame, machine);
-            }
-            None
-        }
-        policy::Disposition::Default => {
-            // The host already classified this synchronous fault. Select its
-            // disposition here once, then return only a fatal verdict to the
-            // existing host core/exit path. Carrier signal tables stay out.
-            if slot
-                .synchronous_fault()
-                .is_some_and(|(signal, _, _, _)| signal == sig)
-            {
-                slot.synchronous_fault_default();
-                return None;
-            }
-            if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
-                Some(match process.exit_with_signal(sig) {
-                    Ok(_) => CompletionRoute::Suspended,
-                    Err(NativeProcessError::GroupExitCustody) => machine.group_exit_custody(task),
-                    Err(_) => CompletionRoute::InvalidCompletion,
-                })
-            } else {
+        match action.disposition {
+            policy::Disposition::Ignore => {
                 if carrick_signal_core::wait::interrupted_wait(
                     carrick_signal_core::wait::RestartClass::IfSaRestart,
                     carrick_signal_core::wait::WaitProgress::Blocked,
@@ -117,82 +114,178 @@ where
                 {
                     let _ = rewind_interrupted_wait(process, frame, machine);
                 }
-                None
+                return None;
+            }
+            policy::Disposition::Default => {
+                // The host already classified this synchronous fault. Select its
+                // disposition here once, then return only a fatal verdict to the
+                // existing host core/exit path. Carrier signal tables stay out.
+                if slot
+                    .synchronous_fault()
+                    .is_some_and(|(signal, _, _, _)| signal == sig)
+                {
+                    slot.synchronous_fault_default();
+                    return None;
+                }
+                return if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
+                    Some(match process.exit_with_signal(sig) {
+                        Ok(_) => CompletionRoute::Suspended,
+                        Err(NativeProcessError::GroupExitCustody) => {
+                            machine.group_exit_custody(task)
+                        }
+                        Err(_) => CompletionRoute::InvalidCompletion,
+                    })
+                } else {
+                    if carrick_signal_core::wait::interrupted_wait(
+                        carrick_signal_core::wait::RestartClass::IfSaRestart,
+                        carrick_signal_core::wait::WaitProgress::Blocked,
+                        None,
+                    ) == carrick_signal_core::wait::WaitDecision::Continue
+                    {
+                        let _ = rewind_interrupted_wait(process, frame, machine);
+                    }
+                    None
+                };
+            }
+            policy::Disposition::Handler(_) => {
+                let restarted = if carrick_signal_core::wait::interrupted_wait(
+                    carrick_signal_core::wait::RestartClass::IfSaRestart,
+                    carrick_signal_core::wait::WaitProgress::Blocked,
+                    Some(action.flags.restart),
+                ) == carrick_signal_core::wait::WaitDecision::Restart
+                {
+                    rewind_interrupted_wait(process, frame, machine)
+                } else {
+                    None
+                };
+                if restarted == Some(false) {
+                    return force_delivery_fault(
+                        task,
+                        slot,
+                        process,
+                        frame,
+                        fpstate,
+                        machine,
+                        SignalDeliveryFailure {
+                            original: sig,
+                            blocked: thread_blocked,
+                        },
+                    );
+                }
+                (sig, info, action, saved_mask, thread_blocked)
             }
         }
-        policy::Disposition::Handler(handler) => {
-            let restarted = if carrick_signal_core::wait::interrupted_wait(
-                carrick_signal_core::wait::RestartClass::IfSaRestart,
-                carrick_signal_core::wait::WaitProgress::Blocked,
-                Some(action.flags.restart),
-            ) == carrick_signal_core::wait::WaitDecision::Restart
-            {
-                rewind_interrupted_wait(process, frame, machine)
-            } else {
-                None
-            };
-            if restarted == Some(false) {
-                return force_delivery_fault(
-                    task,
-                    slot,
-                    process,
-                    frame,
-                    fpstate,
-                    machine,
-                    SignalDeliveryFailure {
-                        original: sig,
-                        blocked: thread_blocked,
-                    },
-                );
+    };
+
+    let policy::Disposition::Handler(handler) = action.disposition else {
+        return Some(CompletionRoute::InvalidCompletion);
+    };
+    let interrupted_sp = machine.user_sp(frame);
+    let selected_stack = carrick_personality_linux::signal::delivery_stack(
+        slot.read_altstack(),
+        interrupted_sp,
+        action.flags.on_stack,
+    );
+    let Some((sp, stack)) = selected_stack else {
+        return force_delivery_fault(
+            task,
+            slot,
+            process,
+            frame,
+            fpstate,
+            machine,
+            SignalDeliveryFailure {
+                original: sig,
+                blocked: thread_blocked,
+            },
+        );
+    };
+    let params = carrick_personality_linux::signal::SignalFrameParams {
+        stack,
+        signal: sig,
+        sigcode: info.as_ref().map_or(0, |i| i.si_code),
+        fault_addr: info.as_ref().map_or(0, |i| i.si_addr),
+        handler: UserVa::new(handler.0),
+        restorer: action.restorer.map(|r| UserVa::new(r.0)),
+        mask: saved_mask,
+        sp,
+        interrupted_sp,
+    };
+    loop {
+        let info_bytes = info.as_ref().map(|i| {
+            // SAFETY: a borrowed ABI record is contiguous for its own size.
+            unsafe {
+                core::slice::from_raw_parts(i as *const _ as *const u8, core::mem::size_of_val(i))
             }
-            let interrupted_sp = machine.user_sp(frame);
-            let selected_stack = carrick_personality_linux::signal::delivery_stack(
-                slot.read_altstack(),
-                interrupted_sp,
-                action.flags.on_stack,
-            );
-            let Some((sp, stack)) = selected_stack else {
-                return force_delivery_fault(
-                    task,
-                    slot,
-                    process,
-                    frame,
-                    fpstate,
-                    machine,
-                    SignalDeliveryFailure {
-                        original: sig,
-                        blocked: thread_blocked,
-                    },
-                );
-            };
-            let params = carrick_personality_linux::signal::SignalFrameParams {
-                stack,
-                signal: sig,
-                sigcode: info.as_ref().map_or(0, |i| i.si_code),
-                fault_addr: info.as_ref().map_or(0, |i| i.si_addr),
-                handler: UserVa::new(handler.0),
-                restorer: action.restorer.map(|r| UserVa::new(r.0)),
-                mask: saved_mask,
-                sp,
-                interrupted_sp,
-            };
-            let info_bytes = info.as_ref().map(|i| {
-                // SAFETY: a borrowed ABI record is contiguous for its own size.
-                unsafe {
-                    core::slice::from_raw_parts(
-                        i as *const _ as *const u8,
-                        core::mem::size_of_val(i),
+        });
+        let mut deferred = None;
+        let mut invariant_failure = false;
+        let setup = machine.backend().setup_signal_frame(
+            frame,
+            params,
+            info_bytes,
+            fpstate,
+            &mut |va, bytes| match process.copy_signal_frame(va, bytes) {
+                Ok(()) => carrick_core::user_copy::CopyOutcome::Done,
+                Err(NativeProcessError::OwnerWait(wait)) => {
+                    deferred = Some(SignalCopyDeferral::Portal(wait));
+                    carrick_core::user_copy::CopyOutcome::NotYet(
+                        carrick_core::user_copy::GuestCopyRequest {
+                            address: va,
+                            len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                            access: carrick_guest_arch::Access::Write,
+                        },
                     )
                 }
-            });
-            let setup = machine.backend().setup_signal_frame(
-                frame,
-                params,
-                info_bytes,
-                fpstate,
-                &mut |va, bytes| process.copy_signal_frame(va, bytes).is_ok(),
-            );
-            if setup.is_err() {
+                Err(NativeProcessError::Busy) => {
+                    deferred = Some(SignalCopyDeferral::Service);
+                    carrick_core::user_copy::CopyOutcome::NotYet(
+                        carrick_core::user_copy::GuestCopyRequest {
+                            address: va,
+                            len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                            access: carrick_guest_arch::Access::Write,
+                        },
+                    )
+                }
+                Err(NativeProcessError::Stale | NativeProcessError::Quarantined) => {
+                    invariant_failure = true;
+                    carrick_core::user_copy::CopyOutcome::Fault
+                }
+                Err(_) => carrick_core::user_copy::CopyOutcome::Fault,
+            },
+        );
+        if invariant_failure {
+            return Some(CompletionRoute::InvalidCompletion);
+        }
+        match setup {
+            Ok(SignalFrameSetup::Installed(published_sp)) => {
+                machine.published_stack(published_sp);
+                break;
+            }
+            Ok(SignalFrameSetup::NotYet(_)) => {
+                let Some(deferral) = deferred else {
+                    return Some(CompletionRoute::InvalidCompletion);
+                };
+                machine.sync_parked_context(frame, process.resume_context_mut());
+                match process.retain_and_defer_signal_delivery(
+                    sig,
+                    &mut info,
+                    action,
+                    saved_mask,
+                    thread_blocked,
+                    deferral,
+                ) {
+                    Ok(SignalDeferOutcome::Suspended) => {
+                        return Some(CompletionRoute::Suspended);
+                    }
+                    Ok(SignalDeferOutcome::ReadyToRebuild) => continue,
+                    Err(NativeProcessError::GroupExitCustody) => {
+                        return Some(machine.group_exit_custody(task));
+                    }
+                    Err(_) => return Some(CompletionRoute::InvalidCompletion),
+                }
+            }
+            Err(_) => {
                 return force_delivery_fault(
                     task,
                     slot,
@@ -206,24 +299,19 @@ where
                     },
                 );
             }
-            if let Ok(sp) = setup {
-                machine.published_stack(sp);
-            }
-            if slot
-                .synchronous_fault()
-                .is_some_and(|(signal, _, _, _)| signal == sig)
-            {
-                slot.clear_synchronous_fault();
-            }
-            commit_handler_stack(slot, stack, sp, interrupted_sp, action.flags.on_stack);
-            let mask = policy::handler_block_mask(sig, action, thread_blocked);
-            let _ = slot.store_blocked_then_read_pending(
-                BlockedMask(mask.signals().bits()),
-                slot.pending(),
-            );
-            None
         }
     }
+    if slot
+        .synchronous_fault()
+        .is_some_and(|(signal, _, _, _)| signal == sig)
+    {
+        slot.clear_synchronous_fault();
+    }
+    commit_handler_stack(slot, stack, sp, interrupted_sp, action.flags.on_stack);
+    let mask = policy::handler_block_mask(sig, action, thread_blocked);
+    let _ =
+        slot.store_blocked_then_read_pending(BlockedMask(mask.signals().bits()), slot.pending());
+    None
 }
 
 fn commit_handler_stack(

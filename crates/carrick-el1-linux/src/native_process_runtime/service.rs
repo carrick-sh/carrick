@@ -927,6 +927,110 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(outcome)
     }
 
+    #[inline(never)]
+    pub(crate) fn take_pending_signal_delivery(&mut self) -> Option<Box<PendingSignalDelivery>> {
+        let mut graph = self.runtime.graph.lock();
+        let resources = graph
+            .owner
+            .task_mut(self.key)
+            .ok()?
+            .native_mut()
+            .resources_mut();
+        let pending = resources.pending_signal_deliveries.remove(&self.record)?;
+        if signal_record_exists(self.source.zone, self.record)
+            && resources.members.iter().any(|member| {
+                member.record == self.record
+                    && core::ptr::eq(member.control.control(), self.control)
+                    && member.expected_host == pending.expected_host
+            })
+        {
+            Some(pending)
+        } else {
+            None
+        }
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn retain_and_defer_signal_delivery(
+        &mut self,
+        sig: carrick_signal_core::policy::Signal,
+        info: &mut Option<carrick_syscall_abi::LinuxSiginfo>,
+        action: carrick_signal_core::policy::Action,
+        saved_mask: carrick_signal_core::policy::SigBlockMask,
+        thread_blocked: carrick_signal_core::policy::SigBlockMask,
+        deferral: SignalCopyDeferral,
+    ) -> Result<SignalDeferOutcome, NativeProcessError> {
+        {
+            let mut graph = self.runtime.graph.lock();
+            let resources = graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native_mut()
+                .resources_mut();
+            if !signal_record_exists(self.source.zone, self.record) {
+                return Err(NativeProcessError::Stale);
+            }
+            let expected_host = resources
+                .members
+                .iter()
+                .find(|member| {
+                    member.record == self.record
+                        && core::ptr::eq(member.control.control(), self.control)
+                })
+                .map(|member| member.expected_host)
+                .ok_or(NativeProcessError::Stale)?;
+            let retained = Box::new(PendingSignalDelivery::new(
+                expected_host,
+                sig,
+                info.take(),
+                action,
+                saved_mask,
+                thread_blocked,
+            ));
+            resources
+                .pending_signal_deliveries
+                .insert(self.record, retained);
+        }
+        let owner_wait = match deferral {
+            SignalCopyDeferral::Portal(wait) => Some(wait),
+            SignalCopyDeferral::Service => None,
+        };
+        let result = self.begin_service_inner(
+            ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Syscall,
+            },
+            None,
+            owner_wait,
+            ServicePayload::Copyin,
+            ServiceCompletion::Inline,
+        );
+        match self.finish_service_handoff(result) {
+            Ok(NativeResume::Left(status)) => {
+                if let Some(status) = status {
+                    self.root_exit = Some(status);
+                }
+                Ok(SignalDeferOutcome::Suspended)
+            }
+            Ok(NativeResume::Returned(_)) | Ok(NativeResume::NoPending) => {
+                let reclaimed = self
+                    .take_pending_signal_delivery()
+                    .ok_or(NativeProcessError::Quarantined)?;
+                *info = reclaimed.info;
+                Ok(SignalDeferOutcome::ReadyToRebuild)
+            }
+            Ok(_) => {
+                let _ = self.take_pending_signal_delivery();
+                Err(NativeProcessError::Quarantined)
+            }
+            Err(error) => {
+                let _ = self.take_pending_signal_delivery();
+                Err(error)
+            }
+        }
+    }
+
     pub(super) fn begin_adapter_service(
         &mut self,
         operation: ServiceOperation,
@@ -2317,6 +2421,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         match parked {
             Ok(mut parked) => {
+                self.service.note_owner_wait_parked();
                 self.handoff = parked.take_receipt();
                 Ok(NativeResume::Left(None))
             }
@@ -2462,6 +2567,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         resources.mm = successor.mm.clone();
         resources.address = successor.address;
         resources.interrupted_child_waits.clear();
+        resources.pending_signal_deliveries.clear();
         resources.pending_child_tid = None;
         resources.signals.reset_for_exec_survivor(self.record);
         resources.members[0].thread = validated.new_key.task;

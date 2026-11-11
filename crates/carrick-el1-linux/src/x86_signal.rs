@@ -37,8 +37,8 @@ impl LinuxX86Backend {
         resume: UserReturn,
         siginfo: Option<&'a [u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-    ) -> Result<UserVa, ArchError> {
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<carrick_personality_linux::signal::SignalFrameSetup, ArchError> {
         // 1. Determine stack location
         // On x86_64, user stack has a 128-byte red zone:
         const FP_BYTES: usize = carrick_sched_core::X86_XSAVE_BYTES;
@@ -136,10 +136,27 @@ impl LinuxX86Backend {
 
         // 3. Write frame to user stack
         let frame_bytes = rtsigframe.as_bytes();
-        if !copy_out(UserVa::new(fp_address), &fp_image)
-            || !copy_out(UserVa::new(new_sp), frame_bytes)
-        {
-            return Err(ArchError::InvalidFrame);
+        match copy_out(UserVa::new(fp_address), &fp_image) {
+            carrick_core::user_copy::CopyOutcome::Done => {}
+            carrick_core::user_copy::CopyOutcome::NotYet(request) => {
+                return Ok(carrick_personality_linux::signal::SignalFrameSetup::NotYet(
+                    request,
+                ));
+            }
+            carrick_core::user_copy::CopyOutcome::Fault => {
+                return Err(ArchError::InvalidFrame);
+            }
+        }
+        match copy_out(UserVa::new(new_sp), frame_bytes) {
+            carrick_core::user_copy::CopyOutcome::Done => {}
+            carrick_core::user_copy::CopyOutcome::NotYet(request) => {
+                return Ok(carrick_personality_linux::signal::SignalFrameSetup::NotYet(
+                    request,
+                ));
+            }
+            carrick_core::user_copy::CopyOutcome::Fault => {
+                return Err(ArchError::InvalidFrame);
+            }
         }
 
         // 4. Set up registers for handler invocation
@@ -154,7 +171,7 @@ impl LinuxX86Backend {
         frame.rdx = uc_addr; // arg 3: ucontext_t*
         frame.rax = 0;
 
-        Ok(UserVa::new(new_sp))
+        Ok(carrick_personality_linux::signal::SignalFrameSetup::Installed(UserVa::new(new_sp)))
     }
 }
 
@@ -165,8 +182,8 @@ impl SignalBackend for LinuxX86Backend {
         params: SignalFrameParams,
         siginfo: Option<&[u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-    ) -> Result<UserVa, Self::Error> {
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<carrick_personality_linux::signal::SignalFrameSetup, Self::Error> {
         self.setup_signal_frame_with_resume(
             frame,
             params,

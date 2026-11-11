@@ -759,7 +759,9 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
                 .object_wait(
                     carrick_sched_core::object_wait::ObjectWaitKey::native_service(member).unwrap(),
                     &carrick_sched_core::ShortLockSpin,
-                    &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
                 )
                 .unwrap();
             let ticket = unsafe {
@@ -1059,8 +1061,8 @@ fn signal_stack_real_fault_forces_sigsegv_with_oracle_si_code_128() {
         assert_eq!(frame.x[0], 11, "x0 must carry SIGSEGV (11)");
         let info_offset = (frame.x[1] - altstack.arg()) as usize;
         let siginfo: carrick_syscall_abi::LinuxSiginfo = zerocopy::FromBytes::read_from_bytes(
-            &altstack.as_bytes()
-                [info_offset..info_offset + core::mem::size_of::<carrick_syscall_abi::LinuxSiginfo>()],
+            &altstack.as_bytes()[info_offset
+                ..info_offset + core::mem::size_of::<carrick_syscall_abi::LinuxSiginfo>()],
         )
         .unwrap();
         let si_signo = { siginfo.si_signo };
@@ -1333,10 +1335,51 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
         .zone
         .install_space(sibling_slot, mm_key.raw())
         .unwrap();
-    let sibling_task = CurrentTask::new();
-    sibling_task.execution.task.store(42, Ordering::Release);
-    sibling_task.mm.thread_generation.store(1, Ordering::Release);
+    let (peer_control, peer) = imported_thread_on_slot(fixture, sibling_slot, |id| {
+        id.affinity = 1 << sibling_slot.raw();
+    });
+    assert_eq!(
+        fixture.zone.switch_in_full(sibling_slot).unwrap().record,
+        peer.id
+    );
+    let sibling_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: sibling_slot,
+    };
+    let sibling_task: &'static CurrentTask = Box::leak(Box::new(CurrentTask::new()));
+    sibling_task.set(
+        El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+        fixture.leader.file_table,
+    );
     sibling_task.mm.key.store(mm_key.raw(), Ordering::Release);
+    sibling_task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    sibling_task.publish_visible_pid(41);
+    sibling_task.publish_root_generation(fixture.address.generation);
+    sibling_task.publish_lifecycle(
+        fixture.page as *const _ as u64,
+        peer_control as *const _ as u64,
+    );
+    let peer_stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let peer_sp_top = peer_stack.va_at(peer_stack.len());
+    // SAFETY: switch_in_full gave sibling_slot exclusive custody of peer.id.
+    unsafe {
+        let context = fixture.zone.record(peer.id).ctx_mut();
+        context.native.pc = 0x50_0004;
+        context.native.sp_el0 = peer_sp_top.raw();
+    }
+    registry()
+        .register_thread(
+            sibling_source,
+            sibling_task,
+            fixture.address,
+            fixture.page,
+            peer_control,
+        )
+        .unwrap();
 
     let done = core::sync::atomic::AtomicBool::new(false);
     let mmap_cycles = AtomicUsize::new(0);
@@ -1353,13 +1396,22 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
         }
         let _stop_mapper = StopMapper(done_ref);
         let mmap_cycles_ref = &mmap_cycles;
-        let sibling_task_ref = &sibling_task;
         let leader_slot = fixture.slot;
         let mapper_tables = &fixture.tables;
         let mapper_zone = fixture.zone;
         let mapper_reservations = fixture.region.table();
+        let mapper_page = fixture.page;
         let mapper = scope.spawn(move || {
-            let counters = carrick_el1_abi::Counters::default();
+            let counters = Box::new(carrick_el1_abi::Counters::new());
+            let mut sibling_service = Aarch64NativeProcessService::with_crossing(
+                sibling_task,
+                sibling_slot,
+                mapper_zone,
+                mapper_reservations,
+                NonZeroU64::MIN,
+                TestStockCrossing::new(&[]),
+            );
+            let mut peer_saved = Box::new(Aarch64ParkedContext::ZERO);
             let mut memory = UnbackedMmapMemory {
                 tables: mapper_tables,
             };
@@ -1369,14 +1421,18 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                     "timed out in concurrent mmap/munmap thread"
                 );
                 let access = crate::sched::object_wait::space_access(mapper_zone, sibling_slot);
-                let mut map_frame = carrick_el1_abi::TrapFrame::default();
-                map_frame.slot = u64::from(sibling_slot.raw());
+                let mut map_frame = carrick_el1_abi::TrapFrame {
+                    esr: 0x5600_0000,
+                    elr: 0x50_0004,
+                    slot: u64::from(sibling_slot.raw()),
+                    ..Default::default()
+                };
                 map_frame.x[8] = 222;
                 map_frame.x[..6].copy_from_slice(&[0, 4096, 3, 0x22, u64::MAX, 0]);
                 if carrick_el1::memory::serve_delegated_anonymous(
                     &mut map_frame,
                     &counters,
-                    sibling_task_ref,
+                    sibling_task,
                     access,
                     mapper_reservations,
                     &mut memory,
@@ -1384,25 +1440,111 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                 ) == carrick_el1::memory::DelegatedAnonymous::Served
                 {
                     let mapped_va = map_frame.x[0];
-                    let access = crate::sched::object_wait::space_access(mapper_zone, sibling_slot);
-                    let mut unmap_frame = carrick_el1_abi::TrapFrame::default();
-                    unmap_frame.slot = u64::from(sibling_slot.raw());
-                    unmap_frame.x[8] = 215;
-                    unmap_frame.x[0] = mapped_va;
-                    unmap_frame.x[1] = 4096;
+                    assert!(
+                        (mapped_va as i64) > 0,
+                        "concurrent mmap returned error {mapped_va:#x}"
+                    );
+                    *peer_saved = Aarch64ParkedContext::ZERO;
+                    crate::sched::ThreadCpu::save(
+                        &mut crate::sched::FakeCpu::default(),
+                        &map_frame,
+                        &mut peer_saved,
+                        crate::sched::CpuExitCause::Svc,
+                    );
+                    peer_saved.native.sp_el0 = peer_sp_top.raw();
                     assert_eq!(
-                        carrick_el1::memory::serve_delegated_anonymous(
+                        crate::dispatch::arm_signal_user_return_entry(
+                            sibling_source,
+                            sibling_task,
+                            &peer_saved.native,
+                            ttbr0,
+                            mapper_page,
+                            peer_control,
+                            &mut sibling_service,
+                            |process| {
+                                crate::arm_signal::deliver_on_user_return_at(
+                                    sibling_task,
+                                    peer_control,
+                                    process,
+                                    &mut map_frame,
+                                    |_, _| peer_sp_top,
+                                )
+                            },
+                        )
+                        .unwrap(),
+                        carrick_el1_abi::Action::Served
+                    );
+                    assert_eq!(map_frame.elr, 0x50_0004);
+                    loop {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "timed out in concurrent munmap retry"
+                        );
+                        let access =
+                            crate::sched::object_wait::space_access(mapper_zone, sibling_slot);
+                        let mut unmap_frame = carrick_el1_abi::TrapFrame {
+                            esr: 0x5600_0000,
+                            elr: 0x50_0004,
+                            slot: u64::from(sibling_slot.raw()),
+                            ..Default::default()
+                        };
+                        unmap_frame.x[8] = 215;
+                        unmap_frame.x[0] = mapped_va;
+                        unmap_frame.x[1] = 4096;
+                        match carrick_el1::memory::serve_delegated_anonymous(
                             &mut unmap_frame,
                             &counters,
-                            sibling_task_ref,
+                            sibling_task,
                             access,
                             mapper_reservations,
                             &mut memory,
                             None,
-                        ),
-                        carrick_el1::memory::DelegatedAnonymous::Served
-                    );
+                        ) {
+                            carrick_el1::memory::DelegatedAnonymous::Served => {
+                                assert_eq!(unmap_frame.x[0], 0);
+                                *peer_saved = Aarch64ParkedContext::ZERO;
+                                crate::sched::ThreadCpu::save(
+                                    &mut crate::sched::FakeCpu::default(),
+                                    &unmap_frame,
+                                    &mut peer_saved,
+                                    crate::sched::CpuExitCause::Svc,
+                                );
+                                peer_saved.native.sp_el0 = peer_sp_top.raw();
+                                assert_eq!(
+                                    crate::dispatch::arm_signal_user_return_entry(
+                                        sibling_source,
+                                        sibling_task,
+                                        &peer_saved.native,
+                                        ttbr0,
+                                        mapper_page,
+                                        peer_control,
+                                        &mut sibling_service,
+                                        |process| {
+                                            crate::arm_signal::deliver_on_user_return_at(
+                                                sibling_task,
+                                                peer_control,
+                                                process,
+                                                &mut unmap_frame,
+                                                |_, _| peer_sp_top,
+                                            )
+                                        },
+                                    )
+                                    .unwrap(),
+                                    carrick_el1_abi::Action::Served
+                                );
+                                assert_eq!(unmap_frame.elr, 0x50_0004);
+                                break;
+                            }
+                            carrick_el1::memory::DelegatedAnonymous::Contended(_) => {
+                                std::thread::yield_now();
+                            }
+                            other => {
+                                panic!("unexpected munmap outcome {other:?} for {mapped_va:#x}");
+                            }
+                        }
+                    }
                     mmap_cycles_ref.fetch_add(1, Ordering::Release);
+                    std::thread::yield_now();
                 } else {
                     std::thread::yield_now();
                 }
@@ -1463,13 +1605,18 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
         }
         let _clear = ClearHook;
 
+        let counters = Box::new(carrick_el1_abi::Counters::new());
+        let mut saved = Box::new(Aarch64ParkedContext::ZERO);
+        let words = Box::new(Aarch64ParkedContext::from_parts(
+            ThreadCtx::ZERO,
+            fixture.address,
+        ));
         for index in 0..1_000 {
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out delivering signal {index}/1000"
             );
             {
-                let words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
                 with_process_entry(
                     source,
                     task,
@@ -1503,7 +1650,7 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                     std::time::Instant::now() < deadline,
                     "timed out waiting for signal {index} owner-wait wake"
                 );
-                let mut saved = Box::new(Aarch64ParkedContext::ZERO);
+                *saved = Aarch64ParkedContext::ZERO;
                 crate::sched::ThreadCpu::save(
                     &mut crate::sched::FakeCpu::default(),
                     &frame,
@@ -1533,15 +1680,53 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                 match action {
                     carrick_el1_abi::Action::Served => break,
                     carrick_el1_abi::Action::Idle => {
+                        let _ = crate::sched::leave_space(
+                            fixture.zone,
+                            fixture.slot,
+                            &mut crate::sched::FakeCpu::default(),
+                        );
                         parked_waits.fetch_add(1, Ordering::Relaxed);
-                        while fixture.zone.runnable_head(fixture.slot) != Some(owner_record) {
+                        if let Ok(Some(notice)) = fixture.task.service_notice.take() {
+                            let queue = fixture
+                                .zone
+                                .object_wait(
+                                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(
+                                        member,
+                                    )
+                                    .unwrap(),
+                                    &carrick_sched_core::ShortLockSpin,
+                                    &|owned| {
+                                        crate::sched::object_wait::deliver_host_completion(
+                                            owned.zone(),
+                                            owned,
+                                        )
+                                    },
+                                )
+                                .unwrap();
+                            let ticket = unsafe {
+                                carrick_core_abi::service::ServiceCell::claim_notice(
+                                    &fixture.control.service,
+                                    notice,
+                                    NonZeroU64::MIN,
+                                    fixture.zone.record(owner_record).identity(),
+                                )
+                            }
+                            .unwrap();
+                            assert!(ticket.complete(true).is_ok());
+                            queue
+                                .notify_object(fixture.slot, &mut WakeEffects::default())
+                                .unwrap();
+                            drop(queue);
+                        }
+                        while fixture.zone.runnable_head(fixture.slot) != Some(owner_record)
+                            && fixture.zone.runnable_head(sibling_slot) != Some(owner_record)
+                        {
                             assert!(
                                 std::time::Instant::now() < deadline,
-                                "signal {index} parked on OwnerWait was never woken"
+                                "signal {index} parked on contention was never woken"
                             );
                             std::thread::yield_now();
                         }
-                        let counters = carrick_el1_abi::Counters::new();
                         let mut cpu = ResumeCpu {
                             inner: crate::sched::FakeCpu {
                                 ttbr: (ttbr0, ttbr0),
@@ -1576,6 +1761,10 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
                 frame.elr, frame.x[0]
             );
             assert_eq!(frame.x[0], 10);
+            assert_ne!(fixture.control.blocked().0 & usr1.bit(), 0);
+            fixture
+                .control
+                .init_blocked(carrick_el1_abi::BlockedMask(0));
         }
 
         done.store(true, Ordering::Release);
