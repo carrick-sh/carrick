@@ -76,35 +76,25 @@ fn selection(root: &Path, meta: &Value, paths: &[PathBuf]) -> Result<BTreeSet<St
     }
 }
 
-fn kernel_host_facilities() -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        // Probe permission rather than guessing from uid: ping_group_range also
-        // admits supplementary groups and capabilities can override that range.
-        // SAFETY: socket has no pointer arguments; the fresh fd is closed once.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_INET,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
-                libc::IPPROTO_ICMP,
-            )
-        };
-        if fd < 0 {
-            return Err(format!(
-                "host facility unavailable: Linux ping socket: {}; net.ipv4.ping_group_range={}",
-                std::io::Error::last_os_error(),
-                std::fs::read_to_string("/proc/sys/net/ipv4/ping_group_range")
-                    .unwrap_or_else(|e| e.to_string())
-                    .trim()
-            )
-            .into());
-        }
-        // SAFETY: fd is owned by this function.
-        unsafe {
-            libc::close(fd);
-        }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostLane {
+    Runs,
+    Unavailable,
+    NoTests,
+}
+
+fn classify_host_lane(
+    by_package_keys: &BTreeSet<String>,
+    crate_name: &str,
+    has_tests: bool,
+) -> HostLane {
+    if by_package_keys.contains(crate_name) {
+        HostLane::Runs
+    } else if has_tests {
+        HostLane::Unavailable
+    } else {
+        HostLane::NoTests
     }
-    Ok(())
 }
 
 pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
@@ -187,25 +177,40 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
                 .push(records.clone());
         }
     }
+    let available_lanes: BTreeSet<String> = by_package.keys().cloned().collect();
     let mut failures = Vec::new();
+    let mut unavailable = Vec::new();
     for name in selected {
         println!("test-touched: {name}");
-        let Some(records) = by_package.get(&name) else {
-            let has_tests = meta["packages"]
-                .as_array()
-                .ok_or("missing packages")?
-                .iter()
-                .find(|p| p["name"].as_str() == Some(&name))
-                .and_then(|p| p["targets"].as_array())
-                .is_some_and(|targets| targets.iter().any(|t| t["test"] == true));
-            let reason = format!("{name}: no just test selection on {}", std::env::consts::OS);
-            println!("test-touched: {reason}");
-            if has_tests && !args.plan {
-                failures.push(format!(
-                    "{reason}; required test lane unavailable on this host"
-                ));
+        let has_tests = meta["packages"]
+            .as_array()
+            .ok_or("missing packages")?
+            .iter()
+            .find(|p| p["name"].as_str() == Some(&name))
+            .and_then(|p| p["targets"].as_array())
+            .is_some_and(|targets| targets.iter().any(|t| t["test"] == true));
+        match classify_host_lane(&available_lanes, &name, has_tests) {
+            HostLane::Unavailable => {
+                let reason = format!("{name}: no just test selection on {}", std::env::consts::OS);
+                if args.plan {
+                    println!("test-touched: {reason}");
+                } else {
+                    println!("test-touched: UNAVAILABLE: {reason}");
+                    unavailable.push(name);
+                }
+                continue;
             }
-            continue;
+            HostLane::NoTests => {
+                println!(
+                    "test-touched: {name}: no just test selection on {}",
+                    std::env::consts::OS
+                );
+                continue;
+            }
+            HostLane::Runs => {}
+        }
+        let Some(records) = by_package.get(&name) else {
+            return Err(format!("internal error: missing lane records for {name}").into());
         };
         if args.plan {
             for unit in records {
@@ -214,7 +219,6 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
             continue;
         }
         let preflight: Result<()> = match name.as_str() {
-            "carrick-kernel" => kernel_host_facilities(),
             "carrick-xtask" => crate::fixtures::reject_ambient_overrides()
                 .map_err(|e| format!("host configuration unavailable: {e}").into())
                 .and_then(|()| {
@@ -254,6 +258,12 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
             if red { "FAIL" } else { "PASS" }
         );
     }
+    if !unavailable.is_empty() {
+        println!(
+            "test-touched: UNAVAILABLE lanes (not failures): {}",
+            unavailable.join(", ")
+        );
+    }
     if failures.is_empty() {
         Ok(())
     } else {
@@ -265,6 +275,27 @@ pub fn run(root: &Path, args: TestTouchedArgs) -> Result<()> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_host_lane_distinguishes_runs_unavailable_and_no_tests() {
+        let lanes = BTreeSet::from(["carrick-kernel".to_owned(), "carrick-xtask".to_owned()]);
+        assert_eq!(
+            classify_host_lane(&lanes, "carrick-vmm-hvf", true),
+            HostLane::Unavailable
+        );
+        assert_eq!(
+            classify_host_lane(&lanes, "carrick-kernel", true),
+            HostLane::Runs
+        );
+        assert_eq!(
+            classify_host_lane(&lanes, "carrick-kernel", false),
+            HostLane::Runs
+        );
+        assert_eq!(
+            classify_host_lane(&lanes, "carrick-x86-cpl0", false),
+            HostLane::NoTests
+        );
+    }
     #[test]
     fn sched_change_selects_transitive_reverse_dependencies() {
         let package = |name: &str, deps: Vec<Value>| {

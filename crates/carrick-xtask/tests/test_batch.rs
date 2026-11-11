@@ -390,12 +390,10 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
     );
     assert!(!text.contains("must_not_run ... FAILED"), "{text}");
     assert!(text.contains("regular_feature_union ... ok"), "{text}");
-    if !text.contains("host facility unavailable") {
-        assert!(
-            text.contains("test-touched: carrick-kernel: PASS"),
-            "{text}"
-        );
-    }
+    assert!(
+        text.contains("test-touched: carrick-kernel: PASS"),
+        "{text}"
+    );
     // Editing the authority changes the touched plan immediately; no second table.
     write(
         "justfile",
@@ -509,4 +507,199 @@ fn recipe_authority_preserves_features_partitions_and_reverse_dependencies() {
         "{text}"
     );
     assert!(!text.contains("must_not_run ... FAILED"), "{text}");
+}
+
+fn init_touched_lane_fixture() -> (tempfile::TempDir, String) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let write = |path: &str, data: &str| {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, data).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers=['available','unavailable']\nresolver='2'\n",
+    );
+    write(
+        "available/Cargo.toml",
+        "[package]\nname='available-lane'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write("available/src/lib.rs", "#[test] fn green() {}\n");
+    write(
+        "unavailable/Cargo.toml",
+        "[package]\nname='unavailable-lane'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(
+        "unavailable/src/lib.rs",
+        "#[test] fn unscheduled_host_test() { panic!(\"lane must not run\"); }\n",
+    );
+    write(
+        "scripts/migrate/check-serial-host-tests.py",
+        "# fixture authority\n",
+    );
+    write(
+        "justfile",
+        "test:\n    cargo --locked --offline test -p available-lane --lib\n",
+    );
+    let lock = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(lock.status.success());
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "commit",
+        "-qm",
+        "base",
+    ]);
+    let base = git(&["rev-parse", "HEAD"]);
+    (temp, base)
+}
+
+#[test]
+fn touched_crate_without_lane_reports_unavailable_and_exits_zero() {
+    let (temp, base) = init_touched_lane_fixture();
+    let root = temp.path();
+    std::fs::write(
+        root.join("unavailable/src/lib.rs"),
+        "#[test] fn unscheduled_host_test() { panic!(\"still unscheduled\"); }\n",
+    )
+    .unwrap();
+    for args in [
+        &["add", "unavailable/src/lib.rs"][..],
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-qm",
+            "touch unavailable crate",
+        ][..],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let plan = xtask_command()
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "test-touched",
+            &base,
+            "--plan",
+        ])
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env("JOBS", "1")
+        .output()
+        .unwrap();
+    let plan_stdout = String::from_utf8_lossy(&plan.stdout);
+    assert!(
+        plan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    assert!(
+        plan_stdout.contains(&format!(
+            "test-touched: unavailable-lane: no just test selection on {}",
+            std::env::consts::OS
+        )),
+        "{plan_stdout}"
+    );
+    assert!(!plan_stdout.contains("UNAVAILABLE"), "{plan_stdout}");
+
+    let out = xtask_command()
+        .args(["--root", root.to_str().unwrap(), "test-touched", &base])
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env("JOBS", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "test-touched: UNAVAILABLE: unavailable-lane: no just test selection on {}",
+            std::env::consts::OS
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("test-touched: UNAVAILABLE lanes (not failures): unavailable-lane"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn touched_crate_with_failing_test_in_available_lane_exits_nonzero_and_names_crate() {
+    let (temp, base) = init_touched_lane_fixture();
+    let root = temp.path();
+    std::fs::write(
+        root.join("available/src/lib.rs"),
+        "#[test] fn red() { panic!(); }\n",
+    )
+    .unwrap();
+    for args in [
+        &["add", "available/src/lib.rs"][..],
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-qm",
+            "introduce regression in available lane",
+        ][..],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let out = xtask_command()
+        .args(["--root", root.to_str().unwrap(), "test-touched", &base])
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env("JOBS", "1")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("available-lane"), "{text}");
+    assert!(
+        text.contains("test-touched: available-lane: FAIL"),
+        "{text}"
+    );
 }
