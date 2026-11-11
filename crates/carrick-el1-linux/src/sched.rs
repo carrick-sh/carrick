@@ -376,9 +376,8 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
         let shared = authenticate.is_some();
         // A wake has no expiry to retain and finishes once policy runs, so
         // its mapping is authenticated first (as #1941 does on x86).
-        if matches!(call.args[1], FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE)
-            && let Some(authenticate) = authenticate.take()
-        {
+        let wake = call.args[1] == FUTEX_WAKE_PRIVATE || call.args[1] == FUTEX_WAKE_BITSET_PRIVATE;
+        if wake && let Some(authenticate) = authenticate.take() {
             match authenticate(UserVa::new(call.args[0]), None) {
                 Ok(true) => {}
                 Ok(false) => return Ok(None),
