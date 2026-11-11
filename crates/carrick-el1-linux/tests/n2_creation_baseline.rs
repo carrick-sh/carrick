@@ -40,10 +40,11 @@ fn creation_host_routes(policy: ArmRingFirst) {
             frame.x[..6].copy_from_slice(&[17, 23, 31, 41, 47, 53]);
             frame.x[8] = nr;
             let mut original = frame.x;
-            // pipe2 (59) is served in ring since #1740, so strict mode refuses it
-            // here, where no IPC venue is supplied, instead of forwarding it.
+            // close (57) and pipe2 (59) are served in ring, so strict mode
+            // refuses them here, where no IPC venue is supplied, instead of
+            // forwarding them.
             let refused =
-                policy.is_strict() && matches!(nr, 59 | 73 | 96 | 103 | 122 | 134 | 178 | 260);
+                policy.is_strict() && matches!(nr, 57 | 59 | 73 | 96 | 103 | 122 | 134 | 178 | 260);
             if refused {
                 original[0] =
                     carrick_personality_linux::crossing::LINUX_ENOSYS.guest_retval() as u64;

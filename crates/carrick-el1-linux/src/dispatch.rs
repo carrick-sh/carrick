@@ -4004,42 +4004,25 @@ impl<
                 NativeDescriptorNamespace::Legacy
             };
         };
-        if let Some(table) = venue.tables.owned_table_of(task) {
+        if let Some(table) = venue
+            .tables
+            .owned_table_of(task)
+            .or_else(|| venue.tables.table_of(task))
+        {
             return NativeDescriptorNamespace::Native(Some(table));
         }
         if native {
-            return NativeDescriptorNamespace::Native(venue.tables.table_of(task));
+            return NativeDescriptorNamespace::Native(None);
         }
-        // A borrowed root table can also own ring-created objects. Keep
-        // native tasks' missing-table authority above, while selecting the
-        // same constructor and zone-description owner for the live root.
-        let table = venue.tables.table_of(task);
-        let ordinal = self.frame.canonical_ordinal();
         let constructor = matches!(
-            ordinal,
+            self.frame.canonical_ordinal(),
             carrick_personality_linux::crossing::nr::PIPE2
                 | carrick_personality_linux::crossing::nr::EVENTFD2
                 | carrick_personality_linux::crossing::nr::EPOLL_CREATE1
                 | carrick_personality_linux::crossing::nr::EPOLL_CTL
         );
-        let zone_description = table.is_some_and(|raw| {
-            venue
-                .region
-                .fd(NativeFdWait)
-                .get(
-                    carrick_el1_abi::ipc::fd::TableId::from_raw(raw),
-                    carrick_el1_abi::ipc::fd::Fd(self.frame.argument(0).unwrap_or(0) as i32),
-                )
-                .map_or_else(
-                    |error| {
-                        error == carrick_fd_core::Error::BadFd
-                            && carrick_personality_linux::dispatch::descriptor_ordinal(ordinal)
-                    },
-                    ipc::is_zone_releasable_backing,
-                )
-        });
-        if constructor || zone_description {
-            return NativeDescriptorNamespace::Native(table);
+        if constructor {
+            return NativeDescriptorNamespace::Native(None);
         }
         NativeDescriptorNamespace::Legacy
     }
@@ -4359,6 +4342,11 @@ impl<
         let result = (|| {
             let Some(IpcBacking::Pipe { object, .. }) = IpcBacking::decode(description.backing)
             else {
+                if ordinal == nr::FCNTL {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EBADF.guest_retval(),
+                    );
+                }
                 return FamilyCompletion::Forward;
             };
             if ordinal == nr::LSEEK {
