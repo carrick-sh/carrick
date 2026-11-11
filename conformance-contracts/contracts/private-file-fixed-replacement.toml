@@ -1,3 +1,6 @@
+# #2070: shared signal-frame setup defers PortalOwnerWait/Busy contention via
+# PendingSignalDelivery under kernel.el1.signal-delivery-owner; private file
+# mapping replacement, source custody and work budgets are unchanged.
 # #1881: shared thread registration prepares custody before publication.
 # This family's operations and budgets are unchanged. Atomicity is witnessed by
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable

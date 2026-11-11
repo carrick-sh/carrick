@@ -9627,6 +9627,17 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
         crate::arm_signal::restart_forwarded_frame(frame)
     }
 
+    fn sync_parked_context(
+        &self,
+        frame: &carrick_el1_abi::TrapFrame,
+        ctx: &mut Aarch64ParkedContext,
+    ) {
+        ctx.native.x = frame.x;
+        ctx.native.pc = frame.elr;
+        ctx.native.pstate = frame.spsr;
+        ctx.native.sp_el0 = self.user_sp.raw();
+    }
+
     fn group_exit_custody(
         &self,
         _task: &CurrentTask,
@@ -9661,8 +9672,8 @@ impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-    ) -> Result<UserVa, Self::Error> {
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<carrick_personality_linux::signal::SignalFrameSetup, Self::Error> {
         crate::arm_signal::setup_arm_signal_frame(frame, params, siginfo, fpstate, copy_out)
     }
 

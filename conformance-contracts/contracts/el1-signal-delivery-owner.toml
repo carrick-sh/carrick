@@ -1,3 +1,11 @@
+# #2070: signal-frame setup preserves CopyOutcome::NotYet on PortalOwnerWait and
+# service-busy contention instead of collapsing temporary address-space exclusion
+# into a delivery fault. The shared EL1 signal_delivery owner retains the
+# dequeued PendingSignalDelivery on the exact member record across CarrierWork /
+# park_owner_wait (releasing its execution lease, probing once after enrolment,
+# and rebuilding the frame on wake without repeating SA_RESETHAND, suspend-mask
+# consumption, or SA_RESTART rewind); only a real fault forces SIGSEGV with
+# SI_KERNEL (si_code=128, si_addr=0) on both ARM and x86 CPL0.
 # #1881: shared thread registration prepares custody before publication.
 # This family's operations and budgets are unchanged. Atomicity is witnessed by
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable
@@ -43,8 +51,9 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
-  "carrick-el1-linux::aarch64_process_tests::native_signal_resume_tests::{arm_retained_sigprocmask_copyout_delivers_before_svc_user_return,arm_parked_signal_copyout_rejects_stale_owner_after_peer_selection,arm_parked_signal_input_rejects_stale_owner_after_peer_selection}",
   "carrick-el1-linux::aarch64_process_tests::native_signal_work_return_tests::*",
+  "carrick-el1-linux::aarch64_process_tests::native_signal_resume_tests::*",
+  "carrick-vmm-kvm::cpl0_entry::{production_signal_frame_owner_wait_parks_and_delivers_once,production_signal_frame_busy_once_retains_and_delivers_once,production_signal_frame_real_fault_delivers_sigsegv_si_kernel}",
   "carrick-el1-linux::aarch64_process_tests::native_host_owned_signal_resume_tests::*",
   "carrick-el1-linux::aarch64_process_tests::{arm_classified_maperr_and_bus_use_signal_owner,arm_classified_fault_default_ignored_and_blocked_return_to_host_core_path,arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path,arm_classified_fault_racing_live_sibling_exit_group_settles,arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome,arm_permission_fault_keeps_signal_owner_after_admission_home_release}",
   "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::declined_fault_owner_wait_parks_on_owner_and_reruns_with_retained_fault",

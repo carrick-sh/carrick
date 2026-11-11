@@ -107,6 +107,7 @@ pub fn schedule(slot: SlotId) -> ! {
                         match deliver_signal_on_syscall_return(
                             current,
                             entry,
+                            state.address,
                             &mut frame,
                             &native.xsave,
                         ) {
@@ -140,6 +141,8 @@ pub fn schedule(slot: SlotId) -> ! {
                         if let Some(status) = root_exit {
                             publish_root_exit(current, status.to_termination_status());
                         }
+                        #[cfg(feature = "test-support")]
+                        crate::anonymous::release_injected_edit_wait(source, current);
                         settle_current_work(current);
                         leave_space(source);
                         continue;
@@ -170,6 +173,7 @@ pub fn schedule(slot: SlotId) -> ! {
                     if let Some(route) = deliver_signal_on_syscall_return(
                         current,
                         &mut entry,
+                        state.address,
                         &mut frame,
                         &native.xsave,
                     ) {
@@ -196,6 +200,8 @@ pub fn schedule(slot: SlotId) -> ! {
                 }
             }
             if suspended {
+                #[cfg(feature = "test-support")]
+                crate::anonymous::release_injected_edit_wait(source, current);
                 settle_current_work(current);
                 continue;
             }

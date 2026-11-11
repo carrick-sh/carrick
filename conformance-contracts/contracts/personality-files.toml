@@ -1,3 +1,6 @@
+# #2070: shared signal-frame setup defers PortalOwnerWait/Busy contention via
+# PendingSignalDelivery under kernel.el1.signal-delivery-owner; neutral file
+# service operations, pin custody and work budgets are unchanged.
 # #1394: additional ABI bookkeeping witness only; existing semantic and
 # work-budget bindings remain authoritative. Census publication reads counters
 # after executor join and does not alter this contract's guest operation.

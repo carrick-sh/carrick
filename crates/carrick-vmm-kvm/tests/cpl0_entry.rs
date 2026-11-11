@@ -3129,7 +3129,9 @@ fn production_pipe_metadata_stays_in_the_ring_namespace() {
 /// keep the dequeued signal owned without forcing SIGSEGV, and deliver the
 /// original handler once after resume.
 fn run_production_signal_frame_contention_probe(busy_service_mode: bool) {
-    const INJECT_ROOT_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe10;
+    const IMAGE_BASE: u64 = 0x0040_0000;
+    const CODE_BASE: u64 = 0x0040_00b0;
+    const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
     const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
     const INJECT_OWNED_COPY_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe1b;
     const INJECT_OWNED_COPY_CENSUS: u64 = 0xffff_ffff_ffff_fe1c;
@@ -3137,12 +3139,27 @@ fn run_production_signal_frame_contention_probe(busy_service_mode: bool) {
     let mut code = Vec::new();
     let mut failures = Vec::new();
 
+    for (register, value) in [
+        (&[0x48, 0xbf][..], IMAGE_BASE + 0x4000),
+        (&[0x48, 0xbe], 0xb000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x32),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+
     code.extend_from_slice(&[0x48, 0xbc]); // movabs rsp, stack
     let stack_pointer = code.len();
     code.extend_from_slice(&0_u64.to_le_bytes());
     for offset in (0x4000_u64..=0xe000).step_by(0x1000) {
         append_mov(&mut code, &[0x48, 0xb8], IMAGE_BASE + offset);
-        code.extend_from_slice(&[0xc6, 0x00, 0x5a]);
+        code.extend_from_slice(&[0xc6, 0x00, 0x00]);
     }
 
     append_mov(&mut code, &[0x48, 0xbf], 10);
@@ -3161,7 +3178,7 @@ fn run_production_signal_frame_contention_probe(busy_service_mode: bool) {
     let inject = if busy_service_mode {
         INJECT_OWNED_COPY_BUSY_ONCE
     } else {
-        INJECT_ROOT_BUSY_ONCE
+        INJECT_EDITOR_BUSY_ONCE
     };
     append_mov(&mut code, &[0x48, 0xb8], inject);
     code.extend_from_slice(&[0x0f, 0x05]);
@@ -3183,7 +3200,7 @@ fn run_production_signal_frame_contention_probe(busy_service_mode: bool) {
         append_mov(&mut code, &[0x48, 0xb8], INJECT_OWNED_COPY_CENSUS);
         code.extend_from_slice(&[0x0f, 0x05]);
         code.extend_from_slice(&[0x48, 0xb9]);
-        code.extend_from_slice(&0x0000_0001_0000_0002_u64.to_le_bytes());
+        code.extend_from_slice(&0x0000_0001_0000_0001_u64.to_le_bytes());
         code.extend_from_slice(&[0x48, 0x39, 0xc8, 0x0f, 0x85]);
         failures.push(code.len());
         code.extend_from_slice(&0_i32.to_le_bytes());
@@ -3201,23 +3218,22 @@ fn run_production_signal_frame_contention_probe(busy_service_mode: bool) {
     append_mov(&mut code, &[0x48, 0xb8], 231);
     code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     for branch in failures {
-        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        let delta = i32::try_from(failure as isize - (branch as isize + 4)).unwrap();
         code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
     }
 
-    let handler = IMAGE_BASE + code.len() as u64;
+    let handler = CODE_BASE + code.len() as u64;
     code.extend_from_slice(&[0x48, 0xb8]);
     let handler_counter_ptr = code.len();
     code.extend_from_slice(&0_u64.to_le_bytes());
     code.extend_from_slice(&[0x48, 0xff, 0x00, 0xc3]);
-    let restorer = IMAGE_BASE + code.len() as u64;
+    let restorer = CODE_BASE + code.len() as u64;
     code.extend_from_slice(&[0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
-    while code.len() % 8 != 0 {
+    while (0xb0 + code.len()) % 8 != 0 {
         code.push(0x90);
     }
-    let counter = IMAGE_BASE + code.len() as u64;
-    code.extend_from_slice(&0_u64.to_le_bytes());
-    let action = IMAGE_BASE + code.len() as u64;
+    let counter = IMAGE_BASE + 0x4000;
+    let action = CODE_BASE + code.len() as u64;
     code.extend_from_slice(&handler.to_le_bytes());
     code.extend_from_slice(&0x8400_0000_u64.to_le_bytes());
     code.extend_from_slice(&restorer.to_le_bytes());
@@ -3251,16 +3267,33 @@ fn production_signal_frame_busy_once_retains_and_delivers_once() {
 /// still forces SIGSEGV with Linux's SI_KERNEL (si_code == 128, si_addr == 0).
 #[test]
 fn production_signal_frame_real_fault_delivers_sigsegv_si_kernel() {
+    const IMAGE_BASE: u64 = 0x0040_0000;
+    const CODE_BASE: u64 = 0x0040_00b0;
     for read_only in [false, true] {
         let mut code = Vec::new();
         let mut failures = Vec::new();
+
+        for (register, value) in [
+            (&[0x48, 0xbf][..], IMAGE_BASE + 0x4000),
+            (&[0x48, 0xbe], 0xb000),
+            (&[0x48, 0xba], 3),
+            (&[0x49, 0xba], 0x32),
+            (&[0x49, 0xb8], u64::MAX),
+            (&[0x49, 0xb9], 0),
+            (&[0x48, 0xb8], 9),
+        ] {
+            append_mov(&mut code, register, value);
+        }
+        code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+        failures.push(code.len());
+        code.extend_from_slice(&0_i32.to_le_bytes());
 
         code.extend_from_slice(&[0x48, 0xbc]);
         let stack_pointer = code.len();
         code.extend_from_slice(&0_u64.to_le_bytes());
         for offset in (0x4000_u64..=0xe000).step_by(0x1000) {
             append_mov(&mut code, &[0x48, 0xb8], IMAGE_BASE + offset);
-            code.extend_from_slice(&[0xc6, 0x00, 0x5a]);
+            code.extend_from_slice(&[0xc6, 0x00, 0x00]);
         }
 
         code.extend_from_slice(&[0x48, 0xbf]);
@@ -3316,7 +3349,7 @@ fn production_signal_frame_real_fault_delivers_sigsegv_si_kernel() {
         append_mov(&mut code, &[0x48, 0xb8], 231);
         code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
 
-        let segv_handler = IMAGE_BASE + code.len() as u64;
+        let segv_handler = CODE_BASE + code.len() as u64;
         code.extend_from_slice(&[0x48, 0x83, 0xff, 11, 0x0f, 0x85]);
         failures.push(code.len());
         code.extend_from_slice(&0_i32.to_le_bytes());
@@ -3335,26 +3368,26 @@ fn production_signal_frame_real_fault_delivers_sigsegv_si_kernel() {
             code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
         }
 
-        let usr1_handler = IMAGE_BASE + code.len() as u64;
+        let usr1_handler = CODE_BASE + code.len() as u64;
         code.extend_from_slice(&[0xbf, 8, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
-        let restorer = IMAGE_BASE + code.len() as u64;
+        let restorer = CODE_BASE + code.len() as u64;
         code.extend_from_slice(&[0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
-        while code.len() % 8 != 0 {
+        while (0xb0 + code.len()) % 8 != 0 {
             code.push(0x90);
         }
-        let segv_action = IMAGE_BASE + code.len() as u64;
+        let segv_action = CODE_BASE + code.len() as u64;
         code.extend_from_slice(&segv_handler.to_le_bytes());
         code.extend_from_slice(&0x0c00_0004_u64.to_le_bytes());
         code.extend_from_slice(&restorer.to_le_bytes());
         code.extend_from_slice(&0_u64.to_le_bytes());
 
-        let usr1_action = IMAGE_BASE + code.len() as u64;
+        let usr1_action = CODE_BASE + code.len() as u64;
         code.extend_from_slice(&usr1_handler.to_le_bytes());
         code.extend_from_slice(&0x0400_0000_u64.to_le_bytes());
         code.extend_from_slice(&restorer.to_le_bytes());
         code.extend_from_slice(&0_u64.to_le_bytes());
 
-        let altstack_record = IMAGE_BASE + code.len() as u64;
+        let altstack_record = CODE_BASE + code.len() as u64;
         code.extend_from_slice(&(IMAGE_BASE + 0x4000).to_le_bytes());
         code.extend_from_slice(&0_u64.to_le_bytes());
         code.extend_from_slice(&0x4000_u64.to_le_bytes());

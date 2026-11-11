@@ -1,3 +1,7 @@
+# #2070: shared signal-frame setup defers PortalOwnerWait/Busy contention via
+# PendingSignalDelivery over the existing CarrierWork / park_owner_wait path
+# under kernel.el1.signal-delivery-owner; scheduler affinity, preemption,
+# fairness and work budgets are unchanged.
 # #1845: ReadinessLockCustody types the physical readiness-lock handoff in
 # sched-core::object_wait and the zone accessor in el1_zone.rs. This family's
 # operations and budgets are unchanged. The change is witnessed under
