@@ -1127,7 +1127,9 @@ struct PendingWait {
     /// The caller's channel generation sampled under the graph guard that
     /// selected this park: a registry `WaitPrecheck`, or the scan that found
     /// a sibling's birth reservation held. Only a later publication wakes it.
-    observed: TaskWakeGeneration,
+    /// `None`: a host request refused the park, so the owner's next entry
+    /// reruns the wait without a publication.
+    observed: Option<TaskWakeGeneration>,
     /// A contended `WNOHANG` wait reruns as `WNOHANG` once released.
     nohang: bool,
     channel: Arc<WaitChannel>,
@@ -1434,6 +1436,16 @@ impl<'a> PendingTable<'a> {
             PendingKey::ChildWait(key, owner),
             PendingState::ChildWait(pending),
         );
+    }
+    /// A retained wait that never enrolled reruns at its owner's next entry.
+    fn rerun_child_wait(&mut self, key: &TaskKey, owner: ContinuationOwner) {
+        if let Some(PendingState::ChildWait(PendingChildContinuation::Wait(pending))) = self
+            .rows
+            .get_mut(&PendingKey::ChildWait(*key, owner))
+            .map(|row| &mut **row)
+        {
+            pending.observed = None;
+        }
     }
     fn remove_child_wait(
         &mut self,
@@ -5236,7 +5248,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             query,
                             status,
                             output,
-                            observed: precheck.wake_generation(),
+                            observed: Some(precheck.wake_generation()),
                             nohang: false,
                             channel,
                         }),
@@ -5279,7 +5291,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 query,
                 status,
                 output,
-                observed,
+                observed: Some(observed),
                 nohang,
                 channel,
             }),
@@ -5333,18 +5345,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 (channel, observed)
             };
+            // A host request refusing this park is contention: the parent
+            // yields with its suspension retained (`park_continuation`).
             let parked = self.park_continuation(
                 &channel,
                 observed,
                 PendingChildContinuation::Vfork(PendingVfork { child, pid }),
-            );
-            // The child exists: its clone must return its pid. If a concurrent
-            // host request on this record refuses the handoff park, return the
-            // published child's pid rather than failing clone after birth.
-            let parked = match parked {
-                Err(NativeProcessError::Busy) => return Ok(returned(i64::from(pid))),
-                parked => parked?,
-            };
+            )?;
             match parked {
                 ContinuationPark::Rescan => continue,
                 // Linux defers a non-fatal signal until the child releases
@@ -5787,7 +5794,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return match pending {
                 PendingChildContinuation::Wait(pending) => {
                     if pending.caller != self.key
-                        || pending.channel.generation.generation() == pending.observed
+                        || pending.observed == Some(pending.channel.generation.generation())
                     {
                         self.runtime.graph.lock().pending.insert_child_wait(
                             self.key,
@@ -5919,6 +5926,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_el1_abi::EntryRecordGeneration(sequence),
         );
         if receipt.is_none() {
+            drop(guard);
+            if carrick_core::entry::host_requested_running(self.binding, self.source, record) {
+                // A host request on this exact running record closed park
+                // admission (#1467): contention, not a refusal. The wait and
+                // its owner continuation stay retained, and no channel
+                // publication will wake a wait that never enrolled: the
+                // owner's next entry reruns it after the handback (#2095).
+                self.runtime
+                    .graph
+                    .lock()
+                    .pending
+                    .rerun_child_wait(&self.key, owner);
+                self.yield_retained_wait(record)?;
+                return Ok(ContinuationPark::Parked);
+            }
             self.runtime
                 .graph
                 .lock()
@@ -5928,12 +5950,32 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             unsafe {
                 zone.record(record).consume_owner_continuation();
             }
-            return Err(NativeProcessError::Busy);
+            return Err(NativeProcessError::Stale);
         }
         drop(guard);
         zone.clear_current(self.source.slot);
         self.handoff = receipt;
         Ok(ContinuationPark::Parked)
+    }
+
+    /// Leave a refused park through the owner checkpoint: the record, with
+    /// its published owner continuation, goes to its slot's run queue, where
+    /// the host requester takes it.
+    fn yield_retained_wait(
+        &mut self,
+        record: carrick_sched_core::RecordId,
+    ) -> Result<(), NativeProcessError> {
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
+            .ok_or(NativeProcessError::Stale)?;
+        let requeue = self.source.zone.requeue_preempted(self.source.slot, record);
+        if !requeue.is_queued() {
+            return Err(NativeProcessError::Quarantined);
+        }
+        self.handoff = Some(
+            carrick_core::entry::publish_handoff_yield(start, requeue)
+                .ok_or(NativeProcessError::Quarantined)?,
+        );
+        Ok(())
     }
 
     fn signal_interrupts_current(&self) -> bool {
