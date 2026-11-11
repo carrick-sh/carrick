@@ -1893,12 +1893,22 @@ mod tests {
         }
     }
 
+    /// The independent carrier gate, `process_carrier` and `vm_lifecycle` are
+    /// process-wide, while the parallel partition runs tests on many threads.
+    /// Every test that asserts them clean takes this lock first, so one test's
+    /// live carrier is never read as another test's leak. Reentrant so a test
+    /// can hold it across several guarded sections.
+    static PROCESS_CARRIER_TEST_LOCK: parking_lot::ReentrantMutex<()> =
+        parking_lot::ReentrantMutex::new(());
+
     struct ProcessCarrierTestGuard {
         test_name: &'static str,
+        _exclusive: parking_lot::ReentrantMutexGuard<'static, ()>,
     }
 
     impl ProcessCarrierTestGuard {
         fn acquire(test_name: &'static str) -> Self {
+            let exclusive = PROCESS_CARRIER_TEST_LOCK.lock();
             assert_eq!(
                 crate::carrier::live_container_count(),
                 0,
@@ -1921,7 +1931,10 @@ mod tests {
                     )
                 }),
             );
-            Self { test_name }
+            Self {
+                test_name,
+                _exclusive: exclusive,
+            }
         }
     }
 
@@ -2088,6 +2101,9 @@ mod tests {
 
     #[test]
     fn process_carrier_test_guard_isolates_leaked_and_concurrent_prepare_leases() {
+        // Held across the deliberate unguarded leak below, so no parallel
+        // guarded test observes it.
+        let _exclusive = PROCESS_CARRIER_TEST_LOCK.lock();
         prepare_failure_releases_pid_placement();
         prepare_on_holds_and_rolls_back_the_exact_carrier_lease();
 
