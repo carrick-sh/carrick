@@ -6,17 +6,11 @@
 //! moment gets "Text file busy" when it runs the file it just wrote.
 #![cfg(unix)]
 
+use carrick_test_support::executable::write_executable;
 use std::io::ErrorKind;
-use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-
-fn write_executable(path: &Path, script: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, script).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
 
 #[test]
 fn write_then_exec_never_sees_text_file_busy_under_spawn_load() {

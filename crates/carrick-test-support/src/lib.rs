@@ -32,6 +32,7 @@ use flate2::write::GzEncoder;
 use std::io::Write;
 
 mod el1_region;
+pub mod executable;
 pub use el1_region::TestEl1Region;
 pub mod guest_user;
 pub use guest_user::{GuestUserBuffer, GuestUserValue, assert_guest_args, user_arg};
