@@ -1,0 +1,29 @@
+rules:
+  - id: carrick-test-executable-write-then-exec
+    languages: [generic]
+    severity: ERROR
+    message: |
+      A test writes (or copies) a file and then makes it executable with a raw
+      `set_permissions`. On Linux, a sibling test thread that forks while this
+      thread's write descriptor is open hands the descriptor to its child until
+      the child execs, and the exec of the file then fails with ETXTBSY
+      ("Text file busy"). It flaked CI six times (#814, #863, #1299, #1814,
+      #2012).
+      Create executables with `carrick_test_support::executable::
+      write_executable` / `write_executable_mode` / `copy_executable`: a child
+      process creates the file, so this process never holds a write descriptor
+      for it. Do not retry on ETXTBSY and do not serialise the tests.
+      A file that is written but only inspected, never executed, is not the
+      hazard; mark it `// nosemgrep: carrick-test-executable-write-then-exec`
+      with the reason. Semgrep skips `tests/` by default, so `lint-domains.sh`
+      runs this rule with `--x-ignore-semgrepignore-files`.
+    pattern-either:
+      - pattern-regex: '(?s)\bfs::(?:write|copy)\(\s*(?:[^,;]+,\s*)?&?(\w+)\s*[,)].{0,3000}?set_permissions\(\s*&?\1\s*,[^;]*?from_mode\(\s*0o7[0-7]{2}\s*\)'
+      - pattern-regex: '(?s)\bfs::write\(\s*&?(\w+)\s*,.{0,3000}?\1\.set_mode\(\s*0o7[0-7]{2}\s*\)'
+    paths:
+      include:
+        - "**/tests/**"
+        - "**/tests.rs"
+      exclude:
+        # Guest probe binaries run inside carrick, not threads of a test process.
+        - "**/tests/fixtures/**"
