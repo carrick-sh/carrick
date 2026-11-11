@@ -1375,6 +1375,27 @@ pub fn inspect_artifact(root: &Path) -> Result<ArtifactIdentity, String> {
     inspect_executable(&bin_path)
 }
 
+/// Every installed file a signed run executes or mounts into its guests:
+/// the installed receipt itself, the bundle's executables and any
+/// candidate-built probes (#1980), as absolute paths. Signed acceptance
+/// hashes these at the end of its build and compares them after gate
+/// admission (#2013), so the bytes verified are the bytes the guests run.
+/// Built from `fixtures`' public verification: the manifest's executables
+/// and the candidate probe names, which the publisher builds for both targets.
+fn installed_artifact_paths(root: &Path) -> Result<Vec<PathBuf>, crate::fixtures::FixturesError> {
+    use crate::fixtures::{GuestTarget, INSTALLED_MANIFEST};
+    let manifest = crate::fixtures::verify_installed(root)?;
+    let receipt = crate::fixtures::verify_installed_receipt(root)?;
+    let mut paths = vec![root.join(INSTALLED_MANIFEST)];
+    paths.extend(manifest.executables.iter().map(|e| root.join(&e.path)));
+    for probe in receipt.candidate_probes.iter().flat_map(|c| &c.probes) {
+        for target in [GuestTarget::Musl, GuestTarget::Gnu] {
+            paths.push(root.join(probe.name.executable(target)));
+        }
+    }
+    Ok(paths)
+}
+
 /// SHA-256, CDHash, LC_UUID, hypervisor entitlement and `__dof_carrick`
 /// presence of one signed Mach-O executable.
 pub fn inspect_executable(bin_path: &Path) -> Result<ArtifactIdentity, String> {
@@ -2361,7 +2382,7 @@ fn run_inner(
             // this lease is released: the signed release binary (when it
             // built) and every installed fixture. test-signed builds its own
             // test executables later, under gate, and needs no handoff.
-            match crate::fixtures::installed_artifact_paths(&root) {
+            match installed_artifact_paths(&root) {
                 Ok(paths) => fixture_artifacts = paths,
                 Err(error) => {
                     let msg = format!("signed fixture artifacts: {error}");

@@ -911,25 +911,6 @@ pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result
     Ok(path)
 }
 
-/// Every installed file a signed run executes or mounts into its guests:
-/// the installed receipt itself, the bundle's executables and any
-/// candidate-built probes (#1980), as absolute paths. Signed acceptance
-/// hashes these at the end of its build and compares them after gate
-/// admission (#2013), so the bytes verified are the bytes the guests run.
-pub fn installed_artifact_paths(root: &Path) -> Result<Vec<PathBuf>> {
-    let receipt = safe_path(root, INSTALLED_MANIFEST)?;
-    let installed: Installed = serde_json::from_slice(&fs::read(&receipt)?)?;
-    let mut paths = vec![receipt];
-    let candidate = installed
-        .candidate_probes
-        .iter()
-        .flat_map(|set| set.executables.iter());
-    for executable in installed.manifest.executables.iter().chain(candidate) {
-        paths.push(safe_path(root, &executable.path)?);
-    }
-    Ok(paths)
-}
-
 pub fn verify_installed(root: &Path) -> Result<Manifest> {
     verify_installed_record(root).map(|(installed, _)| installed.manifest)
 }
