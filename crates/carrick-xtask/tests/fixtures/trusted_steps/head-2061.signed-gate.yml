@@ -1,0 +1,386 @@
+name: Signed gate
+
+on:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number, or main to publish a baseline
+        required: true
+        type: string
+      sha:
+        description: Exact full commit SHA (current PR head or a main ancestor)
+        required: true
+        type: string
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  authorize:
+    if: github.repository == 'carrick-sh/carrick' && (github.event_name == 'merge_group' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.label.name == 'gate:signed')
+    runs-on: ubuntu-latest
+    # Authorization only names the candidate and its merge base; the gate job
+    # executes that base itself, so nothing waits for a main push baseline.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      sha: ${{ steps.request.outputs.sha }}
+      base: ${{ steps.request.outputs.base }}
+      main: ${{ steps.request.outputs.main }}
+    steps:
+      - name: Refuse unauthorized actors before checking out code
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # Automatic main/queue events are authorized by exact event identity
+          # in Rust below. Manual requests remain owner-only (#654).
+          case "$EVENT_NAME" in merge_group|push) exit 0 ;; esac
+          case "$ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
+          case "$TRIGGERING_ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Authorize exact SHA and merge base
+        id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo run --locked -p carrick-xtask -- signed-gate prepare
+          --event "$GITHUB_EVENT_PATH" --output "$RUNNER_TEMP/request"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request/
+          if-no-files-found: error
+
+  # The merge base's fixture bundle comes only from main's own publisher:
+  # the kernel-runtime push run that built exactly that commit. Trusted main
+  # code authenticates the producing run (repository, workflow, main branch,
+  # event) and blocks when no such bundle exists. Both paired runs restore
+  # this one bundle (#1889); candidate code builds only added probes (#1980).
+  base-fixtures:
+    needs: authorize
+    runs-on: ubuntu-latest
+    # main's publisher takes up to 60 minutes; the fetcher waits up to 75.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - name: Fetch the merge base's trusted fixture bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo run --locked -p carrick-xtask -- signed-gate base-fixtures
+          --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/base-fixtures"
+      - name: Upload the trusted base fixture bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-base-fixtures-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/base-fixtures/
+          if-no-files-found: error
+          compression-level: 0
+
+  # Owner decision #1980: when the candidate's only fixture-input difference
+  # from the base bundle is added conformance probes, build just those probes
+  # from candidate code with main's publisher build code, on the publisher's
+  # runner class. Trusted main code checks out the candidate itself and
+  # records any other difference as a refusal, which the Mac reports again.
+  candidate-probes:
+    needs: [authorize, base-fixtures]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Verify native ARM Linux builder
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = aarch64
+      - name: Install pinned Rust toolchain and guest targets
+        run: rustup show active-toolchain
+      # The candidate probe build runs the fixture builders with `--offline`
+      # (the publisher policy), so their lockfile dependencies must be in the
+      # Cargo cache first, as kernel-runtime.yml's publisher does before its
+      # fixture build. Without this every merge group failed here with
+      # "failed to download `simd-adler32` ... --offline was specified".
+      # Trusted main code fetches main's fixture lockfiles; a candidate that
+      # changed any lockfile is refused by the classifier anyway.
+      - name: Fetch fixture lockfile dependencies
+        run: cargo run --locked -p carrick-xtask -- fixtures fetch
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-base-fixtures-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-fixtures
+      - name: Build the candidate's added probes beside the base bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=("$RUNNER_TEMP"/signed-fixtures/*.tar.gz)
+          test "${#bundles[@]}" -eq 1
+          cargo run --locked -p carrick-xtask -- signed-gate candidate-probes \
+            --request "$RUNNER_TEMP/request/request.json" --bundle "${bundles[0]}" \
+            --output "$RUNNER_TEMP/candidate-probes"
+      - name: Upload the candidate probe outcome
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-candidate-probes-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/candidate-probes/
+          if-no-files-found: error
+          compression-level: 0
+
+  gate:
+    needs: [authorize, base-fixtures, candidate-probes]
+    runs-on: [self-hosted, macOS, ARM64, carrick-signed-gate]
+    # Paired execution (#1884): the merge base and then the candidate run on
+    # this one Mac, each about 22-35 min (60 min worst observed), under one
+    # gate lease whose acquisition may wait up to an hour. 2 x 60 + 60 = 180.
+    timeout-minutes: 240
+    # GitHub has not assigned runner.name when it evaluates concurrency.
+    # The runner schedules one job at a time; execute holds one per-host gate
+    # lease across both runs' restore/build/accept/identity inspection. This
+    # additional group suppresses duplicate requests for one SHA across Macs.
+    concurrency:
+      group: signed-gate-${{ needs.authorize.outputs.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Install repository Rust toolchain (infrastructure)
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_toolchain() {
+            rustup show active-toolchain
+          }
+          export -f install_toolchain
+          if ! python3 - <<'PYTHON'
+          import os, signal, subprocess, sys
+          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
+          try:
+              sys.exit(child.wait(timeout=600))
+          except subprocess.TimeoutExpired:
+              os.killpg(child.pid, signal.SIGKILL)
+              child.wait()
+              sys.exit(75)
+          PYTHON
+          then
+            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
+            exit 75
+          fi
+          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-base-fixtures-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-fixtures
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-candidate-probes-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/candidate-probes
+      - name: Select the unique content-addressed archives
+        id: fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=("$RUNNER_TEMP"/signed-fixtures/*.tar.gz)
+          test "${#bundles[@]}" -eq 1
+          printf 'bundle=%s\n' "${bundles[0]}" >> "$GITHUB_OUTPUT"
+          test -f "$RUNNER_TEMP/candidate-probes/candidate-probes.json"
+          sets=("$RUNNER_TEMP"/candidate-probes/*/*.tar.gz)
+          test "${#sets[@]}" -le 1
+          printf 'candidate=%s\n' "${sets[0]:-}" >> "$GITHUB_OUTPUT"
+      # Look up a sealed base receipt on this exact Mac before `execute` (#1918).
+      # Only this step receives GH_TOKEN; `execute` below still gets no API
+      # credential. Any miss exits zero without writing base-seal.json so
+      # `execute` runs PairSide::Base in-job as today.
+      - name: Look up reusable sealed base receipt for this Mac
+        if: needs.authorize.outputs.main != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CARRICK_SIGNED_FIXTURE_BUNDLE: ${{ steps.fixture.outputs.bundle }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/reused-base"
+          cargo run --locked -p carrick-xtask -- signed-gate reuse-lookup \
+            --request "$RUNNER_TEMP/request/request.json" \
+            --output "$RUNNER_TEMP/reused-base"
+      # Both runs restore the merge base's trusted bundle; a candidate whose
+      # fixture inputs differ is refused rather than served by its own build,
+      # except for added probes, served to the candidate run only (#1980).
+      - name: Execute merge base and approved SHA on this Mac under one lease
+        shell: bash
+        env:
+          CARRICK_RUN_ID: signed-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          # Trusted base artifact; no API credential is passed to candidate code.
+          CARRICK_SIGNED_FIXTURE_BUNDLE: ${{ steps.fixture.outputs.bundle }}
+          CANDIDATE_PROBES: ${{ steps.fixture.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          candidate=()
+          if [ -n "$CANDIDATE_PROBES" ]; then
+            candidate=(--candidate-probes "$CANDIDATE_PROBES")
+          fi
+          reuse=()
+          if [ -f "$RUNNER_TEMP/reused-base/base-seal.json" ]; then
+            reuse=(--reuse-base "$RUNNER_TEMP/reused-base")
+          fi
+          cargo run --locked -p carrick-xtask -- signed-gate execute \
+            --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/signed-result" \
+            ${candidate[@]+"${candidate[@]}"} \
+            ${reuse[@]+"${reuse[@]}"}
+      - name: Upload paired receipts, artifact identities and step logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-result-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-result/
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish:
+    needs: [authorize, gate]
+    if: always() && needs.authorize.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - name: Download execution evidence when available
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-result-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-result
+      - name: Compare candidate with its paired base and publish verdict
+        id: verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EXECUTION_RESULT: ${{ needs.gate.result }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signed-result"
+          cargo run --locked -p carrick-xtask -- signed-gate publish \
+            --request "$RUNNER_TEMP/request/request.json" --results "$RUNNER_TEMP/signed-result" \
+            --run-url "$RUN_URL" --execution-result "$EXECUTION_RESULT"
+      - name: Publish admitted main baseline
+        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-baseline-${{ needs.authorize.outputs.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-result/candidate.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Download base fixture bundle for reusable main baseline
+        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-base-fixtures-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-fixtures
+      - name: Prepare admitted reusable base receipt
+        id: reuse_base
+        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=("$RUNNER_TEMP"/signed-fixtures/*.tar.gz)
+          test "${#bundles[@]}" -eq 1
+          cargo run --locked -p carrick-xtask -- signed-gate prepare-reuse-upload \
+            --request "$RUNNER_TEMP/request/request.json" \
+            --results "$RUNNER_TEMP/signed-result" \
+            --fixture-bundle "${bundles[0]}" \
+            --run-id "${{ github.run_id }}" \
+            --output "$RUNNER_TEMP/signed-base-reuse"
+      - name: Publish admitted reusable base receipt
+        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success' && steps.reuse_base.outputs.artifact_name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.reuse_base.outputs.artifact_name }}
+          path: ${{ runner.temp }}/signed-base-reuse/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload comparison and publication log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-verdict-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/request/
+            ${{ runner.temp }}/signed-result/diff.json
+            ${{ runner.temp }}/signed-result/comment.md
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Require this check in main's ruleset, with the PR-only placeholder in
+  # trusted-hardware-pr.yml. Never allow skipped authorization to pass a group.
+  signed-queue-gate:
+    name: Signed queue gate
+    needs: [authorize, base-fixtures, candidate-probes, gate, publish]
+    if: always() && github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require a published PASS for this merge group
+        env:
+          AUTHORIZE: ${{ needs.authorize.result }}
+          FIXTURES: ${{ needs.base-fixtures.result }}
+          PROBES: ${{ needs.candidate-probes.result }}
+          GATE: ${{ needs.gate.result }}
+          PUBLISH: ${{ needs.publish.result }}
+        run: |
+          test "$AUTHORIZE" = success
+          test "$FIXTURES" = success
+          test "$PROBES" = success
+          test "$GATE" = success
+          test "$PUBLISH" = success
