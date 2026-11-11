@@ -311,7 +311,7 @@ impl SyscallDispatcher {
             )
         })
         .unwrap_or_else(|never| match never {});
-        self.serve_native_host_file_with_authority(&owner, record, Some(resources.filesystem()))
+        self.serve_native_host_file_with_authority(&owner, record, Some(&resources))
     }
 
     /// The transient filesystem authority of one path crossing, built from
@@ -366,7 +366,7 @@ impl SyscallDispatcher {
         &self,
         owner: &Arc<HostIpc>,
         record: &mut [u8],
-        host_root: Option<&NativeFsAuthority>,
+        host_root: Option<&super::resources::HostRootResourceSnapshot>,
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal)?;
         let header = view.header();
@@ -377,8 +377,8 @@ impl SyscallDispatcher {
         });
         let served = if header.op.resolves_path() {
             // Every path record leads with its caller's access context.
-            let (authority, path) = if let Some(authority) = host_root {
-                (authority.clone(), view.input())
+            let (authority, path) = if let Some(root) = host_root {
+                (root.filesystem().clone(), view.input())
             } else {
                 let (context, path) =
                     AccessContext::decode(view.input()).ok_or(NativeHostFileRefusal)?;
@@ -407,7 +407,20 @@ impl SyscallDispatcher {
             self.serve_native_poll(owner, table, header, view.input(), view.output_capacity())
         } else {
             match owner.with_pinned_host_resource(table, fd::Fd(header.fd), |resource| {
-                self.serve_native_resource(header, resource, view.input(), view.output_capacity())
+                match host_root.and_then(|root| self.host_root_projection(root, header, resource)) {
+                    Some(description) => self.serve_native_open_file(
+                        header,
+                        &description,
+                        view.input(),
+                        view.output_capacity(),
+                    ),
+                    None => self.serve_native_resource(
+                        header,
+                        resource,
+                        view.input(),
+                        view.output_capacity(),
+                    ),
+                }
             }) {
                 Ok(served) => served,
                 // Closed after the ring staged the call: the descriptor is gone.
@@ -426,6 +439,43 @@ impl SyscallDispatcher {
         view.reply(result, &output)
             .map_err(|_| NativeHostFileRefusal)?;
         Ok(NativeHostFileServed { retained_source })
+    }
+
+    /// The run root's own host-table description behind a projected ring
+    /// descriptor, for the calls that carry its offset or contents. A
+    /// descriptor the root's host table opened (one it inherited at launch)
+    /// is published in its ring namespace as a physical hold whose own
+    /// description has a separate cursor; the host table's description is
+    /// the one owner Linux shares between every descriptor of the file
+    /// (#1714). Authenticated by physical identity: a different file at the
+    /// same number is not served. Only a regular file or directory: the
+    /// carrier never waits on a pipe, terminal or socket.
+    fn host_root_projection(
+        &self,
+        root: &super::resources::HostRootResourceSnapshot,
+        header: HostFileHeader,
+        resource: &HostResource,
+    ) -> Option<Arc<crate::kernel::FileDescription>> {
+        if !matches!(
+            header.op,
+            HostFileOp::Read | HostFileOp::Pread | HostFileOp::Lseek | HostFileOp::Getdents64
+        ) {
+            return None;
+        }
+        let hold = resource.downcast_ref::<crate::kernel::objects::IpcPhysicalHold>()?;
+        let description = root.host_description(header.fd)?;
+        let file = description
+            .inspect_kind(|open| {
+                matches!(
+                    open,
+                    super::OpenDescription::File { .. }
+                        | super::OpenDescription::HostFile { .. }
+                        | super::OpenDescription::InMemoryFile { .. }
+                        | super::OpenDescription::Directory { .. }
+                )
+            })
+            .unwrap_or(false);
+        (file && hold.projects(&description)).then_some(description)
     }
 
     /// A path call with an empty path. Only `statx(fd, "", AT_EMPTY_PATH)`
