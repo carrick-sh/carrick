@@ -1335,7 +1335,12 @@ fn serve_clone<'a>(
                     }
                     // Busy, not a host birth: the host ledger stocks an
                     // unmanaged pool, and this clone reruns in ring after it.
-                    if !managed && let Some(outcome) = native.await_unmanaged_thread_stock() {
+                    // `PoolEmpty` ignores the gate; the ledger stocks only an
+                    // Open one, so HostOnly and closing pages stay the host's.
+                    if !managed
+                        && page.gate() == GateState::Open
+                        && let Some(outcome) = native.await_unmanaged_thread_stock()
+                    {
                         return Some(outcome);
                     }
                     native.record_decline(LifecycleDecline::ClonePoolEmpty);
