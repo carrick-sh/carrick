@@ -1148,9 +1148,9 @@ fn arm_process_registry_moves_bounded_handles() {
     assert!(core::mem::size_of::<Task>() <= 64);
     assert!(core::mem::size_of::<super::process_owner::GuestRetiring<Native>>() <= 128);
 }
-/// The exact thread that parked a process-keyed continuation. Only that
-/// thread's entry may resume it; a sibling's syscall runs normally.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// The exact thread that parked a continuation. Only that thread's entry may
+/// resume it; a sibling's syscall runs normally.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ContinuationOwner {
     control: usize,
     tid: u32,
@@ -1364,17 +1364,19 @@ enum ContinuationPark {
     Interrupted,
 }
 
-enum PendingContinuation {
+enum PendingChildContinuation {
     Wait(PendingWait),
-    Ipc(PendingIpc),
     Vfork(PendingVfork),
+}
+
+enum PendingContinuation {
+    Ipc(PendingIpc),
 }
 
 /// A vfork(2) parent suspended until its exact child execs or exits. The
 /// child's release (exec commit or exit) removes its `Graph::vfork_parents`
 /// row and publishes this parent's channel; the parent then returns `pid`.
 struct PendingVfork {
-    owner: ContinuationOwner,
     child: TaskKey,
     pid: u32,
 }
@@ -1416,15 +1418,18 @@ struct MemberWaitState<'a> {
 }
 
 // Every continuation remains separately typed and keyed, while one tree
-// implementation serves process operations, terminal custody, and member waits.
+// implementation serves process operations, member child/vfork waits, terminal
+// custody, and member waits.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum PendingKey {
     Operation(TaskKey),
+    ChildWait(TaskKey, ContinuationOwner),
     Exit(TaskKey),
     Member(RecordRef),
 }
 enum PendingState<'a> {
     Operation(PendingContinuation),
+    ChildWait(PendingChildContinuation),
     Exit(Box<PendingExit<'a>>),
     Member(MemberWaitState<'a>),
 }
@@ -1447,16 +1452,62 @@ impl<'a> PendingTable<'a> {
             _ => unreachable!(),
         }
     }
-    fn contains_key(&self, key: &TaskKey) -> bool {
+    fn has_ipc(&self, key: &TaskKey) -> bool {
         self.get(key).is_some()
     }
-    /// Whether `key`'s retained wait/IPC continuation belongs to this thread.
-    fn parked_by(&self, key: &TaskKey, owner: ContinuationOwner) -> bool {
+    #[cfg(test)]
+    fn contains_key(&self, key: &TaskKey) -> bool {
+        self.has_ipc(key)
+            || self.rows.keys().any(
+                |row_key| matches!(row_key, PendingKey::ChildWait(process, _) if process == key),
+            )
+    }
+    fn has_child_wait(&self, key: &TaskKey, owner: ContinuationOwner) -> bool {
+        self.rows.contains_key(&PendingKey::ChildWait(*key, owner))
+    }
+    fn insert_child_wait(
+        &mut self,
+        key: TaskKey,
+        owner: ContinuationOwner,
+        pending: PendingChildContinuation,
+    ) {
+        self.insert_row(
+            PendingKey::ChildWait(key, owner),
+            PendingState::ChildWait(pending),
+        );
+    }
+    fn remove_child_wait(
+        &mut self,
+        key: &TaskKey,
+        owner: ContinuationOwner,
+    ) -> Option<PendingChildContinuation> {
+        match self.take_row(&PendingKey::ChildWait(*key, owner))? {
+            PendingState::ChildWait(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    pub(super) fn remove_member_child_waits(&mut self, key: &TaskKey, control: usize) {
+        self.rows.retain(|row_key, _| {
+            !matches!(
+                row_key,
+                PendingKey::ChildWait(process, owner)
+                    if process == key && owner.control == control
+            )
+        });
+    }
+    pub(super) fn remove_process_child_waits(&mut self, key: &TaskKey) {
+        self.rows.retain(
+            |row_key, _| !matches!(row_key, PendingKey::ChildWait(process, _) if process == key),
+        );
+    }
+    fn parked_ipc_by(&self, key: &TaskKey, owner: ContinuationOwner) -> bool {
         self.get(key).is_some_and(|pending| match pending {
-            PendingContinuation::Wait(wait) => wait.owner == owner,
             PendingContinuation::Ipc(ipc) => ipc.owner == owner,
-            PendingContinuation::Vfork(vfork) => vfork.owner == owner,
         })
+    }
+    /// Whether `key`'s retained wait/vfork/IPC continuation belongs to this thread.
+    fn parked_by(&self, key: &TaskKey, owner: ContinuationOwner) -> bool {
+        self.has_child_wait(key, owner) || self.parked_ipc_by(key, owner)
     }
     fn insert(&mut self, key: TaskKey, pending: PendingContinuation) {
         self.insert_row(PendingKey::Operation(key), PendingState::Operation(pending));
@@ -1551,7 +1602,7 @@ impl<'a> PendingTable<'a> {
     fn len(&self) -> usize {
         self.rows
             .keys()
-            .filter(|key| matches!(key, PendingKey::Operation(_)))
+            .filter(|key| matches!(key, PendingKey::Operation(_) | PendingKey::ChildWait(..)))
             .count()
     }
 }
@@ -1882,6 +1933,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     *key,
                     member.record,
                     member.control.visible_tid(),
+                    core::ptr::from_ref(member.control.control()).addr(),
                 ))
             })
             .collect();
@@ -1890,7 +1942,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
         let mut graph = runtime.graph.lock();
         if let Ok(row) = graph.owner.task_mut(process) {
-            for (key, record, visible_tid) in &completed {
+            for (key, record, visible_tid, _) in &completed {
                 if let Some(tid) = visible_tid {
                     row.remove_thread(*tid);
                     if let Ok(tid) = i32::try_from(*tid) {
@@ -1910,11 +1962,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 });
             }
         }
-        for (_, record, _) in &completed {
+        for (_, record, _, control_addr) in &completed {
             let _ = graph.take_relative_futex_wait(record);
+            graph
+                .pending
+                .remove_member_child_waits(&process, *control_addr);
         }
         drop(graph);
-        for (key, record, _) in completed {
+        for (key, record, _, _) in completed {
             state.members.remove(&key);
             state
                 .records
@@ -2219,6 +2274,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .get_mut(&(key.carrier, process))
             .ok_or(NativeProcessError::Stale)?
             .1[key_index] = key;
+        if old_record != reference || old_key != key {
+            graph
+                .pending
+                .remove_member_child_waits(&process, core::ptr::from_ref(control).addr());
+        }
         let resources = graph
             .owner
             .task_mut(process)
@@ -4769,6 +4829,16 @@ fn returned(value: i64) -> LifecycleOutcome {
         work: false,
     }
 }
+fn map_wait_owner_error<E>(
+    error: super::process_owner::GuestProcessError<E>,
+) -> NativeProcessError {
+    match error {
+        super::process_owner::GuestProcessError::Wait(
+            carrick_sched_core::process::wait::WaitError::Busy(_),
+        ) => NativeProcessError::Busy,
+        _ => NativeProcessError::Stale,
+    }
+}
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
@@ -5077,7 +5147,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let selected = match rescan.take() {
                     Some(selected) => selected,
                     None => native_process_entry::scan_wait(&graph.owner, self.key, query)
-                        .map_err(|_| NativeProcessError::Busy)?,
+                        .map_err(map_wait_owner_error)?,
                 };
                 (selected, mm, channel)
             };
@@ -5122,7 +5192,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         let mut graph = self.runtime.graph.lock();
                         copied
                             .consume(&mut graph.owner)
-                            .map_err(|_| NativeProcessError::Busy)?
+                            .map_err(map_wait_owner_error)?
                     };
                     let consumed = match consumed {
                         CopiedWaitOutcome::Consumed(consumed) => consumed,
@@ -5176,7 +5246,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     match self.park_continuation(
                         &ch,
                         precheck.wake_generation(),
-                        PendingContinuation::Wait(PendingWait {
+                        PendingChildContinuation::Wait(PendingWait {
                             caller: self.key,
                             owner: self.continuation_owner(),
                             query,
@@ -5241,15 +5311,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let parked = self.park_continuation(
                 &channel,
                 observed,
-                PendingContinuation::Vfork(PendingVfork {
-                    owner: self.continuation_owner(),
-                    child,
-                    pid,
-                }),
+                PendingChildContinuation::Vfork(PendingVfork { child, pid }),
             );
-            // The child exists: its clone must return its pid. A sibling
-            // thread's parked wait owns this process's one continuation row,
-            // so this thread cannot also park; it returns unsuspended.
+            // The child exists: its clone must return its pid. If a concurrent
+            // host request on this record refuses the handoff park, return the
+            // published child's pid rather than failing clone after birth.
             let parked = match parked {
                 Err(NativeProcessError::Busy) => return Ok(returned(i64::from(pid))),
                 parked => parked?,
@@ -5683,44 +5749,56 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(error) => self.fail(error),
             });
         }
+        let child_wait = self
+            .runtime
+            .graph
+            .lock()
+            .pending
+            .remove_child_wait(&self.key, self.continuation_owner());
+        if let Some(pending) = child_wait {
+            return match pending {
+                PendingChildContinuation::Wait(pending) => {
+                    if pending.caller != self.key
+                        || pending.channel.generation.generation()
+                            == pending.precheck.wake_generation()
+                    {
+                        self.runtime.graph.lock().pending.insert_child_wait(
+                            self.key,
+                            pending.owner,
+                            PendingChildContinuation::Wait(pending),
+                        );
+                        return Some(self.fail(NativeProcessError::Stale));
+                    }
+                    Some(
+                        match self.wait_query(pending.query, pending.status, false, pending.output)
+                        {
+                            Ok(outcome) => outcome,
+                            Err(error) => self.fail(error),
+                        },
+                    )
+                }
+                // A resumed vfork parent re-checks its exact child's release row.
+                PendingChildContinuation::Vfork(pending) => {
+                    Some(match self.vfork_wait_for(pending.child, pending.pid) {
+                        Ok(outcome) => outcome,
+                        Err(error) => self.fail(error),
+                    })
+                }
+            };
+        }
         let pending = {
             let mut graph = self.runtime.graph.lock();
             // A sibling's entry never consumes another thread's parked operation.
             if !graph
                 .pending
-                .parked_by(&self.key, self.continuation_owner())
+                .parked_ipc_by(&self.key, self.continuation_owner())
             {
                 return None;
             }
             graph.pending.remove(&self.key)?
         };
         match pending {
-            PendingContinuation::Wait(pending) => {
-                if pending.caller != self.key
-                    || pending.channel.generation.generation() == pending.precheck.wake_generation()
-                {
-                    self.runtime
-                        .graph
-                        .lock()
-                        .pending
-                        .insert(self.key, PendingContinuation::Wait(pending));
-                    return Some(self.fail(NativeProcessError::Stale));
-                }
-                Some(
-                    match self.wait_query(pending.query, pending.status, false, pending.output) {
-                        Ok(outcome) => outcome,
-                        Err(error) => self.fail(error),
-                    },
-                )
-            }
             PendingContinuation::Ipc(pending) => Some(self.resume_ipc(pending)),
-            // A resumed vfork parent re-checks its exact child's release row.
-            PendingContinuation::Vfork(pending) => {
-                Some(match self.vfork_wait_for(pending.child, pending.pid) {
-                    Ok(outcome) => outcome,
-                    Err(error) => self.fail(error),
-                })
-            }
         }
     }
     // Keep parking scratch out of the status-copy branch of wait_query.
@@ -5729,7 +5807,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         channel: &Arc<WaitChannel>,
         precheck_gen: TaskWakeGeneration,
-        continuation: PendingContinuation,
+        continuation: PendingChildContinuation,
     ) -> Result<ContinuationPark, NativeProcessError> {
         let zone = self.source.zone;
         let record = zone
@@ -5752,15 +5830,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             drop(guard);
             return Ok(ContinuationPark::Rescan);
         }
+        let owner = self.continuation_owner();
         {
             let graph = self.runtime.graph.lock();
-            if graph.pending.contains_key(&self.key) {
-                return Err(NativeProcessError::Busy);
+            if graph.pending.has_child_wait(&self.key, owner) {
+                return Err(NativeProcessError::Stale);
             }
         }
         if self.signal_interrupts_current() {
             // The clone already succeeded: a vfork parent is never restarted.
-            if matches!(continuation, PendingContinuation::Vfork(_)) {
+            if matches!(continuation, PendingChildContinuation::Vfork(_)) {
                 return Ok(ContinuationPark::Interrupted);
             }
             let thread = NativeThreadIdentity::from_binding(self.binding)?;
@@ -5802,14 +5881,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .graph
             .lock()
             .pending
-            .insert(self.key, continuation);
+            .insert_child_wait(self.key, owner, continuation);
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
             &guard,
             carrick_el1_abi::EntryRecordGeneration(sequence),
         );
         if receipt.is_none() {
-            self.runtime.graph.lock().pending.remove(&self.key);
+            self.runtime
+                .graph
+                .lock()
+                .pending
+                .remove_child_wait(&self.key, owner);
             // SAFETY: no handoff was published; this entry retains the record.
             unsafe {
                 zone.record(record).consume_owner_continuation();
@@ -5970,7 +6053,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         {
             return Err(carrick_syscall_abi::LINUX_EINTR.guest_retval());
         }
-        if graph.pending.contains_key(&self.key) {
+        if graph.pending.has_ipc(&self.key) {
             return Err(NativeProcessError::Busy.errno());
         }
         let sequence = zone.next_seq(record);
@@ -6349,6 +6432,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
                 return Err(NativeProcessError::Stale);
             }
+            self.runtime
+                .graph
+                .lock()
+                .pending
+                .remove_member_child_waits(&self.key, core::ptr::from_ref(self.control).addr());
             return Ok(LifecycleOutcome::HostCustody);
         };
         let (custody, mut membership) = match custody.reserve_member(page, self.control) {
@@ -6361,6 +6449,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
                     return Err(NativeProcessError::Stale);
                 }
+                self.runtime
+                    .graph
+                    .lock()
+                    .pending
+                    .remove_member_child_waits(&self.key, core::ptr::from_ref(self.control).addr());
                 return Ok(LifecycleOutcome::HostCustody);
             }
             Err(_) => return Err(NativeProcessError::Quarantined),
@@ -6381,6 +6474,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             membership,
         )
         .map_err(|_| NativeProcessError::Quarantined)?;
+        self.runtime
+            .graph
+            .lock()
+            .pending
+            .remove_member_child_waits(&self.key, core::ptr::from_ref(self.control).addr());
         self.retire_thread_verdict(custody.into_verdict(page));
         self.current
             .linux
@@ -7339,7 +7437,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .task(self.key)
             .ok()
             .map(|t| t.metadata().namespace_pid);
-        let _ = self.runtime.graph.lock().pending.remove(&self.key);
+        {
+            let mut graph = self.runtime.graph.lock();
+            let _ = graph.pending.remove(&self.key);
+            graph.pending.remove_process_child_waits(&self.key);
+        }
         if let Some(pid) = pid {
             let ipc = self.runtime.graph.lock().ipc.clone();
             let channels = ipc.lock().exit_process(pid);
@@ -9105,6 +9207,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 resources.interrupted_child_waits.remove(record);
                 resources.pending_signal_deliveries.remove(record);
             }
+        }
+        if !retired.is_empty() {
+            graph
+                .pending
+                .remove_member_child_waits(&self.key, core::ptr::from_ref(self.control).addr());
         }
         drop(graph);
         if let Some(registry) = *self.runtime.registry.lock() {
