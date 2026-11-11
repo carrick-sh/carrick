@@ -3,11 +3,14 @@ pub use carrick_el1::substrate::sched::*;
 use carrick_el1_abi::TrapFrame;
 use carrick_el1_abi::{ReservationMm, UserVa};
 use carrick_guest_arch::CounterTick;
+use carrick_personality_linux::lifecycle::LifecycleOutcome;
 pub use carrick_personality_linux::sched::{
     EAGAIN, ETIMEDOUT_RESULT, FUTEX_WAIT_BITSET_PRIVATE, FUTEX_WAIT_PRIVATE,
     FUTEX_WAKE_BITSET_PRIVATE, FUTEX_WAKE_PRIVATE, SYS_FUTEX,
 };
-use carrick_personality_linux::sched::{FutexCall, FutexFrequency, FutexVenue, FutexWait};
+use carrick_personality_linux::sched::{
+    FutexCall, FutexFrequency, FutexVenue, FutexWait, MmFutexKey, RelativeFutexWait,
+};
 use core::sync::atomic::Ordering;
 
 /// ARM's Linux execution entry: the substrate moves registers, then this
@@ -103,13 +106,52 @@ fn args(frame: &TrapFrame) -> [u64; 6] {
         frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
     ]
 }
-struct Adapter<'a, 's, C: ThreadCpu, U: UserWord> {
+/// The admitted process's shared-private authority: whether a shared futex
+/// word is private anonymous storage of its MM
+/// ([`carrick_personality_linux::lifecycle::ProcessNative::futex_shared_private`]).
+/// `Err` is the memory owner's retry or failure outcome.
+pub type SharedFutexMapping<'m> =
+    dyn FnMut(UserVa, Option<RelativeFutexWait>) -> Result<bool, LifecycleOutcome> + 'm;
+
+/// Why an admitted futex left the scheduler without a completion.
+pub enum FutexRefusal {
+    /// The word is not yet readable, or faults.
+    Copy(carrick_core::user_copy::CopyOutcome),
+    /// The shared word's memory owner retries or fails the syscall.
+    Mapping(LifecycleOutcome),
+}
+
+struct Adapter<'a, 's, 'm, C: ThreadCpu, U: UserWord> {
     sched: &'a mut Sched<'s, C, U>,
     frame: &'a mut TrapFrame,
-    refusal: Option<carrick_core::user_copy::CopyOutcome>,
+    refusal: Option<FutexRefusal>,
     operation: &'a mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
+    /// Set for a shared candidate: its key is the shared-private one, after
+    /// this authority admits the word's mapping.
+    shared: Option<&'a mut SharedFutexMapping<'m>>,
 }
-impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
+impl<C: ThreadCpu, U: UserWord> Adapter<'_, '_, '_, C, U> {
+    /// The scheduler key of `address`: the shared-private key for an
+    /// authenticated shared word, the private key otherwise. `None` leaves
+    /// the call unserved (a mapping the authority refuses, or its retry).
+    fn key(&mut self, address: UserVa) -> Option<u64> {
+        let Some(authenticate) = self.shared.as_deref_mut() else {
+            return MmFutexKey::private(address).map(MmFutexKey::scheduler_address);
+        };
+        let retained = self.operation.as_ref().map(|wait| RelativeFutexWait {
+            deadline: wait.deadline,
+        });
+        match authenticate(address, retained) {
+            Ok(true) => MmFutexKey::shared_private(address).map(MmFutexKey::scheduler_address),
+            Ok(false) => None,
+            Err(outcome) => {
+                self.refusal = Some(FutexRefusal::Mapping(outcome));
+                None
+            }
+        }
+    }
+}
+impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
     type Served = Served;
     fn mm(&self) -> Option<ReservationMm> {
         ReservationMm::new(self.sched.task.mm.key.load(Ordering::Acquire))
@@ -146,8 +188,9 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
         bitset: u32,
         limit: u32,
     ) -> Option<Served> {
+        let key = self.key(address)?;
         self.sched
-            .wake_word(self.frame, mm.raw(), address.raw(), bitset, limit)
+            .wake_word(self.frame, mm.raw(), key, bitset, limit)
     }
     fn wait(&mut self, wait: FutexWait) -> Option<Served> {
         if self.operation.is_none()
@@ -156,12 +199,14 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
             *self.operation =
                 Some(carrick_personality_linux::sched::RelativeFutexWait { deadline });
         }
+        // Policy decoded the relative expiry first: a mapping retry retains it.
+        let key = self.key(wait.address)?;
 
         let zone = self.sched.zone;
         let result = self.sched.wait_word_with(
             self.frame,
             wait.mm.raw(),
-            wait.address.raw(),
+            key,
             wait.bitset,
             wait.expected,
             wait.deadline.map(CounterTick::raw),
@@ -174,11 +219,13 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
                         carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
                     ))
             },
-            |user, task, address| {
+            // The key may carry the shared-private tag; the word is read at
+            // the guest's own address.
+            |user, task, _key| {
                 use carrick_core::user_copy::{CopyOutcome, UserCopy};
                 let mut copy = FutexCopy { task, user };
                 let mut word = 0;
-                match copy.atomic_load_u32(UserVa::new(address), &mut word) {
+                match copy.atomic_load_u32(wait.address, &mut word) {
                     CopyOutcome::Done => Ok(word),
                     refusal => Err(refusal),
                 }
@@ -187,7 +234,7 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
         match result {
             Ok(served) => served,
             Err(refusal) => {
-                self.refusal = Some(refusal);
+                self.refusal = Some(FutexRefusal::Copy(refusal));
                 None
             }
         }
@@ -272,11 +319,15 @@ pub trait LinuxSchedEntry {
         &mut self,
         frame: &mut TrapFrame,
     ) -> Result<Option<Served>, carrick_core::user_copy::CopyOutcome>;
+    /// Serve an admitted futex. With `shared`, a shared spelling of an
+    /// admitted PRIVATE op is a candidate too, keyed shared-private once
+    /// `shared` authenticates its word (#2124).
     fn serve_futex_operation(
         &mut self,
         frame: &mut TrapFrame,
         operation: &mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
-    ) -> Result<Option<Served>, carrick_core::user_copy::CopyOutcome>;
+        shared: Option<&mut SharedFutexMapping<'_>>,
+    ) -> Result<Option<Served>, FutexRefusal>;
     fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
     fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
 }
@@ -288,24 +339,43 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
         &mut self,
         frame: &mut TrapFrame,
     ) -> Result<Option<Served>, carrick_core::user_copy::CopyOutcome> {
-        self.serve_futex_operation(frame, &mut None)
+        // No mapping authority: no shared candidate, so no mapping refusal.
+        match self.serve_futex_operation(frame, &mut None, None) {
+            Ok(served) => Ok(served),
+            Err(FutexRefusal::Copy(refusal)) => Err(refusal),
+            Err(FutexRefusal::Mapping(_)) => Ok(None),
+        }
     }
     fn serve_futex_operation(
         &mut self,
         frame: &mut TrapFrame,
         operation: &mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
-    ) -> Result<Option<Served>, carrick_core::user_copy::CopyOutcome> {
-        if !is_served_futex_op(frame) {
+        shared: Option<&mut SharedFutexMapping<'_>>,
+    ) -> Result<Option<Served>, FutexRefusal> {
+        if frame.x[8] != SYS_FUTEX as u64 {
             return Ok(None);
         }
-        let call = FutexCall {
+        let mut call = FutexCall {
             args: crate::sched::args(frame),
         };
+        // The same candidate rule as x86's native entry (`serve_native_futex`).
+        let candidate = shared.is_some().then(|| call.shared_private_candidate());
+        let shared = match candidate.flatten() {
+            Some(candidate) => {
+                call = candidate;
+                shared
+            }
+            None => None,
+        };
+        if !call.admitted() {
+            return Ok(None);
+        }
         let mut adapter = Adapter {
             sched: self,
             frame,
             refusal: None,
             operation,
+            shared,
         };
         let served = ::carrick_personality_linux::sched::serve_futex(call, &mut adapter);
         match adapter.refusal {

@@ -51,7 +51,7 @@ struct Adapter<'e, 'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<
     copy: RefCell<&'e mut dyn UserCopy>,
     refusal: Cell<Option<CopyOutcome>>,
     shared: bool,
-    mapping_refusal: Option<NativeProcessError>,
+    mapping_refusal: Option<LifecycleOutcome>,
     now: CounterTick,
     frequency: FutexFrequency,
     retained: Option<RelativeFutexWait>,
@@ -63,22 +63,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if !self.shared {
             return Some(true);
         }
-        let mm = self
-            .entry
-            .runtime
-            .graph
-            .lock()
-            .owner
-            .task(self.entry.key)
-            .ok()?
-            .native()
-            .resources()
-            .mm
-            .clone();
-        match self.entry.service.futex_shared_private(&mm, address) {
+        let retained = self.retained.as_ref().map(|wait| RelativeFutexWait {
+            deadline: wait.deadline,
+        });
+        match self.entry.authenticate_shared_futex(address, retained) {
             Ok(admitted) => Some(admitted),
-            Err(error) => {
-                self.mapping_refusal = Some(error);
+            Err(outcome) => {
+                self.mapping_refusal = Some(outcome);
                 None
             }
         }
@@ -325,6 +316,51 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         result.map_err(|_| carrick_core_abi::NativeRunFailureReason::NativeStale)
     }
 
+    /// The one shared-private admission for both ISAs (#2124): a shared
+    /// futex word keys as [`MmFutexKey::shared_private`] only after the
+    /// memory owner authenticates private anonymous storage in this task's
+    /// MM. Owner contention retains `retained` and retries the syscall on
+    /// the holder's wait; any other refusal fails the run.
+    pub(super) fn authenticate_shared_futex(
+        &mut self,
+        address: UserVa,
+        retained: Option<RelativeFutexWait>,
+    ) -> Result<bool, LifecycleOutcome> {
+        let Ok(mm) = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map(|task| task.native().resources().mm.clone())
+        else {
+            return Ok(false);
+        };
+        match self.service.futex_shared_private(&mm, address) {
+            Ok(admitted) => Ok(admitted),
+            Err(NativeProcessError::OwnerWait(wait)) => {
+                if let Some(retained) = retained {
+                    self.retain_relative_futex_wait(retained);
+                }
+                Err(self
+                    .retry_guest_input(
+                        carrick_core_abi::service::ServiceOperation::CarrierWork {
+                            entry: OwnerEntry::Syscall,
+                            demand: carrick_core_abi::service::CarrierDemand::Work,
+                        },
+                        None,
+                        Some(wait),
+                    )
+                    .unwrap_or_else(|error| self.run_failed(error.run_failure_reason())))
+            }
+            // A live portal always observes its Reservations source before
+            // the root probe, so mapping contention cannot reach here as a
+            // bare `Busy`. Treat it as the invariant break it is instead of
+            // adding a waitless checkpoint-retry second path.
+            Err(error) => Err(self.run_failed(error.run_failure_reason())),
+        }
+    }
+
     pub(super) fn serve_native_futex(
         &mut self,
         mut call: FutexCall,
@@ -359,32 +395,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             retained,
         };
         let result = carrick_personality_linux::sched::serve_futex(call, &mut adapter);
-        if let Some(error) = adapter.mapping_refusal {
-            return Some(match error {
-                NativeProcessError::OwnerWait(wait) => {
-                    if let Some(retained) = adapter.retained {
-                        adapter.entry.retain_relative_futex_wait(retained);
-                    }
-                    adapter
-                        .entry
-                        .retry_guest_input(
-                            carrick_core_abi::service::ServiceOperation::CarrierWork {
-                                entry: OwnerEntry::Syscall,
-                                demand: carrick_core_abi::service::CarrierDemand::Work,
-                            },
-                            None,
-                            Some(wait),
-                        )
-                        .unwrap_or_else(|error| {
-                            adapter.entry.run_failed(error.run_failure_reason())
-                        })
-                }
-                // A live portal always observes its Reservations source before
-                // the root probe, so mapping contention cannot reach here as a
-                // bare `Busy`. Treat it as the invariant break it is instead of
-                // adding a waitless checkpoint-retry second path.
-                error => adapter.entry.run_failed(error.run_failure_reason()),
-            });
+        if let Some(outcome) = adapter.mapping_refusal {
+            return Some(outcome);
         }
         match adapter.refusal.get() {
             Some(CopyOutcome::Fault) => {

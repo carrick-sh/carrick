@@ -275,6 +275,18 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     ) -> Option<LifecycleOutcome> {
         None
     }
+    /// Authenticate a shared futex word as private anonymous storage of this
+    /// process's MM, the one rule both ISAs key shared-private waits by
+    /// (#2124). `Ok(false)` leaves the shared operation unrouted. `Err` is
+    /// the memory owner's retry or failure; it retains `retained` first, so
+    /// a relative timeout keeps its first-attempt expiry.
+    fn futex_shared_private(
+        &mut self,
+        _address: UserVa,
+        _retained: Option<crate::sched::RelativeFutexWait>,
+    ) -> Result<bool, LifecycleOutcome> {
+        Ok(false)
+    }
     fn enqueue_thread(&mut self, _record: RecordRef) -> BornEnqueue {
         BornEnqueue::Refused
     }

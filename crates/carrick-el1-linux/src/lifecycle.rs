@@ -822,6 +822,15 @@ impl<
         let Some(zone) = &mut self.zone else {
             return false;
         };
+        // The exit's wake is a shared futex wake: it releases the joiner
+        // keyed shared-private, the same key as x86's `wake_thread_join`
+        // (#2124: glibc's `pthread_join` waits with a shared op).
+        let Some(key) = carrick_personality_linux::sched::MmFutexKey::shared_private(address)
+        else {
+            // exit's best-effort futex wake cannot wake an aligned neighbour
+            // when clear_child_tid itself is unaligned.
+            return true;
+        };
         native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
             .wake_word(
                 match self.frame.arm_frame() {
@@ -829,7 +838,7 @@ impl<
                     None => return false,
                 },
                 mm.raw(),
-                address.raw(),
+                key.scheduler_address(),
                 carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
                 carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
             )
