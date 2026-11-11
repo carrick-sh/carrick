@@ -2025,6 +2025,58 @@ fn zone_pipe_poll_zero_timeout_returns_immediately() {
     zone_pipe_poll_wake(&["-DUSE_POLL", "-DWAKE_BY_CLOSE", "-DZERO_TIMEOUT"]);
 }
 
+fn run_poll_revents_only_fixture(flags: &[&str]) {
+    let elf = native_exit_fixture_with_flags("native_poll_revents_only.S", flags);
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    std::fs::write(&oracle, &elf).expect("oracle binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o755))
+            .expect("executable oracle");
+    }
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native Linux oracle failed (flags={flags:?}): {:?}",
+        native.status
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(try_run_pool_fixture_with_root_affinity(
+            &elf,
+            512,
+            kvm_pool_fixture::ROOT_AFFINITY_ANY,
+        ));
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("CPL0 poll revents witness hung past 10 s")
+        .expect("CPL0 poll revents witness refused");
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "CPL0 poll revents witness failed at stage {} (flags={flags:?}; see native_poll_revents_only.S)",
+        outcome.run.exit_code
+    );
+}
+
+#[test]
+fn x86_cpl0_poll_and_ppoll_write_only_writable_revents_page() {
+    run_poll_revents_only_fixture(&["-DREADONLY_INPUT_PAGE"]);
+}
+
+#[test]
+fn x86_cpl0_poll_preserves_fields_changed_during_host_wait() {
+    run_poll_revents_only_fixture(&[]);
+}
+
 fn private_file_fixture(cow: bool) {
     private_file_fixture_with(cow, &[], 0);
 }

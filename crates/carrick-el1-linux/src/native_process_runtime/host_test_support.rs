@@ -6036,7 +6036,11 @@ fn retained_poll_output_owner_wait(
     let observed =
         notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
-    let output_address = address;
+    let output_address = if production_frame && !constructor {
+        address + 6
+    } else {
+        address
+    };
     service.on_copy_complete = Some(Box::new(move |address| {
         if address.raw() == output_address {
             access.raise(space.index());
@@ -6058,7 +6062,11 @@ fn retained_poll_output_owner_wait(
         )
     };
     service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
-    service.child_copy_error_at = Some(address + piece);
+    service.child_copy_error_at = Some(if production_frame && !constructor {
+        address + 14
+    } else {
+        address + piece
+    });
     let bytes: Vec<u8> = if constructor {
         [0i32, 1i32]
             .into_iter()
@@ -6158,10 +6166,17 @@ fn retained_poll_output_owner_wait(
             assert!(entry.take_handoff_receipt().is_some());
         }
     }
-    assert_eq!(
-        take_output(&mut service),
-        [(UserVa::new(address), bytes[..piece as usize].to_vec())]
-    );
+    if production_frame && !constructor {
+        assert_eq!(
+            take_output(&mut service),
+            [(UserVa::new(address + 6), bytes[6..8].to_vec())]
+        );
+    } else {
+        assert_eq!(
+            take_output(&mut service),
+            [(UserVa::new(address), bytes[..piece as usize].to_vec())]
+        );
+    }
     if let Some(table) = constructor_table.as_ref() {
         for fd in [0, 1] {
             assert_eq!(
@@ -6244,13 +6259,26 @@ fn retained_poll_output_owner_wait(
         assert!(
             matches!(resumed, NativeResume::Returned(result) if result.raw() == expected_result)
         );
-        assert_eq!(
-            take_output(&mut service),
-            [(
-                UserVa::new(address + piece),
-                bytes[piece as usize..].to_vec()
-            )]
-        );
+        if production_frame && !constructor {
+            let expected: Vec<_> = (1..1024)
+                .map(|index| {
+                    let offset = index * 8 + 6;
+                    (
+                        UserVa::new(address + offset as u64),
+                        bytes[offset..offset + 2].to_vec(),
+                    )
+                })
+                .collect();
+            assert_eq!(take_output(&mut service), expected);
+        } else {
+            assert_eq!(
+                take_output(&mut service),
+                [(
+                    UserVa::new(address + piece),
+                    bytes[piece as usize..].to_vec()
+                )]
+            );
+        }
     }
     if let Some(table) = constructor_table.as_ref() {
         let region = constructor_owner.as_ref().unwrap().region();
