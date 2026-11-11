@@ -465,6 +465,16 @@ pub struct PollFd {
     pub revents: i16,
 }
 
+const _: () = {
+    assert!(
+        core::mem::size_of::<PollFd>() == core::mem::size_of::<carrick_syscall_abi::LinuxPollFd>()
+    );
+    assert!(
+        core::mem::offset_of!(PollFd, revents)
+            == core::mem::offset_of!(carrick_syscall_abi::LinuxPollFd, revents)
+    );
+};
+
 fn claim_open_record<'a>(
     open_table: &'a [DelegatedOpenFile],
     object_table: &'a [DelegatedFile],
