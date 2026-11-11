@@ -57,7 +57,7 @@ impl std::fmt::Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "trusted step {}/{} runs {}, which this PR adds or changes; land it first in a separate PR (#2092)",
+            "trusted step {}/{} runs {}, which the merge base lacks; land it first in a separate PR (#2092)",
             self.job, self.step, self.thing
         )
     }
@@ -137,20 +137,60 @@ pub fn run<W: Write>(
     args: &TrustedStepsArgs,
     writer: &mut W,
 ) -> Result<(), TrustedStepsError> {
-    let violations = check(&GitTree::new(root), &args.base, &args.head)?;
-    if violations.is_empty() {
+    let report = check_report(&GitTree::new(root), &args.base, &args.head)?;
+    for warning in &report.warnings {
+        writeln!(writer, "warning: {warning}")?;
+    }
+    if report.violations.is_empty() {
         writeln!(writer, "trusted-steps: ok")?;
         return Ok(());
     }
-    let text: Vec<String> = violations.iter().map(ToString::to_string).collect();
+    let text: Vec<String> = report.violations.iter().map(ToString::to_string).collect();
     Err(TrustedStepsError::Violations(text.join("\n")))
 }
 
+/// What the check found: `violations` fail the merge group, `warnings` do not.
+#[derive(Debug, Default)]
+pub struct Report {
+    pub violations: Vec<Violation>,
+    pub warnings: Vec<Warning>,
+}
+
+/// A trusted step that references something present on the merge base whose
+/// content differs on head. The merge group runs base's copy until the PR lands.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Warning {
+    pub job: String,
+    pub step: String,
+    pub path: String,
+}
+
+impl std::fmt::Display for Warning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "trusted step {}/{} will run base's copy of {} until this PR lands",
+            self.job, self.step, self.path
+        )
+    }
+}
+
+#[derive(Default)]
+struct Found {
+    violations: BTreeSet<Violation>,
+    warnings: BTreeSet<Warning>,
+}
+
+/// Only what fails the merge group; see [`check_report`] for warnings.
 pub fn check(tree: &dyn Tree, base: &str, head: &str) -> Result<Vec<Violation>, TrustedStepsError> {
+    Ok(check_report(tree, base, head)?.violations)
+}
+
+pub fn check_report(tree: &dyn Tree, base: &str, head: &str) -> Result<Report, TrustedStepsError> {
     let base_cli = ClapModel::load(tree, base)?;
     let base_recipes = justfile_recipes(tree, base)?;
     let head_files: HashSet<String> = tree.list(head, ".")?.into_iter().collect();
-    let mut found = BTreeSet::new();
+    let mut found = Found::default();
     for wf in tree.list(head, ".github/workflows")? {
         if !(wf.ends_with(".yml") || wf.ends_with(".yaml")) {
             continue;
@@ -186,7 +226,10 @@ pub fn check(tree: &dyn Tree, base: &str, head: &str) -> Result<Vec<Violation>, 
             }
         }
     }
-    Ok(found.into_iter().collect())
+    Ok(Report {
+        violations: found.violations.into_iter().collect(),
+        warnings: found.warnings.into_iter().collect(),
+    })
 }
 
 struct Ctx<'a> {
@@ -218,11 +261,48 @@ fn norm_dir(p: &str) -> String {
     if p.is_empty() { ".".into() } else { p.into() }
 }
 
+/// Checkout directories a step's `working-directory:` may name. A literal is
+/// itself; an expression yields its quoted literals, or, when none can be read,
+/// every checkout (fail closed: never skip a step we cannot resolve).
+fn step_dirs(wd: Option<&str>, trust: &HashMap<String, bool>) -> Vec<String> {
+    let Some(wd) = wd else {
+        return vec![".".into()];
+    };
+    if !wd.contains("${{") {
+        return vec![norm_dir(wd)];
+    }
+    let lit = Regex::new(r"'([^']*)'").ok();
+    let mut dirs: Vec<String> = lit
+        .iter()
+        .flat_map(|re| re.captures_iter(wd).map(|c| norm_dir(&c[1])))
+        .collect();
+    if dirs.is_empty() {
+        dirs = trust.keys().cloned().collect();
+        dirs.push(".".into());
+    }
+    dirs
+}
+
+/// Whether a step running in `dir` sees a trusted checkout.
+fn dir_trusted(dir: &str, trust: &HashMap<String, bool>) -> bool {
+    if let Some(t) = trust.get(dir) {
+        return *t;
+    }
+    // A subdirectory of a checkout, else the workspace-root checkout.
+    trust
+        .iter()
+        .filter(|(k, _)| k.as_str() != "." && dir.starts_with(&format!("{k}/")))
+        .map(|(_, t)| *t)
+        .next()
+        .or_else(|| trust.get(".").copied())
+        .unwrap_or(false)
+}
+
 fn check_job(
     job_id: &str,
     job: &Yaml,
     ctx: &Ctx<'_>,
-    found: &mut BTreeSet<Violation>,
+    found: &mut Found,
 ) -> Result<(), TrustedStepsError> {
     let Some(steps) = job["steps"].as_vec() else {
         return Ok(());
@@ -237,12 +317,9 @@ fn check_job(
             trust.insert(dir, trusted);
             continue;
         }
-        let wd = norm_dir(step["working-directory"].as_str().unwrap_or("."));
-        let in_trusted = trust
-            .get(&wd)
-            .or_else(|| trust.get("."))
-            .copied()
-            .unwrap_or(false);
+        let in_trusted = step_dirs(step["working-directory"].as_str(), &trust)
+            .iter()
+            .any(|d| dir_trusted(d, &trust));
         if !in_trusted {
             continue;
         }
@@ -251,37 +328,52 @@ fn check_job(
             .map(str::to_owned)
             .or_else(|| (!uses.is_empty()).then(|| uses.to_owned()))
             .unwrap_or_else(|| format!("step {}", idx + 1));
-        let mut things = Vec::new();
+        let mut things = Findings::default();
         if let Some(dir) = uses.strip_prefix("./") {
-            things.extend(changed_under(ctx, dir)?);
+            for path in ctx.tree.list(ctx.head, dir)? {
+                things.path(ctx, &path)?;
+            }
         }
         if let Some(script) = step["run"].as_str() {
-            things.extend(analyze_script(script, ctx)?);
+            analyze_script(script, ctx, &mut things)?;
         }
-        for thing in things {
-            found.insert(Violation {
+        for thing in things.fail {
+            found.violations.insert(Violation {
                 job: job_id.into(),
                 step: label.clone(),
                 thing,
+            });
+        }
+        for path in things.warn {
+            found.warnings.insert(Warning {
+                job: job_id.into(),
+                step: label.clone(),
+                path,
             });
         }
     }
     Ok(())
 }
 
-/// Files of a local action directory that differ from the merge base.
-fn changed_under(ctx: &Ctx<'_>, dir: &str) -> Result<Vec<String>, TrustedStepsError> {
-    let mut out = Vec::new();
-    for path in ctx.tree.list(ctx.head, dir)? {
-        if differs(ctx, &path)? {
-            out.push(path);
-        }
-    }
-    Ok(out)
+/// What one step references that the merge base lacks (`fail`) or has with
+/// other content (`warn`).
+#[derive(Default)]
+struct Findings {
+    fail: Vec<String>,
+    warn: Vec<String>,
 }
 
-fn differs(ctx: &Ctx<'_>, path: &str) -> Result<bool, TrustedStepsError> {
-    Ok(ctx.tree.read(ctx.base, path)? != ctx.tree.read(ctx.head, path)?)
+impl Findings {
+    /// A repository file the step runs: absent on base fails, changed warns.
+    fn path(&mut self, ctx: &Ctx<'_>, path: &str) -> Result<(), TrustedStepsError> {
+        let on_base = ctx.tree.read(ctx.base, path)?;
+        if on_base.is_none() {
+            self.fail.push(path.to_owned());
+        } else if on_base != ctx.tree.read(ctx.head, path)? {
+            self.warn.push(path.to_owned());
+        }
+        Ok(())
+    }
 }
 
 fn is_word(w: &str) -> bool {
@@ -291,97 +383,202 @@ fn is_word(w: &str) -> bool {
         && cs.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// The leading bare words of `rest`, up to the first flag, quote or expansion.
-fn leading_words(rest: &str) -> Vec<String> {
-    rest.split_whitespace()
-        .take_while(|w| is_word(w))
-        .map(str::to_owned)
-        .collect()
+fn unquote(t: &str) -> &str {
+    t.trim_matches(|c| c == '"' || c == '\'')
 }
 
-fn analyze_script(script: &str, ctx: &Ctx<'_>) -> Result<Vec<String>, TrustedStepsError> {
-    let text = script.replace("\\\n", " ");
-    let mut things = Vec::new();
-
-    // Repository paths executed directly or through an interpreter.
-    let path_re = Regex::new(
-        r#"(?m)(?:^|[;&|(`]|\b(?:then|else|do|if|exec|sudo|source|bash|sh|python3?)\b|(?:^|\s)\.)(?:[ \t]+-[A-Za-z-]+)*[ \t]*["']?(?:\./|\$\{\{\s*github\.workspace\s*\}\}/|\$GITHUB_WORKSPACE/|\$\{GITHUB_WORKSPACE\}/)?([A-Za-z0-9_][A-Za-z0-9_./-]*)"#,
-    )
-    .map_err(regex_err)?;
-    let mut seen = HashSet::new();
-    for cap in path_re.captures_iter(&text) {
-        let path = &cap[1];
-        if ctx.head_files.contains(path) && seen.insert(path.to_owned()) && differs(ctx, path)? {
-            things.push(path.to_owned());
+/// The subcommand words that follow the xtask binary, past its global
+/// `--root`, up to the first flag, quote or expansion.
+fn xtask_words(toks: &[&str]) -> Vec<String> {
+    let mut it = toks.iter().copied().peekable();
+    let mut words = Vec::new();
+    while let Some(t) = it.peek().copied() {
+        if t == "--root" {
+            it.next();
+            it.next();
+        } else if t.starts_with("--root=") {
+            it.next();
+        } else if is_word(t) {
+            words.push(t.to_owned());
+            it.next();
+        } else {
+            break;
         }
     }
+    words
+}
+
+/// Simple commands of a shell script: split on separators, drop comments.
+fn split_commands(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in script.replace("\\\n", " ").lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        let line = line.split(" #").next().unwrap_or(line);
+        out.extend(
+            line.split([';', '&', '|', '(', ')', '`', '{', '}'])
+                .map(|c| c.trim().to_owned())
+                .filter(|c| !c.is_empty()),
+        );
+    }
+    out
+}
+
+fn is_assignment(t: &str) -> Option<&str> {
+    let (name, _) = t.split_once('=')?;
+    let mut cs = name.chars();
+    (cs.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then_some(name)
+}
+
+fn analyze_script(
+    script: &str,
+    ctx: &Ctx<'_>,
+    out: &mut Findings,
+) -> Result<(), TrustedStepsError> {
+    let ws = Regex::new(r"\$\{\{\s*github\.workspace\s*\}\}").map_err(regex_err)?;
+    let text = ws.replace_all(script, "$$GITHUB_WORKSPACE");
+    let commands = split_commands(&text);
 
     // Variables standing for the xtask binary.
     let mut aliases: HashSet<String> = ["CARRICK_XTASK_PREBUILT", "CARRICK_XTASK_BIN"]
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
-    let assign_re = Regex::new(
-        r"(?m)(?:^|[;&]|\bthen\b)[ \t]*(\w+)=[^\n]*(?:carrick-xtask|XTASK_PREBUILT|XTASK_BIN)",
-    )
-    .map_err(regex_err)?;
-    for cap in assign_re.captures_iter(&text) {
-        aliases.insert(cap[1].to_owned());
+    for c in &commands {
+        for t in c.split_whitespace() {
+            if let Some(name) = is_assignment(t)
+                && (t.contains("carrick-xtask")
+                    || t.contains("XTASK_PREBUILT")
+                    || t.contains("XTASK_BIN"))
+            {
+                aliases.insert(name.to_owned());
+            }
+        }
     }
 
     let mut invocations: Vec<Vec<String>> = Vec::new();
-    let direct = Regex::new(
-        r#"(?m)(?:-p[ \t]+carrick-xtask|(?:^|&&|\|\||[;|(])[ \t]*"?[^\s"]*carrick-xtask"?)(?:[ \t]+--)?(?:[ \t]|$)([^\n]*)"#,
-    )
-    .map_err(regex_err)?;
-    for cap in direct.captures_iter(&text) {
-        invocations.push(leading_words(&cap[1]));
-    }
-    let var = Regex::new(
-        r#"(?m)(?:^|&&|\|\||[;|(]|\bthen\b)[ \t]*"?\$\{?(\w+)(?:\[@\])?\}?"?[ \t]([^\n]*)"#,
-    )
-    .map_err(regex_err)?;
-    for cap in var.captures_iter(&text) {
-        if aliases.contains(&cap[1]) {
-            invocations.push(leading_words(&cap[2]));
-        }
-    }
-    let just = Regex::new(r"(?m)(?:^|&&|\|\||[;|(]|\bthen\b)[ \t]*just[ \t]+([^\n]*)")
-        .map_err(regex_err)?;
-    for cap in just.captures_iter(&text) {
-        let mut toks = cap[1].split_whitespace();
-        let mut recipe = None;
-        while let Some(t) = toks.next() {
+    let mut seen = HashSet::new();
+    for cmd in &commands {
+        let all: Vec<&str> = cmd.split_whitespace().collect();
+        let mut i = 0;
+        // Leading keywords, wrappers and `VAR=val` prefixes.
+        while i < all.len() {
+            let t = all[i];
             if matches!(
                 t,
-                "--justfile" | "-f" | "--working-directory" | "-d" | "--set"
-            ) {
-                toks.next();
-            } else if t.starts_with('-') {
-                continue;
+                "then"
+                    | "else"
+                    | "do"
+                    | "if"
+                    | "elif"
+                    | "while"
+                    | "until"
+                    | "!"
+                    | "time"
+                    | "exec"
+                    | "nohup"
+                    | "command"
+                    | "export"
+            ) || is_assignment(t).is_some()
+            {
+                i += 1;
+            } else if matches!(t, "sudo" | "env") {
+                i += 1;
+                while all.get(i).is_some_and(|f| f.starts_with('-')) {
+                    i += 1;
+                }
             } else {
-                recipe = Some(t.to_owned());
                 break;
             }
         }
-        let Some(recipe) = recipe else { continue };
-        if !is_word(&recipe) {
-            continue;
+        let Some(&first) = all.get(i) else { continue };
+        let mut rest = &all[i + 1..];
+        let mut head = unquote(first);
+        // Interpreters: the first non-flag argument is the script.
+        if matches!(head, "bash" | "sh" | "python" | "python3" | "source" | ".") {
+            let n = rest.iter().take_while(|t| t.starts_with('-')).count();
+            let Some(&script) = rest.get(n) else { continue };
+            head = unquote(script);
+            rest = &[];
         }
-        if !ctx.recipes.contains(&recipe) {
-            things.push(format!("just recipe {recipe}"));
-        } else if recipe == "xtask" {
-            let rest: Vec<&str> = toks.collect();
-            invocations.push(leading_words(&rest.join(" ")));
+        if head == "just" {
+            let mut toks = rest.iter().copied();
+            let mut recipe = None;
+            while let Some(t) = toks.next() {
+                if matches!(
+                    t,
+                    "--justfile" | "-f" | "--working-directory" | "-d" | "--set"
+                ) {
+                    toks.next();
+                } else if t.starts_with('-') {
+                    continue;
+                } else {
+                    recipe = Some(t.to_owned());
+                    break;
+                }
+            }
+            let Some(recipe) = recipe else { continue };
+            if !is_word(&recipe) {
+                continue;
+            }
+            if !ctx.recipes.contains(&recipe) {
+                out.fail.push(format!("just recipe {recipe}"));
+            } else if recipe == "xtask" {
+                invocations.push(xtask_words(&toks.collect::<Vec<_>>()));
+            }
+        } else if head == "cargo" {
+            let sub = rest
+                .iter()
+                .copied()
+                .find(|t| !t.starts_with('-') && !t.starts_with('+'));
+            if sub != Some("run") {
+                continue;
+            }
+            let (flags, args) = match rest.iter().position(|t| *t == "--") {
+                Some(p) => (&rest[..p], &rest[p + 1..]),
+                None => (rest, &rest[rest.len()..]),
+            };
+            let names_xtask = flags.windows(2).any(|w| {
+                matches!(w[0], "-p" | "--package" | "--bin") && unquote(w[1]) == "carrick-xtask"
+            }) || flags.iter().any(|t| {
+                matches!(
+                    *t,
+                    "--package=carrick-xtask" | "--bin=carrick-xtask" | "-pcarrick-xtask"
+                )
+            });
+            if names_xtask {
+                invocations.push(xtask_words(args));
+            }
+        } else if head.ends_with("carrick-xtask") {
+            invocations.push(xtask_words(rest));
+        } else if let Some(var) = head
+            .strip_prefix("${")
+            .and_then(|v| v.strip_suffix('}'))
+            .or_else(|| head.strip_prefix('$'))
+            && aliases.contains(var)
+        {
+            invocations.push(xtask_words(rest));
+        } else {
+            let path = ["$GITHUB_WORKSPACE/", "${GITHUB_WORKSPACE}/", "./"]
+                .iter()
+                .fold(head, |p, pre| p.strip_prefix(pre).unwrap_or(p));
+            if ctx.head_files.contains(path) && seen.insert(path.to_owned()) {
+                out.path(ctx, path)?;
+            }
         }
     }
 
     for words in invocations {
         if let Some(missing) = ctx.cli.first_missing(&words) {
-            things.push(format!("carrick-xtask {missing}"));
+            out.fail.push(format!("carrick-xtask {missing}"));
         }
     }
-    Ok(things)
+    Ok(())
 }
 
 fn regex_err(e: regex::Error) -> TrustedStepsError {
