@@ -1302,8 +1302,9 @@ fn el1_queues_a_pinned_thread_on_its_busy_cpu() {
 /// A floating thread whose affinity excludes the waker's CPU, with no slot
 /// in the guest that may run it, is still woken in the ring (#1941): queued
 /// on the live slot of its CPU, stopped at a host exit, whose driver runs it
-/// when it comes back (#1961 review). Only a thread no slot may run at all
-/// stays on the waker's slot, misplaced. An idle slot of its CPU takes it
+/// when it comes back (#1961 review). A thread no driven slot may run, whose
+/// affinity excludes the waker's CPU, goes to the host, never to the waker's
+/// queue (#1961 second review, P0-1). An idle slot of its CPU takes it
 /// directly.
 #[test]
 fn el1_honours_affinity_for_floating_threads() {
@@ -1322,15 +1323,11 @@ fn el1_honours_affinity_for_floating_threads() {
     );
     assert!(!effects.queued_own && !effects.owes_host_boundary());
     assert_eq!(zone.switch_in_full(SLOT), None, "never run on the waker");
-    // No slot of CPU 2 exists: the waker's own queue is the last resort.
+    // No slot of CPU 2 exists: the host takes it, never the waker's queue.
     let (unrunnable, seq) = park_pinned(&zone, 5, 0x4200, 1 << 2);
     let (woken, effects) = wake_effects(&zone, 0x4200, 1, SLOT);
     assert_eq!(woken, [unrunnable]);
-    assert_eq!(
-        zone.record(unrunnable).claim(),
-        Claim::Queued { slot: SLOT, seq }
-    );
-    assert!(effects.queued_own && effects.misplaced);
+    assert_handed_to_host(&zone, unrunnable, seq, effects);
     // CPU 1's slot returns and idles: it takes the next pinned thread.
     assert_eq!(zone.switch_in_full(OTHER).unwrap().record, pinned);
     zone.clear_current(OTHER);
@@ -1345,6 +1342,130 @@ fn el1_honours_affinity_for_floating_threads() {
         Claim::Queued { slot: OTHER, seq }
     );
     assert!(!effects.misplaced);
+}
+
+/// `record` (park `seq`), woken by an EL1 wake with `effects`, went to the
+/// host through the carrier's completion chain: on no run queue, the waker
+/// owes the host its boundary, and the boundary hands it over exactly once.
+fn assert_handed_to_host(zone: &ZoneTables, record: RecordId, seq: u32, effects: WakeEffects) {
+    assert_eq!(
+        zone.record(record).claim(),
+        Claim::Transferring {
+            seq,
+            cancelled: false,
+            host_requested: false
+        },
+        "handed to the host, never queued where it may not run"
+    );
+    assert!(effects.handed_to_host && effects.owes_host_boundary());
+    assert!(!effects.queued_own && !effects.misplaced);
+    assert_eq!(zone.record(record).entry_count(), 0);
+    let mut handed = Vec::new();
+    zone.take_completion_handbacks(&HostWait, &mut |r| handed.push(r.id));
+    assert_eq!(handed, [record], "the host boundary hands it over once");
+    assert_eq!(zone.record(record).claim(), Claim::Host { seq });
+    assert_eq!(zone.record(record).handback(), Some(Handback::Woken));
+}
+
+/// #1961 second review, P0-1: a floating thread that last ran on the
+/// waker's slot, whose affinity now excludes the waker's CPU, with no slot
+/// an executor drives on a CPU it may run on, is handed to the host. It used
+/// to be queued on the waker's slot, `misplaced`, where nothing relocates it:
+/// x86 ran it on the forbidden CPU and ARM bounced it between `switch_in`
+/// and `unswitch`.
+#[test]
+fn an_excluded_waiter_no_driven_slot_may_run_goes_to_the_host() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    // CPU 1's slot ran the waiter last, and its driver left it since.
+    enter(&zone, OTHER, 1);
+    zone.leave_guest(OTHER, &HostWait);
+    assert!(zone.leave_slot(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    for last in [SLOT, OTHER] {
+        let (pinned, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
+        zone.record(pinned)
+            .last_slot
+            .store(last.plus_one(), Ordering::Relaxed);
+        let (woken, effects) = wake_effects(&zone, 0x4000, 1, SLOT);
+        assert_eq!(woken, [pinned], "an EL1 wake is never refused");
+        assert_handed_to_host(&zone, pinned, seq, effects);
+        assert_eq!(zone.slot(SLOT).queued(), 0, "never on the waker's queue");
+        assert_eq!(
+            zone.slot(OTHER).queued(),
+            0,
+            "never on a slot nobody drives"
+        );
+        assert_eq!(zone.counters.el1_misplaced.load(Ordering::Relaxed), 0);
+        zone.free_record(pinned);
+    }
+}
+
+/// #1961 second review, P0-2 (the #1892/#1902 kick): a floating thread
+/// queued on the slot whose driver is away on the host gets every live slot
+/// its affinity allows kicked, which may have become live on its CPU since
+/// the choice: such a slot steals it sooner than the away driver returns.
+#[test]
+fn an_excluded_waiter_queued_on_an_away_slot_kicks_live_peers_of_its_cpu() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    zone.leave_guest(OTHER, &HostWait);
+    assert!(zone.step_away(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    // THIRD runs on CPU 1 too, an address space the waiter's is not.
+    host_publish(&zone, THIRD, MM + 1, Some(1), 0);
+    zone.enter_guest(THIRD);
+    let (pinned, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
+    zone.record(pinned)
+        .last_slot
+        .store(OTHER.plus_one(), Ordering::Relaxed);
+    let (woken, effects) = wake_effects(&zone, 0x4000, 1, SLOT);
+    assert_eq!(woken, [pinned]);
+    assert_eq!(
+        zone.record(pinned).claim(),
+        Claim::Queued { slot: OTHER, seq },
+        "queued for the away driver, which comes back to its slot"
+    );
+    assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), [THIRD]);
+    assert!(zone.take_resched(THIRD), "the live peer owes a reschedule");
+    assert!(!zone.take_resched(SLOT));
+    assert!(!effects.owes_host_boundary());
+}
+
+/// #1961 second review, P0-2: the slot a wake chose for a floating thread
+/// whose affinity excludes the waker's CPU loses its driver between the
+/// choice and the wake taking its lock (`leave_slot` stores `drive = 0`
+/// under that lock). The wake re-checks the custody under the lock and
+/// hands the thread to the host, never stranding it on the abandoned
+/// slot. Both orders of the race give that verdict.
+#[test]
+fn a_slot_left_between_choice_and_lock_never_strands_the_waiter() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    zone.leave_guest(OTHER, &HostWait);
+    let (pinned, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
+    zone.record(pinned)
+        .last_slot
+        .store(OTHER.plus_one(), Ordering::Relaxed);
+    let bucket = ZoneTables::bucket_of(MM, 0x4000);
+    let held = zone.slot_lock(OTHER, &HostWait).unwrap();
+    let (woken, effects) = std::thread::scope(|scope| {
+        let waker = scope.spawn(|| wake_effects(&zone, 0x4000, 1, SLOT));
+        // The waker holds the bucket lock and spins on OTHER's lock: it
+        // chose OTHER (live, last ran there) before its driver leaves.
+        while zone.lock(bucket, &BoundedSpin(0)).is_some() {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // `leave_slot`'s locked step, under the lock this test holds.
+        assert_eq!(zone.slot(OTHER).driver(), Some(u64::from(OTHER.raw()) + 1));
+        zone.slot(OTHER).drive.store(0, Ordering::Release);
+        drop(held);
+        waker.join().unwrap()
+    });
+    assert_eq!(woken, [pinned]);
+    assert_handed_to_host(&zone, pinned, seq, effects);
+    assert_eq!(zone.slot(OTHER).queued(), 0, "never on the left slot");
 }
 
 /// Readiness and interruption return to the native owner; host continuations
