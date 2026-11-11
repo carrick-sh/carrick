@@ -3125,7 +3125,7 @@ fn production_pipe_metadata_stays_in_the_ring_namespace() {
 
 /// #2071 witness 4 (x86 CPL0/KVM twin of witness 1): two threads of one
 /// native x86_64 process each call blocking `wait4` on distinct forked
-/// children while both children are still alive (`nanosleep`). On unmodified
+/// children while both children are still alive (`FUTEX_WAIT`). On unmodified
 /// `main`, the second waiter gets `-EAGAIN` (`-11`, reported as exit `111`);
 /// with per-member wait continuations, both block and each reaps its own child.
 #[test]
@@ -3174,31 +3174,32 @@ _start:
      * +0x18: i32 child_b_pid
      * +0x20: i32 status_a
      * +0x28: i32 status_b
-     * +0x30: i32 worker_reaped_code
+     * +0x30: i32 worker_result (22 on success, 100 + errno on wait4 error)
+     * +0x38: u32 child_futex_word (0)
      * +0x40: timespec join_timeout = { 5, 0 }
-     * +0x50: timespec sleep_a = { 0, 150000000 }
-     * +0x60: timespec sleep_b = { 0, 220000000 }
+     * +0x50: timespec wait_a = { 0, 80000000 }
+     * +0x60: timespec wait_b = { 0, 140000000 }
      */
     movq $5, 0x40(%r12)
     movq $0, 0x48(%r12)
     movq $0, 0x50(%r12)
-    movq $150000000, 0x58(%r12)
+    movq $80000000, 0x58(%r12)
     movq $0, 0x60(%r12)
-    movq $220000000, 0x68(%r12)
+    movq $140000000, 0x68(%r12)
 
-    /* Fork child_a: sleeps 150 ms, then exits 11. */
+    /* Fork child_a: blocks 80 ms in ring FUTEX_WAIT, then exits 11. */
     mov $57, %eax
     syscall
     test %eax, %eax
-    js report_errno
+    js leader_errno
     jz child_a
     mov %eax, 0x10(%r12)
 
-    /* Fork child_b: sleeps 220 ms, then exits 22. */
+    /* Fork child_b: blocks 140 ms in ring FUTEX_WAIT, then exits 22. */
     mov $57, %eax
     syscall
     test %eax, %eax
-    js report_errno
+    js leader_errno
     jz child_b
     mov %eax, 0x18(%r12)
 
@@ -3211,11 +3212,12 @@ _start:
     mov $56, %eax
     syscall
     test %rax, %rax
-    js report_errno
+    js leader_errno
     jz worker_thread
     mov %eax, %r13d
 
     /* Leader calls blocking wait4(child_a_pid, &status_a, 0, NULL). */
+    xor %r14d, %r14d
     mov 0x10(%r12), %edi
     lea 0x20(%r12), %rsi
     xor %edx, %edx
@@ -3223,7 +3225,13 @@ _start:
     mov $61, %eax
     syscall
     test %rax, %rax
-    js report_errno
+    jns leader_wait_ok
+    neg %eax
+    add $100, %eax
+    mov %eax, %r14d
+    jmp join_loop
+
+leader_wait_ok:
     cmp 0x10(%r12), %eax
     jne fail_pid_a
     mov 0x20(%r12), %eax
@@ -3245,12 +3253,17 @@ join_loop:
     jmp join_loop
 
 joined:
-    cmpl $22, 0x30(%r12)
-    jne fail_worker_code
+    test %r14d, %r14d
+    jnz exit_leader_err
+    mov 0x30(%r12), %edi
+    cmp $22, %edi
+    jne die
     mov $7, %edi
-    mov $231, %eax
-    syscall
-    ud2
+    jmp die
+
+exit_leader_err:
+    mov %r14d, %edi
+    jmp die
 
 worker_thread:
     /* Worker calls blocking wait4(child_b_pid, &status_b, 0, NULL). */
@@ -3261,22 +3274,37 @@ worker_thread:
     mov $61, %eax
     syscall
     test %rax, %rax
-    js report_errno
+    js worker_errno
     cmp 0x18(%r12), %eax
-    jne fail_pid_b
+    jne worker_bad_pid
     mov 0x28(%r12), %eax
     cmp $(22 << 8), %eax
-    jne fail_status_b
+    jne worker_bad_status
     movl $22, 0x30(%r12)
+    jmp worker_exit
+
+worker_errno:
+    neg %eax
+    add $100, %eax
+    mov %eax, 0x30(%r12)
+    jmp worker_exit
+worker_bad_pid:
+    movl $96, 0x30(%r12)
+    jmp worker_exit
+worker_bad_status:
+    movl $97, 0x30(%r12)
+worker_exit:
     xor %edi, %edi
     mov $60, %eax
     syscall
     ud2
 
 child_a:
-    lea 0x50(%r12), %rdi
+    lea 0x38(%r12), %rdi
     xor %esi, %esi
-    mov $35, %eax
+    xor %edx, %edx
+    lea 0x50(%r12), %r10
+    mov $202, %eax
     syscall
     mov $11, %edi
     mov $231, %eax
@@ -3284,22 +3312,22 @@ child_a:
     ud2
 
 child_b:
-    lea 0x60(%r12), %rdi
+    lea 0x38(%r12), %rdi
     xor %esi, %esi
-    mov $35, %eax
+    xor %edx, %edx
+    lea 0x60(%r12), %r10
+    mov $202, %eax
     syscall
     mov $22, %edi
     mov $231, %eax
     syscall
     ud2
 
-report_errno:
+leader_errno:
     neg %eax
     add $100, %eax
     mov %eax, %edi
-    mov $231, %eax
-    syscall
-    ud2
+    jmp die
 
 fail_mmap:
     mov $91, %edi
@@ -3312,15 +3340,6 @@ fail_status_a:
     jmp die
 fail_join_timeout:
     mov $94, %edi
-    jmp die
-fail_worker_code:
-    mov $95, %edi
-    jmp die
-fail_pid_b:
-    mov $96, %edi
-    jmp die
-fail_status_b:
-    mov $97, %edi
 die:
     mov $231, %eax
     syscall
