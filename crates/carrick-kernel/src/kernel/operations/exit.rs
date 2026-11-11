@@ -261,6 +261,7 @@ pub struct PreparedTaskExit {
     >,
     pub(super) registry_zombie: Zombie,
     pub(super) result_zombie: Zombie,
+    identity: super::identity::TaskIdentity,
 }
 
 /// Signal-visible retirement has committed, while completion remains reserved.
@@ -302,6 +303,14 @@ impl PreparedTaskExit {
 
     pub const fn transaction(&self) -> KernelTransactionId {
         self.reservation.transaction
+    }
+
+    /// The exiting task's identity in the reserved snapshot that admitted
+    /// this exit. Retirement removes the task from the live graph, so an
+    /// exit record built after it (the ProcessExit lifecycle event, #2020)
+    /// takes its identity from here, never from a live-task lookup.
+    pub const fn identity(&self) -> super::identity::TaskIdentity {
+        self.identity
     }
 
     /// Who will consume the zombie this exit publishes.
@@ -842,6 +851,7 @@ impl Kernel {
             namespace_session,
         );
         let result_zombie = registry_zombie.clone();
+        let identity = super::identity::TaskIdentity::of(&task);
         let reservation =
             TaskSetReservation::acquired_exit(self, &mut state, &topology, transaction)?;
         drop(state);
@@ -855,6 +865,7 @@ impl Kernel {
             topology,
             registry_zombie,
             result_zombie,
+            identity,
         })
     }
 

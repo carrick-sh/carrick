@@ -63,6 +63,20 @@ pub struct ProcessIdentity {
     pub state: ProcessState,
 }
 
+impl TaskIdentity {
+    /// The identity tuple of `task` as it stands now. Callers read it under
+    /// the registry lock that proves the task is the one they mean.
+    pub(crate) fn of(task: &Task) -> Self {
+        Self {
+            task: task.key(),
+            parent: task.parent(),
+            mm: task.shared().mm().id(),
+            process_group: task.process_group(),
+            session: task.session(),
+        }
+    }
+}
+
 impl Kernel {
     pub fn task_identity(&self, task_id: TaskId) -> Result<TaskIdentity, KernelOperationError> {
         let state = self.registry().settled().read();
@@ -70,13 +84,7 @@ impl Kernel {
             .tasks
             .get(&task_id)
             .ok_or(KernelOperationError::UnknownTask(task_id))?;
-        Ok(TaskIdentity {
-            task: record.task.key(),
-            parent: record.task.parent(),
-            mm: record.task.shared().mm().id(),
-            process_group: record.task.process_group(),
-            session: record.task.session(),
-        })
+        Ok(TaskIdentity::of(&record.task))
     }
 
     /// Resolve one guest pid to the identity tuple every guest-visible "who is
