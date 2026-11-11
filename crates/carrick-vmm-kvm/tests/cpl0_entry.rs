@@ -1346,8 +1346,8 @@ fn production_anonymous_failed_replay_settlement_is_fatal_not_efault() {
 
     match try_run_instrumented_pool_fixture(&production_probe_elf(&code), 32) {
         Err(error) => assert!(
-            error.to_string().contains("CPL0 fatal exit"),
-            "settlement refusal must be a fatal invariant: {error}"
+            error.to_string().contains("production port 0xcc"),
+            "settlement refusal must ring the fatal doorbell (port 0xcc), not return an errno: {error}"
         ),
         Ok(outcome) => panic!(
             "guest survived a failed settlement with exit {} (14 = EFAULT)",
