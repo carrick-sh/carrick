@@ -1038,6 +1038,42 @@ mod tests {
         );
     }
 
+    /// Bytes a report line charges to `chain`.
+    fn chain_bytes(report: &[String], chain: &str) -> usize {
+        let prefix = format!("EL1 stack {chain}: ");
+        report
+            .iter()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|bytes| bytes.parse().ok())
+            .unwrap_or_else(|| panic!("missing chain {chain} in {report:?}"))
+    }
+
+    #[test]
+    fn an_outlined_fork_body_is_charged_to_every_fork_chain() {
+        // `fork_owned` wraps `fork_reserved` (#2095). Should the body ever be
+        // emitted as its own frame, both are live across every fork callee.
+        let chains = [
+            "native fork publication",
+            "native fork descriptors",
+            "native fd inheritance",
+            "native fd retirement",
+            "native fork context",
+            "native fork settlement",
+        ];
+        let mut frames = small_frames();
+        let inlined = frames.check(16384, 288).unwrap();
+        frames.0.insert("x::fork_reserved::h0".to_owned(), 700);
+        let outlined = frames.check(16384, 288).unwrap();
+        for chain in chains {
+            assert_eq!(
+                chain_bytes(&outlined, chain),
+                chain_bytes(&inlined, chain) + 700,
+                "{chain}"
+            );
+        }
+    }
+
     #[test]
     fn declined_fault_prefix_is_charged() {
         for prefix in [
