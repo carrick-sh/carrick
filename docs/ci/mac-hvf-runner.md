@@ -19,7 +19,7 @@ cloudmac (/Library/LaunchDaemons/sh.carrick.hvf-runner.plist, KeepAlive=true, Us
   /Volumes/carrick-hvf/runner/     root:wheel 0755 (--disableupdate; root-owned .env, run.sh, bin/, externals/)
   ACTIONS_RUNNER_HOOK_JOB_STARTED  /usr/local/libexec/carrick-ci/hvf-job-started.sh (root:wheel 0755)
     -> verifies root-owned /usr/local/bin/carrick-xtask and /etc/carrick-ci/policy ("standing")
-    -> runs `carrick-xtask ci-scaler admit-job` (push or owner workflow_dispatch on refs/heads/main)
+    -> runs `carrick-xtask ci-scaler admit-job` (push, schedule or owner workflow_dispatch on refs/heads/main)
     -> on any policy/path failure: `kill -KILL 0` (kills worker + listener; launchd KeepAlive respawns clean)
     -> reclaims stale $GITHUB_WORKSPACE/target
   step 0 (`Disk admission`)        60 GiB floor via `df -Pk "$RUNNER_WORKSPACE"` before checkout (::error::)
@@ -130,7 +130,7 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
      `carrick-sh/carrick/.github/workflows/kernel-runtime.yml@refs/heads/main`.
 
    GitHub blocks any other workflow or ref before job assignment; `hvf-job-started.sh` and
-   `Admission::Standing` (`push` or owner `workflow_dispatch` on `refs/heads/main`) enforce
+   `Admission::Standing` (`push`, `schedule` or owner `workflow_dispatch` on `refs/heads/main`) enforce
    the same invariant locally before steps run.
 
 5. **Root-owned runner tree with `--disableupdate` (#1232).**
@@ -277,16 +277,16 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
   `scripts/test-signed.sh`) applies `com.apple.security.hypervisor` without a Keychain
   certificate, and `hvf-kernel` verifies both `com.apple.security.hypervisor` and
   `__dof_carrick` on `target/release/carrick`.
-- **Newest-push coalescing:** `hvf-kernel` declares job-level
-  `concurrency: { group: hvf-kernel-${{ github.event_name }}, cancel-in-progress: false }`.
-  While one `hvf-kernel` job is running, GitHub keeps at most one pending `push` job (the
-  newest `main` push, superseding older queued pushes) without cancelling the running job
-  and without letting an owner `workflow_dispatch` cancel or replace a pending `push`.
+- **Nightly and dispatch only (#2057):** `hvf-kernel` runs on the `schedule` trigger
+  (`0 9 * * *`, 09:00 UTC) and on owner `workflow_dispatch`, never on `push`: it cost about
+  17 Mac-hours a day per-push. It declares job-level
+  `concurrency: { group: hvf-kernel-${{ github.event_name }}, cancel-in-progress: false }`, so a
+  dispatch queues beside a scheduled run instead of displacing it. Per-merge HVF attribution comes
+  from each merge group's own Signed queue gate.
 - **Host-lease serialization (`/tmp/carrick-host-lease.lock`):**
-  - `hvf-kernel` runs `Host-only source gate` (`just ci`: compilation and host tests) under the
-    **shared** `just lease carrick`, so it no longer blocks PR jobs (#2013). It acquires an
+  - `hvf-kernel` builds its checkout xtask under the **shared** `just lease carrick` and acquires an
     **exclusive** `just lease gate` across fixture restoration, `just accept --phase signed`, and
-    `Signed embedded guest tests`.
+    `Signed embedded guest tests`. It no longer runs `just ci` (hosted CI covers it, #2057).
   - Director gates (`just accept`, `just remote-accept` on `/Volumes/carrick-gate`) also
     acquire exclusive `gate` mode.
   - `ci.yml`'s `carrick-macos-ci` PR jobs (`macos-clippy`, `macos-build`, `macos-unit-a`,
@@ -340,14 +340,14 @@ Disk exhaustion fails up front with a clear GitHub annotation rather than mid-bu
      so free space drops below 60 GiB, dispatch `kernel-runtime.yml` on `main`, confirm step 0
      (`Disk admission`) fails immediately with `::error title=HVF disk admission failed::`,
      and remove the ballast.
-   - Dispatch or push on `main` and confirm `hvf-kernel` runs on `cloudmac-hvf`, uploads
-     `receipt-hvf-<sha>-<attempt>`, and prunes `target/` on completion.
+   - Dispatch (or wait for the 09:00 UTC schedule) on `main` and confirm `hvf-kernel` runs on `cloudmac-hvf`, uploads
+     `receipt-hvf-<sha>-<attempt>`, and prunes `target/` on completion. (A push to `main` must skip `hvf-kernel`.)
 3. **Retiring `mac-jit`:** keep `carrick-ci-mac-jit.service` (stopped, not deleted),
    `/Volumes/carrick-build/carrick-ci`, and `crates/carrick-xtask/src/ci_scaler/mac.rs`
    in place until **three consecutive `main` runs** complete green on `cloudmac-hvf`, where green
-   means both receipt gates (`HVF · receipt gate` and `KVM · receipt gate`) succeeded, with
-   `NEW=[]` against the receipted main ancestor. `hvf-kernel` and therefore `Trusted hardware OK`
-   stay red on main by design while main carries known EL1 failures, so neither is the test. The
+   means the `KVM · receipt gate` succeeded, with
+   `NEW=[]` against the receipted main ancestor (the `HVF · receipt gate` was retired in #2057).
+   `hvf-kernel` stays red by design while main carries known EL1 failures, so it is not the test. The
    cutover also needs #1238's probe check (the #1196/#1119 probes MATCH on the new runner). Only
    then disable `carrick-ci-mac-jit.service` (`sudo systemctl disable carrick-ci-mac-jit.service`)
    and retire the legacy tree, posting the post-cutover note on `#231`.
@@ -369,17 +369,22 @@ Disk exhaustion fails up front with a clear GitHub annotation rather than mid-bu
 
 ## Seeding baselines
 
-`kernel-runtime.yml` runs the HVF lane and selected KVM backend once per
-main push event on `push` to `main`, subject to queued-push coalescing. A
-single push can land several commits. Owner `workflow_dispatch` on `main` also
-runs both lanes to seed receipts. Neither pull requests, merge groups nor
-schedules run this workflow. The optional full-conformance `hvf-closure` job
+`kernel-runtime.yml` runs `signed-fixtures`, the KVM lane and the EL1-native lane
+once per `push` to `main` (a single push can land several commits). The cloudmac HVF
+lane (`hvf-kernel`) runs nightly (`schedule`, 09:00 UTC) and on owner `workflow_dispatch` on
+`main`, which also runs the KVM and EL1-native lanes to seed receipts (#2057). Neither pull
+requests nor merge groups run this workflow. The optional full-conformance `hvf-closure` job
 runs only on owner dispatch with its enable variable and dedicated runner.
 `ci.yml` retains its own PR, merge-group, schedule and dispatch
 triggers; only `ci-ok` is a merge requirement. The director owns pre-merge
 hardware evidence; the hardware run after landing is the backstop.
 
-On push, hosted `hvf-gate` and `kvm-gate` build the selector xtask from the
+There is no HVF receipt gate. The per-push `hvf-gate` compared each push's receipt with
+its receipted first-parent ancestor, which needs a receipt per push; nightly receipts are
+about 160 commits apart (the selector walks at most 50), and receipts from this host cannot serve as
+a gate base (#1884). The nightly publishes `receipt-hvf-<sha>-<attempt>` as a record.
+
+On push, hosted `kvm-gate` and `el1-native-gate` build the selector xtask from the
 trusted `github.event.before` commit, using its own checkout and lockfile.
 `ci-receipt select-baseline` rejects zero/malformed `before` values and any
 `before` outside the pushed SHA's first-parent ancestry (force pushes).
@@ -417,9 +422,11 @@ gh workflow run kernel-runtime.yml --repo carrick-sh/carrick --ref main
 
 After a gap, this supplies a baseline for subsequent pushes; it does not
 accumulate or retroactively turn an earlier No baseline outcome into a comparison.
-`Trusted hardware OK` requires both hardware lanes, and on push also both
-receipt comparisons. It remains visible after landing and does not gate
-merging.
+`Trusted hardware OK` has an exact expectation per event. On push,
+`signed-fixtures`, KVM, EL1-native and their two receipt comparisons must succeed and the HVF jobs must
+be skipped. On schedule, `signed-fixtures` and `hvf-kernel` must succeed and the rest be skipped. On dispatch,
+every lane must succeed (the closure only if enabled). Any other result, or an
+unknown event, fails. It remains visible after landing and does not gate merging.
 
 ### Retiring or renaming gated tests (`.github/retired-tests.toml`)
 
@@ -429,7 +436,7 @@ receipt lane, the candidate commit may include a PR-scoped
 `test = "<bin>::<test>"`, `reason`, `pr`, and optional
 `replaced_by = "<bin>::<test>"`. The binary and every test-path segment must
 match `[A-Za-z_][A-Za-z0-9_]*`; receipt matches always include the binary.
-Hosted `hvf-gate` and `kvm-gate` build the comparison xtask from the
+Hosted `kvm-gate` and `el1-native-gate` build the comparison xtask from the
 selected receipted ancestor; `ci-receipt gate` fetches `--candidate-sha` from `origin`
 and inspects the candidate tree's `.github/retired-tests.toml` alongside the
 parent main commit's tree. A declaration drops `missing:` only when the

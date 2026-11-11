@@ -431,10 +431,11 @@ fn bound_hook_admits_only_the_vetted_run_attempt_and_sha() {
 }
 
 #[test]
-fn standing_job_start_admits_push_and_dispatch_on_main_only() {
+fn standing_job_start_admits_push_schedule_and_dispatch_on_main_only() {
     let queue = "refs/heads/gh-readonly-queue/main/pr-42-0123456789abcdef0123456789abcdef01234567";
     for (event, git_ref) in [
         ("push", "refs/heads/main"),
+        ("schedule", "refs/heads/main"),
         ("workflow_dispatch", "refs/heads/main"),
     ] {
         assert!(
@@ -451,7 +452,7 @@ fn standing_job_start_admits_push_and_dispatch_on_main_only() {
         ("pull_request", "refs/heads/main"),
         ("pull_request_target", "refs/heads/main"),
         ("workflow_run", "refs/heads/main"),
-        ("schedule", "refs/heads/main"),
+        ("schedule", "refs/heads/work/feature"),
         ("push", "refs/heads/work/feature"),
         ("workflow_dispatch", "refs/heads/work/feature"),
         ("push", "refs/heads/main@evil"),
@@ -506,13 +507,17 @@ fn standing_run(event: &str, branch: &str) -> serde_json::Value {
 
 #[test]
 fn standing_demand_serves_only_trusted_kernel_runtime_runs() {
-    for (event, branch) in [("push", "main"), ("workflow_dispatch", "main")] {
+    for (event, branch) in [
+        ("push", "main"),
+        ("schedule", "main"),
+        ("workflow_dispatch", "main"),
+    ] {
         assert!(Admission::Standing.identifies_run(&standing_run(event, branch)));
     }
     for (event, branch) in [
         ("pull_request", "main"),
         ("pull_request", "work/x"),
-        ("schedule", "main"),
+        ("schedule", "work/x"),
         (
             "merge_group",
             "gh-readonly-queue/main/pr-7-0123456789abcdef",
@@ -729,7 +734,7 @@ fn trusted_hardware_decision(jobs: &yaml_rust2::Yaml) -> &yaml_rust2::Yaml {
         .find(|s| {
             s["name"]
                 .as_str()
-                .is_some_and(|n| n.starts_with("Require both trusted-hardware lanes"))
+                .is_some_and(|n| n.starts_with("Require the lanes this event runs"))
         })
         .expect("trusted-hardware-ok decision step")
 }
@@ -779,11 +784,11 @@ fn self_hosted_jobs_never_run_on_pull_request_events() {
     for event in on.keys() {
         let event = event.as_str().unwrap();
         assert!(
-            ["push", "workflow_dispatch"].contains(&event),
+            ["push", "schedule", "workflow_dispatch"].contains(&event),
             "kernel-runtime.yml must not trigger on {event}"
         );
     }
-    assert_eq!(on.len(), 2);
+    assert_eq!(on.len(), 3);
     assert!(!kernel.contains("merge_group"));
     assert!(!kernel.contains("check-merge-group"));
     assert_eq!(docs[0]["on"]["push"]["branches"][0].as_str(), Some("main"));
@@ -802,9 +807,10 @@ fn one_always_job_requires_both_trusted_hardware_lanes() {
         .map(|n| n.as_str().unwrap())
         .collect();
     for job in [
+        "signed-fixtures",
         "hvf-kernel",
+        "hvf-closure",
         "kvm-tests-willow",
-        "hvf-gate",
         "kvm-gate",
         "el1-native-tests",
         "el1-native-gate",
@@ -814,12 +820,18 @@ fn one_always_job_requires_both_trusted_hardware_lanes() {
     let script = trusted_hardware_decision(&docs[0]["jobs"])["run"]
         .as_str()
         .unwrap();
-    assert!(script.contains("test \"$HVF\" = success"));
-    assert!(script.contains("test \"$KVM\" = success"));
-    assert!(script.contains("test \"$HVF_GATE\" = success"));
-    assert!(script.contains("test \"$KVM_GATE\" = success"));
-    assert!(script.contains("test \"$EL1N\" = success"));
-    assert!(script.contains("test \"$EL1N_GATE\" = success"));
+    assert!(!needs.contains(&"hvf-gate"), "hvf-gate was retired (#2057)");
+    for expectation in [
+        "require signed-fixtures \"$FIXTURES\" success",
+        "require hvf-kernel \"$HVF\" skipped",
+        "require hvf-kernel \"$HVF\" success",
+        "require kvm-tests-willow \"$KVM\" success",
+        "require kvm-gate \"$KVM_GATE\" success",
+        "require el1-native-tests \"$EL1N\" success",
+        "require el1-native-gate \"$EL1N_GATE\" success",
+    ] {
+        assert!(script.contains(expectation), "{expectation}");
+    }
     // No step interpolates the merge-group base SHA into a shell script.
     for job in docs[0]["jobs"].as_hash().unwrap().values() {
         for step in job["steps"].as_vec().into_iter().flatten() {
@@ -877,7 +889,6 @@ fn hardware_lanes_never_wait_and_hosted_gates_grade_with_receipted_baseline_code
         );
     }
     for (gate, lane, name) in [
-        ("hvf-gate", "hvf-kernel", "receipt-hvf-"),
         ("kvm-gate", "kvm-tests-willow", "receipt-kvm-"),
         ("el1-native-gate", "el1-native-tests", "receipt-el1-native-"),
     ] {
@@ -1030,147 +1041,85 @@ fn template_sets_and_verifies_disk_boot_order_after_attaching_the_disk() {
 }
 
 #[test]
-fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
+fn trusted_hardware_aggregate_has_an_exact_expectation_per_event() {
     let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
     let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
     let script = trusted_hardware_decision(&docs[0]["jobs"])["run"]
         .as_str()
         .unwrap();
-    for (event, hvf, kvm, hvf_gate, kvm_gate, superseded, expected) in [
-        (
-            "push", "success", "success", "success", "success", false, true,
-        ),
-        (
-            "push", "success", "success", "failure", "success", false, false,
-        ),
-        (
-            "push", "success", "success", "success", "failure", false, false,
-        ),
-        (
-            "push", "success", "success", "skipped", "skipped", false, false,
-        ),
-        (
-            "push", "skipped", "success", "success", "success", false, false,
-        ),
-        (
-            "push",
-            "success",
-            "cancelled",
-            "success",
-            "success",
-            false,
-            false,
-        ),
-        (
-            "workflow_dispatch",
-            "success",
-            "success",
-            "skipped",
-            "skipped",
-            false,
-            true,
-        ),
-        (
-            "workflow_dispatch",
-            "failure",
-            "success",
-            "skipped",
-            "skipped",
-            false,
-            false,
-        ),
-        // A coalesced HVF job with a newer push run: superseded, not red.
-        (
-            "push",
-            "cancelled",
-            "success",
-            "skipped",
-            "success",
-            true,
-            true,
-        ),
-        // Superseded never excuses a failed KVM lane or gate.
-        (
-            "push",
-            "cancelled",
-            "success",
-            "skipped",
-            "failure",
-            true,
-            false,
-        ),
-        (
-            "push",
-            "cancelled",
-            "failure",
-            "skipped",
-            "success",
-            true,
-            false,
-        ),
-        // A cancel with no newer push run (manual, or newest) stays red.
-        (
-            "push",
-            "cancelled",
-            "success",
-            "skipped",
-            "success",
-            false,
-            false,
-        ),
-        (
-            "push",
-            "cancelled",
-            "success",
-            "cancelled",
-            "success",
-            false,
-            false,
-        ),
-    ] {
+    // Results in the order: fixtures, hvf, hvf-closure, kvm, kvm-gate,
+    // el1-native, el1-native-gate.
+    const PUSH: [&str; 7] = [
+        "success", "skipped", "skipped", "success", "success", "success", "success",
+    ];
+    const SCHEDULE: [&str; 7] = [
+        "success", "success", "skipped", "skipped", "skipped", "skipped", "skipped",
+    ];
+    const DISPATCH: [&str; 7] = [
+        "success", "success", "skipped", "success", "skipped", "success", "skipped",
+    ];
+    let with = |base: [&'static str; 7], index: usize, value: &'static str| {
+        let mut results = base;
+        results[index] = value;
+        results
+    };
+    let mut cases: Vec<(&str, [&str; 7], bool)> = vec![
+        ("push", PUSH, true),
+        ("schedule", SCHEDULE, true),
+        ("workflow_dispatch", DISPATCH, true),
+        // A dispatch may run the dormant closure and must then see it pass.
+        ("workflow_dispatch", with(DISPATCH, 2, "success"), true),
+        ("workflow_dispatch", with(DISPATCH, 2, "failure"), false),
+        // Unknown events never pass.
+        ("pull_request", PUSH, false),
+        ("merge_group", SCHEDULE, false),
+    ];
+    // On push, the HVF jobs are skipped by design and anything else is
+    // unexpected; a skip never masks a red or missing fixtures/KVM/EL1 lane.
+    for hvf in ["success", "failure", "cancelled"] {
+        cases.push(("push", with(PUSH, 1, hvf), false));
+        cases.push(("push", with(PUSH, 2, hvf), false));
+    }
+    for index in [0, 3, 4, 5, 6] {
+        for result in ["failure", "cancelled", "skipped"] {
+            cases.push(("push", with(PUSH, index, result), false));
+        }
+    }
+    // The nightly needs the HVF lane, and fixtures to have published.
+    for result in ["failure", "cancelled", "skipped"] {
+        cases.push(("schedule", with(SCHEDULE, 1, result), false));
+    }
+    for result in ["failure", "cancelled", "skipped"] {
+        cases.push(("schedule", with(SCHEDULE, 0, result), false));
+    }
+    // KVM and EL1-native lanes do not run nightly; if they did, that is not
+    // the expected state.
+    for index in [3, 4, 5, 6] {
+        cases.push(("schedule", with(SCHEDULE, index, "success"), false));
+    }
+    // An owner dispatch needs every lane green and no push-only gates.
+    for index in [0, 1, 3, 5] {
+        for result in ["failure", "cancelled", "skipped"] {
+            cases.push(("workflow_dispatch", with(DISPATCH, index, result), false));
+        }
+    }
+    for (event, r, expected) in cases {
         let output = std::process::Command::new("bash")
             .args(["-e", "-c", script])
             .env("EVENT", event)
-            .env("HVF", hvf)
-            .env("KVM", kvm)
-            .env("HVF_GATE", hvf_gate)
-            .env("KVM_GATE", kvm_gate)
-            // The el1-native lane and its gate follow the KVM pair here;
-            // their own red cases follow the table.
-            .env("EL1N", "success")
-            .env("EL1N_GATE", kvm_gate)
-            .env("SUPERSEDED", if superseded { "true" } else { "false" })
-            .env("KVM_BACKEND", "willow")
+            .env("FIXTURES", r[0])
+            .env("HVF", r[1])
+            .env("HVF_CLOSURE", r[2])
+            .env("KVM", r[3])
+            .env("KVM_GATE", r[4])
+            .env("EL1N", r[5])
+            .env("EL1N_GATE", r[6])
             .output()
             .unwrap();
         assert_eq!(
             output.status.success(),
             expected,
-            "{event}: hvf={hvf} kvm={kvm} hvf-gate={hvf_gate} kvm-gate={kvm_gate} superseded={superseded}"
-        );
-    }
-    // A red el1-native lane, or a red el1-native gate on push, is red.
-    for (event, el1n, el1n_gate, gate) in [
-        ("push", "failure", "skipped", "success"),
-        ("workflow_dispatch", "failure", "skipped", "skipped"),
-        ("push", "success", "failure", "success"),
-    ] {
-        let output = std::process::Command::new("bash")
-            .args(["-e", "-c", script])
-            .env("EVENT", event)
-            .env("HVF", "success")
-            .env("KVM", "success")
-            .env("HVF_GATE", gate)
-            .env("KVM_GATE", gate)
-            .env("EL1N", el1n)
-            .env("EL1N_GATE", el1n_gate)
-            .env("SUPERSEDED", "false")
-            .env("KVM_BACKEND", "willow")
-            .output()
-            .unwrap();
-        assert!(
-            !output.status.success(),
-            "{event}: el1-native={el1n} el1-native-gate={el1n_gate}"
+            "{event}: fixtures/hvf/closure/kvm/kvm-gate/el1n/el1n-gate = {r:?}"
         );
     }
 }
@@ -1535,16 +1484,21 @@ fn cloudmac_hvf_workflow_enforces_disk_admission_before_checkout_and_signed_gate
         hvf["concurrency"]["cancel-in-progress"].as_bool(),
         Some(false)
     );
-    // A coalesced hvf-kernel ends `cancelled` in a run that is not cancelled:
-    // the receipt gate must not run without a candidate receipt, and the
-    // aggregate must tell a superseded lane from a manual cancel.
-    let gate_if = workflow["jobs"]["hvf-gate"]["if"].as_str().unwrap();
-    assert!(gate_if.contains("needs.hvf-kernel.result != 'cancelled'"));
-    let detect = workflow["jobs"]["trusted-hardware-ok"]["steps"][0]["run"]
-        .as_str()
-        .unwrap();
-    assert!(detect.contains("select(.run_number > $RUN_NUMBER)"));
-    assert!(detect.contains("[ \"$HVF\" = cancelled ]"));
+    // The HVF lane runs only nightly and on owner dispatch, never on push.
+    let hvf_if = hvf["if"].as_str().unwrap();
+    assert!(
+        hvf_if.contains("github.event_name == 'schedule'"),
+        "{hvf_if}"
+    );
+    assert!(
+        hvf_if.contains("github.event_name == 'workflow_dispatch'"),
+        "{hvf_if}"
+    );
+    assert!(!hvf_if.contains("'push'"), "{hvf_if}");
+    assert!(workflow["jobs"]["hvf-gate"].is_badvalue());
+    let triggers = &workflow["on"];
+    assert!(!triggers["schedule"].is_badvalue());
+    assert_eq!(triggers["schedule"][0]["cron"].as_str(), Some("0 9 * * *"));
 
     let steps = hvf["steps"].as_vec().unwrap();
     let position = |pred: &dyn Fn(&yaml_rust2::Yaml) -> bool| steps.iter().position(pred).unwrap();
@@ -1656,38 +1610,37 @@ fn cloudmac_hvf_workflow_enforces_disk_admission_before_checkout_and_signed_gate
     );
     assert!(bad_out.contains("::error"), "{bad_out}");
 
-    // Pre-signed-acceptance 35 GiB check runs after pruning host-gate artifacts
-    // (even when `Host-only source gate` fails, provided pre-gate setup passed)
-    // and gates `Signed acceptance receipt`.
-    let setup_idx = position(&|s| s["id"].as_str() == Some("host-gate-setup"));
-    let host_gate_idx = position(&|s| s["name"].as_str() == Some("Host-only source gate"));
-    let prune_idx =
-        position(&|s| s["name"].as_str() == Some("Prune host-only gate build artifacts"));
+    // The 35 GiB check gates `Signed acceptance receipt`. The old `just ci`
+    // host gate (and its setup, cache and prune steps) is gone (#2057).
+    for retired in [
+        "Host-only source gate",
+        "Prune host-only gate build artifacts",
+        "Install Semgrep",
+        "Restore cargo registry",
+        "Save cargo registry",
+    ] {
+        assert!(
+            !steps.iter().any(|s| s["name"].as_str() == Some(retired)),
+            "{retired} must not return"
+        );
+    }
+    assert!(
+        !steps
+            .iter()
+            .any(|s| s["run"].as_str().is_some_and(|r| r.contains("just ci"))),
+        "hvf-kernel must not run `just ci`"
+    );
     let signed_disk_idx = position(&|s| {
         s["run"]
             .as_str()
             .is_some_and(|r| r.trim() == "CARRICK_DISK_FLOOR_GIB=35 just check-disk")
     });
     let signed_receipt_idx = position(&|s| s["name"].as_str() == Some("Signed acceptance receipt"));
-    assert!(setup_idx < host_gate_idx);
-    assert!(host_gate_idx < prune_idx);
-    assert!(prune_idx < signed_disk_idx);
     assert!(signed_disk_idx < signed_receipt_idx);
 
     let signed_disk = &steps[signed_disk_idx];
     assert_eq!(signed_disk["id"].as_str(), Some("signed-disk"));
-    let signed_disk_if = signed_disk["if"].as_str().unwrap();
-    assert!(signed_disk_if.contains("!cancelled()"), "{signed_disk_if}");
-    assert!(
-        signed_disk_if.contains("steps.host-gate-setup.outcome == 'success'"),
-        "{signed_disk_if}"
-    );
-
-    let prune_if = steps[prune_idx]["if"].as_str().unwrap();
-    assert!(
-        prune_if.contains("steps.host-gate-setup.outcome == 'success'"),
-        "{prune_if}"
-    );
+    assert!(signed_disk["if"].is_badvalue());
 
     let signed_receipt_if = steps[signed_receipt_idx]["if"].as_str().unwrap();
     assert!(

@@ -701,8 +701,9 @@ pub enum Admission {
     /// The historical one-job pilot: `willow-pilot.yml`, dispatched from
     /// `work/willow-pilot` at one approved SHA.
     Pilot { sha: String },
-    /// `kernel-runtime.yml` on this repository for a push to main
-    /// or an owner workflow_dispatch on main. Never pull_request.
+    /// `kernel-runtime.yml` on this repository for a push to main, the
+    /// nightly schedule on main, or an owner workflow_dispatch on main.
+    /// Never pull_request.
     Standing,
 }
 pub(crate) fn full_sha(sha: &str) -> bool {
@@ -785,7 +786,7 @@ impl Admission {
 }
 fn standing_event_ref(event: &str, branch: &str) -> bool {
     match event {
-        "push" | "workflow_dispatch" => branch == "main",
+        "push" | "schedule" | "workflow_dispatch" => branch == "main",
         _ => false,
     }
 }

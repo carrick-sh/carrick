@@ -1,14 +1,21 @@
 name: Kernel runtime · trusted hardware
 
-# Self-hosted jobs here run once per landed commit on push to main, or
-# on an owner-triggered dispatch on main. There is no
-# pull_request trigger: the persistent HVF runner (`carrick-hvf`), the
-# standing KVM controller (`carrick-xtask ci-scaler standing`), and each
-# runner's job-start hook admit only these events for this workflow file
+# Per landed commit (push to main): the exact-SHA signed fixture bundle
+# (`signed-fixtures`, which every merge group's `base-fixtures` job downloads),
+# the KVM and EL1-native lanes and their receipt gates. The cloudmac HVF lane
+# (`hvf-kernel`, `hvf-closure`) is too expensive for every push, so it runs
+# nightly (`schedule`, 09:00 UTC) and on an owner-triggered dispatch on main
+# (owner decision, #2057); per-merge HVF attribution comes from each merge
+# group's own Signed queue gate. There is no pull_request trigger: the
+# persistent HVF runner (`carrick-hvf`), the standing KVM controller
+# (`carrick-xtask ci-scaler standing`), and each runner's job-start hook admit
+# only push, schedule (on main) and owner dispatch for this workflow file
 # (docs/ci/mac-hvf-runner.md, docs/ci/willow-pilot.md).
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: '0 9 * * *'
   workflow_dispatch:
 
 permissions:
@@ -105,13 +112,17 @@ jobs:
   # `carrick-hvf` runner on its dedicated internal APFS volume; see
   # docs/ci/mac-hvf-runner.md). This is deliberately separate from public
   # pull-request CI: hosted macOS Arm64 does not support the nested
-  # virtualization HVPatch requires. Job-level concurrency (`cancel-in-progress:
-  # false`, keyed by `github.event_name`) keeps a running job intact while
-  # GitHub coalesces queued `push` jobs to the newest main push without
-  # letting an owner `workflow_dispatch` displace a pending `push`.
+  # virtualization HVPatch requires. It runs only on the nightly `schedule`
+  # and on an owner `workflow_dispatch` on main, never on `push` (#2057).
+  # Job-level concurrency (`cancel-in-progress: false`, keyed by
+  # `github.event_name`) keeps a running job intact and lets a dispatch queue
+  # beside, not displace, a scheduled run.
   hvf-kernel:
     name: HVF · signed embed + cached probes
-    if: ${{ !cancelled() && needs.signed-fixtures.result == 'success' }}
+    if: >-
+      ${{ !cancelled() && needs.signed-fixtures.result == 'success' &&
+          ((github.event_name == 'schedule' && github.ref == 'refs/heads/main') ||
+           (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
     needs: [signed-fixtures]
     runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
     concurrency:
@@ -229,32 +240,10 @@ jobs:
           BUNDLE_SHA256: ${{ needs.signed-fixtures.outputs.bundle-sha256 }}
         run: scripts/ci/download-fixture-bundle.sh verify
 
-      - name: Install just and cargo-deny
+      - name: Install just
         uses: ./.github/actions/install-tools
         with:
-          tools: just,cargo-deny
-
-      # CARGO_HOME is runner-private and may persist across runs on the
-      # persistent runner, but nothing below relies on that. Restore verifies fixture
-      # input identity offline, so populate the cache from every fixture
-      # lockfile first; this is the job's only network step for fixtures.
-      # rust-cache above saves only when the whole job succeeds, so keep the
-      # downloaded registry in its own cache, saved after the host-only gate
-      # whatever its verdict. A warm cache makes both network-free (#899).
-      - name: Locate cargo home
-        id: cargo-home
-        run: echo "dir=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_OUTPUT"
-
-      - name: Restore cargo registry
-        id: registry
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ${{ steps.cargo-home.outputs.dir }}/registry/index
-            ${{ steps.cargo-home.outputs.dir }}/registry/cache
-            ${{ steps.cargo-home.outputs.dir }}/git/db
-          key: hvf-cargo-registry-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: hvf-cargo-registry-v2-
+          tools: just
 
       - name: Build checkout xtask under shared lease
         run: |
@@ -264,62 +253,11 @@ jobs:
       - name: Fetch fixture lockfile dependencies
         run: just xtask fixtures fetch
 
-      # Run the host-only source gate before the signed release steps and
-      # prune its build tree immediately afterward.
-      # `just ci` populates ~28.27 GiB (`target/debug` ~24.82 GiB,
-      # `target/host-authority-census` ~2.28 GiB, `target/aarch64-unknown-linux-gnu`
-      # ~0.55 GiB, `target/doc` ~0.55 GiB, `target/host-authority-escape-syntax`
-      # ~0.06 GiB) and `Signed acceptance receipt` populates ~27.86 GiB in
-      # `target/release` (including ~21.08 GiB of `.dSYM` bundles needed for
-      # crash post-mortem and `carrick-lldb`). Reordering and pruning keeps peak
-      # `target/` at ~31.34 GiB instead of ~55.63 GiB without trimming debuginfo.
-      - name: Install Semgrep
-        id: host-gate-setup
-        # A venv, never the system interpreter (PEP 668 refuses a system-wide pip
-        # install on cloudmac's Homebrew Python).
-        run: just ci-install-semgrep
-
-      # `just ci` is compilation and host tests, not timing-sensitive signed
-      # execution, so it takes the shared `carrick` lease, not exclusive `gate`.
-      # Under `gate` its ~49 min blocked every macOS PR CI job on this Mac:
-      # 14 of 14 slow jobs on 2026-11-09 spent 18-47 min in `host-lease:
-      # waiting` (owner decision on #231, 2026-11-10). The signed steps below
-      # keep `gate`. CARRICK_DISK_GUARD=0 because `check-disk` takes `gate`
-      # itself, and a gate nested under a shared lease is refused; the
-      # "Disk admission" step above has already applied this job's 60 GiB floor.
-      - name: Host-only source gate
-        run: RUST_TEST_THREADS=1 CARRICK_DISK_GUARD=0 just lease carrick just ci
-
-      # Save after the gate too: `just ci` downloads the workspace's own
-      # crates, which the fixture fetch alone does not. `!cancelled()` plus
-      # `host-gate-setup` keeps the save independent of the gate's verdict
-      # (red on main) without running if pre-checkout disk admission failed.
-      - name: Save cargo registry
-        if: ${{ !cancelled() && steps.host-gate-setup.outcome == 'success' && steps.registry.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ${{ steps.cargo-home.outputs.dir }}/registry/index
-            ${{ steps.cargo-home.outputs.dir }}/registry/cache
-            ${{ steps.cargo-home.outputs.dir }}/git/db
-          key: hvf-cargo-registry-v2-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Prune host-only gate build artifacts
-        # Must run even when `Host-only source gate` fails (`!cancelled()`), so
-        # `Signed acceptance receipt` below starts with a clean worktree and can
-        # still publish main's per-SHA baseline receipt without hitting the disk floor.
-        if: ${{ !cancelled() && steps.host-gate-setup.outcome == 'success' }}
-        run: |
-          rm -rf \
-            target/debug \
-            target/doc \
-            target/aarch64-unknown-linux-gnu \
-            target/host-authority-census \
-            target/host-authority-escape-syntax
-
+      # `Signed acceptance receipt` populates ~27.86 GiB in `target/release`
+      # (including ~21.08 GiB of `.dSYM` bundles needed for crash post-mortem
+      # and `carrick-lldb`); do not trim debuginfo to fit.
       - name: Check disk headroom before signed acceptance
         id: signed-disk
-        if: ${{ !cancelled() && steps.host-gate-setup.outcome == 'success' }}
         run: CARRICK_DISK_FLOOR_GIB=35 just check-disk
 
       # The landing gate's signed phase (`xtask accept`): build + artifact
@@ -327,11 +265,11 @@ jobs:
       # with scoped cleanup per step. Its receipt is the lane's per-SHA
       # record; a FAIL receipt is still a receipt. Main is not green under
       # the strict signed gate, so this lane gates on NEW failures against
-      # the base SHA's receipt (hosted hvf-gate job), not on the absolute verdict.
+      # the base SHA's receipt, not on the absolute verdict. This lane no
+      # longer has a hosted receipt gate (#2057): nightly receipts are ~160
+      # commits apart, past the baseline selector's 50-commit walk.
       # `if: ${{ !cancelled() && steps.signed-disk.outcome == 'success' }}` ensures
-      # a red `Host-only source gate` on a main push still produces and uploads the
-      # per-SHA baseline receipt for `hvf-gate` (while the job itself still ends red),
-      # whereas a failed 60 GiB or 35 GiB disk check stops before the ~28 GiB build.
+      # a failed 60 GiB or 35 GiB disk check stops before the ~28 GiB build.
       - name: Signed acceptance receipt
         id: signed-receipt
         if: ${{ !cancelled() && steps.signed-disk.outcome == 'success' }}
@@ -490,7 +428,8 @@ jobs:
   # A real KVM device is the contract. An incidental or software-emulated
   # hosted environment is not accepted as this lane. Every `kvm`-lane test
   # target runs (`just test-kvm`, derived from Cargo metadata) on a real
-  # /dev/kvm, on push to main or owner dispatch, on Willow JIT clones
+  # /dev/kvm, on push to main or owner dispatch (not the nightly schedule,
+  # which would only rerun an already-tested SHA), on Willow JIT clones
   # (`ci-scaler standing`, docs/ci/willow-pilot.md, docs/ci/contabo-kvm.md).
   # Its labels are `ci_scaler::LABELS`; a test keeps them identical.
   # Pull requests and merge groups are not run here; only main pushes and
@@ -499,7 +438,7 @@ jobs:
     name: KVM · x86 kvm-lane tests (Willow)
     if: >-
       ${{ !cancelled() &&
-          vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
+          vars.CARRICK_SELF_HOSTED_KVM == 'true' && github.event_name != 'schedule' &&
           (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
     runs-on: [self-hosted, Linux, X64, willow-kvm]
     timeout-minutes: 90
@@ -577,7 +516,7 @@ jobs:
   el1-native-tests:
     name: EL1 · native-process tests (Linux ARM64)
     if: >-
-      ${{ !cancelled() &&
+      ${{ !cancelled() && github.event_name != 'schedule' &&
           (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
@@ -627,127 +566,12 @@ jobs:
           path: target/el1-gate/
           if-no-files-found: ignore
 
-  # The selector is built from trusted event.before, then the comparison is
-  # built from the selected receipted ancestor in its own clean checkout.
-  # Reuse the selector build when before itself supplies the baseline.
-  # Owner dispatch seeds receipts without requiring any baseline.
-  hvf-gate:
-    name: HVF · receipt gate vs receipted main ancestor
-    permissions:
-      contents: read
-      actions: read
-    needs: [hvf-kernel]
-    # A coalesced (superseded) hvf-kernel ends `cancelled` while the run
-    # itself is not, so `!cancelled()` alone would run this gate with no
-    # candidate receipt. The newer push's run gates that range instead.
-    if: ${{ !cancelled() && github.event_name == 'push' && needs.hvf-kernel.result != 'skipped' && needs.hvf-kernel.result != 'cancelled' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 110
-    steps:
-      - name: Reject an invalid push before checkout
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
-        run: |
-          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ || "$BEFORE_SHA" =~ ^0{40}$ ]]; then
-            echo "::error title=Invalid push history::Missing, zero or malformed event.before; refusing to execute repository code"
-            printf '## Invalid push history\n\nMissing, zero or malformed event.before; no comparison was made.\n' >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-      - name: Check out the trusted pre-push commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.before }}
-          path: selector
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: gate-xtask-release
-          workspaces: selector -> target
-          cache-workspace-crates: "true"
-          save-if: false
-      - name: Prepare locked Cargo cache (infrastructure)
-        # Trusted-tree checkouts (selector/baseline) may predate the
-        # prepare-cargo action (#1571), so their root-only preparation is
-        # inline: one bounded locked fetch, exit 75 as infrastructure.
-        working-directory: selector
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! timeout 600 bash -c 'cargo fetch --locked --offline || CARGO_NET_OFFLINE=false CARGO_NET_RETRY=0 CARGO_HTTP_TIMEOUT=30 cargo fetch --locked'; then
-            echo '::error title=Infrastructure::Cargo cache preparation failed; tests did not run'
-            exit 75
-          fi
-          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
-      - name: Build the trusted selector (owner seeding required at rollout)
-        working-directory: selector
-        run: |
-          cargo build --locked --offline --release -p carrick-xtask
-          target/release/carrick-xtask ci-receipt --help > "$RUNNER_TEMP/receipt-help"
-          if ! grep -q select-baseline "$RUNNER_TEMP/receipt-help"; then
-            echo "::error title=Baseline selector unavailable::The trusted pre-push commit predates the selector. Seed current main with an owner dispatch; subsequent pushes can compare."
-            printf '## Baseline selector unavailable\n\nTrusted event.before predates select-baseline. Seed current main with an owner dispatch for subsequent pushes. No comparison was made.\n' >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-      - name: Select the nearest trusted receipt baseline
-        id: baseline
-        working-directory: selector
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BEFORE_SHA: ${{ github.event.before }}
-        run: >-
-          target/release/carrick-xtask ci-receipt select-baseline --lane hvf
-          --before-sha "$BEFORE_SHA" --candidate-sha "$GITHUB_SHA"
-          --wait-minutes 90 --poll-seconds 60
-      - name: Check out the selected baseline cleanly
-        if: ${{ steps.baseline.outputs.reuse != 'true' }}
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.baseline.outputs.sha }}
-          path: baseline
-          clean: true
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        if: ${{ steps.baseline.outputs.reuse != 'true' }}
-        with:
-          shared-key: gate-xtask-release
-          workspaces: baseline -> target
-          cache-workspace-crates: "true"
-          save-if: false
-      - name: Prepare locked Cargo cache (infrastructure)
-        if: ${{ steps.baseline.outputs.reuse != 'true' }}
-        # Trusted-tree checkouts (selector/baseline) may predate the
-        # prepare-cargo action (#1571), so their root-only preparation is
-        # inline: one bounded locked fetch, exit 75 as infrastructure.
-        working-directory: baseline
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! timeout 600 bash -c 'cargo fetch --locked --offline || CARGO_NET_OFFLINE=false CARGO_NET_RETRY=0 CARGO_HTTP_TIMEOUT=30 cargo fetch --locked'; then
-            echo '::error title=Infrastructure::Cargo cache preparation failed; tests did not run'
-            exit 75
-          fi
-          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
-      - name: Build the selected baseline xtask with its own lockfile
-        if: ${{ steps.baseline.outputs.reuse != 'true' }}
-        working-directory: baseline
-        run: cargo build --locked --offline --release -p carrick-xtask
-      - name: Download candidate receipt data
-        uses: actions/download-artifact@v4
-        with:
-          pattern: receipt-hvf-${{ github.sha }}-*
-          path: ${{ runner.temp }}/candidate
-      - name: Compare using the selected baseline's code
-        working-directory: ${{ steps.baseline.outputs.reuse == 'true' && 'selector' || 'baseline' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ steps.baseline.outputs.sha }}
-        run: >-
-          target/release/carrick-xtask ci-receipt gate --lane hvf
-          --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
-          --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
-          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 0
-
+  # There is no `hvf-gate` receipt gate (#2057). It compared each push's HVF
+  # receipt with the receipted first-parent ancestor, which only works while
+  # every push produces a receipt. The nightly lane's receipts are ~160 main
+  # commits apart, beyond the baseline selector's 50-commit walk, and receipts
+  # from this host cannot serve as a queue gate base (#1884). Per-merge HVF
+  # attribution is the merge group's own Signed queue gate.
   kvm-gate:
     name: KVM · receipt gate vs receipted main ancestor
     permissions:
@@ -995,68 +819,77 @@ jobs:
       - name: Build the trusted xtask
         run: cargo build --locked --offline --release -p carrick-xtask
 
-  # Post-landing aggregate (not a merge requirement). Skipped or cancelled
-  # lanes fail visibly; pushes also require both ancestor receipt comparisons.
+  # Post-landing aggregate (not a merge requirement). Each event has an exact
+  # expectation per job; anything else, including an unexpected skip, fails
+  # visibly. The HVF jobs are skipped by design on push, and only there may a
+  # skip stand in for success: KVM, EL1-native and fixtures are still required.
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
-    needs: [signed-fixtures, hvf-kernel, kvm-tests-willow, hvf-gate, kvm-gate, el1-native-tests, el1-native-gate]
+    needs: [signed-fixtures, hvf-kernel, hvf-closure, kvm-tests-willow, kvm-gate, el1-native-tests, el1-native-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
       actions: read
     steps:
-      # Job-level concurrency on hvf-kernel coalesces queued push jobs to the
-      # newest main push; the dropped job ends `cancelled`. Only a push whose
-      # HVF job was cancelled while a newer kernel-runtime push run exists is
-      # superseded. Any other cancel (a manual one, or on the newest run) stays
-      # red.
-      - name: Detect a superseded HVF lane
-        id: superseded
+      - name: Require the lanes this event runs (and skip the rest)
         env:
-          GH_TOKEN: ${{ github.token }}
+          FIXTURES: ${{ needs.signed-fixtures.result }}
           HVF: ${{ needs.hvf-kernel.result }}
-          EVENT: ${{ github.event_name }}
-          REPO: ${{ github.repository }}
-          RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          superseded=false
-          if [ "$EVENT" = push ] && [ "$HVF" = cancelled ]; then
-            newer=$(gh api "repos/$REPO/actions/workflows/kernel-runtime.yml/runs?branch=main&event=push&per_page=20" \
-              --jq "[.workflow_runs[] | select(.run_number > $RUN_NUMBER)] | length")
-            if [ "${newer:-0}" -gt 0 ]; then
-              superseded=true
-              echo "::notice::HVF lane superseded by a newer main push; that run's receipt gate covers this commit."
-            fi
-          fi
-          echo "superseded=$superseded" >> "$GITHUB_OUTPUT"
-      - name: Require both trusted-hardware lanes (and their gates on push)
-        env:
-          SUPERSEDED: ${{ steps.superseded.outputs.superseded }}
-          HVF: ${{ needs.hvf-kernel.result }}
+          HVF_CLOSURE: ${{ needs.hvf-closure.result }}
           KVM: ${{ needs.kvm-tests-willow.result }}
-          HVF_GATE: ${{ needs.hvf-gate.result }}
           KVM_GATE: ${{ needs.kvm-gate.result }}
           EL1N: ${{ needs.el1-native-tests.result }}
           EL1N_GATE: ${{ needs.el1-native-gate.result }}
           EVENT: ${{ github.event_name }}
         run: |
-          echo "hvf-kernel=$HVF kvm=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE el1-native=$EL1N el1-native-gate=$EL1N_GATE superseded=$SUPERSEDED"
-          test "$KVM" = success
-          test "$EL1N" = success
-          if [ "$SUPERSEDED" = true ]; then
-            # The newer push's run carries the HVF lane and its gate.
-            test "$EVENT" = push
-            test "$HVF" = cancelled
-            test "$HVF_GATE" = skipped
-            test "$KVM_GATE" = success
-            test "$EL1N_GATE" = success
-            exit 0
-          fi
-          test "$HVF" = success
-          if [ "$EVENT" = push ]; then
-            test "$HVF_GATE" = success
-            test "$KVM_GATE" = success
-            test "$EL1N_GATE" = success
-          fi
+          echo "event=$EVENT signed-fixtures=$FIXTURES hvf-kernel=$HVF hvf-closure=$HVF_CLOSURE kvm=$KVM kvm-gate=$KVM_GATE el1-native=$EL1N el1-native-gate=$EL1N_GATE"
+          require() { # name actual expected
+            if [ "$2" != "$3" ]; then
+              echo "::error title=Trusted hardware::$1 is '$2', expected '$3' on $EVENT"
+              failed=1
+            fi
+          }
+          failed=0
+          require signed-fixtures "$FIXTURES" success
+          case "$EVENT" in
+            push)
+              # Every push: fixtures, KVM and EL1-native with their gates.
+              # The HVF lane is nightly/dispatch only, so it must be skipped,
+              # not failed, cancelled or (unexpectedly) run.
+              require kvm-tests-willow "$KVM" success
+              require kvm-gate "$KVM_GATE" success
+              require el1-native-tests "$EL1N" success
+              require el1-native-gate "$EL1N_GATE" success
+              require hvf-kernel "$HVF" skipped
+              require hvf-closure "$HVF_CLOSURE" skipped
+              ;;
+            schedule)
+              # Nightly: the HVF lane only. KVM and EL1-native were already
+              # exercised on this SHA by its push.
+              require hvf-kernel "$HVF" success
+              require hvf-closure "$HVF_CLOSURE" skipped
+              require kvm-tests-willow "$KVM" skipped
+              require kvm-gate "$KVM_GATE" skipped
+              require el1-native-tests "$EL1N" skipped
+              require el1-native-gate "$EL1N_GATE" skipped
+              ;;
+            workflow_dispatch)
+              # Owner dispatch: every lane, no push-only receipt gates. The
+              # closure is dormant unless its host variable enables it.
+              require hvf-kernel "$HVF" success
+              if [ "$HVF_CLOSURE" != success ]; then
+                require hvf-closure "$HVF_CLOSURE" skipped
+              fi
+              require kvm-tests-willow "$KVM" success
+              require kvm-gate "$KVM_GATE" skipped
+              require el1-native-tests "$EL1N" success
+              require el1-native-gate "$EL1N_GATE" skipped
+              ;;
+            *)
+              echo "::error title=Trusted hardware::unknown event '$EVENT'"
+              failed=1
+              ;;
+          esac
+          exit "$failed"

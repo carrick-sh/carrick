@@ -504,6 +504,8 @@ mod tests {
         };
         for (event, branch, admitted) in [
             ("push", "main", true),
+            ("schedule", "main", true),
+            ("schedule", "work/x", false),
             ("workflow_dispatch", "main", true),
             ("merge_group", "gh-readonly-queue/main/pr-1-abc", false),
             ("pull_request", "main", false),

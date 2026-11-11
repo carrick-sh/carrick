@@ -156,7 +156,7 @@ reaping needs no sudo target a job could write.
 
 Post-landing receipt comparison: a selector built from trusted event.before
 validates first-parent history and finds the nearest receipted ancestor
-within 50 commits. Hosted `hvf-gate` and `kvm-gate` then build that selected
+within 50 commits. Hosted `kvm-gate` and `el1-native-gate` then build that selected
 baseline's xtask in a clean checkout with its own lockfile to grade candidate
 receipt data. If before supplies the receipt, the build is reused. Candidate
 Rust never grades itself. The summary and notice list the baseline and any
