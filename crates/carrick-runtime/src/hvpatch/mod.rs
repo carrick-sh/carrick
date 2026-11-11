@@ -564,6 +564,29 @@ impl ProcessContext {
             );
             return None;
         };
+        self.lifecycle_event_for(identity, phase, tid, detail)
+    }
+
+    /// Build a lifecycle event for an identity the caller already holds
+    /// exactly (a live lookup, or the snapshot an exit reserved).
+    fn lifecycle_event_for(
+        &self,
+        identity: carrick_kernel::kernel::TaskIdentity,
+        phase: carrick_observability::probes::HvpatchGuestLifecyclePhase,
+        tid: crate::thread::ThreadId,
+        detail: i64,
+    ) -> Option<(
+        carrick_observability::probes::HvpatchGuestLifecycle,
+        carrick_kernel::kernel::MmBinding,
+    )> {
+        if identity.task != self.task_key() {
+            tracing::error!(
+                pid = self.pid(),
+                ?phase,
+                "hvpatch lifecycle identity names another task"
+            );
+            return None;
+        }
         let Some(binding) = self.mm_binding() else {
             tracing::error!(pid = self.pid(), "hvpatch task has no mm backend");
             return None;
@@ -958,17 +981,23 @@ impl ProcessContext {
             .map_err(|error| error.to_string())
     }
 
+    /// `identity` is the exiting task's identity from the exit reservation
+    /// ([`carrick_kernel::kernel::PreparedTaskExit::identity`]): by the time
+    /// the terminal owner records the exit, retirement has already removed
+    /// the task from the live graph (#2020).
     pub(crate) fn record_process_exit_begin(
         &self,
         exit_code: i32,
         tid: crate::thread::ThreadId,
+        identity: carrick_kernel::kernel::TaskIdentity,
     ) -> Option<carrick_observability::probes::HvpatchGuestLifecycle> {
         carrick_kernel::event_ring::rec_hvpatch_process_exit_begin(
             self.pid(),
             tid.raw(),
             exit_code,
         );
-        self.prepare_lifecycle_event(
+        self.lifecycle_event_for(
+            identity,
             carrick_observability::probes::HvpatchGuestLifecyclePhase::ProcessExit,
             tid,
             i64::from(exit_code),
@@ -1720,7 +1749,11 @@ mod tests {
     }
 
     fn finalize_test_child(process: &ProcessContext, exit_code: i32, tid: crate::thread::ThreadId) {
-        let event = process.record_process_exit_begin(exit_code, tid);
+        let identity = process
+            .kernel_graph()
+            .task_identity(process.task_id())
+            .unwrap();
+        let event = process.record_process_exit_begin(exit_code, tid, identity);
         let _ = process
             .kernel_graph()
             .exit_task_key_eventually_notifying(
