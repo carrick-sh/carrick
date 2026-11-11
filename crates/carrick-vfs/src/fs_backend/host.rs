@@ -741,15 +741,30 @@ fn rename_scratch_to_trash(path: &Path) -> Option<PathBuf> {
 /// removes at most [`SCRATCH_SYNC_CLEANUP_LIMIT`] entries from the oldest
 /// retired tree, preserving that tree's age until it is fully gone.
 pub(crate) fn cleanup_oldest_trash_checkpoint(scratch_root: &Path) -> usize {
+    cleanup_oldest_trash_with_limit(scratch_root, SCRATCH_SYNC_CLEANUP_LIMIT).removed
+}
+
+/// What one [`cleanup_oldest_trash_with_limit`] pass did.
+struct TrashPass {
+    removed: usize,
+    /// A retired tree existed, whether or not the budget finished it.
+    found: bool,
+}
+
+fn cleanup_oldest_trash_with_limit(scratch_root: &Path, limit: usize) -> TrashPass {
+    let none = TrashPass {
+        removed: 0,
+        found: false,
+    };
     let dedicated = scratch_root.join(SCRATCH_TRASH_DIRECTORY);
     let search_root = if dedicated.is_dir() {
         dedicated.as_path()
     } else {
         scratch_root
     };
-    let mut budget = CleanupBudget::new(SCRATCH_SYNC_CLEANUP_LIMIT);
+    let mut budget = CleanupBudget::new(limit);
     let Some(Ok(entries)) = budget.attempt(|| std::fs::read_dir(search_root)) else {
-        return 0;
+        return none;
     };
     let mut oldest: Option<(PathBuf, (std::time::SystemTime, std::ffi::OsString))> = None;
     for entry in entries {
@@ -780,7 +795,7 @@ pub(crate) fn cleanup_oldest_trash_checkpoint(scratch_root: &Path) -> usize {
         }
     }
     let Some((oldest, (original_modified, _))) = oldest else {
-        return 0;
+        return none;
     };
     cleanup_tree_entries_with_budget(&oldest, search_root, &mut budget);
     if let Some(Ok(directory)) = budget.attempt(|| std::fs::File::open(&oldest)) {
@@ -788,11 +803,11 @@ pub(crate) fn cleanup_oldest_trash_checkpoint(scratch_root: &Path) -> usize {
             directory.set_times(std::fs::FileTimes::new().set_modified(original_modified))
         });
     }
-    debug_assert_eq!(
-        budget.attempts + budget.remaining,
-        SCRATCH_SYNC_CLEANUP_LIMIT
-    );
-    budget.removed
+    debug_assert_eq!(budget.attempts + budget.remaining, limit);
+    TrashPass {
+        removed: budget.removed,
+        found: true,
+    }
 }
 
 #[cfg(test)]
@@ -944,6 +959,10 @@ enum ScratchCleanupWork {
         path: PathBuf,
         completion: std::sync::mpsc::SyncSender<ScratchCleanupCompletion>,
     },
+    /// Reply once every item queued before this one has finished.
+    Flush {
+        reply: std::sync::mpsc::SyncSender<()>,
+    },
     Discover {
         root: PathBuf,
         #[cfg(test)]
@@ -1063,6 +1082,7 @@ fn scratch_cleanup_sender() -> &'static ScratchWorker {
                         } => {
                             for retired in discover_orphans_after_root_lock(
                                 &root,
+                                Some(STARTUP_DISCOVERY_LIMIT),
                                 #[cfg(test)]
                                 observer.as_ref(),
                             ) {
@@ -1072,6 +1092,9 @@ fn scratch_cleanup_sender() -> &'static ScratchWorker {
                             if let Some(observer) = observer {
                                 observer.cleanup_complete.wait();
                             }
+                        }
+                        ScratchCleanupWork::Flush { reply } => {
+                            let _ = reply.try_send(());
                         }
                         ScratchCleanupWork::ClassifyVolume { query, reply } => {
                             // Capacity-1 reply owned by this item: never
@@ -1194,6 +1217,7 @@ pub(crate) fn enqueue_orphan_discovery_observed(root: PathBuf, observer: Scratch
 
 fn discover_orphans_after_root_lock(
     scratch_root: &Path,
+    limit: Option<usize>,
     #[cfg(test)] observer: Option<&ScratchDiscoveryObserver>,
 ) -> Vec<PathBuf> {
     let root_lock_path = scratch_root.join(".carrick.sweep.lock");
@@ -1214,7 +1238,52 @@ fn discover_orphans_after_root_lock(
     let Ok(_root_guard) = root_lock.write() else {
         return Vec::new();
     };
-    discover_orphans(scratch_root, Some(STARTUP_DISCOVERY_LIMIT))
+    discover_orphans(scratch_root, limit)
+}
+
+/// Finish this run's scratch reclamation before the process exits, so a
+/// `--rm` (or any) run leaves no scratch behind and trash from earlier
+/// failed or interrupted runs does not accumulate. The deferred-removal
+/// worker has no shutdown join (exit latency is deliberate while the guest
+/// runs), so a short-lived process otherwise abandons its queue and each run
+/// leaks its whole image tree. Call once, after the guest has exited and its
+/// output is flushed.
+pub fn finish_scratch_cleanup() {
+    let (reply, done) = std::sync::mpsc::sync_channel(1);
+    if let Some(sender) = scratch_cleanup_sender().sender.as_ref()
+        && sender.send(ScratchCleanupWork::Flush { reply }).is_ok()
+    {
+        let _ = done.recv();
+    }
+    if let Ok(root) = default_scratch_root() {
+        reclaim_scratch_root(&root);
+    }
+}
+
+/// Retire every orphaned scratch tree under `scratch_root` and remove all
+/// retired trees, however many entries they hold.
+fn reclaim_scratch_root(scratch_root: &Path) {
+    // The returned names are already in the trash; the loop below owns them.
+    let _ = discover_orphans_after_root_lock(
+        scratch_root,
+        None,
+        #[cfg(test)]
+        None,
+    );
+    // A tree that cannot make progress is quarantined by the pass itself, so
+    // this ends; the cap only guards a quarantine that also fails.
+    let mut idle_passes = 0;
+    while idle_passes < 3 {
+        let pass = cleanup_oldest_trash_with_limit(scratch_root, usize::MAX);
+        if !pass.found {
+            break;
+        }
+        idle_passes = if pass.removed == 0 {
+            idle_passes + 1
+        } else {
+            0
+        };
+    }
 }
 
 impl std::fmt::Debug for HostFsBackend {
