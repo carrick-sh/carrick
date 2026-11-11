@@ -227,12 +227,17 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         ) {
             carrick_el1::memory::DelegatedAnonymous::Served => {
                 // A parked edit's token outlives its wake; the replay owns it.
-                if carrick_core::wait::complete_anonymous_edit_replay(
-                    self.source.zone,
-                    slot,
-                    self.task.mm.key.load(Ordering::Acquire),
-                )
-                .is_err()
+                #[cfg(feature = "test-support")]
+                let refused = crate::test_support::take_replay_settlement_refusal();
+                #[cfg(not(feature = "test-support"))]
+                let refused = false;
+                if refused
+                    || carrick_core::wait::complete_anonymous_edit_replay(
+                        self.source.zone,
+                        slot,
+                        self.task.mm.key.load(Ordering::Acquire),
+                    )
+                    .is_err()
                 {
                     return DelegatedStep::Served(SyscallResult::from_errno(
                         carrick_syscall_abi::LINUX_EFAULT,

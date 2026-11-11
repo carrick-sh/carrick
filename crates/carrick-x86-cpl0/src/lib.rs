@@ -45,6 +45,10 @@ mod test_support {
     /// Read the injected-copy census: refusals in the high 32 bits, owned
     /// copies that completed after an owned refusal in the low 32 bits.
     pub const INJECT_OWNED_COPY_CENSUS: u64 = 0xffff_ffff_ffff_fe1c;
+    /// The next anonymous replay settlement reports the ownership refusal
+    /// (`Stale`) that `take_object_operation` raises, after the mapping edit
+    /// has already committed.
+    pub const INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe1d;
     pub const INJECT_PEER_IDLE_RELEASE_ONCE: u64 = 0xffff_ffff_ffff_fe18;
     // Test-only actor ordering: armed by CPU0's fixture syscall; CPU0
     // publishes Parked before requesting CPU1's scheduler to release it.
@@ -84,6 +88,13 @@ mod test_support {
 
     pub fn take_edit_park() -> bool {
         EDIT_PARK_PUBLISHED.swap(false, Ordering::AcqRel)
+    }
+
+    static REPLAY_SETTLEMENT_REFUSAL: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    pub fn take_replay_settlement_refusal() -> bool {
+        REPLAY_SETTLEMENT_REFUSAL.swap(false, Ordering::AcqRel)
     }
 
     static ANONYMOUS_WAIT_HANDBACKS: core::sync::atomic::AtomicU64 =
@@ -231,6 +242,9 @@ mod test_support {
             INJECT_OWNED_COPY_BUSY_ONCE => {
                 (!OWNED_COPY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
             }
+            INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE => (!REPLAY_SETTLEMENT_REFUSAL
+                .swap(true, Ordering::AcqRel))
+            .then_some(0),
             INJECT_OWNED_COPY_CENSUS => Some(
                 (OWNED_COPY_REFUSALS.load(Ordering::Acquire) << 32)
                     | (OWNED_COPY_RERUNS.load(Ordering::Acquire) & u64::from(u32::MAX)),

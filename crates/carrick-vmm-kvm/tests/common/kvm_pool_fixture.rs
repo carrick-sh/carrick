@@ -19,6 +19,17 @@ pub fn run_instrumented_pool_fixture(
     elf: &[u8],
     max_exits: usize,
 ) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    try_run_instrumented_pool_fixture(elf, max_exits).expect("instrumented shared pool fixture")
+}
+
+#[allow(dead_code)]
+pub fn try_run_instrumented_pool_fixture(
+    elf: &[u8],
+    max_exits: usize,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_runtime::prepare::PreparedKvmPoolFailure,
+> {
     let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
     try_run_program_with_dispatcher_image(
         &program,
@@ -28,7 +39,6 @@ pub fn run_instrumented_pool_fixture(
         carrick_kernel::dispatch::SyscallDispatcher::default(),
         Some(include_bytes!(env!("CARRICK_X86_CPL0_TEST_IMAGE"))),
     )
-    .expect("instrumented shared pool fixture")
 }
 
 pub fn run_pool_fixture_with(
