@@ -1424,10 +1424,14 @@ impl<'a> MemView<'a> {
             // mutation holds its gate, so no private file mapping of it may
             // initialize through UserWrite. Every description the retained
             // source reader serves (`snapshot_private_mmap_description`)
-            // takes source custody instead, POPULATE and LOCKED included:
-            // their residency and lock accounting are metadata (#1141).
+            // takes source custody instead. POPULATE and LOCKED keep the
+            // eager venue: lazy custody neither populates nor carries the
+            // host lock into the root (#1141).
             let owner_file_eligible = map_sharing == MmapSharing::Private
-                && !map_flags.intersects(LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::GROWSDOWN)
+                && !map_flags.intersects(
+                    LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::GROWSDOWN
+                        | LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED,
+                )
                 && this.mem().lock().delegated_root().is_some();
             // Inspect the description once for both venues. Retaining an owner
             // source does not introduce another file-description authority.
@@ -2448,8 +2452,9 @@ impl<'a> MemView<'a> {
                     // here is that guard's own gate, never foreign
                     // contention. Every description the retained source
                     // reader serves took source custody above; only the
-                    // residual eager shapes (device, packet-ring and alias
-                    // placements of an admitted MM) still reach this copy.
+                    // residual eager shapes (POPULATE and LOCKED, #1141;
+                    // device, packet-ring and alias placements, #2133) still
+                    // reach this copy.
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("file content could not be copied into the mapping"),
