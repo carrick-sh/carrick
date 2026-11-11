@@ -592,13 +592,20 @@ Now each owner candidate carries the custody it needs (`OwnerCustody`:
 home driven, live and able to run it, or driven on an allowed CPU), which
 `requeue_claimed` re-checks under the slot lock; a waiter no driven slot
 may run and the waker's CPU may not run goes to the host through the
-completion chain. As defense in depth, x86's two switch sites
-(`native_execution::schedule`, `NativeLane::switch_next`) use
-`ZoneTables::switch_in_admitted`, which never switches in a thread whose
-affinity excludes the CPU (narrowed while it was queued): it goes to the
-slot that owns it, with its kick. x86's WORK boundary does not settle the
-completion chain; every x86 CPU's slot is driven from boot, so an x86 waiter
-reaches it only if its affinity names no CPU with a slot.
+completion chain. Exclusion is read only from an affinity this venue can
+read (`excludes_cpu`); an unreadable bound source keeps the waiter on the
+waker for its executor. x86's WORK boundary does not settle the completion
+chain; every x86 CPU's slot is driven from boot, so an x86 waiter reaches it
+only if its affinity names no CPU with a slot.
+
+The review also suggested guarding x86's switch (`native_execution::schedule`,
+`NativeLane::switch_next`) against a thread whose affinity excludes the CPU.
+That guard cannot land yet: x86 KVM production publishes records with
+affinity CPU 0 (`cpl0_boot.rs`) and children inherit it, while the idle-peer
+lane runs them on CPU 1 by design. Enforcing the mask moved them back to
+CPU 0, and `loaded_lane_shutdown_kick_between_check_and_entry_is_sticky` and
+the four `zone_pipe_(p)poll_*` KVM tests hung; with only the guard reverted
+they pass. x86 affinity publication is follow-up work.
 
 Witnesses (red with only the production fix reverted, green after):
 
@@ -613,10 +620,10 @@ Witnesses (red with only the production fix reverted, green after):
 - ARM, `forked_child_futex_wake_hands_a_waiter_no_driven_vcpu_may_run_to_the_host`
   (through `dispatch_arm_syscall_with_native_process`, two live threads of a
   fork child): red `Queued { slot: SlotId(0) }`, the waker's slot.
-- x86, `native_futex_wake_of_a_waiter_no_driven_cpu_may_run_goes_to_the_host`
-  and the two-live-thread
-  `switch_never_runs_a_thread_whose_affinity_excludes_the_cpu` (red with
-  `switch_next` back on `switch_in_full`: the excluded thread ran on CPU 0).
+- x86, `native_futex_wake_of_a_waiter_no_driven_cpu_may_run_goes_to_the_host`.
+- `an_unreadable_affinity_excludes_no_cpu` (`carrick-sched-core`): a bound
+  source with no alias here keeps its waiter on the waker (red: handed to
+  the completion chain).
 
 The x86 KVM futex witness also exposed an x86 result defect, older than
 this change: the x86 native futex branch of the EL1 pending families
