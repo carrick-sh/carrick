@@ -12,6 +12,8 @@ use std::time::{Duration, UNIX_EPOCH};
 const CLOCK_GETTIME: u64 = 113;
 const CLOCK_GETRES: u64 = 114;
 const GETTIMEOFDAY: u64 = 169;
+/// The other stage keyed on `x8` alone before #2039 (`getrandom`).
+const GETRANDOM: u64 = 278;
 
 fn deterministic(secs: u64) -> Arc<ClockDomain> {
     Arc::new(ClockDomain::deterministic(
@@ -848,14 +850,15 @@ fn child_exit_operation(
 /// it does for the instructions after the call returns) publishes the owner
 /// fault, never a clock sample: a sample answered there writes into
 /// whatever `x1` holds, overwrites `x0`, and resumes the faulting
-/// instruction with the fault unsupplied.
+/// instruction with the fault unsupplied. The entropy stage, keyed on `x8`
+/// the same way, is held to the same rule.
 #[test]
 fn child_data_abort_with_clock_registers_publishes_its_fault() {
     use carrick_core_abi::service::ServiceOperation;
     const FAR: u64 = 0x5000_0010;
     // EC 0x24 (lower-EL data abort), IL, WnR, level-3 translation fault.
     let esr = (0x24 << 26) | (1 << 25) | (1 << 6) | 0x07;
-    for nr in [CLOCK_GETTIME, GETTIMEOFDAY] {
+    for nr in [CLOCK_GETTIME, GETTIMEOFDAY, GETRANDOM] {
         let operation = child_exit_operation(esr, FAR, nr, false);
         let ServiceOperation::Fault(fault) = operation else {
             panic!("a data abort with clock registers ({nr}) published {operation:?}");
@@ -871,7 +874,7 @@ fn child_data_abort_with_clock_registers_publishes_its_fault() {
 fn child_host_work_irq_with_clock_registers_publishes_carrier_work() {
     use carrick_core_abi::service::ServiceOperation;
     use carrick_sched_core::object_wait::OwnerEntry;
-    for nr in [CLOCK_GETTIME, GETTIMEOFDAY] {
+    for nr in [CLOCK_GETTIME, GETTIMEOFDAY, GETRANDOM] {
         let operation = child_exit_operation(0, 0, nr, true);
         assert!(
             matches!(

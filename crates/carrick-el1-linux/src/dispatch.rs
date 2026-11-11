@@ -1385,6 +1385,17 @@ pub(super) enum NativeServiceDecision {
     Begin(alloc::boxed::Box<NativeServiceBegin>),
 }
 
+/// The syscall number an owned native exit names, if it is one: only an SVC
+/// (ESR.EC 0x15) is. A data abort or an EL0 IRQ taken after a call returned
+/// still holds that call's number and arguments in `x8` and `x0`..; staging
+/// it from them would answer a syscall nobody made, overwrite `x0`, write
+/// through whatever `x1` holds and drop the fault or carrier work the exit
+/// carries (#2039).
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_svc_number(frame: &TrapFrame) -> Option<u64> {
+    ((frame.esr >> 26) & 0x3f == 0x15).then_some(frame.x[8])
+}
+
 /// Decide what an owned native exit publishes. `host_file` stages the
 /// host-file venue in the caller's ring namespace (None keeps the call's
 /// route); the bare-metal wrapper supplies the guest IPC venue and hardware
@@ -1405,6 +1416,7 @@ pub(super) fn native_service_decision(
 ) -> NativeServiceDecision {
     let child = || owner() == super::native_process_runtime::NativeThreadGroupOwner::ForkChild;
     let mut service_wait = wait;
+    let svc = native_svc_number(frame);
     let staged = match native_exec_stage(frame, task) {
         Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
         Some(NativeExecStage::Failed(errno)) => NativeServiceStage::Return(errno.guest_retval()),
@@ -1420,9 +1432,11 @@ pub(super) fn native_service_decision(
         // Planning is argument-only and matches the ring's own answer for
         // everything that needs no sample, so only a reading is staged here.
         None if child()
-            && let Some(call) = carrick_personality_linux::clock::ClockCall::from_canonical(
-                carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
-            )
+            && let Some(call) = svc.and_then(|nr| {
+                carrick_personality_linux::clock::ClockCall::from_canonical(
+                    carrick_syscall_abi::CanonicalNr::new(nr),
+                )
+            })
             && matches!(
                 carrick_personality_linux::clock::plan(call, [frame.x[0], frame.x[1]]),
                 carrick_personality_linux::clock::ClockPlan::Sample { .. }
@@ -1439,7 +1453,7 @@ pub(super) fn native_service_decision(
                 service_wait: None,
             }));
         }
-        None if frame.x[8] == 278 => {
+        None if svc == Some(278) => {
             let (address, capacity, flags, requested) = native_entropy_stage(frame);
             NativeServiceStage::Entropy {
                 address,
