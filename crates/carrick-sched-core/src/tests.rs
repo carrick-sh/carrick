@@ -5063,8 +5063,10 @@ fn a_left_first_candidate_falls_back_to_a_driven_peer() {
     );
 }
 
+type SlotLockObserver = Box<dyn Fn(SlotId)>;
+
 std::thread_local! {
-    static SLOT_LOCK_OBSERVER: std::cell::RefCell<Option<Box<dyn Fn(SlotId)>>> = const { std::cell::RefCell::new(None) };
+    static SLOT_LOCK_OBSERVER: std::cell::RefCell<Option<SlotLockObserver>> = const { std::cell::RefCell::new(None) };
     static SLOT_LOCK_PROBES: std::cell::RefCell<Option<Vec<SlotId>>> = const { std::cell::RefCell::new(None) };
 }
 
