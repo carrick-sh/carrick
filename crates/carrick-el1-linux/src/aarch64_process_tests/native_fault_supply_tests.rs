@@ -66,7 +66,7 @@ impl carrick_el1::fault::PreparedPageResolver for NoInheritedSupply<'_> {
     }
 }
 
-fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
+pub(super) fn leaf(words: &(impl LiveDescriptorWords + ?Sized), root: u64, va: u64) -> u64 {
     let mut table = root & AARCH64_ROOT_ADDRESS_MASK;
     for (level, index) in carrick_mmu_core::aarch64::indices(va)
         .into_iter()
@@ -155,6 +155,101 @@ impl carrick_el1::memory::AnonymousRetirementEditor for FixtureMapping<'_> {
         ));
         assert!(residency.commit());
         Ok(())
+    }
+}
+impl carrick_el1::memory::AnonymousDiscardEditor for FixtureMapping<'_> {
+    fn discard_and_scrub(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        steps: &[carrick_el1::memory::AnonymousDiscardStep],
+    ) -> Result<(), carrick_el1::memory::AnonymousDiscardError> {
+        carrick_el1::memory::discard_aarch64_anonymous_steps(
+            self.words,
+            carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
+            carrick_el1_abi::EL1_COW_COPY_BASE,
+            steps,
+            |alias_va, _| {
+                let to = leaf(self.words, root.raw(), alias_va);
+                assert_eq!(to & 3, 3);
+                assert_eq!(to & (3 << 6), 0);
+                assert_ne!(to & ((1 << 54) | (1 << 53)), 0);
+            },
+        )
+    }
+}
+pub(super) struct FixtureDiscardMapping<'a> {
+    pub(super) mapping: FixtureMapping<'a>,
+    pub(super) pages: &'a RefCell<BTreeMap<u64, Vec<u8>>>,
+    pub(super) scrubs: &'a Cell<usize>,
+}
+impl carrick_el1::memory::AnonymousBackingProbe for FixtureDiscardMapping<'_> {
+    fn bind_operation(&mut self, sequence: carrick_el1_abi::ReservationSequence) {
+        self.mapping.bind_operation(sequence);
+    }
+    fn backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> carrick_el1::memory::Stage1Backing {
+        self.mapping.backing(root, va, len)
+    }
+    fn stock_span(
+        &mut self,
+        mm: ReservationMm,
+        va: UserVa,
+    ) -> Option<carrick_guest_arch::UserRange> {
+        self.mapping.stock_span(mm, va)
+    }
+}
+impl carrick_el1::memory::AnonymousPermissionEditor for FixtureDiscardMapping<'_> {
+    fn bind_resident_edit(&mut self, generation: carrick_el1::memory::AnonymousEditGeneration) {
+        self.mapping.bind_resident_edit(generation);
+    }
+    fn protect_and_invalidate(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        self.mapping.protect_and_invalidate(root, edit)
+    }
+}
+impl carrick_el1::memory::AnonymousRetirementEditor for FixtureDiscardMapping<'_> {
+    fn bind_resident_edit(&mut self, generation: carrick_el1::memory::AnonymousEditGeneration) {
+        self.mapping.bind_resident_edit(generation);
+    }
+    fn retire_and_invalidate(
+        &mut self,
+        mm: ReservationMm,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        address: UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
+        self.mapping.retire_and_invalidate(mm, root, address, len)
+    }
+}
+impl carrick_el1::memory::AnonymousDiscardEditor for FixtureDiscardMapping<'_> {
+    fn discard_and_scrub(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        steps: &[carrick_el1::memory::AnonymousDiscardStep],
+    ) -> Result<(), carrick_el1::memory::AnonymousDiscardError> {
+        carrick_el1::memory::discard_aarch64_anonymous_steps(
+            self.mapping.words,
+            carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
+            carrick_el1_abi::EL1_COW_COPY_BASE,
+            steps,
+            |alias_va, _| {
+                let to = leaf(self.mapping.words, root.raw(), alias_va);
+                assert_eq!(to & 3, 3);
+                assert_eq!(to & (3 << 6), 0);
+                assert_ne!(to & ((1 << 54) | (1 << 53)), 0);
+                self.pages
+                    .borrow_mut()
+                    .insert(to & AARCH64_ROOT_ADDRESS_MASK, vec![0; 4096]);
+                self.scrubs.set(self.scrubs.get() + 1);
+            },
+        )
     }
 }
 

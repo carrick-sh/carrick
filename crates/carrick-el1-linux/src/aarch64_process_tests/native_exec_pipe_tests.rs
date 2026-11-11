@@ -17,9 +17,34 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
     fork_exec_successor(None);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscardScenario {
+    ZeroLength,
+    V8CodeRangeAndRootForward,
+}
+
 #[test]
 fn serial_host_native_fork_exec_madvise_dontneed_returns_zero() {
-    fork_exec_probe_with_scenario(None, u32::MAX as u64, false, None, None, true);
+    fork_exec_probe_with_scenario(
+        None,
+        u32::MAX as u64,
+        false,
+        None,
+        None,
+        Some(DiscardScenario::ZeroLength),
+    );
+}
+
+#[test]
+fn serial_host_native_fork_exec_v8_code_range_discard_and_root_forward() {
+    fork_exec_probe_with_scenario(
+        None,
+        u32::MAX as u64,
+        false,
+        None,
+        None,
+        Some(DiscardScenario::V8CodeRangeAndRootForward),
+    );
 }
 
 #[test]
@@ -332,7 +357,7 @@ fn fork_exec_probe_with_departure(
     metadata: Option<super::pipe_metadata_tests::Case>,
     departure: Option<TimerDeparture>,
 ) {
-    fork_exec_probe_with_scenario(futex, bitset, timed, metadata, departure, false);
+    fork_exec_probe_with_scenario(futex, bitset, timed, metadata, departure, None);
 }
 
 fn fork_exec_probe_with_scenario(
@@ -341,7 +366,7 @@ fn fork_exec_probe_with_scenario(
     timed: bool,
     metadata: Option<super::pipe_metadata_tests::Case>,
     departure: Option<TimerDeparture>,
-    discard: bool,
+    discard: Option<DiscardScenario>,
 ) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let metadata_scope = MetadataScope::new(fixture);
@@ -607,7 +632,28 @@ fn fork_exec_probe_with_scenario(
         child_binding.address.mm.raw().get()
     );
     let residency = carrick_el1::cow::test_support::residency_table();
-    if discard {
+    let successor_tables = crate::mm_portal::test_support::Tables::new(0xb00000, 0xc00000, 0);
+    {
+        let window = carrick_el1_abi::EL1_COW_COPY_BASE;
+        let win_indices = carrick_mmu_core::aarch64::indices(window);
+        let set = |address: u64, value| {
+            successor_tables.words[((address - 0xb00000) / 8) as usize]
+                .store(value, Ordering::Relaxed)
+        };
+        set(0xb01000 + win_indices[1] as u64 * 8, 0xb04000 | 3);
+        set(0xb04000 + win_indices[2] as u64 * 8, 0xb05000 | 3);
+        for page in 0..2 {
+            let alias = window + page * 4096;
+            set(
+                0xb05000 + carrick_mmu_core::aarch64::indices(alias)[3] as u64 * 8,
+                alias,
+            );
+        }
+    }
+    let successor_words = successor_tables.live(&fixture.maintenance);
+    let fault_pages = std::cell::RefCell::new(BTreeMap::new());
+    let scrubs = std::cell::Cell::new(0usize);
+    if discard.is_some() {
         let successor_raw = fixture.task.mm.key.load(Ordering::Acquire);
         let successor_mm = carrick_el1_abi::ReservationMm::new(successor_raw).unwrap();
         let successor_index = fixture.zone.spaces.find(successor_raw).unwrap();
@@ -619,7 +665,8 @@ fn fork_exec_probe_with_scenario(
                 successor_mm,
                 carrick_el1::memory::reservations::Layout {
                     heap: carrick_el1_abi::ReservationRange::new(0x1000, 0x10_0000).unwrap(),
-                    arena: carrick_el1_abi::ReservationRange::new(0x10_0000, 0x2000_0000).unwrap(),
+                    arena: carrick_el1_abi::ReservationRange::new(0x4000_0000, 0x6000_0000)
+                        .unwrap(),
                     brk: 0x1000,
                     address_limit: u64::MAX,
                     data_limit: u64::MAX,
@@ -681,6 +728,9 @@ fn fork_exec_probe_with_scenario(
         frame.x[1] = address;
         frame.x[2] = count;
         frame.x[3] = extra;
+        if nr == 222 {
+            frame.x[4] = u64::MAX;
+        }
         let selected = fixture.zone.slot(fixture.slot).current().unwrap();
         // SAFETY: fixture retains this selected live record.
         let binding = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
@@ -720,11 +770,13 @@ fn fork_exec_probe_with_scenario(
             )
             .unwrap_or_else(|error| panic!("native entry nr={nr}, fd={fd}: {error:?}"));
         let served_before = counters.served[nr as usize].load(Ordering::Relaxed);
+        let is_root_process = entry.is_root_process();
         struct DiscardAnonymousVenue<'a> {
             call: carrick_el1::memory::AnonymousCall,
             fixture: &'static Fixture,
             counters: &'a carrick_el1_abi::Counters,
-            editor: super::native_fault_supply_tests::FixtureMapping<'a>,
+            is_root_process: bool,
+            editor: super::native_fault_supply_tests::FixtureDiscardMapping<'a>,
         }
         impl carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
             for DiscardAnonymousVenue<'_>
@@ -740,15 +792,36 @@ fn fork_exec_probe_with_scenario(
                 use carrick_el1::memory::{AnonymousCallView, DelegatedAnonymous};
                 use carrick_personality_linux::abi::entry::SyscallResult;
                 use carrick_personality_linux::pending_anonymous::DelegatedStep;
-                match carrick_el1::memory::serve_delegated_mapping(
-                    &mut self.call,
-                    self.counters,
-                    &self.fixture.task,
-                    crate::sched::object_wait::space_access(self.fixture.zone, self.fixture.slot),
-                    self.fixture.region.table(),
-                    &mut self.editor,
-                    None,
+                let access =
+                    crate::sched::object_wait::space_access(self.fixture.zone, self.fixture.slot);
+                let outcome = if carrick_personality_linux::dispatch::AnonymousCall::from_canonical(
+                    carrick_syscall_abi::CanonicalNr::new(self.call.canonical().raw()),
+                ) == Some(
+                    carrick_personality_linux::dispatch::AnonymousCall::Madvise,
                 ) {
+                    if self.is_root_process {
+                        return DelegatedStep::NotDelegated;
+                    }
+                    carrick_el1::memory::serve_delegated_discard(
+                        &mut self.call,
+                        self.counters,
+                        &self.fixture.task,
+                        access,
+                        self.fixture.region.table(),
+                        &mut self.editor,
+                    )
+                } else {
+                    carrick_el1::memory::serve_delegated_mapping(
+                        &mut self.call,
+                        self.counters,
+                        &self.fixture.task,
+                        access,
+                        self.fixture.region.table(),
+                        &mut self.editor,
+                        None,
+                    )
+                };
+                match outcome {
                     DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
                     DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
                     DelegatedAnonymous::Served => {
@@ -774,19 +847,35 @@ fn fork_exec_probe_with_scenario(
             }
             fn install_result(&mut self, _: carrick_personality_linux::abi::entry::SyscallResult) {}
         }
-        let mut anon_venue = discard.then(|| DiscardAnonymousVenue {
+        let mut anon_venue = discard.is_some().then(|| DiscardAnonymousVenue {
             call: carrick_el1::memory::AnonymousCall::new(
                 carrick_core::CallOrdinal::from_raw(nr),
-                [fd, address, count, extra, 0, 0],
+                [
+                    fd,
+                    address,
+                    count,
+                    extra,
+                    if nr == 222 { u64::MAX } else { 0 },
+                    0,
+                ],
                 0,
                 fixture.slot,
                 UserVa::new(0x400004),
             ),
             fixture,
             counters: &counters,
-            editor: super::native_fault_supply_tests::FixtureMapping {
-                words: &words,
-                residency: &residency,
+            is_root_process,
+            editor: super::native_fault_supply_tests::FixtureDiscardMapping {
+                mapping: super::native_fault_supply_tests::FixtureMapping {
+                    words: if is_root_process {
+                        &words
+                    } else {
+                        &successor_words
+                    },
+                    residency: &residency,
+                },
+                pages: &fault_pages,
+                scrubs: &scrubs,
             },
         });
         let route = crate::dispatch::dispatch_syscall_with_native(
@@ -821,7 +910,7 @@ fn fork_exec_probe_with_scenario(
             |_| core::ptr::null_mut(),
         );
         drop(entry);
-        if discard {
+        if discard.is_some() {
             use carrick_personality_linux::dispatch::CompletionRoute;
             assert!(
                 runtime.task_binding(parent).is_some(),
@@ -832,6 +921,7 @@ fn fork_exec_probe_with_scenario(
                 "exec child remains alive"
             );
             if route == CompletionRoute::Forward {
+                let refused_before = counters.refused_child[nr as usize].load(Ordering::Relaxed);
                 let identity = fixture.zone.record(binding.record.id).identity();
                 // SAFETY: the admitted live record owns its lifecycle page.
                 let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
@@ -840,23 +930,43 @@ fn fork_exec_probe_with_scenario(
                     page,
                     fixture.task.visible_pid().unwrap(),
                 );
+                let exit = crate::dispatch::native_unstaged_exit(
+                    &mut frame,
+                    &fixture.task.linux,
+                    carrick_el1_abi::Action::Forward,
+                    || owner,
+                    &counters,
+                );
+                if is_root_process {
+                    assert_eq!(
+                        owner,
+                        crate::native_process_runtime::NativeThreadGroupOwner::Root
+                    );
+                    assert_eq!(
+                        exit,
+                        crate::dispatch::NativeUnstagedExit::Operation(
+                            carrick_core_abi::service::ServiceOperation::Crossing {
+                                ordinal: carrick_guest_arch::NativeOrdinal::new(nr),
+                            },
+                        )
+                    );
+                    assert_eq!(
+                        counters.refused_child[nr as usize].load(Ordering::Relaxed),
+                        refused_before
+                    );
+                    return 0xfeed_face;
+                }
                 assert_eq!(
                     owner,
                     crate::native_process_runtime::NativeThreadGroupOwner::ForkChild
                 );
                 assert_eq!(
-                    crate::dispatch::native_unstaged_exit(
-                        &mut frame,
-                        &fixture.task.linux,
-                        carrick_el1_abi::Action::Forward,
-                        || owner,
-                        &counters,
-                    ),
+                    exit,
                     crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
                 );
                 assert_eq!(
                     counters.refused_child[nr as usize].load(Ordering::Relaxed),
-                    1
+                    refused_before + 1
                 );
                 assert_eq!(
                     counters.venue_refused[nr as usize].load(Ordering::Relaxed),
@@ -911,24 +1021,163 @@ fn fork_exec_probe_with_scenario(
         );
         frame.x[0]
     };
-    if discard {
+    if let Some(scenario) = discard {
         // The fixture has delivered the exec service reply and its wake above.
         // Settle that setup boundary before issuing a fresh syscall, as the
         // carrier does. Otherwise WithWork retains argument 0 for replay;
         // that argument is not a syscall result.
-        let _ = fixture.task.linux.take_served_boundary();
-        if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
-            assert_eq!(work.native_terminal_slot(), None);
-            work.settled();
+        let settle = || {
+            let _ = fixture.task.linux.take_served_boundary();
+            if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+                assert_eq!(work.native_terminal_slot(), None);
+                work.settled();
+            }
+        };
+        settle();
+        match scenario {
+            DiscardScenario::ZeroLength => {
+                // Zero length isolates admission on the child's admitted successor MM.
+                // Linux accepts this aligned no-op.
+                let result = call_full(233, 0x400000, 0, 4, 0) as i64;
+                registry.unregister_root_for_test(&runtime);
+                assert_eq!(
+                    result, 0,
+                    "exec child madvise(0x400000, 0, MADV_DONTNEED=4)"
+                );
+            }
+            DiscardScenario::V8CodeRangeAndRootForward => {
+                use carrick_mmu_core::aarch64::descriptor_txn::{
+                    BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan,
+                    TableGrants, execute_descriptor_op,
+                };
+                use carrick_mmu_core::aarch64::{
+                    GuestLeafPublication, LeafAccess, SubstrateGpa, terminal_descriptor_permits_el0,
+                };
+                const BASE: u64 = 0x4000_0000;
+                // Reserve 4 pages PROT_NONE | MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE.
+                assert_eq!(call_full(222, BASE, 4 * 4096, 0, 0x4032), BASE);
+                settle();
+                // Trim suffix page so BASE + 3*4096 is an unmapped hole.
+                assert_eq!(call_full(215, BASE + 3 * 4096, 4096, 0, 0) as i64, 0);
+                settle();
+                // Promote first 2 pages to RWX, leaving third page PROT_NONE.
+                assert_eq!(call_full(226, BASE, 2 * 4096, 7, 0) as i64, 0);
+                settle();
+                let nz = |v| NonZeroU64::new(v).unwrap();
+                assert!(matches!(
+                    execute_descriptor_op(
+                        &successor_words,
+                        SubstrateGpa(0xb00000),
+                        DescriptorOp::Prepare {
+                            publication: GuestLeafPublication {
+                                va: BASE,
+                                ipa: 0xc00000,
+                                len: 4096,
+                                writable: true,
+                                executable: true,
+                            },
+                            resident: PageSpan::new(BASE, 4096),
+                            backing: BackingIdentity {
+                                frame_id: nz(1),
+                                mapping_id: nz(2),
+                                owner_generation: nz(3),
+                                inventory_revision: nz(4),
+                            },
+                        },
+                        &TableGrants::NONE,
+                        &mut InlineJournal::new(),
+                    ),
+                    DescriptorOutcome::Applied(_)
+                ));
+                fault_pages.borrow_mut().insert(0xc00000, vec![0x5a; 4096]);
+                assert_eq!(
+                    call_full(233, BASE, 2 * 4096, 4, 0) as i64,
+                    0,
+                    "V8 code-range MADV_DONTNEED over resident RWX + lazy page"
+                );
+                settle();
+                assert!(fault_pages.borrow()[&0xc00000].iter().all(|&b| b == 0));
+                assert_eq!(scrubs.get(), 1, "lazy second page stays unbacked");
+                let rwx_leaf =
+                    super::native_fault_supply_tests::leaf(&successor_words, 0xb00000, BASE);
+                assert_eq!(rwx_leaf & AARCH64_ROOT_ADDRESS_MASK, 0xc00000);
+                assert!(terminal_descriptor_permits_el0(rwx_leaf, LeafAccess::Write));
+                assert!(terminal_descriptor_permits_el0(
+                    rwx_leaf,
+                    LeafAccess::Execute
+                ));
+                assert_eq!(
+                    super::native_fault_supply_tests::leaf(&successor_words, 0xb00000, BASE + 4096),
+                    0
+                );
+
+                // Spanning into the trimmed hole scrubs the covered prefix then returns -ENOMEM.
+                fault_pages.borrow_mut().insert(0xc00000, vec![0xa5; 4096]);
+                assert_eq!(call_full(233, BASE, 4 * 4096, 4, 0) as i64, -12);
+                settle();
+                assert!(fault_pages.borrow()[&0xc00000].iter().all(|&b| b == 0));
+                assert_eq!(scrubs.get(), 2);
+
+                // Read-only PROT_READ MADV_DONTNEED (4) still scrubs via the COW write alias.
+                assert_eq!(call_full(226, BASE, 4096, 1, 0) as i64, 0);
+                settle();
+                fault_pages.borrow_mut().insert(0xc00000, vec![0x77; 4096]);
+                assert_eq!(call_full(233, BASE, 4096, 4, 0) as i64, 0);
+                settle();
+                assert!(fault_pages.borrow()[&0xc00000].iter().all(|&b| b == 0));
+                assert_eq!(scrubs.get(), 3);
+                assert_eq!(call_full(226, BASE, 4096, 7, 0) as i64, 0);
+                settle();
+
+                // MADV_FREE (8) and MADV_WILLNEED (3) return 0 without eager scrubbing.
+                fault_pages.borrow_mut().insert(0xc00000, vec![0x33; 4096]);
+                assert_eq!(call_full(233, BASE, 4096, 8, 0) as i64, 0);
+                settle();
+                assert_eq!(call_full(233, BASE, 4096, 3, 0) as i64, 0);
+                settle();
+                assert_eq!(fault_pages.borrow()[&0xc00000][0], 0x33);
+                assert_eq!(scrubs.get(), 3);
+
+                // Unaligned start and unsupported advice (999, MADV_COLD=20) return -EINVAL (-22).
+                assert_eq!(call_full(233, BASE + 1, 4096, 4, 0) as i64, -22);
+                settle();
+                assert_eq!(call_full(233, BASE, 4096, 999, 0) as i64, -22);
+                settle();
+                assert_eq!(call_full(233, BASE, 4096, 20, 0) as i64, -22);
+                settle();
+
+                // Host-attribute advice (MADV_DONTDUMP=16) declines to child counted -ENOSYS (-38).
+                assert_eq!(call_full(233, BASE, 4096, 16, 0) as i64, -38);
+                settle();
+
+                // Shared COW leaf at BASE + 4096 declines to counted -ENOSYS without scrubbing.
+                successor_tables.words[1536 + 1].store(
+                    0xc01000 | (1 << 55) | (2 << 6) | (1 << 10) | (1 << 11) | 3,
+                    Ordering::Relaxed,
+                );
+                fault_pages.borrow_mut().insert(0xc01000, vec![0x99; 4096]);
+                assert_eq!(call_full(233, BASE + 4096, 4096, 4, 0) as i64, -38);
+                settle();
+                assert_eq!(fault_pages.borrow()[&0xc01000][0], 0x99);
+
+                // Switch to the live ARM root process: madvise forwards to the host VMA venue.
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(fixture.slot, child_binding.record.id)
+                        .is_queued()
+                );
+                activate_target(source, &fixture.task, &parent_binding);
+                settle();
+                let forwarded_before = counters.forwarded[233].load(Ordering::Relaxed);
+                assert_eq!(call_full(233, BASE, 4096, 4, 0), 0xfeed_face);
+                assert_eq!(
+                    counters.forwarded[233].load(Ordering::Relaxed),
+                    forwarded_before + 1
+                );
+                registry.unregister_root_for_test(&runtime);
+            }
         }
-        // Zero length isolates admission on the child's admitted successor MM.
-        // Linux accepts this aligned no-op.
-        let result = call_full(233, 0x400000, 0, 4, 0) as i64;
-        registry.unregister_root_for_test(&runtime);
-        assert_eq!(
-            result, 0,
-            "exec child madvise(0x400000, 0, MADV_DONTNEED=4)"
-        );
         return;
     }
     if let Some(case) = metadata {

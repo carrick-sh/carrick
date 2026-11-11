@@ -85,3 +85,43 @@ Observed red: after settling the completed exec setup boundary,
 (ENOSYS), expected `0`, for `(address=0x400000, length=0, advice=4)`.
 The production dispatcher forwards; final capture refuses it once as a child
 call, with zero carrier-venue refusals.
+
+## Resolution: native anonymous discard across ARM EL1 and x86 CPL0
+
+After Slice A (`madvise::plan`, `#1858`) and Slice C (`coordinate_anonymous_edit_wait`, `#1863`),
+Slices B and D complete native ring `madvise` handling across both ISAs:
+
+1. **Exclusive leaf scrubbing (`Slice B`):** `AnonymousDiscardEditor` scrubs
+   populated exclusive private-anonymous leaves in place via
+   `with_cow_write_alias` on both AArch64 (`Stage1Editor::scrub_exclusive_anonymous_range`)
+   and x86_64 (`X86AnonymousEditor`), preserving existing leaf descriptors and
+   guest permissions (`RW`, `RX`, `RWX`) without reallocating or changing PTE flags.
+   COW-shared (`refcount > 1`) and shared/non-anonymous leaves decline cleanly
+   before scrubbing, and unpopulated pages inside a valid private-anonymous
+   reservation succeed as zero-filled demand pages.
+2. **Shared routing, contention wait, and root forwarding (`Slice D`):**
+   `AnonymousCall::Madvise` (`CanonicalNr(233)`) enters `Family::Anonymous` in
+   `carrick-personality-linux` and leaves `HOST_CROSSINGS` (`arm-ring-first-flip.tsv`
+   row `233` moves from `Temporary` to `EL1-first` / `Wire-in-ring`).
+   - On ARM EL1, `El1PendingFamilies::delegated` returns `DelegatedStep::NotDelegated`
+     when `is_root_process()` holds so root-process `madvise` continues to reach
+     the host VMA/residency venue (`mincore`, `MADV_DONTDUMP`, `MAP_SHARED`), while
+     native fork/exec children (`!is_root_process()`) execute
+     `memory::serve_delegated_discard` in ring and decline unsupported cases to
+     counted child `-ENOSYS`.
+   - On x86 CPL0, `X86AnonymousVenue::delegated` routes `SYS_MADVISE` (`28` /
+     canonical `233`) directly through `memory::serve_delegated_discard`,
+     declining unsupported cases to counted `-ENOSYS`.
+   - Both ISAs park contended non-zero-length `madvise` calls on
+     `Reservations`, `Editor` (`probe_discard_root_conflict`), and
+     `PreparedOverlap` via `coordinate_anonymous_edit_wait` and replay from the
+     unedited syscall frame on wake.
+
+Production witnesses cover both ISAs:
+`serial_host_native_fork_exec_madvise_dontneed_returns_zero`,
+`serial_host_native_fork_exec_v8_code_range_discard_and_root_forward`, and
+`anonymous_madvise_busy_parks_once_then_completes` on ARM EL1, plus
+`production_fork_child_v8_code_range_discard_scrubs_and_preserves_rwx` and
+`production_madvise_root_busy_once_parks_and_completes` on x86 CPL0 KVM.
+Signed macOS Node workload verification and the separate post-SIGABRT
+termination/wait investigation remain outside the scope of this slice.
