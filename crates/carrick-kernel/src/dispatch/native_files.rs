@@ -299,6 +299,18 @@ impl SyscallDispatcher {
             .existing_ipc()
             .ok_or(NativeHostFileRefusal)?;
         let resources = resources.snapshot().map_err(|_| NativeHostFileRefusal)?;
+        // The root's ring stages its writes unstamped: its limits stay in
+        // this custody, so the carrier stamps the root's own soft
+        // `RLIMIT_FSIZE`, read now as Linux reads it at each write.
+        carrick_personality_linux::native_host_file::stamp_write_file_size_limit(record, || {
+            Ok::<_, core::convert::Infallible>(
+                resources
+                    .rlimits()
+                    .get(carrick_abi::LinuxResource::Fsize)
+                    .rlim_cur,
+            )
+        })
+        .unwrap_or_else(|never| match never {});
         self.serve_native_host_file_with_authority(&owner, record, Some(resources.filesystem()))
     }
 

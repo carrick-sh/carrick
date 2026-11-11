@@ -8,12 +8,14 @@ pub(super) fn stage(
     task: &CurrentTask,
     cpu_slot: u32,
     origin: carrick_core_abi::service::ServiceOrigin,
+    delegated: impl FnOnce(i32) -> bool,
 ) -> Option<HostFileStage> {
     crate::native_stage::stage_call(
         call,
         task,
         &carrick_el1_linux::file::HardwareValidator,
         origin,
+        delegated,
         || {
             let venue = carrick_el1_linux::ipc::guest_venue(cpu_slot)?;
             let table = carrick_el1_linux::ipc::native_table(&venue, task)?;

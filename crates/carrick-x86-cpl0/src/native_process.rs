@@ -1079,6 +1079,35 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         // retries them, as on the AArch64 owner.
         let _retry_at_next_drain = drain_retired_spaces(&owner, self.worker());
     }
+    /// A completed service's output (a read's bytes, a stat record) into
+    /// the caller's own MM. Staging already proved the whole range
+    /// writable, so this is the same validated user copy ARM uses: no page
+    /// supply, and a range unmapped since staging is EFAULT, as Linux's
+    /// copy-out reports.
+    fn copy_syscall_output(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get()
+            || carrick_el1::isa::x86::hardware_live_root().map_err(error)? != mm.root
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let mut copy =
+            carrick_el1_linux::lifecycle::LinuxUserCopy(carrick_el1_linux::file::ValidatedCopy {
+                task: self.task,
+                validator: &carrick_el1_linux::file::HardwareValidator,
+            });
+        if carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, address, bytes)
+            .is_done()
+        {
+            Ok(())
+        } else {
+            Err(NativeProcessError::Fault)
+        }
+    }
     fn copy_siginfo(
         &mut self,
         mm: &Self::Mm,

@@ -455,14 +455,12 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
     let stat = |fields: &carrick_syscall_abi::LinuxStatFields| -> Box<[u8]> {
         zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStat::from_fields(fields)).into()
     };
-    let output = HostFileOutput {
-        address: BASE,
-        len: LINUX_STAT_BYTES,
-    };
+    let output = HostFileOutput::bytes(BASE, LINUX_STAT_BYTES);
     let pipe = run(
         HostFileCall::Fstat {
             fd: 0,
             statbuf: BASE,
+            layout: StatLayout::Generic,
         },
         &mut user,
     );
@@ -486,7 +484,8 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
         run(
             HostFileCall::Fstat {
                 fd: 4,
-                statbuf: BASE
+                statbuf: BASE,
+                layout: StatLayout::Generic
             },
             &mut user
         ),
@@ -510,10 +509,7 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
             &mut empty
         ),
         Some(HostFileStage::InRingReply {
-            output: HostFileOutput {
-                address: BASE + 0x100,
-                len: LINUX_STATX_BYTES,
-            },
+            output: HostFileOutput::bytes(BASE + 0x100, LINUX_STATX_BYTES),
             bytes: zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStatx::from_fields(
                 &carrick_syscall_abi::LinuxPipeIdentity::new(1, 1).stat_fields()
             ))
@@ -526,7 +522,8 @@ fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
         run(
             HostFileCall::Fstat {
                 fd: 0,
-                statbuf: BASE
+                statbuf: BASE,
+                layout: StatLayout::Generic
             },
             &mut user
         ),
@@ -660,16 +657,14 @@ fn empty_path_stat_names_the_descriptor() {
             path: BASE,
             statbuf: BASE + 0x100,
             flags: u64::from(LINUX_AT_EMPTY_PATH),
+            layout: StatLayout::Generic,
         },
         &mut user,
     ));
     assert!(!resolves_path);
     assert_eq!(
         output,
-        Some(HostFileOutput {
-            address: BASE + 0x100,
-            len: LINUX_STAT_BYTES
-        })
+        Some(HostFileOutput::bytes(BASE + 0x100, LINUX_STAT_BYTES))
     );
     let view = HostFileRequestView::parse(&mut record).unwrap();
     assert_eq!(view.header().op, HostFileOp::Fstat);
@@ -681,7 +676,8 @@ fn empty_path_stat_names_the_descriptor() {
                 dirfd: 3,
                 path: BASE,
                 statbuf: BASE,
-                flags: 0
+                flags: 0,
+                layout: StatLayout::Generic
             },
             &mut user
         ),
@@ -759,6 +755,70 @@ fn completion_copies_output_only_on_success() {
 }
 
 #[test]
+fn x86_fstat_completes_the_canonical_reply_in_x86_layout() {
+    // #1714: x86_64 `fstat` writes a 144-byte record whose st_nlink/st_mode
+    // order differs from the canonical one the carrier replies with.
+    let mut user = memory(&[0u8; X8664_STAT_BYTES]);
+    let (mut record, output, _) = request(run(
+        HostFileCall::Fstat {
+            fd: 3,
+            statbuf: BASE,
+            layout: StatLayout::X8664,
+        },
+        &mut user,
+    ));
+    let output = output.expect("fstat has output");
+    assert_eq!(output.len, X8664_STAT_BYTES);
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.output_capacity(), LINUX_STAT_BYTES);
+    let fields = carrick_syscall_abi::LinuxStatFields {
+        ino: 7,
+        mode: 0o100644,
+        nlink: 2,
+        uid: 1,
+        gid: 3,
+        rdev: 0,
+        size: 30,
+        blocks: None,
+        atime: (1, 2),
+        mtime: (3, 4),
+        ctime: (5, 6),
+    };
+    view.reply(
+        0,
+        zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStat::from_fields(&fields)),
+    )
+    .unwrap();
+    let mut copied = Vec::new();
+    let result = complete(&record, Some(output), &mut |address, bytes| {
+        copied.push((address, bytes.to_vec()));
+        true
+    });
+    assert_eq!(result, SyscallResult::new(0));
+    let expected =
+        zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxX8664Stat::from_fields(&fields))
+            .to_vec();
+    assert_eq!(copied, vec![(BASE, expected)]);
+    // A reply that is not one canonical record is EIO, never a partial copy.
+    let (mut record, output, _) = request(run(
+        HostFileCall::Fstat {
+            fd: 3,
+            statbuf: BASE,
+            layout: StatLayout::X8664,
+        },
+        &mut user,
+    ));
+    HostFileRequestView::parse(&mut record)
+        .unwrap()
+        .reply(0, b"short")
+        .unwrap();
+    assert_eq!(
+        complete(&record, output, &mut |_, _| panic!("no output")),
+        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO)
+    );
+}
+
+#[test]
 fn unwritable_output_requests_write_supply_before_crossing() {
     let mut user = memory(b"");
     user.writable = false;
@@ -766,7 +826,8 @@ fn unwritable_output_requests_write_supply_before_crossing() {
         run(
             HostFileCall::Fstat {
                 fd: 1,
-                statbuf: BASE + 8
+                statbuf: BASE + 8,
+                layout: StatLayout::Generic
             },
             &mut user
         ),
@@ -1119,10 +1180,10 @@ fn ppoll_over_host_stdio_stages_one_readiness_snapshot() {
     assert!(!resolves_path);
     assert_eq!(
         output,
-        Some(HostFileOutput {
-            address: BASE,
-            len: entries.len() * host_file::POLLFD_BYTES,
-        })
+        Some(HostFileOutput::bytes(
+            BASE,
+            entries.len() * host_file::POLLFD_BYTES
+        ))
     );
     let view = HostFileRequestView::parse(&mut record).unwrap();
     assert_eq!(view.header().op, HostFileOp::Poll);
