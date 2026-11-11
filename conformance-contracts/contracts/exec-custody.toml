@@ -1,3 +1,7 @@
+# #2070: shared signal-frame setup defers PortalOwnerWait/Busy contention via
+# PendingSignalDelivery and clears pending_signal_deliveries on exec cutover /
+# process close under kernel.el1.signal-delivery-owner; exec custody ordering and
+# work budgets are unchanged.
 # #1394: additional ABI bookkeeping witness only; existing semantic and
 # work-budget bindings remain authoritative. Census publication reads counters
 # after executor join and does not alter this contract's guest operation.

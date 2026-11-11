@@ -49,6 +49,17 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         self.user_sp = sp;
     }
 
+    fn sync_parked_context(
+        &self,
+        frame: &TrapFrame,
+        ctx: &mut carrick_sched_core::Aarch64ParkedContext,
+    ) {
+        ctx.native.x = frame.x;
+        ctx.native.pc = frame.elr;
+        ctx.native.pstate = frame.spsr;
+        ctx.native.sp_el0 = self.user_sp.raw();
+    }
+
     fn group_exit_custody(
         &self,
         _task: &carrick_el1_abi::CurrentTask,
@@ -305,13 +316,19 @@ pub(crate) fn restore(
     all(target_os = "none", target_arch = "aarch64")
 ))]
 fn frame_copy_buffer(len: usize) -> Result<Vec<u8>, ArchError> {
+    const ZERO_CHUNK: [u8; 256] = [0; 256];
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(len)
         .map_err(|_| ArchError::InvalidFrame)?;
     // Capacity was admitted above, so this only initializes already owned
     // bytes. Allocation failure takes the ordinary sigreturn failure path.
-    bytes.resize(len, 0);
+    let mut remaining = len;
+    while remaining != 0 {
+        let step = remaining.min(ZERO_CHUNK.len());
+        bytes.extend_from_slice(&ZERO_CHUNK[..step]);
+        remaining -= step;
+    }
     Ok(bytes)
 }
 
@@ -466,8 +483,8 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         _fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-    ) -> Result<UserVa, Self::Error> {
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::user_copy::CopyOutcome,
+    ) -> Result<carrick_personality_linux::signal::SignalFrameSetup, Self::Error> {
         setup_arm_signal_frame(frame, params, siginfo, _fpstate, copy_out)
     }
 
@@ -525,8 +542,8 @@ pub(crate) fn setup_arm_signal_frame(
     params: carrick_personality_linux::signal::SignalFrameParams,
     siginfo: Option<&[u8]>,
     fpstate: &[u8],
-    copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-) -> Result<UserVa, ArchError> {
+    copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::user_copy::CopyOutcome,
+) -> Result<carrick_personality_linux::signal::SignalFrameSetup, ArchError> {
     let (sp, sigframe) = build(frame, params, siginfo, fpstate).inspect_err(|error| {
         super::native_diagnostic::emit(format_args!(
             "signal-frame-build esr={:#x} pc={:#x} far={:#x} sp={:#x} signal={} error={error:?}",
@@ -539,17 +556,25 @@ pub(crate) fn setup_arm_signal_frame(
     })?;
     let new_sp = sp.raw();
 
-    if !copy_out(UserVa::new(new_sp), &sigframe) {
-        super::native_diagnostic::emit(format_args!(
-            "signal-frame-copy esr={:#x} pc={:#x} far={:#x} sp={:#x} frame={new_sp:#x}+{:#x} signal={}",
-            frame.esr,
-            frame.elr,
-            frame.far,
-            params.interrupted_sp.raw(),
-            sigframe.len(),
-            params.signal.number(),
-        ));
-        return Err(ArchError::InvalidFrame);
+    match copy_out(UserVa::new(new_sp), &sigframe) {
+        carrick_core::user_copy::CopyOutcome::Done => {}
+        carrick_core::user_copy::CopyOutcome::NotYet(request) => {
+            return Ok(carrick_personality_linux::signal::SignalFrameSetup::NotYet(
+                request,
+            ));
+        }
+        carrick_core::user_copy::CopyOutcome::Fault => {
+            super::native_diagnostic::emit(format_args!(
+                "signal-frame-copy esr={:#x} pc={:#x} far={:#x} sp={:#x} frame={new_sp:#x}+{:#x} signal={}",
+                frame.esr,
+                frame.elr,
+                frame.far,
+                params.interrupted_sp.raw(),
+                sigframe.len(),
+                params.signal.number(),
+            ));
+            return Err(ArchError::InvalidFrame);
+        }
     }
 
     let info_addr = new_sp;
@@ -570,7 +595,7 @@ pub(crate) fn setup_arm_signal_frame(
         carrick_el1::isa::aarch64::set_signal_stack(UserVa::new(new_sp));
     }
 
-    Ok(UserVa::new(new_sp))
+    Ok(carrick_personality_linux::signal::SignalFrameSetup::Installed(UserVa::new(new_sp)))
 }
 
 #[cfg(test)]
@@ -1071,17 +1096,21 @@ mod tests {
             };
             let fp = LinuxFpsimdContext::empty();
             let mut written: Option<(UserVa, Vec<u8>)> = None;
-            let handler_sp = setup_arm_signal_frame(
-                &mut frame,
-                params,
-                None,
-                fp.as_bytes(),
-                &mut |va, bytes| {
-                    written = Some((va, bytes.to_vec()));
-                    true
-                },
-            )
-            .expect("setup_arm_signal_frame must succeed");
+            let carrick_personality_linux::signal::SignalFrameSetup::Installed(handler_sp) =
+                setup_arm_signal_frame(
+                    &mut frame,
+                    params,
+                    None,
+                    fp.as_bytes(),
+                    &mut |va, bytes| {
+                        written = Some((va, bytes.to_vec()));
+                        carrick_core::user_copy::CopyOutcome::Done
+                    },
+                )
+                .expect("setup_arm_signal_frame must succeed")
+            else {
+                panic!("setup_arm_signal_frame must install immediately");
+            };
             let (written_va, written_bytes) = written.expect("signal frame bytes must be written");
             assert_eq!(written_va, handler_sp);
             let decoded = arm::SignalFrame::ref_from_bytes(&written_bytes).unwrap();

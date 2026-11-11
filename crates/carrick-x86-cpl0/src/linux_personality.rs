@@ -337,15 +337,19 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
         copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
     ) -> Result<UserVa, LinuxErrno> {
         let mut backend = carrick_el1_linux::x86_signal::LinuxX86Backend;
-        carrick_personality_linux::signal::SignalBackend::setup_signal_frame(
+        match carrick_personality_linux::signal::SignalBackend::setup_signal_frame(
             &mut backend,
             self.frame,
             params,
             siginfo,
             &self.fpstate.0,
-            &mut |va, src| copy_out.copy_out(va, src).is_done(),
-        )
-        .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
+            &mut |va, src| copy_out.copy_out(va, src),
+        ) {
+            Ok(carrick_personality_linux::signal::SignalFrameSetup::Installed(sp)) => Ok(sp),
+            Ok(carrick_personality_linux::signal::SignalFrameSetup::NotYet(_)) | Err(_) => {
+                Err(carrick_personality_linux::abi::signal::LINUX_EFAULT)
+            }
+        }
     }
 }
 
@@ -379,6 +383,7 @@ pub fn complete_root_exit(task: &CurrentTask, status: LinuxWaitStatus) -> ! {
 
 struct X86SignalMachine {
     backend: carrick_el1_linux::x86_signal::LinuxX86Backend,
+    address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
 }
 
 impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::ParkedContextWords>
@@ -414,6 +419,25 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
             carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
         )
     }
+
+    fn sync_parked_context(
+        &self,
+        frame: &NativeFrame,
+        ctx: &mut carrick_sched_core::ParkedContextWords,
+    ) {
+        use carrick_el1::isa::x86::context;
+        let native = context::context_words::into_native(*ctx, self.address)
+            .unwrap_or_else(|_| fatal_boot());
+        let updated = context::context_words::from_syscall(
+            frame,
+            self.address,
+            native.fs_base,
+            native.gs_base,
+            &native.xsave,
+        )
+        .unwrap_or_else(|_| fatal_boot());
+        *ctx = context::context_words::from_native(&updated);
+    }
 }
 
 pub(crate) fn deliver_signal_on_syscall_return(
@@ -425,6 +449,7 @@ pub(crate) fn deliver_signal_on_syscall_return(
         carrick_sched_core::ParkedContextWords,
         native_process::Service,
     >,
+    address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
     frame: &mut NativeFrame,
     fpstate: &XsaveArea,
 ) -> Option<CompletionRoute> {
@@ -437,6 +462,7 @@ pub(crate) fn deliver_signal_on_syscall_return(
         &fpstate.0,
         &mut X86SignalMachine {
             backend: carrick_el1_linux::x86_signal::LinuxX86Backend,
+            address,
         },
     )
 }
@@ -495,7 +521,9 @@ pub fn signal_user_return(
                 thread.slot.pending(),
             );
         }
-        if let Some(route) = deliver_signal_on_syscall_return(task, &mut process, frame, xsave) {
+        if let Some(route) =
+            deliver_signal_on_syscall_return(task, &mut process, address, frame, xsave)
+        {
             if route != CompletionRoute::Suspended {
                 fatal_boot();
             }
@@ -568,9 +596,13 @@ pub fn signal_irq_return(
                 &mut service,
             )
             .unwrap_or_else(|_| fatal_boot());
-        if let Some(route) =
-            deliver_signal_on_syscall_return(task, &mut process, &mut returned, xsave)
-        {
+        if let Some(route) = deliver_signal_on_syscall_return(
+            task,
+            &mut process,
+            runtime_address,
+            &mut returned,
+            xsave,
+        ) {
             if route != CompletionRoute::Suspended {
                 fatal_boot();
             }
@@ -1301,8 +1333,13 @@ impl Personality for LinuxPersonality {
                 complete_run_failure(task, reason);
             }
             if carrick_personality_linux::signal::signal_delivery_before_work(route, &task.linux)
-                && let Some(r) =
-                    deliver_signal_on_syscall_return(task, &mut process, frame, early_xstate)
+                && let Some(r) = deliver_signal_on_syscall_return(
+                    task,
+                    &mut process,
+                    address,
+                    frame,
+                    early_xstate,
+                )
             {
                 route = r;
             }
