@@ -81,9 +81,9 @@ fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
     }
     unreachable!()
 }
-struct FixtureMapping<'a> {
-    words: &'a dyn LiveDescriptorWords,
-    residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+pub(super) struct FixtureMapping<'a> {
+    pub(super) words: &'a dyn LiveDescriptorWords,
+    pub(super) residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
 }
 impl carrick_el1::memory::AnonymousBackingProbe for FixtureMapping<'_> {
     fn backing(

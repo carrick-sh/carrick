@@ -18,6 +18,11 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
 }
 
 #[test]
+fn serial_host_native_fork_exec_madvise_dontneed_returns_zero() {
+    fork_exec_probe_with_scenario(None, u32::MAX as u64, false, None, None, true);
+}
+
+#[test]
 fn serial_host_native_fork_exec_child_futex_retains_owner_refusal() {
     fork_exec_successor(Some(crate::sched::FUTEX_WAIT_PRIVATE));
 }
@@ -327,6 +332,17 @@ fn fork_exec_probe_with_departure(
     metadata: Option<super::pipe_metadata_tests::Case>,
     departure: Option<TimerDeparture>,
 ) {
+    fork_exec_probe_with_scenario(futex, bitset, timed, metadata, departure, false);
+}
+
+fn fork_exec_probe_with_scenario(
+    futex: Option<u64>,
+    bitset: u64,
+    timed: bool,
+    metadata: Option<super::pipe_metadata_tests::Case>,
+    departure: Option<TimerDeparture>,
+    discard: bool,
+) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let metadata_scope = MetadataScope::new(fixture);
     struct RestoreRegion(usize);
@@ -590,6 +606,36 @@ fn fork_exec_probe_with_departure(
         fixture.task.mm.key.load(Ordering::Acquire),
         child_binding.address.mm.raw().get()
     );
+    let residency = carrick_el1::cow::test_support::residency_table();
+    if discard {
+        let successor_raw = fixture.task.mm.key.load(Ordering::Acquire);
+        let successor_mm = carrick_el1_abi::ReservationMm::new(successor_raw).unwrap();
+        let successor_index = fixture.zone.spaces.find(successor_raw).unwrap();
+        fixture
+            .region
+            .table()
+            .publish(
+                successor_index.index(),
+                successor_mm,
+                carrick_el1::memory::reservations::Layout {
+                    heap: carrick_el1_abi::ReservationRange::new(0x1000, 0x10_0000).unwrap(),
+                    arena: carrick_el1_abi::ReservationRange::new(0x10_0000, 0x2000_0000).unwrap(),
+                    brk: 0x1000,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .unwrap();
+        fixture
+            .region
+            .table()
+            .lock(successor_index.index(), successor_mm)
+            .unwrap()
+            .finish_import()
+            .unwrap();
+    }
     if let Some(operation) = futex {
         child_futex(
             fixture,
@@ -674,6 +720,75 @@ fn fork_exec_probe_with_departure(
             )
             .unwrap_or_else(|error| panic!("native entry nr={nr}, fd={fd}: {error:?}"));
         let served_before = counters.served[nr as usize].load(Ordering::Relaxed);
+        struct DiscardAnonymousVenue<'a> {
+            call: carrick_el1::memory::AnonymousCall,
+            fixture: &'static Fixture,
+            counters: &'a carrick_el1_abi::Counters,
+            editor: super::native_fault_supply_tests::FixtureMapping<'a>,
+        }
+        impl carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
+            for DiscardAnonymousVenue<'_>
+        {
+            fn original_argument0(&self) -> u64 {
+                use carrick_el1::memory::AnonymousCallView;
+                self.call.arguments()[0]
+            }
+            fn task_state(&self) -> Option<&carrick_personality_linux::abi::entry::LinuxTaskState> {
+                Some(&self.fixture.task.linux)
+            }
+            fn delegated(&mut self) -> carrick_personality_linux::pending_anonymous::DelegatedStep {
+                use carrick_el1::memory::{AnonymousCallView, DelegatedAnonymous};
+                use carrick_personality_linux::abi::entry::SyscallResult;
+                use carrick_personality_linux::pending_anonymous::DelegatedStep;
+                match carrick_el1::memory::serve_delegated_mapping(
+                    &mut self.call,
+                    self.counters,
+                    &self.fixture.task,
+                    crate::sched::object_wait::space_access(self.fixture.zone, self.fixture.slot),
+                    self.fixture.region.table(),
+                    &mut self.editor,
+                    None,
+                ) {
+                    DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
+                    DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
+                    DelegatedAnonymous::Served => {
+                        DelegatedStep::Served(SyscallResult::new(self.call.result().0 as i64))
+                    }
+                    DelegatedAnonymous::Forward => DelegatedStep::Forward,
+                }
+            }
+            fn park_prepared(
+                &mut self,
+            ) -> Option<carrick_personality_linux::dispatch::FamilyCompletion> {
+                None
+            }
+            fn permission(
+                &mut self,
+            ) -> carrick_personality_linux::pending_anonymous::PermissionStep {
+                carrick_personality_linux::pending_anonymous::PermissionStep::Forward
+            }
+            fn retirement(
+                &mut self,
+            ) -> carrick_personality_linux::pending_anonymous::RetirementStep {
+                carrick_personality_linux::pending_anonymous::RetirementStep::Forward
+            }
+            fn install_result(&mut self, _: carrick_personality_linux::abi::entry::SyscallResult) {}
+        }
+        let mut anon_venue = discard.then(|| DiscardAnonymousVenue {
+            call: carrick_el1::memory::AnonymousCall::new(
+                carrick_core::CallOrdinal::from_raw(nr),
+                [fd, address, count, extra, 0, 0],
+                0,
+                fixture.slot,
+                UserVa::new(0x400004),
+            ),
+            fixture,
+            counters: &counters,
+            editor: super::native_fault_supply_tests::FixtureMapping {
+                words: &words,
+                residency: &residency,
+            },
+        });
         let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
@@ -700,10 +815,61 @@ fn fork_exec_probe_with_departure(
             None,
             Some(&mut *entry),
             Some(source),
-            None,
+            anon_venue.as_mut().map(|v| {
+                v as &mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
+            }),
             |_| core::ptr::null_mut(),
         );
         drop(entry);
+        if discard {
+            use carrick_personality_linux::dispatch::CompletionRoute;
+            assert!(
+                runtime.task_binding(parent).is_some(),
+                "parent remains alive"
+            );
+            assert!(
+                runtime.task_binding(child).is_some(),
+                "exec child remains alive"
+            );
+            if route == CompletionRoute::Forward {
+                let identity = fixture.zone.record(binding.record.id).identity();
+                // SAFETY: the admitted live record owns its lifecycle page.
+                let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+                let owner = registry.thread_group_owner(
+                    fixture.zone,
+                    page,
+                    fixture.task.visible_pid().unwrap(),
+                );
+                assert_eq!(
+                    owner,
+                    crate::native_process_runtime::NativeThreadGroupOwner::ForkChild
+                );
+                assert_eq!(
+                    crate::dispatch::native_unstaged_exit(
+                        &mut frame,
+                        &fixture.task.linux,
+                        carrick_el1_abi::Action::Forward,
+                        || owner,
+                        &counters,
+                    ),
+                    crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
+                );
+                assert_eq!(
+                    counters.refused_child[nr as usize].load(Ordering::Relaxed),
+                    1
+                );
+                assert_eq!(
+                    counters.venue_refused[nr as usize].load(Ordering::Relaxed),
+                    0
+                );
+            } else {
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+            }
+            return frame.x[0];
+        }
         if metadata.is_some() {
             assert_eq!(
                 counters.served[nr as usize].load(Ordering::Relaxed),
@@ -745,6 +911,26 @@ fn fork_exec_probe_with_departure(
         );
         frame.x[0]
     };
+    if discard {
+        // The fixture has delivered the exec service reply and its wake above.
+        // Settle that setup boundary before issuing a fresh syscall, as the
+        // carrier does. Otherwise WithWork retains argument 0 for replay;
+        // that argument is not a syscall result.
+        let _ = fixture.task.linux.take_served_boundary();
+        if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+            assert_eq!(work.native_terminal_slot(), None);
+            work.settled();
+        }
+        // Zero length isolates admission on the child's admitted successor MM.
+        // Linux accepts this aligned no-op.
+        let result = call_full(233, 0x400000, 0, 4, 0) as i64;
+        registry.unregister_root_for_test(&runtime);
+        assert_eq!(
+            result, 0,
+            "exec child madvise(0x400000, 0, MADV_DONTNEED=4)"
+        );
+        return;
+    }
     if let Some(case) = metadata {
         use carrick_personality_linux::crossing::nr as sys;
         for fd in [3, 4] {
@@ -2506,4 +2692,97 @@ fn consume_injected_sigint(
         .expect("sleeping clone's signal owner");
     let taken = signals.take_deliverable(record, carrick_signal_core::policy::SigBlockMask::NONE);
     assert_eq!(taken.map(|(signal, ..)| signal.number()), Some(2));
+}
+
+/// Linux control only: this is not Carrick guest-memory or signed evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn serial_host_linux_exec_child_v8_memory_control() {
+    use std::{process::Command, time::Duration};
+    use wait_timeout::ChildExt;
+
+    const CHILD: &str = "CARRICK_1846_LINUX_CONTROL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "aarch64_process_tests::native_exec_pipe_tests::serial_host_linux_exec_child_v8_memory_control",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let status = child.wait_timeout(Duration::from_secs(10)).unwrap();
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert!(status.is_some_and(|status| status.success()));
+        return;
+    }
+
+    // SAFETY: this isolated exec child owns the anonymous reservation. Fixed
+    // replacement stays inside it, all pointer accesses are within its RWX
+    // subrange, and no slice survives a protection or mapping change.
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let size = 128 * 1024 * 1024;
+        let touched = 2 * 1024 * 1024;
+        let raw = libc::mmap(
+            core::ptr::null_mut(),
+            size + 2 * page,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        assert_ne!(raw, libc::MAP_FAILED);
+        let base = raw.cast::<u8>().add(page);
+        assert_eq!(libc::munmap(raw, page), 0, "prefix trim");
+        assert_eq!(libc::munmap(base.add(size).cast(), page), 0, "suffix trim");
+        let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+        assert_eq!(libc::mprotect(base.cast(), touched, rwx), 0);
+        core::ptr::write_bytes(base, 0x5a, touched);
+        assert_eq!(libc::madvise(base.cast(), touched, libc::MADV_DONTNEED), 0);
+        assert!(
+            core::slice::from_raw_parts(base, touched)
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        // Same admission reduction as the Carrick fork/exec witness.
+        assert_eq!(
+            libc::madvise(0x400000 as *mut libc::c_void, 0, libc::MADV_DONTNEED),
+            0
+        );
+        for prot in [
+            libc::PROT_NONE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::PROT_READ | libc::PROT_EXEC,
+            rwx,
+        ] {
+            assert_eq!(libc::mprotect(base.cast(), touched, prot), 0, "prot={prot}");
+        }
+        core::ptr::write_bytes(base, 0xa5, touched);
+        assert_eq!(
+            libc::mmap(
+                base.cast(),
+                touched,
+                libc::PROT_NONE,
+                libc::MAP_FIXED | libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0
+            ),
+            base.cast()
+        );
+        assert_eq!(libc::mprotect(base.cast(), touched, libc::PROT_READ), 0);
+        assert!(
+            core::slice::from_raw_parts(base, touched)
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(libc::munmap(base.cast(), size), 0);
+        println!(
+            "Linux exec child: reserve=128MiB, trim=0, RWX=0, DONTNEED(2MiB)=0, zeros=true, DONTNEED(0x400000,0,4)=0, NONE/RW/RX/RWX=0, fixed-decommit=zeros, unmap=0"
+        );
+    }
 }
