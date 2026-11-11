@@ -779,6 +779,96 @@ fn arm_declined_fault_returns_a_quarantined_delivery_refusal() {
     assert_eq!(frame, before, "a refused delivery leaves the frame");
 }
 
+/// Dispatch a syscall for the record currently loaded on `slot` through the
+/// production ARM vector adapter with `ProductionResumeCpu`, so a parked call
+/// switches in and resumes the slot's next runnable record.
+fn call_on_slot(
+    fixture: &'static Fixture,
+    slot: SlotId,
+    tasks: &'static [CurrentTask],
+    dispatch_service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    resume_service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    cpu: &mut crate::sched::FakeCpu,
+) -> carrick_personality_linux::dispatch::CompletionRoute {
+    let current = fixture.zone.slot(slot).current().unwrap();
+    let identity = fixture.zone.record(current).identity();
+    // SAFETY: the native owner retains its lifecycle page and control slot.
+    let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+    // SAFETY: see above.
+    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    // SAFETY: `current` is the slot's active record.
+    let saved = unsafe { *fixture.zone.record(current).ctx_mut() };
+    let ttbr0 = saved
+        .address_context()
+        .expect("native record address context")
+        .root
+        .address()
+        .raw();
+    cpu.ttbr.0 = ttbr0;
+    frame.esr = 0x15 << 26;
+    frame.slot = u64::from(slot.raw());
+    let mut resume_cpu = ProductionResumeCpu {
+        inner: core::mem::take(cpu),
+        service: resume_service,
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+        frame,
+        &counters,
+        tasks,
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut resume_cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(&LoadedVenue),
+        page,
+        control,
+        &saved.native,
+        ttbr0,
+        dispatch_service,
+        |_| core::ptr::null_mut(),
+    )
+    .expect("production ARM native process dispatch");
+    *cpu = core::mem::take(&mut resume_cpu.inner);
+    route
+}
+
+/// Run the production scheduler's idle entry on `slot` for `task`.
+fn switch_on_slot(
+    fixture: &'static Fixture,
+    slot: SlotId,
+    task: &'static CurrentTask,
+    resume_service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    cpu: &mut crate::sched::FakeCpu,
+    frame: &mut carrick_el1_abi::TrapFrame,
+) -> carrick_el1_abi::Action {
+    let mut switch = ProductionResumeCpu {
+        inner: core::mem::take(cpu),
+        service: resume_service,
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let mut handoff = None;
+    let mut zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut switch,
+        user: &crate::sched::HardwareUserWord,
+    };
+    let action =
+        super::super::dispatch::native_scheduler(&mut zone, task, &counters, slot, &mut handoff)
+            .idle_entry(frame, 0);
+    *cpu = core::mem::take(&mut switch.inner);
+    action
+}
+
 struct ProductionProcessHarness {
     fixture: &'static Fixture,
     task: &'static CurrentTask,
@@ -882,54 +972,15 @@ impl ProductionProcessHarness {
         cpu: &mut crate::sched::FakeCpu,
     ) -> carrick_personality_linux::dispatch::CompletionRoute {
         self.settle_doorbells();
-        let current = self.fixture.zone.slot(self.fixture.slot).current().unwrap();
-        let identity = self.fixture.zone.record(current).identity();
-        // SAFETY: the native owner retains its lifecycle page and control slot.
-        let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
-        // SAFETY: see above.
-        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
-        // SAFETY: `current` is the slot's active record.
-        let saved = unsafe { *self.fixture.zone.record(current).ctx_mut() };
-        let ttbr0 = saved
-            .address_context()
-            .expect("native record address context")
-            .root
-            .address()
-            .raw();
-        cpu.ttbr.0 = ttbr0;
-        frame.esr = 0x15 << 26;
-        frame.slot = u64::from(self.fixture.slot.raw());
-        let mut resume_cpu = ProductionResumeCpu {
-            inner: core::mem::take(cpu),
-            service: &mut self.resume_service,
-        };
-        let counters = carrick_el1_abi::Counters::new();
-        let cache = carrick_el1_abi::InotifyNameCache::new();
-        let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-            frame,
-            &counters,
+        let route = call_on_slot(
+            self.fixture,
+            self.fixture.slot,
             core::slice::from_ref(self.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: self.fixture.zone,
-                cpu: &mut resume_cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            None,
-            Some(&LoadedVenue),
-            page,
-            control,
-            &saved.native,
-            ttbr0,
             &mut self.dispatch_service,
-            |_| core::ptr::null_mut(),
-        )
-        .expect("production ARM native process dispatch");
-        *cpu = core::mem::take(&mut resume_cpu.inner);
+            &mut self.resume_service,
+            frame,
+            cpu,
+        );
         self.settle_doorbells();
         route
     }
@@ -940,26 +991,14 @@ impl ProductionProcessHarness {
         frame: &mut carrick_el1_abi::TrapFrame,
     ) -> carrick_el1_abi::Action {
         self.settle_doorbells();
-        let mut switch = ProductionResumeCpu {
-            inner: core::mem::take(cpu),
-            service: &mut self.resume_service,
-        };
-        let counters = carrick_el1_abi::Counters::new();
-        let mut handoff = None;
-        let mut zone = crate::dispatch::Zone {
-            tables: self.fixture.zone,
-            cpu: &mut switch,
-            user: &crate::sched::HardwareUserWord,
-        };
-        let action = super::super::dispatch::native_scheduler(
-            &mut zone,
-            self.task,
-            &counters,
+        let action = switch_on_slot(
+            self.fixture,
             self.fixture.slot,
-            &mut handoff,
-        )
-        .idle_entry(frame, 0);
-        *cpu = core::mem::take(&mut switch.inner);
+            self.task,
+            &mut self.resume_service,
+            cpu,
+            frame,
+        );
         self.settle_doorbells();
         action
     }
@@ -1831,4 +1870,260 @@ fn arm_msgrcv_and_sibling_wait4_do_not_block_each_other() {
             assert_eq!(rx_buf.get::<MsgBuf>(0).mtext, *b"carrick!");
         }
     }
+}
+
+/// One sibling member running on a second vCPU (`SlotId(1)`) of the
+/// harness's process, with its own executor task and services.
+struct SecondVcpu {
+    slot: SlotId,
+    /// Executor tasks indexed by slot, as the vector's `current_tasks`.
+    tasks: &'static [CurrentTask; 2],
+    task: &'static CurrentTask,
+    dispatch_service: Aarch64NativeProcessService<'static, TestStockCrossing>,
+    resume_service: Aarch64NativeProcessService<'static, TestStockCrossing>,
+    cpu: crate::sched::FakeCpu,
+}
+
+impl SecondVcpu {
+    fn new(fixture: &'static Fixture) -> Self {
+        let slot = SlotId::new(1);
+        fixture.zone.drive(slot, 2);
+        fixture.zone.publish_slot(slot, 0, None, 0);
+        fixture.zone.enter_guest(slot);
+        let tasks: &'static [CurrentTask; 2] =
+            Box::leak(Box::new([CurrentTask::new(), CurrentTask::new()]));
+        let task = &tasks[1];
+        let service = || {
+            Aarch64NativeProcessService::with_crossing(
+                task,
+                slot,
+                fixture.zone,
+                fixture.region.table(),
+                NonZeroU64::MIN,
+                TestStockCrossing::new(&[]),
+            )
+        };
+        Self {
+            slot,
+            tasks,
+            task,
+            dispatch_service: service(),
+            resume_service: service(),
+            cpu: crate::sched::FakeCpu::default(),
+        }
+    }
+
+    fn settle_doorbells(&self) {
+        if let Some(work) = self.task.linux.take_host_work_doorbell() {
+            work.settled();
+        }
+        let _ = self.task.linux.take_served_boundary();
+    }
+
+    fn call_current(
+        &mut self,
+        fixture: &'static Fixture,
+        frame: &mut carrick_el1_abi::TrapFrame,
+    ) -> carrick_personality_linux::dispatch::CompletionRoute {
+        self.settle_doorbells();
+        let route = call_on_slot(
+            fixture,
+            self.slot,
+            self.tasks,
+            &mut self.dispatch_service,
+            &mut self.resume_service,
+            frame,
+            &mut self.cpu,
+        );
+        self.settle_doorbells();
+        route
+    }
+
+    fn switch_next(
+        &mut self,
+        fixture: &'static Fixture,
+        frame: &mut carrick_el1_abi::TrapFrame,
+    ) -> carrick_el1_abi::Action {
+        self.settle_doorbells();
+        let action = switch_on_slot(
+            fixture,
+            self.slot,
+            self.task,
+            &mut self.resume_service,
+            &mut self.cpu,
+            frame,
+        );
+        self.settle_doorbells();
+        action
+    }
+}
+
+/// What the sibling's `wait4` did while the forking thread held its birth
+/// reservation.
+#[derive(Debug)]
+struct ContendedWait {
+    x0: i64,
+    parked: bool,
+}
+
+/// #2095: thread A's `fork`/`vfork` holds its process's birth reservation
+/// (`reserve_birth`) across its stock loan crossing. A sibling thread B on a
+/// second vCPU calls blocking `wait4` for an already exited child at that
+/// moment. Contention is "not now": B must enrol on the reservation's
+/// release, park, and reap the zombie once A releases, never return `-11`
+/// (`-EAGAIN`). A `vfork` caller still stays suspended until its child exits.
+fn wait4_reaps_zombie_while_sibling_holds_birth_reservation(vfork: bool) {
+    let mut harness = ProductionProcessHarness::new();
+    let fixture = harness.fixture;
+    let slot0 = fixture.slot;
+    let mut cpu = crate::sched::FakeCpu::default();
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    let vfork_stack = carrick_test_support::GuestUserBuffer::zeroed(4096);
+    let status = carrick_test_support::GuestUserBuffer::from_value(-1i32);
+
+    // A zombie child first, then the sibling thread B.
+    let (zombie_pid, zombie) = harness.fork_child(&mut cpu);
+    let (_sibling_tid, sibling) = harness.spawn_thread(&stack, &mut cpu);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(slot0, harness.parent_record)
+            .is_queued()
+    );
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        harness.switch_next(&mut cpu, &mut frame),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(fixture.zone.slot(slot0).current(), Some(zombie));
+    harness.exit_current_child(5, &mut cpu, &mut frame);
+    // The leader runs on vCPU 0; B waits in vCPU 0's run queue.
+    if fixture.zone.slot(slot0).current() == Some(sibling) {
+        assert!(fixture.zone.requeue_preempted(slot0, sibling).is_queued());
+        assert_eq!(
+            harness.switch_next(&mut cpu, &mut frame),
+            carrick_el1_abi::Action::Served
+        );
+    }
+    assert_eq!(
+        fixture.zone.slot(slot0).current(),
+        Some(harness.parent_record)
+    );
+
+    // vCPU 1 takes B from vCPU 0's queue.
+    let second: &'static mut SecondVcpu = Box::leak(Box::new(SecondVcpu::new(fixture)));
+    let mut idle = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        second.switch_next(fixture, &mut idle),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(fixture.zone.slot(second.slot).current(), Some(sibling));
+
+    // A's stock loan crossing runs B's wait4 on vCPU 1 while A holds the
+    // reservation, as a sibling vCPU does during a real synchronous crossing.
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let observed_by_hook = observed.clone();
+    let second_address = core::ptr::from_mut(second) as usize;
+    let fixture_address = core::ptr::from_ref(fixture) as usize;
+    let status_arg = status.arg();
+    *harness.dispatch_service.crossing.on_loan.lock().unwrap() = Some(Box::new(move || {
+        // SAFETY: the leaked vCPU outlives the test; the outer fork runs
+        // this hook synchronously and never touches vCPU 1's state.
+        let second = unsafe { &mut *(second_address as *mut SecondVcpu) };
+        // SAFETY: the harness leaks its fixture for the life of the test.
+        let fixture: &'static Fixture = unsafe { &*(fixture_address as *const Fixture) };
+        let mut wait = carrick_el1_abi::TrapFrame::default();
+        wait.x[8] = 260;
+        wait.x[0] = u64::from(zombie_pid);
+        wait.x[1] = status_arg;
+        second.call_current(fixture, &mut wait);
+        let parked = matches!(
+            fixture.zone.record(sibling).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        );
+        *observed_by_hook.lock().unwrap() = Some(ContendedWait {
+            x0: wait.x[0] as i64,
+            parked,
+        });
+    }));
+
+    let mut clone = carrick_el1_abi::TrapFrame::default();
+    clone.x[8] = 220;
+    if vfork {
+        clone.x[0] = 0x4111;
+        clone.x[1] = vfork_stack.arg() + 4096;
+    } else {
+        clone.x[0] = 17;
+    }
+    harness.call_current(&mut clone, &mut cpu);
+    let contended = observed
+        .lock()
+        .unwrap()
+        .take()
+        .expect("A's fork crossed for stock while holding its reservation");
+    assert!(
+        contended.parked,
+        "B's wait4 returned {} while A held its birth reservation instead of \
+         waiting for the release",
+        contended.x0
+    );
+    assert_eq!(status.get::<i32>(0), -1, "B parked before copying status");
+
+    if vfork {
+        assert!(
+            matches!(
+                fixture.zone.record(harness.parent_record).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ),
+            "the vfork caller returned unsuspended (x0 = {})",
+            clone.x[0] as i64
+        );
+    } else {
+        assert!(clone.x[0] as i64 > 0, "fork result {}", clone.x[0] as i64);
+    }
+
+    // A's release woke B: it reaps the zombie with its exact status.
+    let mut resumed = carrick_el1_abi::TrapFrame::default();
+    let woken_on_second = fixture.zone.slot(second.slot).queued() > 0;
+    if woken_on_second {
+        assert_eq!(
+            second.switch_next(fixture, &mut resumed),
+            carrick_el1_abi::Action::Served
+        );
+    } else {
+        let current = fixture.zone.slot(slot0).current().unwrap();
+        if current != sibling {
+            assert!(fixture.zone.requeue_preempted(slot0, current).is_queued());
+            loop {
+                assert_eq!(
+                    harness.switch_next(&mut cpu, &mut resumed),
+                    carrick_el1_abi::Action::Served
+                );
+                let now = fixture.zone.slot(slot0).current().unwrap();
+                if now == sibling {
+                    break;
+                }
+                assert!(fixture.zone.requeue_preempted(slot0, now).is_queued());
+            }
+        }
+    }
+    assert_eq!(
+        resumed.x[0] as i64,
+        i64::from(zombie_pid),
+        "B's wait4 after the release"
+    );
+    assert_eq!(
+        status.get::<i32>(0),
+        LinuxWaitStatus::from_wait_encoding(5 << 8).raw()
+    );
+}
+
+#[test]
+fn arm_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
+    wait4_reaps_zombie_while_sibling_holds_birth_reservation(false);
+}
+
+#[test]
+fn arm_wait4_reaps_zombie_while_sibling_vfork_holds_birth_reservation() {
+    wait4_reaps_zombie_while_sibling_holds_birth_reservation(true);
 }
