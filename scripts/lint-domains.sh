@@ -48,6 +48,10 @@ done
 
 "$semgrep_bin" --test --config .semgrep/typed-domains.yml .semgrep/tests/contention.rs
 "$semgrep_bin" --config .semgrep/ crates/ --severity ERROR --error --quiet
+# Semgrep skips `tests/` directories by default, and this rule is about tests.
+"$semgrep_bin" --test --config .semgrep/test-executables.yml .semgrep/tests/test-executables.rs
+"$semgrep_bin" --config .semgrep/test-executables.yml --x-ignore-semgrepignore-files \
+    crates/ --severity ERROR --error --quiet
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 python3 "$script_dir/migrate/check-host-authority-escape-hatches.py" --root .
