@@ -26,6 +26,8 @@ use carrick_syscall_abi::{CanonicalNr, LinuxErrno};
 pub const LINUX_STAT_BYTES: usize = core::mem::size_of::<carrick_syscall_abi::LinuxStat>();
 /// Size of Linux `struct statx`.
 pub const LINUX_STATX_BYTES: usize = core::mem::size_of::<carrick_syscall_abi::LinuxStatx>();
+/// Linux x86_64 `struct stat` size.
+pub const X8664_STAT_BYTES: usize = core::mem::size_of::<carrick_syscall_abi::LinuxX8664Stat>();
 /// Linux `UIO_MAXIOV`.
 pub const LINUX_UIO_MAXIOV: u64 = 1024;
 /// Linux `PATH_MAX`, including the terminating NUL.
@@ -104,6 +106,7 @@ pub enum HostFileCall {
     Fstat {
         fd: i32,
         statbuf: u64,
+        layout: StatLayout,
     },
     Openat {
         dirfd: i32,
@@ -165,6 +168,7 @@ pub enum HostFileCall {
         path: u64,
         statbuf: u64,
         flags: u64,
+        layout: StatLayout,
     },
     Statx {
         dirfd: i32,
@@ -287,6 +291,12 @@ impl HostFileCall {
             c if c == nr::FSTAT => Self::Fstat {
                 fd,
                 statbuf: args[1],
+                layout: StatLayout::Generic,
+            },
+            c if c.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_FSTAT => Self::Fstat {
+                fd,
+                statbuf: args[1],
+                layout: StatLayout::X8664,
             },
             c if c == nr::OPENAT => Self::Openat {
                 dirfd: fd,
@@ -354,7 +364,17 @@ impl HostFileCall {
                 path: args[1],
                 statbuf: args[2],
                 flags: args[3],
+                layout: StatLayout::Generic,
             },
+            c if c.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_NEWFSTATAT => {
+                Self::Newfstatat {
+                    dirfd: fd,
+                    path: args[1],
+                    statbuf: args[2],
+                    flags: args[3],
+                    layout: StatLayout::X8664,
+                }
+            }
             c if c == nr::STATX => Self::Statx {
                 dirfd: fd,
                 path: args[1],
@@ -420,7 +440,84 @@ pub trait HostFileUser {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostFileOutput {
     pub address: u64,
+    /// The bytes the caller's user buffer holds.
     pub len: usize,
+    /// How the carrier's reply is encoded for the caller's ABI.
+    pub layout: OutputLayout,
+}
+
+/// The caller's encoding of a carrier reply. The carrier always replies in
+/// the canonical (asm-generic) layout; the ring that owns the caller's ABI
+/// re-encodes it on completion, as the ring's own stat writers do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputLayout {
+    /// The reply's bytes, unchanged.
+    Bytes,
+    /// An asm-generic `struct stat` reply the caller reads as x86_64's
+    /// 144-byte `struct stat` (`fstat`/`newfstatat` on x86_64).
+    X8664Stat,
+}
+
+impl HostFileOutput {
+    /// `len` bytes copied back unchanged.
+    pub const fn bytes(address: u64, len: usize) -> Self {
+        Self {
+            address,
+            len,
+            layout: OutputLayout::Bytes,
+        }
+    }
+
+    /// A `struct stat` in the caller's `layout`.
+    pub const fn stat(address: u64, layout: StatLayout) -> Self {
+        match layout {
+            StatLayout::Generic => Self::bytes(address, LINUX_STAT_BYTES),
+            StatLayout::X8664 => Self {
+                address,
+                len: X8664_STAT_BYTES,
+                layout: OutputLayout::X8664Stat,
+            },
+        }
+    }
+
+    /// The reply area the carrier fills: the canonical record's size,
+    /// whatever the caller's encoding.
+    pub const fn reply_capacity(self) -> usize {
+        match self.layout {
+            OutputLayout::Bytes => self.len,
+            OutputLayout::X8664Stat => LINUX_STAT_BYTES,
+        }
+    }
+
+    /// Re-encode a canonical reply for the caller. `None` for a reply this
+    /// layout cannot hold.
+    fn encode(self, reply: &[u8]) -> Option<alloc::borrow::Cow<'_, [u8]>> {
+        match self.layout {
+            OutputLayout::Bytes => {
+                (reply.len() <= self.len).then_some(alloc::borrow::Cow::Borrowed(reply))
+            }
+            OutputLayout::X8664Stat => {
+                let stat =
+                    <carrick_syscall_abi::LinuxStat as zerocopy::FromBytes>::read_from_bytes(reply)
+                        .ok()?;
+                Some(alloc::borrow::Cow::Owned(
+                    zerocopy::IntoBytes::as_bytes(
+                        &carrick_syscall_abi::LinuxX8664Stat::from_generic(&stat),
+                    )
+                    .to_vec(),
+                ))
+            }
+        }
+    }
+}
+
+/// Which `struct stat` a decoded `fstat`/`newfstatat` writes: the canonical
+/// asm-generic record, or x86_64's legacy-order record its private ordinals
+/// name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatLayout {
+    Generic,
+    X8664,
 }
 
 /// The ring's routing decision for one decoded call.
@@ -507,6 +604,10 @@ fn in_zone_stat(op: HostFileOp, kind: InZoneKind, output: HostFileOutput) -> Hos
             zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStatx::from_fields(&fields))
                 .into()
         }
+        _ if output.layout == OutputLayout::X8664Stat => zerocopy::IntoBytes::as_bytes(
+            &carrick_syscall_abi::LinuxX8664Stat::from_fields(&fields),
+        )
+        .into(),
         _ => zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStat::from_fields(&fields))
             .into(),
     };
@@ -573,7 +674,7 @@ impl Staging<'_, '_> {
         input: &[u8],
         output: Option<HostFileOutput>,
     ) -> HostFileStage {
-        let output_cap = output.map_or(0, |output| output.len);
+        let output_cap = output.map_or(0, HostFileOutput::reply_capacity);
         self.request_with_reply(op, fd, flags, args, input, output, output_cap)
     }
 
@@ -856,15 +957,16 @@ fn stage_call(
         HostFileCall::Writev { fd, iov, iovcnt } => {
             return staging.write(fd, user, |user| gather_vectors(user, iov, iovcnt));
         }
-        HostFileCall::Fstat { fd, statbuf } => staging.descriptor_stat(
+        HostFileCall::Fstat {
+            fd,
+            statbuf,
+            layout,
+        } => staging.descriptor_stat(
             HostFileOp::Fstat,
             fd,
             0,
             [0; 4],
-            HostFileOutput {
-                address: statbuf,
-                len: LINUX_STAT_BYTES,
-            },
+            HostFileOutput::stat(statbuf, layout),
         )?,
         HostFileCall::Renameat {
             olddirfd,
@@ -1173,15 +1275,13 @@ fn stage_call(
             path,
             statbuf,
             flags,
+            layout,
         } => {
             let path = match copy_path(user, path) {
                 Path::Bytes(path) => path,
                 Path::Stage(stage) => return Some(stage),
             };
-            let output = HostFileOutput {
-                address: statbuf,
-                len: LINUX_STAT_BYTES,
-            };
+            let output = HostFileOutput::stat(statbuf, layout);
             if path.is_empty() {
                 if flags as u32 & LINUX_AT_EMPTY_PATH == 0 {
                     return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
@@ -1214,10 +1314,7 @@ fn stage_call(
                 Path::Bytes(path) => path,
                 Path::Stage(stage) => return Some(stage),
             };
-            let output = HostFileOutput {
-                address: buf,
-                len: LINUX_STATX_BYTES,
-            };
+            let output = HostFileOutput::bytes(buf, LINUX_STATX_BYTES);
             if path.is_empty() {
                 if flags as u32 & LINUX_AT_EMPTY_PATH == 0 {
                     return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
@@ -1269,10 +1366,7 @@ fn stage_call(
                 0,
                 [0; 4],
                 &[],
-                Some(HostFileOutput {
-                    address: buf,
-                    len: chunk(count),
-                }),
+                Some(HostFileOutput::bytes(buf, chunk(count))),
             ),
         },
         HostFileCall::Pread {
@@ -1298,10 +1392,7 @@ fn stage_call(
                 0,
                 [offset, 0, 0, 0],
                 &[],
-                Some(HostFileOutput {
-                    address: buf,
-                    len: chunk(count),
-                }),
+                Some(HostFileOutput::bytes(buf, chunk(count))),
             ),
         },
         HostFileCall::Lseek { fd, offset, whence } => match staging.descriptor(fd)? {
@@ -1323,10 +1414,7 @@ fn stage_call(
                 0,
                 [0; 4],
                 &[],
-                Some(HostFileOutput {
-                    address: dirp,
-                    len: chunk(count),
-                }),
+                Some(HostFileOutput::bytes(dirp, chunk(count))),
             ),
         },
         HostFileCall::Ioctl { fd, request } => match staging.descriptor(fd)? {
@@ -1510,7 +1598,7 @@ fn stage_ppoll(
         0,
         [wait.raw(), 0, 0, 0],
         &entries,
-        Some(HostFileOutput { address: fds, len }),
+        Some(HostFileOutput::bytes(fds, len)),
     ))
 }
 
@@ -1582,10 +1670,10 @@ pub fn complete(
         return SyscallResult::new(reply.result);
     }
     if let Some(output) = output {
-        if reply.output.len() > output.len {
+        let Some(bytes) = output.encode(reply.output) else {
             return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
-        }
-        if !reply.output.is_empty() && !copy_out(output.address, reply.output) {
+        };
+        if !bytes.is_empty() && !copy_out(output.address, &bytes) {
             return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT);
         }
     }

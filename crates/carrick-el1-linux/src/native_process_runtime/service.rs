@@ -1358,12 +1358,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         call: NativeServiceCall<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
         let result = if self.host_root_retains_filesystem() {
-            use carrick_core_abi::host_file::{HostFileOp, HostFileRequestView};
-            let op = HostFileRequestView::parse(&mut record)
-                .map_err(|_| NativeProcessError::Invalid)?
-                .header()
-                .op;
-            if chdir || matches!(op, HostFileOp::Write) {
+            // The carrier retains the root's resource custody (#1714 option
+            // A): it resolves paths with the root's filesystem authority and
+            // stamps a write's `RLIMIT_FSIZE` from the root's own limits, so
+            // the record crosses unstamped. Only the cwd stays the host's.
+            carrick_core_abi::host_file::HostFileRequestView::parse(&mut record)
+                .map_err(|_| NativeProcessError::Invalid)?;
+            if chdir {
                 call.counters.record_refusal(
                     call.ordinal,
                     carrick_core_abi::service::ServiceOrigin::Initial,
