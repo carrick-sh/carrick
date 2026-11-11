@@ -16284,6 +16284,7 @@ fn futex_owner_wait_episode(
     if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
         work.settled();
     }
+    let _ = fixture.task.linux.take_served_boundary();
     // The adopted sibling executes the production futex dispatcher. WAKE must
     // be address-only: HardwareUserWord cannot dereference this synthetic VA.
     run_as(fixture, 42, 12, 102, sibling);
@@ -16659,4 +16660,675 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
     let next_child = runtime.namespace_child_key(parent, next_pid).unwrap();
     assert_eq!(next_child.id, child.id, "fully released number is reusable");
     assert_ne!(next_child.serial, child.serial, "reuse starts a new task");
+}
+
+#[test]
+fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
+    use carrick_abi::{
+        LINUX_AT_FDCWD, LINUX_F_DUPFD, LINUX_O_CREAT, LINUX_O_TRUNC, LINUX_O_WRONLY, LinuxStat,
+    };
+    use carrick_core_abi::service::ServiceOrigin;
+    use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_personality_linux::native_host_file::{
+        DescriptionAccess, HostFileStage, NativeDescriptor,
+    };
+    use carrick_test_support::GuestUserBuffer;
+    use std::sync::Arc;
+
+    struct HostPointerMemory;
+    impl GuestMemory for HostPointerMemory {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if address == 0 {
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            // SAFETY: test passes live GuestUserBuffer host addresses.
+            let slice = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
+            Ok(slice.to_vec())
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            if address == 0 {
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                });
+            }
+            // SAFETY: test passes live GuestUserBuffer host addresses.
+            let slice = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, bytes.len()) };
+            slice.copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for HostPointerMemory {}
+
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner: &'static _ = Box::leak(Box::new(context.kernel().ipc().unwrap()));
+    let files = context.resources().files();
+
+    let root_table_key = files.id().raw();
+    let fixture: &'static Fixture = Box::leak(Box::new(Fixture::with_file_table(
+        0x10000,
+        asid(1),
+        root_table_key,
+    )));
+
+    let map = unsafe {
+        &*fixture
+            .region
+            .ptr
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    files.publish_ipc(Arc::clone(owner), map).unwrap();
+
+    let pages: Vec<_> = (0..16).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = Box::new(TestStockCrossing::new(&pages));
+    crossing.ipc = Some((Arc::clone(owner), map));
+    let crossing: &'static TestStockCrossing = Box::leak(crossing);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let tables: &'static _ = Box::leak(Box::new(crate::ipc::MapTables(map)));
+    let venue = crate::ipc::IpcVenue {
+        region: owner.region(),
+        tables,
+    };
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        crossing,
+    )
+    .with_words(words);
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let mut host_mem = HostPointerMemory;
+    let reporter = carrick_kernel::compat::CompatReporter::default();
+
+    let mut call_root = |nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            elr: 0x4000,
+            slot: u64::from(fixture.slot.raw()),
+            ..Default::default()
+        };
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        let route =
+            super::dispatch::dispatch_arm_syscall_with_native_process(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &cache,
+                None::<
+                    crate::dispatch::Zone<
+                        '_,
+                        crate::sched::FakeCpu,
+                        crate::sched::HardwareUserWord,
+                    >,
+                >,
+                Some(&venue),
+                Some(fixture),
+                fixture.page,
+                fixture.control,
+                &ThreadCtx::ZERO,
+                ttbr0,
+                &mut service,
+                |_| core::ptr::null_mut(),
+            )
+            .unwrap();
+        let ret = if route == CompletionRoute::Forward {
+            match dispatcher
+                .dispatch(
+                    &context,
+                    carrick_kernel::dispatch::SyscallRequest::new(
+                        nr,
+                        carrick_kernel::compat::SyscallArgs(args),
+                    ),
+                    &mut host_mem,
+                    &reporter,
+                )
+                .unwrap()
+            {
+                carrick_kernel::dispatch::DispatchOutcome::Returned { value } => value,
+                carrick_kernel::dispatch::DispatchOutcome::Errno { errno } => errno.guest_retval(),
+                other => panic!("unexpected host dispatch outcome for nr={nr}: {other:?}"),
+            }
+        } else {
+            frame.x[0] as i64
+        };
+        (route, ret)
+    };
+
+    let out_path = GuestUserBuffer::from_bytes(b"/dev/null\0");
+    let (open_route, opened_fd) = call_root(
+        56,
+        [
+            LINUX_AT_FDCWD,
+            out_path.arg(),
+            LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_TRUNC,
+            0o600,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(open_route, CompletionRoute::Forward);
+    assert_eq!(opened_fd, 3);
+
+    // Shell builtin redirection sequence:
+    // fcntl(1, F_DUPFD, 10) -> dup3(3, 1, 0) -> dup3(10, 1, 0) -> close(10).
+    let (dupfd_route, saved_stdout) = call_root(25, [1, LINUX_F_DUPFD, 10, 0, 0, 0]);
+    assert_eq!(saved_stdout, 10);
+    let (redir_route, redir_ret) = call_root(24, [3, 1, 0, 0, 0, 0]);
+    assert_eq!(redir_ret, 1);
+    let (restore_route, restore_ret) = call_root(24, [10, 1, 0, 0, 0, 0]);
+    assert_eq!(restore_ret, 1);
+    let (close_route, close_ret) = call_root(57, [10, 0, 0, 0, 0, 0]);
+    assert_eq!(close_ret, 0);
+
+    // Clone child through production ARM native process admission/fork.
+    let (clone_route, child_pid) = call_root(220, [17, 0, 0, 0, 0, 0]);
+    assert_eq!(clone_route, CompletionRoute::WithWork);
+    assert!(child_pid > 0, "clone failed with {child_pid}");
+    if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    let _ = fixture.task.linux.take_served_boundary();
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .expect("clone admitted root into production registry");
+    let parent_key = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child_key = runtime
+        .namespace_child_key(parent_key, child_pid as u32)
+        .unwrap();
+    let child_binding = runtime.task_binding(child_key).unwrap();
+    let child_identity = fixture.zone.record(child_binding.record.id).identity();
+    let selected = activate_target(source, &fixture.task, &child_binding);
+    assert_eq!(selected.record, child_binding.record.id);
+
+    let child_table = crate::ipc::native_table(&venue, &fixture.task)
+        .expect("fork child owns a published ring descriptor table");
+    assert_eq!(
+        crate::ipc::native_descriptor(&venue, child_table, 1),
+        Some(NativeDescriptor::HostBacked {
+            access: DescriptionAccess::ReadWrite,
+        }),
+        "child fd 1 resolves in fd-core as HostBacked (not None)"
+    );
+    assert_eq!(
+        crate::ipc::native_descriptor(&venue, child_table, 10),
+        Some(NativeDescriptor::Absent),
+        "closed saved stdout fd 10 must be absent in child"
+    );
+
+    let mut cpu = crate::sched::FakeCpu::default();
+    let mut run_child_host_file = |nr: u64, args: [u64; 6]| -> i64 {
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            elr: 0x4004,
+            slot: u64::from(fixture.slot.raw()),
+            ..Default::default()
+        };
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        let saved = unsafe { runtime.record_binding(child_binding.record) }
+            .unwrap()
+            .words;
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                child_binding.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crossing.fd_map(),
+            &[],
+            crossing.open_table(),
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            None,
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        drop(entry);
+        assert_eq!(
+            route,
+            CompletionRoute::Forward,
+            "child syscall {nr} must decline in-ring pipe family to stage host-file request"
+        );
+        let stage = crate::dispatch::native_host_file_stage(
+            &frame,
+            &fixture.task,
+            &crate::file::HardwareValidator,
+            child_table,
+            ServiceOrigin::Descendant,
+            |fd| crate::ipc::native_descriptor(&venue, child_table, fd),
+            &mut |_| 0,
+        );
+        match stage {
+            Some(HostFileStage::Request {
+                mut record, output, ..
+            }) => match dispatcher.serve_native_host_file(&mut record) {
+                Ok(_) => {
+                    let parsed = carrick_core_abi::host_file::reply(&record)
+                        .expect("served host-file record must contain a valid reply");
+                    if let Some(out) = output
+                        && !parsed.output.is_empty()
+                    {
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                out.address as *mut u8,
+                                parsed.output.len(),
+                            )
+                        };
+                        dst.copy_from_slice(parsed.output);
+                    }
+                    parsed.result
+                }
+                Err(_) => carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+            },
+            Some(HostFileStage::Returned(res)) => res.raw(),
+            other => panic!("unexpected child stage for nr={nr}: {other:?}"),
+        }
+    };
+
+    let stat_buf = GuestUserBuffer::zeroed(core::mem::size_of::<LinuxStat>());
+    let fstat_ret = run_child_host_file(80, [1, stat_buf.arg(), 0, 0, 0, 0]);
+    let msg = GuestUserBuffer::from_bytes(b"child-ok\n");
+    let write_ret = run_child_host_file(64, [1, msg.arg(), 9, 0, 0, 0]);
+
+    assert_eq!(
+        fstat_ret, 0,
+        "child fstat(1) after root redirect+restore returned {fstat_ret} (ENOSYS = -38)"
+    );
+    assert_eq!(
+        write_ret, 9,
+        "child write(1) after root redirect+restore returned {write_ret} (ENOSYS = -38)"
+    );
+    assert_eq!(dispatcher.stdout(), b"child-ok\n");
+    assert_eq!(
+        (dupfd_route, redir_route, restore_route, close_route),
+        (
+            CompletionRoute::Served,
+            CompletionRoute::Served,
+            CompletionRoute::Served,
+            CompletionRoute::Served,
+        ),
+        "root dup/fcntl/close must be served in ring"
+    );
+    assert_ne!(child_identity.file_table, root_table_key);
+    registry().unregister_root_for_test(&runtime);
+}
+
+#[test]
+fn arm_two_live_processes_dup_and_close_isolate_tables() {
+    use carrick_abi::{LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_SETFD, LINUX_FD_CLOEXEC};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use std::sync::Arc;
+
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner: &'static _ = Box::leak(Box::new(context.kernel().ipc().unwrap()));
+    let files = context.resources().files();
+
+    let root_table_key = files.id().raw();
+    let fixture: &'static Fixture = Box::leak(Box::new(Fixture::with_file_table(
+        0x10000,
+        asid(1),
+        root_table_key,
+    )));
+
+    let map = unsafe {
+        &*fixture
+            .region
+            .ptr
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    files.publish_ipc(Arc::clone(owner), map).unwrap();
+
+    let pages: Vec<_> = (0..16).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = Box::new(TestStockCrossing::new(&pages));
+    crossing.ipc = Some((Arc::clone(owner), map));
+    let crossing: &'static TestStockCrossing = Box::leak(crossing);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let tables: &'static _ = Box::leak(Box::new(crate::ipc::MapTables(map)));
+    let venue = crate::ipc::IpcVenue {
+        region: owner.region(),
+        tables,
+    };
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        crossing,
+    )
+    .with_words(words);
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+
+    // Clone so root and child are two live processes with distinct tables.
+    let mut clone_frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        elr: 0x4000,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    clone_frame.x[0] = 17;
+    clone_frame.x[8] = 220;
+    let clone_route = super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut clone_frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        crossing.fd_map(),
+        &[],
+        crossing.open_table(),
+        &[],
+        &cache,
+        None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+        Some(&venue),
+        Some(fixture),
+        fixture.page,
+        fixture.control,
+        &ThreadCtx::ZERO,
+        ttbr0,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    assert_eq!(clone_route, CompletionRoute::WithWork);
+    let child_pid = clone_frame.x[0] as i64;
+    assert!(child_pid > 0);
+    if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    let _ = fixture.task.linux.take_served_boundary();
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let parent_key = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child_key = runtime
+        .namespace_child_key(parent_key, child_pid as u32)
+        .unwrap();
+    let parent_binding = runtime.task_binding(parent_key).unwrap();
+    let child_binding = runtime.task_binding(child_key).unwrap();
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
+    let mut cpu = crate::sched::FakeCpu::default();
+
+    // Also create a second independent live root process (never cloned) with its own
+    // published host-binding table in the same HostIpc + IpcTableMap, proving both
+    // root/root and root/child table isolation through production ARM dispatch.
+    let table_b = carrick_kernel::el1_ipc::HostTable::create(Arc::clone(owner), 64, 8).unwrap();
+    for stdio_fd in 0..=2 {
+        owner
+            .install_host_description(
+                table_b.id(),
+                Box::new(stdio_fd),
+                carrick_el1_abi::ipc::fd::AccessMode::ReadWrite,
+                carrick_el1_abi::ipc::fd::StatusFlags::default(),
+                false,
+            )
+            .unwrap();
+    }
+    let root_b_actual_key = 7;
+    map.publish(root_b_actual_key, table_b.id().to_raw())
+        .unwrap();
+    let page_b = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    let control_b = Box::leak(Box::new(ThreadControlSlot::new()));
+    let fixture_b: &'static Fixture = Box::leak(Box::new(Fixture::with_identity(
+        0x30000,
+        asid(2),
+        page_b,
+        control_b,
+        ThreadIdentity {
+            tid: 77,
+            serial: 202,
+            mm: 2,
+            file_table: root_b_actual_key,
+            generation: 22,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: page_b as *const _ as u64,
+            control_slot: control_b as *const _ as u64,
+        },
+    )));
+    let words_b = Box::leak(Box::new(fixture_b.tables.live(&fixture_b.maintenance)));
+    let mut service_b = Aarch64NativeProcessService::with_crossing(
+        &fixture_b.task,
+        fixture_b.slot,
+        fixture_b.zone,
+        fixture_b.region.table(),
+        NonZeroU64::MIN,
+        crossing,
+    )
+    .with_words(words_b);
+    let ttbr0_b = (u64::from(asid(2).raw()) << 48) | fixture_b.address.root.address().raw();
+    let mut call_root_b = |nr: u64, args: [u64; 6]| -> (CompletionRoute, i64) {
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            elr: 0x400c,
+            slot: u64::from(fixture_b.slot.raw()),
+            ..Default::default()
+        };
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        let route =
+            super::dispatch::dispatch_arm_syscall_with_native_process(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture_b.task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &cache,
+                None::<
+                    crate::dispatch::Zone<
+                        '_,
+                        crate::sched::FakeCpu,
+                        crate::sched::HardwareUserWord,
+                    >,
+                >,
+                Some(&venue),
+                Some(fixture_b),
+                fixture_b.page,
+                fixture_b.control,
+                &ThreadCtx::ZERO,
+                ttbr0_b,
+                &mut service_b,
+                |_| core::ptr::null_mut(),
+            )
+            .unwrap();
+        (route, frame.x[0] as i64)
+    };
+
+    // Uncloned root_b serves dup/fcntl/close in-ring in its own table without
+    // touching root_a or child.
+    assert_eq!(
+        call_root_b(23, [1, 0, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 3),
+        "live uncloned root_b dup(1) must serve in-ring -> fd 3"
+    );
+    assert_eq!(
+        call_root_b(57, [1, 0, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 0),
+        "live uncloned root_b close(1) with fd 3 retained must complete in-ring without host work"
+    );
+    assert_eq!(
+        call_root_b(57, [0, 0, 0, 0, 0, 0]),
+        (CompletionRoute::WithWork, 0),
+        "live uncloned root_b close(0) must retire last reference in-ring and ring release work"
+    );
+    let _ = fixture_b.task.linux.take_served_boundary();
+    assert!(fixture_b.task.linux.take_host_work_doorbell().is_some());
+    assert_eq!(
+        call_root_b(25, [0, LINUX_F_GETFD, 0, 0, 0, 0]),
+        (CompletionRoute::Served, -9),
+        "root_b fd 0 must be closed (-EBADF)"
+    );
+
+    let mut call_process = |target: &super::native_process_runtime::NativeRecordBinding<
+        AddressContext<RootGpa>,
+        Aarch64ParkedContext,
+    >,
+                            nr: u64,
+                            args: [u64; 6]|
+     -> (CompletionRoute, i64) {
+        if fixture.zone.slot(fixture.slot).current() != Some(target.record.id) {
+            if let Some(current) = fixture.zone.slot(fixture.slot).current() {
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(fixture.slot, current)
+                        .is_queued()
+                );
+            }
+            activate_target(source, &fixture.task, target);
+        }
+        let ctx = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, target.address);
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x15 << 26,
+            elr: 0x4008,
+            slot: u64::from(fixture.slot.raw()),
+            ..Default::default()
+        };
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        let mut entry = runtime
+            .enter(source, &fixture.task, ctx, &mut service)
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crossing.fd_map(),
+            &[],
+            crossing.open_table(),
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            Some(fixture),
+            Some(&mut entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        drop(entry);
+        (route, frame.x[0] as i64)
+    };
+
+    // Root duplicates fd 1 -> 3, marks fd 3 CLOEXEC, closes fd 1.
+    assert_eq!(
+        call_process(&parent_binding, 23, [1, 0, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 3)
+    );
+    assert_eq!(
+        call_process(
+            &parent_binding,
+            25,
+            [3, LINUX_F_SETFD, LINUX_FD_CLOEXEC, 0, 0, 0]
+        ),
+        (CompletionRoute::Served, 0)
+    );
+    assert_eq!(
+        call_process(&parent_binding, 57, [1, 0, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 0)
+    );
+
+    // Child's table is unaffected: fd 1 is still open (F_GETFD == 0) and fd 3 is absent (-EBADF).
+    assert_eq!(
+        call_process(&child_binding, 25, [1, LINUX_F_GETFD, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 0)
+    );
+    assert_eq!(
+        call_process(&child_binding, 25, [3, LINUX_F_GETFD, 0, 0, 0, 0]),
+        (CompletionRoute::Served, -9)
+    );
+
+    // Child duplicates fd 1 -> 12 with F_DUPFD_CLOEXEC and closes fd 2; root is unaffected.
+    assert_eq!(
+        call_process(&child_binding, 25, [1, LINUX_F_DUPFD_CLOEXEC, 12, 0, 0, 0]),
+        (CompletionRoute::Served, 12)
+    );
+    assert_eq!(
+        call_process(&child_binding, 57, [2, 0, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 0)
+    );
+    assert_eq!(
+        call_process(&parent_binding, 25, [2, LINUX_F_GETFD, 0, 0, 0, 0]),
+        (CompletionRoute::Served, 0)
+    );
+    assert_eq!(
+        call_process(&parent_binding, 25, [12, LINUX_F_GETFD, 0, 0, 0, 0]),
+        (CompletionRoute::Served, -9)
+    );
+    assert_eq!(
+        call_process(&parent_binding, 25, [3, LINUX_F_GETFD, 0, 0, 0, 0]),
+        (CompletionRoute::Served, LINUX_FD_CLOEXEC as i64)
+    );
+
+    if let Ok(runtime_b) = registry().for_entry(
+        BornInZoneSource {
+            zone: fixture_b.zone,
+            slot: fixture_b.slot,
+        },
+        &fixture_b.task,
+        fixture_b.address,
+    ) {
+        registry().unregister_root_for_test(&runtime_b);
+    }
+    registry().unregister_root_for_test(&runtime);
 }
