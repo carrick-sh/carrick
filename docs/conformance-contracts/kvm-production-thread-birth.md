@@ -90,9 +90,11 @@ and merge-group lane. Worker gate evidence is recorded on draft PR #1902.
 ## Clear-tid placement custody (#1902, round 5)
 
 The native syscall and clear-child-tid callers share `wake_native_futex`.
-It reuses the scheduler's `wake_host` transfer and `place_native_handback`
-queue custody when `wake_placed` reports `Unplaceable`, without changing the
-caller's MM, key, mask or count. No new queue, poll or retry is introduced.
+It makes one `wake_placed` call, which never refuses (#1941), without
+changing the caller's MM, key, mask or count. A joiner no guest slot may run
+is queued on the waker, misplaced; the waker's host boundary relocates it into
+`place_native_handback` queue custody. No new queue, poll or retry is
+introduced.
 The existing syscall adapter's mask/count witness remains authoritative;
 clear-tid retains the shared-on-private key and CHILD_TID wake constants.
 
@@ -100,9 +102,10 @@ The two `native_clear_tid_stopped_join_driver_*` bindings enroll a timed
 join through a registered native futex entry, authenticate a published Born
 sibling through the production registry, and dispatch its raw nonfinal exit
 through the common lifecycle owner. They stop the only eligible join driver
-and require `Unplaceable` before exit. Exit must retire in ring with no host
-custody or service notice, clear the TID once, and retain exactly one join
-completion until the driver returns. The schedule uses fixed scheduler steps
+and require the joiner queued misplaced on the exiting member's slot after
+exit. Exit must retire in ring with no host custody or service notice, clear
+the TID once, and retain exactly one join completion, through relocation and
+native handback, until the driver returns. The schedule uses fixed scheduler steps
 on AArch64/Aarch64Mmu and x86/X86Mmu contexts, with no host blocking waits.
 
 These bindings were red on `e9afb2e70a` production code: both observed
