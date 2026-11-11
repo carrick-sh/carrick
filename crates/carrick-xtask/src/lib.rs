@@ -39,6 +39,7 @@ mod redaction;
 pub mod remote_accept;
 pub mod remote_lock;
 pub mod safe_copy;
+pub mod scoreboard;
 pub mod signed_gate;
 pub mod signed_phase;
 pub mod signed_receipt;

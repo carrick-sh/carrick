@@ -63,6 +63,10 @@ pub enum Commands {
     CiReceipt(crate::ci_receipt::ReceiptArgs),
     #[command(about = "Authorize, execute and publish the on-demand signed Actions gate")]
     SignedGate(crate::signed_gate::SignedGateArgs),
+    #[command(
+        about = "Score Python, Node and Go rows against a carrick binary; writes a JSON receipt"
+    )]
+    Scoreboard(crate::scoreboard::ScoreboardArgs),
     #[cfg(feature = "smoke-signed")]
     #[command(
         about = "Signed first-boot smoke (carrick-embed smoke_signed) with an exact-HEAD receipt"
@@ -326,6 +330,8 @@ pub enum CliError {
     SignedPhase(#[from] crate::signed_phase::SignedPhaseError),
     #[error("stress-capture: {0}")]
     StressCapture(#[from] crate::stress_capture::Error),
+    #[error("scoreboard: {0}")]
+    Scoreboard(#[from] crate::scoreboard::ScoreboardError),
     #[cfg(feature = "smoke-signed")]
     #[error("smoke-signed: {0}")]
     SmokeSigned(#[from] crate::smoke_signed::SmokeSignedError),
@@ -575,6 +581,11 @@ where
         Commands::SignedGate(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::signed_gate::run(&root, args)?;
+            Ok(())
+        }
+        Commands::Scoreboard(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::scoreboard::run(&root, args, &mut std::io::stdout())?;
             Ok(())
         }
         #[cfg(feature = "smoke-signed")]

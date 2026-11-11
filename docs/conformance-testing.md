@@ -409,6 +409,27 @@ should graduate to an owned probe row.
 > `cpython-parity.py --jsonl` *appends* — dedupe last-wins per module when
 > reading the file back.
 
+### Goal scoreboard
+
+The project's goal metric is whether Python, Node and Go run real programs on
+carrick. `carrick-xtask scoreboard` measures it against one signed binary:
+
+```
+cargo run -p carrick-xtask -- scoreboard --carrick target/release/carrick \
+    --out scoreboard.json [--rows py-version,go-hello] [--sha <main-sha>]
+```
+
+It runs eight rows (`py-version`, `py-thread`, `py-fork`, `py-subproc`,
+`node-version`, `node-child`, `go-version`, `go-hello`), each with stdin from
+`/dev/null`, a 120 s bound (`--bound-secs`; a timeout reads as exit 142, 128 +
+SIGALRM) and its own `CARRICK_RUN_ID` (`score-<row>`). After each row the guest
+is reaped by run id through `sudo -n scripts/sudo/kill.sh <run-id>`. The table
+goes to stdout; the JSON receipt (`carrick.scoreboard.v1`) records the main
+SHA, the binary SHA-256 and per row the name, exit code, pass/fail, first
+stdout line and last stderr line. Per-row raw output lands in `<out>.rows/`.
+The command exits 0 even when rows fail: the score is data, not a gate. The
+glibc-vs-musl thread census is not part of it.
+
 ---
 
 ## Local registries
