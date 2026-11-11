@@ -1,6 +1,9 @@
+#![allow(clippy::expect_used, clippy::panic)]
+
 mod frame_budget;
 
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 pub(crate) fn get_sysroot(cargo: &Path) -> Result<String, String> {
@@ -365,29 +368,243 @@ fn main() {
         "cargo:warning=EL1 image budget: {image_size} bytes loaded / {limit} bytes; {headroom} bytes headroom"
     );
 
-    println!("cargo:rerun-if-changed=frame_budget.rs");
-    println!("cargo:rerun-if-changed=../carrick-el1-linux/src");
-    println!("cargo:rerun-if-changed=../carrick-el1-linux/link.ld");
-    println!("cargo:rerun-if-changed=../carrick-el1-linux/build.rs");
-    println!("cargo:rerun-if-changed=../carrick-el1-linux/Cargo.toml");
-    println!("cargo:rerun-if-changed=../carrick-el1/src");
-    println!("cargo:rerun-if-changed=../carrick-el1/Cargo.toml");
-    println!("cargo:rerun-if-changed=../carrick-el1-abi/src");
-    println!("cargo:rerun-if-changed=../carrick-el1-abi/Cargo.toml");
-    // Every crate compiled into the image: a missed dependency here embeds a
-    // stale image whose object layout silently disagrees with the host.
-    println!("cargo:rerun-if-changed=../carrick-inotify-core/src");
-    println!("cargo:rerun-if-changed=../carrick-inotify-core/Cargo.toml");
-    println!("cargo:rerun-if-changed=../carrick-mmu-core/src");
-    println!("cargo:rerun-if-changed=../carrick-mmu-core/Cargo.toml");
-    println!("cargo:rerun-if-changed=../carrick-sched-core/src");
-    println!("cargo:rerun-if-changed=../carrick-sched-core/Cargo.toml");
-    println!("cargo:rerun-if-changed=../carrick-core/src");
-    println!("cargo:rerun-if-changed=../carrick-core/Cargo.toml");
-    println!("cargo:rerun-if-changed=../carrick-core-abi/src");
-    println!("cargo:rerun-if-changed=../carrick-core-abi/Cargo.toml");
-    println!("cargo:rerun-if-changed=../carrick-personality-api/src");
-    println!("cargo:rerun-if-changed=../carrick-personality-api/Cargo.toml");
-    println!("cargo:rerun-if-changed=../carrick-personality-linux/src");
-    println!("cargo:rerun-if-changed=../carrick-personality-linux/Cargo.toml");
+    // Derive rerun-if-changed from the nested build's Makefile-style dep-info
+    // (`carrick-el1.d`) so new workspace dependencies cannot be omitted by a
+    // hand-written crate list, which would embed a stale ring image whose
+    // object layout disagrees with the host. Emit every workspace source file
+    // reported by rustc/Cargo, plus each closure crate's `Cargo.toml`, `src`
+    // directory, and (when present) `build.rs` and `link.ld`, alongside
+    // `frame_budget.rs`, `../carrick-el1-linux/link.ld`, and `../../Cargo.lock`.
+    let depfile_path = el1_target_dir.join("aarch64-unknown-none-softfloat/release/carrick-el1.d");
+    let depfile_text = read_depfile(&depfile_path).unwrap_or_else(|error| panic!("{error}"));
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("carrick-el1-image must reside under crates/ in the workspace");
+    let watch_list = derive_watch_list(
+        &depfile_text,
+        manifest_dir,
+        workspace_root,
+        Path::new(&out_dir),
+        Path::new(&sysroot),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    for path in watch_list {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+fn read_depfile(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read EL1 dep-info {}: {error}", path.display()))
+}
+
+/// Parse a Makefile-style `.d` dep-info file into its prerequisite paths.
+///
+/// Handles `\`-continued lines (`\\\n` and `\\\r\n`), `\ ` escaped spaces,
+/// `\\` escaped backslashes, `\#` and `\:` escaped punctuation, `#` comment
+/// lines, and phony target rules (`path/to/file.rs:`).
+pub(crate) fn parse_depfile(text: &str) -> Vec<PathBuf> {
+    let continued = text.replace("\\\r\n", " ").replace("\\\n", " ");
+    let mut prerequisites = Vec::new();
+    for line in continued.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let mut in_prerequisites = false;
+        let mut current = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => match chars.peek().copied() {
+                    Some(' ' | '\\' | '#' | ':') => {
+                        if let Some(escaped) = chars.next() {
+                            current.push(escaped);
+                        }
+                    }
+                    _ => current.push('\\'),
+                },
+                ':' if !in_prerequisites
+                    && !(current.len() == 1
+                        && current.as_bytes()[0].is_ascii_alphabetic()
+                        && matches!(chars.peek(), Some('/' | '\\'))) =>
+                {
+                    current.clear();
+                    in_prerequisites = true;
+                }
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        let token = std::mem::take(&mut current);
+                        if in_prerequisites {
+                            prerequisites.push(PathBuf::from(token));
+                        }
+                    }
+                }
+                c => current.push(c),
+            }
+        }
+        if in_prerequisites && !current.is_empty() {
+            prerequisites.push(PathBuf::from(current));
+        }
+    }
+    prerequisites
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn relative_path_from(base: &Path, target: &Path) -> PathBuf {
+    let base_components: Vec<_> = base.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+    let common = base_components
+        .iter()
+        .zip(&target_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in common..base_components.len() {
+        relative.push("..");
+    }
+    for component in &target_components[common..] {
+        relative.push(component.as_os_str());
+    }
+    if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative
+    }
+}
+
+/// Derive the sorted, deduplicated `cargo:rerun-if-changed` watch list (relative
+/// to `manifest_dir`) from the nested EL1 build's dep-info text.
+pub(crate) fn derive_watch_list(
+    depfile_text: &str,
+    manifest_dir: &Path,
+    workspace_root: &Path,
+    out_dir: &Path,
+    sysroot: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let raw_ws = lexical_normalize(workspace_root);
+    let canon_ws = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| raw_ws.clone());
+    let canon_manifest = manifest_dir
+        .canonicalize()
+        .unwrap_or_else(|_| lexical_normalize(manifest_dir));
+    let raw_out = lexical_normalize(out_dir);
+    let canon_out = out_dir.canonicalize().ok();
+    let raw_sysroot = lexical_normalize(sysroot);
+    let canon_sysroot = sysroot.canonicalize().ok();
+
+    let is_excluded = |raw_candidate: &Path, resolved: &Path| -> bool {
+        if raw_candidate.starts_with(&raw_out) || resolved.starts_with(&raw_out) {
+            return true;
+        }
+        if let Some(ref out) = canon_out
+            && (raw_candidate.starts_with(out) || resolved.starts_with(out))
+        {
+            return true;
+        }
+        if !raw_sysroot.as_os_str().is_empty()
+            && (raw_candidate.starts_with(&raw_sysroot) || resolved.starts_with(&raw_sysroot))
+        {
+            return true;
+        }
+        if let Some(ref sr) = canon_sysroot
+            && (raw_candidate.starts_with(sr) || resolved.starts_with(sr))
+        {
+            return true;
+        }
+        if let Ok(rel) = resolved.strip_prefix(&canon_ws) {
+            let mut comps = rel.components();
+            if let Some(Component::Normal(first)) = comps.next()
+                && (first == "target" || first == ".cargo")
+            {
+                return true;
+            }
+        }
+        false
+    };
+
+    let mut watched = BTreeSet::new();
+    let mut crate_roots = BTreeSet::new();
+
+    for prerequisite in parse_depfile(depfile_text) {
+        let joined = if prerequisite.is_absolute() {
+            prerequisite.clone()
+        } else {
+            canon_ws.join(&prerequisite)
+        };
+        let raw_candidate = lexical_normalize(&joined);
+        let resolved = if let Ok(canon) = joined.canonicalize() {
+            canon
+        } else if let Ok(rel) = raw_candidate.strip_prefix(&raw_ws) {
+            canon_ws.join(rel)
+        } else {
+            raw_candidate.clone()
+        };
+
+        if !resolved.starts_with(&canon_ws) || is_excluded(&raw_candidate, &resolved) {
+            continue;
+        }
+
+        watched.insert(relative_path_from(&canon_manifest, &resolved));
+
+        let mut cursor = resolved.parent();
+        while let Some(dir) = cursor {
+            if !dir.starts_with(&canon_ws) || dir == canon_ws {
+                break;
+            }
+            if dir.join("Cargo.toml").is_file() {
+                crate_roots.insert(dir.to_path_buf());
+                break;
+            }
+            cursor = dir.parent();
+        }
+    }
+
+    if crate_roots.is_empty() {
+        return Err("EL1 dep-info named no workspace crates".to_owned());
+    }
+
+    for crate_root in &crate_roots {
+        watched.insert(relative_path_from(
+            &canon_manifest,
+            &crate_root.join("Cargo.toml"),
+        ));
+        let src_dir = crate_root.join("src");
+        if src_dir.is_dir() {
+            watched.insert(relative_path_from(&canon_manifest, &src_dir));
+        }
+        for optional in ["build.rs", "link.ld"] {
+            let path = crate_root.join(optional);
+            if path.is_file() {
+                watched.insert(relative_path_from(&canon_manifest, &path));
+            }
+        }
+    }
+
+    watched.insert(PathBuf::from("frame_budget.rs"));
+    watched.insert(relative_path_from(
+        &canon_manifest,
+        &canon_ws.join("crates/carrick-el1-linux/link.ld"),
+    ));
+    watched.insert(relative_path_from(
+        &canon_manifest,
+        &canon_ws.join("Cargo.lock"),
+    ));
+
+    Ok(watched.into_iter().collect())
 }
