@@ -803,7 +803,8 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
   build only on `carrick-personality-api`. Nothing in carrick names NT or any
   other out-of-tree personality. Personalities do not Forward: serve in ring
   or refuse. **Neutral crates must not depend on `carrick-personality-linux`**
-  (`carrick-el1`, `carrick-core`, `carrick-x86-carrier` still do: #366/#237);
+  (`carrick-el1`, `carrick-el1-abi`, `carrick-hal` and `carrick-mem` still
+  do; `carrick-core` only as a dev-dependency: #366/#237, #2075);
   per-task personality state is a ring-owned table keyed by `TaskKey`, Linux
   ids and lineage types move out of neutral crates, new seams use neutral
   vocabulary.
