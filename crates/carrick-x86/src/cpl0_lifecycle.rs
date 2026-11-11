@@ -590,11 +590,13 @@ mod process_exit_tests {
         );
     }
 
-    /// #1941 x86 parity, stopped slot: the waiter's only allowed CPU has no
-    /// slot in the guest, so `wake_placed` queues it on the waker's slot,
-    /// where it may not run, and reports it `misplaced`. The lane must still
-    /// finish the wake in the ring and owe the host a boundary (the
-    /// waker's pending-host-work doorbell) so the host relocates it.
+    /// #1941 x86 parity, no slot at all: the waiter's only allowed CPU has
+    /// no slot an executor drives and it never ran elsewhere, so no slot but
+    /// the waker's may hold it (`ZoneTables::owner_slot` is `None`).
+    /// `wake_placed` queues it on the waker's slot, where it may not run,
+    /// and reports it `misplaced`. The lane must still finish the wake in
+    /// the ring and owe the host a boundary (the waker's pending-host-work
+    /// doorbell), for the waker's executor.
     #[test]
     fn native_futex_wake_of_a_waiter_on_a_stopped_cpu_owes_a_host_boundary() {
         use super::*;

@@ -729,21 +729,25 @@ fn an_el1_futex_wake_always_finishes_in_ring() {
     assert_eq!(zone.slot(SLOT).queued(), 0, "nothing queued on the waker");
     assert!(!task.linux.has_pending_host_work());
 
-    // Pinned to a vCPU stopped at a host exit.
+    // Pinned to a vCPU stopped at a host exit: queued there, where its
+    // driver runs it on re-entry, never on the waker (#1961 review).
     let zone = setup();
     zone.leave_guest(OTHER, &HostWait);
     let (b, seq) = park(&zone, 202, 1 << 1, &[uaddr]);
-    let (served, x0, _, task) = wake(&zone, uaddr);
+    let (served, x0, sgis, task) = wake(&zone, uaddr);
     assert_eq!(
         served, RETURNED,
-        "a waiter no slot may take is never refused"
+        "a waiter no slot may take now is never refused"
     );
     assert_eq!(x0, 1);
-    assert_eq!(zone.record(b).claim(), Claim::Queued { slot: SLOT, seq });
-    assert_eq!(zone.counters.el1_misplaced.load(Ordering::Relaxed), 1);
+    assert_eq!(zone.record(b).claim(), Claim::Queued { slot: OTHER, seq });
+    assert_eq!(zone.counters.el1_misplaced.load(Ordering::Relaxed), 0);
+    assert!(sgis.is_empty(), "a stopped vCPU takes no SGI");
+    assert!(zone.reschedule_owed(OTHER));
+    assert_eq!(zone.slot(SLOT).queued(), 0, "nothing queued on the waker");
     assert!(
-        task.linux.has_pending_host_work(),
-        "the waker's host exit relocates it"
+        !task.linux.has_pending_host_work(),
+        "nothing left for a host boundary"
     );
 
     // Parked on two futexes.
