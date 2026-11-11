@@ -2407,3 +2407,102 @@ fn forked_child_futex_wake_places_a_waiter_pinned_to_a_stopped_vcpu_on_it() {
     assert_eq!(selected.record, waiter);
     assert_eq!(selected.result, Some(0));
 }
+
+/// #1961 second review, P0-1 and P0-2, two live threads: a ring-owned fork
+/// child's `FUTEX_WAKE` whose partner thread may run only on CPU 1, whose
+/// slot's executor left it (`leave_slot`: `drive == 0`, its CPU still
+/// published), through the production ARM entry. No slot an executor
+/// drives may run the waiter and its affinity excludes the waker's CPU 0,
+/// so the wake hands it to the host through the carrier's completion
+/// chain. It used to be queued on the left slot, where no driver ever
+/// comes back, or on the waker's own slot, where ARM bounced it between
+/// `switch_in_full` and `unswitch` forever.
+#[test]
+fn forked_child_futex_wake_hands_a_waiter_no_driven_vcpu_may_run_to_the_host() {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_sched_core::{Claim, ShortLockSpin};
+    let word = 0x2d9e20u64;
+    let other = SlotId::new(1);
+    let ForkedChildFutex {
+        fixture,
+        route,
+        frame,
+        counters,
+        prepared: (waiter, seq),
+        ..
+    } = forked_child_futex(|fixture, identity| {
+        let child_mm = identity.mm;
+        // Guest CPU 1's executor drove its slot, then its mailbox lease
+        // moved on: the slot keeps CPU 1 but nobody drives it.
+        assert!(fixture.zone.reset_slot(other));
+        fixture.zone.drive(other, 2);
+        fixture.zone.publish_slot(other, child_mm, Some(1), 1 << 1);
+        assert!(fixture.zone.leave_slot(other, 2, &mut |_| {}, &mut |_| {}));
+        assert_eq!(fixture.zone.slot(other).driver(), None);
+
+        // The child's partner thread, pinned to CPU 1, parks on the word.
+        let waiter = fixture
+            .zone
+            .alloc_record(carrick_sched_core::ThreadIdentity {
+                tid: identity.tid + 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1 << 1,
+                ..identity
+            })
+            .unwrap();
+        assert!(fixture.zone.mark_native_owned(waiter));
+        let guard = fixture.zone.short_lock(
+            ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(child_mm, word),
+            &ShortLockSpin,
+        );
+        let seq = fixture.zone.next_seq(waiter);
+        fixture
+            .zone
+            .enqueue(&guard, waiter, seq, child_mm, word, u32::MAX, 0)
+            .unwrap();
+        fixture.zone.publish_park(waiter, seq);
+        drop(guard);
+        let wake = [
+            word,
+            carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE,
+            1,
+            0,
+            0,
+            0,
+        ];
+        (wake, (waiter, seq))
+    });
+    assert_ne!(route, CompletionRoute::Forward);
+    assert_eq!(frame.x[0], 1, "one waiter woken");
+    assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 0);
+    assert_eq!(
+        fixture.zone.record(waiter).claim(),
+        Claim::Transferring {
+            seq,
+            cancelled: false,
+            host_requested: false
+        },
+        "handed to the host, on no run queue"
+    );
+    assert_eq!(
+        fixture.zone.slot(other).queued(),
+        0,
+        "never on the left slot"
+    );
+    assert_ne!(
+        fixture.zone.runnable_head(fixture.slot),
+        Some(waiter),
+        "the waker's CPU never switches in a thread pinned elsewhere"
+    );
+    assert_eq!(
+        fixture.zone.counters.el1_misplaced.load(Ordering::Acquire),
+        0
+    );
+    // The waker's host boundary settles the completion chain once.
+    let mut handed = Vec::new();
+    fixture
+        .zone
+        .take_completion_handbacks(&ShortLockSpin, &mut |record| handed.push(record.id));
+    assert_eq!(handed, [waiter]);
+    assert_eq!(fixture.zone.record(waiter).claim(), Claim::Host { seq });
+}
