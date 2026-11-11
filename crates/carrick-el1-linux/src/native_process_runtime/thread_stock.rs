@@ -461,7 +461,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
     ) -> Result<Option<LifecycleOutcome>, NativeProcessError> {
         {
-            let mut graph = self.runtime.graph.lock();
+            let graph = self.runtime.graph.lock();
             // A managed pool's own stock owner waits in `prepare_thread_birth`.
             if graph
                 .owner
@@ -474,11 +474,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 return Err(NativeProcessError::Invalid);
             }
-            if graph.take_thread_stock_reply(&self.record)
-                == Some(carrick_core_abi::service::CarrierWorkReply::Unstockable)
-            {
-                return Ok(None);
-            }
+        }
+        if self.thread_stock_reply.take()
+            == Some(carrick_core_abi::service::CarrierWorkReply::Unstockable)
+        {
+            return Ok(None);
         }
         self.retry_guest_input(
             carrick_core_abi::service::ServiceOperation::CarrierWork {
@@ -491,23 +491,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         .map(Some)
     }
     /// The carrier answered this member's thread-stock demand: retain the
-    /// answer for the clone's rerun.
+    /// answer in the member row for the clone's rerun, the next syscall
+    /// entry, which scopes it to itself (`scope_rerun_answers_to_entry`).
     pub(super) fn retain_thread_stock_reply(
-        &self,
+        &mut self,
         reply: carrick_core_abi::service::CarrierWorkReply,
     ) {
+        self.thread_stock_pending = true;
         self.runtime
             .graph
             .lock()
             .retain_thread_stock_reply(self.record, reply);
     }
-    /// The caller claimed a pool entry: a retained answer is spent.
-    pub(super) fn unmanaged_thread_stock_claimed(&self) {
-        let _ = self
-            .runtime
+    /// Move a retained thread-stock answer out of the member row. The
+    /// admission snapshot keeps an entry without one off the graph lock.
+    pub(super) fn take_retained_thread_stock_reply(
+        &mut self,
+    ) -> Option<carrick_core_abi::service::CarrierWorkReply> {
+        if !core::mem::take(&mut self.thread_stock_pending) {
+            return None;
+        }
+        self.runtime
             .graph
             .lock()
-            .take_thread_stock_reply(&self.record);
+            .take_thread_stock_reply(&self.record)
     }
     pub(super) fn clear_thread_stock_wait(&self) {
         let mut graph = self.runtime.graph.lock();

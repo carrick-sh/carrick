@@ -2971,6 +2971,7 @@ impl<
         {
             let _ = process.take_relative_futex_wait();
         }
+        process.scope_rerun_answers_to_entry();
         process.resume_owned_continuation()
     }
     fn may_serve_poll(&self) -> bool {
