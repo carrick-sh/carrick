@@ -575,11 +575,11 @@ _test-xtask-shards:
 
 [private]
 _test-xtask-domain-unit:
-    {{_cargo}} test --locked -p carrick-xtask --all-features --lib -- terminal_custody copyout_debt guest_copy_debt fixture_leaf_closure
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib -- terminal_custody copyout_debt guest_copy_debt fixture_leaf_closure trusted_steps
 
 [private]
 _test-xtask-domain-integration:
-    {{_cargo}} test --locked -p carrick-xtask --all-features --test probe_coverage --test authority_debt
+    {{_cargo}} test --locked -p carrick-xtask --all-features --test probe_coverage --test authority_debt --test trusted_steps
 
 # The fallback fixture makes sccache unavailable itself, independently of CI setup.
 check-build-cache:

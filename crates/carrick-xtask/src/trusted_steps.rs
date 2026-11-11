@@ -102,7 +102,12 @@ impl Tree for GitTree {
             return Ok(Some(out.stdout));
         }
         // Distinguish "absent at this rev" from a bad rev.
-        let probe = self.git(&["rev-parse", "--verify", "--quiet", &format!("{rev}^{{tree}}")])?;
+        let probe = self.git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{tree}}"),
+        ])?;
         if !probe.status.success() {
             return Err(TrustedStepsError::Git {
                 args: format!("cat-file blob {spec}"),
@@ -197,9 +202,15 @@ fn is_trusted_ref(r: &str) -> bool {
     let r = r.trim();
     r == "main"
         || r == "refs/heads/main"
-        || ["base_sha", "base.sha", "event.before", "merge_group.base", "baseline"]
-            .iter()
-            .any(|k| r.contains(k))
+        || [
+            "base_sha",
+            "base.sha",
+            "event.before",
+            "merge_group.base",
+            "baseline",
+        ]
+        .iter()
+        .any(|k| r.contains(k))
 }
 
 fn norm_dir(p: &str) -> String {
@@ -275,7 +286,8 @@ fn differs(ctx: &Ctx<'_>, path: &str) -> Result<bool, TrustedStepsError> {
 
 fn is_word(w: &str) -> bool {
     let mut cs = w.chars();
-    cs.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+    cs.next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
         && cs.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
@@ -325,19 +337,25 @@ fn analyze_script(script: &str, ctx: &Ctx<'_>) -> Result<Vec<String>, TrustedSte
     for cap in direct.captures_iter(&text) {
         invocations.push(leading_words(&cap[1]));
     }
-    let var = Regex::new(r#"(?m)(?:^|&&|\|\||[;|(]|\bthen\b)[ \t]*"?\$\{?(\w+)(?:\[@\])?\}?"?[ \t]([^\n]*)"#)
-        .map_err(regex_err)?;
+    let var = Regex::new(
+        r#"(?m)(?:^|&&|\|\||[;|(]|\bthen\b)[ \t]*"?\$\{?(\w+)(?:\[@\])?\}?"?[ \t]([^\n]*)"#,
+    )
+    .map_err(regex_err)?;
     for cap in var.captures_iter(&text) {
         if aliases.contains(&cap[1]) {
             invocations.push(leading_words(&cap[2]));
         }
     }
-    let just = Regex::new(r"(?m)(?:^|&&|\|\||[;|(]|\bthen\b)[ \t]*just[ \t]+([^\n]*)").map_err(regex_err)?;
+    let just = Regex::new(r"(?m)(?:^|&&|\|\||[;|(]|\bthen\b)[ \t]*just[ \t]+([^\n]*)")
+        .map_err(regex_err)?;
     for cap in just.captures_iter(&text) {
         let mut toks = cap[1].split_whitespace();
         let mut recipe = None;
         while let Some(t) = toks.next() {
-            if matches!(t, "--justfile" | "-f" | "--working-directory" | "-d" | "--set") {
+            if matches!(
+                t,
+                "--justfile" | "-f" | "--working-directory" | "-d" | "--set"
+            ) {
                 toks.next();
             } else if t.starts_with('-') {
                 continue;
@@ -382,7 +400,8 @@ fn justfile_recipes(tree: &dyn Tree, rev: &str) -> Result<HashSet<String>, Trust
     let text = String::from_utf8_lossy(&bytes);
     let recipe = Regex::new(r"(?m)^@?([A-Za-z_][A-Za-z0-9_-]*)(?:[ \t]+[^:\n]*)?:(?:[^=\n]|$)")
         .map_err(regex_err)?;
-    let alias = Regex::new(r"(?m)^alias[ \t]+([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:=").map_err(regex_err)?;
+    let alias =
+        Regex::new(r"(?m)^alias[ \t]+([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:=").map_err(regex_err)?;
     let mut out: HashSet<String> = recipe
         .captures_iter(&text)
         .map(|c| c[1].to_owned())
@@ -391,11 +410,18 @@ fn justfile_recipes(tree: &dyn Tree, rev: &str) -> Result<HashSet<String>, Trust
     Ok(out)
 }
 
+/// One subcommand: the names clap accepts and the enum it nests, if any.
+#[derive(Debug)]
+struct VariantInfo {
+    names: Vec<String>,
+    child: Option<String>,
+}
+
 /// The subcommand tree declared by `#[derive(Subcommand)]` enums.
 #[derive(Debug, Default)]
 pub struct ClapModel {
     /// Enum name -> (accepted names, child enum if the variant nests one).
-    enums: HashMap<String, Vec<(Vec<String>, Option<String>)>>,
+    enums: HashMap<String, Vec<VariantInfo>>,
     root: Option<String>,
 }
 
@@ -428,14 +454,14 @@ impl ClapModel {
         }
         let mut model = ClapModel::default();
         for e in raw_enums.iter().filter(|e| derives(&e.attrs, "Subcommand")) {
-            let variants: Vec<(Vec<String>, Option<String>)> = e
+            let variants: Vec<VariantInfo> = e
                 .variants
                 .iter()
                 .map(|v| {
                     let mut names = variant_names(v);
                     names.sort();
                     let child = variant_child(v, &structs);
-                    (names, child)
+                    VariantInfo { names, child }
                 })
                 .collect();
             // Same-named enums in different modules merge: permissive, never a
@@ -458,10 +484,10 @@ impl ClapModel {
         for w in words {
             let variants = self.enums.get(cur)?;
             path.push(w);
-            let Some((_, child)) = variants.iter().find(|(names, _)| names.contains(w)) else {
+            let Some(variant) = variants.iter().find(|v| v.names.contains(w)) else {
                 return Some(path.join(" "));
             };
-            match child {
+            match &variant.child {
                 Some(c) if self.enums.contains_key(c) => cur = c,
                 _ => return None,
             }
@@ -523,9 +549,12 @@ fn names_xtask(attrs: &[syn::Attribute]) -> bool {
 fn has_subcommand_attr(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         (a.path().is_ident("command") || a.path().is_ident("clap"))
-            && a.meta
-                .require_list()
-                .is_ok_and(|l| l.tokens.to_string().split(',').any(|t| t.trim() == "subcommand"))
+            && a.meta.require_list().is_ok_and(|l| {
+                l.tokens
+                    .to_string()
+                    .split(',')
+                    .any(|t| t.trim() == "subcommand")
+            })
     })
 }
 
@@ -547,7 +576,9 @@ fn type_ident(ty: &syn::Type) -> Option<String> {
 }
 
 fn subcommand_field(f: &syn::Field) -> Option<String> {
-    has_subcommand_attr(&f.attrs).then(|| type_ident(&f.ty)).flatten()
+    has_subcommand_attr(&f.attrs)
+        .then(|| type_ident(&f.ty))
+        .flatten()
 }
 
 fn variant_child(v: &syn::Variant, structs: &HashMap<String, String>) -> Option<String> {
@@ -570,7 +601,11 @@ fn variant_names(v: &syn::Variant) -> Vec<String> {
             continue;
         }
         let _ = a.parse_nested_meta(|m| {
-            let key = m.path.get_ident().map(ToString::to_string).unwrap_or_default();
+            let key = m
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .unwrap_or_default();
             if m.input.peek(syn::Token![=]) {
                 let value: syn::Expr = m.value()?.parse()?;
                 if let syn::Expr::Lit(syn::ExprLit {
@@ -608,7 +643,10 @@ fn kebab(ident: &str) -> String {
         if c.is_ascii_uppercase() && i > 0 {
             let prev = chars[i - 1];
             let next_lower = chars.get(i + 1).is_some_and(char::is_ascii_lowercase);
-            if prev.is_ascii_lowercase() || prev.is_ascii_digit() || (prev.is_ascii_uppercase() && next_lower) {
+            if prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next_lower)
+            {
                 out.push('-');
             }
         }
