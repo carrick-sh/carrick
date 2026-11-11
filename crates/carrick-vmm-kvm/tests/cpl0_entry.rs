@@ -608,7 +608,7 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
 }
 
 /// Test-support ordinal; see `carrick-x86-cpl0`'s `test_support`.
-const INJECT_BLOCK_SIGUSR1_AT_SECOND_CHECKPOINT: u64 = 0xffff_ffff_ffff_fe1d;
+const INJECT_BLOCK_SIGUSR1_AT_SECOND_CHECKPOINT: u64 = 0xffff_ffff_ffff_fe1e;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CloneProbe {
