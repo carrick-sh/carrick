@@ -2033,6 +2033,23 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .map_err(|_| NativeProcessError::Stale)
     }
 
+    fn futex_shared_private(
+        &mut self,
+        mm: &Mm,
+        address: UserVa,
+    ) -> Result<bool, NativeProcessError> {
+        // The neutral MM owner authenticates the mapping, as on x86 CPL0;
+        // this service supplies only its portal, the authenticated MM handle
+        // and the current worker.
+        let handle = self.service_mm_handle(mm)?;
+        super::native_process_runtime::private_anonymous_futex_mapping(
+            &self.portal()?,
+            handle,
+            self.worker(),
+            address,
+        )
+    }
+
     /// The HVC root exit crossing becomes the host's whole-process terminal
     /// (`TrapError::NativeRootExit`), which ends every host and zone thread.
     fn root_exit_ends_run(&self) -> bool {

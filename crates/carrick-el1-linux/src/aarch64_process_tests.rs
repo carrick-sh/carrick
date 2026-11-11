@@ -7190,6 +7190,77 @@ fn arm_glibc_pthread_join_shared_bitset_wait_wakes_on_child_exit() {
     assert_eq!(resumed.x[0], 0, "pthread_join's futex returns 0");
 }
 
+/// The same join while another lane holds the MM root: authenticating the
+/// shared word's mapping is contention, never an errno and never a park on
+/// an unauthenticated key. The syscall retries on the holder's release with
+/// its registers intact (`Suspended`); the futex-entry owner-wait episodes
+/// cover the resumed rerun.
+#[test]
+fn arm_glibc_pthread_join_mapping_owner_held_retries_the_syscall() {
+    let words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
+        0x4000,
+    )));
+    let tid_word = words.arg();
+    let fixture = Box::leak(Box::new(Fixture::with_private_anonymous(
+        0x10000,
+        asid(1),
+        carrick_el1_abi::ReservationRange::new(tid_word, tid_word + 0x4000).unwrap(),
+    )));
+    let mut service = fixture.process_service();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    words.set::<u32>(0, 42);
+    let mut join = carrick_el1_abi::TrapFrame::default();
+    join.x[8] = crate::sched::SYS_FUTEX as u64;
+    join.x[0] = tid_word;
+    join.x[1] = 265;
+    join.x[2] = 42;
+    join.x[5] = 0xffff_ffff;
+    // A word outside private anonymous memory has no shared-private key: the
+    // shared op stays unrouted, as before.
+    let unowned = carrick_test_support::GuestUserBuffer::from_value(42_u32);
+    let mut elsewhere = join;
+    elsewhere.x[0] = unowned.arg();
+    assert_eq!(
+        arm_call_with_cpu(
+            fixture,
+            fixture.control,
+            &mut service,
+            &mut elsewhere,
+            &mut cpu
+        )
+        .unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Forward
+    );
+    let saved = join;
+    let portal = super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    let held = portal.root_any(ReservationMm::new(1).unwrap(), 1).unwrap();
+    let route =
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut join, &mut cpu).unwrap();
+    drop(held);
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+        "a held mapping owner retries the syscall"
+    );
+    assert_eq!(join.x, saved.x, "no errno: the retry reruns the same call");
+    assert!(
+        (1..carrick_sched_core::ZONE_RECORDS as u32)
+            .filter_map(carrick_sched_core::RecordId::from_raw)
+            .all(|id| !matches!(
+                fixture.zone.record(id).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            )),
+        "nothing enrols before the mapping is authenticated"
+    );
+}
+
 #[test]
 fn arm_two_live_threads_exit_group_ends_group_with_status() {
     use carrick_el1_abi::Lifecycle;
