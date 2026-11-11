@@ -417,14 +417,47 @@ fn split_commands(script: &str) -> Vec<String> {
             continue;
         }
         let line = line.split(" #").next().unwrap_or(line);
-        out.extend(
-            line.split([';', '&', '|', '(', ')', '`', '{', '}'])
-                .map(|c| c.trim().to_owned())
-                .filter(|c| !c.is_empty()),
-        );
+        for seg in line.split([';', '&', '|', '(', ')', '`']) {
+            // `{` and `}` group commands only as words of their own; inside
+            // `${VAR}` they are part of an expansion.
+            let mut cur: Vec<&str> = Vec::new();
+            for w in seg.split_whitespace() {
+                if matches!(w, "{" | "}") {
+                    if !cur.is_empty() {
+                        out.push(cur.join(" "));
+                        cur.clear();
+                    }
+                } else {
+                    cur.push(w);
+                }
+            }
+            if !cur.is_empty() {
+                out.push(cur.join(" "));
+            }
+        }
     }
     out
 }
+
+/// `cargo run` options that take a separate value word.
+const CARGO_VALUED: &[&str] = &[
+    "-p",
+    "--package",
+    "--bin",
+    "--example",
+    "--features",
+    "-F",
+    "--manifest-path",
+    "--target",
+    "--target-dir",
+    "--profile",
+    "-j",
+    "--jobs",
+    "--config",
+    "-Z",
+    "--color",
+    "--message-format",
+];
 
 fn is_assignment(t: &str) -> Option<&str> {
     let (name, _) = t.split_once('=')?;
@@ -458,6 +491,18 @@ fn analyze_script(
             {
                 aliases.insert(name.to_owned());
             }
+        }
+    }
+
+    // Bash arrays standing for the xtask command: `xtask=(cargo run ... --)`.
+    let array = Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)=\(([^)]*)\)").map_err(regex_err)?;
+    for cap in array.captures_iter(&text) {
+        let body = &cap[2];
+        if body.contains("carrick-xtask")
+            || body.contains("XTASK_PREBUILT")
+            || body.contains("XTASK_BIN")
+        {
+            aliases.insert(cap[1].to_owned());
         }
     }
 
@@ -539,10 +584,28 @@ fn analyze_script(
             if sub != Some("run") {
                 continue;
             }
-            let (flags, args) = match rest.iter().position(|t| *t == "--") {
-                Some(p) => (&rest[..p], &rest[p + 1..]),
-                None => (rest, &rest[rest.len()..]),
-            };
+            let run_at = rest
+                .iter()
+                .position(|t| !t.starts_with('-') && !t.starts_with('+'))
+                .map_or(0, |p| p + 1);
+            let mut args_at = rest.len();
+            let mut k = run_at;
+            while k < rest.len() {
+                let t = rest[k];
+                if t == "--" {
+                    args_at = k + 1;
+                    break;
+                } else if CARGO_VALUED.contains(&t) {
+                    k += 2;
+                } else if t.starts_with('-') {
+                    k += 1;
+                } else {
+                    args_at = k;
+                    break;
+                }
+            }
+            let flags = &rest[..args_at.min(rest.len())];
+            let args = &rest[args_at.min(rest.len())..];
             let names_xtask = flags.windows(2).any(|w| {
                 matches!(w[0], "-p" | "--package" | "--bin") && unquote(w[1]) == "carrick-xtask"
             }) || flags.iter().any(|t| {
@@ -560,6 +623,11 @@ fn analyze_script(
             .strip_prefix("${")
             .and_then(|v| v.strip_suffix('}'))
             .or_else(|| head.strip_prefix('$'))
+            .map(|v| {
+                v.strip_suffix("[@]")
+                    .or_else(|| v.strip_suffix("[*]"))
+                    .unwrap_or(v)
+            })
             && aliases.contains(var)
         {
             invocations.push(xtask_words(rest));

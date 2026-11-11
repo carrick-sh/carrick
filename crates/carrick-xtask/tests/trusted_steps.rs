@@ -339,6 +339,41 @@ fn invocation_shapes_that_once_slipped_through_are_refused() {
     }
 }
 
+fn refused_shape(shape: &str) {
+    let mut tree = MemTree::with_base().fork_head();
+    tree.put("head", "scripts/ci/added.sh", "new");
+    tree.put(
+        "head",
+        ".github/workflows/t.yml",
+        &trusted_workflow(&shape.replace('\n', "\n          ")),
+    );
+    let msgs = messages(&tree);
+    assert_eq!(msgs.len(), 1, "{shape}: {msgs:#?}");
+    assert!(
+        msgs[0].contains("brand-new") || msgs[0].contains("added.sh"),
+        "{shape}: {msgs:#?}"
+    );
+}
+
+#[test]
+fn braced_variable_xtask_invocations_are_refused() {
+    refused_shape("\"${CARRICK_XTASK_BIN}\" signed-gate brand-new-sub");
+    refused_shape("${CARRICK_XTASK_PREBUILT} brand-new-sub");
+    refused_shape("\"${GITHUB_WORKSPACE}/scripts/ci/added.sh\"");
+}
+
+#[test]
+fn bash_array_xtask_alias_is_refused() {
+    refused_shape(
+        "xtask=(cargo run --locked -p carrick-xtask --)\n\"${xtask[@]}\" signed-gate brand-new-sub",
+    );
+}
+
+#[test]
+fn cargo_run_without_separator_is_refused() {
+    refused_shape("cargo run --locked -p carrick-xtask signed-gate brand-new-sub");
+}
+
 #[test]
 fn folded_scalar_run_is_analyzed() {
     let wf = "name: t\non: push\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: main\n      - name: go\n        run: >-\n          cargo build --locked --release -p carrick-xtask &&\n          target/release/carrick-xtask signed-gate brand-new\n";
