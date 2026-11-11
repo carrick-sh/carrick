@@ -758,7 +758,7 @@ fn check_bundle_objects(path: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn inspect_bundle(path: &Path) -> Result<Manifest> {
+fn inspect_bundle(path: &Path) -> Result<Manifest> {
     let manifest = read_bundle_manifest(path)?;
     check_bundle_objects(path, &manifest)?;
     Ok(manifest)
