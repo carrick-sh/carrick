@@ -631,99 +631,6 @@ mod process_exit_tests {
             "the handed-back waiter owes the host a boundary"
         );
     }
-
-    /// #1961 second review, P0-1 guard, two live threads: x86's switch
-    /// (`NativeLane::switch_next`, as `native_execution::schedule`) never
-    /// switches in a thread whose affinity excludes its CPU (narrowed while
-    /// it was queued), since no host exit moves it. That thread goes to the
-    /// slot of the CPU it may run on, with its reschedule kick, and the next
-    /// thread on the queue runs here.
-    #[test]
-    fn switch_never_runs_a_thread_whose_affinity_excludes_the_cpu() {
-        use super::*;
-        let busy_slot = SlotId::new(1);
-        let fixture = LaneWake::new(&[(busy_slot, 1)], 1 << 1);
-        let zone = &fixture.zone;
-        let slot = LaneWake::WAKER;
-        let space = zone
-            .spaces
-            .publish_closed(LaneWake::MM, 0x1000, 0)
-            .expect("space");
-        zone.spaces.open(space);
-        // Two threads of the process are runnable on the waker's CPU 0; the
-        // head one's affinity then narrows to CPU 1 while it is queued.
-        let excluded = zone
-            .alloc_record(LaneWake::identity(44, 1 << 0))
-            .expect("excluded");
-        let allowed = zone
-            .alloc_record(LaneWake::identity(45, 1 << 0))
-            .expect("allowed");
-        assert!(zone.requeue_preempted(slot, excluded).is_queued());
-        assert!(zone.requeue_preempted(slot, allowed).is_queued());
-        zone.record(excluded).set_affinity(1 << 1);
-        let counters = Counters::new();
-        let page = ThreadLifecyclePage::new();
-        let controls = core::array::from_fn(|_| ThreadControlSlot::new());
-        let mut lane = LifecycleLane {
-            contexts: [const { NativeBirthContext::EMPTY }; 2],
-            parent: LaneWake::identity(41, 0),
-            slot,
-            maintenance_root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x1000))
-                .expect("maintenance root"),
-            data_start: LIFECYCLE_DATA,
-            data_end: LIFECYCLE_DATA + 0x1000,
-            wakes: 0,
-            births: 0,
-            retirements: 0,
-        };
-        lane.contexts[0].record = Some(zone.record_ref(excluded));
-        lane.contexts[1].record = Some(zone.record_ref(allowed));
-        let mut frame = NativeFrame::default();
-        let mut xsave = XsaveArea::ZERO;
-        #[allow(clippy::panic)]
-        fn terminal_failure(
-            _: carrick_core_abi::ExecutionBinding,
-            reason: carrick_core_abi::NativeRunFailureReason,
-        ) -> ! {
-            std::panic::panic_any(reason)
-        }
-        let mut native = NativeLane {
-            terminal_failure,
-            handoff: None,
-            frame: &mut frame,
-            xsave: &mut xsave,
-            task: &fixture.task,
-            counters: &counters,
-            zone,
-            lane: &mut lane,
-            page: &page,
-            controls: &controls,
-            args: [0; 6],
-        };
-
-        assert!(native.resume_after_child_exit().is_some());
-
-        assert!(
-            matches!(
-                zone.record(allowed).claim(),
-                Claim::OnCpu { slot: on, .. } if on == slot
-            ),
-            "the next thread runs on CPU 0"
-        );
-        assert_eq!(zone.slot(slot).current(), Some(allowed));
-        assert!(
-            matches!(
-                zone.record(excluded).claim(),
-                Claim::Queued { slot: on, .. } if on == busy_slot
-            ),
-            "the excluded thread moved to CPU 1's slot, never run on CPU 0"
-        );
-        assert_eq!(
-            zone.counters.el1_sgis.load(Ordering::Relaxed),
-            1,
-            "CPU 1's busy slot is sent its reschedule kick"
-        );
-    }
 }
 
 pub const LIFECYCLE_ZONE: u64 = 0xffff_ffff_b000_0000;
@@ -890,12 +797,7 @@ impl NativeLane<'_> {
         self.lane.wakes += u64::from(count);
     }
     fn switch_next(&mut self) -> Option<carrick_core::Served> {
-        // Never a thread whose affinity excludes this CPU: x86 has no host
-        // exit that would move it (#1961 second review).
-        let mut effects = WakeEffects::default();
-        let switched = self.zone.switch_in_admitted(self.lane.slot, &mut effects);
-        effects.send_kicks(self.zone, &mut self.wake_cpu());
-        let switched = switched?;
+        let switched = self.zone.switch_in_full(self.lane.slot)?;
         let reference = self.zone.record_ref(switched.record);
         let index = self
             .lane

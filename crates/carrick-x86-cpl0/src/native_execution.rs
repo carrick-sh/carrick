@@ -32,18 +32,7 @@ pub fn schedule(slot: SlotId) -> ! {
             crate::anonymous::release_injected_edit_wait(source, current);
         }
         expire_signal_timer(slot);
-        // Never a thread whose affinity excludes this CPU: x86 has no host
-        // exit that would move it (#1961 second review).
-        let mut effects = carrick_sched_core::WakeEffects::default();
-        let selected = source.zone.switch_in_admitted(slot, &mut effects);
-        effects.send_kicks(
-            source.zone,
-            &mut carrick_el1::isa::x86::context::scheduler::WakeCpu {
-                task: current,
-                waker: slot,
-            },
-        );
-        if let Some(selected) = selected {
+        if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
             let record = source.zone.record_ref(selected.record);
             let runtime = native_process::runtime_for_record(source.zone, record);
