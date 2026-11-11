@@ -240,9 +240,9 @@ mod test_support {
             INJECT_OWNED_COPY_BUSY_ONCE => {
                 (!OWNED_COPY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
             }
-            INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE => (!REPLAY_SETTLEMENT_REFUSAL
-                .swap(true, Ordering::AcqRel))
-            .then_some(0),
+            INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE => {
+                (!REPLAY_SETTLEMENT_REFUSAL.swap(true, Ordering::AcqRel)).then_some(0)
+            }
             INJECT_OWNED_COPY_CENSUS => Some(
                 (OWNED_COPY_REFUSALS.load(Ordering::Acquire) << 32)
                     | (OWNED_COPY_RERUNS.load(Ordering::Acquire) & u64::from(u32::MAX)),
