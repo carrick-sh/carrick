@@ -16815,7 +16815,7 @@ fn arm_root_host_backed_descriptors_keep_one_owner() {
     assert!(made == 0 || made == -17, "mkdir /tmp: {made}");
     let path = GuestUserBuffer::from_bytes(b"/tmp/carrick-1410-redirect-target\0");
     // Reads the redirect target back through a fresh root descriptor.
-    let mut read_target = |call_root: &mut dyn FnMut(u64, [u64; 6]) -> (CompletionRoute, i64)| {
+    let read_target = |call_root: &mut dyn FnMut(u64, [u64; 6]) -> (CompletionRoute, i64)| {
         let (_, fd) = call_root(56, [LINUX_AT_FDCWD, path.arg(), 0, 0, 0, 0]);
         if fd < 0 {
             return format!("<reopen failed: {fd}>").into_bytes();
@@ -16918,7 +16918,6 @@ fn arm_root_host_backed_descriptors_keep_one_owner() {
         carrick_syscall_abi::LINUX_EBADF.guest_retval(),
     );
     let final_contents = read_target(&mut call_root);
-    drop(call_root);
     let stdout = dispatcher.stdout();
     for (what, got, want) in [
         ("target after restore", contents, &b"redirected\n"[..]),
