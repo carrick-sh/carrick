@@ -21,6 +21,8 @@ mod native_retirement_tests;
 mod native_signal_resume_tests;
 #[cfg(test)]
 mod native_signal_work_return_tests;
+#[cfg(test)]
+mod native_venue_notice_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 mod pipe_metadata_tests;
 
