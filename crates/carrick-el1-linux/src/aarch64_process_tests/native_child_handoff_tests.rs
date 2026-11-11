@@ -2498,11 +2498,11 @@ fn forked_child_futex_wake_hands_a_waiter_no_driven_vcpu_may_run_to_the_host() {
         fixture.zone.counters.el1_misplaced.load(Ordering::Acquire),
         0
     );
-    // The waker's host boundary settles the completion chain once.
-    let mut handed = Vec::new();
-    fixture
-        .zone
-        .take_completion_handbacks(&ShortLockSpin, &mut |record| handed.push(record.id));
-    assert_eq!(handed, [waiter]);
+    // Exercise the actual host boundary, including native-handback routing.
+    carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+        carrick_kernel::el1_zone::hand_back_completions();
+    });
     assert_eq!(fixture.zone.record(waiter).claim(), Claim::Host { seq });
+    assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+    assert_eq!(fixture.zone.slot(other).queued(), 0);
 }
