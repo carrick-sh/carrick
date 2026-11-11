@@ -7,7 +7,10 @@
  * last one instead of writing, so the wake is writer-close POLLHUP.
  * -DZERO_TIMEOUT: poll/ppoll uses a zero timeout while the child sleeps 50ms
  * before closing the last writer, so poll/ppoll must return 0 with revents
- * cleared to 0 before the child closes. */
+ * cleared to 0 before the child closes.
+ * -DFINITE_TIMEOUT: poll uses 1 ms, ppoll {0, 1ms}; with the child sleeping
+ * 50ms the call must time out (0, revents cleared). -DFINITE_TIMEOUT_LONG:
+ * the same finite calls with 5 s, so a prompt writer close wins (1, POLLHUP). */
 .global _start
 .text
 _start:
@@ -41,6 +44,10 @@ _start:
 #ifdef USE_POLL
 #ifdef ZERO_TIMEOUT
     xor %edx, %edx                 /* poll(pfd, 1, 0) */
+#elif defined(FINITE_TIMEOUT)
+    mov $1, %edx                   /* poll(pfd, 1, 1ms) */
+#elif defined(FINITE_TIMEOUT_LONG)
+    mov $5000, %edx                /* poll(pfd, 1, 5000ms) */
 #else
     mov $-1, %edx                  /* poll(pfd, 1, -1) */
 #endif
@@ -48,6 +55,10 @@ _start:
 #else
 #ifdef ZERO_TIMEOUT
     lea zero_ts(%rip), %rdx        /* ppoll(pfd, 1, &{0, 0}, NULL, 8) */
+#elif defined(FINITE_TIMEOUT)
+    lea short_ts(%rip), %rdx       /* ppoll(pfd, 1, &{0, 1ms}, NULL, 8) */
+#elif defined(FINITE_TIMEOUT_LONG)
+    lea long_ts(%rip), %rdx        /* ppoll(pfd, 1, &{5s, 0}, NULL, 8) */
 #else
     xor %edx, %edx                 /* ppoll(pfd, 1, NULL, NULL, 8) */
 #endif
@@ -57,7 +68,7 @@ _start:
 #endif
     syscall
     mov %rax, poll_result(%rip)
-#ifdef ZERO_TIMEOUT
+#if defined(ZERO_TIMEOUT) || defined(FINITE_TIMEOUT)
     test %rax, %rax
     jnz fail_result
     movzwl pfd+6(%rip), %eax
@@ -147,6 +158,8 @@ exit:
 .balign 16
 delay: .quad 0, 50000000
 zero_ts: .quad 0, 0
+short_ts: .quad 0, 1000000
+long_ts: .quad 5, 0
 byte: .byte 'x'
 .bss
 .balign 4096

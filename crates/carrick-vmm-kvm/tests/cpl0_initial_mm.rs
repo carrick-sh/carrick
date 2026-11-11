@@ -2107,6 +2107,31 @@ fn x86_cpl0_poll_preserves_fields_changed_during_host_wait() {
     run_poll_revents_only_fixture(&[]);
 }
 
+#[test]
+fn zone_pipe_ppoll_finite_timeout_expires() {
+    zone_pipe_poll_wake(&["-DWAKE_BY_CLOSE", "-DFINITE_TIMEOUT"]);
+}
+
+#[test]
+fn zone_pipe_poll_finite_timeout_expires() {
+    zone_pipe_poll_wake(&["-DUSE_POLL", "-DWAKE_BY_CLOSE", "-DFINITE_TIMEOUT"]);
+}
+
+#[test]
+fn zone_pipe_ppoll_finite_timeout_writer_close_wins() {
+    zone_pipe_poll_wake(&["-DWAKE_BY_CLOSE", "-DNO_CHILD_SLEEP", "-DFINITE_TIMEOUT_LONG"]);
+}
+
+#[test]
+fn zone_pipe_poll_finite_timeout_writer_close_wins() {
+    zone_pipe_poll_wake(&[
+        "-DUSE_POLL",
+        "-DWAKE_BY_CLOSE",
+        "-DNO_CHILD_SLEEP",
+        "-DFINITE_TIMEOUT_LONG",
+    ]);
+}
+
 fn private_file_fixture(cow: bool) {
     private_file_fixture_with(cow, &[], 0);
 }
