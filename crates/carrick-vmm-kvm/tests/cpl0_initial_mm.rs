@@ -1872,6 +1872,40 @@ fn in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring() {
         "child write errno (0 means the write completed without an IPC execution \
          binding, 38 is ENOSYS, 90 pipe2 / 91 fork-wait failed)"
     );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let write_nr = usize::from(X86_SYS_WRITE);
+    assert_eq!(
+        counters.refused[write_nr].load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "x86 write (ordinal 1) must be recorded in ring refusal census"
+    );
+    assert_eq!(
+        counters.refused_child[write_nr].load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "child's in-ring pipe write refusal must credit descendant origin"
+    );
+    assert_eq!(
+        counters.venue_refused[write_nr].load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "in-ring refusal must not be recorded as a carrier venue refusal"
+    );
+    assert_eq!(
+        counters.venue_refused_child[write_nr].load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "in-ring refusal must not be recorded as a child carrier venue refusal"
+    );
+    let total_refusals: u64 = counters
+        .refused
+        .iter()
+        .map(|counter| counter.load(std::sync::atomic::Ordering::Acquire))
+        .sum();
+    assert_eq!(
+        total_refusals, 1,
+        "only the child's x86 write (ordinal 1) may be recorded in ring refusal census"
+    );
 }
 
 /// Ruling 2 on #542: a child's blocking wait never parks on another task's
