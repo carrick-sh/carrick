@@ -11,12 +11,16 @@
 //!   1. `rw`: a private anonymous RW range is written, discarded, reads back
 //!      zero and is still writable;
 //!   2. `code`: V8's code-range shape: a `PROT_NONE`/`MAP_NORESERVE`
-//!      reservation, part of it made RW, written with code, made RX and
-//!      called, then the whole reservation discarded; the RX pages read back
-//!      zero and the range is recommitted (RW, new code, RX) and called again;
-//!   3. `rwx`: an RWX range is written with code, called, discarded, reads
-//!      back zero, and is rewritten in place and called again;
+//!      reservation, part of it made RW, filled, made RX and read back, then
+//!      the whole reservation discarded; the RX pages read back zero and the
+//!      range is recommitted (RW, refilled, RX) and read back again;
+//!   3. `rwx`: an RWX range is filled, discarded, reads back zero, and is
+//!      rewritten in place;
 //!   4. `misaligned`: a start one byte past a page boundary is EINVAL.
+//!
+//! The probe never executes the ranges: it proves the discard result and the
+//! readback, not instruction fetch, so it needs no inline cache maintenance,
+//! which an added probe may not carry (`candidate_probes::unlisted_reader`).
 //!
 //! The child is bounded by `alarm(10)` (it survives `execve`, and is set again
 //! after it); the parent's `waitpid` by a non-restarting `alarm(20)` that
@@ -30,42 +34,10 @@ fn outcome(ret: libc::c_int) -> (libc::c_int, i32) {
     (ret, if ret < 0 { errno() } else { 0 })
 }
 
-#[cfg(target_arch = "aarch64")]
-unsafe fn write_return_value(page: *mut u8, value: u16) {
-    let words = page.cast::<u32>();
-    words.write(0x5280_0000 | (u32::from(value) << 5)); // mov w0, #value
-    words.add(1).write(0xd65f_03c0); // ret
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn sync_generated_code(page: *mut u8) {
-    core::arch::asm!("dc cvau, {page}", page = in(reg) page, options(nostack, preserves_flags));
-    core::arch::asm!("dsb ish", options(nostack, preserves_flags));
-    core::arch::asm!("ic ivau, {page}", page = in(reg) page, options(nostack, preserves_flags));
-    core::arch::asm!("dsb ish", options(nostack, preserves_flags));
-    core::arch::asm!("isb", options(nostack, preserves_flags));
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn write_return_value(page: *mut u8, value: u16) {
-    // mov eax, imm32; ret
-    page.write(0xb8);
-    page.add(1).cast::<u32>().write_unaligned(u32::from(value));
-    page.add(5).write(0xc3);
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn sync_generated_code(_page: *mut u8) {}
-
-unsafe fn call_return_value(page: *mut u8) -> u32 {
-    let function: unsafe extern "C" fn() -> u32 = core::mem::transmute(page);
-    function()
-}
-
-unsafe fn all_zero(base: *const u8, len: usize) -> bool {
+unsafe fn all_byte(base: *const u8, len: usize, value: u8) -> bool {
     std::slice::from_raw_parts(base, len)
         .iter()
-        .all(|byte| *byte == 0)
+        .all(|byte| *byte == value)
 }
 
 unsafe fn map(len: usize, prot: libc::c_int, extra: libc::c_int) -> *mut u8 {
@@ -94,7 +66,7 @@ unsafe fn rw_case(page: usize) {
     std::ptr::write_bytes(base, 0xa5, len);
     let (ret, err) = discard(base, len);
     report!(rw_madvise_ret = ret, rw_madvise_errno = err);
-    report!(rw_zero_after_discard = all_zero(base, len));
+    report!(rw_zero_after_discard = all_byte(base, len, 0));
     base.add(page).write(0x5a);
     report!(rw_rewrite_kept = base.add(page).read() == 0x5a && base.read() == 0);
 }
@@ -112,8 +84,7 @@ unsafe fn code_case(page: usize) {
     if rw.0 != 0 {
         libc::_exit(3);
     }
-    std::ptr::write_bytes(base.add(page), 0xa5, page);
-    write_return_value(base, 0x1234);
+    std::ptr::write_bytes(base, 0xa5, committed);
     let rx = outcome(libc::mprotect(
         base.cast(),
         committed,
@@ -123,12 +94,11 @@ unsafe fn code_case(page: usize) {
     if rx.0 != 0 {
         libc::_exit(3);
     }
-    sync_generated_code(base);
-    report!(code_first_call = call_return_value(base));
+    report!(code_rx_readback = all_byte(base, committed, 0xa5));
 
     let (ret, err) = discard(base, len);
     report!(code_madvise_ret = ret, code_madvise_errno = err);
-    report!(code_zero_after_discard = all_zero(base, committed));
+    report!(code_zero_after_discard = all_byte(base, committed, 0));
 
     let recommit = outcome(libc::mprotect(
         base.cast(),
@@ -142,7 +112,7 @@ unsafe fn code_case(page: usize) {
     if recommit.0 != 0 {
         libc::_exit(3);
     }
-    write_return_value(base, 0x5678);
+    std::ptr::write_bytes(base, 0x5a, committed);
     let rx = outcome(libc::mprotect(
         base.cast(),
         committed,
@@ -152,23 +122,19 @@ unsafe fn code_case(page: usize) {
     if rx.0 != 0 {
         libc::_exit(3);
     }
-    sync_generated_code(base);
-    report!(code_recommit_call = call_return_value(base));
+    report!(code_recommit_readback = all_byte(base, committed, 0x5a));
 }
 
 unsafe fn rwx_case(page: usize) {
     let len = 2 * page;
     let base = map(len, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC, 0);
-    std::ptr::write_bytes(base.add(page), 0xa5, page);
-    write_return_value(base, 0x2222);
-    sync_generated_code(base);
-    report!(rwx_first_call = call_return_value(base));
+    std::ptr::write_bytes(base, 0xa5, len);
+    report!(rwx_written = all_byte(base, len, 0xa5));
     let (ret, err) = discard(base, len);
     report!(rwx_madvise_ret = ret, rwx_madvise_errno = err);
-    report!(rwx_zero_after_discard = all_zero(base, len));
-    write_return_value(base, 0x3333);
-    sync_generated_code(base);
-    report!(rwx_rewrite_call = call_return_value(base));
+    report!(rwx_zero_after_discard = all_byte(base, len, 0));
+    std::ptr::write_bytes(base, 0x33, page);
+    report!(rwx_rewrite_kept = all_byte(base, page, 0x33) && all_byte(base.add(page), page, 0));
 }
 
 unsafe fn misaligned_case(page: usize) {

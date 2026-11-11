@@ -1,7 +1,7 @@
 //! Signed guest witness for ARM native-child `madvise(MADV_DONTNEED)` (#1846).
 //! A fork child `execve`s the probe again, so the new image is a ring-owned
 //! native task. It discards private anonymous RW, V8 code-range (reserved,
-//! committed RW, written, RX, called) and RWX ranges; Linux returns 0, keeps
+//! committed RW, filled, RX and read back) and RWX ranges; Linux returns 0, keeps
 //! each mapping's protection and reads the discarded pages back as zero.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod common;
@@ -61,7 +61,7 @@ fn case_native_exec_child_madvise_dontneed_discards() {
             "code_commit_rw_errno=0\n",
             "code_rx_ret=0\n",
             "code_rx_errno=0\n",
-            "code_first_call=4660\n",
+            "code_rx_readback=true\n",
             "code_madvise_ret=0\n",
             "code_madvise_errno=0\n",
             "code_zero_after_discard=true\n",
@@ -69,12 +69,12 @@ fn case_native_exec_child_madvise_dontneed_discards() {
             "code_recommit_rw_errno=0\n",
             "code_recommit_rx_ret=0\n",
             "code_recommit_rx_errno=0\n",
-            "code_recommit_call=22136\n",
-            "rwx_first_call=8738\n",
+            "code_recommit_readback=true\n",
+            "rwx_written=true\n",
             "rwx_madvise_ret=0\n",
             "rwx_madvise_errno=0\n",
             "rwx_zero_after_discard=true\n",
-            "rwx_rewrite_call=13107\n",
+            "rwx_rewrite_kept=true\n",
             "misaligned_madvise_ret=-1\n",
             "misaligned_madvise_errno=22\n",
             "child_exit=0\n",
