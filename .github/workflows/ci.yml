@@ -435,6 +435,8 @@ jobs:
           persist-credentials: false
       - name: Self-test the gate
         run: scripts/ci/test-require-linked-issue.sh
+      - name: Self-test the prebuilt carrick-xtask verifier
+        run: scripts/ci/test-xtask-prebuilt.sh
       - name: Require a linked issue
         env:
           GH_TOKEN: ${{ github.token }}
