@@ -5849,8 +5849,10 @@ fn completed_output_busy_yields(in_preparation: bool) {
             .unwrap();
         let result = entry.finish_copyout(service::OwnedCopyout {
             effect: None,
-            address: UserVa::new(0x10000),
-            bytes: bytes.clone(),
+            data: service::CopyoutData::Bytes {
+                address: UserVa::new(0x10000),
+                bytes: bytes.clone(),
+            },
             offset: 0,
             result: SyscallResult::new(37),
             prefix_on_fault: false,
@@ -5933,6 +5935,61 @@ fn completed_poll_output_copy_busy_yields_then_delivers_the_answer() {
 #[test]
 fn completed_poll_output_preparation_busy_yields_then_delivers_the_answer() {
     completed_output_busy_yields(true);
+}
+
+#[cfg(test)]
+#[test]
+fn poll_revents_crossing_a_page_retains_partial_copy_and_fault() {
+    let fixture = native_exec_fixture();
+    let mut service = fixture.service();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    for fault in [false, true] {
+        service.child_copy_error = fault.then_some(NativeProcessError::Fault);
+        service.child_copy_error_at = Some(0x11000);
+        take_signal_copies();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let output = service::OwnedCopyout {
+            effect: None,
+            data: service::CopyoutData::Poll(vec![carrick_syscall_abi::PollReventsOutput::new(
+                carrick_guest_arch::GuestVa::new(0x10ff9),
+                0x1234,
+            )]),
+            offset: 0,
+            result: SyscallResult::new(1),
+            prefix_on_fault: false,
+        };
+        let result = entry.finish_copyout(output);
+        let bytes = 0x1234_i16.to_ne_bytes();
+        if fault {
+            assert!(matches!(result, Err(NativeProcessError::Fault)));
+            assert_eq!(
+                take_signal_copies(),
+                [(UserVa::new(0x10fff), vec![bytes[0]])]
+            );
+        } else {
+            assert!(matches!(result, Ok(NativeResume::Returned(value)) if value.raw() == 1));
+            assert_eq!(
+                take_signal_copies(),
+                [
+                    (UserVa::new(0x10fff), vec![bytes[0]]),
+                    (UserVa::new(0x11000), vec![bytes[1]])
+                ]
+            );
+        }
+    }
 }
 
 #[cfg(test)]

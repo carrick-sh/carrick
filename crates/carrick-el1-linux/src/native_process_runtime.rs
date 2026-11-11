@@ -5594,8 +5594,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let nanos = u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(frequency))
             .unwrap_or(u64::MAX);
         let result = self.finish_copyout(service::OwnedCopyout {
-            address,
-            bytes: carrick_personality_linux::sleep::timespec_bytes(nanos).to_vec(),
+            data: service::CopyoutData::Bytes {
+                address,
+                bytes: carrick_personality_linux::sleep::timespec_bytes(nanos).to_vec(),
+            },
             offset: 0,
             result: interrupted,
             prefix_on_fault: false,
@@ -8322,8 +8324,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         effect: Box<dyn carrick_personality_linux::lifecycle::CopyoutEffect + 'a>,
     ) -> LifecycleOutcome {
         let result = self.finish_copyout(service::OwnedCopyout {
-            address,
-            bytes,
+            data: service::CopyoutData::Bytes { address, bytes },
             offset: 0,
             result: SyscallResult::new(0),
             prefix_on_fault: false,
@@ -8338,8 +8339,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         result: SyscallResult,
     ) -> LifecycleOutcome {
         let result = self.finish_copyout(service::OwnedCopyout {
-            address,
-            bytes,
+            data: service::CopyoutData::Bytes { address, bytes },
+            offset: 0,
+            prefix_on_fault: false,
+            result,
+            effect: None,
+        });
+        self.finish_output_outcome(result)
+    }
+    fn complete_poll_copyout(
+        &mut self,
+        fields: Vec<carrick_syscall_abi::PollReventsOutput>,
+        result: SyscallResult,
+    ) -> LifecycleOutcome {
+        let result = self.finish_copyout(service::OwnedCopyout {
+            data: service::CopyoutData::Poll(fields),
             offset: 0,
             prefix_on_fault: false,
             result,
