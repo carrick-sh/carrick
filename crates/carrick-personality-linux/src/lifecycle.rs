@@ -461,10 +461,12 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
     /// An unmanaged clone (no venue stock) found the ring pool empty. The
     /// host ledger stocks this pool, so the empty pool is contention, not a
     /// host birth (#1974): keep the clone, release the execution lease
-    /// through carrier work that asks the host for stock, and rerun the clone
-    /// in ring. `None` keeps today's host-issued birth for this call: the
-    /// host already answered this clone's demand without stock (no stocker,
-    /// `RLIMIT_NPROC`, exhaustion), or there is no venue to wait in.
+    /// through carrier work whose request asks the host for stock, and rerun
+    /// the clone in ring. A rerun that finds the pool empty after the host
+    /// stocked lost the stock to a sibling and waits again. `None` keeps
+    /// today's host-issued birth for this call: the host answered that it
+    /// can stock nothing (no standing depth, `RLIMIT_NPROC`, exhaustion), or
+    /// there is no venue to wait in.
     fn await_unmanaged_thread_stock(&mut self) -> Option<LifecycleOutcome> {
         None
     }

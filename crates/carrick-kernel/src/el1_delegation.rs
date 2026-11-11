@@ -69,24 +69,45 @@ pub fn settle_host_work_boundary(
     deliver_boundary_wakes(kernel, served, doorbell);
 }
 
-/// Settle the host work a native member's `CarrierWork` request owes. A
-/// thread-stock cause names that member's ring clone, waiting on an empty
-/// unmanaged pool (#1974): stock its exact process first, so the clone the
-/// reply reruns claims a ring entry instead of becoming a host birth.
-pub fn settle_carrier_work_boundary(
+/// The host half of a native member's `CarrierWork` request, shared by every
+/// carrier that serves one (the ARM `finish_native_service` today). It
+/// settles the owed host work and decides the request's own demand from the
+/// exact requester, returning the typed answer the carrier acknowledges.
+///
+/// A [`CarrierDemand::ThreadStock`] request is a ring clone by `requester`
+/// waiting on its empty unmanaged pool (#1974). The demand rides the
+/// request, so no other boundary can consume it. Its process is stocked
+/// after the ledger settles, and the answer is `Stocked` iff that page then
+/// holds claimable stock; otherwise `Unstockable` (no standing depth,
+/// `RLIMIT_NPROC`, exhaustion, a closed gate, or a requester no longer exact
+/// in `zone`), and the clone's rerun takes the host's own answer.
+///
+/// [`CarrierDemand::ThreadStock`]: carrick_core_abi::service::CarrierDemand::ThreadStock
+pub fn settle_carrier_work(
     kernel: &crate::kernel::Kernel,
-    requester: carrick_sched_core::RecordRef,
+    zone: Option<&ZoneTables>,
+    request: &carrick_core_abi::service::ServiceRequest,
     doorbell: Option<carrick_el1_abi::HostWorkDoorbell>,
-) {
-    if doorbell
-        .as_ref()
-        .is_some_and(carrick_el1_abi::HostWorkDoorbell::thread_stock_demand)
-        && let Some(zone) = zone_tables()
-        && zone.record_ref(requester.id) == requester
-    {
-        kernel.stock_thread_births_on_demand(&zone.record(requester.id).identity());
-    }
-    settle_host_work_boundary(kernel, true, doorbell);
+) -> carrick_core_abi::service::CarrierWorkReply {
+    use carrick_core_abi::service::{CarrierDemand, CarrierWorkReply, ServiceOperation};
+    kernel.settle_thread_ledger();
+    let reply = match request.operation {
+        ServiceOperation::CarrierWork {
+            demand: CarrierDemand::ThreadStock,
+            ..
+        } => {
+            let requester = request.identity.birth.record;
+            match zone.filter(|zone| zone.record_ref(requester.id) == requester) {
+                Some(zone) => {
+                    kernel.stock_thread_births_on_demand(&zone.record(requester.id).identity())
+                }
+                None => CarrierWorkReply::Unstockable,
+            }
+        }
+        _ => CarrierWorkReply::Delivered,
+    };
+    deliver_boundary_wakes(kernel, true, doorbell);
+    reply
 }
 
 /// Publish wakes after the stopped carrier has consumed its exact task's

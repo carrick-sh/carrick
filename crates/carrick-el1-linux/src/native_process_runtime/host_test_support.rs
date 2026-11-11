@@ -1919,6 +1919,7 @@ impl NativeServiceCapacityFixture {
                 .begin_service(
                     ServiceOperation::CarrierWork {
                         entry: carrick_sched_core::object_wait::OwnerEntry::Syscall,
+                        demand: carrick_core_abi::service::CarrierDemand::Work,
                     },
                     None
                 )
@@ -2381,6 +2382,7 @@ fn carrier_work_wake_preserves_the_completed_syscall_result() {
         let result = entry.begin_service(
             ServiceOperation::CarrierWork {
                 entry: OwnerEntry::Syscall,
+                demand: carrick_core_abi::service::CarrierDemand::Work,
             },
             None,
         );
@@ -2636,6 +2638,7 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
         fixture,
         parked_read.then_some(carrick_core_abi::service::ServiceOperation::CarrierWork {
             entry: OwnerEntry::Syscall,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
         }),
     )
 }
@@ -3952,6 +3955,7 @@ fn native_exec_successor_retracts_exec_cancellation_before_owner_wait() {
             .begin_owner_service_wait(
                 carrick_core_abi::service::ServiceOperation::CarrierWork {
                     entry: OwnerEntry::Syscall,
+                    demand: carrick_core_abi::service::CarrierDemand::Work,
                 },
                 wait,
             )
@@ -5389,7 +5393,8 @@ fn carrier_work_redrives_parked_wait4(cancel: bool) {
         assert!(matches!(
             parent.begin_service(
                 ServiceOperation::CarrierWork {
-                    entry: OwnerEntry::Syscall
+                    entry: OwnerEntry::Syscall,
+                    demand: carrick_core_abi::service::CarrierDemand::Work,
                 },
                 None
             ),
@@ -5581,7 +5586,8 @@ fn portal_wait_terminal_cancellation_resumes_exact_native_service_waiter() {
             entry
                 .begin_owner_service_wait(
                     carrick_core_abi::service::ServiceOperation::CarrierWork {
-                        entry: OwnerEntry::Syscall
+                        entry: OwnerEntry::Syscall,
+                        demand: carrick_core_abi::service::CarrierDemand::Work,
                     },
                     wait
                 )
@@ -7134,6 +7140,7 @@ fn retained_ipc_supply_for<
         );
         let work = ServiceOperation::CarrierWork {
             entry: OwnerEntry::Syscall,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
         };
         if matches!(
             refusal,
@@ -7622,6 +7629,7 @@ fn retained_ipc_terminal_close_for<
         let result = sibling_entry.begin_service(
             ServiceOperation::CarrierWork {
                 entry: OwnerEntry::Syscall,
+                demand: carrick_core_abi::service::CarrierDemand::Work,
             },
             None,
         );
@@ -7857,6 +7865,7 @@ fn host_request_during_service_park_yields_then_reparks() {
     host_contended_service_park(
         carrick_core_abi::service::ServiceOperation::CarrierWork {
             entry: OwnerEntry::Syscall,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
         },
         false,
     );
@@ -7872,6 +7881,7 @@ fn host_takeover_before_yield_receipt_is_not_now() {
     host_contended_service_park(
         carrick_core_abi::service::ServiceOperation::CarrierWork {
             entry: OwnerEntry::Syscall,
+            demand: carrick_core_abi::service::CarrierDemand::Work,
         },
         true,
     );
@@ -8239,6 +8249,7 @@ fn host_request_during_owner_wait_park_yields_then_reparks() {
         let parked = entry.begin_owner_service_wait(
             carrick_core_abi::service::ServiceOperation::CarrierWork {
                 entry: OwnerEntry::Syscall,
+                demand: carrick_core_abi::service::CarrierDemand::Work,
             },
             wait,
         );

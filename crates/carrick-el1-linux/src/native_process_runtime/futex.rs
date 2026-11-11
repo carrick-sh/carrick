@@ -370,6 +370,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .retry_guest_input(
                             carrick_core_abi::service::ServiceOperation::CarrierWork {
                                 entry: OwnerEntry::Syscall,
+                                demand: carrick_core_abi::service::CarrierDemand::Work,
                             },
                             None,
                             Some(wait),
