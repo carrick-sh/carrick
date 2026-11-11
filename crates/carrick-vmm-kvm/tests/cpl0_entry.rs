@@ -24,8 +24,10 @@ use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
     restore_native_context,
 };
-use kvm_pool_fixture::{physical_inventory, run_instrumented_pool_fixture, run_pool_fixture,
-    try_run_instrumented_pool_fixture};
+use kvm_pool_fixture::{
+    physical_inventory, run_instrumented_pool_fixture, run_pool_fixture,
+    try_run_instrumented_pool_fixture,
+};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
@@ -1309,7 +1311,11 @@ fn production_anonymous_failed_replay_settlement_is_fatal_not_efault() {
     const INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe1d;
 
     let mut code = Vec::new();
-    append_mov(&mut code, &[0x48, 0xb8], INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE);
+    append_mov(
+        &mut code,
+        &[0x48, 0xb8],
+        INJECT_REPLAY_SETTLEMENT_REFUSAL_ONCE,
+    );
     code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x85]); // jnz unarmed
     let unarmed = code.len();
     code.extend_from_slice(&0_i32.to_le_bytes());
