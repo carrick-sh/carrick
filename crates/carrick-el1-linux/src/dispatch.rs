@@ -3820,8 +3820,12 @@ impl<
             memory::DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
             memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
             memory::DelegatedAnonymous::Served => {
-                if super::mm_portal::complete_anonymous_edit_replay(zone.tables, slot, task)
-                    .is_err()
+                if carrick_core::wait::complete_anonymous_edit_replay(
+                    zone.tables,
+                    slot,
+                    task.mm.key.load(Ordering::Acquire),
+                )
+                .is_err()
                 {
                     invalid_completion(NativeInvariant::EntryBinding);
                 }
