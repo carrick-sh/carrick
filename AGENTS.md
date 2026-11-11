@@ -244,7 +244,9 @@ skills `carrick-trace` and `carrick-lldb`.
   project, rarely, with a logged reason (owner, 2026-11-11).
 - **Personality split:** the shared kernel is personality-neutral. Nothing
   here names an out-of-tree personality. Neutral crates must not depend on
-  `carrick-personality-linux` (#366, #237). Seam PRs follow the lighter gate in
+  `carrick-personality-linux`; `carrick-el1`, `carrick-el1-abi`, `carrick-hal`
+  and `carrick-mem` still do, `carrick-core` only as a dev-dependency (#366,
+  #237, #2075). Seam PRs follow the lighter gate in
   [`docs/director-playbook.md`](docs/director-playbook.md#seams).
 
 ## Where to look next
