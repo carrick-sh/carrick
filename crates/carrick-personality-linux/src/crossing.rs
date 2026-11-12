@@ -452,6 +452,35 @@ mod tests {
     extern crate std;
     use super::*;
 
+    /// The fd-operand resolver names a crossing's descriptor by canonical
+    /// argument index, and an x86 venue rewrites the native register at
+    /// that index. That holds only if x86 decoding keeps every declared
+    /// descriptor argument in place; a legacy normalization that moved one
+    /// would rewrite the wrong register.
+    #[test]
+    fn x86_decoding_keeps_every_declared_descriptor_argument_in_place() {
+        use crate::dispatch::FdOperand;
+        let args = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15];
+        for native in 0..512 {
+            let call = crate::entry::decode_x86_64(native, args, 0x8000);
+            let Some(crossing) =
+                AllowedHostCrossing::from_canonical_aarch64(CanonicalNr::new(call.canonical.raw()))
+                    .or_else(|| private_x86_crossing(CanonicalNr::new(call.canonical.raw())))
+            else {
+                continue;
+            };
+            let index = match crossing.operand_spec().fd_operand() {
+                FdOperand::Fd { index } => index,
+                FdOperand::ObjectWrite => 0,
+                FdOperand::None | FdOperand::DirFd { .. } | FdOperand::Unresolved => continue,
+            };
+            assert_eq!(
+                call.args[index as usize], args[index as usize],
+                "x86 native {native} ({crossing:?}) moves its descriptor argument {index}"
+            );
+        }
+    }
+
     #[test]
     fn ring_first_census_host_files_are_admitted_but_signal_return_is_owned() {
         for ordinal in [213, 223, 281, 230, 231] {

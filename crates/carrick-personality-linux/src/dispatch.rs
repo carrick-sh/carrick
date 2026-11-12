@@ -311,10 +311,10 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn native_number(&self) -> Option<carrick_syscall_abi::NativeNr> {
         None
     }
-    /// Reject a guest descriptor that cannot use this host crossing before
-    /// the crossing table evaluates the syscall ordinal.
-    fn preflight_host_crossing(&mut self, _ordinal: u64) -> bool {
-        true
+    /// Resolve the crossing's descriptor operand before the crossing table
+    /// evaluates the syscall ordinal (see [`OperandSpec::fd_operand`]).
+    fn preflight_host_crossing(&mut self, _ordinal: u64) -> HostCrossingPreflight {
+        HostCrossingPreflight::Proceed
     }
     /// Offer an unserved call to the venue's retained host-file staging
     /// before the crossing table can refuse it, as ARM stages ahead of its
@@ -870,6 +870,169 @@ pub struct OperandSpec {
     pub crossing: crate::crossing::AllowedHostCrossing,
 }
 
+/// Where a crossing names the open descriptor it uses, and how a host object
+/// bound to that descriptor crosses. The shared fd-operand resolver keys on
+/// this, so enabling a crossing for an ISA is a table flip, not per-call code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FdOperand {
+    /// The crossing names no open descriptor (paths, time, entropy, memory,
+    /// exit, socket creation).
+    None,
+    /// Argument `index` names an open descriptor. A host object under
+    /// another number crosses with that argument rewritten to its host fd.
+    Fd { index: u8 },
+    /// `write(fd, buf, count)`: a host object under another number crosses
+    /// as a host-object write the carrier authenticates.
+    ObjectWrite,
+    /// Argument `index` is a dirfd, consulted only for a relative path and
+    /// resolved by the path's owner (`AT_FDCWD` is no descriptor).
+    DirFd { index: u8 },
+    /// More than one descriptor, or a descriptor range: no transport yet.
+    /// The resolver refuses it in ring rather than cross unresolved numbers.
+    Unresolved,
+}
+
+/// The fd-operand resolver's verdict before the crossing table runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostCrossingPreflight {
+    /// The operands may cross; the crossing table decides.
+    Proceed,
+    /// No open descriptor: answered with EBADF.
+    BadFd,
+    /// The operand is the ring's object (or has no transport): never
+    /// forwarded, answered with a counted ENOSYS in ring.
+    RefusedInRing,
+}
+
+impl OperandSpec {
+    /// The descriptor operand of this crossing, exhaustive by design: a new
+    /// crossing must state it before any ISA can enable it.
+    pub const fn fd_operand(self) -> FdOperand {
+        use crate::crossing::AllowedHostCrossing as C;
+        match self.crossing {
+            C::Write => FdOperand::ObjectWrite,
+            C::Fsetxattr
+            | C::Fgetxattr
+            | C::Flistxattr
+            | C::Fremovexattr
+            | C::Ioctl
+            | C::Flock
+            | C::Fstatfs
+            | C::Ftruncate
+            | C::Fallocate
+            | C::Fchdir
+            | C::Fchmod
+            | C::Fchown
+            | C::Getdents64
+            | C::Lseek
+            | C::Read
+            | C::Readv
+            | C::Writev
+            | C::Pread64
+            | C::Pwrite64
+            | C::Preadv
+            | C::Pwritev
+            | C::Vmsplice
+            | C::Fstat
+            | C::Fsync
+            | C::Fdatasync
+            | C::SyncFileRange
+            | C::Syncfs
+            | C::Preadv2
+            | C::Pwritev2
+            | C::Bind
+            | C::Listen
+            | C::Accept
+            | C::Connect
+            | C::Getsockname
+            | C::Getpeername
+            | C::Sendto
+            | C::Recvfrom
+            | C::Setsockopt
+            | C::Getsockopt
+            | C::Shutdown
+            | C::Sendmsg
+            | C::Recvmsg
+            | C::Accept4
+            | C::Recvmmsg
+            | C::Sendmmsg
+            | C::EpollCtl
+            | C::EpollPwait
+            | C::EpollPwait2
+            | C::Dup
+            | C::Dup3
+            | C::Fcntl
+            | C::Close
+            | C::TimerfdSettime
+            | C::TimerfdGettime
+            | C::Readahead
+            | C::Fadvise64 => FdOperand::Fd { index: 0 },
+            C::Mknodat
+            | C::Mkdirat
+            | C::Unlinkat
+            | C::Linkat
+            | C::Renameat
+            | C::Faccessat
+            | C::Fchmodat
+            | C::Fchownat
+            | C::Openat
+            | C::Readlinkat
+            | C::Newfstatat
+            | C::Utimensat
+            | C::Renameat2
+            | C::Statx
+            | C::Openat2
+            | C::Faccessat2
+            | C::Fchmodat2
+            | C::Execveat => FdOperand::DirFd { index: 0 },
+            C::Symlinkat => FdOperand::DirFd { index: 1 },
+            C::Sendfile
+            | C::Splice
+            | C::Tee
+            | C::CopyFileRange
+            | C::Pselect6
+            | C::CloseRange
+            | C::Signalfd4 => FdOperand::Unresolved,
+            C::Setxattr
+            | C::Lsetxattr
+            | C::Getxattr
+            | C::Lgetxattr
+            | C::Listxattr
+            | C::Llistxattr
+            | C::Removexattr
+            | C::Lremovexattr
+            | C::Getcwd
+            | C::Statfs
+            | C::Truncate
+            | C::Chdir
+            | C::Chroot
+            | C::Sync
+            | C::Execve
+            | C::Msync
+            | C::Mlock
+            | C::Munlock
+            | C::Mincore
+            | C::Madvise
+            | C::Mlock2
+            | C::Socket
+            | C::Socketpair
+            | C::Nanosleep
+            | C::ClockGettime
+            | C::ClockGetres
+            | C::ClockNanosleep
+            | C::Times
+            | C::Gettimeofday
+            | C::Getrandom
+            | C::InotifyInit1
+            | C::TimerfdCreate
+            | C::Mlockall
+            | C::Munlockall
+            | C::Exit
+            | C::ExitGroup => FdOperand::None,
+        }
+    }
+}
+
 impl ServiceOwner {
     /// Preserve the existing family fallback path. Crossing permission is still
     /// evaluated separately on a decline, including terminal carrier handbacks.
@@ -1180,8 +1343,8 @@ fn finish<'a, C: EntryContext + 'a>(
             pending.record_forwarded(ordinal);
             return CompletionRoute::Forward;
         }
-        if !pending.preflight_host_crossing(ordinal) {
-            return CompletionRoute::Served;
+        if let Some(route) = preflight_host_crossing(ordinal, pending) {
+            return route;
         }
         let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
         let crossing_set = pending.crossing_set();
@@ -1243,6 +1406,31 @@ fn finish<'a, C: EntryContext + 'a>(
     route
 }
 
+/// Settle a crossing whose descriptor operand the venue answered before the
+/// crossing table: `None` lets the table decide. An in-ring refusal is
+/// counted in the same bucket as a table refusal.
+fn preflight_host_crossing<'a, C: EntryContext + 'a>(
+    ordinal: u64,
+    pending: &mut dyn PendingFamilies<'a, C>,
+) -> Option<CompletionRoute> {
+    match pending.preflight_host_crossing(ordinal) {
+        HostCrossingPreflight::Proceed => None,
+        HostCrossingPreflight::BadFd => {
+            pending.install_result(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EBADF));
+            Some(CompletionRoute::Served)
+        }
+        HostCrossingPreflight::RefusedInRing => {
+            pending.install_result(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS));
+            pending.record_refusal(
+                pending
+                    .crossing_set()
+                    .refusal_bucket(pending.native_number()),
+            );
+            Some(CompletionRoute::Served)
+        }
+    }
+}
+
 /// One routing and completion owner. A retained IPC operation is offered to
 /// its family before any fresh descriptor lookup, even with return work pending.
 pub fn dispatch<'a, C: EntryContext + 'a>(
@@ -1299,8 +1487,8 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         Some(authority) => authority,
         None if family == Family::AllocatorControl => CompletionAuthority::AllocatorDiagnostic,
         None => {
-            if !pending.preflight_host_crossing(ordinal) {
-                return CompletionRoute::Served;
+            if let Some(route) = preflight_host_crossing(ordinal, pending) {
+                return route;
             }
             let set = pending.crossing_set();
             let strict = pending.ring_first_strict();

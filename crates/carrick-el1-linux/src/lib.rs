@@ -11,6 +11,7 @@ pub mod aarch64_process;
 pub mod aarch64_process_tests;
 pub mod common_entry;
 pub mod cow_resolver;
+pub mod crossing_operand;
 pub mod dispatch;
 pub mod exec_stage;
 pub mod exec_successor;

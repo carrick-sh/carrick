@@ -1127,6 +1127,7 @@ impl Personality for FixturePersonality {
                         files: &files,
                         host_file: None,
                         staged: None,
+                        crossing_operand: None,
                     };
                     let route = match production_boundary(
                         carrick_el1_linux::dispatch::dispatch_syscall_with_lifecycle(
@@ -1157,6 +1158,7 @@ impl Personality for FixturePersonality {
                         ProductionBoundary::HostCustody => CompletionRoute::HostCustody,
                         ProductionBoundary::Invalid => CompletionRoute::InvalidCompletion,
                     };
+                    let crossing_operand = native.crossing_operand;
                     match route {
                         CompletionRoute::Served => {}
                         CompletionRoute::WithWork => notify_work(frame),
@@ -1167,7 +1169,7 @@ impl Personality for FixturePersonality {
                             fatal_error(frame);
                         }
                         CompletionRoute::Forward | CompletionRoute::HostCustody => {
-                            forward_to_host(frame);
+                            linux_personality::forward_crossing(frame, crossing_operand);
                         }
                     }
                 }

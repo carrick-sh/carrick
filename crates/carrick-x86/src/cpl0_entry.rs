@@ -315,6 +315,19 @@ impl NativeFrame {
     pub fn restart_syscall(&mut self) {
         self.rcx = self.syscall_pc();
     }
+
+    /// The register carrying `SYSCALL` argument `index` (rdi, rsi, rdx,
+    /// r10, r8, r9); an index past the sixth is the sixth.
+    pub fn syscall_argument_mut(&mut self, index: u8) -> &mut u64 {
+        match index {
+            0 => &mut self.rdi,
+            1 => &mut self.rsi,
+            2 => &mut self.rdx,
+            3 => &mut self.r10,
+            4 => &mut self.r8,
+            _ => &mut self.r9,
+        }
+    }
 }
 
 impl X86Registers for NativeFrame {
