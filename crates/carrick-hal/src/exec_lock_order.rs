@@ -120,6 +120,29 @@
 //! # }
 //! ```
 //!
+//! #2192, the re-review's counterexample: owners that are `'static`
+//! handles to `static` mutexes. A guard taken through the preparations
+//! phase must not ride out of it into the stock phase:
+//!
+//! ```compile_fail
+//! # use carrick_hal::exec_lock_order::ExecCrossingOrder;
+//! # use carrick_guest_arch::CpuId;
+//! # use std::sync::Mutex;
+//! static PREPARATIONS: Mutex<u32> = Mutex::new(0);
+//! static STOCK: Mutex<u32> = Mutex::new(0);
+//! let (mut prep_ref, mut stock_ref) = (&PREPARATIONS, &STOCK);
+//! let (released, held_preparations) =
+//!     ExecCrossingOrder::on_stopped(CpuId::new(0), &mut prep_ref, &mut stock_ref)
+//!         .preparations(|p| p.lock().unwrap());
+//! let (rooted, ()) = released.root_release(|| ());
+//! let (bound, ()) = rooted.bind_zone(|| ());
+//! bound.fork_stock(|s| {
+//!     let _held_stock = s.lock().unwrap();
+//!     assert!(PREPARATIONS.try_lock().is_err());
+//! });
+//! drop(held_preparations);
+//! ```
+//!
 //! The x86 fork commit already follows this order with no preparations at
 //! all: physical custody, the stopped-CPU lease, then `ForkStock::settle`.
 use carrick_guest_arch::CpuId;
