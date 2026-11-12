@@ -2,7 +2,9 @@
 //! Hardware fixtures and the initial production process use the same image;
 //! fixture observation ports remain separate from the production transport.
 use crate::carrier_cpu::FixtureWatchdog;
-use crate::carrier_cpu::{CarrierCpu, CarrierCpuDebug, CarrierCpuIo, CarrierRunExit};
+use crate::carrier_cpu::{
+    CarrierCpu, CarrierCpuDebug, CarrierCpuIo, CarrierRootBinding, CarrierRunExit,
+};
 use crate::carrier_memory::{
     BackingExtent, BackingHandle, CarrierMemory, CarrierMemoryIo, InventoryTransaction,
     PreparedBacking,
@@ -966,6 +968,77 @@ mod design_doc_tests {
 mod forward_execution_tests {
     use super::*;
 
+    /// #2142: after a root `execve`, the forward leader rule names the run
+    /// root's TID for the successor MM only; the predecessor MM is no longer
+    /// the root's, and a stale predecessor cannot rebind it again.
+    #[test]
+    fn root_exec_moves_the_forward_leader_rule_to_the_successor_mm() {
+        use carrick_hal::guest_arch_binding::GuestArchBinding;
+        let nz = |raw| NonZeroU64::new(raw).expect("nonzero");
+        let initial = InitialTaskBinding {
+            task: carrick_sched_core::process::TaskKey {
+                id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                    core::num::NonZeroI32::new(41).expect("task id"),
+                ),
+                serial: carrick_sched_core::process::TaskSerial::from_raw_u64(7)
+                    .expect("task serial"),
+            },
+            thread: carrick_sched_core::ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                generation: 1,
+                file_table: 5,
+                ..Default::default()
+            },
+            mm: MmGeneration::new(nz(302)),
+        };
+        let task = |execution| carrick_guest_arch::TaskIdentity {
+            carrier: carrick_guest_arch::CarrierGeneration::new(nz(1)),
+            task: carrick_guest_arch::TaskSerial::new(nz(7)),
+            execution: carrick_guest_arch::ExecutionGeneration::new(nz(execution)),
+        };
+        let context = |root, mm, generation| AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(root)).expect("aligned root"),
+            mm: MmGeneration::new(nz(mm)),
+            generation: ContextGeneration::new(nz(generation)),
+        };
+        let predecessor = GuestArchBinding::x86(task(1), context(0x7000, 302, 9));
+        let successor = GuestArchBinding::x86(task(1), context(0x9000, 303, 10));
+        let no_pid = || None;
+        assert_eq!(
+            forward_leader_task(Some(initial), MmGeneration::new(nz(302)), no_pid).unwrap(),
+            carrick_el1_abi::EntryTaskKey::from_raw(41)
+        );
+
+        let replaced = initial
+            .exec_successor(predecessor, successor, 202)
+            .expect("exec successor of the exact root");
+        assert_eq!(replaced.mm, successor.context().mm);
+        assert_eq!(replaced.thread.tid, 41, "exec keeps the root's TID");
+        assert_eq!(replaced.thread.serial, 202);
+        assert_eq!(replaced.task, initial.task);
+        assert_eq!(
+            forward_leader_task(Some(replaced), MmGeneration::new(nz(303)), no_pid).unwrap(),
+            carrick_el1_abi::EntryTaskKey::from_raw(41)
+        );
+        assert!(
+            forward_leader_task(Some(replaced), MmGeneration::new(nz(302)), no_pid).is_err(),
+            "the predecessor MM no longer resolves to the run root"
+        );
+        assert!(
+            replaced
+                .exec_successor(predecessor, successor, 303)
+                .is_err(),
+            "a stale predecessor cannot rebind the replaced root"
+        );
+        assert!(
+            initial
+                .exec_successor(predecessor, predecessor, 202)
+                .is_err(),
+            "exec replaces the MM"
+        );
+    }
+
     fn execution() -> (carrick_el1_abi::ExecutionBinding, AddressContext<RootGpa>) {
         (
             carrick_el1_abi::ExecutionBinding {
@@ -1288,6 +1361,28 @@ impl KernelStackSnapshot {
 impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     pub fn cpu_mut(&mut self) -> &mut CarrierCpu<M> {
         &mut self.cpu
+    }
+
+    /// Rebind the loaded run root to its `execve` successor: the carrier's
+    /// shared root binding, this CPU's loaded custody and the forward leader
+    /// rule all name the successor afterwards, or none changes.
+    pub fn retarget_root_exec(
+        &mut self,
+        predecessor: carrick_hal::guest_arch_binding::GuestArchBinding,
+        successor: carrick_hal::guest_arch_binding::GuestArchBinding,
+        successor_thread_serial: u64,
+    ) -> Result<(), TrapError> {
+        let mut custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let initial = custody
+            .initial_task
+            .ok_or_else(|| fail("root exec has no issued root task"))?
+            .exec_successor(predecessor, successor, successor_thread_serial)?;
+        self.cpu.retarget_loaded_exec(predecessor, successor)?;
+        custody.initial_task = Some(initial);
+        Ok(())
     }
 
     pub fn physical_slot(&self) -> Option<carrick_guest_arch::CpuId> {
@@ -2506,15 +2601,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
 }
 
 impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionWorkerParts<M, Mem> {
-    /// Both CPUs take the root binding from `root_state` itself; callers
-    /// cannot supply a second, possibly different, root binding.
+    /// Both CPUs share one root binding issued from `root_state` itself;
+    /// callers cannot supply a second, possibly different, root binding.
     pub fn new(
         mut cpus: [CarrierCpu<M>; 2],
         custody: BootstrapCustody<Mem>,
         root_state: carrick_x86::arch_context::X86ArchContext,
     ) -> Self {
+        let root = CarrierRootBinding::issued(root_state.binding());
         for cpu in &mut cpus {
-            cpu.bind_root(root_state.binding());
+            cpu.bind_root(root.clone());
         }
         Self {
             cpus,
@@ -2558,6 +2654,53 @@ pub struct InitialTaskBinding {
     pub task: carrick_sched_core::process::TaskKey,
     pub thread: carrick_sched_core::ThreadIdentity,
     pub mm: MmGeneration,
+}
+
+impl InitialTaskBinding {
+    /// The run root after `execve` from `predecessor` to `successor`. Exec
+    /// keeps the Linux task and TID; the MM, the thread serial and the
+    /// execution generation are the successor's. A predecessor that is not
+    /// this exact root is stale.
+    pub fn exec_successor(
+        self,
+        predecessor: carrick_hal::guest_arch_binding::GuestArchBinding,
+        successor: carrick_hal::guest_arch_binding::GuestArchBinding,
+        successor_thread_serial: u64,
+    ) -> Result<Self, TrapError> {
+        if self.mm != predecessor.context().mm
+            || self.task.serial.raw() != predecessor.task().task.raw().get()
+            || self.thread.generation != predecessor.task().execution.raw().get()
+            || successor_thread_serial == 0
+        {
+            return Err(fail("root exec names a stale initial task"));
+        }
+        let successor = predecessor.exec_successor(successor)?;
+        let mut thread = self.thread;
+        thread.serial = successor_thread_serial;
+        thread.generation = successor.task().execution.raw().get();
+        Ok(Self {
+            task: self.task,
+            thread,
+            mm: successor.context().mm,
+        })
+    }
+}
+
+/// The process leader a stopped forward must name. The run root leads its
+/// own MM by its issued TID; any other MM is led by its visible pid.
+fn forward_leader_task(
+    initial: Option<InitialTaskBinding>,
+    mm: MmGeneration,
+    visible_pid: impl FnOnce() -> Option<u32>,
+) -> Result<carrick_el1_abi::EntryTaskKey, TrapError> {
+    match initial {
+        Some(initial) if mm == initial.mm => {
+            Ok(carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid))
+        }
+        _ => Ok(carrick_el1_abi::EntryTaskKey::from_raw(u64::from(
+            visible_pid().ok_or_else(|| fail("stopped forward task has no visible pid"))?,
+        ))),
+    }
 }
 
 /// A single movable view into metadata retained by `Cpl0HostCustody`.
@@ -2759,15 +2902,8 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
             NonZeroU64::new(native.mm_owner_generation.load(Ordering::Acquire))
                 .ok_or_else(|| fail("stopped forward address incarnation"))?,
         );
-        let leader_task = match custody.initial_task {
-            Some(initial) if context.mm == initial.mm => {
-                carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid)
-            }
-            _ => carrick_el1_abi::EntryTaskKey::from_raw(u64::from(
-                task.visible_pid()
-                    .ok_or_else(|| fail("stopped forward task has no visible pid"))?,
-            )),
-        };
+        let leader_task =
+            forward_leader_task(custody.initial_task, context.mm, || task.visible_pid())?;
         let execution = admit_forward_execution(
             cpu,
             carrick_guest_arch::CpuId::new(native.cpu_slot),

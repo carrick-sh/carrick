@@ -272,11 +272,48 @@ impl CarrierChildBindings {
     }
 }
 
+/// The issued run root's binding, shared by every CPU of one carrier. The
+/// idle peer authenticates a root forward against it without a loaded lease,
+/// so a root `execve` must replace it for all CPUs at once.
+#[derive(Clone, Default)]
+pub struct CarrierRootBinding(std::sync::Arc<std::sync::Mutex<Option<GuestArchBinding>>>);
+
+impl CarrierRootBinding {
+    pub fn issued(binding: GuestArchBinding) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(binding))))
+    }
+
+    pub fn get(&self) -> Result<Option<GuestArchBinding>, TrapError> {
+        Ok(*self
+            .0
+            .lock()
+            .map_err(|_| boundary_error("root binding authority poisoned"))?)
+    }
+
+    /// Replace the exact predecessor with its admitted exec successor. A
+    /// predecessor that is no longer the root is stale and changes nothing.
+    fn replace_exec(
+        &self,
+        predecessor: GuestArchBinding,
+        successor: GuestArchBinding,
+    ) -> Result<(), TrapError> {
+        let mut root = self
+            .0
+            .lock()
+            .map_err(|_| boundary_error("root binding authority poisoned"))?;
+        if *root != Some(predecessor) {
+            return Err(boundary_error("exec retarget names a stale root binding"));
+        }
+        *root = Some(predecessor.exec_successor(successor)?);
+        Ok(())
+    }
+}
+
 pub struct CarrierCpu<I: CarrierCpuIo> {
     io: I,
     neutral: X86VcpuSnapshot,
     custody: Custody,
-    root_binding: Option<GuestArchBinding>,
+    root_binding: CarrierRootBinding,
     child_bindings: CarrierChildBindings,
     maintenance_root: Option<RootGpa>,
     debug: Option<Arc<CarrierCpuDebug>>,
@@ -296,7 +333,7 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             io,
             neutral,
             custody: Custody::Idle,
-            root_binding: None,
+            root_binding: CarrierRootBinding::default(),
             child_bindings,
             maintenance_root: None,
             debug: None,
@@ -313,13 +350,41 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
         Ok(cpu)
     }
 
-    /// Record the issued root task, which the idle peer may find stopped in a
+    /// Share the issued root task, which the idle peer may find stopped in a
     /// forward without a loaded lease. Only `ProductionWorkerParts::new`
-    /// calls this, with its own root state's binding, so the binding that
-    /// authenticates forwards cannot diverge from the root task handed to the
-    /// executor.
-    pub(crate) fn bind_root(&mut self, binding: GuestArchBinding) {
-        self.root_binding = Some(binding);
+    /// calls this, with one cell issued from its own root state's binding for
+    /// every CPU, so the binding that authenticates forwards cannot diverge
+    /// from the root task handed to the executor, nor between CPUs after a
+    /// root `execve` replaces it.
+    pub(crate) fn bind_root(&mut self, root: CarrierRootBinding) {
+        self.root_binding = root;
+    }
+
+    /// Move the loaded run root to its `execve` successor: the carrier's
+    /// shared root binding and this CPU's loaded custody both name the
+    /// successor afterwards, or neither changes. The successor's image was
+    /// installed by the exec transaction; a later save validates it.
+    pub(crate) fn retarget_loaded_exec(
+        &mut self,
+        predecessor: GuestArchBinding,
+        successor: GuestArchBinding,
+    ) -> Result<(), TrapError> {
+        let Custody::Loaded { binding, .. } = &mut self.custody else {
+            return Err(boundary_error(
+                "exec retarget requires its loaded predecessor",
+            ));
+        };
+        if *binding != predecessor {
+            return Err(boundary_error(
+                "exec retarget requires its exact loaded predecessor",
+            ));
+        }
+        self.root_binding.replace_exec(predecessor, successor)?;
+        *binding = successor;
+        if let Some(debug) = &self.debug {
+            debug.bound(successor.task());
+        }
+        Ok(())
     }
 
     pub fn physical_slot(&self) -> Option<carrick_guest_arch::CpuId> {
@@ -444,7 +509,7 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
         {
             return Ok(binding);
         }
-        if let Some(binding) = self.root_binding
+        if let Some(binding) = self.root_binding.get()?
             && binding.context().root == root_gpa
         {
             return Ok(binding);
@@ -1183,10 +1248,77 @@ mod tests {
             err.to_string().contains("unregistered forward CR3"),
             "{err:?}"
         );
-        cpu.bind_root(root.binding());
+        cpu.bind_root(CarrierRootBinding::issued(root.binding()));
         assert_eq!(
             cpu.registered_task_binding(root_gpa).unwrap(),
             root.binding()
+        );
+    }
+    /// #2142: a root `execve` moves the loaded CPU's custody and the
+    /// carrier's one root binding to the successor, so the other CPU's idle
+    /// peer authenticates the successor's root and refuses the predecessor's.
+    #[test]
+    fn root_exec_retarget_moves_loaded_custody_and_every_cpu_root_binding() {
+        let nz = |v| NonZeroU64::new(v).unwrap();
+        let root = context(2);
+        let predecessor = root.binding();
+        let successor_root = RootGpa::page_aligned(FrameGpa::new(0x9000)).unwrap();
+        let successor = GuestArchBinding::x86(
+            predecessor.task(),
+            AddressContext {
+                root: successor_root,
+                mm: MmGeneration::new(nz(99)),
+                generation: ContextGeneration::new(nz(98)),
+            },
+        );
+        let shared = CarrierRootBinding::issued(predecessor);
+        let mut loaded = CarrierCpu::new(TestIo {
+            image: context(1).hardware_image(),
+        })
+        .unwrap();
+        let mut peer = CarrierCpu::new(TestIo {
+            image: context(1).hardware_image(),
+        })
+        .unwrap();
+        loaded.bind_root(shared.clone());
+        peer.bind_root(shared.clone());
+        assert!(
+            loaded.retarget_loaded_exec(predecessor, successor).is_err(),
+            "an unloaded CPU has no predecessor to retarget"
+        );
+        loaded.load(root.clone()).unwrap();
+        assert!(
+            loaded
+                .retarget_loaded_exec(context(3).binding(), successor)
+                .is_err(),
+            "a binding other than the loaded predecessor is stale"
+        );
+        assert!(
+            loaded
+                .retarget_loaded_exec(predecessor, context(3).binding())
+                .is_err(),
+            "exec keeps the task"
+        );
+        assert_eq!(shared.get().unwrap(), Some(predecessor));
+
+        loaded.retarget_loaded_exec(predecessor, successor).unwrap();
+        assert_eq!(shared.get().unwrap(), Some(successor));
+        assert!(matches!(
+            loaded.custody,
+            Custody::Loaded { binding, .. } if binding == successor
+        ));
+        assert_eq!(
+            peer.registered_task_binding(successor_root).unwrap(),
+            successor
+        );
+        assert!(
+            peer.registered_task_binding(predecessor.context().root)
+                .is_err(),
+            "the predecessor root no longer authenticates a forward"
+        );
+        assert!(
+            loaded.retarget_loaded_exec(predecessor, successor).is_err(),
+            "a retired predecessor cannot retarget again"
         );
     }
     #[test]
