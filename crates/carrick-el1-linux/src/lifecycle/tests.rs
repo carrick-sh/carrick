@@ -1583,9 +1583,24 @@ fn clone_then_join(w: &mut World, word: &GuestUserValue<u32>) -> TrapFrame {
 
 #[test]
 fn exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it() {
+    born_thread_exit_is_served_in_zone(false);
+}
+
+/// glibc registers a robust list for every thread. No lane walks it yet, so
+/// it is no reason to leave the zone: a ring-born thread has no host lane to
+/// leave to (#2109).
+#[test]
+fn exit_of_a_born_thread_with_a_robust_list_is_served_in_zone() {
+    born_thread_exit_is_served_in_zone(true);
+}
+
+fn born_thread_exit_is_served_in_zone(robust: bool) {
     let mut w = World::new(LifecycleHatches::ON);
     let word = GuestUserValue::new(0_u32);
     let mut frame = clone_then_join(&mut w, &word);
+    if robust {
+        w.venue.child_slot(0).set_robust_list(0x9000, 24);
+    }
     let action = w.call(&mut frame, SYS_EXIT, &[0]);
     assert_eq!(action, Action::Served);
     assert_eq!(word.get(), 0, "CLEARTID cleared");
@@ -1665,12 +1680,9 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
 fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
     // (label, setup applied after the child is switched in)
     type Setup = fn(&World);
-    let cases: [(&str, Setup); 5] = [
+    let cases: [(&str, Setup); 4] = [
         ("last thread (n == 1)", |w| {
             w.page().try_exit().unwrap();
-        }),
-        ("robust list registered", |w| {
-            w.venue.child_slot(0).set_robust_list(0x9000, 24);
         }),
         ("pending signal", |w| {
             let _ = w

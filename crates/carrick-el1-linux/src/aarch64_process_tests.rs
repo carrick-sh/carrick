@@ -6994,7 +6994,7 @@ fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
 }
 
 #[test]
-fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
+fn arm_two_live_threads_robust_exit_retires_in_ring() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (control, record) = imported_thread_with_identity(fixture, |_| {});
     let mut service = fixture.process_service();
@@ -7011,7 +7011,7 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
         record.id
     );
-    // Every glibc/musl thread registers a robust list at start.
+    // Every glibc thread registers a robust list at start.
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[0] = 0x2000;
     frame.x[1] = 24;
@@ -7023,51 +7023,21 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
     );
     assert_eq!(frame.x[0], 0);
     assert_eq!(control.robust_list().0, 0x2000);
-    // The in-ring exit declines (no robust-list walker here) with a live
-    // sibling: the host walks the list and retires the thread.
+    // No lane walks a robust list yet, so it is no reason to leave the ring
+    // (#2109): with a live sibling the raw exit retires only this thread, in
+    // ring, exactly as an exit without a list does.
     frame.x = [0; 31];
     frame.x[8] = 93;
     let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
     assert_eq!(
         route,
-        carrick_personality_linux::dispatch::CompletionRoute::HostCustody
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
-    assert_eq!(
-        arm_route_action(fixture, route, &mut frame),
-        carrick_el1_abi::Action::HostCustody
-    );
-    assert_eq!(frame.x[0], 0, "never rewritten to -ENOSYS");
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-    assert!(registry().for_record(fixture.zone, record).is_some());
-    assert!(control.host_exit_requested());
-    fixture.zone.clear_current(fixture.slot);
-    assert!(leader_sees_thread(fixture, &mut service, 42));
-    let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
-        carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-        carrick_core_abi::entry::BirthSerial::of_task(
-            carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
-        ),
-        carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
-    )
-    .unwrap();
-    carrick_el1_abi::Lifecycle::reserve_nonfinal_exit(fixture.page)
-        .unwrap()
-        .publish();
-    fixture
-        .page
-        .publish_exact_host_retirement(control, receipt.retirement());
+    assert!(!control.host_exit_requested());
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
+    assert!(registry().for_record(fixture.zone, record).is_none());
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
     run_as_leader(fixture);
-    registry()
-        .for_entry(
-            BornInZoneSource {
-                zone: fixture.zone,
-                slot: fixture.slot,
-            },
-            &fixture.task,
-            fixture.address,
-        )
-        .unwrap();
-    fixture.zone.free_record(record.id);
     assert!(!leader_sees_thread(fixture, &mut service, 42));
     assert!(leader_sees_thread(fixture, &mut service, 41));
 }
