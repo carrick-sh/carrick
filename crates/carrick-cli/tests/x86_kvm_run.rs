@@ -2519,11 +2519,12 @@ fn compare_root_crossings_with_native(fixture: &str) {
     assert!(run.stderr.is_empty(), "{fixture}: {:?}", run.stderr);
 }
 
-/// A forked child performs a B1 crossing family's calls. It owns no host task,
-/// so a path call is the ring's counted ENOSYS (as on ARM) and a closed
-/// descriptor is EBADF; the run must not fail and the child leaves no host
-/// effect, which the parent proves. The fixture's own exit code carries the
-/// first step that differed.
+/// A forked child performs a B1 crossing family's calls. The root's fork
+/// seeds the child's cwd (#2155), so the calls the child mutation venue serves
+/// (mkdirat, truncate, newfstatat) run against it and the parent proves their
+/// host effect; a path call with no child route is the ring's counted ENOSYS
+/// (as on ARM) and a closed descriptor is EBADF. The fixture's own exit code
+/// carries the first step that differed.
 fn forked_child_crossings_refuse_in_ring(fixture: &str) {
     if skip_without_kvm() {
         return;

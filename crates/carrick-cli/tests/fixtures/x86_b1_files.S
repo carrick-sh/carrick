@@ -5,9 +5,11 @@
  *
  *   (none)  the run root performs every call; each returns its native
  *           Linux result. Expected stdout "F\n", exit 7.
- *   CHILD   a forked child: a path call is a counted ENOSYS in ring (no host
- *           task) and leaves no host effect, which the parent proves by
- *           creating the directory afterwards; a closed descriptor is EBADF. */
+ *   CHILD   a forked child, whose cwd the root's fork seeded (#2155): its
+ *           mkdirat is served by the child mutation venue and creates the
+ *           directory on the host, which the parent proves by finding the
+ *           name taken (EEXIST) before it removes it; a closed descriptor is
+ *           EBADF. */
 #include "x86_b1_common.h"
 
 .equ SYS_openat, 257
@@ -48,7 +50,7 @@ child_script:
     AT_PATH %rsi, dir
     mov $0755, %edx
     SYS SYS_mkdirat
-    EXPECT 11, -ENOSYS
+    EXPECT 11, 0
     /* A closed descriptor is the ring's own EBADF, never a crossing. */
     mov $2, %edi
     SYS SYS_close
@@ -79,12 +81,12 @@ parent_script:
     mov $256, %esi
     SYS SYS_getcwd
     EXPECT_OK 20
-    /* The child's mkdirat never reached the host: the name is still free. */
+    /* The child's mkdirat reached the host: the name is taken. */
     mov $AT_FDCWD, %edi
     AT_PATH %rsi, dir
     mov $0755, %edx
     SYS SYS_mkdirat
-    EXPECT 21, 0
+    EXPECT 21, -17
     mov $AT_FDCWD, %edi
     AT_PATH %rsi, dir
     mov $AT_REMOVEDIR, %edx

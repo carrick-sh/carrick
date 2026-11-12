@@ -6,9 +6,11 @@
  *   (none)  the run root performs every call; each returns its native
  *           Linux result and the values it writes to the stat buffers match.
  *           Expected stdout "F\n", exit 7.
- *   CHILD   a forked child owns no host task: a path call is a counted ENOSYS
- *           in ring and leaves no host effect (the parent proves the file
- *           still has its size); a closed descriptor is EBADF. */
+ *   CHILD   a forked child, whose cwd the root's fork seeded (#2155): the
+ *           child mutation venue serves truncate and newfstatat against that
+ *           cwd (ENOENT on the absent file, no host effect, which the parent
+ *           proves); fchmodat has no child route and is a counted ENOSYS in
+ *           ring; a closed descriptor is EBADF. */
 #include "x86_b1_common.h"
 
 .equ SYS_openat, 257
@@ -79,13 +81,13 @@ child_script:
     PATH %rdi, file
     mov $1, %esi
     SYS SYS_truncate
-    EXPECT 12, -ENOSYS
+    EXPECT 12, -2
     mov $AT_FDCWD, %edi
     PATH %rsi, file
     PATH %rdx, stat
     xor %r10d, %r10d
     SYS SYS_newfstatat
-    EXPECT 13, -ENOSYS
+    EXPECT 13, -2
     /* A closed descriptor is the ring's own EBADF, never a crossing. */
     mov $2, %edi
     SYS SYS_close
@@ -107,7 +109,7 @@ parent_script:
     PATH %rsi, statfs_buf
     SYS SYS_statfs
     EXPECT 22, 0
-    /* The child's truncate and chmod never reached the host: still absent. */
+    /* The child's truncate and chmod created nothing on the host: still absent. */
     mov $AT_FDCWD, %edi
     PATH %rsi, file
     PATH %rdx, stat

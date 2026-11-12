@@ -4,10 +4,11 @@
  * when every step returned its Linux result. A wrong result exits with the
  * step number instead, so a red run names the first call that differed.
  *
- * Under -DCHILD the script runs in a forked child instead: the ring answers
- * a fork child's host crossing with a counted ENOSYS (it owns no host task),
- * except a descriptor it closed, which is EBADF. The parent reaps the child
- * and checks that the child left no host effect. */
+ * Under -DCHILD the script runs in a forked child instead: the child's cwd
+ * is seeded by the fork (#2155), so a call the child mutation venue serves
+ * runs against it; the ring answers any other host crossing with a counted
+ * ENOSYS (the child owns no host task), except a descriptor it closed, which
+ * is EBADF. The parent reaps the child and checks the child's host effect. */
 .equ AT_FDCWD, -100
 .equ SYS_write, 1
 .equ SYS_close, 3
