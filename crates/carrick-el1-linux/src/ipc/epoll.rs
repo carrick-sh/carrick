@@ -153,17 +153,53 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
     if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
         return returned(frame, linux::EINVAL);
     }
-    let wait = wait.unwrap_or_else(|| match argument_word(frame, 3) as i32 {
-        0 => Wait::Poll,
-        ms if ms < 0 => Wait::Forever,
-        // Round up by one tick: the wait lasts at least `ms` (epoll_wait(2)).
-        ms => Wait::Until(
-            sched
-                .now()
-                .saturating_add(sched.ticks(ms as u64 * 1_000_000))
-                .saturating_add(1),
-        ),
-    });
+    let wait = match wait {
+        // A retained operation owns its original absolute deadline. Never
+        // reread a timespec that another thread may have changed or unmapped.
+        Some(wait) => wait,
+        None if super::ordinal(frame) == 441 => {
+            let address = argument_word(frame, 3);
+            if address == 0 {
+                Wait::Forever
+            } else {
+                let mut bytes = [0u8; 16];
+                if !user.copy_in(&mut bytes, address) {
+                    if user.has_copyin_refusal() {
+                        return IpcServed::Forward;
+                    }
+                    return returned(frame, carrick_syscall_abi::LINUX_EFAULT.guest_retval());
+                }
+                let seconds = i64::from_ne_bytes(bytes[..8].try_into().unwrap_or_default());
+                let nanos = i64::from_ne_bytes(bytes[8..].try_into().unwrap_or_default());
+                if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+                    return returned(frame, linux::EINVAL);
+                }
+                if seconds == 0 && nanos == 0 {
+                    Wait::Poll
+                } else {
+                    let ns = (seconds as u64)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(nanos as u64);
+                    Wait::Until(
+                        sched
+                            .now()
+                            .saturating_add(sched.ticks(ns))
+                            .saturating_add(1),
+                    )
+                }
+            }
+        }
+        None => match argument_word(frame, 3) as i32 {
+            0 => Wait::Poll,
+            ms if ms < 0 => Wait::Forever,
+            ms => Wait::Until(
+                sched
+                    .now()
+                    .saturating_add(sched.ticks(ms as u64 * 1_000_000))
+                    .saturating_add(1),
+            ),
+        },
+    };
     let task = sched.task();
     let region = &venue.region;
     let Some(table) = venue.tables.table_of(task) else {
@@ -190,7 +226,7 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
         mm: mm_key(task),
         buf: IpcUserVa(argument_word(frame, 1)),
         orig_x0: argument_word(frame, 0),
-        nr: SYS_EPOLL_PWAIT as u32,
+        nr: super::ordinal(frame) as u32,
         ..IpcOperation::EMPTY
     };
     let (pin, desc) = match fda.pin(table, fd) {

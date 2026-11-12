@@ -452,7 +452,7 @@ pub fn serve_ipc_with_signals<E: IpcExecution, M: UserCopy>(
     interrupt: &mut dyn FnMut() -> bool,
 ) -> (IpcServed, bool) {
     let nr = ordinal(frame);
-    if nr != SYS_READ && nr != SYS_WRITE && nr != 66 && nr != SYS_EPOLL_PWAIT {
+    if nr != SYS_READ && nr != SYS_WRITE && nr != 66 && !matches!(nr, SYS_EPOLL_PWAIT | 441) {
         return (IpcServed::Forward, false);
     }
     let (token, op, resumed) = match sched.take_object_operation() {
@@ -537,7 +537,7 @@ pub fn serve_ipc_with_signals<E: IpcExecution, M: UserCopy>(
             }
             (token, op, true)
         }
-        Ok(None) if nr == SYS_EPOLL_PWAIT => {
+        Ok(None) if matches!(nr, SYS_EPOLL_PWAIT | 441) => {
             return (epoll::serve(sched, frame, venue, user, interrupt), false);
         }
         Ok(None) => match admit(sched, frame, venue, user) {
