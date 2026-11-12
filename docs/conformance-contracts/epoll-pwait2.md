@@ -30,7 +30,10 @@ child-created epoll. It covers packed x86 epoll_event output and eventfd
 read/write through that same owner. An empty infinite wait retains an
 operation and releases the slot. The fixture places lifecycle ABI records in
 TestEl1Region storage in the production metadata address window, retaining the
-exact identity check including the live affinity source. KVM epoll-specific
-parking, signal-mask and exhaustive member-kind witnesses remain required. No crossing
+exact identity check including the live affinity source. The KVM binding adds
+USE_EPOLL to the existing pipe-wake guest: epoll_create1, ADD, parent pwait(-1),
+child write and packed readiness cookie, with no ring refusals or epoll
+forwarding. A pre-fix KVM replay, signal-mask and exhaustive member-kind
+witnesses remain required. No crossing
 allowlist change is included. Signed Node validation, blocked-pool capacity,
 EINTR, Docker differential and signed artifact promotion remain required.
