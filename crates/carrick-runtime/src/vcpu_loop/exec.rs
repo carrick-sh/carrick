@@ -14,7 +14,9 @@
 use super::*;
 
 use carrick_fatal::carrick_fatal;
-use carrick_kernel::kernel::exec_transaction::apply_exec_image_proc_state;
+use carrick_kernel::kernel::exec_transaction::{
+    ExecExit, ExecStep, ImageReplacement, RootExecVenue,
+};
 
 #[expect(
     clippy::large_enum_variant,
@@ -1505,7 +1507,7 @@ where
             binfmt_argv,
             command_line: cmdline,
             inventory_failure_injection,
-            mut hvpatch_mm_reservation,
+            hvpatch_mm_reservation,
             terminal_context,
             clone_admission,
             runtime_region_count,
@@ -1520,955 +1522,35 @@ where
                 clone_admission.is_some()
             );
         }
-        let emit_runtime_stage =
-            |phase: carrick_observability::probes::HvpatchExecRuntimeStagePhase,
-             started: std::time::Instant| {
-                if kernel.hvpatch_process.is_some() {
-                    let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-                    crate::probes::hvpatch_exec_runtime_stage(
-                        carrick_observability::probes::HvpatchExecRuntimeStage::new(
-                            phase,
-                            elapsed_ns,
-                            runtime_region_count,
-                            runtime_mapped_bytes,
-                        ),
-                    );
-                }
-            };
-        emit_runtime_stage(
-            carrick_observability::probes::HvpatchExecRuntimeStagePhase::SiblingDrain,
-            sibling_drain_started,
-        );
-        // Kernel preparation follows the runtime sibling drain (whose
-        // exiting host loops retire their own old Kernel threads) but
-        // precedes every destructive image, CLOEXEC, and proc-state
-        // mutation. HVPatch selects the survivor and installs the exec
-        // reservation under one registry write lock, so a late loser
-        // retirement cannot invalidate a separately captured revision.
-        // From here, the prepared exec transaction is the sole owner of
-        // nonleader promotion and replacement Mm state.
-        let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
-            Some(process) => {
-                let reservation = hvpatch_mm_reservation.take().unwrap_or_else(|| {
-                    carrick_fatal!(
-                        "hvpatch::mm_authority",
-                        "prepared HVPatch exec lost MM-generation admission for tid={:?}",
-                        self.linux_tid
-                    );
-                });
-                process
-                    .prepare_exec_for_linux_tid_with_mm_reservation(self.linux_tid, reservation)
-                    .map(|(prepared, context)| {
-                        (
-                            RuntimePreparedExec::Hvpatch(Box::new(prepared)),
-                            Some(context),
-                        )
-                    })
-            }
-            None => kernel
-                .dispatcher
-                .prepare_one_task_kernel_exec(kernel_context)
-                .map(|prepared| (RuntimePreparedExec::Other(Box::new(prepared)), None))
-                .map_err(|error| error.to_string()),
+        let identity = carrick_kernel::kernel::exec_transaction::ExecImageIdentity {
+            path: path.clone(),
+            argv: proc_argv,
+            env: proc_env,
+            source: executable_source,
+            binfmt_argv,
+            command_line: cmdline,
         };
-        let (mut prepared_kernel_exec, refreshed_hvpatch_context) = match prepared_kernel_exec {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!("prepare authoritative Kernel exec: {error}"),
-                )
-                .map(Some);
-            }
-        };
-        let exec_kernel_context = refreshed_hvpatch_context.as_ref().unwrap_or(kernel_context);
-        let old_mm_id = prepared_kernel_exec.old_mm_id();
-        let replacement_mm_id = prepared_kernel_exec.replacement_mm_id();
-        let mut exec_predecessor_identity = None;
-        // Allocate both complete transaction envelopes before proc-state
-        // mutation or topology/backend locking. Dropping the guard on
-        // any pre-replacement failure abandons both runtime records and
-        // dropping `prepared_kernel_exec` rolls back Kernel preparation.
-        let _inventory_abandon = if let Some(process) = kernel.hvpatch_process.as_ref() {
-            // The reservation pinned this topology decision under MM-resource
-            // authority before any later topology mutation. Never recount it.
-            let disposition = prepared_kernel_exec
-                .hvpatch_disposition()
-                .unwrap_or_else(|| {
-                    carrick_fatal!(
-                        "hvpatch::exec_topology",
-                        "HVPatch prepared exec missing disposition metadata during transaction routing"
-                    );
-                });
-            let routing = route_exec_disposition(disposition);
-            let retires_old_mm = routing.retirement_inventory;
-            let predecessor_shared = routing.predecessor_shared;
-            let predecessor_binding = process.mm_binding().ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "HVPatch exec predecessor has no exact MM binding".to_owned(),
-                )
-            })?;
-            if exec_kernel_context.task().key() != process.task_key()
-                || exec_kernel_context.shared().mm().id() != old_mm_id
-            {
-                return Err(RuntimeError::Configuration(
-                    "HVPatch exec predecessor ProcessContext/MM binding drifted".to_owned(),
-                ));
-            }
-            let predecessor_identity = carrick_hal::ExecPredecessorIdentity {
-                task_serial: exec_kernel_context.task().key().serial.raw(),
-                thread_serial: exec_kernel_context.thread().key().serial.raw(),
-                linux_pid: exec_kernel_context.task().key().id.raw(),
-                linux_tid: exec_kernel_context.thread().key().tid.raw(),
-                mm: old_mm_id.raw(),
-                asid: predecessor_binding.asid.raw(),
-            };
-            let predecessor_classification =
-                carrick_observability::probes::HvpatchExecPredecessorClassification::new(
-                    carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::AuthorityComputed,
-                    carrick_observability::probes::HvpatchExecPredecessorIdentity::new(
-                        predecessor_identity.task_serial,
-                        predecessor_identity.thread_serial,
-                        predecessor_identity.linux_pid,
-                        predecessor_identity.linux_tid,
-                        predecessor_identity.mm,
-                        u32::from(predecessor_identity.asid),
-                    )
-                    .map_err(|error| {
-                        RuntimeError::Configuration(format!(
-                            "construct authoritative HVPatch exec predecessor identity: {error}"
-                        ))
-                    })?,
-                    predecessor_shared,
-                )
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!(
-                        "construct authoritative HVPatch exec predecessor classification: {error}"
-                    ))
-                })?;
-            crate::probes::hvpatch_exec_predecessor_classification(predecessor_classification);
-            exec_predecessor_identity = Some(predecessor_identity);
-            engine.mark_exec_predecessor_shared(predecessor_shared);
-            let (mut old_extent_count, replacement_extent_count) =
-                engine.frame_inventory_exec_extent_counts(&img);
-            if inventory_failure_injection
-                == Some(HvpatchExecInventoryFailureInjection::OldCapacity)
-            {
-                old_extent_count = carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2 + 1;
-            }
-            // `old_extent_count == 0` silently skips the retirement of the OLD
-            // mm's inventory, which is correct only when a live sharer still
-            // owns that ledger. Getting it wrong leaves the kernel graph with
-            // mappings naming an mm that no longer exists, and nothing else
-            // reports it. Name the numbers.
-            tracing::debug!(
-                target: "carrick::exec",
-                old_mm = ?old_mm_id,
-                replacement_mm = ?replacement_mm_id,
-                old_extent_count,
-                replacement_extent_count,
-                retires_old_mm,
-                "HVPatch exec inventory sizing",
-            );
-            // A retained pinned disposition has no retirement reservation at
-            // all; an observed zero is not allowed to redefine ownership.
-            let old_capacity = if !retires_old_mm {
-                None
-            } else {
-                match carrick_hal::FrameEventCapacity::for_event_count(
-                    carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
-                ) {
-                    Ok(capacity) => Some(capacity),
-                    Err(error) => {
-                        return Self::exec_failed_past_no_return(
-                            kernel,
-                            engine,
-                            &format!("size HVPatch exec retirement inventory: {error}"),
-                        )
-                        .map(Some);
-                    }
-                }
-            };
-            let replacement_capacity = match carrick_hal::FrameEventCapacity::for_event_count(
-                carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
-            ) {
-                Ok(capacity) => capacity,
-                Err(error) => {
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        &format!("size HVPatch exec replacement inventory: {error}"),
-                    )
-                    .map(Some);
-                }
-            };
-            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
-                carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
-                process.pid(),
-                self.this_tid.raw(),
-            );
-            let retired = match old_capacity {
-                None => None,
-                Some(old_capacity) => {
-                    match process
-                        .kernel_graph()
-                        .reserve_frame_inventory(0, 0, old_capacity)
-                    {
-                        Ok(reservation) => Some(reservation),
-                        Err(error) => {
-                            return Self::exec_failed_past_no_return(
-                                kernel,
-                                engine,
-                                &format!("reserve HVPatch exec retirement inventory: {error}"),
-                            )
-                            .map(Some);
-                        }
-                    }
-                }
-            };
-            let retired_transaction = retired.as_ref().map(|retired| retired.transaction());
-            let replacement_candidate_count = if inventory_failure_injection
-                == Some(HvpatchExecInventoryFailureInjection::ReplacementReservation)
-            {
-                replacement_capacity.get() + 1
-            } else {
-                replacement_extent_count
-            };
-            let replacement = match process.kernel_graph().reserve_frame_inventory(
-                replacement_candidate_count,
-                replacement_candidate_count,
-                replacement_capacity,
-            ) {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    if let Some(retired_transaction) = retired_transaction {
-                        process
-                            .kernel_graph()
-                            .frame_inventory()
-                            .abandon(retired_transaction);
-                    }
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        &format!("reserve HVPatch exec replacement inventory: {error}"),
-                    )
-                    .map(Some);
-                }
-            };
-            let replacement_transaction = replacement.transaction();
-            let abandon = super::quiesce::InventoryAbandon::new(
-                process.kernel_graph().frame_inventory(),
-                [retired_transaction, Some(replacement_transaction)],
-            );
-            if inventory_failure_injection
-                == Some(HvpatchExecInventoryFailureInjection::BeginInventory)
-            {
-                engine.inject_next_begin_exec_inventory_failure();
-            }
-            if let Err(error) = engine.begin_exec_inventory(retired, replacement) {
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!("arm HVPatch exec frame inventory: {error}"),
-                )
-                .map(Some);
-            }
-            drop(registry);
-            Some(abandon)
-        } else {
-            None
-        };
-        let proc_state_started = std::time::Instant::now();
-        if should_update_host_process_title(kernel.hvpatch_process.is_some()) {
-            carrick_kernel::dispatch::set_host_process_name(cmdline.as_bytes());
-        }
-        kernel.dispatcher.set_executable_identity_with_source(
-            path.clone(),
-            proc_argv,
-            proc_env,
-            executable_source,
-        );
-        if let Some(argv) = binfmt_argv {
-            kernel.dispatcher.enter_binfmt(&argv);
-        }
-        kernel
-            .dispatcher
-            .reset_signal_handlers_on_execve(exec_kernel_context);
-        // Reset + refresh /proc/self/maps and /proc/self/auxv under one
-        // dispatcher memory-authority generation. The historical MM
-        // retains the pre-staging snapshot, but records this deliberate
-        // source revision so commit can reject any later mutation.
-        let mut prepared_dispatch_mm_exec = Some(apply_exec_image_proc_state(
-            &kernel.dispatcher,
-            replacement_mm_id,
-            &img,
-        ));
-        if let Err(error) = prepared_kernel_exec.acknowledge_staged_vma_revision() {
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("acknowledge staged exec VMA revision: {error}"),
-            )
-            .map(Some);
-        }
-        emit_runtime_stage(
-            carrick_observability::probes::HvpatchExecRuntimeStagePhase::ProcState,
-            proc_state_started,
-        );
-
-        // Stage-2 edits for distinct MMs touch distinct IPA ranges owned by
-        // distinct MMs, so the exclusion is the MM's transaction guard rather
-        // than the carrier topology lock.
-        // Task 4: replaced acquire_topology_lock with mutation.begin_transaction().
-        let topology_lock_started = std::time::Instant::now();
-        let mut admitted_mm_executor = None;
-        let mutation = if kernel.hvpatch_process.is_some() {
-            let mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation = match self
-                .guest_execution
-                .as_mut()
-                .filter(|p| p.mm_id() == old_mm_id)
-            {
-                Some(participation) => participation,
-                None => match kernel.dispatcher.enter_mm_executor() {
-                    Ok(p) => admitted_mm_executor.insert(p),
-                    Err(error) => {
-                        return Self::exec_failed_past_no_return(
-                            kernel,
-                            engine,
-                            &format!("admit exact-MM exec authority: {error}"),
-                        )
-                        .map(Some);
-                    }
-                },
-            };
-            let mutation = match carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor) {
-                Ok(mutation) => mutation.with_operation(
-                    carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
-                ),
-                Err(error) => {
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        &format!("acquire exact-MM exec authority: {error:?}"),
-                    )
-                    .map(Some);
-                }
-            };
-            Some(mutation)
-        } else {
-            None
-        };
-        let mut _hvpatch_topology = mutation.as_ref().map(|m| m.begin_transaction());
-        if let Some(guard) = _hvpatch_topology.as_mut() {
-            if let Some(process) = kernel.hvpatch_process.as_ref() {
-                guard.set_identity(process.pid(), self.this_tid.raw());
-            }
-        }
-        emit_runtime_stage(
-            carrick_observability::probes::HvpatchExecRuntimeStagePhase::TopologyLock,
-            topology_lock_started,
-        );
-        let engine_replace_started = std::time::Instant::now();
-        let mut backend_publication_gate = ExecBackendPublicationGate::default();
-        let retiring_thread = self.kernel_thread.as_ref().cloned().ok_or_else(|| {
-            RuntimeError::Configuration(
-                "committed exec lost predecessor Kernel thread authority".to_owned(),
-            )
-        })?;
-        let worker_executor = self
-            .execution_lease
-            .lock()
-            .as_ref()
-            .map(carrick_kernel::kernel::objects::ThreadExecutionLease::executor)
-            .ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "exec replacement lost worker-authenticated execution lease".to_owned(),
-                )
-            })?;
-        let replacement_asid_load = match prepared_kernel_exec.prepare_hvpatch_address_space(engine)
-        {
-            Ok(load) => load,
-            Err(error) => {
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!("bind fresh HVPatch exec MM/ASID lease: {error}"),
-                )
-                .map(Some);
-            }
-        };
-        let old_files = prepared_kernel_exec.old_file_table();
-        let armed_kernel_exec = match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
-            (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
-                let replacement_vma_source = prepared_dispatch_mm_exec.as_ref().map_or_else(
-                    || kernel.dispatcher.vma_snapshot_source(),
-                    carrick_kernel::dispatch::PreparedDispatchMmExec::vma_snapshot_source,
-                );
-                match process.arm_exec_no_return(*prepared, replacement_vma_source) {
-                    Ok(armed) => RuntimeArmedExec::Hvpatch(armed),
-                    Err(error) => {
-                        return Err(RuntimeError::Configuration(format!(
-                            "reject exec before no-return arm: {error}"
-                        )));
-                    }
-                }
-            }
-            (None, RuntimePreparedExec::Other(prepared)) => RuntimeArmedExec::Other(*prepared),
-            _ => {
-                carrick_fatal!(
-                    "hvpatch::exec_backend",
-                    "prepared Kernel exec variant disagrees with configured HVPatch backend before destructive image replacement"
-                );
-            }
-        };
-        if let Err(error) =
-            retire_execution_authority_for_exec(&retiring_thread, &self.execution_lease)
-        {
-            drop(replacement_asid_load);
-            drop(armed_kernel_exec);
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("retire predecessor after exec no-return arm: {error}"),
-            )
-            .map(Some);
-        }
-        if let Some(identity) = exec_predecessor_identity
-            && let Err(error) = engine.bind_exec_predecessor_identity(identity)
-        {
-            drop(replacement_asid_load);
-            drop(armed_kernel_exec);
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("bind exact HVPatch exec predecessor identity: {error}"),
-            )
-            .map(Some);
-        }
-        if inventory_failure_injection == Some(HvpatchExecInventoryFailureInjection::ImageReplace) {
-            drop(replacement_asid_load);
-            drop(armed_kernel_exec);
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                "injected HVPatch exec failure before image replacement",
-            )
-            .map(Some);
-        }
-        if let Err(error) = engine.execve_into(&img) {
-            drop(replacement_asid_load);
-            drop(armed_kernel_exec);
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("replace guest image: {error}"),
-            )
-            .map(Some);
-        }
-        backend_publication_gate.record_engine_replaced();
-        let published_kernel_exec = match (kernel.hvpatch_process.as_ref(), armed_kernel_exec) {
-            (Some(process), RuntimeArmedExec::Hvpatch(armed)) => {
-                match process.publish_exec_mm(armed) {
-                    Ok(published) => RuntimePublishedExec::Hvpatch(Box::new(published)),
-                    Err(error) => {
-                        return Self::exec_failed_past_no_return(
-                            kernel,
-                            engine,
-                            &format!("publish replacement MM after image replacement: {error}"),
-                        )
-                        .map(Some);
-                    }
-                }
-            }
-            (None, RuntimeArmedExec::Other(prepared)) => {
-                RuntimePublishedExec::Other(Box::new(prepared))
-            }
-            _ => {
-                carrick_fatal!(
-                    "hvpatch::exec_backend",
-                    "armed Kernel exec variant disagrees with configured HVPatch backend after destructive image replacement"
-                );
-            }
-        };
-        if let (Some(process), RuntimePublishedExec::Hvpatch(published)) =
-            (kernel.hvpatch_process.as_ref(), &published_kernel_exec)
-        {
-            let source = process.table_arena_source_for_lease(published.replacement_lease());
-            tracing::debug!(target: "carrick::stage1_arena", "install replacement-lease arena source after execve_into");
-            if let Err(error) = engine.install_stage1_table_arena_source(source) {
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!("install replacement HVPatch table arena source: {error}"),
-                )
-                .map(Some);
-            }
-        }
-        // `execve_into` has released every stage-2/frame lock. Topology
-        // serialization must also be released before runtime takes its
-        // frame-inventory authority lock.
-        drop(_hvpatch_topology);
-        drop(mutation);
-        drop(admitted_mm_executor);
-        if let Some(process) = kernel.hvpatch_process.as_ref() {
-            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
-                carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
-                process.pid(),
-                self.this_tid.raw(),
-            );
-            let Some((retired_commit, fallback_replacement_commit)) =
-                backend_publication_gate.take_after_replace(|| engine.take_exec_inventory())
-            else {
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    "HVPatch destructive exec produced no frame inventory commits",
-                )
-                .map(Some);
-            };
-            if let Some(retired_commit) = retired_commit {
-                if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
-                    table.retire_overlapping(old_mm_id.raw(), 0, u64::MAX);
-                }
-                super::signal::withdraw_guest_descriptor_work(old_mm_id.raw());
-                if let Err(error) = process
-                    .kernel_graph()
-                    .frame_inventory()
-                    .apply(old_mm_id, retired_commit)
-                {
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        &format!(
-                            "apply HVPatch exec retirement frame inventory for old mm {old_mm_id:?}: {error}"
-                        ),
-                    )
-                    .map(Some);
-                }
-            }
-            let mut applied_by_authority = false;
-            if let Err(error) =
-                engine.apply_exec_inventory(replacement_mm_id.raw(), &mut |commit| {
-                    applied_by_authority = true;
-                    process
-                        .kernel_graph()
-                        .frame_inventory()
-                        .apply_with_receipt(replacement_mm_id, commit)
-                        .map(|(_, receipt)| receipt)
-                        .map_err(|error| crate::trap::TrapError::Hypervisor(error.to_string()))
-                })
-            {
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!(
-                        "apply HVPatch exec replacement authority for replacement mm {replacement_mm_id:?}: {error}"
-                    ),
-                )
-                .map(Some);
-            }
-            if !applied_by_authority {
-                let Some(replacement_commit) = fallback_replacement_commit else {
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        "HVPatch fallback replacement frame inventory commit missing",
-                    )
-                    .map(Some);
-                };
-                if let Err(error) = process
-                    .kernel_graph()
-                    .frame_inventory()
-                    .apply(replacement_mm_id, replacement_commit)
-                {
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        &format!(
-                            "apply HVPatch exec replacement frame inventory for replacement mm {replacement_mm_id:?}: {error}"
-                        ),
-                    )
-                    .map(Some);
-                }
-            }
-            drop(registry);
-        }
-        #[cfg(test)]
-        self.fail_exec_terminal_context_for_test(ExecTerminalContextFailpoint::BeforeKernelCommit)?;
-        let committed = match (kernel.hvpatch_process.as_ref(), published_kernel_exec) {
-            (Some(process), RuntimePublishedExec::Hvpatch(published)) => process
-                .complete_exec(*published, prepared_dispatch_mm_exec.take())
-                .map(|committed| (committed.context().retain_exact(), Some(committed))),
-            (None, RuntimePublishedExec::Other(prepared)) => {
-                let committed = kernel.dispatcher.commit_one_task_kernel_exec(*prepared);
-                if committed.is_ok()
-                    && let Some(prepared) = prepared_dispatch_mm_exec.take()
-                {
-                    prepared.commit();
-                }
-                committed
-                    .map(|context| (context, None))
-                    .map_err(crate::hvpatch::CompleteExecError::before_commit)
-            }
-            _ => {
-                carrick_fatal!(
-                    "hvpatch::exec_commit",
-                    "published Kernel exec variant disagrees with configured HVPatch backend after destructive image replacement"
-                );
-            }
-        };
-        let (committed_context, committed_transition) = match committed {
-            Ok(committed) => committed,
-            Err(error) => {
-                let (error, committed_context) = error.into_parts();
-                if let Some(committed_context) = committed_context {
-                    *kernel_context = committed_context;
-                }
-                // The engine now runs the replacement image. Returning a
-                // guest-visible exec failure or resuming the old Kernel
-                // graph would create split lifecycle authority.
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!("commit Kernel exec after image replacement: {error}"),
-                )
-                .map(Some);
-            }
-        };
-        // This is the terminal-context authority boundary: every remaining
-        // edge is post-commit and must carry the Kernel successor, including
-        // errors before runtime state and replacement publication catch up.
-        *kernel_context = committed_context.retain_exact();
-        #[cfg(test)]
-        {
-            self.committed_exec_context_for_test = Some(committed_context.retain_exact());
-            self.fail_exec_terminal_context_for_test(
-                ExecTerminalContextFailpoint::TaskLoadPublication,
-            )?;
-        }
-        // Linux detaches every SysV shared-memory mapping only after exec has
-        // crossed its no-return boundary. Preparation failures above preserve
-        // the old image and its attachment set; a committed replacement owns
-        // neither the old VMAs nor their `shm_nattch` charges.
-        kernel
-            .dispatcher
-            .cleanup_sysv_shm_attachments_on_process_exit();
-        let replacement_loaded = replacement_asid_load.is_some();
-        if let Some(load) = replacement_asid_load
-            && let Err(error) = load.mark_resident()
-        {
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("commit replacement ASID residence after exec: {error}"),
-            )
-            .map(Some);
-        }
-        if replacement_loaded {
-            crate::HVPATCH_TASK_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let committed_owned_mm = committed_context.shared().mm();
-        let committed_mm = committed_owned_mm.id();
-        let committed_asid_generation = kernel.hvpatch_process.as_ref().map_or(
-            committed_mm.raw(),
-            crate::hvpatch::ProcessContext::asid_generation,
-        );
-        super::signal::admit_bound_mm(
+        let mut venue = HvpatchExecVenue {
+            exec_predecessor_identity: None,
+            refreshed_context: None,
+            backend_publication_gate: ExecBackendPublicationGate::default(),
+            state: self,
+            kernel,
+            kernel_context,
             engine,
-            &super::signal::BoundMm {
-                mm: committed_owned_mm,
-                asid_generation: committed_asid_generation,
-            },
-        );
-        #[cfg(test)]
-        self.fail_exec_terminal_context_for_test(
-            ExecTerminalContextFailpoint::SnapshotPublication,
-        )?;
-        let replacement_cpu = match engine.snapshot_guest_state_for_publication() {
-            Ok(state) => state,
-            Err(error) => {
-                committed_context.thread().fail_uninitialized_snapshot(
-                    carrick_kernel::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
-                );
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!("capture replacement execution state after exec: {error}"),
-                )
-                .map(Some);
-            }
+            hvpatch_mm_reservation,
+            inventory_failure_injection,
+            runtime_region_count,
+            runtime_mapped_bytes,
+            path,
+            img,
         };
-
-        // `exec` publishes a new Mm generation while keeping this host
-        // engine/vCPU.  Frame-COW callbacks must therefore move from
-        // the retired mm to the committed replacement before any
-        // identity-page or guest write can fault.  Keeping the old
-        // authority makes a structurally valid COW MappingId belong to
-        // the retired mm and fail closed at replacement-mm teardown.
-        if let Some(process) = kernel.hvpatch_process.as_ref() {
-            #[cfg(test)]
-            self.fail_exec_terminal_context_for_test(
-                ExecTerminalContextFailpoint::FrameCowBinding,
-            )?;
-            let owner_inventory = engine.frame_cow_owner_inventory().ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "committed HVPatch exec has no carrier host-owner inventory".to_owned(),
-                )
-            })?;
-            let binding = process.mm_binding().ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "committed HVPatch exec has no replacement mm binding".to_owned(),
-                )
-            })?;
-            let authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
-                std::sync::Arc::new(super::KernelFrameCowAuthority {
-                    runtime: std::sync::Arc::downgrade(kernel),
-                    deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(committed_mm),
-                    kernel: std::sync::Arc::clone(committed_context.kernel()),
-                    mm: committed_mm,
-                    owner_inventory,
-                    tid: self.this_tid,
-                    identity: carrick_hal::FrameCowIdentity {
-                        linux_pid: process.pid(),
-                        linux_tid: self.this_tid.raw(),
-                        mm: committed_mm.raw(),
-                        asid: binding.asid.raw(),
-                    },
-                    pt_quiesce: kernel.dispatcher.pt_quiesce(),
-                });
-            engine.bind_frame_cow(
-                authority,
-                carrick_hal::FrameCowIdentity {
-                    linux_pid: process.pid(),
-                    linux_tid: self.this_tid.raw(),
-                    mm: committed_mm.raw(),
-                    asid: binding.asid.raw(),
-                },
-            );
-            if !kernel
-                .dispatcher
-                .bind_deferred_anonymous_state(engine, committed_mm)
-            {
-                return Err(RuntimeError::Configuration(
-                    "exec anonymous authority MM mismatch".to_owned(),
-                ));
-            }
-            // The exec rebuild starts a fresh stage-1 manager for the
-            // replacement mm; its extension arenas must be leased against the
-            // REPLACEMENT lease (the old source belongs to the retired mm and
-            // would return live slots at that mm's teardown). Without this the
-            // exec'd process could never grow past one arena — pagetablegrow
-            // through `/bin/sh -c` died at 87 mappings, and CPython's
-            // recursion-limit compile hit `OutOfTables (arenas=1)`.
-            let arena_source = process
-                .mm_resources()
-                .table_arena_source(committed_context.task().key())
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!(
-                        "committed HVPatch exec has no replacement table arena lease: {error}"
-                    ))
-                })?;
-            tracing::debug!(target: "carrick::stage1_arena", "install committed-task arena source at exec commit");
-            engine
-                .install_stage1_table_arena_source(arena_source)
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!(
-                        "install replacement HVPatch table arena source: {error}"
-                    ))
-                })?;
-            #[cfg(test)]
-            self.fail_exec_terminal_context_for_test(
-                ExecTerminalContextFailpoint::InventoryActivation,
-            )?;
-            if let Err(error) = engine.activate_exec_inventory() {
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!("activate HVPatch exec authority: {error}"),
-                )
-                .map(Some);
-            }
-        }
-        emit_runtime_stage(
-            carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,
-            engine_replace_started,
-        );
-        let close_cloexec_started = std::time::Instant::now();
-        kernel.dispatcher.close_draining_file_table(
-            committed_context.kernel(),
-            &old_files,
-            Some(committed_context.task().key()),
-            Some(&committed_context.resources().files()),
-        );
-        emit_runtime_stage(
-            carrick_observability::probes::HvpatchExecRuntimeStagePhase::CloseCloexec,
-            close_cloexec_started,
-        );
-        self.linux_tid = committed_context.thread().key().tid;
-        // Crash-register authority follows the replacement Kernel
-        // Thread generation. Keeping the pre-exec Arc would publish a
-        // later capture into a retired object, while the committed
-        // task census correctly waits on the replacement object.
-        self.kernel_thread = Some(std::sync::Arc::clone(committed_context.thread()));
-        // The common run-loop signal boundary must consume the exact
-        // replacement generation, never the pre-exec context retained
-        // at syscall entry. A failed exec leaves that entry context in
-        // place; only a committed image replacement publishes here.
-        self.service_kernel_context = Some(committed_context.retain_exact());
-        let publication_started = std::time::Instant::now();
-        if kernel.hvpatch_process.is_some()
-            && ::std::env::var_os("CARRICK_HVPATCH_VERIFY_EXEC_CODE").is_some()
-        {
-            if let Err(error) = verify_published_exec_image(engine, &img, &path) {
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!("verify published HVPatch exec image: {error}"),
-                )
-                .map(Some);
-            }
-        }
-        carrick_kernel::namespace::pid::mark_self_execed_for(&committed_context);
-        // execve_into rebuilt a fresh vCPU: re-stamp the identity page
-        // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
-        let identity_base = if inventory_failure_injection
-            == Some(HvpatchExecInventoryFailureInjection::IdentityPage)
-        {
-            u64::MAX - 0x100
-        } else {
-            crate::memory::LINUX_IDENTITY_PAGE_BASE
-        };
-        #[cfg(test)]
-        self.fail_exec_terminal_context_for_test(
-            ExecTerminalContextFailpoint::IdentityPublication,
-        )?;
-        if let Err(error) = carrick_kernel::kernel::identity_page::stamp_identity_page_at(
-            engine,
-            &kernel.dispatcher,
-            &committed_context,
-            identity_base,
-        ) {
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("stamp HVPatch exec identity page: {error}"),
-            )
-            .map(Some);
-        }
-        // The new image's vvar was published with the host calibration only;
-        // fold in the guest CLOCK_REALTIME delta before the image runs its
-        // first instruction, so a vDSO read before any syscall already agrees
-        // with the syscall path (`sync_vvar_realtime_offset`; probe
-        // clocksettimevdso, `date -s` followed by an exec'd `date`).
-        #[cfg(test)]
-        self.fail_exec_terminal_context_for_test(ExecTerminalContextFailpoint::VvarPublication)?;
-        if let Err(error) = kernel
-            .dispatcher
-            .sync_vvar_realtime_offset(committed_context.task().container().clock(), engine)
-        {
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("stamp HVPatch exec vvar realtime word: {error}"),
-            )
-            .map(Some);
-        }
-        if let Err(error) = super::stamp_ns_visible_guest_tid(engine, &committed_context) {
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("publish HVPatch guest thread identity: {error}"),
-            )
-            .map(Some);
-        }
-        self.fatal_image_generation = kernel
-            .fatal_signal
-            .rebind_after_exec(self.fatal_image_generation)
-            .unwrap_or_else(|| {
-                carrick_fatal!(
-                    "kernel::fatal_signal_authority",
-                    "fatal-signal image generation could not rebind to committed exec successor: fatal_image_generation={:?}",
-                    self.fatal_image_generation
-                );
-            });
-        emit_runtime_stage(
-            carrick_observability::probes::HvpatchExecRuntimeStagePhase::Publication,
-            publication_started,
-        );
-        if let Some(process) = kernel.hvpatch_process.as_ref() {
-            process.trace_lifecycle(
-                carrick_observability::probes::HvpatchGuestLifecyclePhase::Exec,
-                self.this_tid,
-                0,
-            );
-        }
-        // vfork: the execve SUCCEEDED and we now have our own private VM.
-        // Release the suspended parent by writing one byte to the
-        // inherited pipe, then close it. A FAILED execve returns above via
-        // a failure branch WITHOUT releasing — the child then `_exit`s
-        // and the parent's `read()` gets EOF instead.
-        if let Some(fd) = self.vfork_release_fd.take() {
-            let _ = unsafe { ::libc::write(fd, [0u8; 1].as_ptr().cast(), 1) };
-            unsafe { libc::close(fd) };
-        }
-        let replacement_state = carrick_kernel::kernel::objects::MigratableTaskState {
-            cpu: replacement_cpu,
-            mm: committed_mm,
-            asid_generation: committed_asid_generation,
-        };
-        if let Err(error) = publish_execution_authority_after_exec(
-            committed_context.thread(),
-            worker_executor,
-            replacement_state.clone(),
-            &self.execution_lease,
-        ) {
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("publish replacement execution lease after exec: {error}"),
-            )
-            .map(Some);
-        }
-        if kernel.hvpatch_process.is_some() {
-            let bind_births = super::thread_adoption::engine_thread_birth_template(
-                engine,
-                &replacement_state.cpu,
-            )
-            .and_then(|backend_template| {
-                super::thread_adoption::bind_executable_thread_births(
-                    kernel,
-                    self,
-                    &committed_context,
-                    replacement_state,
-                    backend_template,
-                )
-            });
-            if let Err(error) = bind_births {
-                return Self::exec_failed_past_no_return(
-                    kernel,
-                    engine,
-                    &format!("bind executable thread births after exec: {error}"),
-                )
-                .map(Some);
-            }
-        }
-        if let Some(committed) = committed_transition {
-            let (transition, replacement_mm, retired_mm) = committed.into_parts();
-            let replacement = super::executor::PendingExecReplacement {
-                transition,
-                replacement_mm,
-                retired_mm,
-            };
-            if self.pending_exec_replacement.replace(replacement).is_some() {
-                carrick_fatal!(
-                    "hvpatch::exec_replacement",
-                    "duplicate pending exec replacement would overwrite Kernel transition and MM retirement authority"
-                );
-            }
-        }
-        stop_after_traced_exec(&kernel.dispatcher);
-        Ok(None)
+        Box::pin(carrick_kernel::kernel::exec_transaction::drive_root_exec(
+            &mut venue,
+            carrick_kernel::kernel::exec_transaction::Drained::new(sibling_drain_started),
+            identity,
+        ))
+        .await
     }
 
     /// Resume the destructive exec suffix after the persistent executor has
@@ -2578,6 +1660,1211 @@ where
         let result = self.finish_prepared_execve(kernel, engine, prepared);
         drop(completion_ownership);
         result
+    }
+}
+
+/// The HVF/HVPatch venue of the shared root exec transaction
+/// ([`carrick_kernel::kernel::exec_transaction`], #2142). Its fields drop in
+/// declaration order after the driver's locals, which is the order the
+/// `drive_execve` locals they came from dropped in.
+struct HvpatchExecVenue<'a, E: ThreadedEngine> {
+    exec_predecessor_identity: Option<carrick_hal::ExecPredecessorIdentity>,
+    refreshed_context: Option<carrick_kernel::kernel::KernelContext>,
+    backend_publication_gate: ExecBackendPublicationGate,
+    state: &'a mut ThreadRuntimeState<E>,
+    kernel: &'a Kernel,
+    kernel_context: &'a mut carrick_kernel::kernel::KernelContext,
+    engine: &'a mut E,
+    hvpatch_mm_reservation: Option<crate::hvpatch::ExecMmReservation>,
+    inventory_failure_injection: Option<HvpatchExecInventoryFailureInjection>,
+    runtime_region_count: u64,
+    runtime_mapped_bytes: u64,
+    path: String,
+    img: AddressSpace,
+}
+
+/// The hooks that run under the venue's exact-MM transaction guard, which
+/// [`HvpatchExecVenue::replace_image`] holds around this borrow.
+struct HvpatchImageReplacement<'s, E: ThreadedEngine> {
+    kernel: &'s Kernel,
+    engine: &'s mut E,
+    kernel_thread: &'s Option<carrick_kernel::kernel::ThreadRef>,
+    execution_lease: &'s super::ExecutionLeaseCell,
+    exec_predecessor_identity: Option<carrick_hal::ExecPredecessorIdentity>,
+    inventory_failure_injection: Option<HvpatchExecInventoryFailureInjection>,
+    img: &'s AddressSpace,
+    backend_publication_gate: &'s mut ExecBackendPublicationGate,
+}
+
+struct HvpatchArmedExec {
+    armed_kernel_exec: RuntimeArmedExec,
+    replacement_asid_load: Option<crate::hvpatch::AsidLoad>,
+    worker_executor: carrick_kernel::kernel::objects::ExecutorId,
+}
+
+struct HvpatchReplacedExec {
+    published_kernel_exec: RuntimePublishedExec,
+    replacement_asid_load: Option<crate::hvpatch::AsidLoad>,
+    worker_executor: carrick_kernel::kernel::objects::ExecutorId,
+}
+
+struct HvpatchCommittedExec {
+    committed_transition: Option<crate::hvpatch::CommittedProcessExec>,
+    replacement_asid_load: Option<crate::hvpatch::AsidLoad>,
+    worker_executor: carrick_kernel::kernel::objects::ExecutorId,
+}
+
+/// The committed MM as this lane loaded it.
+struct HvpatchResidentMm {
+    committed_mm: carrick_kernel::kernel::MmId,
+    committed_asid_generation: u64,
+}
+
+fn record_exec_runtime_stage(
+    kernel: &Kernel,
+    phase: carrick_observability::probes::HvpatchExecRuntimeStagePhase,
+    started: std::time::Instant,
+    runtime_region_count: u64,
+    runtime_mapped_bytes: u64,
+) {
+    if kernel.hvpatch_process.is_some() {
+        let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        crate::probes::hvpatch_exec_runtime_stage(
+            carrick_observability::probes::HvpatchExecRuntimeStage::new(
+                phase,
+                elapsed_ns,
+                runtime_region_count,
+                runtime_mapped_bytes,
+            ),
+        );
+    }
+}
+
+impl carrick_kernel::kernel::exec_transaction::PreparedRootExec for RuntimePreparedExec {
+    fn replacement_mm_id(&self) -> carrick_kernel::kernel::MmId {
+        Self::replacement_mm_id(self)
+    }
+
+    fn old_file_table(&self) -> std::sync::Arc<carrick_kernel::kernel::FileTable> {
+        Self::old_file_table(self)
+    }
+
+    fn acknowledge_staged_vma_revision(&mut self) -> Result<(), String> {
+        Self::acknowledge_staged_vma_revision(self)
+    }
+}
+
+impl<E: ThreadedEngine + 'static> HvpatchExecVenue<'_, E>
+where
+    E::SiblingSpec: 'static,
+{
+    fn exec_failed_past_no_return(
+        kernel: &Kernel,
+        engine: &mut E,
+        cause: &str,
+    ) -> ExecExit<VcpuLoopOutcome> {
+        ExecExit::new(
+            ThreadRuntimeState::<E>::exec_failed_past_no_return(kernel, engine, cause).map(Some),
+        )
+    }
+}
+
+impl<E: ThreadedEngine + 'static> HvpatchImageReplacement<'_, E>
+where
+    E::SiblingSpec: 'static,
+{
+    fn exec_failed_past_no_return(
+        kernel: &Kernel,
+        engine: &mut E,
+        cause: &str,
+    ) -> ExecExit<VcpuLoopOutcome> {
+        ExecExit::new(
+            ThreadRuntimeState::<E>::exec_failed_past_no_return(kernel, engine, cause).map(Some),
+        )
+    }
+}
+
+impl<'a, E: ThreadedEngine + 'static> RootExecVenue for HvpatchExecVenue<'a, E>
+where
+    E::SiblingSpec: 'static,
+{
+    type Outcome = VcpuLoopOutcome;
+    type Prepared = RuntimePreparedExec;
+    type Envelope = Option<super::quiesce::InventoryAbandon<'a, 2>>;
+    type Armed = HvpatchArmedExec;
+    type Installed = HvpatchArmedExec;
+    type Replaced = HvpatchReplacedExec;
+    type Committed = HvpatchCommittedExec;
+    type Resident = HvpatchResidentMm;
+    type Entry = carrick_kernel::kernel::objects::MigratableTaskState;
+
+    fn dispatcher(&self) -> &carrick_kernel::dispatch::SyscallDispatcher {
+        &self.kernel.dispatcher
+    }
+
+    fn image(&self) -> &AddressSpace {
+        &self.img
+    }
+
+    fn exec_context(&self) -> &carrick_kernel::kernel::KernelContext {
+        self.refreshed_context
+            .as_ref()
+            .unwrap_or(self.kernel_context)
+    }
+
+    fn renames_host_process(&self) -> bool {
+        should_update_host_process_title(self.kernel.hvpatch_process.is_some())
+    }
+
+    fn record_stage(
+        &self,
+        phase: carrick_observability::probes::HvpatchExecRuntimeStagePhase,
+        started: std::time::Instant,
+    ) {
+        record_exec_runtime_stage(
+            self.kernel,
+            phase,
+            started,
+            self.runtime_region_count,
+            self.runtime_mapped_bytes,
+        );
+    }
+
+    fn fail_past_no_return(&mut self, cause: &str) -> ExecExit<VcpuLoopOutcome> {
+        Self::exec_failed_past_no_return(self.kernel, self.engine, cause)
+    }
+
+    fn prepare_mm(&mut self) -> ExecStep<(RuntimePreparedExec, Self::Envelope), VcpuLoopOutcome> {
+        let kernel = self.kernel;
+        // Kernel preparation follows the runtime sibling drain (whose
+        // exiting host loops retire their own old Kernel threads) but
+        // precedes every destructive image, CLOEXEC, and proc-state
+        // mutation. HVPatch selects the survivor and installs the exec
+        // reservation under one registry write lock, so a late loser
+        // retirement cannot invalidate a separately captured revision.
+        // From here, the prepared exec transaction is the sole owner of
+        // nonleader promotion and replacement Mm state.
+        let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
+            Some(process) => {
+                let reservation = self.hvpatch_mm_reservation.take().unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::mm_authority",
+                        "prepared HVPatch exec lost MM-generation admission for tid={:?}",
+                        self.state.linux_tid
+                    );
+                });
+                process
+                    .prepare_exec_for_linux_tid_with_mm_reservation(
+                        self.state.linux_tid,
+                        reservation,
+                    )
+                    .map(|(prepared, context)| {
+                        (
+                            RuntimePreparedExec::Hvpatch(Box::new(prepared)),
+                            Some(context),
+                        )
+                    })
+            }
+            None => kernel
+                .dispatcher
+                .prepare_one_task_kernel_exec(self.kernel_context)
+                .map(|prepared| (RuntimePreparedExec::Other(Box::new(prepared)), None))
+                .map_err(|error| error.to_string()),
+        };
+        let (prepared_kernel_exec, refreshed_hvpatch_context) = match prepared_kernel_exec {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    self.engine,
+                    &format!("prepare authoritative Kernel exec: {error}"),
+                ));
+            }
+        };
+        self.refreshed_context = refreshed_hvpatch_context;
+        let engine = &mut *self.engine;
+        let img = &self.img;
+        let inventory_failure_injection = self.inventory_failure_injection;
+        let exec_kernel_context = self
+            .refreshed_context
+            .as_ref()
+            .unwrap_or(self.kernel_context);
+        let old_mm_id = prepared_kernel_exec.old_mm_id();
+        let replacement_mm_id = prepared_kernel_exec.replacement_mm_id();
+        // Allocate both complete transaction envelopes before proc-state
+        // mutation or topology/backend locking. Dropping the guard on
+        // any pre-replacement failure abandons both runtime records and
+        // dropping `prepared_kernel_exec` rolls back Kernel preparation.
+        let inventory_abandon = if let Some(process) = kernel.hvpatch_process.as_ref() {
+            // The reservation pinned this topology decision under MM-resource
+            // authority before any later topology mutation. Never recount it.
+            let disposition = prepared_kernel_exec
+                .hvpatch_disposition()
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::exec_topology",
+                        "HVPatch prepared exec missing disposition metadata during transaction routing"
+                    );
+                });
+            let routing = route_exec_disposition(disposition);
+            let retires_old_mm = routing.retirement_inventory;
+            let predecessor_shared = routing.predecessor_shared;
+            let predecessor_binding = process.mm_binding().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "HVPatch exec predecessor has no exact MM binding".to_owned(),
+                )
+            })?;
+            if exec_kernel_context.task().key() != process.task_key()
+                || exec_kernel_context.shared().mm().id() != old_mm_id
+            {
+                return Err(RuntimeError::Configuration(
+                    "HVPatch exec predecessor ProcessContext/MM binding drifted".to_owned(),
+                )
+                .into());
+            }
+            let predecessor_identity = carrick_hal::ExecPredecessorIdentity {
+                task_serial: exec_kernel_context.task().key().serial.raw(),
+                thread_serial: exec_kernel_context.thread().key().serial.raw(),
+                linux_pid: exec_kernel_context.task().key().id.raw(),
+                linux_tid: exec_kernel_context.thread().key().tid.raw(),
+                mm: old_mm_id.raw(),
+                asid: predecessor_binding.asid.raw(),
+            };
+            let predecessor_classification =
+                carrick_observability::probes::HvpatchExecPredecessorClassification::new(
+                    carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::AuthorityComputed,
+                    carrick_observability::probes::HvpatchExecPredecessorIdentity::new(
+                        predecessor_identity.task_serial,
+                        predecessor_identity.thread_serial,
+                        predecessor_identity.linux_pid,
+                        predecessor_identity.linux_tid,
+                        predecessor_identity.mm,
+                        u32::from(predecessor_identity.asid),
+                    )
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "construct authoritative HVPatch exec predecessor identity: {error}"
+                        ))
+                    })?,
+                    predecessor_shared,
+                )
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "construct authoritative HVPatch exec predecessor classification: {error}"
+                    ))
+                })?;
+            crate::probes::hvpatch_exec_predecessor_classification(predecessor_classification);
+            self.exec_predecessor_identity = Some(predecessor_identity);
+            engine.mark_exec_predecessor_shared(predecessor_shared);
+            let (mut old_extent_count, replacement_extent_count) =
+                engine.frame_inventory_exec_extent_counts(img);
+            if inventory_failure_injection
+                == Some(HvpatchExecInventoryFailureInjection::OldCapacity)
+            {
+                old_extent_count = carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2 + 1;
+            }
+            // `old_extent_count == 0` silently skips the retirement of the OLD
+            // mm's inventory, which is correct only when a live sharer still
+            // owns that ledger. Getting it wrong leaves the kernel graph with
+            // mappings naming an mm that no longer exists, and nothing else
+            // reports it. Name the numbers.
+            tracing::debug!(
+                target: "carrick::exec",
+                old_mm = ?old_mm_id,
+                replacement_mm = ?replacement_mm_id,
+                old_extent_count,
+                replacement_extent_count,
+                retires_old_mm,
+                "HVPatch exec inventory sizing",
+            );
+            // A retained pinned disposition has no retirement reservation at
+            // all; an observed zero is not allowed to redefine ownership.
+            let old_capacity = if !retires_old_mm {
+                None
+            } else {
+                match carrick_hal::FrameEventCapacity::for_event_count(
+                    carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
+                ) {
+                    Ok(capacity) => Some(capacity),
+                    Err(error) => {
+                        return Err(Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("size HVPatch exec retirement inventory: {error}"),
+                        ));
+                    }
+                }
+            };
+            let replacement_capacity = match carrick_hal::FrameEventCapacity::for_event_count(
+                carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
+            ) {
+                Ok(capacity) => capacity,
+                Err(error) => {
+                    return Err(Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("size HVPatch exec replacement inventory: {error}"),
+                    ));
+                }
+            };
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
+                process.pid(),
+                self.state.this_tid.raw(),
+            );
+            let retired = match old_capacity {
+                None => None,
+                Some(old_capacity) => {
+                    match process
+                        .kernel_graph()
+                        .reserve_frame_inventory(0, 0, old_capacity)
+                    {
+                        Ok(reservation) => Some(reservation),
+                        Err(error) => {
+                            return Err(Self::exec_failed_past_no_return(
+                                kernel,
+                                engine,
+                                &format!("reserve HVPatch exec retirement inventory: {error}"),
+                            ));
+                        }
+                    }
+                }
+            };
+            let retired_transaction = retired.as_ref().map(|retired| retired.transaction());
+            let replacement_candidate_count = if inventory_failure_injection
+                == Some(HvpatchExecInventoryFailureInjection::ReplacementReservation)
+            {
+                replacement_capacity.get() + 1
+            } else {
+                replacement_extent_count
+            };
+            let replacement = match process.kernel_graph().reserve_frame_inventory(
+                replacement_candidate_count,
+                replacement_candidate_count,
+                replacement_capacity,
+            ) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    if let Some(retired_transaction) = retired_transaction {
+                        process
+                            .kernel_graph()
+                            .frame_inventory()
+                            .abandon(retired_transaction);
+                    }
+                    return Err(Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("reserve HVPatch exec replacement inventory: {error}"),
+                    ));
+                }
+            };
+            let replacement_transaction = replacement.transaction();
+            let abandon = super::quiesce::InventoryAbandon::new(
+                process.kernel_graph().frame_inventory(),
+                [retired_transaction, Some(replacement_transaction)],
+            );
+            if inventory_failure_injection
+                == Some(HvpatchExecInventoryFailureInjection::BeginInventory)
+            {
+                engine.inject_next_begin_exec_inventory_failure();
+            }
+            if let Err(error) = engine.begin_exec_inventory(retired, replacement) {
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("arm HVPatch exec frame inventory: {error}"),
+                ));
+            }
+            drop(registry);
+            Some(abandon)
+        } else {
+            None
+        };
+        Ok((prepared_kernel_exec, inventory_abandon))
+    }
+
+    fn replace_image<R>(
+        &mut self,
+        prepared_kernel_exec: RuntimePreparedExec,
+        topology_lock_started: std::time::Instant,
+        replace: impl FnOnce(
+            &mut dyn ImageReplacement<Self>,
+            RuntimePreparedExec,
+        ) -> ExecStep<R, VcpuLoopOutcome>,
+    ) -> ExecStep<R, VcpuLoopOutcome> {
+        let old_mm_id = prepared_kernel_exec.old_mm_id();
+        let replacement_mm_id = prepared_kernel_exec.replacement_mm_id();
+        let kernel = self.kernel;
+        let state = &mut *self.state;
+        // Stage-2 edits for distinct MMs touch distinct IPA ranges owned by
+        // distinct MMs, so the exclusion is the MM's transaction guard rather
+        // than the carrier topology lock.
+        // Task 4: replaced acquire_topology_lock with mutation.begin_transaction().
+        let mut admitted_mm_executor = None;
+        let mutation = if kernel.hvpatch_process.is_some() {
+            let mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation = match state
+                .guest_execution
+                .as_mut()
+                .filter(|p| p.mm_id() == old_mm_id)
+            {
+                Some(participation) => participation,
+                None => match kernel.dispatcher.enter_mm_executor() {
+                    Ok(p) => admitted_mm_executor.insert(p),
+                    Err(error) => {
+                        return Err(Self::exec_failed_past_no_return(
+                            kernel,
+                            self.engine,
+                            &format!("admit exact-MM exec authority: {error}"),
+                        ));
+                    }
+                },
+            };
+            let mutation = match carrick_kernel::dispatch::mm_mutation::from_executor(mm_executor) {
+                Ok(mutation) => mutation.with_operation(
+                    carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
+                ),
+                Err(error) => {
+                    return Err(Self::exec_failed_past_no_return(
+                        kernel,
+                        self.engine,
+                        &format!("acquire exact-MM exec authority: {error:?}"),
+                    ));
+                }
+            };
+            Some(mutation)
+        } else {
+            None
+        };
+        let mut _hvpatch_topology = mutation.as_ref().map(|m| m.begin_transaction());
+        if let Some(guard) = _hvpatch_topology.as_mut() {
+            if let Some(process) = kernel.hvpatch_process.as_ref() {
+                guard.set_identity(process.pid(), state.this_tid.raw());
+            }
+        }
+        record_exec_runtime_stage(
+            kernel,
+            carrick_observability::probes::HvpatchExecRuntimeStagePhase::TopologyLock,
+            topology_lock_started,
+            self.runtime_region_count,
+            self.runtime_mapped_bytes,
+        );
+        let mut transaction = HvpatchImageReplacement {
+            kernel,
+            engine: &mut *self.engine,
+            kernel_thread: &state.kernel_thread,
+            execution_lease: &state.execution_lease,
+            exec_predecessor_identity: self.exec_predecessor_identity,
+            inventory_failure_injection: self.inventory_failure_injection,
+            img: &self.img,
+            backend_publication_gate: &mut self.backend_publication_gate,
+        };
+        let replaced = replace(&mut transaction, prepared_kernel_exec)?;
+        let engine = &mut *self.engine;
+        // `execve_into` has released every stage-2/frame lock. Topology
+        // serialization must also be released before runtime takes its
+        // frame-inventory authority lock.
+        drop(_hvpatch_topology);
+        drop(mutation);
+        drop(admitted_mm_executor);
+        if let Some(process) = kernel.hvpatch_process.as_ref() {
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
+                process.pid(),
+                state.this_tid.raw(),
+            );
+            let Some((retired_commit, fallback_replacement_commit)) = self
+                .backend_publication_gate
+                .take_after_replace(|| engine.take_exec_inventory())
+            else {
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    "HVPatch destructive exec produced no frame inventory commits",
+                ));
+            };
+            if let Some(retired_commit) = retired_commit {
+                if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                    table.retire_overlapping(old_mm_id.raw(), 0, u64::MAX);
+                }
+                super::signal::withdraw_guest_descriptor_work(old_mm_id.raw());
+                if let Err(error) = process
+                    .kernel_graph()
+                    .frame_inventory()
+                    .apply(old_mm_id, retired_commit)
+                {
+                    return Err(Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!(
+                            "apply HVPatch exec retirement frame inventory for old mm {old_mm_id:?}: {error}"
+                        ),
+                    ));
+                }
+            }
+            let mut applied_by_authority = false;
+            if let Err(error) =
+                engine.apply_exec_inventory(replacement_mm_id.raw(), &mut |commit| {
+                    applied_by_authority = true;
+                    process
+                        .kernel_graph()
+                        .frame_inventory()
+                        .apply_with_receipt(replacement_mm_id, commit)
+                        .map(|(_, receipt)| receipt)
+                        .map_err(|error| crate::trap::TrapError::Hypervisor(error.to_string()))
+                })
+            {
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!(
+                        "apply HVPatch exec replacement authority for replacement mm {replacement_mm_id:?}: {error}"
+                    ),
+                ));
+            }
+            if !applied_by_authority {
+                let Some(replacement_commit) = fallback_replacement_commit else {
+                    return Err(Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        "HVPatch fallback replacement frame inventory commit missing",
+                    ));
+                };
+                if let Err(error) = process
+                    .kernel_graph()
+                    .frame_inventory()
+                    .apply(replacement_mm_id, replacement_commit)
+                {
+                    return Err(Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!(
+                            "apply HVPatch exec replacement frame inventory for replacement mm {replacement_mm_id:?}: {error}"
+                        ),
+                    ));
+                }
+            }
+            drop(registry);
+        }
+        Ok(replaced)
+    }
+
+    fn commit(
+        &mut self,
+        replaced: HvpatchReplacedExec,
+        prepared_dispatch_mm_exec: &mut Option<carrick_kernel::dispatch::PreparedDispatchMmExec>,
+    ) -> ExecStep<(carrick_kernel::kernel::KernelContext, HvpatchCommittedExec), VcpuLoopOutcome>
+    {
+        let kernel = self.kernel;
+        let HvpatchReplacedExec {
+            published_kernel_exec,
+            replacement_asid_load,
+            worker_executor,
+        } = replaced;
+        #[cfg(test)]
+        self.state.fail_exec_terminal_context_for_test(
+            ExecTerminalContextFailpoint::BeforeKernelCommit,
+        )?;
+        let committed = match (kernel.hvpatch_process.as_ref(), published_kernel_exec) {
+            (Some(process), RuntimePublishedExec::Hvpatch(published)) => process
+                .complete_exec(*published, prepared_dispatch_mm_exec.take())
+                .map(|committed| (committed.context().retain_exact(), Some(committed))),
+            (None, RuntimePublishedExec::Other(prepared)) => {
+                let committed = kernel.dispatcher.commit_one_task_kernel_exec(*prepared);
+                if committed.is_ok()
+                    && let Some(prepared) = prepared_dispatch_mm_exec.take()
+                {
+                    prepared.commit();
+                }
+                committed
+                    .map(|context| (context, None))
+                    .map_err(crate::hvpatch::CompleteExecError::before_commit)
+            }
+            _ => {
+                carrick_fatal!(
+                    "hvpatch::exec_commit",
+                    "published Kernel exec variant disagrees with configured HVPatch backend after destructive image replacement"
+                );
+            }
+        };
+        let (committed_context, committed_transition) = match committed {
+            Ok(committed) => committed,
+            Err(error) => {
+                let (error, committed_context) = error.into_parts();
+                if let Some(committed_context) = committed_context {
+                    *self.kernel_context = committed_context;
+                }
+                // The engine now runs the replacement image. Returning a
+                // guest-visible exec failure or resuming the old Kernel
+                // graph would create split lifecycle authority.
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    self.engine,
+                    &format!("commit Kernel exec after image replacement: {error}"),
+                ));
+            }
+        };
+        Ok((
+            committed_context,
+            HvpatchCommittedExec {
+                committed_transition,
+                replacement_asid_load,
+                worker_executor,
+            },
+        ))
+    }
+
+    fn adopt_successor_context(
+        &mut self,
+        committed_context: &carrick_kernel::kernel::KernelContext,
+    ) -> ExecStep<(), VcpuLoopOutcome> {
+        // This is the terminal-context authority boundary: every remaining
+        // edge is post-commit and must carry the Kernel successor, including
+        // errors before runtime state and replacement publication catch up.
+        *self.kernel_context = committed_context.retain_exact();
+        #[cfg(test)]
+        {
+            self.state.committed_exec_context_for_test = Some(committed_context.retain_exact());
+            self.state.fail_exec_terminal_context_for_test(
+                ExecTerminalContextFailpoint::TaskLoadPublication,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn load_successor_mm(
+        &mut self,
+        committed_context: &carrick_kernel::kernel::KernelContext,
+        committed: &mut HvpatchCommittedExec,
+    ) -> ExecStep<HvpatchResidentMm, VcpuLoopOutcome> {
+        let kernel = self.kernel;
+        let engine = &mut *self.engine;
+        let replacement_asid_load = committed.replacement_asid_load.take();
+        let replacement_loaded = replacement_asid_load.is_some();
+        if let Some(load) = replacement_asid_load
+            && let Err(error) = load.mark_resident()
+        {
+            return Err(Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("commit replacement ASID residence after exec: {error}"),
+            ));
+        }
+        if replacement_loaded {
+            crate::HVPATCH_TASK_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let committed_owned_mm = committed_context.shared().mm();
+        let committed_mm = committed_owned_mm.id();
+        let committed_asid_generation = kernel.hvpatch_process.as_ref().map_or(
+            committed_mm.raw(),
+            crate::hvpatch::ProcessContext::asid_generation,
+        );
+        super::signal::admit_bound_mm(
+            engine,
+            &super::signal::BoundMm {
+                mm: committed_owned_mm,
+                asid_generation: committed_asid_generation,
+            },
+        );
+        Ok(HvpatchResidentMm {
+            committed_mm,
+            committed_asid_generation,
+        })
+    }
+
+    fn entry_state(
+        &mut self,
+        committed_context: &carrick_kernel::kernel::KernelContext,
+        resident: HvpatchResidentMm,
+    ) -> ExecStep<carrick_kernel::kernel::objects::MigratableTaskState, VcpuLoopOutcome> {
+        #[cfg(test)]
+        self.state.fail_exec_terminal_context_for_test(
+            ExecTerminalContextFailpoint::SnapshotPublication,
+        )?;
+        let replacement_cpu = match self.engine.snapshot_guest_state_for_publication() {
+            Ok(state) => state,
+            Err(error) => {
+                committed_context.thread().fail_uninitialized_snapshot(
+                    carrick_kernel::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+                );
+                return Err(Self::exec_failed_past_no_return(
+                    self.kernel,
+                    self.engine,
+                    &format!("capture replacement execution state after exec: {error}"),
+                ));
+            }
+        };
+        Ok(carrick_kernel::kernel::objects::MigratableTaskState {
+            cpu: replacement_cpu,
+            mm: resident.committed_mm,
+            asid_generation: resident.committed_asid_generation,
+        })
+    }
+
+    fn bind_successor_memory(
+        &mut self,
+        committed_context: &carrick_kernel::kernel::KernelContext,
+    ) -> ExecStep<(), VcpuLoopOutcome> {
+        let kernel = self.kernel;
+        let engine = &mut *self.engine;
+        let committed_mm = committed_context.shared().mm().id();
+        // `exec` publishes a new Mm generation while keeping this host
+        // engine/vCPU.  Frame-COW callbacks must therefore move from
+        // the retired mm to the committed replacement before any
+        // identity-page or guest write can fault.  Keeping the old
+        // authority makes a structurally valid COW MappingId belong to
+        // the retired mm and fail closed at replacement-mm teardown.
+        if let Some(process) = kernel.hvpatch_process.as_ref() {
+            #[cfg(test)]
+            self.state.fail_exec_terminal_context_for_test(
+                ExecTerminalContextFailpoint::FrameCowBinding,
+            )?;
+            let owner_inventory = engine.frame_cow_owner_inventory().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "committed HVPatch exec has no carrier host-owner inventory".to_owned(),
+                )
+            })?;
+            let binding = process.mm_binding().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "committed HVPatch exec has no replacement mm binding".to_owned(),
+                )
+            })?;
+            let authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
+                std::sync::Arc::new(super::KernelFrameCowAuthority {
+                    runtime: std::sync::Arc::downgrade(kernel),
+                    deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(committed_mm),
+                    kernel: std::sync::Arc::clone(committed_context.kernel()),
+                    mm: committed_mm,
+                    owner_inventory,
+                    tid: self.state.this_tid,
+                    identity: carrick_hal::FrameCowIdentity {
+                        linux_pid: process.pid(),
+                        linux_tid: self.state.this_tid.raw(),
+                        mm: committed_mm.raw(),
+                        asid: binding.asid.raw(),
+                    },
+                    pt_quiesce: kernel.dispatcher.pt_quiesce(),
+                });
+            engine.bind_frame_cow(
+                authority,
+                carrick_hal::FrameCowIdentity {
+                    linux_pid: process.pid(),
+                    linux_tid: self.state.this_tid.raw(),
+                    mm: committed_mm.raw(),
+                    asid: binding.asid.raw(),
+                },
+            );
+            if !kernel
+                .dispatcher
+                .bind_deferred_anonymous_state(engine, committed_mm)
+            {
+                return Err(RuntimeError::Configuration(
+                    "exec anonymous authority MM mismatch".to_owned(),
+                )
+                .into());
+            }
+            // The exec rebuild starts a fresh stage-1 manager for the
+            // replacement mm; its extension arenas must be leased against the
+            // REPLACEMENT lease (the old source belongs to the retired mm and
+            // would return live slots at that mm's teardown). Without this the
+            // exec'd process could never grow past one arena — pagetablegrow
+            // through `/bin/sh -c` died at 87 mappings, and CPython's
+            // recursion-limit compile hit `OutOfTables (arenas=1)`.
+            let arena_source = process
+                .mm_resources()
+                .table_arena_source(committed_context.task().key())
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "committed HVPatch exec has no replacement table arena lease: {error}"
+                    ))
+                })?;
+            tracing::debug!(target: "carrick::stage1_arena", "install committed-task arena source at exec commit");
+            engine
+                .install_stage1_table_arena_source(arena_source)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "install replacement HVPatch table arena source: {error}"
+                    ))
+                })?;
+            #[cfg(test)]
+            self.state.fail_exec_terminal_context_for_test(
+                ExecTerminalContextFailpoint::InventoryActivation,
+            )?;
+            if let Err(error) = engine.activate_exec_inventory() {
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("activate HVPatch exec authority: {error}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn rebind_identity(&mut self, committed_context: &carrick_kernel::kernel::KernelContext) {
+        self.state.linux_tid = committed_context.thread().key().tid;
+        // Crash-register authority follows the replacement Kernel
+        // Thread generation. Keeping the pre-exec Arc would publish a
+        // later capture into a retired object, while the committed
+        // task census correctly waits on the replacement object.
+        self.state.kernel_thread = Some(std::sync::Arc::clone(committed_context.thread()));
+        // The common run-loop signal boundary must consume the exact
+        // replacement generation, never the pre-exec context retained
+        // at syscall entry. A failed exec leaves that entry context in
+        // place; only a committed image replacement publishes here.
+        self.state.service_kernel_context = Some(committed_context.retain_exact());
+    }
+
+    fn verify_image(&mut self) -> ExecStep<(), VcpuLoopOutcome> {
+        let kernel = self.kernel;
+        let engine = &mut *self.engine;
+        if kernel.hvpatch_process.is_some()
+            && ::std::env::var_os("CARRICK_HVPATCH_VERIFY_EXEC_CODE").is_some()
+        {
+            if let Err(error) = verify_published_exec_image(engine, &self.img, &self.path) {
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("verify published HVPatch exec image: {error}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn stamp_port(
+        &mut self,
+        committed_context: &carrick_kernel::kernel::KernelContext,
+    ) -> ExecStep<(), VcpuLoopOutcome> {
+        let kernel = self.kernel;
+        let engine = &mut *self.engine;
+        // execve_into rebuilt a fresh vCPU: re-stamp the identity page
+        // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
+        let identity_base = if self.inventory_failure_injection
+            == Some(HvpatchExecInventoryFailureInjection::IdentityPage)
+        {
+            u64::MAX - 0x100
+        } else {
+            crate::memory::LINUX_IDENTITY_PAGE_BASE
+        };
+        #[cfg(test)]
+        self.state.fail_exec_terminal_context_for_test(
+            ExecTerminalContextFailpoint::IdentityPublication,
+        )?;
+        if let Err(error) = carrick_kernel::kernel::identity_page::stamp_identity_page_at(
+            engine,
+            &kernel.dispatcher,
+            committed_context,
+            identity_base,
+        ) {
+            return Err(Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("stamp HVPatch exec identity page: {error}"),
+            ));
+        }
+        // The new image's vvar was published with the host calibration only;
+        // fold in the guest CLOCK_REALTIME delta before the image runs its
+        // first instruction, so a vDSO read before any syscall already agrees
+        // with the syscall path (`sync_vvar_realtime_offset`; probe
+        // clocksettimevdso, `date -s` followed by an exec'd `date`).
+        #[cfg(test)]
+        self.state
+            .fail_exec_terminal_context_for_test(ExecTerminalContextFailpoint::VvarPublication)?;
+        if let Err(error) = kernel
+            .dispatcher
+            .sync_vvar_realtime_offset(committed_context.task().container().clock(), engine)
+        {
+            return Err(Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("stamp HVPatch exec vvar realtime word: {error}"),
+            ));
+        }
+        if let Err(error) = super::stamp_ns_visible_guest_tid(engine, committed_context) {
+            return Err(Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("publish HVPatch guest thread identity: {error}"),
+            ));
+        }
+        self.state.fatal_image_generation = kernel
+            .fatal_signal
+            .rebind_after_exec(self.state.fatal_image_generation)
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::fatal_signal_authority",
+                    "fatal-signal image generation could not rebind to committed exec successor: fatal_image_generation={:?}",
+                    self.state.fatal_image_generation
+                );
+            });
+        Ok(())
+    }
+
+    fn publish_replacement(
+        &mut self,
+        committed_context: &carrick_kernel::kernel::KernelContext,
+        committed: HvpatchCommittedExec,
+        replacement_state: carrick_kernel::kernel::objects::MigratableTaskState,
+    ) -> ExecStep<(), VcpuLoopOutcome> {
+        let kernel = self.kernel;
+        let engine = &mut *self.engine;
+        if let Some(process) = kernel.hvpatch_process.as_ref() {
+            process.trace_lifecycle(
+                carrick_observability::probes::HvpatchGuestLifecyclePhase::Exec,
+                self.state.this_tid,
+                0,
+            );
+        }
+        // vfork: the execve SUCCEEDED and we now have our own private VM.
+        // Release the suspended parent by writing one byte to the
+        // inherited pipe, then close it. A FAILED execve returns above via
+        // a failure branch WITHOUT releasing — the child then `_exit`s
+        // and the parent's `read()` gets EOF instead.
+        if let Some(fd) = self.state.vfork_release_fd.take() {
+            let _ = unsafe { ::libc::write(fd, [0u8; 1].as_ptr().cast(), 1) };
+            unsafe { libc::close(fd) };
+        }
+        if let Err(error) = publish_execution_authority_after_exec(
+            committed_context.thread(),
+            committed.worker_executor,
+            replacement_state.clone(),
+            &self.state.execution_lease,
+        ) {
+            return Err(Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("publish replacement execution lease after exec: {error}"),
+            ));
+        }
+        if kernel.hvpatch_process.is_some() {
+            let bind_births = super::thread_adoption::engine_thread_birth_template(
+                engine,
+                &replacement_state.cpu,
+            )
+            .and_then(|backend_template| {
+                super::thread_adoption::bind_executable_thread_births(
+                    kernel,
+                    self.state,
+                    committed_context,
+                    replacement_state,
+                    backend_template,
+                )
+            });
+            if let Err(error) = bind_births {
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("bind executable thread births after exec: {error}"),
+                ));
+            }
+        }
+        if let Some(committed) = committed.committed_transition {
+            let (transition, replacement_mm, retired_mm) = committed.into_parts();
+            let pending = super::executor::PendingExecReplacement {
+                transition,
+                replacement_mm,
+                retired_mm,
+            };
+            let state = &mut *self.state;
+            if state.pending_exec_replacement.replace(pending).is_some() {
+                carrick_fatal!(
+                    "hvpatch::exec_replacement",
+                    "duplicate pending exec replacement would overwrite Kernel transition and MM retirement authority"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<E: ThreadedEngine + 'static> ImageReplacement<HvpatchExecVenue<'_, E>>
+    for HvpatchImageReplacement<'_, E>
+where
+    E::SiblingSpec: 'static,
+{
+    fn arm_no_return(
+        &mut self,
+        prepared_kernel_exec: RuntimePreparedExec,
+        prepared_dispatch_mm_exec: Option<&carrick_kernel::dispatch::PreparedDispatchMmExec>,
+    ) -> ExecStep<HvpatchArmedExec, VcpuLoopOutcome> {
+        let kernel = self.kernel;
+        let engine = &mut *self.engine;
+        let retiring_thread = self.kernel_thread.as_ref().cloned().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "committed exec lost predecessor Kernel thread authority".to_owned(),
+            )
+        })?;
+        let worker_executor = self
+            .execution_lease
+            .lock()
+            .as_ref()
+            .map(carrick_kernel::kernel::objects::ThreadExecutionLease::executor)
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "exec replacement lost worker-authenticated execution lease".to_owned(),
+                )
+            })?;
+        let replacement_asid_load = match prepared_kernel_exec.prepare_hvpatch_address_space(engine)
+        {
+            Ok(load) => load,
+            Err(error) => {
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("bind fresh HVPatch exec MM/ASID lease: {error}"),
+                ));
+            }
+        };
+        let armed_kernel_exec = match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
+            (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
+                let replacement_vma_source = prepared_dispatch_mm_exec.map_or_else(
+                    || kernel.dispatcher.vma_snapshot_source(),
+                    carrick_kernel::dispatch::PreparedDispatchMmExec::vma_snapshot_source,
+                );
+                match process.arm_exec_no_return(*prepared, replacement_vma_source) {
+                    Ok(armed) => RuntimeArmedExec::Hvpatch(armed),
+                    Err(error) => {
+                        return Err(RuntimeError::Configuration(format!(
+                            "reject exec before no-return arm: {error}"
+                        ))
+                        .into());
+                    }
+                }
+            }
+            (None, RuntimePreparedExec::Other(prepared)) => RuntimeArmedExec::Other(*prepared),
+            _ => {
+                carrick_fatal!(
+                    "hvpatch::exec_backend",
+                    "prepared Kernel exec variant disagrees with configured HVPatch backend before destructive image replacement"
+                );
+            }
+        };
+        if let Err(error) =
+            retire_execution_authority_for_exec(&retiring_thread, self.execution_lease)
+        {
+            drop(replacement_asid_load);
+            drop(armed_kernel_exec);
+            return Err(Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("retire predecessor after exec no-return arm: {error}"),
+            ));
+        }
+        if let Some(identity) = self.exec_predecessor_identity
+            && let Err(error) = engine.bind_exec_predecessor_identity(identity)
+        {
+            drop(replacement_asid_load);
+            drop(armed_kernel_exec);
+            return Err(Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("bind exact HVPatch exec predecessor identity: {error}"),
+            ));
+        }
+        Ok(HvpatchArmedExec {
+            armed_kernel_exec,
+            replacement_asid_load,
+            worker_executor,
+        })
+    }
+
+    #[expect(
+        clippy::needless_borrow,
+        reason = "`no_return_arming_precedes_destructive_work_and_mm_publication_follows_it` \
+                  locates the destructive replacement by its `engine.execve_into(&img)` text"
+    )]
+    fn install_image(
+        &mut self,
+        armed: HvpatchArmedExec,
+    ) -> ExecStep<HvpatchArmedExec, VcpuLoopOutcome> {
+        let kernel = self.kernel;
+        let engine = &mut *self.engine;
+        let img = self.img;
+        let HvpatchArmedExec {
+            armed_kernel_exec,
+            replacement_asid_load,
+            worker_executor,
+        } = armed;
+        if self.inventory_failure_injection
+            == Some(HvpatchExecInventoryFailureInjection::ImageReplace)
+        {
+            drop(replacement_asid_load);
+            drop(armed_kernel_exec);
+            return Err(Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                "injected HVPatch exec failure before image replacement",
+            ));
+        }
+        if let Err(error) = engine.execve_into(&img) {
+            drop(replacement_asid_load);
+            drop(armed_kernel_exec);
+            return Err(Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("replace guest image: {error}"),
+            ));
+        }
+        self.backend_publication_gate.record_engine_replaced();
+        Ok(HvpatchArmedExec {
+            armed_kernel_exec,
+            replacement_asid_load,
+            worker_executor,
+        })
+    }
+
+    fn publish_mm(
+        &mut self,
+        installed: HvpatchArmedExec,
+    ) -> ExecStep<HvpatchReplacedExec, VcpuLoopOutcome> {
+        let kernel = self.kernel;
+        let engine = &mut *self.engine;
+        let HvpatchArmedExec {
+            armed_kernel_exec,
+            replacement_asid_load,
+            worker_executor,
+        } = installed;
+        let published_kernel_exec = match (kernel.hvpatch_process.as_ref(), armed_kernel_exec) {
+            (Some(process), RuntimeArmedExec::Hvpatch(armed)) => {
+                match process.publish_exec_mm(armed) {
+                    Ok(published) => RuntimePublishedExec::Hvpatch(Box::new(published)),
+                    Err(error) => {
+                        return Err(Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("publish replacement MM after image replacement: {error}"),
+                        ));
+                    }
+                }
+            }
+            (None, RuntimeArmedExec::Other(prepared)) => {
+                RuntimePublishedExec::Other(Box::new(prepared))
+            }
+            _ => {
+                carrick_fatal!(
+                    "hvpatch::exec_backend",
+                    "armed Kernel exec variant disagrees with configured HVPatch backend after destructive image replacement"
+                );
+            }
+        };
+        if let (Some(process), RuntimePublishedExec::Hvpatch(published)) =
+            (kernel.hvpatch_process.as_ref(), &published_kernel_exec)
+        {
+            let source = process.table_arena_source_for_lease(published.replacement_lease());
+            tracing::debug!(target: "carrick::stage1_arena", "install replacement-lease arena source after execve_into");
+            if let Err(error) = engine.install_stage1_table_arena_source(source) {
+                return Err(Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("install replacement HVPatch table arena source: {error}"),
+                ));
+            }
+        }
+        Ok(HvpatchReplacedExec {
+            published_kernel_exec,
+            replacement_asid_load,
+            worker_executor,
+        })
     }
 }
 
