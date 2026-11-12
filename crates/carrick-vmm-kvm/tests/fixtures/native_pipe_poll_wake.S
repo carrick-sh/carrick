@@ -122,6 +122,18 @@ _start:
     jne fail_fields
     cmpw $1, pfd+4(%rip)
     jne fail_fields
+#ifdef EPOLL_INPUT_FAULT
+    mov %r13d, %edi
+    lea epoll_event(%rip), %rsi
+    mov $1, %edx
+    mov $1, %r10d                  /* unmapped timespec */
+    xor %r8d, %r8d
+    mov $8, %r9d
+    mov $441, %eax                 /* epoll_pwait2 */
+    syscall
+    cmp $-14, %rax                 /* input owner EFAULT, never rax=441 */
+    jne fail_input
+#endif
     /* wait4(child, &status, 0, NULL) */
     mov %r12d, %edi
     lea status(%rip), %rsi
@@ -182,6 +194,9 @@ fail_wait:
     jmp exit
 fail_close:
     mov $16, %edi
+    jmp exit
+fail_input:
+    mov $18, %edi
 exit:
     mov $231, %eax
     syscall
