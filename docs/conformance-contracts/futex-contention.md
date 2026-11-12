@@ -718,3 +718,16 @@ issue shared FUTEX_WAIT, including the relative timed variant. The executing
 KVM fixtures retain their repeated birth/retirement, exact wake cardinality,
 TLS/extended-context and timer-release assertions. This bounded sidecar does
 not establish production executor-pool exhaustion or signed ARM execution.
+
+Round 2 recovered the original stack unchanged at `bef61a77b`, on #1961's
+`a63b2a9a10` (GitHub main `70604de41`). Reconfirming the custody-boundary
+witness with only `ZoneFutexQueue::wake` changed to pass the untagged guest
+address fails at `aarch64_process_tests.rs`'s host-retirement assertion:
+zero wakes instead of one. The temporary mutation was restored before gates.
+The durable worker receipt is `red-host-wake.log` under
+`/tmp/2124-round2-evidence`; the command was
+`JOBS=3 CARGO_BUILD_JOBS=3 cargo test -p carrick-el1-linux --lib arm_glibc_pthread_join_robust_host_wake_meets_ring_wait`
+(exit 101). This reconfirms the production queue-boundary defect and does not
+claim signed ARM execution. The two P0 corrections remain the shared-key
+repair `add5fd232` and the inherited x86 immediate-result repair `1633d3b71`;
+the deterministic KVM result witness is `547b6a24f`.
