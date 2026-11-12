@@ -2635,15 +2635,18 @@ mod tests {
             struct Restore(Option<HandbackPublisher>, usize);
             impl Drop for Restore {
                 fn drop(&mut self) {
+                    crate::el1_delegation::clear_el1_region_host_ptr();
                     *HANDBACK_PUBLISHER.write() = self.0.take();
                     carrick_el1_abi::record_el1_region_host_ptr(self.1);
                 }
             }
-            let _restore = Restore(
+            let previous = (
                 HANDBACK_PUBLISHER.write().take(),
                 carrick_el1_abi::get_el1_region_host_ptr(),
             );
             let region = carrick_test_support::TestEl1Region::zeroed();
+            // Retire the aperture before the backing allocation drops.
+            let _restore = Restore(previous.0, previous.1);
             carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
             let task = {
                 let at = region.as_ptr() as usize
