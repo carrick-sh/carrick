@@ -1544,6 +1544,21 @@ impl El1TaskId {
     }
 }
 
+/// A thread group's process binding on a vCPU slot: the namespace PID and
+/// the root incarnation that admission authenticates together. A switch-in
+/// publishes both from one owner, never one half from another thread (#1958).
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct ProcessBinding {
+    pub visible_pid: core::num::NonZeroU32,
+    pub root_generation: carrick_guest_arch::ContextGeneration,
+}
+
 /// Per-vCPU slot task record published by the host runtime before running
 /// a vCPU and cleared when unloaded.
 #[repr(C, align(8))]
@@ -1706,6 +1721,12 @@ impl CurrentTask {
     pub fn publish_root_generation(&self, generation: carrick_guest_arch::ContextGeneration) {
         self.root_generation
             .store(generation.raw().get(), Ordering::Release);
+    }
+
+    /// The process binding of the thread a switch-in selected.
+    pub fn publish_process_binding(&self, binding: ProcessBinding) {
+        self.publish_visible_pid(binding.visible_pid.get());
+        self.publish_root_generation(binding.root_generation);
     }
 
     /// The host's load publication of its thread's process binding: the

@@ -2775,6 +2775,40 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime.task_binding(process).map(|binding| binding.address)
     }
 
+    /// The process binding of the admitted thread group a scheduler record's
+    /// identity names: its exact MM and lifecycle page. An unregistered record
+    /// carries neither the namespace PID nor its root incarnation (#1958).
+    pub fn group_binding(
+        &self,
+        zone: &ZoneTables<C>,
+        mm: u64,
+        page: u64,
+    ) -> Option<carrick_el1_abi::ProcessBinding> {
+        let carrier = core::ptr::from_ref(zone).addr();
+        let page = usize::try_from(page).ok()?;
+        let (pid, runtime, process) = {
+            let state = self.state.lock();
+            let mut groups = state
+                .groups
+                .range((carrier, mm, 0, 0, 0)..=(carrier, mm, u64::MAX, usize::MAX, u32::MAX))
+                .filter(|((_, _, _, group_page, _), _)| *group_page == page);
+            let (&(_, _, _, _, pid), (runtime, process)) = groups.next()?;
+            // One MM and page name one admitted group; anything else is no
+            // binding to publish.
+            if groups.next().is_some() {
+                return None;
+            }
+            (pid, runtime.clone(), *process)
+        };
+        let (visible_pid, address) = runtime.process_binding(process)?;
+        (visible_pid == pid && address.mm.raw().get() == mm).then_some(
+            carrick_el1_abi::ProcessBinding {
+                visible_pid: NonZeroU32::new(pid)?,
+                root_generation: address.generation,
+            },
+        )
+    }
+
     /// Classify the admitted thread group at whatever address incarnation.
     /// Root and fork-child groups have distinct exec authority until native
     /// child exec is implemented.
@@ -4577,6 +4611,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 && resources.page as *const _ as u64 == identity.lifecycle_page
         })?;
         Some(row.metadata().namespace_pid)
+    }
+    /// A process row's namespace PID and admitted address, without its
+    /// context or MM handle.
+    pub fn process_binding(&self, key: TaskKey) -> Option<(u32, AddressContext<RootGpa>)> {
+        let graph = self.graph.lock();
+        let row = graph.owner.task(key).ok()?;
+        Some((
+            row.metadata().namespace_pid,
+            row.native().resources().address,
+        ))
     }
     pub fn task_binding(&self, key: TaskKey) -> Option<NativeRecordBinding<M, C>> {
         let graph = self.graph.lock();

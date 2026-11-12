@@ -329,6 +329,16 @@ fn resume_unregistered(
         let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
         return crate::sched::ResumeAction::Left;
     }
+    // A home record resumes with the host's load publication (`Sched::load`).
+    // Any other unregistered record was unhomed into a host zone wait and may
+    // run on any vCPU: this slot's binding can be another process's (#1958).
+    if rec.home() != Some(slot) {
+        let identity = rec.identity();
+        if let Some(binding) = registry().group_binding(zone, identity.mm, identity.lifecycle_page)
+        {
+            task.publish_process_binding(binding);
+        }
+    }
     let lifecycle = {
         #[cfg(target_os = "none")]
         {
