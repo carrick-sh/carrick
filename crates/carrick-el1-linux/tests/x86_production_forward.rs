@@ -2045,6 +2045,21 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         "x86 child write(1) after dup3(3, 1) must stage against fd-core instead of failing preflight_host_crossing"
     );
 
+    // A native child creates this epoll in ring. Its wait must use the
+    // same descriptor authority through the production CPL0 frame.
+    let (route, epoll) = call_x86(&env, &child, &mut service, 291, [0; 6]);
+    assert_eq!(route, CompletionRoute::Served);
+    assert!(epoll >= 0);
+    let events = GuestUserBuffer::zeroed(12);
+    let (route, result) = call_x86(
+        &env,
+        &child,
+        &mut service,
+        281,
+        [epoll as u64, events.arg(), 1, 0, 0, 0],
+    );
+    assert_eq!((route, result), (CompletionRoute::Served, 0));
+
     // Two-live-process table isolation on x86 CPL0 while both root and child remain live:
     // Child closes fd 3; root's fd 3 stays open and root can dup(3) -> 4.
     let (_, child_close_3) = call_x86(&env, &child, &mut service, 3, [3, 0, 0, 0, 0, 0]);
