@@ -6,8 +6,10 @@
 //! holds: the no-venue routing is chosen by carrick-el1-linux's own
 //! `cfg(any(test, feature = "host-test"))`, which is off for this target, and
 //! carrick-el1's host-test items are test doubles, a bounded wake trace and
-//! an unset copy-fault flag that production routing never selects. The
-//! witnesses pass unchanged with that dev feature removed (#690 review).
+//! a copy-fault flag that the no-venue witnesses leave unset. The native
+//! input-completion witness below injects a guarded-copy refusal after admission. The
+//! no-venue witnesses pass unchanged with that dev feature removed (#690 review);
+//! the explicit input-copy failure injection requires the dev feature.
 #![allow(clippy::panic)]
 
 use carrick_el1_abi::{Action, Counters, CurrentTask, El1TaskId, InotifyNameCache, TrapFrame};
@@ -1305,6 +1307,19 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             })
         }
 
+        fn prepare_owned_read(
+            &mut self,
+            _: &Self::Mm,
+            request: carrick_core::user_copy::GuestCopyRequest,
+        ) -> Result<(), NativeProcessError> {
+            // This fixture has only resident user buffers. The deliberate
+            // unreadable timeout must reach its exact-MM input owner.
+            assert_eq!(request.address.raw(), 1);
+            assert_eq!(request.len.raw(), 16);
+            assert_eq!(request.access, carrick_guest_arch::Access::Read);
+            Err(NativeProcessError::Fault)
+        }
+
         fn prepare_mm(
             &mut self,
             parent: &Self::Mm,
@@ -2127,6 +2142,32 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
                 .collect::<Vec<_>>()
         );
 
+        struct RestoreCopyFault;
+        impl Drop for RestoreCopyFault {
+            fn drop(&mut self) {
+                carrick_el1::substrate::file::SIMULATE_COPY_FAULT
+                    .with(|fault| fault.store(false, Ordering::Relaxed));
+            }
+        }
+        let fault_result = {
+            // The host fixture has no EL1 exception fixup. Inject at that
+            // instruction boundary; the dispatch and input owner remain real.
+            carrick_el1::substrate::file::SIMULATE_COPY_FAULT
+                .with(|fault| fault.store(true, Ordering::Relaxed));
+            let _restore = RestoreCopyFault;
+            call_x86(
+                &env,
+                &child,
+                &mut service,
+                441,
+                [epoll as u64, events.arg(), 1, 1, 0, 0],
+            )
+        };
+        assert_eq!(
+            fault_result,
+            (CompletionRoute::Served, -14),
+            "input owner EFAULT must replace the native ordinal in rax"
+        );
         let (route, event) = call_x86(&env, &child, &mut service, 290, [0; 6]);
         assert_eq!(route, CompletionRoute::Served);
         assert!(event >= 0);
