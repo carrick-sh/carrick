@@ -743,21 +743,11 @@ fn rename_scratch_to_trash(path: &Path) -> Option<PathBuf> {
 /// removes at most [`SCRATCH_SYNC_CLEANUP_LIMIT`] entries from the oldest
 /// retired tree, preserving that tree's age until it is fully gone.
 pub(crate) fn cleanup_oldest_trash_checkpoint(scratch_root: &Path) -> usize {
-    cleanup_oldest_trash_with_limit(scratch_root, SCRATCH_SYNC_CLEANUP_LIMIT).removed
+    cleanup_oldest_trash_with_limit(scratch_root, SCRATCH_SYNC_CLEANUP_LIMIT)
 }
 
-/// What one [`cleanup_oldest_trash_with_limit`] pass did.
-struct TrashPass {
-    removed: usize,
-    /// A retired tree existed, whether or not the budget finished it.
-    found: bool,
-}
-
-fn cleanup_oldest_trash_with_limit(scratch_root: &Path, limit: usize) -> TrashPass {
-    let none = TrashPass {
-        removed: 0,
-        found: false,
-    };
+fn cleanup_oldest_trash_with_limit(scratch_root: &Path, limit: usize) -> usize {
+    let none = 0;
     let dedicated = scratch_root.join(SCRATCH_TRASH_DIRECTORY);
     let search_root = if dedicated.is_dir() {
         dedicated.as_path()
@@ -806,10 +796,7 @@ fn cleanup_oldest_trash_with_limit(scratch_root: &Path, limit: usize) -> TrashPa
         });
     }
     debug_assert_eq!(budget.attempts + budget.remaining, limit);
-    TrashPass {
-        removed: budget.removed,
-        found: true,
-    }
+    budget.removed
 }
 
 #[cfg(test)]
