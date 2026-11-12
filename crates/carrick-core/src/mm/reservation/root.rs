@@ -2957,6 +2957,22 @@ impl<
     /// still holds `epoch` and starts at `expected_start`, and `new_start`
     /// lies in `(expected_start, end]`. `new_start == end` frees the slot
     /// and advances its epoch. Anything else is `Stale` with no effect.
+    ///
+    /// A bare (slot, epoch, start) is no authority:
+    ///
+    /// ```compile_fail,E0061
+    /// fn forge(
+    ///     journal: &mut dyn carrick_core_abi::ReturnJournal,
+    ///     owed: &carrick_core_abi::DeferredReturn,
+    /// ) {
+    ///     let _ = journal.acknowledge_chunk(
+    ///         owed.slot,
+    ///         owed.epoch,
+    ///         owed.range.start(),
+    ///         owed.range.end(),
+    ///     );
+    /// }
+    /// ```
     pub fn acknowledge_chunk(
         &mut self,
         slot: OwedSlot,
@@ -4062,6 +4078,43 @@ mod tests {
             Ok(ChunkAcknowledgement::Stale)
         );
         assert_eq!(owed_rows(&successor), vec![reused]);
+    }
+    /// #1480 P0-2: final retirement is no settlement. A retired MM's owed
+    /// slots stay owed under its key until its release receipt, so another
+    /// MM's retirement never lands in them meanwhile.
+    #[test]
+    fn retire_final_leaves_the_retired_mm_returns_owed() {
+        let table = table();
+        let (gone, next) = (
+            ReservationMm::new(1484).unwrap(),
+            ReservationMm::new(1485).unwrap(),
+        );
+        for (slot, mm) in [(0, gone), (1, next)] {
+            table.publish(slot, mm, layout()).unwrap();
+            table.lock(slot, mm).unwrap().finish_import().unwrap();
+        }
+        let rw = ReservationProtection::READ_WRITE;
+        let mut root = table.lock(0, gone).unwrap();
+        let mapped = root.mmap(Placement::Fixed(0x100000), 0x2000, rw).unwrap();
+        complete(&mut root, mapped);
+        retire_owed(&mut root, range(0x100000, 0x102000));
+        let [old] = owed_rows(&root)[..] else {
+            panic!("one owed extent");
+        };
+        assert_eq!(root.retire_final(), Ok(1));
+        let mut successor = table.lock(1, next).unwrap();
+        let mapped = successor
+            .mmap(Placement::Fixed(0x100000), 0x2000, rw)
+            .unwrap();
+        complete(&mut successor, mapped);
+        retire_owed(&mut successor, range(0x100000, 0x102000));
+        let [placed] = owed_rows(&successor)[..] else {
+            panic!("one owed extent");
+        };
+        assert_ne!(
+            placed.slot, old.slot,
+            "the retired MM's slot stays owed until its release receipt"
+        );
     }
     fn first_fit_avoids(root: &mut Reservations<'_>, owed: ReservationRange, len: u64) -> bool {
         let start = root.first_fit(len).unwrap();
