@@ -2512,6 +2512,98 @@ fn serial_host_root_loader_reads_stats_and_protects_through_the_ring() {
     assert!(!outcome.run.trap_limit_hit);
 }
 
+/// Run one `native_ring_descriptors.S` mode on the production CPL0 path,
+/// after the native oracle exits 0 with it. Returns the guest's exit code
+/// (the failed step) and its nonzero refusal counters as (x86 nr, count).
+fn ring_descriptor_run(mode: &str) -> (i32, Vec<(usize, u64)>) {
+    let dir = tempfile::tempdir().expect("ring descriptor directory");
+    let path = dir.path().join("library");
+    std::fs::write(&path, b"loader library").expect("ring descriptor file");
+    let file = format!("-DFILE_PATH=\"{}\"", path.display());
+    let directory = format!("-DDIR_PATH=\"{}\"", dir.path().display());
+    let elf =
+        native_exit_fixture_with_flags("native_ring_descriptors.S", &[mode, &file, &directory]);
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("bounded native ring descriptor control");
+    assert!(native.status.success(), "{mode} native result: {native:?}");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        128,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .expect("ring descriptor production runtime");
+    assert!(!outcome.run.trap_limit_hit, "{mode}: {:?}", outcome.run);
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let refused = counters
+        .refused
+        .iter()
+        .enumerate()
+        .map(|(nr, counter)| (nr, counter.load(std::sync::atomic::Ordering::Acquire)))
+        .filter(|(_, count)| *count != 0)
+        .collect();
+    (outcome.run.exit_code, refused)
+}
+
+/// #2138 P0-1: a bad descriptor on a ring-served call is the ring's EBADF.
+/// The run root's `writev`, `getdents64` and `statx(AT_EMPTY_PATH)` on fd
+/// -1 and on a closed descriptor each return -EBADF (9) with no refusal.
+/// Red before the fix: an absent descriptor declined the stage, so these
+/// calls, which have no x86 host crossing, were counted ENOSYS (exit 20).
+#[test]
+fn serial_host_root_bad_descriptor_on_ring_served_calls_is_ebadf() {
+    assert_eq!(
+        ring_descriptor_run("-DBAD_FD"),
+        (0, vec![]),
+        "exit is the failed step (20-22 fd -1, 30-32 closed fd: writev, getdents64, \
+         statx); refusals are (x86 nr, count)"
+    );
+}
+
+/// #2138 P0-2: the run root opens a directory in its ring namespace and
+/// `getdents64` copies its `linux_dirent64` entries out, then reports the
+/// end. Red on main: root `getdents64` was a counted ENOSYS (exit 31).
+#[test]
+fn serial_host_root_getdents64_lists_a_ring_directory() {
+    assert_eq!(
+        ring_descriptor_run("-DROOT_DIR"),
+        (0, vec![]),
+        "exit is the failed step (30 open, 31 getdents64, 32 no \"library\", 33 not at \
+         the end); refusals are (x86 nr, count)"
+    );
+}
+
+/// #2138 P0-2: a fork child's inherited ring descriptors are served in
+/// ring. The run root opens a file and a directory in its ring namespace and
+/// forks; the child reads, preads (keeping the cursor), seeks, `fstat`s (x86
+/// layout) and `getdents64`s them. Red on main: the descendant's `read`
+/// crossed with no host task context and was refused (exit 51).
+#[test]
+fn serial_host_fork_child_reads_its_inherited_ring_descriptors() {
+    assert_eq!(
+        ring_descriptor_run("-DCHILD"),
+        (0, vec![]),
+        "exit is the failed step (38/39 root opens, 40-42 fork and wait, 51 read, \
+         52 pread64, 53/54 lseek, 55/56 fstat, 61-63 getdents64); refusals are \
+         (x86 nr, count)"
+    );
+}
+
 /// Run `test` in a separate `timeout`-bounded process: a parked guest need
 /// not consume the pool's exit budget, so a lost wake must not hang CI.
 fn bounded_witness(test: &str, witness: impl FnOnce()) {
