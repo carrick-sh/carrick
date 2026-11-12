@@ -3614,6 +3614,48 @@ mod initial_reply_tests {
         assert_eq!(rows[1].gpa.raw(), grants[3].gpa);
     }
 
+    /// An exec successor reuses the boot inventory transaction unchanged:
+    /// its tables are reserved fork-stock pages and its data frames another
+    /// grant, neither one contiguous run. Only the data frames get mappings.
+    #[test]
+    fn successor_inventory_stages_stock_tables_and_data_frames_in_runs() {
+        let page = |gpa| RootGpa::page_aligned(FrameGpa::new(gpa)).unwrap();
+        let mut stock: Vec<RootGpa> = [0x40_0000, 0x40_1000, 0x50_0000, 0x50_1000]
+            .map(page)
+            .to_vec();
+        let tables = carrick_hal::fork_stock::take_successor_table_runs(&mut stock, 3).unwrap();
+        let base = INITIAL_EXTENT_GPA + 0x20_000;
+        let data = [base, base + 4096, base + 0x10_000].map(FrameGpa::new);
+        let authority = Arc::new(FrameInventoryAuthority::new());
+        let (inventory, grants) = InitialInventory::stage(
+            Arc::default(),
+            authority.physical_projection(Arc::new(ObjectIdRegistry::new())),
+            tables
+                .iter()
+                .map(|table| table.address())
+                .chain(data.iter().copied()),
+            tables.len(),
+            4096,
+            carrick_hal::GuestFrameOwner {
+                native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
+                root_generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
+        )
+        .expect("staged multi-run grants");
+        let granted: Vec<FrameGpa> = grants
+            .iter()
+            .map(|grant| FrameGpa::new(grant.gpa))
+            .collect();
+        let runs = carrick_core_abi::successor_image::frame_runs(&granted, 4096).unwrap();
+        assert_eq!(runs.len(), 4, "two table runs, then two data runs");
+        assert_eq!(inventory.frames.len(), data.len());
+        let rows = authority.snapshot().mappings;
+        assert_eq!(
+            rows.iter().map(|row| row.gpa.raw()).collect::<Vec<_>>(),
+            data.map(FrameGpa::raw).to_vec()
+        );
+    }
+
     #[test]
     fn corrupted_guest_reply_cannot_change_host_grant_or_stack_geometry() {
         let request = X86InitialBootRequest {
