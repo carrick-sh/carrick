@@ -2938,10 +2938,80 @@ pub enum IpcLeave {
     /// The harvested events could not be copied out: the items are
     /// restored and the host resolves the fault.
     EpollCopyOut,
+    /// `epoll_pwait` on a descriptor that is not a zone epoll (a host-backed
+    /// epoll, or a non-epoll object the host answers EINVAL for).
+    EpollNotZone,
+    /// `epoll_pwait` with no IPC venue published for this entry.
+    EpollNoVenue,
+    /// `epoll_pwait` with a venue but no execution binding (no scheduler
+    /// zone or current task: every x86 entry today).
+    EpollNoExecution,
 }
 
 impl IpcLeave {
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 26;
+
+    /// Every variant, in ordinal order.
+    pub const ALL: [IpcLeave; Self::COUNT] = [
+        Self::NoTable,
+        Self::TableContended,
+        Self::TableRefused,
+        Self::PinContended,
+        Self::PinRefused,
+        Self::NoOperationRecord,
+        Self::CopyInFault,
+        Self::StaleOperation,
+        Self::ForeignOperation,
+        Self::FlagsRefused,
+        Self::ObjectBusy,
+        Self::ObjectBusyHost,
+        Self::ObjectBusyEl1,
+        Self::TransferRefused,
+        Self::ParkRefused,
+        Self::BrokenFirst,
+        Self::FaultFirst,
+        Self::SigpipeHandback,
+        Self::Restart,
+        Self::EpollSigmask,
+        Self::EpollHostItems,
+        Self::EpollTimedWait,
+        Self::EpollCopyOut,
+        Self::EpollNotZone,
+        Self::EpollNoVenue,
+        Self::EpollNoExecution,
+    ];
+
+    /// The stable snake_case name reports key this variant by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NoTable => "no_table",
+            Self::TableContended => "table_contended",
+            Self::TableRefused => "table_refused",
+            Self::PinContended => "pin_contended",
+            Self::PinRefused => "pin_refused",
+            Self::NoOperationRecord => "no_operation_record",
+            Self::CopyInFault => "copy_in_fault",
+            Self::StaleOperation => "stale_operation",
+            Self::ForeignOperation => "foreign_operation",
+            Self::FlagsRefused => "flags_refused",
+            Self::ObjectBusy => "object_busy",
+            Self::ObjectBusyHost => "object_busy_host",
+            Self::ObjectBusyEl1 => "object_busy_el1",
+            Self::TransferRefused => "transfer_refused",
+            Self::ParkRefused => "park_refused",
+            Self::BrokenFirst => "broken_first",
+            Self::FaultFirst => "fault_first",
+            Self::SigpipeHandback => "sigpipe_handback",
+            Self::Restart => "restart",
+            Self::EpollSigmask => "epoll_sigmask",
+            Self::EpollHostItems => "epoll_host_items",
+            Self::EpollTimedWait => "epoll_timed_wait",
+            Self::EpollCopyOut => "epoll_copy_out",
+            Self::EpollNotZone => "epoll_not_zone",
+            Self::EpollNoVenue => "epoll_no_venue",
+            Self::EpollNoExecution => "epoll_no_execution",
+        }
+    }
 }
 
 /// Why EL1 left a delegated-MM anonymous `brk`/`mmap`/`munmap`/`mprotect`
@@ -5276,6 +5346,16 @@ mod tests {
             .unwrap();
         assert_eq!(output.lines().count(), 33);
         assert!(output.ends_with("samples=32/32 (bounded prefix; not a census)\n"));
+    }
+
+    #[test]
+    fn ipc_leave_table_matches_ordinals_and_names_are_unique() {
+        for (index, leave) in IpcLeave::ALL.iter().enumerate() {
+            assert_eq!(*leave as usize, index);
+            for other in &IpcLeave::ALL[index + 1..] {
+                assert_ne!(leave.name(), other.name());
+            }
+        }
     }
 
     #[test]

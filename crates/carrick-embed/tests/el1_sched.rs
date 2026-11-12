@@ -625,38 +625,13 @@ fn anonymous_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
 }
 
 fn ipc_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
-    use carrick_el1_abi::IpcLeave as L;
-    [
-        (L::NoTable, "no_table"),
-        (L::TableContended, "table_contended"),
-        (L::TableRefused, "table_refused"),
-        (L::PinContended, "pin_contended"),
-        (L::PinRefused, "pin_refused"),
-        (L::NoOperationRecord, "no_operation_record"),
-        (L::CopyInFault, "copy_in_fault"),
-        (L::StaleOperation, "stale_operation"),
-        (L::ForeignOperation, "foreign_operation"),
-        (L::FlagsRefused, "flags_refused"),
-        (L::ObjectBusy, "object_busy"),
-        (L::ObjectBusyHost, "object_busy_host"),
-        (L::ObjectBusyEl1, "object_busy_el1"),
-        (L::TransferRefused, "transfer_refused"),
-        (L::ParkRefused, "park_refused"),
-        (L::BrokenFirst, "broken_first"),
-        (L::FaultFirst, "fault_first"),
-        (L::SigpipeHandback, "sigpipe_handback"),
-        (L::Restart, "restart"),
-        (L::EpollSigmask, "epoll_sigmask"),
-        (L::EpollHostItems, "epoll_host_items"),
-        (L::EpollTimedWait, "epoll_timed_wait"),
-        (L::EpollCopyOut, "epoll_copy_out"),
-    ]
-    .into_iter()
-    .filter_map(|(reason, name)| {
-        let count = measured.ipc_leaves[reason as usize];
-        (count != 0).then_some((name, count))
-    })
-    .collect()
+    carrick_el1_abi::IpcLeave::ALL
+        .into_iter()
+        .filter_map(|reason| {
+            let count = measured.ipc_leaves[reason as usize];
+            (count != 0).then_some((reason.name(), count))
+        })
+        .collect()
 }
 
 fn el1_reason_breakdown(measured: &Measured) -> String {
