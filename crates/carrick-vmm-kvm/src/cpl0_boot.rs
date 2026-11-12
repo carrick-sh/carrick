@@ -3983,6 +3983,79 @@ impl Cpl0Carrier {
     }
 }
 
+/// The host Exec service (#1093 S4c slice c) on this stopped carrier.
+impl Cpl0Carrier {
+    /// Stage an exec successor on stopped `cpu`: reserve its fork-stock
+    /// tables and data frames and import its rows before the arm.
+    pub fn stage_exec_successor(
+        &mut self,
+        cpu: usize,
+        request: carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecRequest,
+    ) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecStage, TrapError> {
+        let cpu = u32::try_from(cpu)
+            .ok()
+            .filter(|cpu| (*cpu as usize) < self.cpus.len())
+            .ok_or_else(|| fail("exec service CPU"))?;
+        self.custody
+            .stage_native_exec(carrick_guest_arch::CpuId::new(cpu), request)
+    }
+
+    /// Probe a parked exec once against this carrier's fork stock.
+    pub fn probe_parked_exec(
+        &self,
+        parked: carrick_x86_cpl0_host::cpl0_boot::exec_service::ParkedX86Exec,
+    ) -> Result<
+        carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecRequest,
+        carrick_x86_cpl0_host::cpl0_boot::exec_service::ParkedX86Exec,
+    > {
+        self.custody.probe_parked_exec(parked)
+    }
+
+    /// Return the unused preparation of `successor` whole.
+    pub fn release_exec_successor(
+        &mut self,
+        successor: ReservationMm,
+    ) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecRequest, TrapError> {
+        self.custody.release_native_exec(successor)
+    }
+
+    /// The tables and data grants a retained preparation holds.
+    pub fn exec_reservation(
+        &self,
+        successor: ReservationMm,
+    ) -> Option<(Vec<RootGpa>, Vec<carrick_core_abi::X86InitialBootGrant>)> {
+        self.custody.native_exec_reservation(successor)
+    }
+
+    /// Reusable fork-stock table pages.
+    pub fn fork_table_stock(&self) -> usize {
+        self.custody.fork_table_stock()
+    }
+
+    /// Publish the closed successor root the ring publishes before an exec.
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture_publish_exec_successor(
+        &mut self,
+        successor: ReservationMm,
+    ) -> Result<NonZeroU64, TrapError> {
+        self.custody.fixture_publish_exec_successor(successor)
+    }
+
+    /// Hold all but `left` fork-stock tables, as a live holder would.
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture_hold_fork_stock(
+        &mut self,
+        left: usize,
+    ) -> Result<carrick_hal::fork_stock::SuccessorTables, TrapError> {
+        self.custody.fixture_hold_fork_stock(left)
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture_release_fork_stock(&mut self, held: carrick_hal::fork_stock::SuccessorTables) {
+        self.custody.fixture_release_fork_stock(held);
+    }
+}
+
 impl Cpl0Carrier {
     /// Fill the shared fixture MM census while both CPUs are stopped.
     pub fn exhaust_fork_address_spaces(&mut self) -> Result<(), TrapError> {

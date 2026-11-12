@@ -3042,6 +3042,8 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     )>,
     maintenance_root: Option<RootGpa>,
     anonymous_next_gpa: FrameGpa,
+    /// Exec successors reserved before their arm (#1093 S4c slice c).
+    exec_preparations: exec_service::X86ExecPreparations<exec_service::CarrierExecData>,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     native_backing_pending:
         std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
@@ -4454,6 +4456,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             fork_stock,
             maintenance_root: None,
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
+            exec_preparations: exec_service::X86ExecPreparations::default(),
             anonymous_pending: [None, None],
             native_backing_pending: std::collections::BTreeMap::new(),
             owner_grant_crossings: 0,

@@ -546,6 +546,248 @@ where
     Ok(request)
 }
 
+/// A successor's data frames on the carrier: one private extent, its
+/// frames' identities bound per page under boot's inventory transaction.
+pub struct CarrierExecData {
+    inventory: InitialInventory,
+    grants: Vec<X86InitialBootGrant>,
+    handle: BackingHandle,
+}
+
+impl X86ExecData for CarrierExecData {
+    fn grants(&self) -> &[X86InitialBootGrant] {
+        &self.grants
+    }
+}
+
+/// The carrier's frame supply: fresh GPAs from the dynamic grant window,
+/// each extent backed privately and staged in the frame inventory.
+struct CarrierExecFrames<'a, M: CarrierMemoryIo> {
+    vm: &'a mut CarrierMemory<M>,
+    next: &'a mut FrameGpa,
+    inventory: &'a Arc<dyn PhysicalFrameInventory>,
+    rollback_fault: &'a Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
+}
+
+impl<M: CarrierMemoryIo> X86ExecFrames for CarrierExecFrames<'_, M> {
+    type Data = CarrierExecData;
+
+    fn stage(
+        &mut self,
+        pages: usize,
+        owner: carrick_hal::GuestFrameOwner,
+    ) -> Result<CarrierExecData, TrapError> {
+        let len = u64::try_from(pages)
+            .ok()
+            .and_then(|pages| pages.checked_mul(4096))
+            .filter(|len| *len != 0)
+            .ok_or_else(|| fail("exec successor data length"))?;
+        let base = *self.next;
+        *self.next = FrameGpa::new(
+            base.raw()
+                .checked_add(len)
+                .ok_or_else(|| fail("exec successor GPA exhausted"))?,
+        );
+        let (mut inventory, grants) = InitialInventory::stage(
+            Arc::clone(self.rollback_fault),
+            Arc::clone(self.inventory),
+            (0..pages as u64).map(|page| FrameGpa::new(base.raw() + page * 4096)),
+            0,
+            4096,
+            owner,
+        )?;
+        let identity = inventory
+            .frames()
+            .first()
+            .ok_or_else(|| fail("exec successor frame identity"))?
+            .1;
+        let extent =
+            BackingExtent::private(base, len as usize).map_err(|error| fail(error.to_string()))?;
+        let handle = self
+            .vm
+            .prepare(
+                &[PreparedBacking {
+                    extent: Arc::new(extent),
+                    identity,
+                }],
+                &mut inventory,
+            )
+            .map_err(|error| fail(error.to_string()))?[0];
+        if let Err(error) = self.vm.bind_frame_identities(handle, inventory.frames()) {
+            // SAFETY: the extent was prepared just above; no descriptor of
+            // any MM has named it.
+            unsafe { self.vm.cancel_prepared(&[handle], &mut inventory) }
+                .map_err(|error| fail(error.to_string()))?;
+            return Err(fail(error.to_string()));
+        }
+        Ok(CarrierExecData {
+            inventory,
+            grants,
+            handle,
+        })
+    }
+
+    fn release(&mut self, mut data: CarrierExecData) -> Result<(), TrapError> {
+        // SAFETY: only an unused preparation is released: its successor was
+        // never built, so no descriptor names these frames.
+        unsafe { self.vm.cancel_prepared(&[data.handle], &mut data.inventory) }
+            .map_err(|error| fail(error.to_string()))
+    }
+}
+
+impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
+    fn exec_tables(ram: &GuestRam) -> Result<(&X86Cpl0Reservations, &X86Cpl0Zone), TrapError> {
+        let roots = ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET,
+                size_of::<X86Cpl0Reservations>(),
+            )
+            .ok_or_else(|| fail("exec reservation table"))?;
+        let zone = ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("exec zone"))?;
+        // SAFETY: boot initialized both aligned records in the retained
+        // metadata window, which `ram` keeps alive.
+        Ok(unsafe {
+            (
+                &*roots.cast::<X86Cpl0Reservations>(),
+                &*zone.cast::<X86Cpl0Zone>(),
+            )
+        })
+    }
+
+    /// The host Exec service on the stopped `cpu`; see [`stage_x86_exec`].
+    pub(crate) fn stage_native_exec(
+        &mut self,
+        cpu: carrick_guest_arch::CpuId,
+        request: X86ExecRequest,
+    ) -> Result<X86ExecStage, TrapError> {
+        // Not bound on the carrier yet: the ring's counted ENOSYS.
+        let _ = (cpu, request, CarrierExecFrames::<M>::stage);
+        Ok(X86ExecStage::Refused(LINUX_ENOSYS))
+    }
+
+    /// Return the unused preparation of `successor`; see [`release_x86_exec`].
+    pub(crate) fn release_native_exec(
+        &mut self,
+        successor: ReservationMm,
+    ) -> Result<X86ExecRequest, TrapError> {
+        let preparation = self
+            .exec_preparations
+            .take(successor)
+            .ok_or_else(|| fail("exec successor not prepared"))?;
+        let ram = Arc::clone(&self.ram);
+        let (roots, zone) = Self::exec_tables(&ram)?;
+        let mut frames = CarrierExecFrames {
+            vm: &mut self._vm,
+            next: &mut self.anonymous_next_gpa,
+            inventory: &self.frame_inventory,
+            rollback_fault: &self.initial_rollback_fault,
+        };
+        release_x86_exec(preparation, &mut self.fork_stock, &mut frames, roots, zone)
+    }
+}
+
+impl<M: CarrierMemoryIo> BootstrapCustody<M> {
+    /// The host Exec service on the stopped `cpu` (#1093 S4c slice c).
+    pub fn stage_native_exec(
+        &mut self,
+        cpu: carrick_guest_arch::CpuId,
+        request: X86ExecRequest,
+    ) -> Result<X86ExecStage, TrapError> {
+        self.0.stage_native_exec(cpu, request)
+    }
+
+    /// Probe a parked exec once against this carrier's fork stock.
+    pub fn probe_parked_exec(
+        &self,
+        parked: ParkedX86Exec,
+    ) -> Result<X86ExecRequest, ParkedX86Exec> {
+        parked.probe(&self.0.fork_stock)
+    }
+
+    pub fn release_native_exec(
+        &mut self,
+        successor: ReservationMm,
+    ) -> Result<X86ExecRequest, TrapError> {
+        self.0.release_native_exec(successor)
+    }
+
+    /// The reserved tables and data grants of a retained preparation.
+    pub fn native_exec_reservation(
+        &self,
+        successor: ReservationMm,
+    ) -> Option<(Vec<RootGpa>, Vec<X86InitialBootGrant>)> {
+        let preparation = self.0.exec_preparations.get(successor)?;
+        Some((
+            preparation.tables().to_vec(),
+            preparation.data().grants().to_vec(),
+        ))
+    }
+
+    /// Reusable fork-stock table pages.
+    pub fn fork_table_stock(&self) -> usize {
+        self.0.fork_stock.table_stock().len()
+    }
+
+    /// Publish the closed, unadmitted successor root the ring publishes
+    /// before it asks for an exec (`prepare_closed_exec_successor_slot`),
+    /// returning its root generation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_publish_exec_successor(
+        &mut self,
+        successor: ReservationMm,
+    ) -> Result<NonZeroU64, TrapError> {
+        let ram = Arc::clone(&self.0.ram);
+        let (roots, zone) = Cpl0HostCustody::<M>::exec_tables(&ram)?;
+        let layout = carrick_el1_linux::exec_successor::successor_layout()
+            .map_err(|error| fail(format!("successor layout: {error:?}")))?;
+        let index = zone
+            .spaces
+            .publish_closed_with_layout(
+                successor.raw(),
+                0,
+                0,
+                layout.heap.start(),
+                layout.arena.start(),
+            )
+            .ok_or_else(|| fail("successor space"))?;
+        if !zone.spaces.mark_initial_bindable(index) {
+            return Err(fail("successor space bindable"));
+        }
+        roots
+            .publish(index.index(), successor, layout)
+            .map_err(|error| fail(format!("successor root: {error:?}")))?;
+        SuccessorRoot {
+            roots,
+            zone,
+            successor,
+        }
+        .locked(|model| Ok(NonZeroU64::new(model.incarnation().raw())))
+        .map_err(root_fault)?
+        .ok_or_else(|| fail("successor root generation"))
+    }
+
+    /// Hold all but `left` stock tables, as a live holder (a pending fork,
+    /// live children) would.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_hold_fork_stock(&mut self, left: usize) -> Result<SuccessorTables, TrapError> {
+        let count = self.fork_table_stock().saturating_sub(left);
+        self.0
+            .fork_stock
+            .reserve_successor_tables(count)
+            .map_err(|error| fail(format!("hold fork stock: {error:?}")))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_release_fork_stock(&mut self, held: SuccessorTables) {
+        self.0.fork_stock.return_successor_tables(held);
+    }
+}
+
 #[cfg(test)]
 #[path = "cpl0_exec/tests.rs"]
 mod tests;
