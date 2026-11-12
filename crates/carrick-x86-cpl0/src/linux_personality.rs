@@ -226,12 +226,8 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
                     validator: &carrick_el1_linux::file::HardwareValidator,
                 };
                 let mut byte = [0u8];
-                carrick_el1_linux::file::UserCopy::copy_in(
-                    &mut copy,
-                    &mut byte,
-                    address,
-                )
-                .then_some(byte[0])
+                carrick_el1_linux::file::UserCopy::copy_in(&mut copy, &mut byte, address)
+                    .then_some(byte[0])
             },
         );
         self.crossing_operand = Some(operand);
