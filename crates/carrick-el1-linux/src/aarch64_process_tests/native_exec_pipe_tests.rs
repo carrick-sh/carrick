@@ -477,7 +477,11 @@ fn fork_exec_probe_with_departure(
         child_copy_error: None,
         prepare_copy_error: None,
         child_copy_error_at: None,
-        on_copy_complete: None,
+        // #1671: a simulated never-touched output page stays unwritable to
+        // the ring's hardware copy until the owner prepares it.
+        on_copy_complete: Some(Box::new(|_| {
+            crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        })),
         native_ipc: Some(owner.region()),
         refuse_copy: false,
         waker_slot: carrick_sched_core::SlotId::new(0),
@@ -843,6 +847,69 @@ fn fork_exec_probe_with_departure(
     assert_eq!(
         call_full(sys::EPOLL_PWAIT.raw(), epoll, memory.arg() + 800, 1, 0),
         0
+    );
+    // #1671: Node's event buffer is a never-touched page. The ring's copy
+    // refuses until the native owner supplies it; the ring prepares it in
+    // place and reports the event, never forwarding its own epoll fd.
+    let leaves =
+        |why: carrick_el1_abi::IpcLeave| counters.ipc_leaves[why as usize].load(Ordering::Relaxed);
+    let forwarded = || counters.forwarded[sys::EPOLL_PWAIT.raw() as usize].load(Ordering::Relaxed);
+    let forwarded_before = forwarded();
+    assert_eq!(call_full(sys::WRITE.raw(), event, wake, 8, 0), 8);
+    memory.as_mut_bytes()[800..816].fill(0);
+    crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    let first_touch = call_full(sys::EPOLL_PWAIT.raw(), epoll, memory.arg() + 800, 1, 0);
+    assert!(
+        !crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.swap(false, Ordering::Relaxed)),
+        "the native owner must prepare the untouched event page: result {}, \
+         leaves[EpollCopyOut] {}, forwarded[22] {}",
+        first_touch as i64,
+        leaves(carrick_el1_abi::IpcLeave::EpollCopyOut),
+        forwarded() - forwarded_before
+    );
+    assert_eq!(first_touch, 1, "first-touch epoll_pwait reports its event");
+    assert_eq!(
+        &memory.as_mut_bytes()[800..804],
+        &carrick_el1_abi::ipc::epoll::events::IN.to_ne_bytes()
+    );
+    assert_eq!(
+        u64::from_ne_bytes(memory.as_mut_bytes()[808..816].try_into().unwrap()),
+        cookie
+    );
+    // Exactly once: the edge was consumed by the one delivery.
+    assert_eq!(
+        call_full(sys::EPOLL_PWAIT.raw(), epoll, memory.arg() + 800, 1, 0),
+        0
+    );
+    // A truly invalid buffer is EFAULT in ring, and (as on Linux) the
+    // undelivered report stays queued for the next wait.
+    assert_eq!(call_full(sys::WRITE.raw(), event, wake, 8, 0), 8);
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    let invalid = call_full(sys::EPOLL_PWAIT.raw(), epoll, 0x6000_0000, 1, 0) as i64;
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+    assert_eq!(invalid, -14, "unmapped epoll_pwait buffer is EFAULT");
+    memory.as_mut_bytes()[800..816].fill(0);
+    assert_eq!(
+        call_full(sys::EPOLL_PWAIT.raw(), epoll, memory.arg() + 800, 1, 0),
+        1,
+        "the report refused by EFAULT is not lost"
+    );
+    assert_eq!(
+        u64::from_ne_bytes(memory.as_mut_bytes()[808..816].try_into().unwrap()),
+        cookie
+    );
+    assert_eq!(
+        call_full(sys::EPOLL_PWAIT.raw(), epoll, memory.arg() + 800, 1, 0),
+        0
+    );
+    assert_eq!(
+        (leaves(carrick_el1_abi::IpcLeave::EpollCopyOut), forwarded()),
+        (0, forwarded_before),
+        "a ring-owned epoll never forwards its copy-out"
+    );
+    assert_eq!(
+        call_full(sys::READ.raw(), event, memory.arg() + 768, 8, 0),
+        8
     );
     assert_eq!(call_full(sys::EPOLL_CTL.raw(), epoll, 2, event, 0), 0);
     assert_eq!(call_full(sys::FCNTL.raw(), event, 1, 0, 0), 1);
