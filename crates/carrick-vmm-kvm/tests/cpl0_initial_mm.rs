@@ -2975,3 +2975,53 @@ fn crossing_operand_duplicated_stdin_reads_through_its_binding() {
         outcome.run
     );
 }
+
+
+fn cwd_run(mode: &[&str]) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut flags = mode.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for (name, leaf) in [("BASE", "a"), ("PARENT", "b"), ("CHILD", "c")] {
+        let path = dir.path().join(leaf);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("marker"), leaf.as_bytes()).unwrap();
+        flags.push(format!("-D{name}_PATH=\"{}\"", path.display()));
+    }
+    let flags = flags.iter().map(String::as_str).collect::<Vec<_>>();
+    let elf = native_exit_fixture_with_flags("native_cwd.S", &flags);
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .unwrap();
+    assert!(native.status.success(), "native: {native:?}");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/")).unwrap(),
+    ));
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).unwrap();
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        512,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .unwrap();
+    assert_eq!(outcome.run.exit_code, 0, "{mode:?}: {:?}", outcome.run);
+    assert!(!outcome.run.trap_limit_hit);
+}
+
+#[test]
+fn serial_host_root_cwd_and_relative_open_agree() {
+    cwd_run(&[]);
+}
+#[test]
+fn serial_host_fork_cwd_is_inherited_and_isolated() {
+    cwd_run(&["-DCHILD"]);
+}
+#[test]
+fn serial_host_two_live_processes_keep_distinct_cwds() {
+    cwd_run(&["-DCHILD", "-DCONCURRENT"]);
+}
