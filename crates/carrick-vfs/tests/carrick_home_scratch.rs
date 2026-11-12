@@ -99,7 +99,17 @@ fn runs_keep_all_state_under_carrick_home_and_release_it() {
 
     run(&good).expect("good layer extracts");
     let scratch = carrick_home.path().join("scratch");
+    // Non-vacuous: the explicit CARRICK_HOME (never a dedicated volume) is
+    // the scratch root, and this run left its marks there.
+    assert_eq!(
+        carrick_vfs::fs_backend::default_scratch_root().unwrap(),
+        scratch
+    );
     let start = census(&scratch);
+    assert!(
+        start.contains_key(Path::new(".carrick.sweep.lock")),
+        "census root {scratch:?} is not the live scratch root: {start:?}"
+    );
 
     assert!(run(&bad).is_err(), "the injected layer error must surface");
     run(&good).expect("good layer extracts after the failure");

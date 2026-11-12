@@ -3251,8 +3251,7 @@ mod store_root_tests {
         let store = std::path::PathBuf::from(std::env::var_os("CARRICK_TEST_STORE").unwrap());
         super::pin_carrick_home_to_store(Some(&store));
         assert_eq!(carrick_spec::carrick_home(), store);
-        // macOS prefers a dedicated APFS volume when one is mounted.
-        #[cfg(not(target_os = "macos"))]
+        // An explicit root beats a dedicated APFS volume on macOS too.
         assert_eq!(
             carrick_vfs::fs_backend::default_scratch_root().unwrap(),
             store.join("scratch")
