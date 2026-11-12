@@ -965,6 +965,15 @@ pub fn take_successor_table_runs(stock: &mut Vec<RootGpa>, count: usize) -> Opti
     Some(taken)
 }
 
+/// The revision of the fork stock's table returns. Every page that comes
+/// back to the reusable stock (an aborted or partly used loan, a reclaimed
+/// child, unused descriptor grants, a returned successor reservation)
+/// advances it; taking pages never does. An exec successor reservation
+/// refused for capacity observes it first and reruns once it has moved:
+/// the stock's release is the holder's release notification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct StockRelease(u64);
+
 /// Table pages reserved from the fork stock for one exec successor build.
 /// They are out of the reusable stock until the build is committed to the
 /// successor or returned with [`ForkStock::return_successor_tables`].
@@ -1865,6 +1874,16 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             .flatten()
             .copied()
             .collect()
+    }
+
+    /// The current table-return revision; see [`StockRelease`].
+    pub fn table_release(&self) -> StockRelease {
+        StockRelease(0)
+    }
+
+    /// True once some table page has returned since `observed`.
+    pub fn released_since(&self, observed: StockRelease) -> bool {
+        self.table_release() > observed
     }
 
     /// Reserve `count` table pages for an exec successor build, in as many
