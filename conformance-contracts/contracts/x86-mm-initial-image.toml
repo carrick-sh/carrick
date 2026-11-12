@@ -3,6 +3,11 @@
 # the shared carrick_core_abi::successor_image validator that boot and the exec
 # successor build both run. Any refusal is still one InvalidRange before the
 # first frame is taken; boot behaviour and work budgets are unchanged.
+# #1093 S4c slice c: boot's image row import moved to the shared CPL0 host
+# coordinator (import_x86_image_rows), which runs the shared validator first
+# and imports the same rows; boot keeps its own finish_import and built-stack
+# insert. image_frame_demand counts beside the editor exactly what it takes.
+# Boot behaviour and work budgets are unchanged (cpl0_initial_mm 78 passed).
 schema_version = 1
 id = "x86.mm.initial-image"
 title = "A fresh x86 address space enters an ELF executable and its interpreter through the shared guest MM owner"
@@ -47,6 +52,7 @@ vm_free = [
   "carrick-el1::isa::x86_initial_mm::tests::guest_stack_has_sysv_order_and_exact_auxv_addresses",
   "carrick-el1::isa::x86_initial_mm::tests::fresh_owner_enters_interpreter_but_break_and_auxv_belong_to_executable",
   "carrick-el1::isa::x86_initial_mm::tests::editor_refuses_an_overlapping_successor_before_taking_a_frame",
+  "carrick-el1::isa::x86_initial_mm::tests::image_frame_demand_is_exactly_what_the_editor_takes",
   "carrick-core-abi::successor_image::tests::{a_well_formed_successor_image_is_accepted_with_the_executable_break,malformed_successor_rows_are_refused_with_their_exact_reason,overlapping_successor_rows_name_both_rows}",
   "carrick-x86-cpl0-host::cpl0_boot::birth_source_tests::bootstrap_metadata_records_are_disjoint_before_root_binding",
   "carrick-mem::x86_initial_image::static_x86_image_reuses_elf_plan_without_host_mm_edits",
