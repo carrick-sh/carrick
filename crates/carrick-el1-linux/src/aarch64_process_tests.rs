@@ -7103,6 +7103,120 @@ fn arm_glibc_pthread_join_shared_bitset_wait_wakes_on_child_exit() {
     assert_eq!(resumed.x[0], 0, "pthread_join's futex returns 0");
 }
 
+// Robust-list exit plus host queue completion of an in-ring join.
+#[test]
+fn arm_glibc_pthread_join_robust_host_wake_meets_ring_wait() {
+    // The joined CLEARTID word lives in private anonymous memory (glibc's
+    // thread descriptor sits in the mmap'd thread stack).
+    let words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
+        0x4000,
+    )));
+    let tid_word = words.arg();
+    let fixture = Box::leak(Box::new(Fixture::with_private_anonymous(
+        0x10000,
+        asid(1),
+        carrick_el1_abi::ReservationRange::new(tid_word, tid_word + 0x4000).unwrap(),
+    )));
+    let (control, child) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    // CLONE_CHILD_SETTID published the child's tid in the joined word.
+    words.set::<u32>(0, 42);
+    let mut join = carrick_el1_abi::TrapFrame::default();
+    join.x[8] = crate::sched::SYS_FUTEX as u64;
+    join.x[0] = tid_word;
+    join.x[1] = 265;
+    join.x[2] = 42;
+    join.x[5] = 0xffff_ffff;
+    let route =
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut join, &mut cpu).unwrap();
+    assert_ne!(
+        join.x[0] as i64, -38,
+        "ENOSYS aborts glibc: the futex facility returned an unexpected error code"
+    );
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served,
+        "the join parks in ring; it is never forwarded"
+    );
+    // The joiner's own record (the leader, tid 41) parked on the word.
+    let leader = (1..carrick_sched_core::ZONE_RECORDS as u32)
+        .filter_map(carrick_sched_core::RecordId::from_raw)
+        .find(|&id| {
+            fixture.zone.record(id).identity().tid == 41
+                && matches!(
+                    fixture.zone.record(id).claim(),
+                    carrick_sched_core::Claim::Parked { .. }
+                )
+        })
+        .expect("the joiner is parked on the CLEARTID word");
+    // The park ran the queued child on this slot.
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child.id));
+
+    run_as(fixture, 42, 12, 102, control);
+    control.set_clear_child_tid(tid_word);
+    let mut robust = carrick_el1_abi::TrapFrame::default();
+    robust.x[8] = 99;
+    robust.x[0] = tid_word + 0x100;
+    robust.x[1] = 24;
+    arm_call_with_cpu(fixture, control, &mut service, &mut robust, &mut cpu).unwrap();
+    assert_eq!(robust.x[0], 0);
+    assert_ne!(control.robust_list().0, 0);
+    let mut exit = carrick_el1_abi::TrapFrame::default();
+    exit.x[8] = 93;
+    assert_eq!(
+        arm_call_with_cpu(fixture, control, &mut service, &mut exit, &mut cpu).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
+    );
+    // Host retirement's clear-child-tid copyout and raw-address queue wake.
+    words.set::<u32>(0, 0);
+    let wake = carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+        carrick_kernel::el1_zone::FutexQueueAuthority::of_mm(
+            carrick_kernel::kernel::MmId::from_raw_u64(1).unwrap(),
+        )
+        .wake_child_tid(&carrick_kernel::thread::FutexTable::new(), tid_word)
+    });
+    assert_eq!(
+        wake.count, 1,
+        "host retirement must meet the in-ring join key"
+    );
+    assert!(
+        wake.handed.is_empty(),
+        "native completion keeps ring custody"
+    );
+    assert_eq!(words.get::<u32>(0), 0, "exit cleared the CLEARTID word");
+    assert!(
+        matches!(
+            fixture.zone.record(leader).claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ),
+        "the clear-child-tid wake released the joiner, found {:?}",
+        fixture.zone.record(leader).claim()
+    );
+    // The slot runs the woken joiner next, with the futex's completion.
+    run_as_leader(fixture);
+    let counters = carrick_el1_abi::Counters::new();
+    let mut resumed = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        }
+        .run_ready(&mut resumed),
+        Some(crate::sched::Served::Returned { switched: true })
+    );
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(leader));
+    assert_eq!(resumed.x[0], 0, "pthread_join's futex returns 0");
+}
+
 /// A shared futex on an owned word while another lane holds the MM root:
 /// authenticating the word's mapping is contention, never an errno and
 /// never a wait or wake on an unauthenticated key. The syscall retries on
