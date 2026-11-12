@@ -15,7 +15,8 @@
 //!
 //! The service takes the host's exec lock order
 //! ([`carrick_hal::exec_lock_order::ExecCrossingOrder`]): preparations, then
-//! the successor's root, then the fork stock, never nested.
+//! the successor's root, then the fork stock, never nested; each phase sees
+//! only its owner's state, for that phase alone (#2192).
 use super::*;
 use carrick_abi::{LINUX_E2BIG, LINUX_ENOEXEC, LINUX_ENOMEM, LINUX_ENOSYS, LinuxErrno};
 use carrick_core_abi::service::{ExecArgumentCharge, ExecSuccessorBacking, ExecSuccessorEntry};
@@ -26,7 +27,7 @@ use carrick_el1::isa::x86_initial_mm::{
 use carrick_el1::memory::reservations::{
     NoRootWait, Refusal, X86Cpl0Root, X86Cpl0RootReleaseVenue,
 };
-use carrick_hal::exec_lock_order::ExecCrossingOrder;
+use carrick_hal::exec_lock_order::{Exclusive, ExecCrossingOrder};
 use carrick_hal::fork_stock::{
     ChildAddressTags, ForkStock, ForkStockServiceError, StockRelease, SuccessorTables,
 };
@@ -451,8 +452,7 @@ pub fn stage_x86_exec<T, C, F>(
     zone: &X86Cpl0Zone,
 ) -> Result<X86ExecStage, TrapError>
 where
-    T: ChildAddressTags + 'static,
-    C: 'static,
+    T: ChildAddressTags,
     F: X86ExecFrames,
 {
     let root = SuccessorRoot {
@@ -464,8 +464,9 @@ where
     // Observed before the probe, so a return that lands after the refusal
     // is never missed.
     let observed = stock.table_release();
-    let (released, admitted) = ExecCrossingOrder::on_stopped(cpu, preparations, stock)
-        .preparations(|preparations| preparations.get(request.successor).is_none());
+    let (released, admitted) =
+        ExecCrossingOrder::on_stopped(cpu, Exclusive(&mut *preparations), Exclusive(&mut *stock))
+            .preparations(|preparations| preparations.get(request.successor).is_none());
     if !admitted {
         return Err(fail("exec successor already prepared"));
     }
