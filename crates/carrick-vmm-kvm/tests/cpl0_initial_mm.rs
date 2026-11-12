@@ -3004,7 +3004,11 @@ fn cwd_run(mode: &[&str]) {
     let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
         &program,
         512,
-        ROOT_AFFINITY_LOADED,
+        if mode.contains(&"-DCONCURRENT") {
+            3
+        } else {
+            ROOT_AFFINITY_LOADED
+        },
         |_| {},
         dispatcher,
     )
@@ -3015,13 +3019,19 @@ fn cwd_run(mode: &[&str]) {
 
 #[test]
 fn serial_host_root_cwd_and_relative_open_agree() {
-    cwd_run(&[]);
+    bounded_witness("serial_host_root_cwd_and_relative_open_agree", || {
+        cwd_run(&[])
+    });
 }
 #[test]
 fn serial_host_fork_cwd_is_inherited_and_isolated() {
-    cwd_run(&["-DCHILD"]);
+    bounded_witness("serial_host_fork_cwd_is_inherited_and_isolated", || {
+        cwd_run(&["-DCHILD"])
+    });
 }
 #[test]
 fn serial_host_two_live_processes_keep_distinct_cwds() {
-    cwd_run(&["-DCHILD", "-DCONCURRENT"]);
+    bounded_witness("serial_host_two_live_processes_keep_distinct_cwds", || {
+        cwd_run(&["-DCHILD", "-DCONCURRENT"])
+    });
 }
