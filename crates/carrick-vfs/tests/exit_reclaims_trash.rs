@@ -3,6 +3,8 @@
 //! start, so it was only ever reclaimed 256 entries at a time. A run that
 //! leaves through `process::exit` must finish the job.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::path::{Path, PathBuf};
 
 use carrick_vfs::fs_backend::HostFsBackend;
