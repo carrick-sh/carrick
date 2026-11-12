@@ -2249,7 +2249,8 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    // The fatal names the refusal's kind, not only its site (#1958).
+    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     if action == Action::Idle {
         native_service_idle(zone, slot, &mut sched::HardwareCpu)
     } else {
@@ -2259,7 +2260,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
 
 /// The signal checkpoint's process admission and delivery, shared by the EL1
 /// vector and the VM-free witnesses. A refused admission is returned to the
-/// caller: the vector treats it as a broken entry binding (#1958).
+/// caller: the vector's fatal names its kind (#1958).
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockCrossing>(
