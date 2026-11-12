@@ -481,6 +481,7 @@ mod process_exit_tests {
             let waiter = zone
                 .alloc_record(Self::identity(43, waiter_cpus))
                 .expect("waiter");
+            assert!(zone.mark_native_owned(waiter));
             let seq = zone.next_seq(waiter);
             {
                 let guard = zone
