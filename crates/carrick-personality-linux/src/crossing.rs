@@ -265,7 +265,7 @@ host_crossings! {
     Preadv2 = nr::PREADV2, false, Permanent;
     Pwritev2 = nr::PWRITEV2, false, Permanent;
     Statx = nr::STATX, true, Permanent;
-    Openat2 = nr::OPENAT2, true, Permanent;
+    Openat2 = nr::OPENAT2, false, Permanent;
     Faccessat2 = nr::FACCESSAT2, true, Permanent;
     Fchmodat2 = nr::FCHMODAT2, true, Permanent;
     Socket = nr::SOCKET, false, Permanent;
@@ -518,9 +518,9 @@ mod tests {
     /// Every canonical ordinal x86 crosses to the host for: the 10 landed
     /// before B1, and B1's xattr, file and metadata families (#2157). The
     /// x86 `fstat`/`newfstatat` layouts cross as private aliases instead.
-    const X86_CROSSINGS: [usize; 41] = [
+    const X86_CROSSINGS: [usize; 40] = [
         5, 6, 8, 9, 11, 12, 14, 15, // xattr by path
-        17, 33, 34, 35, 36, 37, 38, 45, 46, 47, 49, 78, 81, 88, 276, 437, // files
+        17, 33, 34, 35, 36, 37, 38, 45, 46, 47, 49, 78, 81, 88, 276, // files
         43, 44, 53, 54, 291, 439, 452, // metadata
         22, 48, 56, 62, 63, 64, 67, 68, 93, 94, // landed before B1
     ];
