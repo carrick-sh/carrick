@@ -3281,6 +3281,73 @@ fn retirement_scan_skips_nested_packages_inside_a_crate() {
 }
 
 #[test]
+fn dummy_manifest_in_tests_cannot_excuse_a_retained_test() {
+    // Review P0 on #2232: any Cargo.toml used to hide its directory, so a
+    // dummy one under tests/ excused a test that still exists.
+    let d = tempfile::tempdir().unwrap();
+    let base = d.path().join("base");
+    let cand = d.path().join("cand");
+    for root in [&base, &cand] {
+        write_test_tree(root, "#[test] fn kept() {}", None);
+    }
+    write_source(
+        &cand,
+        "crates/carrick-vmm-kvm/tests/Cargo.toml",
+        "[package]\nname = \"dummy\"\nversion = \"0.0.0\"\n",
+    );
+    let result = diff_with_retired(
+        &cpl0_receipt(&["cpl0_fork_e2e::kept"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("cpl0_fork_e2e::kept", None)],
+        &base,
+        &cand,
+    );
+    assert!(result.is_err(), "retained test was excused: {result:?}");
+}
+
+#[test]
+fn explicit_target_into_a_nested_package_is_still_scanned() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    write_source(
+        root,
+        "crates/example/Cargo.toml",
+        "[package]\nname = \"example\"\nversion = \"0.0.0\"\n[[bin]]\nname = \"probe\"\npath = \"fixture/main.rs\"\n",
+    );
+    write_source(
+        root,
+        "crates/example/fixture/Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n",
+    );
+    write_source(
+        root,
+        "crates/example/fixture/main.rs",
+        "fn main() {}\n#[test]\nfn kept() {}\n",
+    );
+    assert!(carrick_xtask::ci_receipt::tree_has_test(root, "probe", "kept").unwrap());
+}
+
+#[test]
+fn unparseable_nested_manifest_keeps_its_directory_scanned() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    write_test_tree(root, "#[test]\nfn kept() {}\n", None);
+    write_source(
+        root,
+        "crates/carrick-vmm-kvm/fixtures/odd/Cargo.toml",
+        "not toml [",
+    );
+    write_source(
+        root,
+        "crates/carrick-vmm-kvm/fixtures/odd/main.rs",
+        "macro_rules! gen { () => {}; } gen!();\n",
+    );
+    let error = carrick_xtask::ci_receipt::tree_has_test(root, "cpl0_fork_e2e", "kept")
+        .expect_err("an unparseable nested manifest must not hide its sources");
+    assert!(error.to_string().contains("cannot resolve"), "{error}");
+}
+
+#[test]
 fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
     for code in [101, 0] {
         let dir = tempfile::tempdir().unwrap();
