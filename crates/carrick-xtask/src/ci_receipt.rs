@@ -385,8 +385,13 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ReceiptErr
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path).map_err(|e| source_io(&path, e))?;
         if metadata.is_dir() {
-            // Git internals cannot be part of an archived source tree.
-            if entry.file_name() != ".git" {
+            // Git internals cannot be part of an archived source tree. A
+            // subdirectory with its own Cargo.toml is a separate package
+            // (e.g. `carrick-vmm-kvm/fixtures/x86-threads`), never one of this
+            // crate's targets, so its sources cannot define this crate's tests.
+            let nested_package =
+                std::fs::symlink_metadata(path.join("Cargo.toml")).is_ok_and(|m| m.is_file());
+            if entry.file_name() != ".git" && !nested_package {
                 collect_rs_files(&path, out)?;
             }
         } else if metadata.is_file() && path.extension().is_some_and(|e| e == "rs") {
