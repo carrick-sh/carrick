@@ -66,8 +66,11 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn may_serve_descriptor(&self) -> bool {
         false
     }
-    fn preflight_host_crossing(&mut self, _ordinal: u64) -> bool {
-        true
+    fn preflight_host_crossing(
+        &mut self,
+        _ordinal: u64,
+    ) -> carrick_personality_linux::dispatch::HostCrossingPreflight {
+        carrick_personality_linux::dispatch::HostCrossingPreflight::Proceed
     }
     /// Stage an unserved call on the venue's retained host-file owner ahead
     /// of the crossing table. ARM stages after its `Forward` route instead.
@@ -3509,7 +3512,10 @@ impl<
             self.frame.native_number().raw(),
         ))
     }
-    fn preflight_host_crossing(&mut self, ordinal: u64) -> bool {
+    fn preflight_host_crossing(
+        &mut self,
+        ordinal: u64,
+    ) -> carrick_personality_linux::dispatch::HostCrossingPreflight {
         self.frame.preflight_host_crossing(ordinal)
     }
     fn stage_native_host_file(&mut self) -> bool {

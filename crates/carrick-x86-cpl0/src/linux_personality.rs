@@ -9,6 +9,9 @@ use carrick_el1_abi::{
     Action, Counters, CurrentTask, DelegatedOpenFile, FileTables, HostObjectBinding,
     HostObjectReleaseCrossing, HostObjectWriteCrossing, HostReadinessCrossing, fd_map_lookup,
 };
+use carrick_el1_linux::crossing_operand::{
+    CrossingOperand, classify_fd_operand, resolve_crossing_operand,
+};
 use carrick_el1_linux::dispatch::GuestDispatchFrame;
 use carrick_el1_linux::dispatch::{PollSignalMask, PollTimeoutKind, dispatch_syscall_with_native};
 use carrick_el1_linux::lifecycle::LifecycleVenue;
@@ -18,7 +21,7 @@ use carrick_personality_linux::crossing::{HostCrossingSet, evaluate_host_crossin
 use carrick_personality_linux::dispatch::{CompletionRoute, SyscallFrame};
 use carrick_personality_linux::entry::{CanonicalCall, decode_x86_snapshot};
 use carrick_personality_linux::lifecycle::LinuxWaitStatus;
-use carrick_syscall_abi::{CanonicalNr, LINUX_EBADF};
+use carrick_syscall_abi::CanonicalNr;
 use carrick_x86_carrier::entry::{
     PageFaultStack, cross_owner_grant, fatal_boot, fatal_error, forward_to_host, halt, notify_work,
     prepare_user_page_fault, user_fault_gate,
@@ -68,6 +71,29 @@ pub fn admit_stdio_cached(binding: &CpuBinding, task: &CurrentTask, files: &File
 pub static CARRICK_CPL0_ISA_UNSUPPORTED_FORWARDS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Forward a crossing the ring did not serve, applying the shared fd-operand
+/// resolver's verdict ([`CrossingOperand`]) to this ISA's frame registers.
+pub fn forward_crossing(frame: &mut NativeFrame, operand: Option<CrossingOperand>) {
+    match operand {
+        Some(CrossingOperand::ObjectWrite(binding)) => {
+            let saved = (frame.rdi, frame.rcx);
+            frame.rax = HostObjectWriteCrossing::NUMBER;
+            frame.rdi = binding.encoded() as u64;
+            frame.rcx = HostObjectWriteCrossing::FRAME_TAG;
+            forward_to_host(frame);
+            (frame.rdi, frame.rcx) = saved;
+        }
+        Some(CrossingOperand::Rewrite { index, host_fd }) => {
+            let saved = core::mem::replace(frame.syscall_argument_mut(index), host_fd as u64);
+            forward_to_host(frame);
+            *frame.syscall_argument_mut(index) = saved;
+        }
+        // The shared dispatch owner answered these in ring before any Forward.
+        Some(CrossingOperand::InRing | CrossingOperand::BadFd) => fatal_error(frame),
+        Some(CrossingOperand::Pass) | None => forward_to_host(frame),
+    }
+}
+
 pub struct NativeDispatch<'a> {
     pub frame: &'a mut NativeFrame,
     pub fpstate: &'a mut XsaveArea,
@@ -82,6 +108,9 @@ pub struct NativeDispatch<'a> {
     /// The answer staged ahead of the crossing table, completed by the
     /// caller on the `Forward` route.
     pub staged: Option<carrick_personality_linux::native_host_file::HostFileStage>,
+    /// The shared resolver's verdict on the crossing's descriptor operand,
+    /// applied to the frame on the `Forward` route.
+    pub crossing_operand: Option<CrossingOperand>,
 }
 
 #[derive(Clone, Copy)]
@@ -167,32 +196,32 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
             || self.call.canonical.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
     }
 
-    fn preflight_host_crossing(&mut self, ordinal: u64) -> bool {
-        let read = ordinal == carrick_personality_linux::crossing::nr::READ.raw();
-        let stdio_call = read
-            || [
-                carrick_personality_linux::crossing::nr::WRITE,
-                carrick_personality_linux::crossing::nr::LSEEK,
-                carrick_personality_linux::crossing::nr::PREAD64,
-                carrick_personality_linux::crossing::nr::PWRITE64,
-            ]
-            .iter()
-            .any(|nr| nr.raw() == ordinal);
-        let guest_fd = self.call.args[0] as i32;
-        if !stdio_call || !(0..=2).contains(&guest_fd) {
-            return true;
-        }
-        let binding = fd_map_lookup(self.files.fd_map(), self.file_table, guest_fd)
-            .and_then(|(handle, _)| handle.checked_sub(1))
-            .and_then(|index| self.files.opens().get(index as usize))
-            .and_then(DelegatedOpenFile::host_object);
-        if binding.is_none()
-            || (read && binding.is_some_and(|binding| binding.stdio_fd() != Some(guest_fd)))
-        {
-            self.frame.rax = carrick_syscall_abi::LINUX_EBADF.guest_retval() as u64;
-            return false;
-        }
-        true
+    fn preflight_host_crossing(
+        &mut self,
+        ordinal: u64,
+    ) -> carrick_personality_linux::dispatch::HostCrossingPreflight {
+        let venue = self.host_file;
+        let operand = resolve_crossing_operand(
+            HostCrossingSet::X86,
+            CanonicalNr::new(ordinal),
+            &self.call.args,
+            |fd| {
+                classify_fd_operand(
+                    self.files.fd_map(),
+                    self.files.opens(),
+                    self.file_table,
+                    fd,
+                    |fd| {
+                        let venue = venue?;
+                        let ipc = carrick_el1_linux::ipc::guest_venue(venue.cpu_slot)?;
+                        let table = carrick_el1_linux::ipc::native_table(&ipc, venue.task)?;
+                        carrick_el1_linux::ipc::native_descriptor(&ipc, table, fd)
+                    },
+                )
+            },
+        );
+        self.crossing_operand = Some(operand);
+        operand.preflight()
     }
 
     fn stage_native_host_file(&mut self) -> bool {
@@ -1159,6 +1188,7 @@ impl Personality for LinuxPersonality {
         let mut service = native_process::Service::new(task, slot);
         native_process::drain_external_ingress(source, &mut service)
             .unwrap_or_else(|_| fatal_boot());
+        let crossing_operand;
         let (route, root_exit) = {
             let (runtime, address) =
                 native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot());
@@ -1191,6 +1221,7 @@ impl Personality for LinuxPersonality {
                     origin,
                 }),
                 staged: None,
+                crossing_operand: None,
             };
             let mut route = dispatch_syscall_with_native(
                 &mut native,
@@ -1216,6 +1247,7 @@ impl Personality for LinuxPersonality {
                 cache_lookup,
             );
             let staged = native.staged.take();
+            crossing_operand = native.crossing_operand.take();
             if route == CompletionRoute::NativeService
                 && call.canonical.raw() == carrick_personality_linux::crossing::nr::GETRANDOM.raw()
             {
@@ -1424,70 +1456,7 @@ impl Personality for LinuxPersonality {
                 ControlFlow::Return(())
             }
             CompletionRoute::Forward | CompletionRoute::HostCustody => {
-                let mut handled_in_ring = false;
-                if [
-                    carrick_personality_linux::crossing::nr::READ,
-                    carrick_personality_linux::crossing::nr::WRITE,
-                    carrick_personality_linux::crossing::nr::LSEEK,
-                    carrick_personality_linux::crossing::nr::PREAD64,
-                    carrick_personality_linux::crossing::nr::PWRITE64,
-                ]
-                .contains(&carrick_syscall_abi::CanonicalNr(call.canonical.raw()))
-                {
-                    let table = task.linux.file_table.load(Ordering::Acquire).max(1);
-                    let guest_fd = call.args[0] as i32;
-                    let binding = fd_map_lookup(files.fd_map(), table, guest_fd)
-                        .and_then(|(handle, _)| handle.checked_sub(1))
-                        .and_then(|index| files.opens().get(index as usize))
-                        .and_then(DelegatedOpenFile::host_object);
-                    if call.canonical.raw() == carrick_personality_linux::crossing::nr::WRITE.raw()
-                        && let Some(binding) = binding
-                        && binding.stdio_fd() != Some(guest_fd)
-                    {
-                        let saved = (frame.rax, frame.rdi, frame.rcx);
-                        frame.rax = HostObjectWriteCrossing::NUMBER;
-                        frame.rdi = binding.encoded() as u64;
-                        frame.rcx = HostObjectWriteCrossing::FRAME_TAG;
-                        forward_to_host(frame);
-                        let result = frame.rax;
-                        (frame.rdi, frame.rcx) = (saved.1, saved.2);
-                        frame.rax = result;
-                        handled_in_ring = true;
-                    }
-                    let positional = [
-                        carrick_personality_linux::crossing::nr::LSEEK,
-                        carrick_personality_linux::crossing::nr::PREAD64,
-                        carrick_personality_linux::crossing::nr::PWRITE64,
-                    ]
-                    .contains(&carrick_syscall_abi::CanonicalNr(call.canonical.raw()));
-                    if !handled_in_ring
-                        && positional
-                        && (0..=2).contains(&guest_fd)
-                        && let Some(host_fd) = binding.and_then(|binding| {
-                            binding
-                                .stdio_fd()
-                                .or_else(|| binding.host_fd().map(|fd| fd.raw()))
-                        })
-                        && host_fd != guest_fd
-                    {
-                        let saved_fd = frame.rdi;
-                        frame.rdi = host_fd as u64;
-                        forward_to_host(frame);
-                        frame.rdi = saved_fd;
-                        handled_in_ring = true;
-                    }
-                    if !handled_in_ring
-                        && (0..=2).contains(&guest_fd)
-                        && (binding.is_none()
-                            || binding.is_some_and(|binding| binding.stdio_fd() != Some(guest_fd)))
-                    {
-                        frame.rax = LINUX_EBADF.guest_retval() as u64;
-                        handled_in_ring = true;
-                    }
-                }
-                if !handled_in_ring {
-                    forward_to_host(frame);
-                }
+                forward_crossing(frame, crossing_operand);
                 ControlFlow::Return(())
             }
         }

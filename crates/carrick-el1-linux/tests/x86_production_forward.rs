@@ -1242,7 +1242,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     use carrick_core_abi::service::ServiceOrigin;
     use carrick_el1_abi::{
         BornInZoneSource, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, ThreadControlSlot,
-        ThreadIdentity, ThreadLifecyclePage, fd_map_lookup,
+        ThreadIdentity, ThreadLifecyclePage,
     };
     use carrick_el1_linux::file_table::admit_stdio;
     use carrick_el1_linux::ipc::{IpcVenue, MapTables};
@@ -1473,32 +1473,30 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             .contains(&CanonicalNr(self.call.canonical.raw()))
                 || self.call.canonical.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
         }
-        fn preflight_host_crossing(&mut self, ordinal: u64) -> bool {
-            let read = ordinal == carrick_personality_linux::crossing::nr::READ.raw();
-            let stdio_call = read
-                || [
-                    carrick_personality_linux::crossing::nr::WRITE,
-                    carrick_personality_linux::crossing::nr::LSEEK,
-                    carrick_personality_linux::crossing::nr::PREAD64,
-                    carrick_personality_linux::crossing::nr::PWRITE64,
-                ]
-                .iter()
-                .any(|nr| nr.raw() == ordinal);
-            let guest_fd = self.call.args[0] as i32;
-            if !stdio_call || !(0..=2).contains(&guest_fd) {
-                return true;
-            }
-            let binding = fd_map_lookup(self.fd_map, self.file_table, guest_fd)
-                .and_then(|(handle, _)| handle.checked_sub(1))
-                .and_then(|index| self.opens.get(index as usize))
-                .and_then(DelegatedOpenFile::host_object);
-            if binding.is_none()
-                || (read && binding.is_some_and(|b| b.stdio_fd() != Some(guest_fd)))
-            {
-                self.rax = carrick_syscall_abi::LINUX_EBADF.guest_retval() as u64;
-                return false;
-            }
-            true
+        fn preflight_host_crossing(
+            &mut self,
+            ordinal: u64,
+        ) -> carrick_personality_linux::dispatch::HostCrossingPreflight {
+            // The production CPL0 venue's resolver, over this frame's tables.
+            let (venue, task) = (self.venue, self.task);
+            carrick_el1_linux::crossing_operand::resolve_crossing_operand(
+                carrick_personality_linux::crossing::HostCrossingSet::X86,
+                CanonicalNr::new(ordinal),
+                &self.call.args,
+                |fd| {
+                    carrick_el1_linux::crossing_operand::classify_fd_operand(
+                        self.fd_map,
+                        self.opens,
+                        self.file_table,
+                        fd,
+                        |fd| {
+                            let table = carrick_el1_linux::ipc::native_table(venue, task)?;
+                            carrick_el1_linux::ipc::native_descriptor(venue, table, fd)
+                        },
+                    )
+                },
+            )
+            .preflight()
         }
         fn stage_native_host_file(&mut self) -> bool {
             let Some(decoded) =
