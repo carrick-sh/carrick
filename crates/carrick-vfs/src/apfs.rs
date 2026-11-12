@@ -699,21 +699,11 @@ mod tests {
         );
         assert_eq!(root, PathBuf::from("/explicit/home/scratch"));
         // Unset: the volume wins over $HOME; rejected: $HOME is the last resort.
-        let root = resolve_scratch_root_from(
-            conventional,
-            true,
-            |_| true,
-            None,
-            Some("/Users/u".into()),
-        );
+        let root =
+            resolve_scratch_root_from(conventional, true, |_| true, None, Some("/Users/u".into()));
         assert_eq!(root, conventional);
-        let root = resolve_scratch_root_from(
-            conventional,
-            true,
-            |_| false,
-            None,
-            Some("/Users/u".into()),
-        );
+        let root =
+            resolve_scratch_root_from(conventional, true, |_| false, None, Some("/Users/u".into()));
         assert_eq!(root, PathBuf::from("/Users/u/.carrick/scratch"));
     }
 
@@ -893,7 +883,10 @@ mod tests {
                 "exit flush waited {waited:?} on a wedged worker"
             );
             release.send(()).unwrap();
-            reply.recv_timeout(Duration::from_secs(60)).unwrap().unwrap();
+            reply
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap()
+                .unwrap();
         }
 
         /// Busy once, then success: with the worker queue full the verdict
