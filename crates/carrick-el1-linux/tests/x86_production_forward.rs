@@ -2067,3 +2067,159 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         "root close(1) must not close live child's fd 1"
     );
 }
+
+// #2160: every epoll_pwait the ring hands to the host names its cause in
+// `ipc_leaves`, on the production entry of both ISAs.
+fn epoll_pwait_leave(
+    x86: bool,
+    with_venue: bool,
+    work: bool,
+    leave: carrick_el1_abi::IpcLeave,
+) -> [u64; carrick_el1_abi::IpcLeave::COUNT] {
+    use carrick_el1_abi::ipc::{IpcBacking, fd};
+    use carrick_el1_linux::ipc::{IpcVenue, MapTables};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use std::sync::Arc;
+
+    let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+    let table = HostTable::create(Arc::clone(&owner), 64, 8).unwrap();
+    let object = owner.create_epoll().unwrap();
+    let epoll = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Epoll { object }.encode(),
+            fd::AccessMode::ReadWrite,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    epoll.install(table.id(), fd::Fd(3), false).unwrap();
+    let region = carrick_test_support::TestEl1Region::zeroed();
+    // SAFETY: TestEl1Region provides ABI-aligned zeroed storage for this map.
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish_owned(7, table.id().to_raw()).unwrap();
+    let tables = MapTables(map);
+    let venue = IpcVenue {
+        region: owner.region(),
+        tables: &tables,
+    };
+    let task = CurrentTask::new();
+    task.set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        7,
+    );
+    if work {
+        task.linux.mark_pending_host_work();
+    }
+    let counters = Counters::new();
+    let names = InotifyNameCache::new();
+    let events = carrick_test_support::GuestUserBuffer::zeroed(16);
+    let args = [3, events.arg(), 1, 0, 0, 0];
+    let mut arm = TrapFrame {
+        esr: 0x15 << 26,
+        elr: 0x4004,
+        ..Default::default()
+    };
+    arm.x[8] = carrick_personality_linux::crossing::nr::EPOLL_PWAIT.raw();
+    arm.x[..6].copy_from_slice(&args);
+    let isa_unsupported = AtomicU64::new(0);
+    let call = decode_x86_64(281, args, 0x7fff_0000);
+    let mut amd = X86Frame {
+        native: call.native,
+        canonical: call.canonical,
+        args,
+        rax: 0xfeed,
+        isa_unsupported: &isa_unsupported,
+    };
+    let ipc = with_venue.then_some(&venue);
+    let route = if x86 {
+        dispatch::dispatch_syscall_with_native::<
+            _,
+            NoCpu,
+            sched::HardwareUserWord,
+            _,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >(
+            &mut amd,
+            &counters,
+            core::slice::from_ref(&task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None,
+            ipc,
+            None,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        )
+    } else {
+        dispatch::dispatch_syscall_with_native::<
+            _,
+            NoCpu,
+            sched::HardwareUserWord,
+            _,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >(
+            &mut arm,
+            &counters,
+            core::slice::from_ref(&task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None,
+            ipc,
+            None,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(
+        route,
+        CompletionRoute::Forward,
+        "x86={x86} venue={with_venue}"
+    );
+    let counts = core::array::from_fn(|i| counters.ipc_leaves[i].load(Ordering::Relaxed));
+    assert_eq!(
+        counts.iter().sum::<u64>(),
+        1,
+        "x86={x86} venue={with_venue} work={work}: exactly one named leave, got {:?}",
+        carrick_el1_abi::IpcLeave::ALL
+            .iter()
+            .filter(|l| counts[**l as usize] != 0)
+            .map(|l| l.name())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(counts[leave as usize], 1, "x86={x86} venue={with_venue}");
+    counts
+}
+
+#[test]
+fn epoll_pwait_without_an_ipc_venue_is_a_counted_leave() {
+    use carrick_el1_abi::IpcLeave::EpollNoVenue;
+    for x86 in [false, true] {
+        for work in [false, true] {
+            epoll_pwait_leave(x86, false, work, EpollNoVenue);
+        }
+    }
+}
+
+#[test]
+fn epoll_pwait_without_an_execution_binding_is_a_counted_leave() {
+    use carrick_el1_abi::IpcLeave::EpollNoExecution;
+    for x86 in [false, true] {
+        epoll_pwait_leave(x86, true, false, EpollNoExecution);
+    }
+}
