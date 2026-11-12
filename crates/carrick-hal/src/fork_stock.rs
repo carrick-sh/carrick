@@ -221,6 +221,8 @@ impl GrantExecution {
     /// Authenticate a stopped lane against its live installed MM and root.
     /// The caller reads the binding and root incarnation from the stopped
     /// lane's current-task atomics, and supplies the observed hardware root.
+    /// A sibling vCPU's page-table pause of the same MM is contention, not
+    /// a moved identity: the installed lane still runs that root (#1742).
     pub fn from_stopped_lane<C: Copy + Send + Sync + zerocopy::FromZeros>(
         cpu: CpuId,
         binding: ExecutionBinding,
@@ -230,7 +232,7 @@ impl GrantExecution {
     ) -> Option<Self> {
         let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
         let index = zone.spaces.find(binding.mm.raw())?;
-        let grant = zone.spaces.grant(index, binding.mm.raw())?;
+        let grant = zone.spaces.installed_grant(index, binding.mm.raw())?;
         if !binding.issued()
             || zone.installed_space(slot) != binding.mm.raw()
             || root.address().raw() != grant.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK

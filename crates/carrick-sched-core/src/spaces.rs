@@ -670,8 +670,20 @@ impl AddressSpaces {
     /// to install if the gate is open (read `SeqCst`, after the slot), and
     /// the entry still names `key`.
     pub fn grant(&self, index: SpaceIndex, key: u64) -> Option<SpaceGrant> {
+        if self.entry(index).gate.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        self.installed_grant(index, key)
+    }
+
+    /// Host: the roots of `key` as a lane that already installed it runs
+    /// them. A counted page-table pause ([`Self::raise`]) holds new installs
+    /// and EL1 editors, not the identity of a lane already running the
+    /// space, so it is not refused here; a closed (retiring) entry, or one no
+    /// longer naming `key`, is.
+    pub fn installed_grant(&self, index: SpaceIndex, key: u64) -> Option<SpaceGrant> {
         let entry = self.entry(index);
-        if entry.gate.load(Ordering::SeqCst) != 0 {
+        if entry.gate.load(Ordering::SeqCst) & GATE_CLOSED != 0 {
             return None;
         }
         let ttbr0 = entry.ttbr0.load(Ordering::Acquire);
@@ -1259,6 +1271,21 @@ mod tests {
         spaces.close(index);
         assert!(spaces.grant(index, 7).is_none(), "retiring");
         assert!(spaces.grant(index, 8).is_none(), "another key");
+    }
+
+    #[test]
+    fn an_installed_lane_keeps_its_grant_through_a_pause_but_not_closure() {
+        let spaces = AddressSpaces::new();
+        let index = spaces.publish_closed(7, 0x1_0000, 0x1_0000).unwrap();
+        assert!(spaces.installed_grant(index, 7).is_none(), "never opened");
+        spaces.open(index);
+        spaces.raise(index);
+        assert!(spaces.grant(index, 7).is_none(), "a pause holds installs");
+        assert_eq!(spaces.installed_grant(index, 7).unwrap().ttbr0, 0x1_0000);
+        assert!(spaces.installed_grant(index, 8).is_none(), "another key");
+        spaces.lower(index);
+        spaces.close(index);
+        assert!(spaces.installed_grant(index, 7).is_none(), "retiring");
     }
 
     #[test]
