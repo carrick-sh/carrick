@@ -829,8 +829,23 @@ pub(crate) fn load_x86_exec_image<'a>(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
 ) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
-    let _ = (loader, files, target.into(), argv, env);
-    Err(crate::linux_abi::LINUX_ENOSYS)
+    use carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage;
+    // No vDSO or trap policy reaches an image the CPL0 build maps.
+    let _ = loader;
+    let ResolvedExecTarget { argv, source, .. } = resolve_exec_target(files, target, argv)?;
+    // Linux counts the strings a `#!` chain left before it looks at the
+    // image (E2BIG ahead of ENOEXEC).
+    X86ExecImage::check_arguments(&argv, &env)?;
+    let bytes = source.read_all().map_err(host_io_errno)?;
+    let program = carrick_mem::elf::ElfProgram::load(&bytes, native_guest_elf_machine(), &|path| {
+        acquire_exec_source(files, path).ok()?.read_all().ok()
+    })
+    .map_err(|error| {
+        carrick_kernel::exec_helpers::exec_image_errno(carrick_mem::memory::AddressSpaceError::Elf(
+            error,
+        ))
+    })?;
+    X86ExecImage::from_program(&program, argv, env)
 }
 
 // Shebang resolution and the signal-death / stop helpers live in the
