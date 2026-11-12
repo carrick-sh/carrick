@@ -1511,9 +1511,9 @@ impl Cpl0Carrier {
             return Err(error);
         }
         let slot = SlotId::new(0);
-        zone.drive(slot, 1);
-        zone.publish_slot_with_affinity(
+        zone.drive_and_publish(
             slot,
+            1,
             mm.raw(),
             Some(0),
             carrick_sched_core::AffinitySource::UNBOUND,

@@ -217,6 +217,7 @@ fn claim_word_round_trips() {
             seq: u32::MAX,
         },
         Claim::Host { seq: 77 },
+        Claim::Held { seq: 77 },
         Claim::FirstEntryHost {
             incarnation: u64::MAX >> 4,
         },
@@ -5245,4 +5246,36 @@ fn a_signal_claims_held_custody_without_overwriting_the_wake_result() {
         zone.place_native_handback(record),
         Some(NativePlacement::Held)
     );
+}
+
+#[test]
+fn held_affinity_probe_busy_once_then_success() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let (record, seq) = held_completion(&zone);
+    zone.record(record.id).set_affinity(1);
+    let lock = zone.slot_lock(SLOT, &HostWait).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        let probe = scope.spawn(|| {
+            SLOT_LOCK_OBSERVER.with_borrow_mut(|observer| {
+                *observer = Some(Box::new(move |slot| {
+                    if slot == SLOT {
+                        tx.send(()).unwrap();
+                    }
+                }))
+            });
+            zone.probe_held(&mut WakeEffects::default());
+            SLOT_LOCK_OBSERVER.with_borrow_mut(|observer| *observer = None);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(zone.record(record.id).claim(), Claim::Held { seq });
+        drop(lock);
+        probe.join().unwrap();
+    });
+    assert_eq!(
+        zone.record(record.id).claim(),
+        Claim::Queued { slot: SLOT, seq }
+    );
+    assert_eq!(zone.slot(SLOT).queued(), 1);
 }

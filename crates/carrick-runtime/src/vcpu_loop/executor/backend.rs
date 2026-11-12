@@ -1965,9 +1965,10 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         // this executor to load; a record with a published native owner may
         // install its own MM and run directly from the zone.
         let _vacant_at_entry = SettledIdleSlot::admit(Some(slot))?;
-        drive_zone_slot(slot, zone_driver(self.executor_id))?;
-        zone.publish_slot_with_affinity(
+        prepare_zone_driver(slot, zone_driver(self.executor_id))?;
+        zone.drive_and_publish(
             slot,
+            zone_driver(self.executor_id),
             0,
             self.bound_cpu,
             carrick_sched_core::AffinitySource::UNBOUND,
@@ -2209,11 +2210,14 @@ pub(crate) fn zone_driver(executor: ExecutorId) -> u64 {
     u64::from(executor.raw()) + 1
 }
 
-/// The calling executor (`driver`) now drives `slot`: a slot it drove
+/// Prepare the driver handoff before atomic CPU/driver publication: a slot it drove
 /// before and left (its lease went with the task it unloaded) is vacated,
 /// unless another executor took it over, so nothing waits on a vCPU nobody
 /// runs.
-pub(crate) fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) -> Result<(), TrapError> {
+pub(crate) fn prepare_zone_driver(
+    slot: carrick_el1_abi::SlotId,
+    driver: u64,
+) -> Result<(), TrapError> {
     let previous = DRIVEN_ZONE_SLOT.with(std::cell::Cell::get);
     if let Some((previous, previous_driver)) = previous.filter(|(previous, _)| *previous != slot) {
         if let Err(refused) =
@@ -2225,9 +2229,6 @@ pub(crate) fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) -> Res
         }
     }
     DRIVEN_ZONE_SLOT.with(|cell| cell.set(Some((slot, driver))));
-    if let Some(zone) = carrick_kernel::el1_zone::zone() {
-        zone.drive(slot, driver);
-    }
     Ok(())
 }
 
@@ -2323,7 +2324,7 @@ fn publish_zone_slot(
         // publishing this only in EL1 idle would lose a remote affinity kick.
         zone.slot(zone_slot)
             .set_sgi_target(carrick_vmm_hvf::gic::reschedule_target(vcpu)?);
-        drive_zone_slot(zone_slot, driver)?;
+        prepare_zone_driver(zone_slot, driver)?;
         // What the slot still holds, for the fatal below: the record EL1
         // left switched in, its claim, identity, pending object operation and
         // handback, and the slot's queue.
@@ -2352,7 +2353,7 @@ fn publish_zone_slot(
         // Threads queued here for another address space stay: EL1 leaves
         // the vCPU for this executor when one reaches the head, and the
         // executor loads it.
-        zone.publish_slot_with_affinity(zone_slot, mm, bound_cpu, affinity);
+        zone.drive_and_publish(zone_slot, driver, mm, bound_cpu, affinity);
     }
     carrick_el1_abi::publish_zone_identity(slot, mm, serial);
     Ok(())

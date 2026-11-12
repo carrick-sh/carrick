@@ -649,3 +649,38 @@ The lifecycle wait-channel wake crossing (`cross_wait_channel_wake`, HVC
 handler is follow-up work. The signed end-to-end check (the two-process test
 from 0/10 to 10/10) is outstanding, and the separate `entry_binding` fatal at
 `arm_signal_user_return` may still end some signed runs of that test.
+
+### Native handback custody when no allowed driver exists (#1941)
+
+Native readiness completions use `OwnerCustody::Driven` under the target slot
+lock, including a driver stepped away on a host wait. No native record borrows
+its last slot or slot zero without admission. If no allowed driver exists,
+`Claim::Held` retains its park sequence and wake result in the ring. An appended
+hint bitmap locates candidates; only the claim CAS transfers custody.
+
+CPU publication probes after releasing the slot lock. Production ARM and KVM
+entry publish driver and CPU in one operation. Affinity publication pays its
+probe debt after dropping the process graph lock. A scanner clears the hint,
+tries admission, then republishes the hint with SeqCst and probes once on
+refusal. No bucket lock is acquired, and only one slot lock is held at a time.
+
+Signals and cancellation claim Held by CAS to Transferring. Cancellation uses
+the existing native member path, before MM retirement. The physical retirement
+module does not enumerate scheduler claims: its invalidation membership tracks
+CPU translations, while native process membership and record allocation remain
+live until cancellation/retirement. Held therefore needs no new physical-MM
+member count. A stale hint after cancellation or reuse has no authority over a
+record that no longer has the Held claim.
+
+VM-free bindings include `native_handback_admits_a_stepped_away_allowed_driver`,
+`native_handback_without_an_allowed_driver_is_held`,
+`a_published_driver_places_a_held_completion_exactly_once`,
+`an_affinity_change_places_a_held_completion`,
+`held_affinity_probe_busy_once_then_success`,
+`a_held_completion_can_be_cancelled_and_reused_before_a_trigger`, and
+`a_signal_claims_held_custody_without_overwriting_the_wake_result`.
+The loom binding `native_hold_races_driver_cpu_publication` explores the actual
+placement and publication operations. The ARM fork-child handback binding now
+re-drives CPU 1 and requires the waiter to switch in with result zero. The x86
+LaneWake binding holds and then places the same native completion. This changes
+no x86 switch-time affinity guard; affinity publication remains #2131.

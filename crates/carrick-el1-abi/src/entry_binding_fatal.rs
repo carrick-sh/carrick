@@ -364,6 +364,7 @@ impl fmt::Display for CompactClaim {
             Claim::Free => f.write_str("Free"),
             Claim::Parked { seq } => write!(f, "Parked{{seq:{seq}}}"),
             Claim::Host { seq } => write!(f, "Host{{seq:{seq}}}"),
+            Claim::Held { seq } => write!(f, "Held{{seq:{seq}}}"),
             Claim::Queued { slot, seq } => write!(f, "Queued{{slot:{},seq:{seq}}}", slot.raw()),
             Claim::OnCpu { slot, seq } => write!(f, "OnCpu{{slot:{},seq:{seq}}}", slot.raw()),
             Claim::Activating { incarnation } => {

@@ -5118,6 +5118,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.slot(slot).affinity.store(affinity, Ordering::Release);
     }
 
+    /// Publish driver and CPU together, then pay held-placement debt.
+    pub fn drive_and_publish(
+        &self,
+        slot: SlotId,
+        driver: u64,
+        mm: u64,
+        cpu: Option<u32>,
+        source: AffinitySource,
+    ) {
+        debug_assert!(driver != 0 && driver & SLOT_AWAY == 0);
+        self.publish_slot_owner(slot, mm, cpu, source, Some(driver));
+    }
+
     /// Bind a live control authority before guest entry. The execution lane
     /// retains its backing until this slot is rebound or cleared while stopped.
     pub fn publish_slot_with_affinity(
@@ -5126,6 +5139,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         mm: u64,
         cpu: Option<u32>,
         source: AffinitySource,
+    ) {
+        self.publish_slot_owner(slot, mm, cpu, source, None);
+    }
+
+    fn publish_slot_owner(
+        &self,
+        slot: SlotId,
+        mm: u64,
+        cpu: Option<u32>,
+        source: AffinitySource,
+        driver: Option<u64>,
     ) {
         let guard = self.slot_lock(slot, &SpinForever);
         let s = self.slot(slot);
@@ -5136,6 +5160,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             Ordering::Release,
         );
         self.bind_slot_affinity(slot, source);
+        if let Some(driver) = driver {
+            s.drive.store(driver, Ordering::Release);
+        }
         drop(guard);
         // CPU is now published. Only this returning driver is targeted, so
         // its entry consumes resched debt without a remote host kick.
@@ -5464,7 +5491,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         for slot in candidates.into_iter().flatten().chain(
             (0..ZONE_SLOTS)
                 .filter_map(SlotId::from_index)
-                .filter(|slot| native && !candidates.contains(&Some(*slot))),
+                .filter(|slot| {
+                    native
+                        && !candidates.contains(&Some(*slot))
+                        && OwnerCustody::Driven.holds(self, *slot, rec)
+                }),
         ) {
             let Some(guard) = self.slot_lock(slot, &SpinForever) else {
                 continue;

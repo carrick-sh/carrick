@@ -805,8 +805,7 @@ fn native_hold_races_driver_cpu_publication() {
         );
         let publisher = zone.clone();
         let actor = thread::spawn(move || {
-            publisher.drive(SLOT, 1);
-            publisher.publish_slot(SLOT, 7, Some(1), 0);
+            publisher.drive_and_publish(SLOT, 1, 7, Some(1), AffinitySource::UNBOUND);
         });
         assert!(zone.place_native_handback(record).is_some());
         actor.join().unwrap();
