@@ -384,6 +384,23 @@ fn native_exit_fixture(name: &str) -> Vec<u8> {
     native_exit_fixture_with_flags(name, &[])
 }
 
+/// #1093 S4c: exercise exec from a real ring-born child, with its parent
+/// alive in wait4. A returned exec errno is propagated as the run exit code.
+#[test]
+fn native_fork_child_execs_static_successor() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_marker.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec.S", &[&define]);
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 32, ROOT_AFFINITY_LOADED)
+        .expect("production fork-child exec run");
+    assert_eq!(outcome.run.exit_code, 0, "child exec returned errno");
+    assert_eq!(outcome.run.stdout, b"X\n");
+    assert!(outcome.run.stderr.is_empty());
+}
+
 fn native_exit_fixture_with_flags(name: &str, flags: &[&str]) -> Vec<u8> {
     kvm_pool_fixture::assemble_fixture(name, flags)
 }
