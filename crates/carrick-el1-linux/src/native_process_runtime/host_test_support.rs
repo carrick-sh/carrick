@@ -10727,6 +10727,10 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
 #[path = "tests/futex_contention.rs"]
 mod futex_contention;
 
+#[cfg(test)]
+#[path = "tests/x86_switch_in_binding.rs"]
+mod x86_switch_in_binding;
+
 #[cfg(all(test, not(target_os = "macos")))]
 #[test]
 fn invalid_copy_ranges_are_efault_before_owner_preparation() {
