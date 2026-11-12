@@ -4697,6 +4697,58 @@ fn delegated_failed_return_reconciliation_acknowledges_nothing() {
     assert!(root.owed().is_empty());
 }
 
+/// #1480: the host venue settles through the neutral transaction's commit
+/// order. Every owed extent's backend retirement runs before any extent's
+/// host facts are dropped, so a failure at extent 2 of 3 leaves extent 1's
+/// facts too. The retry settles all three; extent 1 retires again as a
+/// backend no-op.
+#[test]
+fn delegated_failed_extent_applies_nothing_and_the_retry_settles_all() {
+    let (dispatcher, mut memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let mapped = root
+        .guest_mmap(
+            Placement::Anywhere,
+            6 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    let extents = [mapped, mapped + 2 * PAGE, mapped + 4 * PAGE];
+    for start in extents {
+        root.guest_munmap_resident(start, PAGE);
+    }
+    assert_eq!(root.owed().len(), 3);
+    memory.unmap_log.borrow_mut().clear();
+    memory.set_fail_unmap_at(Some(extents[1]));
+    assert!(matches!(
+        reconcile(&dispatcher, &mut memory),
+        Err(crate::dispatch::mem::el1_reservations::El1ReturnError::Backend { range, .. })
+            if range.start() == extents[1]
+    ));
+    assert_eq!(
+        *memory.unmap_log.borrow(),
+        vec![(extents[0], PAGE as usize)],
+        "extent 1 retired before extent 2 failed"
+    );
+    assert!(
+        memory.root_return_log.borrow().is_empty(),
+        "no extent's host facts dropped before every retirement held"
+    );
+    assert_eq!(root.owed().len(), 3, "nothing acknowledged");
+
+    memory.set_fail_unmap_at(None);
+    memory.unmap_log.borrow_mut().clear();
+    assert_eq!(reconcile(&dispatcher, &mut memory).unwrap(), 3);
+    let expected: Vec<(u64, usize)> = extents.iter().map(|&s| (s, PAGE as usize)).collect();
+    let mut retired = memory.unmap_log.borrow().clone();
+    retired.sort_unstable();
+    assert_eq!(retired, expected);
+    let mut returned = memory.root_return_log.borrow().clone();
+    returned.sort_unstable();
+    assert_eq!(returned, expected, "each extent applied exactly once");
+    assert!(root.owed().is_empty());
+}
+
 #[test]
 fn delegated_host_mmap_over_an_owed_range_reconciles_first() {
     let (mut dispatcher, mut memory, _) = populated_host_setup_mm();
