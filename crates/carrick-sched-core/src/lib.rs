@@ -5314,8 +5314,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             // slot may run it, and only while it is in the guest.
             let guard = self.slot_lock(home, &SpinForever)?;
             let state = self.slot(home).state();
-            if !(state.in_guest() || (rec.requires_native_entry() && self.slot(home).is_live()))
-                || !rec.cas(from, Claim::Queued { slot: home, seq })
+            if !(if driven {
+                OwnerCustody::Driven.holds(self, home, rec)
+            } else {
+                state.in_guest()
+            }) || !rec.cas(from, Claim::Queued { slot: home, seq })
             {
                 return None;
             }
@@ -5344,7 +5347,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 None
             },
         ];
-        for slot in candidates.into_iter().flatten() {
+        for slot in candidates.into_iter().flatten().filter(|_| !driven).chain(
+            rec.last_slot()
+                .into_iter()
+                .chain(
+                    (0..ZONE_SLOTS)
+                        .filter_map(SlotId::from_index)
+                        .filter(|slot| Some(*slot) != rec.last_slot()),
+                )
+                .filter(|_| driven),
+        ) {
             let Some(guard) = self.slot_lock(slot, &SpinForever) else {
                 continue;
             };
@@ -5353,8 +5365,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 // Only a slot whose driver comes back to it takes a thread
                 // that needs an executor or has no host continuation: checked
                 // under the lock every drive change holds.
-                self.slot(slot).is_live()
-                    && rec.allows_cpu(self.slot(slot).cpu.load(Ordering::Relaxed))
+                OwnerCustody::Driven.holds(self, slot, rec)
             } else {
                 state.in_guest() && self.accepts_running(slot, rec)
             };
