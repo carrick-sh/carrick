@@ -384,14 +384,10 @@ fn native_exit_fixture(name: &str) -> Vec<u8> {
     native_exit_fixture_with_flags(name, &[])
 }
 
-/// #2142: root exec must replace the production CPL0 image, not return ENOSYS.
-#[test]
-fn production_root_exec_replaces_image_and_runs_static_successor() {
-    let dir = tempfile::tempdir().expect("exec fixture directory");
-    let successor = dir.path().join("successor");
-    let successor_elf = native_exit_fixture("native_root_exec_successor.S");
-    carrick_test_support::executable::write_executable_mode(&successor, &successor_elf, 0o700);
-    let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
+/// Run the production CPL0 root, which execs `path` and exits with the
+/// refused errno (38 is ENOSYS) if `execve` returns.
+fn run_root_exec(path: &std::path::Path) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    let define = format!("-DEXEC_PATH=\"{}\"", path.display());
     let elf = native_exit_fixture_with_flags("native_root_exec.S", &[&define]);
     let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("root ELF");
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
@@ -399,7 +395,7 @@ fn production_root_exec_replaces_image_and_runs_static_successor() {
         carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
             .expect("host filesystem"),
     ));
-    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+    kvm_pool_fixture::try_run_program_with_dispatcher(
         &program,
         128,
         ROOT_AFFINITY_LOADED,
@@ -407,13 +403,51 @@ fn production_root_exec_replaces_image_and_runs_static_successor() {
         dispatcher,
     )
     .map_err(|failure| failure.error)
-    .expect("production CPL0 root exec");
+    .expect("production CPL0 root exec")
+}
+
+/// #2142: root exec must replace the production CPL0 image, not return ENOSYS.
+#[test]
+fn production_root_exec_replaces_image_and_runs_static_successor() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    let successor_elf = native_exit_fixture("native_root_exec_successor.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &successor_elf, 0o700);
+    let outcome = run_root_exec(&successor);
     assert_eq!(
         (outcome.run.exit_code, outcome.run.stdout.as_slice()),
         (0, b"root-exec-ok\n".as_slice()),
         "root exec must run the successor; 38 is ENOSYS"
     );
     assert!(outcome.run.stderr.is_empty());
+}
+
+/// #2142: execve(2) of a missing path fails with ENOENT and the caller keeps
+/// running its old image, which exits with that errno.
+#[test]
+fn production_root_exec_of_a_missing_path_is_enoent() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let outcome = run_root_exec(&dir.path().join("absent"));
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (2, b"".as_slice()),
+        "a missing exec path is ENOENT (2); 38 is ENOSYS"
+    );
+}
+
+/// #2142: execve(2) of an executable file in no recognized format fails with
+/// ENOEXEC and the caller keeps running its old image.
+#[test]
+fn production_root_exec_of_a_non_elf_file_is_enoexec() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let text = dir.path().join("text");
+    carrick_test_support::executable::write_executable_mode(&text, b"not an executable\n", 0o700);
+    let outcome = run_root_exec(&text);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (8, b"".as_slice()),
+        "a non-ELF exec is ENOEXEC (8); 38 is ENOSYS"
+    );
 }
 
 fn native_exit_fixture_with_flags(name: &str, flags: &[&str]) -> Vec<u8> {
