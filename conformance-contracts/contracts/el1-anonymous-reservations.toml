@@ -45,6 +45,9 @@ vm_free = [
   "carrick-el1::memory::tests::delegated::mmap_stack_hint_is_served_like_private_anonymous (MAP_STACK is a hint served by the root; MAP_GROWSDOWN keeps the host decoder)",
   "carrick-el1::memory::tests::delegated::two_isa_anonymous_edits_publish_to_a_live_peer",
   "carrick-x86-cpl0::anonymous_refusal_tests::both_linux_decoders_project_the_same_anonymous_call",
+  "carrick-kernel::dispatch::mem::delegated_tests::delegated_failed_extent_applies_nothing_and_the_retry_settles_all (#1480, red on main: the host venue settles owed returns through the neutral transaction; every fallible retirement precedes the one apply, a failure at extent 2 of 3 applies and acknowledges nothing, and the retry settles all three once)",
+  "carrick-core::mm::reservation::root::tests::{stale_owed_return_handle_never_acknowledges_its_successor,owed_return_chunks_acknowledge_by_compare_and_swap_on_start,whole_mm_teardown_advances_the_epoch_of_every_owed_slot} (#1480 slot epochs: a stale (slot, epoch) never frees its successor, chunk acknowledgement is a compare-and-swap on start across a front merge, teardown advances every owed slot's epoch)",
+  "carrick-hal::return_settlement::tests (#1480 neutral routine: fail 2 of 3 then idempotent retry, commit order, stale settlement has no effect, reused slot keeps its successor owed; no ring-owned retirement yet)",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",

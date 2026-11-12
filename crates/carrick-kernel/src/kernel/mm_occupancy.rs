@@ -950,31 +950,26 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
 
 /// Run `f` under a proof that no EL1 editor of `mm` runs: `held` (the
 /// caller's own exclusion), else the proof that no published space names
-/// `mm`, else a fresh exclusion held for `f`'s duration.
+/// `mm`, else a fresh exclusion held for `f`'s duration. `None`: no proof
+/// could be minted (`mm` has no key).
 pub(crate) fn with_excluded_el1_editor<R>(
     mm: MmId,
     held: Option<&carrick_sched_core::ExcludedEditor<'_>>,
     f: impl FnOnce(&carrick_sched_core::ExcludedEditor<'_>) -> R,
-) -> R {
+) -> Option<R> {
     if let Some(excluded) = held {
-        return f(excluded);
+        return Some(f(excluded));
     }
-    static NO_ZONE: std::sync::OnceLock<Box<AddressSpaces>> = std::sync::OnceLock::new();
-    let spaces = match crate::el1_zone::zone() {
-        Some(zone) => &zone.spaces,
-        None => NO_ZONE.get_or_init(|| Box::new(AddressSpaces::new())),
+    let Some(zone) = crate::el1_zone::zone() else {
+        // No EL1 zone, so no EL1 editor of any MM: an empty table proves
+        // `mm` unpublished. Only VM-free hosts reach this.
+        let spaces = Box::new(AddressSpaces::new());
+        return spaces.unpublished(mm.raw()).map(|excluded| f(&excluded));
     };
-    if let Some(excluded) = spaces.unpublished(mm.raw()) {
-        return f(&excluded);
+    if let Some(excluded) = zone.spaces.unpublished(mm.raw()) {
+        return Some(f(&excluded));
     }
-    let exclusion = exclude_el1_editor(mm).unwrap_or_else(|| {
-        carrick_fatal!(
-            "kernel::mm_occupancy",
-            "published MM {} has no EL1 editor exclusion",
-            mm.raw()
-        )
-    });
-    f(exclusion.excluded())
+    exclude_el1_editor(mm).map(|exclusion| f(exclusion.excluded()))
 }
 
 /// The exclusion core capture reads a paused MM under
