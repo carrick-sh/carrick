@@ -84,9 +84,67 @@ impl X86ExecImage {
         argv: Vec<Vec<u8>>,
         env: Vec<Vec<u8>>,
     ) -> Result<Self, LinuxErrno> {
-        // No x86 exec service yet: the ring's counted ENOSYS (#1093 S4c).
-        let _ = (program, argv, env, prepare_x86_elf, image_frame_demand);
-        Err(LINUX_ENOSYS)
+        Self::check_arguments(&argv, &env)?;
+        let image = prepare_x86_elf(program).map_err(|_| LINUX_ENOEXEC)?;
+        let argv_bytes: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+        let env_bytes: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
+        // The stack pointer does not depend on AT_RANDOM's bytes, only on
+        // where they sit, so the build after the arm (with fresh carrier
+        // randomness) lands on the one sealed here.
+        let stack = build_initial_stack(&InitialStackSpec {
+            entry: image.executable_entry,
+            interpreter_base: image.interpreter_base,
+            phdr: image.phdr,
+            phent: image.phent,
+            phnum: image.phnum,
+            argv: &argv_bytes,
+            envp: &env_bytes,
+            random: [0; 16],
+            stack_top: INITIAL_STACK_TOP,
+            stack_size: INITIAL_STACK_SIZE,
+        })
+        .map_err(|error| match error {
+            InitialMmError::StackTooLarge => LINUX_ENOSYS,
+            _ => LINUX_ENOEXEC,
+        })?;
+        let rows = x86_image_rows(&image);
+        let stack_row = ImageStack {
+            top: UserVa::new(INITIAL_STACK_TOP),
+            size: carrick_guest_arch::GuestLen::new(INITIAL_STACK_SIZE),
+        };
+        carrick_core_abi::successor_image::validate_image_rows(
+            &rows,
+            image.executable_region_count,
+            UserVa::new(image.entry),
+            stack_row,
+            carrick_core_abi::successor_image::ImageGeometry::X86_64,
+        )
+        .map_err(|_| LINUX_ENOEXEC)?;
+        let demand = image_frame_demand(&rows, stack_row).ok_or(LINUX_ENOEXEC)?;
+        Ok(Self {
+            regions: image
+                .regions
+                .iter()
+                .map(|region| ExecRegion {
+                    start: region.start,
+                    end: region.end,
+                    initialized_offset: region.initialized_offset,
+                    file_bytes: region.file_bytes.to_vec(),
+                    perms: region.perms,
+                })
+                .collect(),
+            executable_region_count: image.executable_region_count,
+            entry: image.entry,
+            executable_entry: image.executable_entry,
+            interpreter_base: image.interpreter_base,
+            phdr: image.phdr,
+            phent: image.phent,
+            phnum: image.phnum,
+            argv,
+            env,
+            stack_pointer: stack.rsp,
+            demand,
+        })
     }
 
     /// The image as boot's loader describes one, borrowing these bytes.
@@ -143,7 +201,7 @@ impl X86ExecImage {
 /// closed successor the ring published for it.
 #[derive(Debug)]
 pub struct X86ExecRequest {
-    pub image: X86ExecImage,
+    pub image: Box<X86ExecImage>,
     pub successor: ReservationMm,
     pub root_generation: NonZeroU64,
 }
@@ -397,9 +455,65 @@ where
     C: 'static,
     F: X86ExecFrames,
 {
-    // No x86 exec service yet: the ring's counted ENOSYS (#1093 S4c).
-    let _ = (cpu, request, preparations, stock, frames, roots, zone);
-    Ok(X86ExecStage::Refused(LINUX_ENOSYS))
+    let root = SuccessorRoot {
+        roots,
+        zone,
+        successor: request.successor,
+    };
+    let demand = request.image.demand();
+    // Observed before the probe, so a return that lands after the refusal
+    // is never missed.
+    let observed = stock.table_release();
+    let (released, admitted) = ExecCrossingOrder::on_stopped(cpu, preparations, stock)
+        .preparations(|preparations| preparations.get(request.successor).is_none());
+    if !admitted {
+        return Err(fail("exec successor already prepared"));
+    }
+    let (rooted, imported) = released.root_release(|| root.import(&request.image));
+    match imported {
+        Ok(()) => {}
+        Err(refusal @ (Refusal::Busy | Refusal::Stale)) => return Err(root_fault(refusal)),
+        Err(_) => return Ok(X86ExecStage::Refused(LINUX_ENOMEM)),
+    }
+    let (bound, ()) = rooted.bind_zone(|| ());
+    let reserved = bound.fork_stock(|stock| stock.reserve_successor_tables(demand.tables));
+    let tables = match reserved {
+        Ok(tables) => tables,
+        Err(ForkStockServiceError::SuccessorTableCapacity) => {
+            root.abort().map_err(root_fault)?;
+            return Ok(X86ExecStage::Parked(ParkedX86Exec { request, observed }));
+        }
+        Err(error) => {
+            root.abort().map_err(root_fault)?;
+            return Err(fail(format!("exec successor tables: {error:?}")));
+        }
+    };
+    let owner = carrick_hal::GuestFrameOwner {
+        native_mm: MmGeneration::new(
+            NonZeroU64::new(request.successor.raw()).ok_or_else(|| fail("exec successor MM"))?,
+        ),
+        root_generation: ContextGeneration::new(request.root_generation),
+    };
+    let data = match frames.stage(demand.data, owner) {
+        Ok(data) => data,
+        Err(error) => {
+            stock.return_successor_tables(tables);
+            root.abort().map_err(root_fault)?;
+            return Err(error);
+        }
+    };
+    let preparation = X86ExecPreparation {
+        request,
+        tables,
+        data,
+    };
+    let (backing, entry) = preparation
+        .seal()
+        .ok_or_else(|| fail("exec successor without a root table"))?;
+    preparations
+        .prepared
+        .insert(preparation.request.successor.raw(), preparation);
+    Ok(X86ExecStage::Staged(backing, entry))
 }
 
 /// Return a retained preparation no build has used: its tables to the
