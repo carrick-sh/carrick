@@ -2841,3 +2841,52 @@ fn only_returned_tables_advance_the_stock_release() {
     commit(&mut stock, parent(), granted, 1, 0).unwrap();
     assert!(stock.released_since(returned));
 }
+
+/// #1093 S4c slice c: a waiter enrolled on the release a refused
+/// reservation observed hears of the holder's return exactly once, and
+/// taking pages never wakes it; one enrolled after a return already landed
+/// is woken by its enrolment probe, never left waiting for the next.
+#[test]
+fn an_enrolled_waiter_is_woken_once_by_the_holder_return() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let waiter = |wakes: &Arc<AtomicUsize>| {
+        let wakes = Arc::clone(wakes);
+        StockReleaseWake::new(move || {
+            wakes.fetch_add(1, Ordering::AcqRel);
+        })
+    };
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
+    let observed = stock.table_release();
+    assert_eq!(
+        stock.reserve_successor_tables(3),
+        Err(ForkStockServiceError::SuccessorTableCapacity)
+    );
+    let wakes = Arc::new(AtomicUsize::new(0));
+    assert!(!stock.enrol_release(observed, waiter(&wakes)));
+    assert_eq!(stock.release_waiters(), 1);
+    let taken = stock.reserve_successor_tables(1).unwrap();
+    assert_eq!(wakes.load(Ordering::Acquire), 0, "taking wakes nobody");
+
+    let mut abort = ForkStockSettlement::abort(granted);
+    stock
+        .settle(
+            &mut NoTableLedger,
+            parent(),
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(wakes.load(Ordering::Acquire), 1, "the abort woke it");
+    assert_eq!(stock.release_waiters(), 0);
+    stock.return_successor_tables(taken);
+    assert_eq!(wakes.load(Ordering::Acquire), 1, "woken once");
+
+    let late = Arc::new(AtomicUsize::new(0));
+    assert!(stock.enrol_release(observed, waiter(&late)));
+    assert_eq!(late.load(Ordering::Acquire), 1);
+    assert_eq!(stock.release_waiters(), 0);
+}

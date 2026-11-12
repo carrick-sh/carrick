@@ -525,10 +525,12 @@ fn booted_production_carrier(
 /// table grants it left unused), stages its data frames in the carrier's
 /// frame inventory and memory, and imports its rows into a closed successor
 /// root in the guest's real CPL0 tables; an unused preparation returns
-/// whole. While a holder has the stock it parks with nothing reserved and
-/// no errno, stays parked when probed early, and stages after the release.
+/// whole. While a holder has the stock it parks with nothing reserved, no
+/// errno and its wake enrolled on the stock's release; the holder's return
+/// delivers that wake, and only then does one probe hand back the rerun.
 #[test]
 fn production_exec_service_stages_parks_and_reruns_a_successor() {
+    use carrick_hal::fork_stock::StockReleaseWake;
     use carrick_x86_cpl0_host::cpl0_boot::exec_service::{
         X86ExecImage, X86ExecRequest, X86ExecStage,
     };
@@ -553,8 +555,9 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     let stock = carrier.fork_table_stock();
     assert!(stock >= demand.tables, "boot left the stock {stock} tables");
 
-    let X86ExecStage::Staged(backing, entry) =
-        carrier.stage_exec_successor(0, request()).expect("service")
+    let X86ExecStage::Staged(backing, entry) = carrier
+        .stage_exec_successor(0, request(), StockReleaseWake::new(|| {}))
+        .expect("service")
     else {
         panic!("the stock grants the successor");
     };
@@ -573,17 +576,37 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     let held = carrier
         .fixture_hold_fork_stock(demand.tables - 1)
         .expect("hold stock");
-    let X86ExecStage::Parked(parked) = carrier.stage_exec_successor(0, request()).expect("service")
+    let (woken, wakes) = std::sync::mpsc::sync_channel(1);
+    let wake = StockReleaseWake::new(move || {
+        let _ = woken.try_send(());
+    });
+    let X86ExecStage::Parked(parked) = carrier
+        .stage_exec_successor(0, request(), wake)
+        .expect("service")
     else {
         panic!("a holder has the stock: not now");
     };
     assert_eq!(carrier.fork_table_stock(), demand.tables - 1);
     assert!(carrier.exec_reservation(successor).is_none());
-    let parked = carrier.probe_parked_exec(parked).expect_err("still held");
-    carrier.fixture_release_fork_stock(held);
+    assert_eq!(carrier.fork_stock_release_waiters(), 1, "enrolled");
+    assert!(wakes.try_recv().is_err(), "nothing has returned yet");
+    let carrier = std::thread::scope(|scope| {
+        let releaser = scope.spawn(move || {
+            carrier.fixture_release_fork_stock(held);
+            carrier
+        });
+        wakes
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the holder's return wakes the enrolled exec");
+        releaser.join().expect("releaser")
+    });
+    let mut carrier = carrier;
+    assert_eq!(carrier.fork_stock_release_waiters(), 0, "woken once");
     let rerun = carrier.probe_parked_exec(parked).expect("released");
     assert!(matches!(
-        carrier.stage_exec_successor(0, rerun).expect("service"),
+        carrier
+            .stage_exec_successor(0, rerun, StockReleaseWake::new(|| {}))
+            .expect("service"),
         X86ExecStage::Staged(..)
     ));
     assert_eq!(carrier.fork_table_stock(), stock - demand.tables);
