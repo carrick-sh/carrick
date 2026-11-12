@@ -44,6 +44,9 @@ pub struct DispatchMmAuthority {
     /// vvar frame is already COW-split by the HVPatch RNG-generation
     /// re-stamp, `trap.rs:11281`).
     pub(in crate::dispatch) vvar_realtime_epoch: std::sync::atomic::AtomicU64,
+    /// Serializes every settlement of this MM's owed EL1 returns
+    /// (`carrick_hal::return_settlement`).
+    pub(in crate::dispatch) return_settlement: carrick_hal::return_settlement::SettlementLock,
 }
 
 impl DispatchMmAuthority {
@@ -59,6 +62,7 @@ impl DispatchMmAuthority {
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
+            return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
         }
     }
 
@@ -74,6 +78,7 @@ impl DispatchMmAuthority {
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
+            return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
         }
     }
 
@@ -99,6 +104,7 @@ impl DispatchMmAuthority {
                 self.vvar_realtime_epoch
                     .load(std::sync::atomic::Ordering::Acquire),
             ),
+            return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
         }
     }
 
@@ -128,6 +134,7 @@ impl DispatchMmAuthority {
                 // through the COW split, and re-stamps on its next syscall
                 // only once a `clock_settime` has moved the global epoch.
                 vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
+                return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
             },
             revision,
             ranges,
@@ -185,6 +192,7 @@ impl DispatchMmAuthority {
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
+            return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
         }
     }
 

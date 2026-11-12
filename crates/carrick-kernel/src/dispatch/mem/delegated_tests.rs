@@ -5311,7 +5311,7 @@ fn delegated_fork_owner_refuses_stock_and_owed_returns_before_publication() {
         "preparation creates only an unswitchable child identity, not a host snapshot"
     );
     assert!(
-        !root.lock().fork_settled(),
+        !root.owed().is_empty(),
         "only the owner decides whether its outstanding stock/returns permit publication"
     );
     let mut memory = CountingMmapMemory::new(base, (2 * STOCK_WINDOW) as usize);
