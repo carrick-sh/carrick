@@ -788,8 +788,8 @@ pub enum UnclaimedNativeSyscall {
 
 /// The one place that decides an unclaimed native syscall's route, so a
 /// future unclaimed ordinal is covered too. Both of an owned native entry's
-/// unclaimed exits ask it: an unclaimed exec ([`arm_native_service_exit`])
-/// and a syscall no ring stage served ([`native_unstaged_exit`]). x86 CPL0
+/// unclaimed exits ask it: an unclaimed exec (`arm_native_service_exit`)
+/// and a syscall no ring stage served (`native_unstaged_exit`). x86 CPL0
 /// asks it for a call its Forward arm would send to a host task.
 pub fn unclaimed_native_syscall(
     owner: super::native_process_runtime::NativeThreadGroupOwner,
