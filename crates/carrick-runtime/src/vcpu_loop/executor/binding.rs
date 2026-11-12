@@ -353,10 +353,86 @@ pub struct ExecutorSubmissionContext<'a> {
     pub(crate) exec_replacement: Option<PendingExecReplacement>,
 }
 
+/// A committed exec waiting for its worker to retarget, typed by the venue
+/// that installed the successor image. The Kernel transition names the
+/// successor's thread key and MM; the venue custody carries what the backend
+/// binding needs to load that successor.
 pub(crate) struct PendingExecReplacement {
-    pub(crate) transition: carrick_kernel::kernel::exec::CommittedExecTransition,
-    pub(crate) replacement_mm: Arc<crate::hvpatch::Stage1MmLease>,
-    pub(crate) retired_mm: Option<crate::hvpatch::Stage1MmRetirement>,
+    transition: carrick_kernel::kernel::exec::CommittedExecTransition,
+    venue: ExecReplacementVenue,
+}
+
+enum ExecReplacementVenue {
+    /// HVPatch stage-1: the successor's fresh MM/ASID lease and the
+    /// predecessor MM's retirement.
+    Stage1 {
+        replacement_mm: Arc<crate::hvpatch::Stage1MmLease>,
+        retired_mm: Option<crate::hvpatch::Stage1MmRetirement>,
+    },
+    /// x86 CPL0: the successor's issued task and address-context binding.
+    Cpl0 {
+        arch: carrick_hal::guest_arch_binding::GuestArchBinding,
+    },
+}
+
+impl PendingExecReplacement {
+    pub(crate) fn stage1(
+        transition: carrick_kernel::kernel::exec::CommittedExecTransition,
+        replacement_mm: Arc<crate::hvpatch::Stage1MmLease>,
+        retired_mm: Option<crate::hvpatch::Stage1MmRetirement>,
+    ) -> Self {
+        Self {
+            transition,
+            venue: ExecReplacementVenue::Stage1 {
+                replacement_mm,
+                retired_mm,
+            },
+        }
+    }
+
+    /// The x86 venue's replacement: `arch` must name the committed
+    /// successor's MM.
+    // The x86 RootExecVenue (#2142 slice 4) publishes this; until then only
+    // the KVM retarget witness does.
+    #[allow(dead_code)]
+    pub(crate) fn cpl0(
+        transition: carrick_kernel::kernel::exec::CommittedExecTransition,
+        arch: carrick_hal::guest_arch_binding::GuestArchBinding,
+    ) -> Result<Self, TrapError> {
+        if arch.context().mm.raw() != transition.context().shared().mm().id().nonzero() {
+            return Err(TrapError::Hypervisor(
+                "CPL0 exec replacement binding names another MM".to_owned(),
+            ));
+        }
+        Ok(Self {
+            transition,
+            venue: ExecReplacementVenue::Cpl0 { arch },
+        })
+    }
+
+    /// The Kernel transition, the successor binding's venue custody, and the
+    /// predecessor retirement the worker settles after the retarget.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        carrick_kernel::kernel::exec::CommittedExecTransition,
+        ExecSuccessorCustody,
+        Option<crate::hvpatch::Stage1MmRetirement>,
+    ) {
+        match self.venue {
+            ExecReplacementVenue::Stage1 {
+                replacement_mm,
+                retired_mm,
+            } => (
+                self.transition,
+                ExecSuccessorCustody::Stage1(replacement_mm),
+                retired_mm,
+            ),
+            ExecReplacementVenue::Cpl0 { arch } => {
+                (self.transition, ExecSuccessorCustody::Cpl0(arch), None)
+            }
+        }
+    }
 }
 
 /// Borrowed worker authority passed into one engine-resident logical quantum.
@@ -534,13 +610,29 @@ impl ExecutorSubmissionContext<'_> {
     }
 }
 
+/// Venue custody a committed exec hands to its successor's task binding.
+/// Each backend's resolver accepts only its own venue.
+pub(crate) enum ExecSuccessorCustody {
+    /// HVPatch stage-1: the successor's fresh MM/ASID lease.
+    Stage1(Arc<crate::hvpatch::Stage1MmLease>),
+    /// x86 CPL0: the successor's issued task and address-context binding.
+    Cpl0(carrick_hal::guest_arch_binding::GuestArchBinding),
+}
+
+/// The exact successor a committed exec publishes: its thread key, execution
+/// generation, load identity, venue custody and committed Kernel context.
+pub(crate) struct ExecSuccessorRequest {
+    pub(crate) thread: ThreadKey,
+    pub(crate) generation: ExecutionGeneration,
+    pub(crate) identity: TaskLoadIdentity,
+    pub(crate) custody: Option<ExecSuccessorCustody>,
+    pub(crate) context: carrick_kernel::kernel::KernelContext,
+}
+
 pub(crate) struct ExecBindingTransition {
     pub(crate) predecessor_thread: ThreadKey,
     pub(crate) predecessor_generation: ExecutionGeneration,
-    pub(crate) successor_thread: ThreadKey,
-    pub(crate) successor_generation: ExecutionGeneration,
-    pub(crate) identity: TaskLoadIdentity,
-    pub(crate) replacement_mm: Option<Arc<crate::hvpatch::Stage1MmLease>>,
+    pub(crate) successor: ExecSuccessorRequest,
     pub(crate) authority: Option<SubmissionAuthority>,
 }
 
@@ -802,6 +894,86 @@ impl<B: PersistentTaskBinding + Send + Sync + 'static> TaskBindingDirectory<B> {
             directory: Arc::clone(self),
             key,
             armed: true,
+        })
+    }
+
+    /// Swap the predecessor's combined record for its exec successor under
+    /// one directory lock. `successor` builds the backend binding from the
+    /// predecessor's; the scheduler re-keys the running submission authority
+    /// to the successor; then the successor record is published active and
+    /// the predecessor's is retired. Any refusal restores the predecessor
+    /// record unchanged.
+    pub(crate) fn replace_exec_with(
+        &self,
+        scheduler: &Scheduler,
+        transition: ExecBindingTransition,
+        successor: impl FnOnce(&B, ExecSuccessorRequest) -> Result<B, TrapError>,
+    ) -> Result<ExecBindingReplacement<B>, TrapError> {
+        let ExecBindingTransition {
+            predecessor_thread,
+            predecessor_generation,
+            successor: request,
+            authority,
+        } = transition;
+        let successor_thread = request.thread;
+        let successor_generation = request.generation;
+        if request.context.thread().key() != successor_thread
+            || request.context.shared().mm().id() != request.identity.mm
+        {
+            return Err(TrapError::Hypervisor(
+                "exec replacement context differs from its successor identity".to_owned(),
+            ));
+        }
+        let mut bindings = self.bindings.lock();
+        if bindings.contains_key(&(successor_thread, successor_generation)) {
+            return Err(TrapError::Hypervisor(
+                "exec replacement binding already exists".to_owned(),
+            ));
+        }
+        let mut record = bindings
+            .remove(&(predecessor_thread, predecessor_generation))
+            .ok_or_else(|| TrapError::Hypervisor("missing predecessor exec binding".to_owned()))?;
+        if record.authority.is_some() {
+            bindings.insert((predecessor_thread, predecessor_generation), record);
+            return Err(TrapError::Hypervisor(
+                "exec replacement found authority outside running quantum".to_owned(),
+            ));
+        }
+        let replacement = match successor(&record.binding, request) {
+            Ok(replacement) => Arc::new(replacement),
+            Err(error) => {
+                bindings.insert((predecessor_thread, predecessor_generation), record);
+                return Err(error);
+            }
+        };
+        let authority = match authority {
+            Some(authority) => match authority.replace_exec_exact(
+                scheduler,
+                predecessor_thread,
+                predecessor_generation,
+                successor_thread,
+                successor_generation,
+            ) {
+                Ok(authority) => Some(authority),
+                Err((error, authority)) => {
+                    record.authority = Some(authority);
+                    bindings.insert((predecessor_thread, predecessor_generation), record);
+                    return Err(TrapError::Hypervisor(error.to_string()));
+                }
+            },
+            None => None,
+        };
+        bindings.insert(
+            (successor_thread, successor_generation),
+            TaskBindingRecord {
+                binding: Arc::clone(&replacement),
+                authority: None,
+                active: true,
+            },
+        );
+        Ok(ExecBindingReplacement {
+            binding: replacement,
+            authority,
         })
     }
 
@@ -1273,82 +1445,30 @@ impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
         transition: ExecBindingTransition,
     ) -> Result<ExecBindingReplacement<crate::vcpu_loop::continuation::HvpatchTaskBinding>, TrapError>
     {
-        let ExecBindingTransition {
-            predecessor_thread,
-            predecessor_generation,
-            successor_thread,
-            successor_generation,
-            identity,
-            replacement_mm,
-            authority,
-        } = transition;
-        let mut bindings = self.bindings.lock();
-        if bindings.contains_key(&(successor_thread, successor_generation)) {
-            return Err(TrapError::Hypervisor(
-                "exec replacement binding already exists".to_owned(),
-            ));
-        }
-        let mut record = bindings
-            .remove(&(predecessor_thread, predecessor_generation))
-            .ok_or_else(|| TrapError::Hypervisor("missing predecessor exec binding".to_owned()))?;
-        if record.authority.is_some() {
-            bindings.insert((predecessor_thread, predecessor_generation), record);
-            return Err(TrapError::Hypervisor(
-                "exec replacement found authority outside running quantum".to_owned(),
-            ));
-        }
-        let replacement_result = match replacement_mm {
-            Some(replacement_mm) => record
-                .binding
-                .replacement_with_stage1_mm(identity, replacement_mm),
-            None => {
-                #[cfg(test)]
-                {
-                    Ok(record.binding.replacement(identity))
+        self.replace_exec_with(
+            scheduler,
+            transition,
+            |predecessor, successor| match successor.custody {
+                Some(ExecSuccessorCustody::Stage1(replacement_mm)) => {
+                    predecessor.replacement_with_stage1_mm(successor.identity, replacement_mm)
                 }
-                #[cfg(not(test))]
-                {
-                    Err(TrapError::Hypervisor(
-                        "production exec replacement omitted fresh stage-1/ASID lease".to_owned(),
-                    ))
-                }
-            }
-        };
-        let replacement = match replacement_result {
-            Ok(replacement) => Arc::new(replacement),
-            Err(error) => {
-                bindings.insert((predecessor_thread, predecessor_generation), record);
-                return Err(error);
-            }
-        };
-        let authority = match authority {
-            Some(authority) => match authority.replace_exec_exact(
-                scheduler,
-                predecessor_thread,
-                predecessor_generation,
-                successor_thread,
-                successor_generation,
-            ) {
-                Ok(authority) => Some(authority),
-                Err((error, authority)) => {
-                    record.authority = Some(authority);
-                    bindings.insert((predecessor_thread, predecessor_generation), record);
-                    return Err(TrapError::Hypervisor(error.to_string()));
+                Some(ExecSuccessorCustody::Cpl0(_)) => Err(TrapError::Hypervisor(
+                    "HVPatch exec replacement refused CPL0 custody".to_owned(),
+                )),
+                None => {
+                    #[cfg(test)]
+                    {
+                        Ok(predecessor.replacement(successor.identity))
+                    }
+                    #[cfg(not(test))]
+                    {
+                        Err(TrapError::Hypervisor(
+                            "production exec replacement omitted fresh stage-1/ASID lease"
+                                .to_owned(),
+                        ))
+                    }
                 }
             },
-            None => None,
-        };
-        bindings.insert(
-            (successor_thread, successor_generation),
-            TaskBindingRecord::<crate::vcpu_loop::continuation::HvpatchTaskBinding> {
-                binding: Arc::clone(&replacement),
-                authority: None,
-                active: true,
-            },
-        );
-        Ok(ExecBindingReplacement {
-            binding: replacement,
-            authority,
-        })
+        )
     }
 }

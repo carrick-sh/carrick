@@ -130,11 +130,37 @@ fn try_run_program_with_dispatcher_image(
     carrick_runtime::prepare::PreparedKvmPoolOutcome,
     carrick_runtime::prepare::PreparedKvmPoolFailure,
 > {
+    let (carrier, root) =
+        boot_program_carrier(program, affinity, configure, &dispatcher, production_image);
+    carrick_runtime::prepare::try_run_prepared_kvm_pool(carrier, root, dispatcher, max_exits)
+}
+
+/// Load the issued root of a booted production carrier on a real KVM
+/// executor and retarget it to a committed `execve` successor (#2142).
+#[allow(dead_code)]
+pub fn witness_exec_retarget(elf: &[u8]) -> carrick_runtime::prepare::KvmExecRetargetWitness {
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let (carrier, root) =
+        boot_program_carrier(&program, ROOT_AFFINITY_ANY, |_| {}, &dispatcher, None);
+    carrick_runtime::prepare::witness_kvm_exec_retarget(carrier, root, dispatcher)
+        .expect("KVM exec retarget witness")
+}
+
+/// Boot the production carrier for `program` with its issued root bound and
+/// its initial MM loaded, stopped before any executor runs it.
+fn boot_program_carrier(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    affinity: u64,
+    configure: impl FnOnce(&mut Cpl0Carrier),
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    production_image: Option<&[u8]>,
+) -> (Cpl0Carrier, carrick_kernel::kernel::KernelContext) {
     let image = prepare_x86_elf(program).expect("x86 ELF program");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
     let inventory = physical_inventory();
-    let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher);
+    let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(dispatcher);
     let mut carrier = match production_image {
         Some(image) => Cpl0Carrier::boot_production_image(inventory, image, extent, ipc),
         None => Cpl0Carrier::boot_production(inventory, extent, ipc),
@@ -182,7 +208,7 @@ fn try_run_program_with_dispatcher_image(
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial guest MM");
     configure(&mut carrier);
-    carrick_runtime::prepare::try_run_prepared_kvm_pool(carrier, root, dispatcher, max_exits)
+    (carrier, root)
 }
 
 /// Assemble one `tests/fixtures` guest source into a static ELF.

@@ -53,7 +53,10 @@ use super::{
     ExecutorSubmissionContext, GuestIdleExit, PersistentExecutor, PersistentExecutorFactory,
     RunnableTask, SavedRunnable, SettledIdleSlot,
 };
-use super::{PersistentTaskBinding, TaskBindingDirectory, TaskBindingResolver, TaskLoadIdentity};
+use super::{
+    ExecBindingReplacement, ExecBindingTransition, ExecSuccessorCustody, PersistentTaskBinding,
+    TaskBindingDirectory, TaskBindingResolver, TaskLoadIdentity,
+};
 
 use super::super::signal_ingress_producer::{HostIngressTarget, HostSignalIngressProducer};
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
@@ -86,11 +89,53 @@ pub(crate) struct Cpl0PersistentExecutorFactory<M: CarrierCpuIo, Mem: CarrierMem
     max_idle_exits: usize,
     stats: Arc<Cpl0ForwardStats>,
     scheduler: Arc<Scheduler>,
-    root_binding: Arc<Cpl0TaskBinding>,
+    root_binding: Arc<Cpl0RootBinding>,
     host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
     #[cfg(feature = "kvm-pool-test-control")]
     loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
+}
+
+/// The run root's current task binding, shared by every executor of one
+/// carrier. The idle lane serves root forwards and host files with it, so a
+/// root `execve` replaces it for all executors at once.
+pub(crate) struct Cpl0RootBinding(Mutex<Arc<Cpl0TaskBinding>>);
+
+impl Cpl0RootBinding {
+    pub(crate) fn new(root: Arc<Cpl0TaskBinding>) -> Self {
+        Self(Mutex::new(root))
+    }
+
+    pub(crate) fn current(&self) -> Result<Arc<Cpl0TaskBinding>, TrapError> {
+        self.0
+            .lock()
+            .map(|root| Arc::clone(&root))
+            .map_err(|_| TrapError::Hypervisor("CPL0 root binding poisoned".into()))
+    }
+
+    /// Replace the exact predecessor root with its exec successor once
+    /// `rebind` has moved the physical root custody. A predecessor that is
+    /// no longer the root is stale: `rebind` does not run and nothing
+    /// changes.
+    fn replace_exec(
+        &self,
+        predecessor: &Arc<Cpl0TaskBinding>,
+        successor: Arc<Cpl0TaskBinding>,
+        rebind: impl FnOnce() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        let mut root = self
+            .0
+            .lock()
+            .map_err(|_| TrapError::Hypervisor("CPL0 root binding poisoned".into()))?;
+        if !Arc::ptr_eq(&root, predecessor) {
+            return Err(TrapError::Hypervisor(
+                "CPL0 exec retarget names a stale root binding".into(),
+            ));
+        }
+        rebind()?;
+        *root = successor;
+        Ok(())
+    }
 }
 
 enum BoundReadiness {
@@ -315,7 +360,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutorFactory<M, Mem
             max_idle_exits: config.max_idle_exits,
             stats: config.stats,
             scheduler: config.scheduler,
-            root_binding: config.root_binding,
+            root_binding: Arc::new(Cpl0RootBinding::new(config.root_binding)),
             host_objects: Arc::new(Mutex::new([1; 3])),
             bound_host_fds,
             #[cfg(feature = "kvm-pool-test-control")]
@@ -386,7 +431,7 @@ pub(crate) struct Cpl0PersistentExecutor<M: CarrierCpuIo, Mem: CarrierMemoryIo =
     max_idle_exits: usize,
     stats: Arc<Cpl0ForwardStats>,
     scheduler: Arc<Scheduler>,
-    root_binding: Arc<Cpl0TaskBinding>,
+    root_binding: Arc<Cpl0RootBinding>,
     binding: Option<Arc<Cpl0TaskBinding>>,
     task: Option<TaskIdentity>,
     loaded_generation: Option<ExecutionGeneration>,
@@ -627,6 +672,20 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         })
     }
 
+    /// The task binding this executor has loaded, for the KVM exec
+    /// retarget witness.
+    #[cfg(feature = "kvm-pool-test-control")]
+    pub(crate) fn loaded_binding(&self) -> Option<&Arc<Cpl0TaskBinding>> {
+        self.binding.as_ref()
+    }
+
+    /// The run root binding every executor's idle lane serves, for the KVM
+    /// exec retarget witness.
+    #[cfg(feature = "kvm-pool-test-control")]
+    pub(crate) fn root_binding(&self) -> Result<Arc<Cpl0TaskBinding>, TrapError> {
+        self.root_binding.current()
+    }
+
     fn task(&self) -> Result<TaskIdentity, TrapError> {
         self.task
             .ok_or_else(|| TrapError::Hypervisor("CPL0 executor has no loaded task".into()))
@@ -646,7 +705,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         exited: usize,
         submission: Option<&mut ExecutorSubmissionContext<'_>>,
     ) -> Result<ExecutorExit, TrapError> {
-        let binding = self.binding.as_ref().unwrap_or(&self.root_binding);
+        let root;
+        let binding = match self.binding.as_ref() {
+            Some(binding) => binding,
+            None => {
+                root = self.root_binding.current()?;
+                &root
+            }
+        };
         let authority = ForwardAuthority::of(task, binding);
         // Only the bound task may park, and only on the lease this lane holds.
         let can_block = authority == ForwardAuthority::Task && submission.is_some();
@@ -1210,11 +1276,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     TrapError::Hypervisor("KVM doorbell lost task binding".into())
                 })?;
                 let kernel = binding.kernel_binding.kernel();
+                let root = self.root_binding.current()?;
                 let status = {
-                    let mut host_file = native_host_file_server(
-                        &self.dispatcher,
-                        &self.root_binding.host_root_resources,
-                    );
+                    let mut host_file =
+                        native_host_file_server(&self.dispatcher, &root.host_root_resources);
                     self.physical.service_physical_doorbell_with_host_file(
                         task,
                         &stopped.exit,
@@ -1267,11 +1332,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         match self.physical.run_idle_peer()? {
             exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
                 let kernel = self.scheduler.kernel();
+                let root = self.root_binding.current()?;
                 let status = {
-                    let mut host_file = native_host_file_server(
-                        &self.dispatcher,
-                        &self.root_binding.host_root_resources,
-                    );
+                    let mut host_file =
+                        native_host_file_server(&self.dispatcher, &root.host_root_resources);
                     self.physical.service_idle_peer_doorbell_with_host_file(
                         &exit,
                         |served, doorbell| {
@@ -1398,6 +1462,43 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutor for Cpl0Persisten
         )
     }
 
+    /// Follow the loaded run root to its `execve` successor. The directory
+    /// already published the successor's record and the predecessor gave up
+    /// its terminal role; the physical CPU custody, the carrier's root
+    /// binding and forward leader rule, and this executor's root binding and
+    /// loaded task all move to the successor together, or none does.
+    fn retarget_loaded_task(&mut self, successor: Arc<Self::TaskBinding>) -> Result<(), TrapError> {
+        let predecessor = self
+            .binding
+            .clone()
+            .ok_or_else(|| TrapError::Hypervisor("CPL0 exec retarget has no loaded task".into()))?;
+        if self.task != Some(predecessor.arch().task())
+            || self.loaded_generation != Some(predecessor.generation())
+        {
+            return Err(TrapError::Hypervisor(
+                "CPL0 exec retarget lost its loaded predecessor".into(),
+            ));
+        }
+        if !predecessor.is_exec_transferred() || successor.is_exec_transferred() {
+            return Err(TrapError::Hypervisor(
+                "CPL0 exec retarget requires a transferred predecessor and a live successor".into(),
+            ));
+        }
+        let root = Arc::clone(&self.root_binding);
+        let physical = &mut self.physical;
+        root.replace_exec(&predecessor, Arc::clone(&successor), || {
+            physical.retarget_root_exec(
+                predecessor.arch(),
+                successor.arch(),
+                successor.thread.serial.raw(),
+            )
+        })?;
+        self.task = Some(successor.arch().task());
+        self.loaded_generation = Some(successor.generation());
+        self.binding = Some(successor);
+        Ok(())
+    }
+
     fn save(
         &mut self,
         mut lease: ThreadExecutionLease,
@@ -1503,6 +1604,11 @@ pub(crate) struct Cpl0TaskBinding {
     identity: TaskLoadIdentity,
     arch: GuestArchBinding,
     thread: ThreadKey,
+    generation: ExecutionGeneration,
+    /// Set once when an `execve` successor takes over this binding's task.
+    /// A transferred binding is stale: it refuses every saved image and
+    /// cannot mint a second successor.
+    exec_transferred: AtomicBool,
     kernel_binding: KernelTaskBinding,
     host_root_resources: carrick_kernel::dispatch::resources::HostRootResources,
     retained: Mutex<Option<RetainedForward>>,
@@ -1615,6 +1721,27 @@ impl Cpl0TaskBinding {
         if state.mm != identity.mm
             || state.cpu.guest_abi() != identity.abi
             || state.cpu.version() != identity.version
+        {
+            return Err(TrapError::Hypervisor(
+                "CPL0 task binding differs from the issued kernel root".to_owned(),
+            ));
+        }
+        let binding = Self::issue(context, identity, arch, generation)?;
+        binding.validate_task_state(state)?;
+        Ok(binding)
+    }
+
+    /// The binding of `context`'s task at `generation`, loading `identity`
+    /// through the issued x86 `arch` binding.
+    fn issue(
+        context: &KernelContext,
+        identity: TaskLoadIdentity,
+        arch: GuestArchBinding,
+        generation: ExecutionGeneration,
+    ) -> Result<Self, TrapError> {
+        if identity.mm != context.shared().mm().id()
+            || arch.context().mm.raw() != identity.mm.nonzero()
+            || arch.context().generation.raw().get() != identity.asid_generation
             || arch.task().task.raw().get() != context.task().key().serial.raw()
             || arch.task().execution.raw().get() != generation.raw()
         {
@@ -1622,10 +1749,12 @@ impl Cpl0TaskBinding {
                 "CPL0 task binding differs from the issued kernel root".to_owned(),
             ));
         }
-        let binding = Self {
+        Ok(Self {
             identity,
             arch,
             thread: context.thread().key(),
+            generation,
+            exec_transferred: AtomicBool::new(false),
             kernel_binding: context.task_binding(),
             host_root_resources: carrick_kernel::dispatch::resources::HostRootResources::capture(
                 context,
@@ -1633,13 +1762,58 @@ impl Cpl0TaskBinding {
             retained: Mutex::new(None),
             kernel_stack: Mutex::new(None),
             futex: Arc::new(carrick_thread::thread::FutexTable::new()),
-        };
-        binding.validate_task_state(state)?;
-        Ok(binding)
+        })
+    }
+
+    /// The binding of this task's `execve` successor: the committed
+    /// `context`, its new MM/ASID `identity`, and the successor `arch`
+    /// binding admitted against this one. Exec keeps the task and replaces
+    /// its address space, so the successor starts with no retained forward,
+    /// saved kernel stack or futex waiters.
+    fn exec_successor(
+        &self,
+        context: &KernelContext,
+        identity: TaskLoadIdentity,
+        arch: GuestArchBinding,
+        generation: ExecutionGeneration,
+    ) -> Result<Self, TrapError> {
+        if self.is_exec_transferred()
+            || identity.abi != self.identity.abi
+            || identity.version != self.identity.version
+            || context.task().key() != self.kernel_binding.task_key()
+        {
+            return Err(TrapError::Hypervisor(
+                "CPL0 exec successor names another task or a stale predecessor".to_owned(),
+            ));
+        }
+        if self
+            .retained
+            .lock()
+            .map_err(|_| TrapError::Hypervisor("CPL0 retained frame poisoned".into()))?
+            .is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "CPL0 exec predecessor still retains a blocked forward".to_owned(),
+            ));
+        }
+        Self::issue(
+            context,
+            identity,
+            self.arch.exec_successor(arch)?,
+            generation,
+        )
+    }
+
+    fn is_exec_transferred(&self) -> bool {
+        self.exec_transferred.load(Ordering::Acquire)
     }
 
     pub(crate) const fn arch(&self) -> GuestArchBinding {
         self.arch
+    }
+
+    pub(crate) const fn generation(&self) -> ExecutionGeneration {
+        self.generation
     }
 
     pub(crate) fn futex(&self) -> &Arc<carrick_thread::thread::FutexTable> {
@@ -1661,6 +1835,11 @@ impl PersistentTaskBinding for Cpl0TaskBinding {
     }
 
     fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError> {
+        if self.is_exec_transferred() {
+            return Err(TrapError::Hypervisor(
+                "CPL0 binding was transferred to its exec successor".to_owned(),
+            ));
+        }
         let GuestCpuState::X86_64V1(cpu) = &state.cpu else {
             return Err(TrapError::Hypervisor(
                 "CPL0 binding received a non-x86 saved CPU".to_owned(),
@@ -1676,6 +1855,17 @@ impl PersistentTaskBinding for Cpl0TaskBinding {
             ));
         }
         self.arch.validate_x86(cpu)
+    }
+
+    fn mark_exec_transferred(&self) -> Result<(), TrapError> {
+        self.exec_transferred
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| {
+                TrapError::Hypervisor(
+                    "exec predecessor binding terminal role was already consumed".to_owned(),
+                )
+            })
     }
 }
 
@@ -1711,6 +1901,26 @@ impl TaskBindingResolver<Cpl0TaskBinding> for Cpl0TaskBindingDirectory {
 
     fn retire(&self, thread: ThreadKey, generation: ExecutionGeneration) {
         TaskBindingDirectory::retire(self, thread, generation);
+    }
+
+    fn replace_exec(
+        &self,
+        scheduler: &Scheduler,
+        transition: ExecBindingTransition,
+    ) -> Result<ExecBindingReplacement<Cpl0TaskBinding>, TrapError> {
+        self.replace_exec_with(scheduler, transition, |predecessor, successor| {
+            let Some(ExecSuccessorCustody::Cpl0(arch)) = successor.custody else {
+                return Err(TrapError::Hypervisor(
+                    "CPL0 exec replacement requires the successor's x86 binding".to_owned(),
+                ));
+            };
+            predecessor.exec_successor(
+                &successor.context,
+                successor.identity,
+                arch,
+                successor.generation,
+            )
+        })
     }
 }
 

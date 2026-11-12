@@ -281,6 +281,102 @@ where
     }
 }
 
+/// The running predecessor a committed exec retargets away from.
+pub(crate) struct ExecRetargetPredecessor<'a, B> {
+    pub(crate) binding: &'a Arc<B>,
+    pub(crate) thread: ThreadKey,
+    pub(crate) generation: ExecutionGeneration,
+}
+
+/// Move this worker's running claim, combined binding record and loaded
+/// backend task to a committed exec's successor, inside the scheduler's
+/// retarget transaction. Returns the successor's binding record and the
+/// venue's predecessor retirement. The Kernel has already published the
+/// successor image, so any failure would split worker authority and is
+/// fatal.
+pub(crate) fn retarget_exec_replacement<F, R>(
+    scheduler: &Scheduler,
+    resolver: &R,
+    backend: &mut F,
+    running: &mut carrick_kernel::kernel::RunnableThread,
+    predecessor: ExecRetargetPredecessor<'_, F::TaskBinding>,
+    replacement: PendingExecReplacement,
+    lease: carrick_kernel::kernel::objects::ThreadExecutionLease,
+    authority: Option<carrick_kernel::kernel::SubmissionAuthority>,
+) -> (
+    ExecBindingReplacement<F::TaskBinding>,
+    Option<crate::hvpatch::Stage1MmRetirement>,
+)
+where
+    F: PersistentExecutor,
+    R: TaskBindingResolver<F::TaskBinding> + ?Sized,
+{
+    let executor_id = running.executor();
+    let (transition, custody, retired_mm) = replacement.into_parts();
+    let successor_generation = lease.generation();
+    let binding = predecessor.binding;
+    let replacement_record =
+        scheduler.retarget_running_exec(running, transition, lease, |committed| {
+            backend.validate_loaded_hardware_identity()?;
+            let identity = TaskLoadIdentity {
+                abi: binding.load_identity().abi,
+                version: binding.load_identity().version,
+                mm: committed.successor_mm,
+                asid_generation: committed.successor_asid_generation,
+            };
+            let replacement_record = resolver.replace_exec(
+                scheduler,
+                ExecBindingTransition {
+                    predecessor_thread: predecessor.thread,
+                    predecessor_generation: predecessor.generation,
+                    successor: ExecSuccessorRequest {
+                        thread: committed.successor_thread,
+                        generation: successor_generation,
+                        identity,
+                        custody: Some(custody),
+                        context: committed.context().retain_exact(),
+                    },
+                    authority,
+                },
+            )?;
+            binding.mark_exec_transferred()?;
+            if backend
+                .retarget_loaded_task(Arc::clone(&replacement_record.binding))
+                .is_err()
+            {
+                // The combined record now names the replacement;
+                // allowing the old Arc to receive saved state would
+                // split immutable MM/ASID identity.
+                carrick_fatal!(
+                    "vcpu_loop::executor_exec_transfer",
+                    "backend task retarget failed during exec transfer: executor_id={:?}",
+                    executor_id
+                );
+            }
+            Ok(replacement_record)
+        });
+    let replacement_record = replacement_record.and_then(|replacement| {
+        backend.refresh_loaded_affinity(running.thread())?;
+        Ok(replacement)
+    });
+    match replacement_record {
+        Ok(replacement) => (replacement, retired_mm),
+        Err(error) => {
+            // Kernel exec has already published the replacement
+            // image/thread. Returning through predecessor failure
+            // cleanup would orphan the active successor and its
+            // authority. This is a split-authority invariant loss,
+            // so fail-stop the carrier rather than resume either
+            // image.
+            carrick_fatal!(
+                "vcpu_loop::executor_exec_transfer",
+                "worker-owned exec retarget failed after kernel published successor image: executor_id={:?}, error={error}",
+                executor_id
+            );
+        }
+    }
+}
+
 fn run_executor_loop<F, R>(
     scheduler: &Arc<Scheduler>,
     resolver: &Arc<R>,
@@ -603,76 +699,22 @@ where
             let (settlement_auth, is_consumed) = match authority {
                 TakenExecutionAuthority::Live(lease) => {
                     if let Some(replacement) = exec_replacement {
-                        let PendingExecReplacement {
-                            transition,
-                            replacement_mm,
-                            retired_mm,
-                        } = replacement;
-                        let predecessor_thread = thread;
-                        let predecessor_generation = generation;
                         let successor_generation = lease.generation();
                         let authority = submission_authority.take();
-                        let replacement_record = scheduler.retarget_running_exec(
+                        let (replacement_record, retired_mm) = retarget_exec_replacement(
+                            scheduler,
+                            resolver.as_ref(),
+                            backend,
                             &mut running,
-                            transition,
-                            lease,
-                            |committed| {
-                                backend.validate_loaded_hardware_identity()?;
-                                let identity = TaskLoadIdentity {
-                                    abi: binding.load_identity().abi,
-                                    version: binding.load_identity().version,
-                                    mm: committed.successor_mm,
-                                    asid_generation: committed.successor_asid_generation,
-                                };
-                                let replacement_record = resolver.replace_exec(
-                                    scheduler,
-                                    ExecBindingTransition {
-                                        predecessor_thread,
-                                        predecessor_generation,
-                                        successor_thread: committed.successor_thread,
-                                        successor_generation,
-                                        identity,
-                                        replacement_mm: Some(Arc::clone(&replacement_mm)),
-                                        authority,
-                                    },
-                                )?;
-                                binding.mark_exec_transferred()?;
-                                if backend
-                                    .retarget_loaded_task(Arc::clone(&replacement_record.binding))
-                                    .is_err()
-                                {
-                                    // The combined record now names the replacement;
-                                    // allowing the old Arc to receive saved state would
-                                    // split immutable MM/ASID identity.
-                                    carrick_fatal!(
-                                        "vcpu_loop::executor_exec_transfer",
-                                        "backend task retarget failed during exec transfer: executor_id={:?}",
-                                        executor_id
-                                    );
-                                }
-                                Ok(replacement_record)
+                            ExecRetargetPredecessor {
+                                binding: &binding,
+                                thread,
+                                generation,
                             },
+                            replacement,
+                            lease,
+                            authority,
                         );
-                        let replacement_record = replacement_record.and_then(|replacement| {
-                            backend.refresh_loaded_affinity(running.thread())?;
-                            Ok(replacement)
-                        });
-                        let replacement_record = match replacement_record {
-                            Ok(replacement) => replacement,
-                            Err(error) => {
-                                // Kernel exec has already published the replacement
-                                // image/thread. Returning through predecessor failure
-                                // cleanup would orphan the active successor and its
-                                // authority. This is a split-authority invariant loss,
-                                // so fail-stop the carrier rather than resume either
-                                // image.
-                                carrick_fatal!(
-                                    "vcpu_loop::executor_exec_transfer",
-                                    "worker-owned exec retarget failed after kernel published successor image: executor_id={:?}, error={error}",
-                                    executor_id
-                                );
-                            }
-                        };
                         binding = replacement_record.binding;
                         pending_exec_retirement = retired_mm;
                         pending_exec_cleanup = true;
