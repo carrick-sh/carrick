@@ -3992,10 +3992,9 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     }
 }
 
-/// The IPC transfer capability for this entry (#1756): the running record's
-/// park/wake boundary over the shared transfer engine. Only ARM's scheduler
-/// builds one. x86 builds none (its zone stays `None` here), so an x86
-/// in-ring transfer remains the counted refusal until its capability exists.
+/// ARM scheduler transport for the shared IPC transfer engine. Source-backed
+/// native entries use NativeIpcExecution through ipc_transfer_native instead;
+/// neither transport changes the descriptor or operation owner.
 #[allow(clippy::type_complexity)]
 fn ipc_execution<'s, 'z: 's, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>(
     frame: &'s mut G,
@@ -4320,7 +4319,7 @@ impl<
     }
 
     #[inline(never)]
-    fn ipc_poll_transfer_native(&mut self) -> FamilyCompletion {
+    fn ipc_transfer_native(&mut self) -> FamilyCompletion {
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
@@ -4368,13 +4367,21 @@ impl<
             input_wait: None,
         };
         let mut output = None;
-        let disposition = ipc::serve_single_zone_ppoll(
-            &mut exec,
-            &mut *self.frame,
-            venue,
-            &mut user,
-            &mut output,
-        );
+        let mut sigpipe_owed = false;
+        let disposition = if ordinal.raw() == 73 {
+            ipc::serve_single_zone_ppoll(&mut exec, &mut *self.frame, venue, &mut user, &mut output)
+        } else {
+            let (disposition, owed) = ipc::serve_ipc_with_signals(
+                &mut exec,
+                &mut *self.frame,
+                venue,
+                &mut user,
+                presented.is_some(),
+                &mut || false,
+            );
+            sigpipe_owed = owed;
+            disposition
+        };
         let input_wait = user.input_wait.take();
         if let Some(receipt) = native_handoff
             && let Some(process) = self.process.as_deref_mut()
@@ -4410,6 +4417,9 @@ impl<
                     pc,
                 ),
             );
+        }
+        if sigpipe_owed {
+            raise_native_sigpipe(self.process.as_deref_mut());
         }
         let result = self.frame.result().0 as i64;
         carrick_personality_linux::dispatch::transfer_effect(
@@ -5300,6 +5310,9 @@ impl<
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
+        if !self.frame.arm_scheduler() && self.record_source().is_some() {
+            return self.ipc_transfer_native();
+        }
         let native_signals = self.process.is_some();
         let counters = self.counters;
         let Some((mut sched, frame, task)) = ipc_execution(
@@ -5377,7 +5390,7 @@ impl<
         F: Fn(u32) -> *mut u8,
     {
         if !self.frame.arm_scheduler() {
-            return self.ipc_poll_transfer_native();
+            return self.ipc_transfer_native();
         }
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;

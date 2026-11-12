@@ -21,10 +21,16 @@ The following forwarding paths still need retained owner work:
   mixed host items, output preparation, timer-slot refusal and park refusal.
 - `dispatch.rs::serve_owned_ipc_descriptor`: a host-backed epoll member and
   the shared epoll core's HostHalf refusal.
-- `dispatch.rs::ipc_transfer`: absence of the ARM scheduler execution venue.
+- `dispatch.rs::ipc_transfer`: absence of an execution venue (ARM scheduler
+  or the retained native record source).
 
-The existing neutral NativeIpcExecution used by poll is the venue to reuse
-for x86 epoll work. Its integration and packed x86 epoll_event copyout need
-production-dispatch and KVM witnesses before claiming that lane. No crossing
+The existing neutral NativeIpcExecution used by poll also serves native
+IPC transfers. The production CPL0 frame witness was red with Forward for a
+child-created epoll. It covers packed x86 epoll_event output and eventfd
+read/write through that same owner. An empty infinite wait retains an
+operation and releases the slot. The fixture places lifecycle ABI records in
+TestEl1Region storage in the production metadata address window, retaining the
+exact identity check including the live affinity source. KVM epoll-specific
+parking, signal-mask and exhaustive member-kind witnesses remain required. No crossing
 allowlist change is included. Signed Node validation, blocked-pool capacity,
 EINTR, Docker differential and signed artifact promotion remain required.

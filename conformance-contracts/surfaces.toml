@@ -376,6 +376,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.arm-ring-first-crossing" },
+  { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.epoll-zone" },
   { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.files" },
   { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.futex-handoff" },
   { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.inotify" },
