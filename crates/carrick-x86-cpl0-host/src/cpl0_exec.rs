@@ -665,9 +665,23 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         cpu: carrick_guest_arch::CpuId,
         request: X86ExecRequest,
     ) -> Result<X86ExecStage, TrapError> {
-        // Not bound on the carrier yet: the ring's counted ENOSYS.
-        let _ = (cpu, request, CarrierExecFrames::<M>::stage);
-        Ok(X86ExecStage::Refused(LINUX_ENOSYS))
+        let ram = Arc::clone(&self.ram);
+        let (roots, zone) = Self::exec_tables(&ram)?;
+        let mut frames = CarrierExecFrames {
+            vm: &mut self._vm,
+            next: &mut self.anonymous_next_gpa,
+            inventory: &self.frame_inventory,
+            rollback_fault: &self.initial_rollback_fault,
+        };
+        stage_x86_exec(
+            cpu,
+            request,
+            &mut self.exec_preparations,
+            &mut self.fork_stock,
+            &mut frames,
+            roots,
+            zone,
+        )
     }
 
     /// Return the unused preparation of `successor`; see [`release_x86_exec`].
