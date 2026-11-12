@@ -3055,6 +3055,111 @@ mod tests {
         assert_eq!(w.host().refcount(t, Fd(ep)), Ok(1));
     }
 
+    /// #1671: a native caller's refused events copy-out stays in ring.
+    /// Preparation is Busy once (the owned operation yields and returns
+    /// Ready), then Ready; the call harvests again and reports the
+    /// restored event once. Nothing leaves for the host.
+    #[test]
+    fn el1_epoll_native_copy_out_busy_once_then_prepared_never_forwards() {
+        use carrick_core::mm::transaction::{
+            CopyoutPreparation, CopyoutRequest, OwnedOperationYield,
+        };
+        use carrick_sched_core::object_wait::OperationToken;
+        struct Untouched<'a> {
+            inner: User<'a>,
+            /// The events page the owner has not yet supplied.
+            page: u64,
+            mapped: bool,
+            request: Option<CopyoutRequest>,
+            preparations: usize,
+            yields: usize,
+        }
+        impl UserCopy for Untouched<'_> {
+            fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+                self.inner.copy_in(dst, src)
+            }
+            fn copy_out(&mut self, at: u64, bytes: &[u8]) -> bool {
+                if !self.mapped && at & !(PAGE - 1) == self.page {
+                    self.request = Some(CopyoutRequest {
+                        address: carrick_guest_arch::UserVa::new(at),
+                        len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                    });
+                    return false;
+                }
+                self.inner.copy_out(at, bytes)
+            }
+            fn take_copyout_refusal(&mut self) -> Option<CopyoutRequest> {
+                self.request.take()
+            }
+            fn prepare_copyout(
+                &mut self,
+                _: CopyoutRequest,
+                operation: OperationToken,
+            ) -> CopyoutPreparation {
+                self.preparations += 1;
+                if self.preparations == 1 {
+                    return CopyoutPreparation::Busy(operation);
+                }
+                self.inner.mem.map(MM, self.page, PAGE);
+                self.mapped = true;
+                CopyoutPreparation::Ready(operation)
+            }
+            fn yield_owned_operation(&mut self, operation: OperationToken) -> OwnedOperationYield {
+                self.yields += 1;
+                OwnedOperationYield::Ready(operation)
+            }
+        }
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let e = w.eventfd(t, 0, EventMode::Counter, NONBLOCK);
+        let (ep, _) = zone_epoll(&w, t, e, 0xfeed);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.write(MM, va + 0x100, &1u64.to_ne_bytes());
+        let mut f = syscall(SYS_WRITE, e, va + 0x100, 8, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 8));
+        let events = 0x40000;
+        let mut frame = epoll_pwait(ep, events, 8, 0, A_SVC);
+        let mut user = Untouched {
+            inner: User {
+                task: &w.task,
+                mem: &w.mem,
+            },
+            page: events,
+            mapped: false,
+            request: None,
+            preparations: 0,
+            yields: 0,
+        };
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        assert_eq!(
+            serve_ipc_with_signals(&mut sched, &mut frame, &venue, &mut user, true, &mut || {
+                false
+            })
+            .0,
+            RETURNED
+        );
+        assert_eq!((frame.x[0], user.preparations, user.yields), (1, 2, 1));
+        let event = w.mem.read(MM, events, 16);
+        assert_eq!(event[..4], EPOLL_IN.to_ne_bytes());
+        assert_eq!(event[8..], 0xfeedu64.to_ne_bytes());
+        assert_eq!(leaves(&w, IpcLeave::EpollCopyOut), 0);
+        // The operation retired and dropped its pin.
+        assert_eq!(w.host().refcount(t, Fd(ep)), Ok(1));
+    }
+
     /// What the native owner stand-in saw: the armed mask, and each arm.
     struct MaskState {
         armed: core::cell::Cell<Option<u64>>,
