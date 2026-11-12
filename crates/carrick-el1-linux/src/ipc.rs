@@ -3160,6 +3160,407 @@ mod tests {
         assert_eq!(w.host().refcount(t, Fd(ep)), Ok(1));
     }
 
+    /// A native owner stand-in for a refused events copy-out: the page at
+    /// `page` is refused until the owner prepares it. Preparation answers
+    /// from `answers` (then Ready, supplying the page); an owned yield
+    /// retains the operation on the record, as the native owner's
+    /// `suspend_adapter_operation` does, and suspends. It records the
+    /// temporary mask it armed and what each post-enrollment probe saw.
+    struct NativeOwner<'a> {
+        inner: User<'a>,
+        zone: &'a ZoneTables,
+        page: u64,
+        mapped: bool,
+        request: Option<carrick_core::mm::transaction::CopyoutRequest>,
+        answers: Vec<&'static str>,
+        preparations: usize,
+        yields: usize,
+        on_yield: Option<Box<dyn FnOnce() + 'a>>,
+        mask: &'a MaskState,
+        probes: Vec<Option<u64>>,
+    }
+    impl<'a> NativeOwner<'a> {
+        fn new(w: &'a World, page: u64, mask: &'a MaskState) -> Self {
+            Self {
+                inner: User {
+                    task: &w.task,
+                    mem: &w.mem,
+                },
+                zone: &w.zone,
+                page,
+                mapped: false,
+                request: None,
+                answers: Vec::new(),
+                preparations: 0,
+                yields: 0,
+                on_yield: None,
+                mask,
+                probes: Vec::new(),
+            }
+        }
+    }
+    impl UserCopy for NativeOwner<'_> {
+        fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+            self.inner.copy_in(dst, src)
+        }
+        fn copy_out(&mut self, at: u64, bytes: &[u8]) -> bool {
+            if !self.mapped && at & !(PAGE - 1) == self.page {
+                self.request = Some(carrick_core::mm::transaction::CopyoutRequest {
+                    address: carrick_guest_arch::UserVa::new(at),
+                    len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                });
+                return false;
+            }
+            self.inner.copy_out(at, bytes)
+        }
+        fn take_copyout_refusal(
+            &mut self,
+        ) -> Option<carrick_core::mm::transaction::CopyoutRequest> {
+            self.request.take()
+        }
+        fn prepare_copyout(
+            &mut self,
+            _: carrick_core::mm::transaction::CopyoutRequest,
+            operation: OperationToken,
+        ) -> carrick_core::mm::transaction::CopyoutPreparation {
+            use carrick_core::mm::transaction::CopyoutPreparation;
+            self.preparations += 1;
+            if !self.answers.is_empty() && self.answers.remove(0) == "busy" {
+                return CopyoutPreparation::Busy(operation);
+            }
+            self.inner.mem.map(MM, self.page, PAGE);
+            self.mapped = true;
+            CopyoutPreparation::Ready(operation)
+        }
+        fn yield_owned_operation(
+            &mut self,
+            operation: OperationToken,
+        ) -> carrick_core::mm::transaction::OwnedOperationYield {
+            self.yields += 1;
+            if let Some(hook) = self.on_yield.take() {
+                hook();
+            }
+            let record = self.zone.slot(SLOT).current().unwrap();
+            carrick_core::wait::restore_object_operation(
+                self.zone,
+                SLOT,
+                self.zone.record(record).identity(),
+                operation,
+            )
+            .unwrap();
+            carrick_core::mm::transaction::OwnedOperationYield::Suspended
+        }
+        fn arm_wait_sigmask(&mut self, temporary: u64) -> bool {
+            self.mask.arms.set(self.mask.arms.get() + 1);
+            assert!(
+                self.mask.armed.replace(Some(temporary)).is_none(),
+                "armed twice"
+            );
+            true
+        }
+        fn disarm_wait_sigmask(&mut self) {
+            self.mask.armed.set(None);
+        }
+        fn interrupt_pending_wait(&mut self) -> bool {
+            self.probes.push(self.mask.armed.get());
+            false
+        }
+    }
+
+    /// #1671 review P0-1: a refused events copy-out that meets a full
+    /// operation arena is contention, "not now": the call parks on the
+    /// arena's slot release with its pin dropped (Busy once), a retirement
+    /// wakes it, and the replayed call prepares the buffer and reports the
+    /// event once. Nothing leaves for the host.
+    #[test]
+    fn el1_epoll_native_copy_out_full_operation_arena_waits_for_a_slot_never_forwards() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let e = w.eventfd(a, 1, EventMode::Counter, NONBLOCK);
+        let (ep, _) = zone_epoll(&w, a, e, 0xfeed);
+        let (r2, _w2, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.map(OTHER_MM, va, PAGE);
+        // B runs once A waits: it blocks on an empty pipe, handing back A.
+        let b_read = syscall(SYS_READ, r2, va, 16, B_SVC);
+        w.queue(202, OTHER_MM, &b_read, B_SVC);
+        let pins = w.host().refcount(a, Fd(ep)).unwrap();
+        let mut held = Vec::new();
+        while let Ok(token) = w.region.begin_operation(IpcOperation::EMPTY) {
+            held.push(token);
+        }
+        assert_eq!(held.len(), carrick_el1_abi::ipc::IPC_OPERATIONS);
+        let slots = carrick_sched_core::object_wait::ObjectWaitKey::ipc_operation_slots(
+            w.region.operation_slot_generation(),
+        )
+        .index();
+        let events = 0x40000;
+        let mut frame = epoll_pwait(ep, events, 8, 0, A_SVC);
+        let a_regs = frame.x;
+        let mask = MaskState {
+            armed: Default::default(),
+            arms: Default::default(),
+            accept: Cell::new(true),
+        };
+        let parks = w.zone.counters.el1_parks.load(Ordering::Relaxed);
+        let mut cpu = core::mem::take(&mut w.cpu);
+        let mut owner = NativeOwner::new(&w, events, &mask);
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let native = |frame: &mut TrapFrame, owner: &mut NativeOwner<'_>, cpu: &mut FakeCpu| {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            serve_ipc_with_signals(&mut sched, frame, &venue, owner, true, &mut || false).0
+        };
+        // Busy once: the arena has no slot for the preparation's record.
+        assert_eq!(
+            native(&mut frame, &mut owner, &mut cpu),
+            SWITCHED,
+            "a full arena retains the call on its slot release"
+        );
+        assert_eq!(frame.elr, B_SVC, "A waits, B runs");
+        assert_eq!(
+            w.zone.object_queue_census(slots).unwrap().waiters,
+            1,
+            "A is enrolled on the operation-slot release"
+        );
+        assert_eq!(w.host().refcount(a, Fd(ep)), Ok(pins), "its pin dropped");
+        assert_eq!(owner.preparations, 0);
+        // A retirement returns a slot and wakes A.
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        finish(&mut sched, held.pop().unwrap(), w.region);
+        assert_eq!(w.zone.object_queue_census(slots).unwrap().waiters, 0);
+        // A second slot for B's own wait, so the replay finds one free.
+        finish(&mut sched, held.pop().unwrap(), w.region);
+        // B blocks on the empty pipe: the vCPU goes back to A.
+        let mut g = b_read;
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        assert_eq!(serve_ipc(&mut sched, &mut g, &venue, &mut user), SWITCHED);
+        assert_eq!(g.x, a_regs, "A replays its original call");
+        reenter(&mut g, A_SVC);
+        assert_eq!(native(&mut g, &mut owner, &mut cpu), RETURNED);
+        assert_eq!((g.x[0], owner.preparations), (1, 1), "one report");
+        let event = w.mem.read(MM, events, 32);
+        assert_eq!(event[..4], EPOLL_IN.to_ne_bytes());
+        assert_eq!(event[8..16], 0xfeedu64.to_ne_bytes());
+        assert_eq!(event[16..], [0; 16], "no duplicate");
+        assert_eq!(host_calls(&w), 0, "never forwarded");
+        assert_eq!(
+            [
+                leaves(&w, IpcLeave::NoOperationRecord),
+                leaves(&w, IpcLeave::EpollCopyOut),
+            ],
+            [0, 0]
+        );
+        assert_eq!(
+            w.zone.counters.el1_parks.load(Ordering::Relaxed),
+            parks + 2,
+            "A's one slot wait and B's read"
+        );
+        assert_eq!(
+            w.host().refcount(a, Fd(ep)),
+            Ok(pins),
+            "the final pin dropped"
+        );
+        assert_eq!(mask.arms.get(), 0, "no mask, none armed");
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        for token in held {
+            finish(&mut sched, token, w.region);
+        }
+    }
+
+    /// #1671 review P0-2: a fresh `epoll_pwait` with a sigmask whose events
+    /// copy-out is refused keeps the accepted mask across the owner's
+    /// suspended preparation. Readiness is lost meanwhile and the mask
+    /// buffer is rewritten and unmapped; the production `epoll::resume`
+    /// harvests nothing and parks under the accepted snapshot, and the
+    /// completed call restores the mask.
+    #[test]
+    fn el1_epoll_native_suspended_copy_out_keeps_the_accepted_sigmask() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let e = w.eventfd(a, 1, EventMode::Counter, NONBLOCK);
+        let (ep, object) = zone_epoll(&w, a, e, 0xfeed);
+        let e2 = w.eventfd(a, 0, EventMode::Counter, NONBLOCK);
+        let desc = w.host().get(a, Fd(e2)).unwrap();
+        let Some(IpcBacking::EventFd { object: second }) = IpcBacking::decode(desc.backing) else {
+            panic!("eventfd");
+        };
+        w.region
+            .epoll_add(
+                object,
+                second,
+                carrick_el1_abi::ipc::epoll::EpollMember::EventFd,
+                e2,
+                0x52,
+                EPOLL_IN,
+                0xbeef,
+                &HostWait,
+            )
+            .unwrap();
+        let (r2, _w2, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let va = 0x20000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.map(OTHER_MM, va, PAGE);
+        let sigprof = 1u64 << 26;
+        let mask_va = 0x50000;
+        w.mem.map(MM, mask_va, PAGE);
+        w.mem.write(MM, mask_va, &sigprof.to_le_bytes());
+        let events = 0x40000;
+        let mut frame = epoll_pwait(ep, events, 8, -1, A_SVC);
+        frame.x[4] = mask_va;
+        frame.x[5] = 8;
+        // A native thread runs on its own selected scheduler record, which
+        // retains the suspended operation.
+        w.queue(w.a_tid, MM, &frame, A_SVC);
+        assert!(w.zone.switch_in_full(SLOT).is_some());
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        w.map.publish(w.a_tid, a.to_raw()).unwrap();
+        // B wakes A through the second member, then blocks on an empty pipe.
+        w.mem.write(OTHER_MM, va, &1u64.to_ne_bytes());
+        let b_write = syscall(SYS_WRITE, e2, va, 8, B_SVC);
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        let a_regs = frame.x;
+        let mask = MaskState {
+            armed: Default::default(),
+            arms: Default::default(),
+            accept: Cell::new(true),
+        };
+        let mut cpu = core::mem::take(&mut w.cpu);
+        let mut owner = NativeOwner::new(&w, events, &mask);
+        owner.answers = vec!["busy"];
+        // Another thread takes the first member's readiness while the
+        // owner prepares.
+        let region = *w.region;
+        owner.on_yield = Some(Box::new(move || {
+            region.epoll_delete(object, e, 0x51, &HostWait).unwrap();
+        }));
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let native = |frame: &mut TrapFrame, owner: &mut NativeOwner<'_>, cpu: &mut FakeCpu| {
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            serve_ipc_with_signals(&mut sched, frame, &venue, owner, true, &mut || false).0
+        };
+        // Busy, then the owned yield suspends the retained operation.
+        assert_eq!(native(&mut frame, &mut owner, &mut cpu), IpcServed::Idle);
+        assert_eq!((owner.preparations, owner.yields), (1, 1));
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(w.zone.record(current).has_object_operation(), "suspended");
+        // The mask buffer changes, then goes away, during the suspension.
+        w.mem.write(MM, mask_va, &u64::MAX.to_le_bytes());
+        w.mem.pages.borrow_mut().remove(&(MM, mask_va));
+        // The service resumes it: nothing is ready, so it parks, and B runs.
+        assert_eq!(native(&mut frame, &mut owner, &mut cpu), SWITCHED);
+        assert_eq!(
+            owner.probes,
+            [Some(sigprof)],
+            "the resumed empty harvest parks under the accepted sigmask"
+        );
+        assert_eq!(mask.arms.get(), 1, "the mask argument is read once");
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        assert_eq!(frame.elr, B_SVC, "A parks, B runs");
+        let mut f = b_write;
+        assert_eq!(
+            (serve_ipc(&mut sched, &mut f, &venue, &mut user), f.x[0]),
+            (RETURNED, 8),
+            "B writes"
+        );
+        let mut g = syscall(SYS_READ, r2, va + 0x100, 16, B_SVC);
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        assert_eq!(serve_ipc(&mut sched, &mut g, &venue, &mut user), SWITCHED);
+        assert_eq!(g.x, a_regs);
+        reenter(&mut g, A_SVC);
+        // Woken: the owner prepares the page and the report is copied once.
+        assert_eq!(native(&mut g, &mut owner, &mut cpu), RETURNED);
+        assert_eq!((g.x[0], owner.preparations), (1, 2));
+        let event = w.mem.read(MM, events, 32);
+        assert_eq!(event[..4], EPOLL_IN.to_ne_bytes());
+        assert_eq!(event[8..16], 0xbeefu64.to_ne_bytes());
+        assert_eq!(event[16..], [0; 16], "no duplicate");
+        assert_eq!(mask.armed.get(), None, "completion restores the mask");
+        assert_eq!(mask.arms.get(), 1);
+        assert_eq!(host_calls(&w), 0, "never forwarded");
+        assert_eq!(
+            [
+                leaves(&w, IpcLeave::EpollSigmask),
+                leaves(&w, IpcLeave::EpollCopyOut),
+            ],
+            [0, 0]
+        );
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(!w.zone.record(current).has_object_operation());
+    }
+
     /// What the native owner stand-in saw: the armed mask, and each arm.
     struct MaskState {
         armed: core::cell::Cell<Option<u64>>,
