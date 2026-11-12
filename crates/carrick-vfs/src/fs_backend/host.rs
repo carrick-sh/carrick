@@ -902,16 +902,20 @@ fn cleanup_tree_entries_with_budget(path: &Path, work_root: &Path, budget: &mut 
                 "{SCRATCH_TRASH_PREFIX}promoted-{}-{sequence}",
                 std::process::id()
             ));
-            if !matches!(
-                budget.attempt(|| std::fs::rename(&entry_path, promoted)),
-                Some(Ok(()))
-            ) {
-                blocked = true;
-                break;
+            match budget.attempt(|| std::fs::rename(&entry_path, promoted)) {
+                Some(Ok(())) => {}
+                // Another cleaner already promoted or removed it.
+                Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => {
+                    blocked = true;
+                    break;
+                }
             }
         } else {
             match budget.attempt(|| std::fs::remove_file(&entry_path)) {
                 Some(Ok(())) => budget.removed_one(),
+                // Another cleaner already removed it.
+                Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Some(Err(_)) => {
                     blocked = true;
                     break;
@@ -1302,12 +1306,28 @@ fn note_scratch_root_in_use(scratch_root: &Path) {
 /// tree. Runs automatically at process exit once a backend exists; callable
 /// earlier to settle the state deterministically.
 pub fn finish_scratch_cleanup() {
+    finish_scratch_cleanup_within(SCRATCH_EXIT_FLUSH_BOUND);
+}
+
+/// How long process exit waits for the deferred-removal worker to flush. The
+/// worker is the housekeeping lane that a wedged volume query can park
+/// (`apfs.rs`: later reclaims report `NotQueued` and the next startup sweep
+/// owns their names), so exit must never wait on it unboundedly. Healthy
+/// flushes finish in milliseconds; 5 s tolerates a loaded host while keeping
+/// a wedge from holding the process hostage. On timeout the rest is left to
+/// the next start's reclaim.
+const SCRATCH_EXIT_FLUSH_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub(crate) fn finish_scratch_cleanup_within(bound: std::time::Duration) {
     let (reply, done) = std::sync::mpsc::sync_channel(1);
-    if let Some(sender) = scratch_cleanup_sender().sender.as_ref()
-        && sender.send(ScratchCleanupWork::Flush { reply }).is_ok()
-    {
-        let _ = done.recv();
-    }
+    // `try_send`: a full queue is as wedged as a stuck worker; never block.
+    let queued = scratch_cleanup_sender()
+        .sender
+        .as_ref()
+        .is_some_and(|sender| sender.try_send(ScratchCleanupWork::Flush { reply }).is_ok());
+    // A wedged (or dead) worker: retire our trees below but skip the drain;
+    // the next startup sweep reclaims the rest.
+    let wedged = queued && done.recv_timeout(bound).is_err();
     let live = std::mem::take(&mut scratch_exit_state().live);
     for path in live {
         // Detach an overlay first, exactly as `Drop` does, so the reclaim
@@ -1315,6 +1335,9 @@ pub fn finish_scratch_cleanup() {
         #[cfg(target_os = "linux")]
         unmount_overlay_at(&path.join("merged"));
         let _ = rename_scratch_to_trash(&path);
+    }
+    if wedged {
+        return;
     }
     let roots = scratch_exit_state().roots.clone();
     for root in roots {
@@ -1325,13 +1348,25 @@ pub fn finish_scratch_cleanup() {
 /// Retire every orphaned scratch tree under `scratch_root` and remove all
 /// retired trees, however many entries they hold.
 fn reclaim_scratch_root(scratch_root: &Path) {
+    // Hold the sweep lock across discovery and the whole drain, as
+    // `sweep_orphans` does, so a concurrent run's reclaim cannot race ours
+    // over the same retired trees.
+    let root_lock_path = scratch_root.join(".carrick.sweep.lock");
+    let Ok(root_lock_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&root_lock_path)
+    else {
+        return;
+    };
+    let mut root_lock = fd_lock::RwLock::new(root_lock_file);
+    let Ok(_root_guard) = root_lock.write() else {
+        return;
+    };
     // The returned names are already in the trash; the loop below owns them.
-    let _ = discover_orphans_after_root_lock(
-        scratch_root,
-        None,
-        #[cfg(test)]
-        None,
-    );
+    let _ = discover_orphans(scratch_root, None);
     // A tree that cannot make progress is quarantined by the pass itself, so
     // this ends; the cap only guards a quarantine that also fails.
     let mut idle_passes = 0;

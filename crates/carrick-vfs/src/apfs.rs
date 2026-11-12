@@ -828,6 +828,41 @@ mod tests {
             }
         }
 
+        /// A wedged housekeeping worker must not hold process exit hostage:
+        /// the flush gives up at its bound and exit proceeds.
+        #[test]
+        fn wedged_worker_does_not_block_exit_flush() {
+            use crate::fs_backend::host::{
+                ScratchVolumeEnqueue, enqueue_scratch_volume_query, finish_scratch_cleanup_within,
+            };
+            use std::sync::mpsc::sync_channel;
+            use std::time::{Duration, Instant};
+
+            let (release, blocked) = sync_channel::<()>(1);
+            let (started, running) = sync_channel::<()>(1);
+            let ScratchVolumeEnqueue::Queued(reply) =
+                enqueue_scratch_volume_query(Box::new(move || {
+                    let _ = started.try_send(());
+                    let _ = blocked.recv_timeout(Duration::from_secs(60));
+                    Ok(false)
+                }))
+            else {
+                panic!("worker queue must accept one item");
+            };
+            running
+                .recv_timeout(Duration::from_secs(60))
+                .expect("worker never started the wedging item");
+            let begun = Instant::now();
+            finish_scratch_cleanup_within(Duration::from_millis(200));
+            let waited = begun.elapsed();
+            assert!(
+                waited < Duration::from_secs(30),
+                "exit flush waited {waited:?} on a wedged worker"
+            );
+            release.send(()).unwrap();
+            reply.recv_timeout(Duration::from_secs(60)).unwrap().unwrap();
+        }
+
         /// Busy once, then success: with the worker queue full the verdict
         /// waits and returns the real answer once the queue drains. The
         /// release happens only after the CALLER observed `Full`, so the
