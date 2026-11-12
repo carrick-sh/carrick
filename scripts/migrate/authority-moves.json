@@ -105,6 +105,16 @@
       "from": "carrick_kernel::el1_ipc::HostIpc::bind_waits",
       "to": "carrick_kernel::el1_ipc::pipe_lane_key",
       "issue": 1845
+    },
+    {
+      "from": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve",
+      "to": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::prepare_mm",
+      "issue": 2142
+    },
+    {
+      "from": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve::CARRICK_HVPATCH_VERIFY_EXEC_CODE",
+      "to": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::verify_image::CARRICK_HVPATCH_VERIFY_EXEC_CODE",
+      "issue": 2142
     }
   ],
   "authority_debt_admissions": [
@@ -115,6 +125,26 @@
     {
       "owner": "carrick_el1_image::build_program::read_depfile",
       "issue": 2059
+    },
+    {
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchImageReplacement<'_,E> as ImageReplacement<HvpatchExecVenue<'_,E>>>::arm_no_return",
+      "issue": 2142
+    },
+    {
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchImageReplacement<'_,E> as ImageReplacement<HvpatchExecVenue<'_,E>>>::publish_mm",
+      "issue": 2142
+    },
+    {
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::commit",
+      "issue": 2142
+    },
+    {
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::stamp_port",
+      "issue": 2142
+    },
+    {
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::publish_replacement",
+      "issue": 2142
     }
   ],
   "terminal_custody": []

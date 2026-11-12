@@ -1425,9 +1425,16 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::exec_backend",
-      "owner": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve",
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchImageReplacement<'_,E> as ImageReplacement<HvpatchExecVenue<'_,E>>>::arm_no_return",
       "lane": "shared",
-      "ceiling": 2
+      "ceiling": 1
+    },
+    {
+      "family": "fatal_carrier_fault",
+      "operation": "fatal:hvpatch::exec_backend",
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchImageReplacement<'_,E> as ImageReplacement<HvpatchExecVenue<'_,E>>>::publish_mm",
+      "lane": "shared",
+      "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
@@ -1439,7 +1446,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::exec_commit",
-      "owner": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve",
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::commit",
       "lane": "shared",
       "ceiling": 1
     },
@@ -1467,7 +1474,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::exec_replacement",
-      "owner": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve",
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::publish_replacement",
       "lane": "shared",
       "ceiling": 1
     },
@@ -1516,7 +1523,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::exec_topology",
-      "owner": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve",
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::prepare_mm",
       "lane": "shared",
       "ceiling": 1
     },
@@ -1943,7 +1950,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::mm_authority",
-      "owner": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve",
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::prepare_mm",
       "lane": "shared",
       "ceiling": 1
     },
@@ -2720,7 +2727,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:kernel::fatal_signal_authority",
-      "owner": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve",
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::stamp_port",
       "lane": "shared",
       "ceiling": 1
     },
@@ -5821,7 +5828,7 @@
     {
       "family": "global_config_debug",
       "operation": "global:env_var_os",
-      "owner": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve::CARRICK_HVPATCH_VERIFY_EXEC_CODE",
+      "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::verify_image::CARRICK_HVPATCH_VERIFY_EXEC_CODE",
       "lane": "shared",
       "ceiling": 1
     },
