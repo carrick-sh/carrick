@@ -23,3 +23,9 @@ test = "carrick_el1_linux::sched::tests::timed_waits_this_vcpu_cannot_keep_forwa
 reason = "#1894: a switched-in thread's timed wait is now served in ring on its own timer lease (`timed_wait_allowed` no longer forwards when the thread is not the vCPU's host record), so the forwarding witness became a witness that the wait times out in ring with ETIMEDOUT and consumes its lease; the invalid-timespec refusal is still asserted in the same test."
 replaced_by = "carrick_el1_linux::sched::tests::switched_in_timed_wait_uses_its_own_timer_lease"
 pr = 1894
+
+[[retired]]
+test = "cpl0_initial_mm::in_zone_child_host_read_is_refused_not_served_under_root_context"
+reason = "#2157 B0: an x86 fork child's unstaged crossing is now answered in ring with a counted ENOSYS, like ARM, instead of being refused for its host task context, so the witness was renamed for what it proves (d79573dd4)."
+replaced_by = "cpl0_initial_mm::in_zone_child_host_read_is_counted_enosys_not_served_under_root_context"
+pr = 2167
