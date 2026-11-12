@@ -379,26 +379,75 @@ fn regular_path(root: &Path, relative: &Path, directory: bool) -> Result<bool, R
     })
 }
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ReceiptError> {
+/// Collect every `.rs` file a crate's targets can reach. A subdirectory is
+/// skipped only when it is provably a separate package: its own regular
+/// `Cargo.toml` parses and declares `[package]` or `[workspace]`, it lies
+/// outside the auto-target trees (`src`, `tests`, `benches`, `examples`),
+/// and no explicit target path of the outer manifest points into it.
+/// Anything less certain keeps scanning, so the scan fails closed.
+fn collect_rs_files(
+    crate_dir: &Path,
+    explicit_targets: &[PathBuf],
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), ReceiptError> {
     for entry in std::fs::read_dir(dir).map_err(|e| source_io(dir, e))? {
         let entry = entry.map_err(|e| source_io(dir, e))?;
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path).map_err(|e| source_io(&path, e))?;
         if metadata.is_dir() {
-            // Git internals cannot be part of an archived source tree. A
-            // subdirectory with its own Cargo.toml is a separate package
-            // (e.g. `carrick-vmm-kvm/fixtures/x86-threads`), never one of this
-            // crate's targets, so its sources cannot define this crate's tests.
-            let nested_package =
-                std::fs::symlink_metadata(path.join("Cargo.toml")).is_ok_and(|m| m.is_file());
-            if entry.file_name() != ".git" && !nested_package {
-                collect_rs_files(&path, out)?;
+            // Git internals cannot be part of an archived source tree.
+            if entry.file_name() != ".git" && !separate_package(crate_dir, explicit_targets, &path)?
+            {
+                collect_rs_files(crate_dir, explicit_targets, &path, out)?;
             }
         } else if metadata.is_file() && path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
     }
     Ok(())
+}
+
+fn separate_package(
+    crate_dir: &Path,
+    explicit_targets: &[PathBuf],
+    dir: &Path,
+) -> Result<bool, ReceiptError> {
+    let Ok(relative) = dir.strip_prefix(crate_dir) else {
+        return Ok(false);
+    };
+    let auto_target = relative.components().next().is_some_and(|c| {
+        matches!(c, std::path::Component::Normal(n)
+            if ["src", "tests", "benches", "examples"].iter().any(|t| n == *t))
+    });
+    if auto_target || explicit_targets.iter().any(|t| t.starts_with(relative)) {
+        return Ok(false);
+    }
+    if !regular_path(dir, Path::new("Cargo.toml"), false)? {
+        return Ok(false);
+    }
+    let manifest = dir.join("Cargo.toml");
+    let raw = std::fs::read_to_string(&manifest).map_err(|e| source_io(&manifest, e))?;
+    Ok(toml::from_str::<toml::Value>(&raw)
+        .is_ok_and(|m| m.get("package").is_some() || m.get("workspace").is_some()))
+}
+
+/// Every explicit `path` of the manifest's lib, bin, test, bench and example
+/// targets, as written (crate-relative).
+fn explicit_target_paths(manifest: &toml::Value) -> Vec<PathBuf> {
+    ["test", "bin", "bench", "example"]
+        .into_iter()
+        .flat_map(|kind| {
+            manifest
+                .get(kind)
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .chain(manifest.get("lib"))
+        .filter_map(|target| target.get("path").and_then(toml::Value::as_str))
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn candidate_crate_dirs(tree_root: &Path) -> Result<Vec<PathBuf>, ReceiptError> {
@@ -694,7 +743,8 @@ pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<boo
         }
         check_target_paths(&crate_dir, &manifest)?;
         let mut files = Vec::new();
-        collect_rs_files(&crate_dir, &mut files)?;
+        let explicit_targets = explicit_target_paths(&manifest);
+        collect_rs_files(&crate_dir, &explicit_targets, &crate_dir, &mut files)?;
         scan.scanned = files.iter().filter_map(|f| f.canonicalize().ok()).collect();
         for file in files {
             let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
