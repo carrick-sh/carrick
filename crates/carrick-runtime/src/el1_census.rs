@@ -168,6 +168,10 @@ pub struct Census {
     /// Wall time from EL1 setup to terminal publication.
     #[serde(default)]
     pub wall_ns: u64,
+    /// Calls EL1 left for the host after starting to serve them, by
+    /// `IpcLeave` name (nonzero only; absent in older files).
+    #[serde(default)]
+    pub ipc_leaves: std::collections::BTreeMap<String, u64>,
     pub rows: Vec<CensusRow>,
 }
 
@@ -256,6 +260,7 @@ fn snapshot_counters(
         wall_ns: STARTED
             .get()
             .map_or(0, |start| start.elapsed().as_nanos() as u64),
+        ipc_leaves: std::collections::BTreeMap::new(),
         rows,
     }
 }
@@ -417,6 +422,8 @@ pub struct Aggregate {
     /// Summed carrier CPU (user + system) across the runs.
     pub process_cpu_ns: u64,
     pub wall_ns: u64,
+    /// `IpcLeave` counts summed across the runs, keyed by variant name.
+    pub ipc_leaves: std::collections::BTreeMap<String, u64>,
     pub rows: Vec<AggregateRow>,
 }
 
@@ -427,7 +434,11 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
         return Err("no census inputs".to_owned());
     }
     let mut by_nr: std::collections::BTreeMap<u64, AggregateRow> = Default::default();
+    let mut ipc_leaves: std::collections::BTreeMap<String, u64> = Default::default();
     for census in censuses {
+        for (name, count) in &census.ipc_leaves {
+            *ipc_leaves.entry(name.clone()).or_default() += count;
+        }
         if census.schema != 2 {
             return Err(format!("unknown census schema {}", census.schema));
         }
@@ -467,6 +478,7 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
             .map(|c| c.process_user_ns + c.process_sys_ns)
             .sum(),
         wall_ns: censuses.iter().map(|c| c.wall_ns).sum(),
+        ipc_leaves,
         rows,
     })
 }
@@ -509,6 +521,14 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
             row.refused,
             row.venue_refused
         ));
+    }
+    if !aggregate.ipc_leaves.is_empty() {
+        let leaves: Vec<_> = aggregate
+            .ipc_leaves
+            .iter()
+            .map(|(name, count)| format!("{name}: {count}"))
+            .collect();
+        out.push_str(&format!("\nIPC leaves: {}\n", leaves.join(", ")));
     }
     out
 }
@@ -591,6 +611,7 @@ mod tests {
             process_user_ns: 20_000,
             process_sys_ns: 4_000,
             wall_ns: 30_000,
+            ipc_leaves: Default::default(),
             rows,
         }
     }
@@ -769,6 +790,41 @@ mod tests {
         let encoded = serde_json::to_value(transported).unwrap();
         assert_eq!(encoded["refused"], 1);
         assert_eq!(encoded["venue_refused"], 2);
+    }
+
+    #[test]
+    fn census_json_names_each_nonzero_ipc_leave() {
+        use carrick_el1_abi::IpcLeave;
+        let counters = carrick_el1_abi::Counters::new();
+        counters.ipc_leaves[IpcLeave::EpollNotZone as usize].store(3, Ordering::Relaxed);
+        counters.ipc_leaves[IpcLeave::Restart as usize].store(1, Ordering::Relaxed);
+        let census = snapshot_counters(
+            None,
+            Some(&counters),
+            carrick_spec::syscall_census::CensusIsa::Aarch64,
+        );
+        let encoded = serde_json::to_value(&census).unwrap();
+        assert_eq!(
+            encoded["ipc_leaves"],
+            serde_json::json!({"epoll_not_zone": 3, "restart": 1})
+        );
+        // Older files carry no such field and still load.
+        let mut legacy = encoded.clone();
+        legacy.as_object_mut().unwrap().remove("ipc_leaves");
+        let legacy: Census = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.ipc_leaves.is_empty());
+        // Aggregation sums them across carriers.
+        let other = Census {
+            ipc_leaves: [("epoll_not_zone".to_owned(), 2)].into(),
+            ..census.clone()
+        };
+        let mut a = census;
+        a.rows = vec![row(56, 1, 1)];
+        let mut b = other;
+        b.rows = vec![row(56, 1, 1)];
+        let aggregate = aggregate(&[a, b]).unwrap();
+        assert_eq!(aggregate.ipc_leaves["epoll_not_zone"], 5);
+        assert!(render_table(&aggregate, 10).contains("epoll_not_zone: 5"));
     }
 
     #[test]
