@@ -24,7 +24,8 @@ remains the authority deciding which fork needs a root seed. A fork of a
 non-root process copies that process's existing TaskFs without a host seed.
 
 The two-live-process witness uses pipe-close/poll notifications, since x86
-in-zone pipe byte I/O remains #1756. Both vCPUs are admitted for the concurrent case. Each process changes cwd
+in-zone pipe byte I/O remains #1756. Affinity mask 3 admits both vCPUs for the concurrent case; isolation is proven
+by the pipe-close handshake. Each process changes cwd
 and closes its notification pipe before waiting for the peer's close; both
 then re-check their own values before exiting. Native outputs share an already
 touched BSS page; an untouched wait4 output page returned EFAULT (related evidence is on #2101).
