@@ -2055,6 +2055,39 @@ fn zone_pipe_poll_wake_with_affinity(flags: &[&str], affinity: u64) {
     );
 }
 
+/// #1671: x86 `epoll_pwait` (281) on a ring epoll, reporting into a fresh
+/// anonymous page nothing touched. The native owner prepares the page, the
+/// packed 12-byte report arrives exactly once (EPOLLET), an unmapped buffer
+/// is EFAULT with the report kept queued for the next valid wait, and no
+/// call is forwarded to the host.
+#[test]
+#[ignore = "#2153: x86 epoll_pwait reaches the ring epoll owner only with its routing"]
+fn zone_epoll_pwait_copy_out_into_an_untouched_page_stays_in_ring() {
+    let elf = native_exit_fixture("native_epoll_copyout.S");
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_LOADED)
+        .unwrap_or_else(|failure| panic!("epoll copy-out run: {}", failure.error));
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let forwarded = counters.forwarded[22].load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        (outcome.run.exit_code, forwarded),
+        (7, 0),
+        "fixture stage (100 + errno: the first wait failed; see \
+         native_epoll_copyout.S) and epoll_pwait host forwards"
+    );
+    assert_eq!(
+        counters
+            .refused
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+            .sum::<u64>(),
+        0,
+        "the guest must run without ring refusals"
+    );
+}
+
 #[test]
 #[ignore = "#1756: x86 has no ring IPC venue for the child's zone pipe write"]
 fn zone_pipe_ppoll_blocks_until_peer_write_and_preserves_pollfd() {
