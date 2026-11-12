@@ -560,7 +560,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         manifest: &carrick_core_abi::service::ExecSuccessorManifest,
     ) -> Result<NativeExecSuccessor<Mm, ParkedContextWords>, NativeProcessError> {
-        self.exec_successor()?.adopt(identity, receipt, manifest)
+        // The host builds no x86 successor yet (#1093 S4c slices c and d).
+        self.exec_successor()?
+            .adopt(identity, receipt, manifest, None)
     }
     fn cancel_exec_successor(
         &self,

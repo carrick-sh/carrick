@@ -52,14 +52,31 @@ pub(crate) trait X86ExecMachine {
     fn retire_context(&self, address: Mm) -> bool;
 }
 
+/// The successor build x86 runs inside `prepare_cross`, after the arm and
+/// before the consuming crossing: the boot editor over the reserved
+/// fork-stock tables and inventory data grants, sourcing the shared
+/// supervisor entries from the predecessor's live root
+/// (`carrick_x86_carrier::initial_boot::build_x86_successor`).
+pub(crate) trait X86SuccessorBuild {
+    /// Build the sealed `successor` and return the root it built. `Busy`
+    /// means stock or inventory ran out: not now, with nothing consumed.
+    fn build(
+        &mut self,
+        successor: &ExecSuccessorManifestView,
+    ) -> Result<RootGpa, NativeProcessError>;
+}
+
 /// x86's pre-crossing step. No PCID: the only identity this adopter accepts
 /// is the one `Asid::x86_untagged()` names, and the generation the manifest
 /// seals beside it is the root's. Any other value is a manifest built for
-/// another ISA's translation identity. The closed space carries the root
+/// another ISA's translation identity. With a build attached, the build runs
+/// last and must produce the sealed root. The closed space carries the root
 /// alone.
-pub(crate) struct X86PrepareCross;
+pub(crate) struct X86PrepareCross<'b> {
+    pub(crate) build: Option<&'b mut dyn X86SuccessorBuild>,
+}
 
-impl PrepareCross for X86PrepareCross {
+impl PrepareCross for X86PrepareCross<'_> {
     fn prepare_cross(
         &mut self,
         successor: &ExecSuccessorManifestView,
@@ -140,21 +157,24 @@ where
         cancel_prepared_exec(receipt, |record| self.machine.cross_cancel(record))
     }
 
-    /// Adopt the sealed successor. Everything x86 can refuse is refused
-    /// before the consuming crossing, so a refusal leaves the receipt
-    /// unconsumed, the predecessor installed and the successor unbound.
+    /// Adopt the sealed successor, running `build` (when the successor's
+    /// tables are built here rather than by the host) before the crossing.
+    /// Everything x86 can refuse is refused before the consuming crossing,
+    /// so a refusal leaves the receipt unconsumed, the predecessor installed
+    /// and the successor unbound.
     pub(crate) fn adopt(
         &self,
         identity: ServiceIdentity,
         receipt: ExecAdoptionReceipt,
         manifest: &ExecSuccessorManifest,
+        build: Option<&mut dyn X86SuccessorBuild>,
     ) -> Result<NativeExecSuccessor<Mm, ParkedContextWords>, NativeProcessError> {
         let adopted = adopt_closed_exec_successor(
             self.zone,
             identity,
             receipt,
             manifest,
-            &mut X86PrepareCross,
+            &mut X86PrepareCross { build },
             |record| self.machine.cross_adopt(record),
         )?;
         let address = adopted.address;
@@ -514,7 +534,7 @@ mod tests {
         let manifest = sealed(slot.root_generation());
         slot.prepare_adoption().unwrap();
 
-        let adopted = exec.adopt(identity(), receipt(), &manifest).unwrap();
+        let adopted = exec.adopt(identity(), receipt(), &manifest, None).unwrap();
         slot.commit();
         assert_eq!(exec.machine.adopt_crossings.get(), 1);
         // Entry state is the sealed rip/rsp under the successor's cr3.
@@ -568,7 +588,7 @@ mod tests {
             slot.prepare_adoption().unwrap();
 
             assert!(matches!(
-                exec.adopt(identity(), receipt(), &manifest),
+                exec.adopt(identity(), receipt(), &manifest, None),
                 Err(NativeProcessError::Stale)
             ));
             // Refused before the consuming crossing: the receipt is unspent,
@@ -597,11 +617,113 @@ mod tests {
         let generation = slot.root_generation();
         let manifest = manifest(generation, Asid::x86_untagged(), generation, 1 << 47);
         assert!(matches!(
-            exec.adopt(identity(), receipt(), &manifest),
+            exec.adopt(identity(), receipt(), &manifest, None),
             Err(NativeProcessError::Stale)
         ));
         assert_eq!(exec.machine.adopt_crossings.get(), 0);
         fixture.predecessor_intact();
+    }
+
+    /// A test build: records that it ran before any adoption crossing and
+    /// answers with `result`.
+    struct RecordedBuild<'m> {
+        crossings: &'m Cell<u32>,
+        result: Result<u64, NativeProcessError>,
+        builds: u32,
+        crossed_before_build: bool,
+    }
+    impl<'m> RecordedBuild<'m> {
+        fn new(crossings: &'m Cell<u32>, result: Result<u64, NativeProcessError>) -> Self {
+            Self {
+                crossings,
+                result,
+                builds: 0,
+                crossed_before_build: false,
+            }
+        }
+    }
+    impl X86SuccessorBuild for RecordedBuild<'_> {
+        fn build(
+            &mut self,
+            successor: &ExecSuccessorManifestView,
+        ) -> Result<RootGpa, NativeProcessError> {
+            assert_eq!(successor.successor_mm.raw(), SUCCESSOR);
+            self.builds += 1;
+            self.crossed_before_build |= self.crossings.get() != 0;
+            let root = self.result?;
+            RootGpa::page_aligned(FrameGpa::new(root)).ok_or(NativeProcessError::Invalid)
+        }
+    }
+
+    #[test]
+    fn the_successor_build_runs_before_the_consuming_crossing() {
+        let fixture = Fixture::new();
+        let exec = fixture.exec(fixture.machine(true));
+        let slot = exec
+            .prepare_slot(ReservationMm::new(SUCCESSOR).unwrap())
+            .unwrap();
+        let manifest = sealed(slot.root_generation());
+        slot.prepare_adoption().unwrap();
+        let mut build = RecordedBuild::new(&exec.machine.adopt_crossings, Ok(ROOT));
+
+        let adopted = exec
+            .adopt(identity(), receipt(), &manifest, Some(&mut build))
+            .unwrap();
+        slot.commit();
+        assert_eq!(build.builds, 1);
+        assert!(!build.crossed_before_build);
+        assert_eq!(exec.machine.adopt_crossings.get(), 1);
+        assert_eq!(adopted.address.root.address().raw(), ROOT);
+    }
+
+    #[test]
+    fn a_busy_build_refuses_before_the_crossing_then_succeeds_on_rerun() {
+        let fixture = Fixture::new();
+        let exec = fixture.exec(fixture.machine(true));
+        let slot = exec
+            .prepare_slot(ReservationMm::new(SUCCESSOR).unwrap())
+            .unwrap();
+        let manifest = sealed(slot.root_generation());
+        slot.prepare_adoption().unwrap();
+
+        let mut busy =
+            RecordedBuild::new(&exec.machine.adopt_crossings, Err(NativeProcessError::Busy));
+        assert!(matches!(
+            exec.adopt(identity(), receipt(), &manifest, Some(&mut busy)),
+            Err(NativeProcessError::Busy)
+        ));
+        assert_eq!(busy.builds, 1);
+        // Not now: the receipt is unspent and the predecessor still runs.
+        assert_eq!(exec.machine.adopt_crossings.get(), 0);
+        fixture.predecessor_intact();
+
+        let mut ready = RecordedBuild::new(&exec.machine.adopt_crossings, Ok(ROOT));
+        exec.adopt(identity(), receipt(), &manifest, Some(&mut ready))
+            .unwrap();
+        slot.commit();
+        assert_eq!(exec.machine.adopt_crossings.get(), 1);
+    }
+
+    #[test]
+    fn a_build_of_another_root_is_refused_before_the_crossing() {
+        let fixture = Fixture::new();
+        let exec = fixture.exec(fixture.machine(true));
+        let slot = exec
+            .prepare_slot(ReservationMm::new(SUCCESSOR).unwrap())
+            .unwrap();
+        let manifest = sealed(slot.root_generation());
+        slot.prepare_adoption().unwrap();
+        let mut build = RecordedBuild::new(&exec.machine.adopt_crossings, Ok(ROOT + 0x1000));
+
+        assert!(matches!(
+            exec.adopt(identity(), receipt(), &manifest, Some(&mut build)),
+            Err(NativeProcessError::Stale)
+        ));
+        assert_eq!(build.builds, 1);
+        assert_eq!(exec.machine.adopt_crossings.get(), 0);
+        fixture.predecessor_intact();
+        drop(slot);
+        assert!(fixture.zone().spaces.find(SUCCESSOR).is_none());
     }
 
     #[test]
@@ -613,7 +735,7 @@ mod tests {
             .unwrap();
         let manifest = sealed(slot.root_generation());
         assert!(matches!(
-            exec.adopt(identity(), receipt(), &manifest),
+            exec.adopt(identity(), receipt(), &manifest, None),
             Err(NativeProcessError::Stale)
         ));
         assert_eq!(exec.machine.adopt_crossings.get(), 1);
