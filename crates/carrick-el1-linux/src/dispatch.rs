@@ -6394,6 +6394,8 @@ mod tests {
             (88, [cwd, pointer, 0, 0, 0, 0]),
             (45, [pointer, 1, 0, 0, 0, 0]),
             (46, [1, 1, 0, 0, 0, 0]),
+            // #2206: `mkdir -p`'s fchdir into each created ancestor.
+            (50, [3, 0, 0, 0, 0, 0]),
         ] {
             let mut frame = TrapFrame {
                 esr: 0x15 << 26,
