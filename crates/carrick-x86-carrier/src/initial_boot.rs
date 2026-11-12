@@ -10,8 +10,8 @@ use carrick_core_abi::{
     X86InitialBootRegion, X86InitialBootRequest, X86InitialBootString,
 };
 use carrick_el1::isa::x86::initial_mm::{
-    InitialDataGrant, InitialFrameSource, InitialImageRegion, InitialImageSpec, InitialSourceRange,
-    InitialStackSpec, install_initial_image,
+    InitialDataGrant, InitialFrameSource, InitialImageRegion, InitialImageSpec, InitialMmError,
+    InitialSourceRange, InitialStackSpec, install_initial_image,
 };
 use carrick_guest_arch::{
     EditBacking, EditPermissions, FrameGpa, GuestLen, MmuBackend, RootGpa, UserVa,
@@ -349,7 +349,7 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
         )
     } {
         Ok(loaded) => loaded,
-        Err(carrick_el1::isa::x86::initial_mm::InitialMmError::DescriptorIndeterminate) => {
+        Err(InitialMmError::DescriptorIndeterminate) => {
             carrick_el1::isa::x86::fatal_entry_binding()
         }
         Err(_) => return None,
@@ -374,6 +374,41 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     request.result_initial_break = loaded.initial_break.raw();
     crate::table_span::admit_tables(first_grant, table_end, loaded.address, working);
     Some((request.entry, loaded.stack_pointer))
+}
+
+/// Build an exec successor's address space at CPL0 with the boot editor.
+/// Its tables are reserved fork-stock frames, already inside the span boot
+/// admitted, so unlike boot it admits nothing (`admit_tables` stays boot's
+/// alone); and the shared supervisor entries come from the predecessor's live
+/// root, not the bootstrap root.
+///
+/// # Safety
+/// As for `install_initial_image`. The caller owns the unpublished successor
+/// MM `mm`/`generation`; the predecessor is the live root on this CPU; and
+/// `source` holds the reserved stock tables and inventory data grants
+/// exclusively until the successor is adopted or its build is cancelled.
+pub unsafe fn build_x86_successor<S: InitialFrameSource>(
+    source: &mut S,
+    mm: NonZeroU64,
+    generation: NonZeroU64,
+    image: &InitialImageSpec<'_>,
+) -> Result<carrick_el1::isa::x86::initial_mm::InitialMmImage, InitialMmError> {
+    let predecessor = carrick_el1::isa::x86::hardware_live_root()
+        .map_err(|_| InitialMmError::DescriptorRefused)?;
+    let (start, end) =
+        crate::table_span::admitted_tables().ok_or(InitialMmError::FrameUnavailable)?;
+    // SAFETY: forwarded from this function's contract; the admitted span
+    // covers every stock table and the predecessor's root.
+    unsafe {
+        install_initial_image(
+            &InitialWords::production(start, end),
+            source,
+            predecessor,
+            mm,
+            generation,
+            image,
+        )
+    }
 }
 
 core::arch::global_asm!(

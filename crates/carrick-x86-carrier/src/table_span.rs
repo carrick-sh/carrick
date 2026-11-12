@@ -37,16 +37,20 @@ pub fn live_words(mm: carrick_el1_abi::ReservationMm) -> Option<crate::entry::In
     let root = carrick_el1::isa::x86::hardware_live_root().ok()?;
     let mm = carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(mm.raw())?);
     let context = LIVE_CONTEXTS.lock().authenticate(mm, root)?;
+    let (start, end) = admitted_tables()?;
+    let working = working_tables()?;
+    Some(crate::entry::InitialWords::live(
+        start, end, context, working,
+    ))
+}
+
+/// The boot-admitted table span, `start..end`, once boot has admitted it.
+/// The fork stock is the unused remainder of it, so an exec successor built
+/// from stock tables needs no admission of its own.
+pub fn admitted_tables() -> Option<(u64, u64)> {
     let end = TABLE_END.load(Ordering::Acquire);
     let start = TABLE_START.load(Ordering::Relaxed);
-    let working = working_tables()?;
-    if start != 0 && end > start {
-        Some(crate::entry::InitialWords::live(
-            start, end, context, working,
-        ))
-    } else {
-        None
-    }
+    (start != 0 && end > start).then_some((start, end))
 }
 
 pub fn admit_tables(
