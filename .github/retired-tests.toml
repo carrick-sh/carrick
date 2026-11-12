@@ -29,3 +29,9 @@ test = "cpl0_initial_mm::in_zone_child_host_read_is_refused_not_served_under_roo
 reason = "#2157 B0: an x86 fork child's unstaged crossing is now answered in ring with a counted ENOSYS, like ARM, instead of being refused for its host task context, so the witness was renamed for what it proves (d79573dd4)."
 replaced_by = "cpl0_initial_mm::in_zone_child_host_read_is_counted_enosys_not_served_under_root_context"
 pr = 2167
+
+[[retired]]
+test = "cpl0_initial_mm::in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring"
+reason = "#1671: an in-zone child's pipe write on x86 CPL0 is now served through the shared IPC owner instead of returning a counted ENOSYS, so the refusal witness became a witness that the write is served (9968c4138)."
+replaced_by = "cpl0_initial_mm::in_zone_child_pipe_write_uses_shared_ipc_execution"
+pr = 2153
