@@ -327,6 +327,15 @@ pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_
         None
     }
     fn retain_relative_futex_wait(&mut self, _operation: crate::sched::RelativeFutexWait) {}
+    /// The accepted `epoll_pwait` this thread's rerun continues, if any.
+    fn take_accepted_epoll_wait(&mut self) -> Option<carrick_core_abi::wait::AcceptedWait> {
+        None
+    }
+    /// Retain an accepted `epoll_pwait` for this thread's rerun. `false`:
+    /// this venue retains no rerun answers.
+    fn retain_accepted_epoll_wait(&mut self, _wait: carrick_core_abi::wait::AcceptedWait) -> bool {
+        false
+    }
     /// A syscall entry begins. Answers retained for the rerun of this
     /// thread's last call (the carrier's thread-stock reply, #1974) belong
     /// to exactly this entry: whatever syscall it is, no later entry sees

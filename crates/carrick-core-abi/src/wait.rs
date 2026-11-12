@@ -9,6 +9,17 @@ use carrick_sched_core::spaces::notification::{
 };
 use carrick_sched_core::{RecordId, SlotId, ThreadCtx, ZoneTables};
 
+/// A wait its call accepted at entry, retained by the native owner while the
+/// call waits for an execution resource (an IPC operation slot) and reruns.
+/// The rerun keeps this absolute expiry instead of restarting a relative
+/// timeout; whatever temporary signal mask the call accepted stays armed in
+/// the thread's control slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptedWait {
+    /// The wait's absolute expiry (`None`: untimed).
+    pub deadline: Option<carrick_guest_arch::CounterTick>,
+}
+
 /// Adapter-selected guest re-entry PC, distinct from a syscall return value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationResumePc(u64);
