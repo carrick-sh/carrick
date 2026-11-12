@@ -5157,3 +5157,57 @@ fn native_handback_admits_a_stepped_away_allowed_driver() {
         zone.free_record(record);
     }
 }
+
+fn held_completion(zone: &ZoneTables) -> (RecordRef, u32) {
+    let (record, seq) = park_pinned(zone, 53, 0x4000, 1 << 1);
+    zone.record(record).native_owned.store(1, Ordering::Release);
+    let reference = zone.record_ref(record);
+    assert_eq!(
+        zone.claim_for_host(reference, None, Handback::Woken, &HostWait, &|owned| {
+            let _ = owned.into_parts();
+        }),
+        HostClaim::Claimed
+    );
+    assert_eq!(
+        zone.place_native_handback(reference),
+        Some(NativePlacement::Held)
+    );
+    (reference, seq)
+}
+
+#[test]
+fn a_published_driver_places_a_held_completion_exactly_once() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let (record, seq) = held_completion(&zone);
+    zone.drive(OTHER, 8);
+    zone.publish_slot(OTHER, MM, Some(1), 0);
+    assert_eq!(
+        zone.record(record.id).claim(),
+        Claim::Queued { slot: OTHER, seq }
+    );
+    zone.publish_slot(OTHER, MM, Some(1), 0);
+    assert_eq!(zone.slot(OTHER).queued(), 1);
+}
+
+#[test]
+fn a_held_completion_can_be_cancelled_and_reused_before_a_trigger() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let (record, _) = held_completion(&zone);
+    assert_eq!(
+        zone.claim_for_host(record, None, Handback::Cancelled, &HostWait, &|owned| {
+            let _ = owned.into_parts();
+        }),
+        HostClaim::Claimed
+    );
+    zone.free_record(record.id);
+    let reused = zone.alloc_record(identity(70)).unwrap();
+    assert_eq!(reused, record.id);
+    assert_ne!(zone.record_ref(reused).incarnation, record.incarnation);
+    let before = zone.record(reused).claim();
+    zone.drive(OTHER, 8);
+    zone.publish_slot(OTHER, MM, Some(1), 0);
+    assert_eq!(zone.record(reused).claim(), before);
+    assert_eq!(zone.slot(OTHER).queued(), 0);
+}
