@@ -194,39 +194,39 @@ macro_rules! host_crossings {
 }
 
 host_crossings! {
-    Setxattr = nr::SETXATTR, false, Permanent;
-    Lsetxattr = nr::LSETXATTR, false, Permanent;
+    Setxattr = nr::SETXATTR, true, Permanent;
+    Lsetxattr = nr::LSETXATTR, true, Permanent;
     Fsetxattr = nr::FSETXATTR, false, Permanent;
-    Getxattr = nr::GETXATTR, false, Permanent;
-    Lgetxattr = nr::LGETXATTR, false, Permanent;
+    Getxattr = nr::GETXATTR, true, Permanent;
+    Lgetxattr = nr::LGETXATTR, true, Permanent;
     Fgetxattr = nr::FGETXATTR, false, Permanent;
-    Listxattr = nr::LISTXATTR, false, Permanent;
-    Llistxattr = nr::LLISTXATTR, false, Permanent;
+    Listxattr = nr::LISTXATTR, true, Permanent;
+    Llistxattr = nr::LLISTXATTR, true, Permanent;
     Flistxattr = nr::FLISTXATTR, false, Permanent;
-    Removexattr = nr::REMOVEXATTR, false, Permanent;
-    Lremovexattr = nr::LREMOVEXATTR, false, Permanent;
+    Removexattr = nr::REMOVEXATTR, true, Permanent;
+    Lremovexattr = nr::LREMOVEXATTR, true, Permanent;
     Fremovexattr = nr::FREMOVEXATTR, false, Permanent;
     Getcwd = nr::GETCWD, true, Permanent;
     Ioctl = nr::IOCTL, false, Permanent;
     Flock = nr::FLOCK, false, Permanent;
-    Mknodat = nr::MKNODAT, false, Permanent;
-    Mkdirat = nr::MKDIRAT, false, Permanent;
-    Unlinkat = nr::UNLINKAT, false, Permanent;
-    Symlinkat = nr::SYMLINKAT, false, Permanent;
-    Linkat = nr::LINKAT, false, Permanent;
-    Renameat = nr::RENAMEAT, false, Permanent;
-    Statfs = nr::STATFS, false, Permanent;
-    Fstatfs = nr::FSTATFS, false, Permanent;
-    Truncate = nr::TRUNCATE, false, Permanent;
-    Ftruncate = nr::FTRUNCATE, false, Permanent;
-    Fallocate = nr::FALLOCATE, false, Permanent;
+    Mknodat = nr::MKNODAT, true, Permanent;
+    Mkdirat = nr::MKDIRAT, true, Permanent;
+    Unlinkat = nr::UNLINKAT, true, Permanent;
+    Symlinkat = nr::SYMLINKAT, true, Permanent;
+    Linkat = nr::LINKAT, true, Permanent;
+    Renameat = nr::RENAMEAT, true, Permanent;
+    Statfs = nr::STATFS, true, Permanent;
+    Fstatfs = nr::FSTATFS, true, Permanent;
+    Truncate = nr::TRUNCATE, true, Permanent;
+    Ftruncate = nr::FTRUNCATE, true, Permanent;
+    Fallocate = nr::FALLOCATE, true, Permanent;
     Faccessat = nr::FACCESSAT, true, Permanent;
     Chdir = nr::CHDIR, true, Permanent;
     Fchdir = nr::FCHDIR, false, Permanent;
     Chroot = nr::CHROOT, false, Permanent;
     Fchmod = nr::FCHMOD, false, Permanent;
-    Fchmodat = nr::FCHMODAT, false, Permanent;
-    Fchownat = nr::FCHOWNAT, false, Permanent;
+    Fchmodat = nr::FCHMODAT, true, Permanent;
+    Fchownat = nr::FCHOWNAT, true, Permanent;
     Fchown = nr::FCHOWN, false, Permanent;
     Openat = nr::OPENAT, true, Permanent;
     Getdents64 = nr::GETDENTS64, false, Permanent;
@@ -244,14 +244,14 @@ host_crossings! {
     Vmsplice = nr::VMSPLICE, false, Temporary;
     Splice = nr::SPLICE, false, Temporary;
     Tee = nr::TEE, false, Temporary;
-    Readlinkat = nr::READLINKAT, false, Permanent;
+    Readlinkat = nr::READLINKAT, true, Permanent;
     Newfstatat = nr::NEWFSTATAT, false, Permanent, [carrick_syscall_abi::CARRICK_PRIVATE_X86_NEWFSTATAT];
     Fstat = nr::FSTAT, false, Permanent, [carrick_syscall_abi::CARRICK_PRIVATE_X86_FSTAT];
-    Sync = nr::SYNC, false, Permanent;
+    Sync = nr::SYNC, true, Permanent;
     Fsync = nr::FSYNC, false, Permanent;
     Fdatasync = nr::FDATASYNC, false, Permanent;
     SyncFileRange = nr::SYNC_FILE_RANGE, false, Permanent;
-    Utimensat = nr::UTIMENSAT, false, Permanent;
+    Utimensat = nr::UTIMENSAT, true, Permanent;
     Execve = nr::EXECVE, false, Permanent;
     Msync = nr::MSYNC, false, Permanent;
     Mlock = nr::MLOCK, false, Temporary;
@@ -259,15 +259,15 @@ host_crossings! {
     Mincore = nr::MINCORE, false, Temporary;
     Madvise = nr::MADVISE, false, Temporary;
     Syncfs = nr::SYNCFS, false, Permanent;
-    Renameat2 = nr::RENAMEAT2, false, Permanent;
+    Renameat2 = nr::RENAMEAT2, true, Permanent;
     Mlock2 = nr::MLOCK2, false, Temporary;
     CopyFileRange = nr::COPY_FILE_RANGE, false, Permanent;
     Preadv2 = nr::PREADV2, false, Permanent;
     Pwritev2 = nr::PWRITEV2, false, Permanent;
-    Statx = nr::STATX, false, Permanent;
-    Openat2 = nr::OPENAT2, false, Permanent;
-    Faccessat2 = nr::FACCESSAT2, false, Permanent;
-    Fchmodat2 = nr::FCHMODAT2, false, Permanent;
+    Statx = nr::STATX, true, Permanent;
+    Openat2 = nr::OPENAT2, true, Permanent;
+    Faccessat2 = nr::FACCESSAT2, true, Permanent;
+    Fchmodat2 = nr::FCHMODAT2, true, Permanent;
     Socket = nr::SOCKET, false, Permanent;
     Socketpair = nr::SOCKETPAIR, false, Temporary;
     Bind = nr::BIND, false, Permanent;
@@ -515,6 +515,16 @@ mod tests {
         }
     }
 
+    /// Every canonical ordinal x86 crosses to the host for: the 10 landed
+    /// before B1, and B1's xattr, file and metadata families (#2157). The
+    /// x86 `fstat`/`newfstatat` layouts cross as private aliases instead.
+    const X86_CROSSINGS: [usize; 41] = [
+        5, 6, 8, 9, 11, 12, 14, 15, // xattr by path
+        17, 33, 34, 35, 36, 37, 38, 45, 46, 47, 49, 78, 81, 88, 276, 437, // files
+        43, 44, 53, 54, 291, 439, 452, // metadata
+        22, 48, 56, 62, 63, 64, 67, 68, 93, 94, // landed before B1
+    ];
+
     #[test]
     fn both_sets_match_the_exhaustive_census_through_512() {
         let mut arm = [None; 513];
@@ -546,10 +556,7 @@ mod tests {
             );
             assert_eq!(
                 HostCrossingSet::X86.is_allowed(canonical),
-                matches!(
-                    ordinal,
-                    17 | 22 | 48 | 49 | 56 | 62 | 63 | 64 | 67 | 68 | 93 | 94
-                ),
+                X86_CROSSINGS.contains(&ordinal),
                 "x86 canonical={ordinal}"
             );
         }
@@ -585,7 +592,7 @@ mod tests {
                 .flatten()
                 .filter(|(_, x86, _)| *x86)
                 .count(),
-            12
+            X86_CROSSINGS.len()
         );
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten().filter(|(_, x86, _)| *x86) {
             let nr = crossing.canonical();

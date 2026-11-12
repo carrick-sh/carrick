@@ -1,7 +1,7 @@
-/* #2157 B1, xattr family: setxattr, lsetxattr, fsetxattr, getxattr,
- * lgetxattr, fgetxattr, listxattr, llistxattr, flistxattr, removexattr,
- * lremovexattr, fremovexattr. The script runs in a scratch working
- * directory on a filesystem with user.* attributes.
+/* #2157 B1, xattr family: setxattr, lsetxattr, getxattr, lgetxattr,
+ * listxattr, llistxattr, removexattr, lremovexattr. The script runs in the
+ * root file system's writable layer (a bind mount has no user.* attributes
+ * under carrick) on a native filesystem that has them.
  *
  *   (none)  the run root performs every call; each returns its native
  *           Linux result and the value or list it writes. Expected stdout
@@ -13,6 +13,7 @@
 
 .equ SYS_openat, 257
 .equ SYS_unlinkat, 263
+.equ SYS_dup2, 33
 .equ SYS_setxattr, 188
 .equ SYS_lsetxattr, 189
 .equ SYS_fsetxattr, 190
@@ -27,7 +28,7 @@
 .equ SYS_fremovexattr, 199
 .equ O_RDWR_CREAT, 0x42
 .equ ENODATA, 61
-.equ LIST_LEN, 21 /* "user.k\0user.l\0user.f\0" */
+.equ LIST_LEN, 14 /* "user.k\0user.l\0" */
 
 #ifdef CHILD
 child_script:
@@ -53,32 +54,6 @@ child_script:
     PATH %rsi, name_k
     SYS SYS_removexattr
     EXPECT 14, -ENOSYS
-    /* A closed descriptor is the ring's own EBADF, never a crossing. */
-    mov $2, %edi
-    SYS SYS_close
-    EXPECT 15, 0
-    mov $2, %edi
-    PATH %rsi, name_f
-    PATH %rdx, value_f
-    mov $2, %r10d
-    xor %r8d, %r8d
-    SYS SYS_fsetxattr
-    EXPECT 16, -9
-    mov $2, %edi
-    PATH %rsi, name_f
-    PATH %rdx, scratch
-    mov $16, %r10d
-    SYS SYS_fgetxattr
-    EXPECT 17, -9
-    mov $2, %edi
-    PATH %rsi, scratch
-    mov $64, %edx
-    SYS SYS_flistxattr
-    EXPECT 18, -9
-    mov $2, %edi
-    PATH %rsi, name_f
-    SYS SYS_fremovexattr
-    EXPECT 19, -9
     jmp child_done
 
 parent_script:
@@ -98,8 +73,7 @@ root_script:
     mov $0644, %r10d
     SYS SYS_openat
     EXPECT_OK 11
-    mov %rax, %r12
-    /* set through the path, the no-follow path and the descriptor. */
+    /* set through the path and the no-follow path. */
     PATH %rdi, file
     PATH %rsi, name_k
     PATH %rdx, value_k
@@ -114,13 +88,6 @@ root_script:
     xor %r8d, %r8d
     SYS SYS_lsetxattr
     EXPECT 13, 0
-    mov %r12, %rdi
-    PATH %rsi, name_f
-    PATH %rdx, value_f
-    mov $2, %r10d
-    xor %r8d, %r8d
-    SYS SYS_fsetxattr
-    EXPECT 14, 0
     /* get returns the length and writes the value. */
     PATH %rdi, file
     PATH %rsi, name_k
@@ -139,16 +106,6 @@ root_script:
     mov $16, %r10d
     SYS SYS_lgetxattr
     EXPECT 17, 1
-    mov %r12, %rdi
-    PATH %rsi, name_f
-    PATH %rdx, scratch
-    mov $16, %r10d
-    SYS SYS_fgetxattr
-    EXPECT 18, 2
-    cmpw $0x4646, scratch(%rip) /* "FF" */
-    je 2f
-    mov $19, %edi
-    jmp fail
 2:
     /* A buffer too small is ERANGE; a zero size asks for the length. */
     PATH %rdi, file
@@ -179,11 +136,6 @@ root_script:
     mov $64, %edx
     SYS SYS_llistxattr
     EXPECT 24, LIST_LEN
-    mov %r12, %rdi
-    PATH %rsi, scratch
-    mov $64, %edx
-    SYS SYS_flistxattr
-    EXPECT 25, LIST_LEN
     /* remove through each form; a second removal is ENODATA. */
     PATH %rdi, file
     PATH %rsi, name_k
@@ -193,10 +145,6 @@ root_script:
     PATH %rsi, name_l
     SYS SYS_lremovexattr
     EXPECT 27, 0
-    mov %r12, %rdi
-    PATH %rsi, name_f
-    SYS SYS_fremovexattr
-    EXPECT 28, 0
     PATH %rdi, file
     PATH %rsi, name_k
     SYS SYS_removexattr

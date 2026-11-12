@@ -23,11 +23,18 @@
     syscall
 .endm
 
-/* Fail the script with `step` unless %rax == val. */
+/* Fail the script with `step` unless %rax == val. Built with -DDEBUGRET the
+ * exit status is instead the unexpected result negated (an errno), for
+ * diagnosing a red run by hand. */
 .macro EXPECT step, val
     cmp $\val, %rax
     je 9f
+#ifdef DEBUGRET
+    neg %rax
+    mov %eax, %edi
+#else
     mov $\step, %edi
+#endif
     jmp fail
 9:
 .endm
