@@ -1796,6 +1796,93 @@ fn native_exec_adoption_publishes_closed_manifest_before_consuming_receipt() {
     ));
 }
 
+/// Characterization of ARM's pre-crossing identity (#1093 S4c): the closed
+/// successor must carry exactly `(asid << 48) | root` from the sealed
+/// manifest. Generalising the hook must not change which bindings ARM
+/// adopts, so this pins the accepted binding and three near misses.
+#[test]
+fn arm_exec_adoption_identity_is_the_sealed_asid_over_the_root() {
+    use carrick_core_abi::service::{
+        ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
+        ServiceBirth, ServiceIdentity,
+    };
+    use carrick_core_abi::{El1MmHandle, EntryThreadGeneration, SnapshotGeneration};
+    use carrick_sched_core::process::TaskId;
+    use core::num::NonZeroI32;
+
+    const SEALED: u64 = 0x002f_0000_0090_0000;
+    for (bound, adopted) in [
+        (SEALED, true),
+        // Another ASID over the same root.
+        (0x002e_0000_0090_0000, false),
+        // The same ASID over another root.
+        (0x002f_0000_0091_0000, false),
+        // The untagged root alone, as x86 binds it.
+        (0x0000_0000_0090_0000, false),
+    ] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let service = fixture.process_service();
+        let identity = ServiceIdentity {
+            birth: ServiceBirth {
+                origin: carrick_core_abi::service::ServiceOrigin::Initial,
+                process: TaskKey {
+                    id: TaskId::from_registry_allocation(NonZeroI32::new(7).unwrap()),
+                    serial: TaskSerial::from_registry_allocation(NonZeroU64::new(11).unwrap()),
+                },
+                thread: EntryThreadGeneration::from_raw(13),
+                record: carrick_sched_core::RecordRef {
+                    id: RecordId::from_raw(7).unwrap(),
+                    incarnation: 17,
+                },
+                mm: unsafe {
+                    El1MmHandle::from_admitted_owner(
+                        NonZeroU64::MIN,
+                        ReservationMm::new(19).unwrap(),
+                        NonZeroU64::new(23).unwrap(),
+                    )
+                },
+            },
+            execution: SnapshotGeneration::from_raw(29),
+            sequence: NonZeroU64::new(31).unwrap(),
+        };
+        let successor_mm = ReservationMm::new(37).unwrap();
+        let slot = service.prepare_exec_successor_slot(successor_mm).unwrap();
+        let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(41).unwrap()).unwrap();
+        let root = RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap();
+        let manifest =
+            ExecSuccessorManifest::propose(identity, successor_mm, slot.root_generation())
+                .seal(
+                    identity,
+                    receipt,
+                    ExecSuccessorBacking {
+                        root,
+                        asid: asid(47),
+                        asid_generation: NonZeroU64::new(53).unwrap(),
+                    },
+                    ExecSuccessorEntry {
+                        entry: UserVa::new(0x40_0000),
+                        stack_pointer: UserVa::new(0x7fff_f000),
+                    },
+                )
+                .unwrap();
+        let index = fixture.zone.spaces.find(successor_mm.raw()).unwrap();
+        assert!(
+            fixture
+                .zone
+                .spaces
+                .bind_initial_root(index, successor_mm.raw(), bound, bound)
+        );
+        let result = service.adopt_exec_successor(identity, receipt, &manifest);
+        assert_eq!(result.is_ok(), adopted, "binding {bound:#x}");
+        if adopted {
+            slot.commit();
+        } else {
+            assert!(matches!(result, Err(NativeProcessError::Stale)));
+            drop(slot);
+        }
+    }
+}
+
 #[test]
 fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
     use carrick_core_abi::service::{
