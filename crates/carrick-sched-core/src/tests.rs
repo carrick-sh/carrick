@@ -5279,3 +5279,32 @@ fn held_affinity_probe_busy_once_then_success() {
     );
     assert_eq!(zone.slot(SLOT).queued(), 1);
 }
+
+#[test]
+fn held_affinity_placement_on_an_away_owner_kicks_live_peers() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    enter(&zone, THIRD, 1);
+    assert!(zone.step_away(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    host_publish(&zone, THIRD, MM + 1, Some(1), 0);
+    let (id, seq) = park_pinned(&zone, 75, 0x4000, 1 << 2);
+    zone.record(id).native_owned.store(1, Ordering::Release);
+    let record = zone.record_ref(id);
+    assert_eq!(
+        zone.claim_for_host(record, None, Handback::Woken, &HostWait, &|owned| {
+            let _ = owned.into_parts();
+        }),
+        HostClaim::Claimed
+    );
+    assert_eq!(
+        zone.place_native_handback(record),
+        Some(NativePlacement::Held)
+    );
+    zone.record(id).set_affinity(1 << 1);
+    let mut effects = WakeEffects::default();
+    zone.probe_held(&mut effects);
+    assert_eq!(zone.record(id).claim(), Claim::Queued { slot: OTHER, seq });
+    assert!(effects.sgi_slots().any(|slot| slot == THIRD));
+    assert!(zone.take_resched(THIRD));
+}
