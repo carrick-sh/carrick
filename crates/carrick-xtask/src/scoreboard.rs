@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -24,8 +25,9 @@ const NODE: &str = "docker.io/library/node:22-slim";
 const GO: &str = "docker.io/library/golang:1.23";
 const DEFAULT_BOUND_SECS: u64 = 120;
 /// Exit code the old `perl -e 'alarm 120'` bound produced: 128 + SIGALRM.
+/// A timed-out row reports it whatever signal actually ended it.
 const TIMEOUT_EXIT: i32 = 128 + libc::SIGALRM;
-/// Grace between the bound's SIGALRM and a SIGKILL of a row that ignores it.
+/// Grace between the bound's SIGTERM and a SIGKILL of a row that ignores it.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(clap::Args, Debug)]
@@ -48,8 +50,8 @@ pub struct ScoreboardArgs {
     /// Per-row bound in seconds.
     #[arg(long, default_value_t = DEFAULT_BOUND_SECS)]
     pub bound_secs: u64,
-    /// Reaper invoked as `sudo -n <reaper> <run-id>` (default:
-    /// `<root>/scripts/sudo/kill.sh`).
+    /// Reaper invoked as `<reaper> <run-id>`, then `sudo -n <reaper> <run-id>`
+    /// if that fails (default: `<root>/scripts/sudo/kill.sh`).
     #[arg(long)]
     pub reaper: Option<PathBuf>,
 }
@@ -270,40 +272,47 @@ impl Runner<'_> {
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
+            // Own process group: the leader's pid is the group id, so a
+            // timeout can signal every process the row spawned.
+            .process_group(0)
             .spawn()
             .map_err(io_err(self.carrick))?;
         let pid = child.id() as libc::pid_t;
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let (bound, grace) = (self.bound, KILL_GRACE);
+        let (reaper, reap_run_id) = (self.reaper.to_path_buf(), run_id.clone());
         // The watchdog sleeps on the channel with the bound as its deadline.
         // The main thread leaves the child as a zombie (`WNOWAIT`) until the
-        // watchdog is joined, so a signal can never reach a recycled pid.
+        // watchdog is joined, so the group id stays ours and a signal can
+        // never reach a recycled pid. On timeout the watchdog also reaps, so a
+        // wedged guest cannot block cleanup behind the blocking wait.
         let watchdog = std::thread::spawn(move || {
             if done_rx.recv_timeout(bound) != Err(RecvTimeoutError::Timeout) {
                 return false;
             }
-            // SAFETY: the child is alive or an unreaped zombie until the join.
-            unsafe { libc::kill(pid, libc::SIGALRM) };
-            if done_rx.recv_timeout(grace) == Err(RecvTimeoutError::Timeout) {
-                // SAFETY: as above.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
+            // SAFETY: the leader is alive or an unreaped zombie until the join,
+            // so `-pid` names our row's group.
+            unsafe { libc::kill(-pid, libc::SIGTERM) };
+            // Returns early once the leader exits, but members that ignored
+            // SIGTERM may remain, so the group is killed either way.
+            let _ = done_rx.recv_timeout(grace);
+            // SAFETY: as above.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            reap(&reaper, &reap_run_id);
             true
         });
         wait_without_reaping(pid).map_err(io_err(self.carrick))?;
         let _ = done_tx.send(());
         let timed_out = watchdog.join().unwrap_or(false);
+        if !timed_out {
+            // A row that exited by itself may still have left members behind.
+            // SAFETY: the leader is still an unreaped zombie, so the group id
+            // cannot have been recycled.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            reap(self.reaper, &run_id);
+        }
         let status = child.wait().map_err(io_err(self.carrick))?;
         let exit_code = signal_exit(&status);
-        // Reap by run id; the row is scored whether or not the reap succeeds.
-        let _ = Command::new("sudo")
-            .args(["-n"])
-            .arg(self.reaper)
-            .arg(&run_id)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
         let mut result = row_result(
             row.name,
             exit_code,
@@ -312,14 +321,58 @@ impl Runner<'_> {
             &read_lossy(&err_path),
         );
         if timed_out {
-            result.exit_code = if exit_code == 0 {
-                TIMEOUT_EXIT
-            } else {
-                exit_code
-            };
+            result.exit_code = TIMEOUT_EXIT;
         }
         Ok(result)
     }
+}
+
+/// Upper bound on one reaper invocation.
+const REAP_BOUND: Duration = Duration::from_secs(30);
+
+/// Reap a run id's guest, the way the other harnesses do: run the reaper
+/// directly first, and fall back to `sudo -n` only if that did not succeed.
+/// The row is scored whether or not the reap succeeds.
+fn reap(reaper: &Path, run_id: &str) {
+    let direct = Command::new(reaper);
+    let mut sudo = Command::new("sudo");
+    sudo.arg("-n").arg(reaper);
+    for command in [direct, sudo] {
+        if run_bounded(command, run_id) {
+            return;
+        }
+    }
+}
+
+/// Run `command <run-id>` in its own group under [`REAP_BOUND`]; true on exit 0.
+fn run_bounded(mut command: Command, run_id: &str) -> bool {
+    let Ok(mut child) = command
+        .arg(run_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    else {
+        return false;
+    };
+    let pid = child.id() as libc::pid_t;
+    let (tx, rx) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    let status = match rx.recv_timeout(REAP_BOUND) {
+        Ok(status) => status,
+        Err(_) => {
+            // SAFETY: the waiter has not reaped the child yet, so `-pid` is
+            // still its group.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            rx.recv()
+                .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+        }
+    };
+    let _ = waiter.join();
+    status.is_ok_and(|s| s.success())
 }
 
 /// Block until `pid` has exited, leaving it reapable.
