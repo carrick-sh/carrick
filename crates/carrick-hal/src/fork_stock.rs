@@ -270,6 +270,9 @@ pub enum ForkStockServiceError {
     OccupancyUnavailable,
     /// The exact live child has no reusable authenticated table stock.
     DescriptorTableCapacity,
+    /// The stock holds fewer table pages than an exec successor build needs.
+    /// Not now, never fatal: the exec waits for stock to return.
+    SuccessorTableCapacity,
 }
 
 /// Per-child address-space tag. AArch64 tags every forked root with a
@@ -796,6 +799,8 @@ pub struct ForkStockCounters {
     /// Reclaim attempts that left a child quarantined because its release,
     /// clear or tag retirement failed; the next drain retries it.
     pub reclaim_deferrals: u64,
+    /// Exec successor table reservations refused for capacity.
+    pub successor_table_refusals: u64,
 }
 
 impl ForkStockCounters {
@@ -817,6 +822,7 @@ impl ForkStockCounters {
             ("retire_refusal", self.retire_refusals),
             ("returned_child", self.returned_children),
             ("reclaim_deferral", self.reclaim_deferrals),
+            ("successor_table_refusal", self.successor_table_refusals),
         ]
         .into_iter()
         .filter(|(_, count)| *count != 0)
@@ -865,6 +871,31 @@ pub fn take_fork_table_stock(
     };
     *stock = available;
     Some((child_tables, parent_tables))
+}
+
+/// Take `count` table pages for an exec successor build, all or nothing. The
+/// editor links tables one at a time, so the pages need not be contiguous;
+/// they come from as few runs as the stock allows, keeping long runs for
+/// fork's contiguous arenas: the shortest run that holds them all, else the
+/// longest runs first. Pages are returned in address order within each run.
+pub fn take_successor_table_runs(stock: &mut Vec<RootGpa>, count: usize) -> Option<Vec<RootGpa>> {
+    let _ = (stock, count);
+    None
+}
+
+/// Table pages reserved from the fork stock for one exec successor build.
+/// They are out of the reusable stock until the build is committed to the
+/// successor or returned with [`ForkStock::return_successor_tables`].
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct SuccessorTables {
+    pages: Vec<RootGpa>,
+}
+
+impl SuccessorTables {
+    pub fn pages(&self) -> &[RootGpa] {
+        &self.pages
+    }
 }
 
 /// Runtime reservation of root-table arenas from the carrier's existing
@@ -1752,6 +1783,21 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             .flatten()
             .copied()
             .collect()
+    }
+
+    /// Reserve `count` table pages for an exec successor build, in as many
+    /// runs as the stock needs. A refusal leaves the stock unchanged.
+    pub fn reserve_successor_tables(
+        &mut self,
+        count: usize,
+    ) -> Result<SuccessorTables, ForkStockServiceError> {
+        let _ = count;
+        Err(ForkStockServiceError::SuccessorTableCapacity)
+    }
+
+    /// Return an unused successor reservation to the reusable stock.
+    pub fn return_successor_tables(&mut self, tables: SuccessorTables) {
+        let _ = tables;
     }
 
     /// Seed the bounded stock before any guest can request it. Pages and
