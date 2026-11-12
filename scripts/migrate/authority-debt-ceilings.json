@@ -33590,7 +33590,7 @@
     {
       "family": "k1_inspect_misc",
       "operation": "inspect",
-      "owner": "carrick_kernel::dispatch::fs::mount::FsView<'a>::fchdir",
+      "owner": "carrick_kernel::dispatch::fs::mount::FsView<'a>::fchdir_target",
       "lane": "shared",
       "ceiling": 1
     },
