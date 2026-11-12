@@ -35,9 +35,8 @@ and `scripts/entitlements.plist` (#1918), `reuse-lookup` verifies the seal on
 that Mac before tokenless `execute` runs and reuses the `base/` evidence; any
 miss or verification doubt falls back to executing `PairSide::Base` in-job.
 The xtask subcommands (`reuse-lookup`, `prepare-reuse-upload`, `--reuse-base`)
-land first; the `signed-gate.yml` steps that call them land in a follow-up
-part 2, because the gate builds xtask from trusted `main` (#2092). Until then
-the workflow does not call them and every run executes the base in-job.
+landed first (#2061) because the gate builds xtask from trusted `main` (#2092);
+`signed-gate.yml` now calls them.
 
 **Fixture authority comes from main, never from the candidate** (#1889).
 The `base-fixtures` job runs trusted `main` code that finds the
