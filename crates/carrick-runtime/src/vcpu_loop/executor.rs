@@ -1137,7 +1137,12 @@ where
                     ));
                 }
             };
-            let root_receipt = match binding.retire_detached_exec_predecessor(root_ticket) {
+            // The exec syscall already released the predecessor's frames (a
+            // failed release there killed the process); its tables and root
+            // retire here. Only then are its retired root's returns settled.
+            let cleanup = binding.retire_detached_exec_predecessor(root_ticket);
+            retirement.settle_retired_returns(cleanup.is_ok());
+            let root_receipt = match cleanup {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     let settlement = match settlement_authority {
@@ -1336,6 +1341,11 @@ where
             } else {
                 binding.retire_detached_shared_mm_edge().map(|()| None)
             };
+            // The detached cleanup released the MM's frames: only then are
+            // its retired root's owed returns settled.
+            if let Some(stage1) = retirement.retirement() {
+                stage1.settle_retired_returns(cleanup.is_ok());
+            }
             let root_receipt = match cleanup {
                 Ok(receipt) => receipt,
                 Err(error) => {

@@ -26,9 +26,11 @@
 //! ring-owned; the routine stays.
 
 use super::*;
-use carrick_el1_abi::{ReservationSequence, ReturnJournal, SettlementOutcome};
+use carrick_el1_abi::{
+    OwedReturnRetirement, ReservationSequence, ReturnJournal, SettlementOutcome,
+};
 use carrick_hal::return_settlement::{
-    OwedReturnRetirement, ReturnJournalAccess, ReturnSettlementError, settle_owed_returns,
+    ReturnJournalAccess, ReturnSettlementError, settle_owed_returns,
 };
 
 /// Why a reconciliation acknowledged nothing. The owed extents stay owed.

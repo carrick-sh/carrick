@@ -15,8 +15,18 @@
 //! `new_start == end` frees the slot. A front merge moves `start` back over
 //! pages that really are unsettled, so an acknowledgement that raced it is
 //! stale and has no effect.
+//!
+//! Freeing a slot takes settlement authority, never a bare (slot, epoch):
+//! - an acknowledgement consumes a [`SettledChunk`], which only
+//!   [`ReturnSettlementRequest::retire_and_apply`] mints, under an exclusion
+//!   of the request's MM and after the venue's fallible steps and its one
+//!   infallible apply;
+//! - a retired MM's slots are freed only by an [`MmReleaseReceipt`], which
+//!   only [`MmReleaseReceipt::released`] mints, once the MM's address space
+//!   is excluded and its carrier-wide memory release succeeded.
 
 use super::{Refusal, ReservationMm, ReservationRange, ReservationSequence};
+use carrick_sched_core::ExcludedEditor;
 
 /// Owed extents one root can hold at once (its share of the shared table).
 pub const OWED_RETURNS_PER_MM: usize = 8;
@@ -171,20 +181,153 @@ pub enum SettlementOutcome<R> {
     Skipped(SkipReason),
 }
 
+/// A venue's physical retirement of owed extents.
+pub trait OwedReturnRetirement {
+    /// What the fallible steps staged for the infallible apply.
+    type Prepared;
+    type Error;
+    /// The fallible steps for every extent of `request`: retire its stage-1
+    /// retired leaves, stage-2 and frame-inventory backing. Idempotent over
+    /// an extent already retired. On `Err` nothing may be left for
+    /// [`Self::apply`]: the venue undoes or keeps retryable its own work.
+    fn prepare(&mut self, request: &ReturnSettlementRequest)
+    -> Result<Self::Prepared, Self::Error>;
+    /// The one infallible apply of a prepared batch.
+    fn apply(&mut self, prepared: Self::Prepared);
+}
+
+impl ReturnSettlementRequest {
+    /// The settlement step that mints acknowledgement authority: under an
+    /// exclusion of exactly this request's MM, run the venue's fallible
+    /// steps, then its one infallible apply, and only then hand back one
+    /// [`SettledChunk`] per observed extent. `Ok(None)`: the exclusion names
+    /// another MM, so nothing ran (stale). `Err`: a fallible step failed;
+    /// nothing applied and nothing may be acknowledged.
+    pub fn retire_and_apply<B: OwedReturnRetirement + ?Sized>(
+        self,
+        excluded: &ExcludedEditor<'_>,
+        backend: &mut B,
+    ) -> Result<Option<SettledReturns>, B::Error> {
+        if self.mm.raw() != excluded.key() {
+            return Ok(None);
+        }
+        let prepared = backend.prepare(&self)?;
+        backend.apply(prepared);
+        Ok(Some(SettledReturns {
+            mm: self.mm,
+            chunks: self.owed.map(|owed| {
+                owed.map(|owed| SettledChunk {
+                    slot: owed.slot,
+                    epoch: owed.epoch,
+                    expected_start: owed.range.start(),
+                    new_start: owed.range.end(),
+                })
+            }),
+        }))
+    }
+}
+
+/// Authority to acknowledge `[expected_start, new_start)` of the owed extent
+/// in `slot` during lifetime `epoch`: that part was retired and its batch
+/// applied. Only [`ReturnSettlementRequest::retire_and_apply`] mints one, so
+/// no root holder can free an owed slot without the settlement's exclusion,
+/// retirement and apply. Neither `Clone` nor `Copy`: one acknowledgement.
+#[must_use = "an unacknowledged settled chunk leaves its extent owed"]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub struct SettledChunk {
+    slot: OwedSlot,
+    epoch: OwedSlotEpoch,
+    expected_start: u64,
+    new_start: u64,
+}
+impl SettledChunk {
+    pub const fn slot(&self) -> OwedSlot {
+        self.slot
+    }
+    pub const fn epoch(&self) -> OwedSlotEpoch {
+        self.epoch
+    }
+    /// The slot's `start` the settlement walked from.
+    pub const fn expected_start(&self) -> u64 {
+        self.expected_start
+    }
+    /// The slot's `start` once this chunk is acknowledged.
+    pub const fn new_start(&self) -> u64 {
+        self.new_start
+    }
+}
+
+/// Every extent of one observed request, retired and applied: one
+/// [`SettledChunk`] each.
+#[must_use = "an unacknowledged settlement leaves its extents owed"]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub struct SettledReturns {
+    mm: ReservationMm,
+    chunks: [Option<SettledChunk>; OWED_RETURNS_PER_MM],
+}
+impl SettledReturns {
+    /// The root whose journal the settled request observed.
+    pub const fn mm(&self) -> ReservationMm {
+        self.mm
+    }
+    pub fn is_empty(&self) -> bool {
+        self.chunks.iter().all(Option::is_none)
+    }
+    pub fn into_chunks(self) -> impl Iterator<Item = SettledChunk> {
+        self.chunks.into_iter().flatten()
+    }
+}
+
+/// Evidence that one MM's carrier-wide memory was released for good: its
+/// address space is excluded (for a retired MM, no published entry names
+/// it) and the venue's whole-MM release (frame-inventory rows, COW
+/// residency) succeeded. Only [`Self::released`] mints one; it frees the
+/// retired MM's owed slots ([`RetiredReturns::settle_whole_mm`]), whose
+/// frames that release returned. Neither `Clone` nor `Copy`.
+#[must_use = "an unspent release receipt leaves the MM's returns owed"]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub struct MmReleaseReceipt {
+    mm: ReservationMm,
+}
+impl MmReleaseReceipt {
+    /// Run the venue's whole-MM `release` for the MM whose editor `absent`
+    /// proves excluded, and mint its receipt only if the release succeeded.
+    /// `None`: no MM is named, or the release failed; the MM's returns stay
+    /// owed and the venue retries its (idempotent) release.
+    pub fn released(
+        absent: &ExcludedEditor<'_>,
+        release: impl FnOnce(ReservationMm) -> bool,
+    ) -> Option<Self> {
+        let mm = ReservationMm::new(absent.key())?;
+        release(mm).then_some(Self { mm })
+    }
+    /// The released MM.
+    pub const fn mm(&self) -> ReservationMm {
+        self.mm
+    }
+}
+
+/// The shared owed-return table, for MMs whose root has retired.
+pub trait RetiredReturns {
+    /// Free every slot the released MM still owes; returns how many. The
+    /// receipt is spent either way. `Busy`: a root still publishes the MM
+    /// and owes returns, so nothing is freed and the venue reruns its
+    /// release after that root retires.
+    fn settle_whole_mm(&self, receipt: MmReleaseReceipt) -> Result<usize, Refusal>;
+}
+
 /// One root's owed-return journal, borrowed under its root guard.
 pub trait ReturnJournal {
     /// Every extent the root owes now.
     fn owed_returns(&self) -> Result<ReturnSettlementRequest, Refusal>;
-    /// Acknowledge `[expected_start, new_start)` of the extent in `slot`.
-    /// Effective only while the slot still holds `epoch` and starts at
-    /// `expected_start`, and `new_start` lies in `(expected_start, end]`;
+    /// Acknowledge the settled chunk of one owed extent. Effective only
+    /// while the slot still holds the chunk's epoch and starts at its
+    /// `expected_start`, and its `new_start` lies in `(expected_start, end]`;
     /// `new_start == end` frees the slot and advances its epoch.
     /// `Err(Stale)`: the root is no longer admitted.
-    fn acknowledge_chunk(
-        &mut self,
-        slot: OwedSlot,
-        epoch: OwedSlotEpoch,
-        expected_start: u64,
-        new_start: u64,
-    ) -> Result<ChunkAcknowledgement, Refusal>;
+    ///
+    /// Acknowledgement takes settlement authority: a bare (slot, epoch,
+    /// start) frees nothing (witness: `carrick-core`'s
+    /// `Reservations::acknowledge_chunk` doctests).
+    fn acknowledge_chunk(&mut self, chunk: SettledChunk) -> Result<ChunkAcknowledgement, Refusal>;
 }

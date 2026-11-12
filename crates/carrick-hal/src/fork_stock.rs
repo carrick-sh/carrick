@@ -22,7 +22,8 @@ use std::num::NonZeroU64;
 
 use carrick_el1_abi::{
     ChildRetireRefusal, ExecutionBinding, ForkLifecycleLoan, ForkStockExchange, ForkStockLoan,
-    ForkStockRefusal, ForkStockSettlement, NativeChildRetire, ReservationMm,
+    ForkStockRefusal, ForkStockSettlement, MmReleaseReceipt, NativeChildRetire, ReservationMm,
+    RetiredReturns,
 };
 use carrick_guest_arch::{AddressContext, Asid, CpuId, RootGpa};
 
@@ -643,7 +644,38 @@ impl LifecycleWindow {
 /// quarantine: every frame-inventory mapping (frames no other MM maps
 /// retire) and every COW residency row keyed by the MM. Root-registry and
 /// memslot custody stay with the carrier's own memory owner.
+///
+/// The MM is the one whose editor `absent` proves excluded (a retired
+/// child: no published entry names it). Only a successful release mints its
+/// [`MmReleaseReceipt`], and the receipt is spent at once on the owed
+/// returns the retired MM's root left in `returns`: those slots are freed
+/// only now, after the frames they name returned with the MM's inventory.
+/// `false`: the release failed, or a root still publishes the MM and owes
+/// returns; those returns stay owed, and the caller's existing retry reruns
+/// this release (idempotent: an emptied MM retires nothing again).
 pub fn release_child_mm(
+    inventory: &dyn crate::PhysicalFrameInventory,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    returns: &dyn RetiredReturns,
+    absent: &carrick_sched_core::ExcludedEditor<'_>,
+) -> bool {
+    MmReleaseReceipt::released(absent, |mm| release_mm_memory(inventory, residency, mm))
+        .is_some_and(|receipt| returns.settle_whole_mm(receipt).is_ok())
+}
+
+/// Roll back the carrier-wide per-MM state of a fork child that never ran:
+/// its fork was refused or aborted before commit, so no EL1 editor ever
+/// served it and its root journaled no owed return (fork never copies the
+/// parent's owed returns). Only its inventory and residency rows go.
+pub fn release_unrun_child_mm(
+    inventory: &dyn crate::PhysicalFrameInventory,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    mm: ReservationMm,
+) -> bool {
+    release_mm_memory(inventory, residency, mm)
+}
+
+fn release_mm_memory(
     inventory: &dyn crate::PhysicalFrameInventory,
     residency: &carrick_el1_abi::FrameGrantResidencyTable,
     mm: ReservationMm,

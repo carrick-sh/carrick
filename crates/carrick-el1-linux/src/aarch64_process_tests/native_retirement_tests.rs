@@ -109,6 +109,19 @@ pub(super) struct PhysicalStock {
     lanes: Vec<PhysicalLane>,
     tables: (core::ptr::NonNull<AtomicU64>, u64, usize),
     releases: usize,
+    /// The reservation table whose retired roots' owed returns a child's
+    /// release receipt settles; a fresh empty one when unset.
+    pub returns: Option<&'static carrick_el1::memory::reservations::SharedReservations>,
+}
+
+/// A zero-filled reservation table: no root, no owed return.
+fn empty_reservations() -> Box<carrick_el1::memory::reservations::SharedReservations> {
+    let layout = std::alloc::Layout::new::<carrick_el1::memory::reservations::SharedReservations>();
+    // SAFETY: every atomic and node is zero-valid; root state is MaybeUninit.
+    let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!pointer.is_null());
+    // SAFETY: allocated above with this exact layout.
+    unsafe { Box::from_raw(pointer.cast()) }
 }
 
 impl PhysicalStock {
@@ -168,6 +181,7 @@ impl PhysicalStock {
                 tables.words.len(),
             ),
             releases: 0,
+            returns: None,
         }
     }
 
@@ -353,6 +367,14 @@ impl PhysicalStock {
         let inventory = self.inventory.clone();
         let local_residency = carrick_el1_abi::FrameGrantResidencyTable::new();
         let residency = self.residency.unwrap_or(&local_residency);
+        let local_returns;
+        let returns = match self.returns {
+            Some(returns) => returns,
+            None => {
+                local_returns = empty_reservations();
+                &*local_returns
+            }
+        };
         let returned = self
             .owner
             .reclaim(
@@ -391,7 +413,16 @@ impl PhysicalStock {
                 |life| window.clear(life),
                 |absence| {
                     self.releases += 1;
-                    carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence.mm())
+                    zone.spaces
+                        .unpublished(absence.mm().raw())
+                        .is_some_and(|absent| {
+                            carrick_hal::fork_stock::release_child_mm(
+                                &*inventory,
+                                residency,
+                                returns,
+                                &absent,
+                            )
+                        })
                 },
             )
             .unwrap();

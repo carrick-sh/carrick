@@ -17,6 +17,10 @@
 //! 4. acknowledge each slot by (slot, epoch, start)
 //!    ([`carrick_core_abi::ReturnJournal::acknowledge_chunk`]).
 //!
+//! Steps 1 to 3 are [`ReturnSettlementRequest::retire_and_apply`], the only
+//! mint of the [`carrick_core_abi::SettledChunk`]s step 4 consumes: no
+//! journal holder can acknowledge an extent outside this transaction.
+//!
 //! A failure in step 2 applies and acknowledges nothing: the extents stay
 //! owed and the next settlement retries them, re-retiring the ones that
 //! already succeeded as no-ops. A journal that no longer names the MM is
@@ -27,7 +31,8 @@
 //! inside the journal steps, never across backend service.
 
 use carrick_core_abi::{
-    ChunkAcknowledgement, Refusal, ReturnJournal, ReturnSettlementRequest, SettlementOutcome,
+    ChunkAcknowledgement, OwedReturnRetirement, Refusal, ReturnJournal, ReturnSettlementRequest,
+    SettlementOutcome,
 };
 
 /// One MM's settlement lock: serializes every settlement of the MM's owed
@@ -81,21 +86,6 @@ pub trait ReturnJournalAccess {
     ) -> Result<R, Self::Error>;
 }
 
-/// A venue's physical retirement of owed extents.
-pub trait OwedReturnRetirement {
-    /// What the fallible steps staged for the infallible apply.
-    type Prepared;
-    type Error;
-    /// The fallible steps for every extent of `request`: retire its stage-1
-    /// retired leaves, stage-2 and frame-inventory backing. Idempotent over
-    /// an extent already retired. On `Err` nothing may be left for
-    /// [`Self::apply`]: the venue undoes or keeps retryable its own work.
-    fn prepare(&mut self, request: &ReturnSettlementRequest)
-    -> Result<Self::Prepared, Self::Error>;
-    /// The one infallible apply of a prepared batch.
-    fn apply(&mut self, prepared: Self::Prepared);
-}
-
 /// What a settled transaction acknowledged.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReturnSettlementReceipt {
@@ -127,17 +117,16 @@ pub fn settle_owed_returns<J: ReturnJournalAccess, B: OwedReturnRetirement>(
     if guard.mm() != excluded.key() {
         return Ok(SettlementOutcome::Stale);
     }
-    let request = journal
+    let request: ReturnSettlementRequest = journal
         .with_journal(|journal| journal.owed_returns())
         .map_err(ReturnSettlementError::Journal)?;
-    if request.mm().raw() != excluded.key() {
+    let Some(settled) = request
+        .retire_and_apply(excluded, backend)
+        .map_err(ReturnSettlementError::Backend)?
+    else {
         return Ok(SettlementOutcome::Stale);
-    }
-    let prepared = backend
-        .prepare(&request)
-        .map_err(ReturnSettlementError::Backend)?;
-    backend.apply(prepared);
-    if request.is_empty() {
+    };
+    if settled.is_empty() {
         return Ok(SettlementOutcome::Settled(
             ReturnSettlementReceipt::default(),
         ));
@@ -145,13 +134,8 @@ pub fn settle_owed_returns<J: ReturnJournalAccess, B: OwedReturnRetirement>(
     journal
         .with_journal(|journal| {
             let mut receipt = ReturnSettlementReceipt::default();
-            for owed in request.iter() {
-                match journal.acknowledge_chunk(
-                    owed.slot,
-                    owed.epoch,
-                    owed.range.start(),
-                    owed.range.end(),
-                )? {
+            for chunk in settled.into_chunks() {
+                match journal.acknowledge_chunk(chunk)? {
                     ChunkAcknowledgement::Freed => receipt.freed += 1,
                     ChunkAcknowledgement::Advanced => receipt.advanced += 1,
                     ChunkAcknowledgement::Stale => receipt.stale += 1,

@@ -1440,13 +1440,7 @@ fn reservation_decommit_returns_published_backing() {
     }
     .unwrap();
     root.complete_deferring_return(receipt, slot).unwrap();
-    for owed in carrick_core_abi::ReturnJournal::owed_returns(&root)
-        .unwrap()
-        .iter()
-    {
-        root.acknowledge_chunk(owed.slot, owed.epoch, owed.range.start(), owed.range.end())
-            .unwrap();
-    }
+    crate::mm::reservation::root::settle_all_for_test(&mut root);
     assert_eq!(ledger.book.uses.len(), 0);
     assert!(root.is_reserved(span));
     assert!(!root.is_committed(page));

@@ -344,6 +344,9 @@ fn settle_native_exec_predecessor(
     };
     // SAFETY: initialized atomic ABI record in the retained carrier mapping.
     let residency = unsafe { &*pointer };
+    let Some(returns) = retained_reservations(region) else {
+        return false;
+    };
     let settled = {
         let mut stock = custody.fork_stock.lock();
         let mut ledger = crate::fork_stock::fork_table_accounting(custody);
@@ -353,7 +356,16 @@ fn settle_native_exec_predecessor(
             absence,
             |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
             |_, absence| {
-                carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence.mm())
+                zone.spaces
+                    .unpublished(absence.mm().raw())
+                    .is_some_and(|absent| {
+                        carrick_hal::fork_stock::release_child_mm(
+                            &*inventory,
+                            residency,
+                            returns,
+                            &absent,
+                        )
+                    })
             },
         )
     };
@@ -1665,6 +1677,7 @@ fn reclaim_fork_stock(
         .ok_or(ForkStockServiceError::InvalidRecord)?;
     // SAFETY: initialized atomic ABI record in the retained carrier mapping.
     let residency = unsafe { &*pointer };
+    let returns = retained_reservations(region).ok_or(ForkStockServiceError::InvalidRecord)?;
     stock.owner.reclaim(
         ledger,
         execution,
@@ -1682,8 +1695,35 @@ fn reclaim_fork_stock(
         },
         |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
         |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
-        |absence| carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence.mm()),
+        |absence| {
+            zone.spaces
+                .unpublished(absence.mm().raw())
+                .is_some_and(|absent| {
+                    carrick_hal::fork_stock::release_child_mm(
+                        &*inventory,
+                        residency,
+                        returns,
+                        &absent,
+                    )
+                })
+        },
     )
+}
+
+/// The guest's shared reservation table in the retained carrier region,
+/// where a retired MM's root leaves its owed returns for the MM's release
+/// receipt ([`carrick_hal::fork_stock::release_child_mm`]).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retained_reservations(
+    region: RetainedAbiRegion<'_>,
+) -> Option<&carrick_el1::memory::reservations::SharedReservations> {
+    let pointer = region.record_ptr::<carrick_el1::memory::reservations::SharedReservations>(
+        carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize,
+    )?;
+    // SAFETY: the zero-valid reservation table the guest initializes in the
+    // retained carrier mapping; every field is atomic or guarded by its
+    // owner's root lock, and settlement touches only retired MMs' slots.
+    Some(unsafe { &*pointer })
 }
 
 /// Native stock crossings retain an ABI stack, not a physical inventory row.

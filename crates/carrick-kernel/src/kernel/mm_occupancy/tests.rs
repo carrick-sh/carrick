@@ -1157,6 +1157,86 @@ fn refused_retained_publication_releases_every_backing_reference() {
     );
 }
 
+/// #1480 P0-2, host venue: a retired host-served root's owed returns stay
+/// owed under its retired key until the host venue released the MM's
+/// frames. A failed release mints no receipt and frees nothing; the retry
+/// frees exactly them, once.
+#[test]
+fn host_root_returns_stay_owed_until_its_frames_are_released() {
+    use carrick_el1::memory::reservations::{Decision, Placement};
+    use carrick_el1_abi::{
+        Refusal, ReservationBackingReceipt, ReservationCompletion, ReservationMm,
+        ReservationProtection, ReservationRange, ReservationRequest,
+    };
+    // SAFETY: VM-free: models a completed descriptor and backing commit.
+    let completed = |request: ReservationRequest| unsafe {
+        ReservationCompletion::after_descriptor_and_backing_commit(
+            request,
+            ReservationBackingReceipt {
+                receipt: request.sequence.raw(),
+                granted_bytes: 0,
+                returned_bytes: 0,
+            },
+        )
+        .unwrap()
+    };
+    let backing = Arc::new(RetainedPublicationFixture {
+        bytes: carrick_test_support::TestEl1Region::zeroed(),
+        carrier: std::num::NonZeroU64::new(96).unwrap(),
+        released: Arc::default(),
+    });
+    let guard =
+        PreAdmissionGuard::acquire_in(SpaceTables::retained(backing.clone()).unwrap(), mm(43_004))
+            .unwrap();
+    let publication = guard
+        .publish_closed(
+            &fence(),
+            0x20_000,
+            0x20_000,
+            0,
+            0,
+            ReservationRootPublication {
+                limits: ReservationLimits {
+                    address: u64::MAX,
+                    data: u64::MAX,
+                },
+                provider: None,
+            },
+        )
+        .unwrap();
+    drop(guard);
+    let region = backing.region().unwrap();
+    let key = ReservationMm::new(43_004).unwrap();
+    let index = region.zone.spaces.find(43_004).unwrap().index();
+    {
+        let mut root = region
+            .reservations
+            .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(index, key)
+            .unwrap();
+        root.finish_import().unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        let request = match root.mmap(Placement::Anywhere, 0x2000, rw) {
+            Ok(Decision::Work(request)) => request,
+            other => panic!("mapping proposal: {other:?}"),
+        };
+        let owed: ReservationRange = request.range;
+        root.complete(completed(request)).unwrap();
+        let Ok(Decision::Work(request)) = root.munmap(owed) else {
+            panic!("return proposal");
+        };
+        let slot = root.reserve_return(request.range).unwrap();
+        root.complete_deferring_return(completed(request), slot)
+            .unwrap();
+    }
+    let returns = publication.retired_returns().unwrap();
+    // Final retirement closes the space and retires the root owing one.
+    drop(publication);
+    assert!(region.zone.spaces.find(43_004).is_none());
+    assert_eq!(returns.settle(false), Err(Refusal::Busy));
+    assert_eq!(returns.settle(true), Ok(1), "the retry frees the slot");
+    assert_eq!(returns.settle(true), Ok(0), "and only once");
+}
+
 struct RetainedTestProvider(Arc<RetainedPublicationFixture>);
 impl crate::dispatch::mem::el1_reservations::HostReservationProvider for RetainedTestProvider {
     fn address_space_backing(&self) -> Option<Arc<dyn AddressSpaceBacking>> {

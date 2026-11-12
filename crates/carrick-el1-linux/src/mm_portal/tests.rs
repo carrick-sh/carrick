@@ -4489,22 +4489,54 @@ fn owner_fork_preserves_parent_owed_return_and_omits_retired_child_leaf() {
         .lock_el1_resolved(spaces.find(78).unwrap().index(), request.child_mm, &view, 0)
         .unwrap();
     child_root.observe_deferred_returns(&mut |_| panic!("parent return leaked into child"));
-    let ack = |root: &mut _| {
-        carrick_el1_abi::ReturnJournal::acknowledge_chunk(
-            root,
-            owed[0].slot,
-            owed[0].epoch,
-            retired_range.start(),
-            retired_range.end(),
-        )
-        .unwrap()
+    // Two settlements of the parent's journal (its physical work elided):
+    // the first frees the extent, the replay is stale.
+    struct NoBacking;
+    impl carrick_el1_abi::OwedReturnRetirement for NoBacking {
+        type Prepared = ();
+        type Error = core::convert::Infallible;
+        fn prepare(
+            &mut self,
+            _: &carrick_el1_abi::ReturnSettlementRequest,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn apply(&mut self, (): ()) {}
+    }
+    let venue = Box::new(carrick_sched_core::AddressSpaces::new());
+    let excluded = venue.unpublished(parent.raw()).unwrap();
+    let settle = || {
+        let request = carrick_el1_abi::ReturnJournal::owed_returns(&parent_root).unwrap();
+        match request.retire_and_apply(&excluded, &mut NoBacking) {
+            Ok(settled) => settled.unwrap(),
+            Err(never) => match never {},
+        }
+    };
+    let (first, replay) = (settle(), settle());
+    let ack = |root: &mut _, settled: carrick_el1_abi::SettledReturns| {
+        let [chunk] = <[_; 1]>::try_from(settled.into_chunks().collect::<Vec<_>>()).unwrap();
+        assert_eq!(
+            (
+                chunk.slot(),
+                chunk.epoch(),
+                chunk.expected_start(),
+                chunk.new_start()
+            ),
+            (
+                owed[0].slot,
+                owed[0].epoch,
+                retired_range.start(),
+                retired_range.end()
+            )
+        );
+        carrick_el1_abi::ReturnJournal::acknowledge_chunk(root, chunk).unwrap()
     };
     assert_eq!(
-        ack(&mut parent_root),
+        ack(&mut parent_root, first),
         carrick_el1_abi::ChunkAcknowledgement::Freed
     );
     assert_eq!(
-        ack(&mut parent_root),
+        ack(&mut parent_root, replay),
         carrick_el1_abi::ChunkAcknowledgement::Stale
     );
 }

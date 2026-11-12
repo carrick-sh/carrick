@@ -477,6 +477,29 @@ impl<'a> CowPause<'a> {
     }
 }
 
+fn retained_reservations(ram: &GuestRam) -> Result<&X86Cpl0Reservations, TrapError> {
+    let ptr = ram
+        .host_ptr(
+            META_GPA + carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET,
+            size_of::<X86Cpl0Reservations>(),
+        )
+        .ok_or_else(|| fail("owner reservation table"))?;
+    // SAFETY: boot initialized aligned production reservation table retained
+    // by this RAM; a retired MM's owed slots are settled only by its receipt.
+    Ok(unsafe { &*ptr.cast::<X86Cpl0Reservations>() })
+}
+
+/// Which carrier-wide release a child gets: a retired child's spends its
+/// release receipt on the owed returns its retired root left; a fork child
+/// that never ran owes none.
+enum ChildRelease<'a> {
+    Retired {
+        returns: &'a dyn carrick_el1_abi::RetiredReturns,
+        zone: &'a X86Cpl0Zone,
+    },
+    Unrun,
+}
+
 /// Release a reclaimed child's carrier-wide state: its frame-inventory rows
 /// and COW residency (shared composition), then its CR3/alias registrations
 /// and the memslots admitted only for it.
@@ -484,6 +507,7 @@ fn release_retired_child<M: CarrierMemoryIo>(
     memory: &mut CarrierMemory<M>,
     inventory: &dyn carrick_hal::PhysicalFrameInventory,
     absence: &SlotAbsence,
+    release: ChildRelease<'_>,
 ) -> Result<crate::carrier_memory::RetiredChild, TrapError> {
     // SAFETY: the retained aligned residency table initialized at boot.
     let residency = unsafe {
@@ -492,7 +516,18 @@ fn release_retired_child<M: CarrierMemoryIo>(
         ))
     }
     .map_err(|e| fail(e.to_string()))?;
-    if !carrick_hal::fork_stock::release_child_mm(inventory, residency, absence.mm()) {
+    let released = match release {
+        ChildRelease::Retired { returns, zone } => zone
+            .spaces
+            .unpublished(absence.mm().raw())
+            .is_some_and(|absent| {
+                carrick_hal::fork_stock::release_child_mm(inventory, residency, returns, &absent)
+            }),
+        ChildRelease::Unrun => {
+            carrick_hal::fork_stock::release_unrun_child_mm(inventory, residency, absence.mm())
+        }
+    };
+    if !released {
         return Err(fail("retired child inventory or residency release"));
     }
     memory
@@ -925,6 +960,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .filter_map(|slot| u8::try_from(slot).ok())
             .map(|slot| zone.installed_space(SlotId::new(slot)))
             .collect();
+        let returns = retained_reservations(&self.ram)?;
         let window = self.lifecycle_window();
         let inventory = Arc::clone(&self.frame_inventory);
         let memory = std::cell::RefCell::new(&mut self._vm);
@@ -942,7 +978,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 },
                 |lifecycle| window.clear(lifecycle),
                 |absence| {
-                    release_retired_child(&mut memory.borrow_mut(), &*inventory, absence).is_ok()
+                    release_retired_child(
+                        &mut memory.borrow_mut(),
+                        &*inventory,
+                        absence,
+                        ChildRelease::Retired { returns, zone },
+                    )
+                    .is_ok()
                 },
             )
             .map(|_| ())
@@ -1497,8 +1539,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             if root_installed.get() {
                 let absence = SlotAbsence::scan(loan.request.child_mm, [])
                     .ok_or_else(|| fail("unpublished child MM slot absence"))?;
-                release_retired_child(&mut self._vm, &*frame_inventory, &absence)?;
-            } else if !carrick_hal::fork_stock::release_child_mm(
+                release_retired_child(
+                    &mut self._vm,
+                    &*frame_inventory,
+                    &absence,
+                    ChildRelease::Unrun,
+                )?;
+            } else if !carrick_hal::fork_stock::release_unrun_child_mm(
                 &*frame_inventory,
                 self.cow_residency()?,
                 loan.request.child_mm,
@@ -1574,7 +1621,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if is_abort && had_admitted {
             let absence = SlotAbsence::scan(loan.request.child_mm, [])
                 .ok_or_else(|| fail("aborted child MM slot absence"))?;
-            release_retired_child(&mut self._vm, &*self.frame_inventory, &absence)?;
+            release_retired_child(
+                &mut self._vm,
+                &*self.frame_inventory,
+                &absence,
+                ChildRelease::Unrun,
+            )?;
         }
         // SAFETY: settlement is a fully initialized array of sixteen u64 words.
         let bytes = unsafe {

@@ -1730,6 +1730,15 @@ impl AddressSpacePublication {
             self.reservation_provider.as_ref(),
         );
     }
+    /// The owed returns this host-served root leaves behind when it retires
+    /// ([`retire_reservation_root`]): its slots stay owed until the host
+    /// venue released the MM's frames. Take it before the publication drops.
+    pub fn retired_returns(&self) -> Option<RetiredHostReturns> {
+        (self.tables.live() && self.tables.zone.is_some()).then(|| RetiredHostReturns {
+            tables: self.tables.clone(),
+            mm: self.mm,
+        })
+    }
     /// No EL1 install of the space from now on (its ASID starts retiring).
     pub fn close(&self) {
         if self.tables.live() {
@@ -1796,6 +1805,42 @@ impl Drop for AddressSpacePublication {
     }
 }
 
+/// The owed returns a retired host-served root left in its shared table,
+/// keyed by its never-reused MM. The host venue's release of the MM's frames
+/// (its whole-MM inventory retirement, at exit or exec) is the only thing
+/// that frees them ([`Self::settle`]).
+pub struct RetiredHostReturns {
+    tables: SpaceTables,
+    mm: MmId,
+}
+
+impl std::fmt::Debug for RetiredHostReturns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetiredHostReturns")
+            .field("mm", &self.mm)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetiredHostReturns {
+    /// After the publication dropped (no entry names the MM) and the host
+    /// venue's release of the MM's frames finished with `released`: mint
+    /// the MM's release receipt and free every return its retired root still
+    /// owes. A failed release mints nothing (`Busy`): the returns stay owed
+    /// for a later successful release.
+    pub fn settle(&self, released: bool) -> Result<usize, carrick_el1_abi::Refusal> {
+        use carrick_el1_abi::{MmReleaseReceipt, Refusal, RetiredReturns};
+        let table = self.tables.reservations().ok_or(Refusal::Stale)?;
+        let absent = self
+            .tables
+            .spaces
+            .unpublished(self.mm.raw())
+            .ok_or(Refusal::Busy)?;
+        let receipt = MmReleaseReceipt::released(&absent, |_| released).ok_or(Refusal::Busy)?;
+        table.settle_whole_mm(receipt)
+    }
+}
+
 fn retire_reservation_root(
     tables: &SpaceTables,
     index: carrick_sched_core::SpaceIndex,
@@ -1812,8 +1857,9 @@ fn retire_reservation_root(
     let Some(key) = carrick_el1_abi::ReservationMm::new(mm.raw()) else {
         return;
     };
-    // The space is closed and drained: EL1 journals no return again, and
-    // the owed extents' frames retire with the MM's own inventory.
+    // The space is closed and drained: EL1 journals no return again. The
+    // owed extents stay owed under the retired key until the MM's frames
+    // retire with its own inventory ([`RetiredHostReturns::settle`]).
     let settled = match provider {
         Some(provider) => provider.prepare().and_then(|view| {
             view.lock(key, &carrick_el1::memory::reservations::NoRootWait)?

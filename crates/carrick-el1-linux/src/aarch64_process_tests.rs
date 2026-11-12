@@ -3191,6 +3191,7 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
             carrick_guest_arch::CpuId::new(0),
             fixture.address.root,
         );
+        stock.returns = Some(fixture.region.table());
         crossing.physical = Some(std::sync::Mutex::new(stock));
     }
     let mut service = Aarch64NativeProcessService::with_crossing(

@@ -2971,6 +2971,20 @@ mod tests {
         let authority = Arc::new(FrameInventoryAuthority::new());
         let ids = Arc::new(ObjectIdRegistry::new());
         let inventory = authority.physical_projection(Arc::clone(&ids));
+        // The children's retired roots owe no returns; their release
+        // receipts still settle through the table.
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let returns: Box<carrick_el1::memory::reservations::SharedReservations> = {
+            let layout =
+                std::alloc::Layout::new::<carrick_el1::memory::reservations::SharedReservations>();
+            // SAFETY: every atomic and node is zero-valid; root state is
+            // MaybeUninit. Allocated with this exact layout.
+            unsafe {
+                let pointer = std::alloc::alloc_zeroed(layout);
+                assert!(!pointer.is_null());
+                Box::from_raw(pointer.cast())
+            }
+        };
 
         // The parent maps one frame every child inherits.
         let parent = inventory.bind(mm_generation(PARENT));
@@ -3167,7 +3181,13 @@ mod tests {
                     |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
                     |_| true,
                     |life| window.clear(life),
-                    |absence| release_child_mm(&*inventory, &residency, absence.mm()),
+                    |absence| {
+                        spaces
+                            .unpublished(absence.mm().raw())
+                            .is_some_and(|absent| {
+                                release_child_mm(&*inventory, &residency, &*returns, &absent)
+                            })
+                    },
                 )
                 .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
             assert_eq!(returned, 1, "cycle {cycle}");
