@@ -3242,6 +3242,45 @@ fn retirement_scan_resolves_the_real_el1_linux_crate() {
 }
 
 #[test]
+fn retirement_scan_resolves_the_real_vmm_kvm_crate() {
+    // `carrick-vmm-kvm` holds nested fixture packages (`fixtures/x86-threads`,
+    // its own Cargo.toml and item macros). They are separate packages, not
+    // this crate's targets, so a `cpl0_initial_mm` retirement must still
+    // resolve (#2153's declaration was refused on the fixture's macro).
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let found = carrick_xtask::ci_receipt::tree_has_test(
+        &root,
+        "cpl0_initial_mm",
+        "a_test_name_that_does_not_exist",
+    )
+    .expect("carrick-vmm-kvm sources must resolve for test retirement");
+    assert!(!found);
+}
+
+#[test]
+fn retirement_scan_skips_nested_packages_inside_a_crate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_test_tree(root, "#[test]\nfn kept() {}\n", None);
+    let nested = root.join("crates/carrick-vmm-kvm/fixtures/nested");
+    std::fs::create_dir_all(nested.join("src")).unwrap();
+    std::fs::write(
+        nested.join("Cargo.toml"),
+        "[package]\nname = \"nested\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        nested.join("src/main.rs"),
+        "macro_rules! gen { () => { #[test] fn kept() {} }; } gen!();\nfn main() {}\n",
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::ci_receipt::tree_has_test(root, "cpl0_fork_e2e", "kept")
+            .expect("a nested package's macro must not refuse the outer crate's scan")
+    );
+}
+
+#[test]
 fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
     for code in [101, 0] {
         let dir = tempfile::tempdir().unwrap();
