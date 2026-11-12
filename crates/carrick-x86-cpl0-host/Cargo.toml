@@ -39,6 +39,7 @@ features = ["test-support"]
 
 [dev-dependencies]
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
+carrick-test-support = { path = "../carrick-test-support" }
 
 [package.metadata.carrick.test-lanes]
 "*" = "host"
