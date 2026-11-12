@@ -2222,9 +2222,18 @@ fn shared_submission_directory_accepts_a_non_hvpatch_binding() {
     );
 }
 
+/// The issued x86 binding and saved CPU image of `context`'s task at
+/// `execution`, on page-table root `root` and context generation `asid`.
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-#[test]
-fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
+fn x86_task_fixture(
+    context: &KernelContext,
+    execution: ExecutionGeneration,
+    root: u64,
+    asid: u64,
+) -> (
+    carrick_hal::guest_arch_binding::GuestArchBinding,
+    MigratableTaskState,
+) {
     use carrick_hal::guest_arch_binding::{
         GuestArchBinding,
         core_arch::{
@@ -2236,19 +2245,18 @@ fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
     use carrick_hal::threaded::{
         X86_TASK_RESUME_MAGIC, X86_TASK_RESUME_PAYLOAD_LEN, X86_TASK_XSAVE_LEN, X86TaskCpuStateV1,
     };
-    let (kernel, context) = bootstrap(13_995);
     let nonzero = |raw| std::num::NonZeroU64::new(raw).expect("nonzero identity");
-    let root = RootGpa::page_aligned(FrameGpa::new(0x7000)).expect("aligned root");
+    let root = RootGpa::page_aligned(FrameGpa::new(root)).expect("aligned root");
     let arch = GuestArchBinding::x86(
         TaskIdentity {
             carrier: CarrierGeneration::new(nonzero(8)),
             task: TaskSerial::new(nonzero(context.task().key().serial.raw())),
-            execution: ArchGeneration::new(nonzero(ExecutionGeneration::INITIAL.raw())),
+            execution: ArchGeneration::new(nonzero(execution.raw())),
         },
         AddressContext {
             root,
             mm: MmGeneration::new(context.shared().mm().id().nonzero()),
-            generation: ContextGeneration::new(nonzero(1)),
+            generation: ContextGeneration::new(nonzero(asid)),
         },
     );
     let mut resume = [0u8; X86_TASK_RESUME_PAYLOAD_LEN];
@@ -2267,7 +2275,7 @@ fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
         0,
         0,
         context.shared().mm().id().raw(),
-        1,
+        asid,
         vec![0; X86_TASK_XSAVE_LEN],
         resume.to_vec(),
     )
@@ -2275,8 +2283,18 @@ fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
     let state = MigratableTaskState {
         cpu: GuestCpuState::from_x86_64_v1(cpu).expect("saved x86 CPU"),
         mm: context.shared().mm().id(),
-        asid_generation: 1,
+        asid_generation: asid,
     };
+    (arch, state)
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+#[test]
+fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
+    use carrick_hal::guest_arch_binding::{GuestArchBinding, core_arch::TaskSerial};
+    let (kernel, context) = bootstrap(13_995);
+    let nonzero = |raw| std::num::NonZeroU64::new(raw).expect("nonzero identity");
+    let (arch, state) = x86_task_fixture(&context, ExecutionGeneration::INITIAL, 0x7000, 1);
     let binding =
         super::cpl0::Cpl0TaskBinding::new(&context, &state, arch, ExecutionGeneration::INITIAL)
             .expect("issued KVM root binding");
@@ -2343,6 +2361,150 @@ fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
         )
         .is_err()
     );
+}
+
+/// #2142: a root `execve` mints a new MM, thread key and execution
+/// generation. The CPL0 directory must move the root's combined binding and
+/// submission authority to that exact successor in the scheduler's retarget
+/// transaction, and the predecessor binding must stop resolving.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+#[test]
+fn kvm_exec_replacement_rebinds_root_to_successor_and_retires_predecessor() {
+    type Cpl0Directory = super::cpl0::Cpl0TaskBindingDirectory;
+    let (kernel, context) = bootstrap(14_142);
+    let (_, state) = x86_task_fixture(&context, ExecutionGeneration::INITIAL, 0x7000, 1);
+    let old_generation = context
+        .thread()
+        .publish_initial_task_state(state.clone())
+        .expect("publish x86 root");
+    let (arch, _) = x86_task_fixture(&context, old_generation, 0x7000, 1);
+    let old_binding = Arc::new(
+        super::cpl0::Cpl0TaskBinding::new(&context, &state, arch, old_generation)
+            .expect("issued KVM root binding"),
+    );
+    let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+    let directory = Arc::new(Cpl0Directory::default());
+    <Cpl0Directory as TaskBindingResolver<_>>::install_scheduler(&directory, &scheduler)
+        .expect("install KVM resolver");
+    directory
+        .publish(
+            context.thread().key(),
+            old_generation,
+            Arc::clone(&old_binding),
+        )
+        .unwrap();
+    let authority = scheduler
+        .admit_root(context.thread().key(), old_generation)
+        .unwrap();
+    directory
+        .install_root_authority(&scheduler, Arc::clone(context.thread()), authority)
+        .unwrap();
+    let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+    let registration = scheduler.register_executor(worker.clone()).unwrap();
+    let mut running = scheduler.take(&registration).unwrap();
+    let worker_id = running.executor();
+    let predecessor_authority =
+        <Cpl0Directory as TaskBindingResolver<_>>::take_submission_authority(
+            directory.as_ref(),
+            context.thread().key(),
+            old_generation,
+        )
+        .expect("running generation authority");
+
+    let prepared = kernel
+        .prepare_exec_with_registry_id(&context, ThreadId::synthetic_for_tests(114_142), None)
+        .unwrap();
+    let old_lease = running.take_lease();
+    context.thread().exit_from_executor(old_lease).unwrap();
+    let committed = kernel.commit_exec_transition(prepared, None).unwrap();
+    let committed_context = committed.context().retain_exact();
+    let new_mm = committed_context.shared().mm().id();
+    let committed = committed
+        .attach_successor_asid_generation(new_mm, 2)
+        .unwrap();
+    assert_ne!(new_mm, context.shared().mm().id());
+    assert_ne!(committed_context.thread().key(), context.thread().key());
+    let (_, successor_state) =
+        x86_task_fixture(&committed_context, ExecutionGeneration::INITIAL, 0x9000, 2);
+    let new_generation = committed_context
+        .thread()
+        .publish_initial_task_state(successor_state.clone())
+        .unwrap();
+    let (successor_arch, _) = x86_task_fixture(&committed_context, new_generation, 0x9000, 2);
+    let new_lease = committed_context
+        .thread()
+        .claim_runnable(worker_id)
+        .unwrap();
+    let identity = TaskLoadIdentity {
+        abi: carrick_abi::LinuxGuestAbi::X86_64,
+        version: 1,
+        mm: new_mm,
+        asid_generation: 2,
+    };
+    let replacement = scheduler
+        .retarget_running_exec(&mut running, committed, new_lease, |transition| {
+            directory.replace_exec(
+                &scheduler,
+                ExecBindingTransition {
+                    predecessor_thread: context.thread().key(),
+                    predecessor_generation: old_generation,
+                    successor_thread: transition.successor_thread,
+                    successor_generation: new_generation,
+                    identity,
+                    replacement_mm: None,
+                    authority: Some(predecessor_authority),
+                },
+            )
+        })
+        .expect("CPL0 directory rebinds the exec successor");
+    let super::ExecBindingReplacement {
+        binding: successor,
+        authority: successor_authority,
+    } = replacement;
+    <Cpl0Directory as TaskBindingResolver<_>>::restore_submission_authority(
+        directory.as_ref(),
+        successor_authority.expect("exec retains exact successor authority"),
+    )
+    .unwrap();
+
+    assert_eq!(running.executor(), worker_id);
+    assert_eq!(running.thread_key(), committed_context.thread().key());
+    assert_eq!(running.generation(), new_generation);
+    assert_eq!(successor.load_identity(), identity);
+    assert_eq!(successor.arch(), successor_arch);
+    assert!(Arc::ptr_eq(
+        &<Cpl0Directory as TaskBindingResolver<_>>::resolve(
+            directory.as_ref(),
+            committed_context.thread().key(),
+            new_generation,
+        )
+        .expect("successor binding resolves"),
+        &successor,
+    ));
+    assert!(
+        <Cpl0Directory as TaskBindingResolver<_>>::resolve(
+            directory.as_ref(),
+            context.thread().key(),
+            old_generation,
+        )
+        .is_err(),
+        "the predecessor binding is retired by the swap"
+    );
+    successor
+        .validate_task_state(&successor_state)
+        .expect("successor binding accepts the replaced image");
+    assert!(
+        successor.validate_task_state(&state).is_err(),
+        "successor binding refuses the predecessor image"
+    );
+    assert!(
+        old_binding.validate_task_state(&successor_state).is_err(),
+        "stale predecessor binding refuses the successor image"
+    );
+    scheduler.settle_exited(running).unwrap();
+    scheduler.unregister_executor(&registration).unwrap();
+    scheduler.close();
+    scheduler.wait_closed();
 }
 
 /// An executor kick that records, every time the scheduler consults its
