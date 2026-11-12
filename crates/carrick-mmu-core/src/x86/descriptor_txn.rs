@@ -82,6 +82,12 @@ pub enum DescriptorOp {
     Protect {
         span: PageSpan,
         permissions: Permissions,
+        /// The owning root's ceiling when it authorizes this edit in ring: a
+        /// private leaf may gain execute beyond its recorded `MAY_EXEC`, which
+        /// then records it. Write never widens past `MAY_WRITE`: fork shares a
+        /// read-only private leaf without arming COW (`arm_cow_terminal`), so
+        /// only a recorded write ceiling proves the frame is this MM's alone.
+        ceiling: Option<Permissions>,
     },
     ArmCow(PageSpan),
     CowRepoint {
@@ -183,9 +189,16 @@ impl<'a> DescriptorTxn<'a> {
             },
             EditOperation::Protect {
                 permissions: requested,
+                ceiling,
             } => DescriptorOp::Protect {
                 span,
                 permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+                ceiling: match ceiling {
+                    Some(ceiling) => {
+                        Some(permissions(ceiling).ok_or(DescriptorRefusal::BadEncoding)?)
+                    }
+                    None => None,
+                },
             },
             EditOperation::ArmCow {
                 kernel_only: false,
@@ -662,7 +675,11 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
                 (entry | PRESENT) & !PREPARED
             }
-            DescriptorOp::Protect { permissions: p, .. } => {
+            DescriptorOp::Protect {
+                permissions: p,
+                ceiling,
+                ..
+            } => {
                 if entry & (PRESENT | PREPARED) == 0 {
                     return Err(DescriptorRefusal::MissingTable);
                 }
@@ -672,10 +689,17 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 if entry & COW != 0 {
                     return Err(DescriptorRefusal::CowArmed);
                 }
-                if p.writable && entry & MAY_WRITE == 0 || p.executable && entry & MAY_EXEC == 0 {
+                // Write needs a recorded ceiling; execute, it or the root's.
+                if p.writable && entry & MAY_WRITE == 0
+                    || p.executable
+                        && entry & MAY_EXEC == 0
+                        && !ceiling.is_some_and(|ceiling| ceiling.executable)
+                {
                     return Err(DescriptorRefusal::PermissionWidening);
                 }
-                entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX))
+                entry & !(WRITE | USER | NX)
+                    | (permissions(p) & (WRITE | USER | NX))
+                    | if p.executable { MAY_EXEC } else { 0 }
             }
             DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
             DescriptorOp::CowRepoint { old, new, .. } => {
@@ -801,7 +825,17 @@ impl DescriptorTxn<'_> {
                 },
                 None,
             ),
-            DescriptorOp::Protect { permissions: p, .. } => (3, 0, 0, permissions(p), None),
+            DescriptorOp::Protect {
+                permissions: p,
+                ceiling,
+                ..
+            } => (
+                3,
+                ceiling.map_or(0, |ceiling| 1 | permissions(ceiling)),
+                0,
+                permissions(p),
+                None,
+            ),
             DescriptorOp::ArmCow(_) => (4, 0, 0, 0, None),
             DescriptorOp::CowRepoint {
                 old, new, backing, ..

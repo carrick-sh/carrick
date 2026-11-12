@@ -758,8 +758,11 @@ pub struct GuestLeafPublication {
     pub executable: bool,
 }
 
-/// Mapping protection ceiling (`VM_MAY*`) authorizing a COW-armed private leaf
-/// permission edit when `SW_EL1_MAY_WRITE` carries current write intent.
+/// The owning reservation root's mapping protection ceiling (`VM_MAY*`). It
+/// authorizes an in-ring edit of a COW-armed private leaf (where
+/// `SW_EL1_MAY_WRITE` carries current write intent), and lets a non-COW
+/// private leaf gain write or execute beyond the ceiling its publication
+/// recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestPermissionCeiling {
     pub readable: bool,
@@ -775,7 +778,11 @@ pub struct GuestPermissionEdit {
     pub readable: bool,
     pub writable: bool,
     pub executable: bool,
-    pub cow_ceiling: Option<GuestPermissionCeiling>,
+    /// The root's ceiling when that root authorizes this edit in ring; `None`
+    /// admits only the ceilings already recorded on each leaf. A caller whose
+    /// ceiling newly grants execute first makes those frames' instruction
+    /// stream coherent (see `terminal_descriptor_may_execute`).
+    pub root_ceiling: Option<GuestPermissionCeiling>,
 }
 
 /// Why EL1 could not own a requested resident-anonymous protection edit.
@@ -1012,9 +1019,11 @@ pub unsafe fn publish_existing_invalid_private_pages(
 /// prepared leaf stays invalid; its AP/UXN govern its later commit and host
 /// buffer access). The complete range, terminal coverage, and permission
 /// ceiling are checked before the first store; COW-armed resident leaves edit
-/// in place under `edit.cow_ceiling` (keeping `SW_EL1_COW` armed, never
+/// in place under `edit.root_ceiling` (keeping `SW_EL1_COW` armed, never
 /// granting `AP_RW`, and recording write intent in `SW_EL1_MAY_WRITE`) and
-/// report `PermissionWidening` when `cow_ceiling` is `None` or exceeded. This
+/// report `PermissionWidening` when `root_ceiling` is `None` or exceeded.
+/// Non-COW leaves may widen past their recorded write/execute ceilings only
+/// within `root_ceiling`, which then records the widened ceiling. This
 /// entry point carries no table grants, so a partially covered block is
 /// refused; a host submission carrying grants splits it (see [`descriptor_txn`]).
 /// A rolled-back edit restores every word; the caller still invalidates the
@@ -11329,7 +11338,7 @@ mod tests {
                         readable,
                         writable,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             }
@@ -11371,7 +11380,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: true,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             },
@@ -11420,7 +11429,7 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             },
@@ -11450,7 +11459,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             },
@@ -11815,7 +11824,7 @@ mod tests {
             readable: true,
             writable: false,
             executable: false,
-            cow_ceiling: None,
+            root_ceiling: None,
         })
         .expect("RW to RO");
         for page in 0..3 {
@@ -11841,7 +11850,7 @@ mod tests {
             readable: false,
             writable: false,
             executable: false,
-            cow_ceiling: None,
+            root_ceiling: None,
         })
         .expect("RO to PROT_NONE");
         for page in 0..3 {
@@ -11859,7 +11868,7 @@ mod tests {
             readable: true,
             writable: true,
             executable: false,
-            cow_ceiling: None,
+            root_ceiling: None,
         })
         .expect("PROT_NONE to RW");
         assert!(
@@ -11878,7 +11887,7 @@ mod tests {
                 readable: true,
                 writable: true,
                 executable: true,
-                cow_ceiling: None,
+                root_ceiling: None,
             }),
             Err(GuestPermissionEditError::PermissionWidening)
         );
@@ -12143,7 +12152,7 @@ mod tests {
                     readable,
                     writable,
                     executable: false,
-                    cow_ceiling: None,
+                    root_ceiling: None,
                 })
                 .expect("permission edit must stay inside the target range");
         }
@@ -12386,7 +12395,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             },
@@ -12411,7 +12420,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: ro_ceiling,
+                        root_ceiling: ro_ceiling,
                     },
                 )
             },
@@ -12431,7 +12440,7 @@ mod tests {
                         readable: false,
                         writable: false,
                         executable: false,
-                        cow_ceiling: ro_ceiling,
+                        root_ceiling: ro_ceiling,
                     },
                 )
             },
@@ -12454,7 +12463,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: Some(GuestPermissionCeiling {
+                        root_ceiling: Some(GuestPermissionCeiling {
                             readable: true,
                             writable: true,
                             executable: false,
@@ -12749,7 +12758,7 @@ mod tests {
                 readable,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                root_ceiling: None,
             };
             assert_eq!(
                 unsafe {
@@ -12888,7 +12897,7 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             },
@@ -12945,7 +12954,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             },
@@ -13019,7 +13028,7 @@ mod tests {
                     readable,
                     writable,
                     executable: false,
-                    cow_ceiling: None,
+                    root_ceiling: None,
                 };
                 assert_eq!(
                     unsafe {

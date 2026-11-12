@@ -1536,6 +1536,7 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
                 executable: false,
                 user: true,
             },
+            ceiling: None,
         },
     };
     let receipt = execute_descriptor_txn(

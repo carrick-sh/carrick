@@ -563,6 +563,16 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
                     executable: edit.executable,
                     user: edit.readable || edit.writable || edit.executable,
                 },
+                // An unreadable ceiling authorizes no widening.
+                ceiling: edit
+                    .root_ceiling
+                    .filter(|ceiling| ceiling.readable)
+                    .map(|ceiling| carrick_guest_arch::EditPermissions {
+                        readable: true,
+                        writable: ceiling.writable,
+                        executable: ceiling.executable,
+                        user: true,
+                    }),
             },
         )
         .map_err(|_| carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)

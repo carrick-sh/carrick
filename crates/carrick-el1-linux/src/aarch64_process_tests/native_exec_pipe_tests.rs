@@ -3421,6 +3421,27 @@ impl carrick_el1::memory::AnonymousPermissionEditor for FixtureDiscardMapping<'_
             DescriptorOp, DescriptorOutcome, DescriptorRefusal, InlineJournal, TableGrants,
             execute_descriptor_op,
         };
+        // As the hardware editor: a root ceiling that grants execute cleans
+        // each frame without a recorded execute ceiling first.
+        if edit.executable && edit.root_ceiling.is_some_and(|ceiling| ceiling.executable) {
+            carrick_el1::memory::clean_aarch64_execute_widening(
+                self.mapping.words,
+                carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
+                carrick_el1_abi::EL1_COW_COPY_BASE,
+                edit.va,
+                edit.len,
+                |alias_va| {
+                    let alias = super::native_fault_supply_tests::leaf(
+                        self.mapping.words,
+                        root.raw(),
+                        alias_va,
+                    );
+                    self.cleans
+                        .borrow_mut()
+                        .push(alias & AARCH64_ROOT_ADDRESS_MASK);
+                },
+            )?;
+        }
         // A refusal is the editor's answer, not a fixture failure.
         match execute_descriptor_op(
             self.mapping.words,

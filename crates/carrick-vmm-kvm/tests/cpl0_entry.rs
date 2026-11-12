@@ -3602,8 +3602,9 @@ fn production_fork_child_v8_code_range_discard_scrubs_and_preserves_rwx() {
 /// probe's V8 code-range sequence in a fork child: reserve `PROT_NONE |
 /// MAP_NORESERVE`, commit two pages RW and fill them (first touch publishes
 /// RW, with no execute ceiling), `mprotect(RX)` and read back and run the
-/// code, discard the whole reservation, then recommit RW, refill and go RX
-/// again. Every step is served in ring: an unrouted `mprotect` exits 38.
+/// code, recommit RW, discard the whole reservation, refill and go RX again.
+/// Every `mprotect` is served in ring (an unrouted one exits 38). The discard
+/// of the RX code is x86's one counted decline: see the step below.
 #[test]
 fn production_fork_child_v8_code_range_mprotect_execute_round_trip() {
     let mut code = Vec::new();
@@ -3676,17 +3677,26 @@ fn production_fork_child_v8_code_range_mprotect_execute_round_trip() {
     fill(&mut code, 0x5a);
     mprotect(&mut code, &mut failures, 5);
     readback(&mut code, &mut failures, 0x5a);
-    // code_madvise over the whole reservation; the code pages read zero.
-    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
-    mov(&mut code, 6, 4 * 4096);
-    mov(&mut code, 2, 4);
-    mov(&mut code, 0, 28);
-    code.extend_from_slice(&[0x0f, 0x05]);
-    check(&mut code, &mut failures, 0);
+    // code_madvise over the reservation while the code is RX: x86 fork
+    // shares a non-writable private leaf without arming COW, so the discard
+    // cannot prove the frame exclusive and declines (counted ENOSYS) with
+    // the code intact. Linux returns 0 here; that is the x86 discard seam.
+    let madvise = |code: &mut Vec<u8>, failures: &mut Vec<usize>, len: u64, expected: i32| {
+        code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
+        mov(code, 6, len);
+        mov(code, 2, 4); // MADV_DONTNEED
+        mov(code, 0, 28);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        check(code, failures, expected);
+    };
+    madvise(&mut code, &mut failures, 4 * 4096, -38);
+    readback(&mut code, &mut failures, 0x5a);
+    // code_recommit_rw; while writable the discard is served and reads zero.
+    mprotect(&mut code, &mut failures, 3);
+    madvise(&mut code, &mut failures, 4 * 4096, 0);
     code.extend_from_slice(&[0x41, 0x8b, 0x04, 0x24]); // mov eax, [r12]
     check(&mut code, &mut failures, 0);
-    // code_recommit_rw, refill, code_recommit_rx and readback.
-    mprotect(&mut code, &mut failures, 3);
+    // Refill, code_recommit_rx and readback.
     fill(&mut code, 77);
     mprotect(&mut code, &mut failures, 5);
     readback(&mut code, &mut failures, 77);
@@ -3715,6 +3725,14 @@ fn production_fork_child_v8_code_range_mprotect_execute_round_trip() {
             .unwrap(),
         0,
         "no mprotect fell back to the counted ENOSYS"
+    );
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(28))
+            .unwrap(),
+        1,
+        "only the RX discard declines"
     );
 }
 

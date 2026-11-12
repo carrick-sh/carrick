@@ -118,6 +118,14 @@ impl LiveTables {
                         executable: edit.executable,
                         user: true,
                     },
+                    ceiling: edit.root_ceiling.filter(|ceiling| ceiling.readable).map(
+                        |ceiling| carrick_guest_arch::EditPermissions {
+                            readable: true,
+                            writable: ceiling.writable,
+                            executable: ceiling.executable,
+                            user: true,
+                        },
+                    ),
                 },
             );
         } else {

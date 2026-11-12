@@ -463,6 +463,29 @@ impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
         let words =
             carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64;
         let byte_len = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize;
+        // Only a root ceiling can newly grant execute in ring; make those
+        // frames' instruction stream coherent first.
+        #[cfg(target_arch = "aarch64")]
+        if edit.executable && edit.root_ceiling.is_some_and(|ceiling| ceiling.executable) {
+            with_live_aarch64_words(
+                carrick_guest_arch::AddressSpaceRegister::from_register(ttbr0),
+                |words, root| {
+                    clean_aarch64_execute_widening(
+                        words,
+                        root,
+                        carrick_el1_abi::EL1_COW_COPY_BASE,
+                        edit.va,
+                        edit.len,
+                        // SAFETY: `with_cow_write_alias` mapped `alias_va` as an
+                        // exclusive live 4 KiB EL1 page for this closure.
+                        |alias_va| unsafe {
+                            crate::isa::aarch64::clean_executable_alias_page(alias_va)
+                        },
+                    )
+                },
+            )
+            .map_err(|_| GuestPermissionEditError::NotPrivateAnonymous)??;
+        }
         unsafe {
             carrick_mmu_core::aarch64::protect_existing_el1_private_pages(
                 words,
@@ -1079,6 +1102,95 @@ where
     Ok(())
 }
 
+/// Before a root-authorized `mprotect` grants execute in ring, clean each
+/// frame in `[va, va + len)` whose leaf records no execute ceiling yet.
+/// AArch64 instruction fetch is not coherent with data writes: the carrier
+/// cleans a frame only when it publishes the frame executable, and EL1 now
+/// grants execute itself. Every leaf is validated before the first clean.
+/// COW-armed leaves are skipped, because the descriptor edit refuses to widen
+/// them. `clean_page` gets each frame's exclusive EL1 alias.
+pub fn clean_aarch64_execute_widening<W>(
+    words: &W,
+    root: carrick_mmu_core::aarch64::SubstrateGpa,
+    copy_base: u64,
+    va: u64,
+    len: u64,
+    mut clean_page: impl FnMut(u64),
+) -> Result<(), GuestPermissionEditError>
+where
+    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+{
+    use carrick_mmu_core::aarch64::El1PrivateLeafState;
+    use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+    use carrick_mmu_core::aarch64::descriptor_txn::copy_window::{
+        validate_cow_copy_window, with_cow_write_alias,
+    };
+    const PA_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    let end = va
+        .checked_add(len)
+        .ok_or(GuestPermissionEditError::BadRange)?;
+    let read = |pa: u64| words.load(pa).ok();
+    let needs_clean = |descriptor: u64| {
+        matches!(
+            ArmAnonymousDecode::private_state(descriptor),
+            El1PrivateLeafState::Resident | El1PrivateLeafState::Prepared
+        ) && !carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(descriptor)
+            && !carrick_mmu_core::aarch64::terminal_descriptor_may_execute(descriptor)
+    };
+    let mut needs_window = false;
+    walk_discard_leaves::<ArmAnonymousDecode>(
+        &read,
+        root.raw(),
+        va,
+        end,
+        &mut |_, level, descriptor| {
+            if !needs_clean(descriptor) {
+                return Ok(());
+            }
+            // A coarse block or an output-less leaf has no exact page alias.
+            if level < 3 || descriptor & PA_MASK == 0 {
+                return Err(AnonymousDiscardError::Refused(
+                    carrick_el1_abi::AnonymousLeave::BackingMalformed,
+                ));
+            }
+            needs_window = true;
+            Ok(())
+        },
+    )
+    .map_err(|_| GuestPermissionEditError::NotPrivateAnonymous)?;
+    if !needs_window {
+        return Ok(());
+    }
+    validate_cow_copy_window(words, root, copy_base)
+        .map_err(|_| GuestPermissionEditError::NotPrivateAnonymous)?;
+    walk_discard_leaves::<ArmAnonymousDecode>(
+        &read,
+        root.raw(),
+        va,
+        end,
+        &mut |_, _, descriptor| {
+            if !needs_clean(descriptor) {
+                return Ok(());
+            }
+            let ipa = carrick_mmu_core::aarch64::SubstrateGpa(descriptor & PA_MASK);
+            with_cow_write_alias(words, root, copy_base, ipa, &mut clean_page).map_err(|outcome| {
+                match outcome {
+                    DescriptorOutcome::Indeterminate(_) => AnonymousDiscardError::Indeterminate,
+                    _ => {
+                        AnonymousDiscardError::Refused(carrick_el1_abi::AnonymousLeave::EditRefused)
+                    }
+                }
+            })
+        },
+    )
+    .map_err(|error| match error {
+        // The alias could not be revoked: the editor must not continue.
+        AnonymousDiscardError::Indeterminate => GuestPermissionEditError::RollbackFailed,
+        AnonymousDiscardError::Refused(_) => GuestPermissionEditError::NotPrivateAnonymous,
+    })
+}
+
 /// Validate every step in `steps` over live x86_64 PML4 words before any write,
 /// then zero each owned, exclusive private-anonymous page in place via
 /// [`carrick_mmu_core::x86::copy_window::with_cow_write_alias`].
@@ -1217,6 +1329,58 @@ where
     Ok(())
 }
 
+/// Why the calling MM's live stage-1 words were not available to EL1.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+enum LiveWordsRefusal {
+    /// `ttbr0` is not the live TTBR0 of this CPU.
+    NotLive,
+    Malformed,
+}
+
+/// Run `f` over the live, exact-MM stage-1 words of `ttbr0` (primary alias
+/// plus table pool), as the copy-window editors need them.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn with_live_aarch64_words<R>(
+    ttbr0: carrick_guest_arch::AddressSpaceRegister,
+    f: impl FnOnce(
+        &carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords<
+            '_,
+            crate::isa::arm_edit::El1TableMaintenance,
+        >,
+        carrick_mmu_core::aarch64::SubstrateGpa,
+    ) -> R,
+) -> Result<R, LiveWordsRefusal> {
+    use carrick_mmu_core::aarch64::SubstrateGpa;
+    use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
+    const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    let ttbr0 = ttbr0.raw();
+    let live = crate::isa::aarch64::hardware_live_ttbr();
+    if live == carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE
+        || (live & TTBR_BADDR_MASK) != (ttbr0 & TTBR_BADDR_MASK)
+    {
+        return Err(LiveWordsRefusal::NotLive);
+    }
+    let Some(table) = carrick_el1_abi::service_target_table_window(live, ttbr0) else {
+        return Err(LiveWordsRefusal::NotLive);
+    };
+    let maintenance = crate::isa::arm_edit::El1TableMaintenance { ttbr0 };
+    // SAFETY: the caller holds the exact-MM editor, `live` is this MM's
+    // active TTBR0, and the primary alias plus pool remain mapped.
+    let Ok(words) = (unsafe {
+        PrimaryTableWords::new(
+            table.words,
+            table.physical_base,
+            carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+            &maintenance,
+        )
+        .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
+    }) else {
+        return Err(LiveWordsRefusal::Malformed);
+    };
+    Ok(f(&words, SubstrateGpa(ttbr0 & TTBR_BADDR_MASK)))
+}
+
 #[cfg(target_os = "none")]
 impl AnonymousDiscardEditor for HardwareAnonymousEditor {
     fn check_discard_range(
@@ -1239,51 +1403,31 @@ impl AnonymousDiscardEditor for HardwareAnonymousEditor {
         #[cfg(target_arch = "aarch64")]
         {
             use carrick_el1_abi::AnonymousLeave as Leave;
-            use carrick_mmu_core::aarch64::SubstrateGpa;
-            use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
-            const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
-
-            let ttbr0 = ttbr0.raw();
-            let live = crate::isa::aarch64::hardware_live_ttbr();
-            if live == carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE
-                || (live & TTBR_BADDR_MASK) != (ttbr0 & TTBR_BADDR_MASK)
-            {
-                return Err(AnonymousDiscardError::Refused(Leave::NoGrant));
-            }
-            let Some(table) = carrick_el1_abi::service_target_table_window(live, ttbr0) else {
-                return Err(AnonymousDiscardError::Refused(Leave::NoGrant));
-            };
-            let maintenance = crate::isa::arm_edit::El1TableMaintenance { ttbr0 };
-            // SAFETY: the caller holds the exact-MM editor, `live` is this MM's
-            // active TTBR0, and the primary alias plus pool remain mapped.
-            let Ok(words) = (unsafe {
-                PrimaryTableWords::new(
-                    table.words,
-                    table.physical_base,
-                    carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
-                    &maintenance,
-                )
-                .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
-            }) else {
-                return Err(AnonymousDiscardError::Refused(Leave::BackingMalformed));
-            };
-            discard_aarch64_anonymous_steps(
-                &words,
-                SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
-                carrick_el1_abi::EL1_COW_COPY_BASE,
-                steps,
-                |alias_va, executable| {
-                    // SAFETY: `with_cow_write_alias` mapped `alias_va` as an
-                    // exclusive 4 KiB EL1-RW page in the live TTBR0 and flushes
-                    // its TLB entry before and after this closure.
-                    unsafe {
-                        core::ptr::write_bytes(alias_va as *mut u8, 0, PAGE_SIZE as usize);
-                        if executable {
-                            crate::isa::aarch64::clean_executable_alias_page(alias_va);
+            with_live_aarch64_words(ttbr0, |words, root| {
+                discard_aarch64_anonymous_steps(
+                    words,
+                    root,
+                    carrick_el1_abi::EL1_COW_COPY_BASE,
+                    steps,
+                    |alias_va, executable| {
+                        // SAFETY: `with_cow_write_alias` mapped `alias_va` as an
+                        // exclusive 4 KiB EL1-RW page in the live TTBR0 and flushes
+                        // its TLB entry before and after this closure.
+                        unsafe {
+                            core::ptr::write_bytes(alias_va as *mut u8, 0, PAGE_SIZE as usize);
+                            if executable {
+                                crate::isa::aarch64::clean_executable_alias_page(alias_va);
+                            }
                         }
-                    }
-                },
-            )
+                    },
+                )
+            })
+            .map_err(|live| {
+                AnonymousDiscardError::Refused(match live {
+                    LiveWordsRefusal::NotLive => Leave::NoGrant,
+                    LiveWordsRefusal::Malformed => Leave::BackingMalformed,
+                })
+            })?
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -1620,7 +1764,7 @@ pub fn serve_delegated_anonymous<
         | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
             if request.operation == Protect || adopts_stock =>
         {
-            let cow_ceiling = if request.operation == Protect {
+            let root_ceiling = if request.operation == Protect {
                 let Some(ceiling) = model.protection_ceiling(request.range) else {
                     return refuse(pending, &mut model, Leave::RootUnavailable);
                 };
@@ -1638,7 +1782,7 @@ pub fn serve_delegated_anonymous<
                 readable: request.protection.bits() & PROT_READ != 0,
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
-                cow_ceiling,
+                root_ceiling,
             };
             match editor.protect_and_invalidate(
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -2217,7 +2361,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         readable: prot & PROT_READ != 0,
         writable: prot & PROT_WRITE != 0,
         executable: prot & PROT_EXEC != 0,
-        cow_ceiling: None,
+        root_ceiling: None,
     };
     let Some(generation) = AnonymousEditGeneration::resident() else {
         return MprotectDisposition::Forward;
@@ -2433,7 +2577,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: None,
+                    root_ceiling: None,
                 }
             )]
         );
@@ -3728,7 +3872,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: Some(GuestPermissionCeiling {
+                            root_ceiling: Some(GuestPermissionCeiling {
                                 readable: true,
                                 writable: true,
                                 executable: true,
@@ -4118,7 +4262,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: None,
+                            root_ceiling: None,
                         }
                     ),
                 ]
@@ -4199,7 +4343,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     }
                 )]
             );

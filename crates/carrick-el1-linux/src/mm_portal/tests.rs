@@ -166,7 +166,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         readable: bits != 0,
                         writable: false,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             }
@@ -230,7 +230,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             }

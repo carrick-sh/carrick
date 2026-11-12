@@ -517,6 +517,12 @@ pub enum EditOperation {
     },
     Protect {
         permissions: EditPermissions,
+        /// The owning reservation root's mapping ceiling (`VM_MAY*`) when it
+        /// authorizes this edit in ring: a private leaf may then gain access
+        /// beyond the ceiling its publication recorded, as far as the ISA's
+        /// fork marking proves the frame exclusive. `None` admits only
+        /// recorded ceilings.
+        ceiling: Option<EditPermissions>,
     },
     ArmCow {
         kernel_only: bool,
