@@ -1,4 +1,5 @@
-/* Zone pipe readiness: the parent blocks in poll/ppoll on a not-ready pipe
+/* -DUSE_EPOLL waits through an in-ring epoll watching the same pipe.
+ * Zone pipe readiness: the parent blocks in poll/ppoll on a not-ready pipe
  * read end; a forked child sleeps, then writes one byte. The parent must
  * return 1 with revents == POLLIN while its pollfd fd/events stay intact.
  * Exit 7 = success; every other code names the failed stage. The native
@@ -21,6 +22,22 @@ _start:
     syscall
     test %rax, %rax
     jnz fail_pipe
+#ifdef USE_EPOLL
+    xor %edi, %edi
+    mov $291, %eax                 /* epoll_create1(0) */
+    syscall
+    test %eax, %eax
+    js fail_pipe
+    mov %eax, %r13d
+    mov %r13d, %edi
+    mov $1, %esi                   /* EPOLL_CTL_ADD */
+    mov fds(%rip), %edx
+    lea interest(%rip), %r10
+    mov $233, %eax
+    syscall
+    test %eax, %eax
+    jnz fail_pipe
+#endif
     mov $57, %eax                  /* fork */
     syscall
     test %eax, %eax
@@ -41,7 +58,15 @@ _start:
     movw $0x5a5a, pfd+6(%rip)
     lea pfd(%rip), %rdi
     mov $1, %esi
-#ifdef USE_POLL
+#ifdef USE_EPOLL
+    mov %r13d, %edi
+    lea epoll_event(%rip), %rsi
+    mov $1, %edx
+    mov $-1, %r10d                 /* epoll_pwait(ep, events, 1, -1, NULL, 8) */
+    xor %r8d, %r8d
+    mov $8, %r9d
+    mov $281, %eax
+#elif defined(USE_POLL)
 #ifdef ZERO_TIMEOUT
     xor %edx, %edx                 /* poll(pfd, 1, 0) */
 #elif defined(FINITE_TIMEOUT)
@@ -77,6 +102,12 @@ _start:
 #else
     cmp $1, %rax
     jne fail_result
+#ifdef USE_EPOLL
+    cmpl $1, epoll_event(%rip)
+    jne fail_revents
+    cmpq $0x1671, epoll_event+4(%rip)
+    jne fail_revents
+#else
     movzwl pfd+6(%rip), %eax
 #ifdef WAKE_BY_CLOSE
     cmp $0x10, %eax                /* revents == POLLHUP only */
@@ -84,6 +115,7 @@ _start:
     cmp $1, %eax                   /* revents == POLLIN only */
 #endif
     jne fail_revents
+#endif
 #endif
     mov fds(%rip), %eax
     cmp pfd(%rip), %eax
@@ -156,6 +188,8 @@ exit:
     ud2
 .data
 .balign 16
+interest: .long 1
+          .quad 0x1671
 delay: .quad 0, 50000000
 zero_ts: .quad 0, 0
 short_ts: .quad 0, 1000000
@@ -167,3 +201,6 @@ fds: .space 8
 pfd: .space 8
 status: .space 8
 poll_result: .space 8
+
+.balign 16
+epoll_event: .space 12

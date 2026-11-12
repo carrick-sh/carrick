@@ -1892,17 +1892,9 @@ fn in_zone_child_host_read_is_counted_enosys_not_served_under_root_context() {
     );
 }
 
-/// #1756: x86 builds no IPC execution capability yet, so the shared transfer
-/// engine never runs for an x86 `write` to an in-ring pipe. Since #1935/#1954
-/// (`4c73badd1`) the native stage admits that write and keeps an in-zone fd
-/// in ring (`native_stage::tests::write_to_in_zone_pipe_stays_in_ring`), so
-/// the unserved write is answered in ring as a counted ENOSYS (-38) instead
-/// of reaching the forward-authority check as a typed `HostTaskContext`
-/// refusal. The child's `write` must therefore return ENOSYS: it must not
-/// complete (exit 0), and it must not be served under another task's
-/// authority. Slice 4 constructs the capability and turns this run green.
+/// Native child pipe writes use the source-backed shared IPC executor.
 #[test]
-fn in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring() {
+fn in_zone_child_pipe_write_uses_shared_ipc_execution() {
     let elf = native_exit_fixture("native_pipe_child_write.S");
     let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
         .unwrap_or_else(|failure| {
@@ -1912,11 +1904,7 @@ fn in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring() {
                 failure.authority_refusals, failure.error
             )
         });
-    assert_eq!(
-        outcome.run.exit_code, 38,
-        "child write errno (0 means the write completed without an IPC execution \
-         binding, 38 is ENOSYS, 90 pipe2 / 91 fork-wait failed)"
-    );
+    assert_eq!(outcome.run.exit_code, 0, "child pipe write must complete");
     let counters = outcome
         .physical
         .syscall_counters()
@@ -1924,13 +1912,13 @@ fn in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring() {
     let write_nr = usize::from(X86_SYS_WRITE);
     assert_eq!(
         counters.refused[write_nr].load(std::sync::atomic::Ordering::Acquire),
-        1,
-        "x86 write (ordinal 1) must be recorded in ring refusal census"
+        0,
+        "x86 pipe write must not be refused"
     );
     assert_eq!(
         counters.refused_child[write_nr].load(std::sync::atomic::Ordering::Acquire),
-        1,
-        "child's in-ring pipe write refusal must credit descendant origin"
+        0,
+        "native child pipe write must not be refused"
     );
     assert_eq!(
         counters.venue_refused[write_nr].load(std::sync::atomic::Ordering::Acquire),
@@ -1948,8 +1936,8 @@ fn in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring() {
         .map(|counter| counter.load(std::sync::atomic::Ordering::Acquire))
         .sum();
     assert_eq!(
-        total_refusals, 1,
-        "only the child's x86 write (ordinal 1) may be recorded in ring refusal census"
+        total_refusals, 0,
+        "the guest must run without ring refusals"
     );
 }
 
@@ -2052,6 +2040,30 @@ fn zone_pipe_poll_wake_with_affinity(flags: &[&str], affinity: u64) {
         outcome.run.exit_code, 7,
         "stdout {:?} stderr {:?}",
         outcome.run.stdout, outcome.run.stderr
+    );
+}
+
+#[test]
+fn zone_epoll_pwait_blocks_until_child_pipe_write() {
+    let elf = native_exit_fixture_with_flags("native_pipe_poll_wake.S", &["-DUSE_EPOLL"]);
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| panic!("epoll pipe wake: {}", failure.error));
+    assert_eq!(outcome.run.exit_code, 7, "epoll readiness/wake stage");
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    assert_eq!(
+        counters
+            .refused
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+            .sum::<u64>(),
+        0
+    );
+    assert_eq!(
+        counters.forwarded[22].load(std::sync::atomic::Ordering::Acquire),
+        0
     );
 }
 

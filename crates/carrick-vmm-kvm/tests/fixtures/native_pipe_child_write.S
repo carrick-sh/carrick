@@ -1,5 +1,5 @@
-/* #1756 slice 1: a forked child's write(2) to an in-ring pipe, with no
- * x86 IPC execution binding. The parent reaps the child and exits with
+/* #1671: a forked child's write(2) to an in-ring pipe uses shared
+ * IPC execution custody. The parent reaps the child and exits with
  * the child's status. Child exit 0 = the write returned 1; otherwise the
  * child exits with the negated errno its write returned (38 = ENOSYS).
  * 90 pipe2 failed, 91 fork/wait failed. */
