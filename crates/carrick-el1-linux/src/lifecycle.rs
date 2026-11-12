@@ -808,7 +808,8 @@ impl<
         let Some(zone) = &mut self.zone else {
             return false;
         };
-        let Some(key) = carrick_personality_linux::sched::MmFutexKey::shared_private(address) else {
+        let Some(key) = carrick_personality_linux::sched::MmFutexKey::shared_private(address)
+        else {
             return true;
         };
         native_scheduler(zone, task, self.counters, slot, &mut self.handoff).wake_word(
