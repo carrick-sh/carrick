@@ -755,6 +755,7 @@ mod carrick_home_scratch_tests {
     use std::path::{Path, PathBuf};
 
     const CHILD: &str = "execute::carrick_home_scratch_tests::image_path_child";
+    const EXIT_CHILD: &str = "execute::carrick_home_scratch_tests::image_exit_child";
 
     /// Every entry under `root` with its size, so "returns to its starting
     /// size" also catches a leftover empty directory.
@@ -824,6 +825,20 @@ mod carrick_home_scratch_tests {
         result.map(|_| ())
     }
 
+    /// The `carrick run` exit shape: unpack through the production path, then
+    /// leave through `process::exit` with the backend undropped, so only the
+    /// at-exit hook can release the scratch. Run by `image_path_child`.
+    #[test]
+    #[ignore = "subprocess of image_path_child"]
+    fn image_exit_child() {
+        let layer = PathBuf::from(std::env::var_os("CARRICK_TEST_LAYER").unwrap());
+        let mut host = HostFsBackend::new().unwrap();
+        let cache_root = default_scratch_root().unwrap();
+        prepare_host_root(&mut host, &[layer], false, false, &cache_root).unwrap();
+        std::mem::forget(host);
+        std::process::exit(0);
+    }
+
     /// Body of the test below, in a child so it owns the environment.
     #[test]
     #[ignore = "child of image_runs_keep_all_state_under_carrick_home"]
@@ -837,9 +852,24 @@ mod carrick_home_scratch_tests {
 
         run_image(&good).expect("good layer unpacks");
         let scratch = carrick_home.join("scratch");
+        // Non-vacuous: the explicit CARRICK_HOME (never a dedicated volume)
+        // is the scratch root, and this run left its marks there.
+        assert_eq!(default_scratch_root().unwrap(), scratch);
         let start = census(&scratch);
+        assert!(
+            start.contains_key(Path::new(".carrick.sweep.lock")),
+            "census root {scratch:?} is not the live scratch root: {start:?}"
+        );
         run_image(&bad).expect_err("the injected layer error must surface");
         run_image(&good).expect("good layer unpacks after the failure");
+
+        // The real exit path: a subprocess leaving through `process::exit`.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", EXIT_CHILD])
+            .env("CARRICK_TEST_LAYER", &good)
+            .status()
+            .unwrap();
+        assert!(status.success(), "exiting run child failed: {status}");
 
         assert_eq!(census(&home), BTreeMap::new(), "nothing under $HOME");
         assert_eq!(census(&scratch), start, "scratch and trash back to start");

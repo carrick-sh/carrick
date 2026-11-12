@@ -304,9 +304,10 @@ fn resolve_scratch_root_at(
     carrick_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> PathBuf {
+    // An explicit root never consults the volume, so skip its classification.
     resolve_scratch_root_from(
         conventional,
-        conventional_mount_usable(conventional),
+        carrick_home.is_none() && conventional_mount_usable(conventional),
         |path| path.is_dir() && probe_case_sensitive(path),
         carrick_home,
         home,
@@ -568,12 +569,14 @@ fn resolve_scratch_root_from(
     carrick_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> PathBuf {
-    if classified_usable && probe(conventional) {
+    // Precedence: an explicit $CARRICK_HOME (which `--store` pins) redirects
+    // all state and is never overridden; then the dedicated volume at the
+    // conventional mount; then $HOME/.carrick. (No diskutil: a host without
+    // the conventional mount almost certainly has no carrick volume, and an
+    // exotic mount can be pointed at via $CARRICK_HOME.)
+    if carrick_home.is_none() && classified_usable && probe(conventional) {
         return conventional.to_path_buf();
     }
-    // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick. (No
-    // diskutil: a host without the conventional mount almost certainly has no
-    // carrick volume, and an exotic mount can be pointed at via $CARRICK_HOME.)
     carrick_spec::carrick_home_from(carrick_home, home).join("scratch")
 }
 
@@ -685,6 +688,36 @@ mod tests {
     }
 
     #[test]
+    fn explicit_carrick_home_beats_the_conventional_volume() {
+        let conventional = Path::new("/Volumes/carrick");
+        let root = resolve_scratch_root_from(
+            conventional,
+            true,
+            |_| panic!("an explicit CARRICK_HOME must not probe the volume"),
+            Some("/explicit/home".into()),
+            Some("/Users/u".into()),
+        );
+        assert_eq!(root, PathBuf::from("/explicit/home/scratch"));
+        // Unset: the volume wins over $HOME; rejected: $HOME is the last resort.
+        let root = resolve_scratch_root_from(
+            conventional,
+            true,
+            |_| true,
+            None,
+            Some("/Users/u".into()),
+        );
+        assert_eq!(root, conventional);
+        let root = resolve_scratch_root_from(
+            conventional,
+            true,
+            |_| false,
+            None,
+            Some("/Users/u".into()),
+        );
+        assert_eq!(root, PathBuf::from("/Users/u/.carrick/scratch"));
+    }
+
+    #[test]
     fn conventional_volume_internal_keeps_existing_precedence() {
         let conventional = Path::new("/Volumes/carrick");
         let usable = conventional_volume_usable(true, false, true);
@@ -697,7 +730,7 @@ mod tests {
                 probes += 1;
                 true
             },
-            Some("/internal/carrick-home".into()),
+            None,
             None,
         );
         assert_eq!(probes, 1);
