@@ -305,9 +305,7 @@ impl carrick_hal::native_exec::NativeExecHostService<carrick_vmm_hvf::trap::Gues
         let Ok(root) = run.dispatcher.capture_one_task_context() else {
             return false;
         };
-        root.resources()
-            .fs_context()
-            .with_cwd_and_root(|cwd, root| record.serve(cwd.as_bytes(), root.map(str::as_bytes)))
+        carrick_kernel::dispatch::resources::HostRootResources::capture(&root).seed_fork(record)
     }
 }
 

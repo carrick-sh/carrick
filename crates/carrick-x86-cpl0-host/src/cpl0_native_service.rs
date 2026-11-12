@@ -66,7 +66,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     /// Authenticate a retained supervisor span against this exact live root.
     /// The carrier owns the backing through the crossing; the outstanding
     /// service claim prevents retirement of the member/MM and payload.
-    pub(super) fn native_service_pointer(
+    pub(in crate::cpl0_boot) fn native_service_pointer(
         &self,
         context: AddressContext<RootGpa>,
         address: KernelVa,
