@@ -1343,24 +1343,10 @@ fn arm_vfork_custody_commits_while_a_sibling_pauses_the_parent_space() {
     let (pause_tx, pause_rx) = mpsc::channel::<()>();
     let (paused_tx, paused_rx) = mpsc::channel::<()>();
     let (end_tx, end_rx) = mpsc::channel::<()>();
-    let sibling = std::thread::spawn(move || {
-        use carrick_core::mm::transaction::OwnerVenue;
-        pause_rx.recv().unwrap();
-        let pause = <crate::aarch64_process::Aarch64Venue as OwnerVenue<_>>::space_access(
-            zone,
-            carrick_sched_core::SlotId::new(1),
-        )
-        .try_exclude_editor(parent_space, 1)
-        .unwrap();
-        paused_tx.send(()).unwrap();
-        end_rx.recv().unwrap();
-        drop(pause);
-    });
     *crossing.on_commit.lock().unwrap() = Some(Box::new(move || {
         pause_tx.send(()).unwrap();
         paused_rx.recv().unwrap();
     }));
-
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -1371,14 +1357,29 @@ fn arm_vfork_custody_commits_while_a_sibling_pauses_the_parent_space() {
     )
     .with_words(&words);
     let stack = carrick_test_support::GuestUserBuffer::zeroed(4096);
-    let outcome = runtime
-        .enter(source, &fixture.task, parked, &mut service)
-        .unwrap()
-        .fork(ProcessForkChildTid::vfork(UserVa::new(stack.arg() + 4096)));
-    // The pause is still held: the child was settled under it.
-    assert!(zone.spaces.grant(parent_space, 1).is_none());
-    end_tx.send(()).unwrap();
-    sibling.join().unwrap();
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            use carrick_core::mm::transaction::OwnerVenue;
+            pause_rx.recv().unwrap();
+            let pause = <crate::aarch64_process::Aarch64Venue as OwnerVenue<_>>::space_access(
+                zone,
+                carrick_sched_core::SlotId::new(1),
+            )
+            .try_exclude_editor(parent_space, 1)
+            .unwrap();
+            paused_tx.send(()).unwrap();
+            end_rx.recv().unwrap();
+            drop(pause);
+        });
+        let outcome = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap()
+            .fork(ProcessForkChildTid::vfork(UserVa::new(stack.arg() + 4096)));
+        // The pause is still held: the child was settled under it.
+        assert!(zone.spaces.grant(parent_space, 1).is_none());
+        end_tx.send(()).unwrap();
+        outcome
+    });
 
     assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
     assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 0);
