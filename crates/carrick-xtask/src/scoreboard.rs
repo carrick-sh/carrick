@@ -642,7 +642,7 @@ mod tests {
         let carrick = dir.path().join("carrick");
         write_executable_mode(
             &carrick,
-            &format!(
+            format!(
                 "#!/bin/sh\n{prelude}echo $$ > \"$0.pid\"\n\
                  sleep 30 &\necho $! > \"$0.gc\"\nwait\n"
             ),
