@@ -370,6 +370,7 @@ enum ExecReplacementVenue {
         retired_mm: Option<crate::hvpatch::Stage1MmRetirement>,
     },
     /// x86 CPL0: the successor's issued task and address-context binding.
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
     Cpl0 {
         arch: carrick_hal::guest_arch_binding::GuestArchBinding,
     },
@@ -394,6 +395,7 @@ impl PendingExecReplacement {
     /// successor's MM.
     // The x86 RootExecVenue (#2142 slice 4) publishes this; until then only
     // the KVM retarget witness does.
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
     #[allow(dead_code)]
     pub(crate) fn cpl0(
         transition: carrick_kernel::kernel::exec::CommittedExecTransition,
@@ -428,6 +430,7 @@ impl PendingExecReplacement {
                 ExecSuccessorCustody::Stage1(replacement_mm),
                 retired_mm,
             ),
+            #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
             ExecReplacementVenue::Cpl0 { arch } => {
                 (self.transition, ExecSuccessorCustody::Cpl0(arch), None)
             }
@@ -616,6 +619,7 @@ pub(crate) enum ExecSuccessorCustody {
     /// HVPatch stage-1: the successor's fresh MM/ASID lease.
     Stage1(Arc<crate::hvpatch::Stage1MmLease>),
     /// x86 CPL0: the successor's issued task and address-context binding.
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
     Cpl0(carrick_hal::guest_arch_binding::GuestArchBinding),
 }
 
@@ -1452,6 +1456,7 @@ impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
                 Some(ExecSuccessorCustody::Stage1(replacement_mm)) => {
                     predecessor.replacement_with_stage1_mm(successor.identity, replacement_mm)
                 }
+                #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
                 Some(ExecSuccessorCustody::Cpl0(_)) => Err(TrapError::Hypervisor(
                     "HVPatch exec replacement refused CPL0 custody".to_owned(),
                 )),
