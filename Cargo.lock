@@ -1354,6 +1354,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-sched-core",
+ "carrick-test-support",
  "carrick-x86",
  "libc",
  "static_assertions",
