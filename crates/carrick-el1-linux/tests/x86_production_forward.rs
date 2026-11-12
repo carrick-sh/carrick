@@ -1729,7 +1729,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
                         || Ok(u64::MAX),
                     )
                     .unwrap();
-                    dispatcher.serve_native_host_file(&mut record)
+                    dispatcher.serve_native_host_file(&mut record, None)
                 };
                 match served {
                     Ok(_) => {
