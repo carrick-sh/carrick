@@ -139,6 +139,31 @@ fn prepare_native_exec_image(
     )
 }
 
+/// The x86 CPL0 successor of a native child's exec: the same request,
+/// resolution and checks as [`prepare_native_exec_image`], loaded as the
+/// image the CPL0 build maps (#1093 S4c slice c).
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub(crate) fn prepare_native_x86_exec_image(
+    capability: &NativeExecCapability,
+    payload: &[u8],
+    descriptor_source: impl FnOnce(
+        [u64; 3],
+        i32,
+    ) -> Result<
+        carrick_kernel::dispatch::executable_authority::ExecSource,
+        LinuxErrno,
+    >,
+) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
+    prepare_native_exec(
+        capability,
+        payload,
+        descriptor_source,
+        |files, target, argv, env| {
+            load_x86_exec_image(&capability.loader, files, target, argv, env)
+        },
+    )
+}
+
 /// Parse a native child's staged exec request under the caller's sealed
 /// access, and hand what it names to `load`.
 fn prepare_native_exec<R>(
@@ -790,6 +815,24 @@ pub(crate) fn load_execve_image<'a>(
         source,
         binfmt_argv,
     })
+}
+
+/// Load the successor of an exec on the x86 CPL0 carrier: resolved like
+/// every exec ([`resolve_exec_target`]), checked as Linux checks it (E2BIG
+/// for the arguments a `#!` chain left, before the image), and parsed by
+/// the boot loader's own `ElfProgram`, its interpreter read through the
+/// same capability. The image is mapped by the CPL0 build, which also
+/// writes its stack, so nothing here builds an address space.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub(crate) fn load_x86_exec_image<'a>(
+    loader: &ExecLoaderCapabilities,
+    files: &carrick_kernel::dispatch::exec_files::ExecFiles,
+    target: impl Into<ExecTarget<'a>>,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
+    let _ = (loader, files, target.into(), argv, env);
+    Err(crate::linux_abi::LINUX_ENOSYS)
 }
 
 // Shebang resolution and the signal-death / stop helpers live in the
@@ -1721,5 +1764,152 @@ mod tests {
             Ok(_) => panic!("a foreign-machine ELF prepared"),
             Err(errno) => assert_eq!(errno, crate::linux_abi::LINUX_ENOEXEC),
         }
+    }
+
+    /// A static ET_EXEC x86-64 ELF whose one R+X PT_LOAD maps its own
+    /// program headers, as the x86 CPL0 build requires, entering at 0x401000.
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    fn static_x86_successor() -> Vec<u8> {
+        let mut elf = synthetic_exec(EM_X86_64, [0x0f, 0x05, 0x0f, 0x0b]);
+        let ph = 64;
+        elf[24..32].copy_from_slice(&0x401000_u64.to_le_bytes());
+        elf[ph + 8..ph + 16].copy_from_slice(&0_u64.to_le_bytes());
+        elf[ph + 32..ph + 40].copy_from_slice(&0x1004_u64.to_le_bytes());
+        elf[ph + 40..ph + 48].copy_from_slice(&0x2000_u64.to_le_bytes());
+        elf
+    }
+
+    /// An exec payload naming `path` with `argv`, sealed with root access.
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    fn x86_exec_payload(
+        call: carrick_core_abi::service::ExecCall,
+        path: &str,
+        argv: &[&[u8]],
+        table: Option<[u64; 3]>,
+    ) -> Vec<u8> {
+        let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
+        payload.extend_from_slice(path.as_bytes());
+        payload.push(0);
+        for arg in argv {
+            payload.extend_from_slice(&(arg.len() as u32 + 1).to_le_bytes());
+            payload.extend_from_slice(arg);
+            payload.push(0);
+        }
+        carrick_core_abi::service::encode_exec_payload_header(
+            &mut payload,
+            call,
+            path.len() + 1,
+            argv.len(),
+            0,
+        )
+        .unwrap();
+        seal_task_row(payload, 0, "/", None, table)
+    }
+
+    /// #1093 S4c slice c: a native child's exec on the x86 CPL0 carrier
+    /// loads through the shared request parse and resolver, by path, by
+    /// `#!` script and by descriptor (`fexecve`), as the image the CPL0
+    /// build maps; and refuses with execve(2)'s errnos before any carrier
+    /// resource is reserved: ENOENT (2), ENOEXEC (8) for a non-ELF or
+    /// another machine's ELF, and E2BIG (7) when a `#!` interpreter's
+    /// strings push the arguments past Linux's charge.
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_child_x86_exec_loads_its_successor_through_the_shared_loader() {
+        use carrick_core_abi::service::ExecCall;
+        use carrick_kernel::dispatch::executable_authority::ExecSource;
+
+        let mut layer = tar::Builder::new(Vec::new());
+        let entries: [(&str, Vec<u8>); 4] = [
+            ("bin/successor", static_x86_successor()),
+            ("bin/script", b"#!/bin/successor -x\n".to_vec()),
+            ("bin/text", b"not an executable image".to_vec()),
+            (
+                "bin/arm",
+                synthetic_exec(EM_AARCH64, [0x1f, 0x20, 0x03, 0xd5]),
+            ),
+        ];
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            layer
+                .append_data(&mut header, name, bytes.as_slice())
+                .unwrap();
+        }
+        let rootfs =
+            carrick_vfs::rootfs::RootFs::from_layers([carrick_vfs::rootfs::LayerSource::Tar(
+                layer.into_inner().unwrap(),
+            )])
+            .unwrap();
+        let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+        let capability = capture_native_exec_capability(&dispatcher).unwrap();
+        let load = |path: &str, argv: &[&[u8]]| {
+            prepare_native_x86_exec_image(
+                &capability,
+                &x86_exec_payload(ExecCall::Execve, path, argv, None),
+                no_descriptors,
+            )
+        };
+
+        let image = load("/bin/successor", &[b"successor"]).expect("a static successor loads");
+        assert_eq!(image.entry().entry.raw(), 0x401000);
+        assert_eq!(image.argv(), [b"successor".to_vec()]);
+        assert!(image.demand().tables > 0 && image.demand().data > 0);
+
+        let script = load("/bin/script", &[b"script", b"arg"]).expect("a script loads");
+        assert_eq!(
+            script.argv(),
+            [
+                b"/bin/successor".to_vec(),
+                b"-x".to_vec(),
+                b"/bin/script".to_vec(),
+                b"arg".to_vec(),
+            ],
+            "Linux's #! argv"
+        );
+
+        let errno = |result: Result<_, LinuxErrno>| result.map(|_| ()).unwrap_err().get();
+        assert_eq!(errno(load("/bin/missing", &[b"missing"])), 2);
+        assert_eq!(errno(load("/bin/text", &[b"text"])), 8);
+        assert_eq!(errno(load("/bin/arm", &[b"arm"])), 8);
+        // Under ARG_MAX as staged; the interpreter's strings push it over.
+        let filler = vec![b'f'; 128 * 1024 - 1];
+        let mut argv: Vec<&[u8]> = vec![b"script"];
+        argv.extend(std::iter::repeat_n(filler.as_slice(), 15));
+        // Staged: 17 entries' pointer slots plus both terminators, "script",
+        // fifteen fillers, then the tail, four bytes under ARG_MAX.
+        let near = 2 * 1024 * 1024 - 4 - 19 * 8 - 7 - 15 * 128 * 1024;
+        let tail = vec![b't'; near - 1];
+        argv.push(&tail);
+        assert_eq!(errno(load("/bin/script", &argv)), 7);
+
+        // fexecve runs the descriptor's own object, here a host file.
+        let directory = tempfile::tempdir().unwrap();
+        let opened = directory.path().join("opened");
+        carrick_test_support::executable::write_executable(&opened, static_x86_successor());
+        let source = ExecSource::host(
+            std::fs::File::open(&opened).unwrap(),
+            opened.to_str().unwrap().to_owned(),
+        )
+        .unwrap();
+        let fexecve = ExecCall::Execveat {
+            dirfd: 3,
+            flags: carrick_abi::LINUX_AT_EMPTY_PATH as u32,
+        };
+        let table = [7, 8, 9];
+        let mut asked = None;
+        let by_descriptor = prepare_native_x86_exec_image(
+            &capability,
+            &x86_exec_payload(fexecve, "", &[b"opened"], Some(table)),
+            |t, fd| {
+                asked = Some((t, fd));
+                Ok(source)
+            },
+        )
+        .expect("fexecve loads the open file");
+        assert_eq!(asked, Some((table, 3)));
+        assert_eq!(by_descriptor.entry().entry.raw(), 0x401000);
     }
 }
