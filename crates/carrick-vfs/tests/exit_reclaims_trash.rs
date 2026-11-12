@@ -64,3 +64,39 @@ fn exit_reclaims_promoted_trash() {
         "trash must be reclaimed by the run that follows it, left: {left:?}"
     );
 }
+
+/// Concurrent exits sharing one scratch root drain the same trash. A child
+/// that loses a race to remove an entry sees `NotFound`, which is "already
+/// gone", and the drain runs under the sweep lock; neither may quarantine
+/// live trash into `.carrick-cleanup-failures`, which nothing reclaims.
+#[test]
+fn concurrent_exits_leave_nothing_quarantined() {
+    let root = tempfile::tempdir().unwrap();
+    plant_promoted_trash(root.path());
+
+    let children: Vec<_> = (0..3)
+        .map(|_| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "exiting_run_child"])
+                .env("CARRICK_TEST_SCRATCH_ROOT", root.path())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut child in children {
+        let status = child.wait().unwrap();
+        assert!(status.success(), "exiting run child failed: {status}");
+    }
+
+    let quarantined: Vec<_> = std::fs::read_dir(root.path().join(".carrick-cleanup-failures"))
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        quarantined.is_empty(),
+        "concurrent reclaims must not quarantine trash: {quarantined:?}"
+    );
+    let left: Vec<_> = std::fs::read_dir(root.path().join(".carrick-trash"))
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "trash left behind: {left:?}");
+}
