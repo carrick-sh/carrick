@@ -384,4 +384,68 @@ mod tests {
             );
         }
     }
+
+    /// #2206: coreutils' `mkdir -p` fchdirs (x86 81, canonical 50) into
+    /// each directory it creates. A descendant stages the chdir lookup of
+    /// its descriptor, completed from the reply as `chdir`'s is; the
+    /// initial task keeps its host route; the ring answers a descriptor
+    /// that is no directory.
+    #[test]
+    fn descendant_fchdir_stages_the_chdir_lookup_and_completes_from_its_reply() {
+        use carrick_core_abi::host_file::{HostFileOp, HostFileRequestView};
+        use carrick_personality_linux::entry::SyscallResult;
+        use carrick_personality_linux::native_host_file::{CHDIR_REPLY_BYTES, chdir_target};
+        let args = [3, 0, 0, 0, 0, 0];
+        assert_eq!(
+            stage(81, args, INITIAL, host()),
+            None,
+            "the initial task keeps its host route"
+        );
+        let Some(HostFileStage::Request {
+            mut record,
+            output,
+            resolves_path,
+            map,
+            chdir,
+        }) = stage(81, args, CHILD, host())
+        else {
+            panic!("a descendant's fchdir of a host-backed descriptor is staged");
+        };
+        assert_eq!(
+            (output, resolves_path, map, chdir),
+            (None, true, None, true),
+            "a chdir lookup under the caller's access context"
+        );
+        let view = HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(view.header().op, HostFileOp::Fchdir);
+        assert_eq!(view.header().fd, 3);
+        assert_eq!(view.header().table, [3, 4, 5]);
+        assert_eq!(view.input(), b"");
+        assert_eq!(view.output_capacity(), CHDIR_REPLY_BYTES);
+        let mut stat = carrick_syscall_abi::LinuxStat::from_fields(
+            &carrick_syscall_abi::LinuxPipeIdentity::new(1, 1).stat_fields(),
+        );
+        stat.st_mode = carrick_syscall_abi::LINUX_S_IFDIR | 0o755;
+        let mut reply = zerocopy::IntoBytes::as_bytes(&stat).to_vec();
+        reply.extend_from_slice(b"/tmp/a");
+        view.reply(0, &reply).unwrap();
+        assert_eq!(chdir_target(&record).unwrap().as_bytes(), b"/tmp/a");
+
+        let pipe = Some(NativeDescriptor::InZone(InZoneKind::Pipe(
+            carrick_syscall_abi::LinuxPipeIdentity::new(1, 1),
+        )));
+        for (descriptor, errno) in [
+            (pipe, carrick_syscall_abi::LINUX_ENOTDIR),
+            (
+                Some(NativeDescriptor::Absent),
+                carrick_syscall_abi::LINUX_EBADF,
+            ),
+        ] {
+            assert_eq!(
+                stage(81, args, CHILD, descriptor),
+                Some(HostFileStage::Returned(SyscallResult::from_errno(errno))),
+                "{errno:?}"
+            );
+        }
+    }
 }
