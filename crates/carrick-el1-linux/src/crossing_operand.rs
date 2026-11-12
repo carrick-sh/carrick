@@ -99,13 +99,49 @@ pub fn classify_fd_operand(
     }
 }
 
+/// `AT_FDCWD`.
+const AT_FDCWD: i32 = -100;
+
+/// The verdict for one `(dirfd, path)` pair at `dirfd_index`. Linux consults
+/// the directory descriptor only for a relative (or empty) path. A ring-held
+/// directory is the ring's own description: its number names nothing in the
+/// root's host task, and the shared path staging serves no relative base
+/// through it yet (`native_host_file`'s `path_base`), so the call is the
+/// ring's counted ENOSYS rather than a path resolved against whatever the
+/// host task has under that number.
+fn dir_operand(
+    args: &[u64; 6],
+    dirfd_index: u8,
+    classify: &mut impl FnMut(i32) -> FdOperandClass,
+    first_path_byte: &mut impl FnMut(u64) -> Option<u8>,
+) -> CrossingOperand {
+    let dirfd = args[dirfd_index as usize] as i32;
+    if dirfd == AT_FDCWD {
+        return CrossingOperand::Pass;
+    }
+    let first = first_path_byte(args[dirfd_index as usize + 1]);
+    if first.is_none_or(|byte| byte == b'/') {
+        return CrossingOperand::Pass;
+    }
+    match classify(dirfd) {
+        FdOperandClass::HostBacked | FdOperandClass::HostObject(_) => CrossingOperand::Pass,
+        FdOperandClass::InZone => CrossingOperand::InRing,
+        // An empty path is `ENOENT` before the descriptor is consulted.
+        FdOperandClass::Absent if first == Some(0) => CrossingOperand::Pass,
+        FdOperandClass::Absent => CrossingOperand::BadFd,
+    }
+}
+
 /// Resolve the descriptor operand of `canonical` for `set`. A call that is
 /// not an allowed crossing in `set` passes: the crossing table refuses it.
+/// `first_path_byte` reads the first byte of the user path at an address
+/// (`None`: unreadable, which the crossing itself then reports).
 pub fn resolve_crossing_operand(
     set: HostCrossingSet,
     canonical: CanonicalNr,
     args: &[u64; 6],
-    classify: impl FnOnce(i32) -> FdOperandClass,
+    mut classify: impl FnMut(i32) -> FdOperandClass,
+    mut first_path_byte: impl FnMut(u64) -> Option<u8>,
 ) -> CrossingOperand {
     let crossing = match set {
         HostCrossingSet::X86 => AllowedHostCrossing::from_canonical_x86(canonical),
@@ -114,8 +150,18 @@ pub fn resolve_crossing_operand(
     let Some(crossing) = crossing else {
         return CrossingOperand::Pass;
     };
-    let (index, object_write) = match crossing.operand_spec().fd_operand() {
-        FdOperand::None | FdOperand::DirFd { .. } => return CrossingOperand::Pass,
+    let spec = crossing.operand_spec();
+    let (index, object_write) = match spec.fd_operand() {
+        FdOperand::None => return CrossingOperand::Pass,
+        FdOperand::DirFd { index } => {
+            for dirfd in [Some(index), spec.second_dirfd()].into_iter().flatten() {
+                let verdict = dir_operand(args, dirfd, &mut classify, &mut first_path_byte);
+                if verdict != CrossingOperand::Pass {
+                    return verdict;
+                }
+            }
+            return CrossingOperand::Pass;
+        }
         FdOperand::Unresolved => return CrossingOperand::InRing,
         FdOperand::Fd { index } => (index, false),
         FdOperand::ObjectWrite => (0, true),
@@ -153,7 +199,7 @@ mod tests {
     const X86: HostCrossingSet = HostCrossingSet::X86;
 
     fn resolve(canonical: CanonicalNr, fd: u64, class: FdOperandClass) -> CrossingOperand {
-        resolve_crossing_operand(X86, canonical, &[fd, 0, 0, 0, 0, 0], |_| class)
+        resolve_crossing_operand(X86, canonical, &[fd, 0, 0, 0, 0, 0], |_| class, |_| None)
     }
 
     #[test]
@@ -202,12 +248,103 @@ mod tests {
         // call x86 does not allow (fstat) is the crossing table's to refuse.
         for canonical in [nr::OPENAT, nr::EXIT_GROUP, nr::FSTAT] {
             assert_eq!(
-                resolve_crossing_operand(X86, canonical, &[3, 0, 0, 0, 0, 0], |_| {
-                    panic!("{canonical:?} classified a descriptor")
-                }),
+                resolve_crossing_operand(
+                    X86,
+                    canonical,
+                    &[3, 0, 0, 0, 0, 0],
+                    |_| panic!("{canonical:?} classified a descriptor"),
+                    |_| None,
+                ),
                 CrossingOperand::Pass
             );
         }
+    }
+
+    #[test]
+    fn a_ring_held_dirfd_is_consulted_only_for_a_relative_path() {
+        let resolve = |nr: CanonicalNr, args: [u64; 6], class, first: Option<u8>| {
+            resolve_crossing_operand(X86, nr, &args, |_| class, |_| first)
+        };
+        let at_cwd = -100i64 as u64;
+        // mkdirat(dirfd, path, mode)
+        let args = |dirfd| [dirfd, 0x1000, 0o755, 0, 0, 0];
+        for (name, dirfd, class, first, want) in [
+            (
+                "AT_FDCWD",
+                at_cwd,
+                FdOperandClass::InZone,
+                Some(b'x'),
+                CrossingOperand::Pass,
+            ),
+            (
+                "absolute path",
+                5,
+                FdOperandClass::InZone,
+                Some(b'/'),
+                CrossingOperand::Pass,
+            ),
+            (
+                "ring-held, relative",
+                5,
+                FdOperandClass::InZone,
+                Some(b'x'),
+                CrossingOperand::InRing,
+            ),
+            (
+                "host task's own",
+                5,
+                FdOperandClass::HostBacked,
+                Some(b'x'),
+                CrossingOperand::Pass,
+            ),
+            (
+                "closed",
+                5,
+                FdOperandClass::Absent,
+                Some(b'x'),
+                CrossingOperand::BadFd,
+            ),
+            (
+                "closed, empty path",
+                5,
+                FdOperandClass::Absent,
+                Some(0),
+                CrossingOperand::Pass,
+            ),
+            (
+                "unreadable path",
+                5,
+                FdOperandClass::InZone,
+                None,
+                CrossingOperand::Pass,
+            ),
+        ] {
+            assert_eq!(
+                resolve(nr::MKDIRAT, args(dirfd), class, first),
+                want,
+                "{name}"
+            );
+        }
+        // renameat names a second directory: olddirfd AT_FDCWD, newdirfd ring-held.
+        assert_eq!(
+            resolve(
+                nr::RENAMEAT,
+                [at_cwd, 0x1000, 5, 0x2000, 0, 0],
+                FdOperandClass::InZone,
+                Some(b'x')
+            ),
+            CrossingOperand::InRing
+        );
+        // symlinkat(target, newdirfd, linkpath): the dirfd is argument 1.
+        assert_eq!(
+            resolve(
+                nr::SYMLINKAT,
+                [0x1000, 5, 0x2000, 0, 0, 0],
+                FdOperandClass::InZone,
+                Some(b'x')
+            ),
+            CrossingOperand::InRing
+        );
     }
 
     #[test]

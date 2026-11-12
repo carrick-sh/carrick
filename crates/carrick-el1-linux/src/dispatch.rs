@@ -1509,6 +1509,17 @@ pub(super) fn native_service_decision(
                 fault: native_host_file_fault(address, access),
                 prefix: None,
             },
+            // Only a host-crossing output stage (x86's strict set) yields
+            // these; the same supply and retry applies if one ever arrives.
+            Some(carrick_personality_linux::native_host_file::HostFileStage::PrepareOutput {
+                address,
+            }) => NativeServiceStage::Fault {
+                fault: native_host_file_fault(address, carrick_guest_arch::Access::Write),
+                prefix: None,
+            },
+            Some(carrick_personality_linux::native_host_file::HostFileStage::Crossing) => {
+                NativeServiceStage::Operation
+            }
             Some(
                 carrick_personality_linux::native_host_file::HostFileStage::FaultAfterPrefix {
                     address,
