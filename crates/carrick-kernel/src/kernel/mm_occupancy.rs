@@ -1734,7 +1734,7 @@ impl AddressSpacePublication {
     /// ([`retire_reservation_root`]): its slots stay owed until the host
     /// venue released the MM's frames. Take it before the publication drops.
     pub fn retired_returns(&self) -> Option<RetiredHostReturns> {
-        (self.tables.live() && self.tables.zone.is_some()).then(|| RetiredHostReturns {
+        self.tables.zone.is_some().then(|| RetiredHostReturns {
             tables: self.tables.clone(),
             mm: self.mm,
         })
