@@ -28,18 +28,19 @@ _start:
     jz child
     mov %rax, %r15
 #ifdef CONCURRENT
-    /* Child has changed cwd and remains blocked until our own change. */
+    /* Both processes may change cwd on separate vCPUs. Neither exits
+       until the peer has changed cwd and published its close. */
     mov $13, %r14d
     mov pipes+4(%rip), %edi
     call close
-    mov pipes(%rip), %edi
-    call wait_close
     lea parent(%rip), %r12
     inc %r14d
     call change
-    call check
     mov pipes+12(%rip), %edi
     call close
+    mov pipes(%rip), %edi
+    call wait_close
+    call check
 #endif
     mov $12, %r14d
     mov %r15, %rdi
@@ -118,6 +119,8 @@ check:
     syscall
     test %rax, %rax
     js fail
+    mov %rax, %r13
+    xor %ecx, %ecx
     lea buf(%rip), %rdi
     mov %r12, %rsi
 1:  movb (%rsi), %al
@@ -125,8 +128,11 @@ check:
     jne fail
     inc %rsi
     inc %rdi
+    inc %rcx
     test %al, %al
     jne 1b
+    cmp %r13, %rcx             /* getcwd returns bytes including NUL */
+    jne fail
     mov $-100, %edi
     lea relative(%rip), %rsi
     xor %edx, %edx

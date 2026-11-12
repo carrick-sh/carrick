@@ -1205,7 +1205,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         let stopped = stopped
             .map_err(|error| TrapError::Hypervisor(format!("KVM stopped run boundary: {error}")))?;
         match &stopped.exit {
-            CarrierRunExit::PhysicalDoorbell { .. } => {
+            CarrierRunExit::PhysicalDoorbell { port, .. } => {
                 let binding = self.binding.as_ref().ok_or_else(|| {
                     TrapError::Hypervisor("KVM doorbell lost task binding".into())
                 })?;
@@ -1215,9 +1215,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                         &self.dispatcher,
                         &self.root_binding.host_root_resources,
                     );
-                    if matches!(&stopped.exit, CarrierRunExit::PhysicalDoorbell { port, .. }
-                        if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT)
-                    {
+                    if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT {
                         self.physical.service_root_fork_seed(Some(task), |record| {
                             self.root_binding.host_root_resources.seed_fork(record)
                         })?;
@@ -1274,16 +1272,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             return Ok(GuestIdleExit::Unsupported);
         }
         match self.physical.run_idle_peer()? {
-            exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
+            exit @ CarrierRunExit::PhysicalDoorbell { port, .. } => {
                 let kernel = self.scheduler.kernel();
                 let status = {
                     let mut host_file = native_host_file_server(
                         &self.dispatcher,
                         &self.root_binding.host_root_resources,
                     );
-                    if matches!(&exit, CarrierRunExit::PhysicalDoorbell { port, .. }
-                        if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT)
-                    {
+                    if port == carrick_core_abi::service::ROOT_FORK_SEED_PORT {
                         self.physical.service_root_fork_seed(None, |record| {
                             self.root_binding.host_root_resources.seed_fork(record)
                         })?;
