@@ -1865,7 +1865,7 @@ mod futex_queue_authority {
         ) -> u32 {
             self.el1_wake_key(thread, bitset, count, WORD)
         }
-        fn el1_wake_key(
+        pub(super) fn el1_wake_key(
             &self,
             thread: &super::super::KernelContext,
             bitset: u32,
@@ -2071,10 +2071,15 @@ fn futex_queue_authority_split_cleartid_exit_lost_wake_witness() {
         // The sibling exits in the zone: EL1 clears the word and wakes.
         f.write_word(0);
         assert_eq!(
-            f.el1_wake(
+            f.el1_wake_key(
                 &sibling,
                 carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
                 carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
+                carrick_personality_linux::sched::MmFutexKey::shared_private(
+                    carrick_core::personality::UserVa::new(futex_queue_authority::WORD),
+                )
+                .unwrap()
+                .scheduler_address(),
             ),
             1
         );

@@ -11233,8 +11233,11 @@ mod tests {
             );
             child.service.child_copy_error = None;
             assert_eq!(child.control.clear_child_tid(), tid_va.raw());
-            // A waiter on the child's private futex must become runnable at exit.
-            // Its key deliberately differs from the parent's identical VA.
+            // The exit's shared wake releases a shared-private join waiter.
+            // Its MM deliberately differs from the parent's identical VA.
+            let join_key = carrick_personality_linux::sched::MmFutexKey::shared_private(tid_va)
+                .unwrap()
+                .scheduler_address();
             let waiter = zone
                 .alloc_record(ThreadIdentity {
                     tid: 43,
@@ -11249,23 +11252,15 @@ mod tests {
                 })
                 .unwrap();
             let guard = zone.short_lock(
-                ZoneTables::<ParkedContextWords>::bucket_of_with_context(child_mm, tid_va.raw()),
+                ZoneTables::<ParkedContextWords>::bucket_of_with_context(child_mm, join_key),
                 &NativeBucketWait {
                     lifetime: core::marker::PhantomData,
                     probe: None,
                 },
             );
             let sequence = zone.next_seq(waiter);
-            zone.enqueue(
-                &guard,
-                waiter,
-                sequence,
-                child_mm,
-                tid_va.raw(),
-                u32::MAX,
-                0,
-            )
-            .unwrap();
+            zone.enqueue(&guard, waiter, sequence, child_mm, join_key, u32::MAX, 0)
+                .unwrap();
             zone.publish_park(waiter, sequence);
             drop(guard);
             assert!(matches!(
