@@ -2733,7 +2733,7 @@ mod child_tid_owner_tests {
     }
 
     /// A joiner parked in the zone queue of `mm` on the CLEARTID word, as EL1
-    /// parks a `FUTEX_WAIT_PRIVATE` it serves (or the host's `zone_park`).
+    /// parks a shared join wait it serves (or the host's `zone_park`).
     fn park_zone_joiner(
         zone: &carrick_el1_abi::ZoneTables,
         joiner: &carrick_kernel::kernel::KernelContext,
@@ -2754,9 +2754,16 @@ mod child_tid_owner_tests {
         serial: u64,
         mm: carrick_kernel::kernel::MmId,
     ) -> carrick_el1_abi::RecordId {
+        let key = carrick_personality_linux::sched::MmFutexKey::shared_private(
+            carrick_guest_arch::UserVa::new(VA),
+        )
+        .unwrap();
         let guard = zone
             .lock(
-                carrick_el1_abi::ZoneTables::bucket_of_with_context(mm.raw(), VA),
+                carrick_el1_abi::ZoneTables::bucket_of_with_context(
+                    mm.raw(),
+                    key.scheduler_address(),
+                ),
                 &carrick_kernel::el1_zone::HostLockWait,
             )
             .unwrap();
@@ -2774,8 +2781,16 @@ mod child_tid_owner_tests {
             })
             .unwrap();
         let seq = zone.next_seq(record);
-        zone.enqueue(&guard, record, seq, mm.raw(), VA, u32::MAX, 0)
-            .unwrap();
+        zone.enqueue(
+            &guard,
+            record,
+            seq,
+            mm.raw(),
+            key.scheduler_address(),
+            u32::MAX,
+            0,
+        )
+        .unwrap();
         zone.publish_park(record, seq);
         record
     }
