@@ -630,6 +630,22 @@ mod process_exit_tests {
             fixture.task.linux.has_pending_host_work(),
             "the handed-back waiter owes the host a boundary"
         );
+        zone.take_completion_handbacks(&carrick_sched_core::ShortLockSpin, &mut |_| {});
+        assert_eq!(
+            zone.place_native_handback(zone.record_ref(fixture.waiter)),
+            Some(carrick_sched_core::NativePlacement::Held)
+        );
+        let peer = SlotId::new(1);
+        zone.drive(peer, 2);
+        zone.publish_slot(peer, LaneWake::MM, Some(1), 0);
+        assert_eq!(
+            zone.record(fixture.waiter).claim(),
+            Claim::Queued {
+                slot: peer,
+                seq: fixture.seq
+            }
+        );
+        assert_eq!(zone.slot(peer).queued(), 1);
     }
 }
 

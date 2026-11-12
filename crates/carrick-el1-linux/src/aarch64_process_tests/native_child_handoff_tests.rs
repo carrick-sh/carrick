@@ -2502,7 +2502,21 @@ fn forked_child_futex_wake_hands_a_waiter_no_driven_vcpu_may_run_to_the_host() {
     carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
         carrick_kernel::el1_zone::hand_back_completions();
     });
-    assert_eq!(fixture.zone.record(waiter).claim(), Claim::Host { seq });
+    assert_eq!(fixture.zone.record(waiter).claim(), Claim::Held { seq });
+    fixture.zone.drive(other, 2);
+    fixture.zone.publish_slot(
+        other,
+        fixture.zone.record(waiter).identity().mm,
+        Some(1),
+        1 << 1,
+    );
+    fixture.zone.enter_guest(other);
+    let switched = fixture
+        .zone
+        .switch_in_full(other)
+        .expect("held waiter runs on returning CPU 1");
+    assert_eq!(switched.record, waiter);
+    assert_eq!(switched.result, Some(0));
     assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
     assert_eq!(fixture.zone.slot(other).queued(), 0);
 }

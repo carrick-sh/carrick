@@ -67,6 +67,7 @@ fn make_zone() -> Arc<Box<ZoneTables>> {
         init!(entry_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(idle_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(queued_map, core::array::from_fn(|_| AtomicU64::new(0)));
+        init!(held_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(completion_consumer, AtomicU32::new(0));
         init!(online_cpus, AtomicU64::new(0));
         init!(
@@ -772,5 +773,44 @@ fn concurrent_group_exit_keeps_direct_load_terminal_intent_before_release() {
         root.join().unwrap();
         member.join().unwrap();
         assert_eq!(live.load(Ordering::Acquire), 0);
+    });
+}
+
+#[test]
+fn native_hold_races_driver_cpu_publication() {
+    model(|| {
+        let zone = zone();
+        let id = zone
+            .alloc_record(ThreadIdentity {
+                tid: 1,
+                serial: 1,
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+                affinity_source: AffinitySource::UNBOUND,
+                affinity: 2,
+            })
+            .unwrap();
+        assert!(zone.mark_native_owned(id));
+        let seq = zone.next_seq(id);
+        zone.publish_park(id, seq);
+        let record = zone.record_ref(id);
+        assert_eq!(
+            zone.claim_for_host(record, None, Handback::Woken, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            HostClaim::Claimed
+        );
+        let publisher = zone.clone();
+        let actor = thread::spawn(move || {
+            publisher.drive(SLOT, 1);
+            publisher.publish_slot(SLOT, 7, Some(1), 0);
+        });
+        assert!(zone.place_native_handback(record).is_some());
+        actor.join().unwrap();
+        assert_eq!(zone.record(id).claim(), Claim::Queued { slot: SLOT, seq });
+        assert_eq!(zone.slot(SLOT).queued(), 1);
     });
 }
