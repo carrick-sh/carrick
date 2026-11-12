@@ -5077,6 +5077,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn task_id(&self) -> u32 {
         self.key.id.raw() as u32
     }
+    /// The admitted owner kind of this entry's thread group: the run's root,
+    /// or a fork child (including its exec successor), which has no host task.
+    pub fn thread_group_owner(&self) -> NativeThreadGroupOwner {
+        if self.is_root_process() {
+            NativeThreadGroupOwner::Root
+        } else {
+            NativeThreadGroupOwner::ForkChild
+        }
+    }
     pub fn is_root_process(&self) -> bool {
         let graph = self.runtime.graph.lock();
         self.key == graph.root_key

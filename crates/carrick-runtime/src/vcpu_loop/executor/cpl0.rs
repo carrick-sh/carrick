@@ -477,12 +477,14 @@ impl ForwardAuthority {
 
 /// A forward refused before any forward token is taken, because serving it
 /// would borrow an authority the stopped task does not own. The run fails
-/// closed with this reason; owned host context and parking for in-zone
-/// children is follow-up work.
+/// closed with this reason; parking for in-zone children is follow-up work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardAuthorityRefusal {
     /// The call needs a host task context (fd table, offsets, credentials)
-    /// that an in-zone child does not have.
+    /// that an in-zone child does not have. A broken invariant: the ring
+    /// answers a fork child's unstaged crossing in ring with a counted
+    /// ENOSYS (`carrick_el1_linux::dispatch::unclaimed_native_syscall`), so
+    /// none should reach the carrier.
     HostTaskContext { native: u64 },
     /// The call must wait, and a wait parks only on the waiting task's own
     /// execution lease; this executor holds none for the stopped task.
@@ -503,7 +505,7 @@ impl std::fmt::Display for ForwardAuthorityRefusal {
         match self {
             Self::HostTaskContext { native } => write!(
                 formatter,
-                "forward refused: x86 syscall {native} from an in-zone child needs a host task context it does not own"
+                "forward refused: x86 syscall {native} from an in-zone child reached the carrier (broken invariant: the ring answers it); it needs a host task context it does not own"
             ),
             Self::BlockingWait => formatter.write_str(
                 "forward refused: a blocking wait needs the stopped task's own execution lease",
@@ -857,42 +859,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             if authority == ForwardAuthority::InZoneChild
                 && matches!(class, crate::prepare::InitialForwardClass::Host(_))
             {
-                // Resolve a raw write from an in-zone child through the
-                // stopped child's own CPL0 file table rather than assuming fd
-                // 1 or 2 is host stdio; only a live writable binding to host
-                // stdout or stderr is served here.
-                let write_fd_arg = raw.args[0];
-                let write_buf_arg = raw.args[1];
-                let write_len_arg = raw.args[2];
-                if raw.number.0 == carrick_personality_linux::crossing::nr::WRITE.raw()
-                    && let Ok(guest_fd) = i32::try_from(write_fd_arg)
-                    && let Some(object) = venue.stopped_task_host_object(guest_fd)?
-                {
-                    if let Some(stdio_fd) = object.stdio_fd().filter(|fd| *fd == 1 || *fd == 2) {
-                        let length = usize::try_from(write_len_arg).map_err(|_| {
-                            TrapError::Hypervisor("in-zone stdio write length overflow".into())
-                        })?;
-                        let bytes =
-                            venue
-                                .read_bytes_prefix(write_buf_arg, length)
-                                .map_err(|error| {
-                                    TrapError::Hypervisor(format!(
-                                        "in-zone stdio write copy: {error}"
-                                    ))
-                                })?;
-                        self.stats.record(class)?;
-                        return Ok(ForwardDecision::Immediate(
-                            InitialSyscallDisposition::Return(
-                                dispatcher.forward_stdio_bytes(stdio_fd, &bytes),
-                            ),
-                        ));
-                    }
-                    if object.host_fd().is_some() {
-                        return refuse(ForwardAuthorityRefusal::HostTaskContext {
-                            native: raw.native_number.0,
-                        });
-                    }
-                }
+                // The ring answers a fork child's unstaged crossing in ring
+                // (`unclaimed_native_syscall`); one reaching here is a broken
+                // invariant, never served under the root's authority.
                 return refuse(ForwardAuthorityRefusal::HostTaskContext {
                     native: raw.native_number.0,
                 });

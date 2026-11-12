@@ -1346,6 +1346,21 @@ impl Personality for LinuxPersonality {
                     CompletionRoute::Suspended
                 };
             }
+            // A fork child has no host task context, so an allowed crossing no
+            // ring stage served is answered in ring with a counted ENOSYS, by
+            // the one Linux policy ARM's owned native entry asks too.
+            if route == CompletionRoute::Forward
+                && carrick_el1_linux::dispatch::unclaimed_native_syscall(
+                    process.thread_group_owner(),
+                ) == carrick_el1_linux::dispatch::UnclaimedNativeSyscall::CountedEnosys
+            {
+                frame.rax = carrick_el1_linux::dispatch::count_unclaimed_native_refusal(
+                    carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                    counters,
+                )
+                .0;
+                route = CompletionRoute::Served;
+            }
             if let Some(reason) = process.take_run_failure() {
                 complete_run_failure(task, reason);
             }

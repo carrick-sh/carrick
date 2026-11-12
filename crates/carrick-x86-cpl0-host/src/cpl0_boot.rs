@@ -2788,46 +2788,6 @@ impl<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo> ForwardVenue<'a, M, Mem> {
         self.execution.cpu
     }
 
-    /// Resolve a writable guest descriptor in the stopped task's own CPL0 file
-    /// table to its bound [`carrick_el1_abi::HostObjectBinding`].
-    pub fn stopped_task_host_object(
-        &self,
-        guest_fd: i32,
-    ) -> Result<Option<carrick_el1_abi::HostObjectBinding>, TrapError> {
-        let file_table = self
-            .custody
-            .task(self.execution.cpu)
-            .linux
-            .file_table
-            .load(Ordering::Acquire)
-            .max(1);
-        let region = self.custody.binding(self.execution.cpu).file_region;
-        let tables = self
-            .custody
-            .files
-            .registration
-            .tables(region)
-            .map_err(|error| fail(format!("stopped task file tables: {error:?}")))?;
-        let _guard = carrick_el1_abi::lock_fd_map(tables.fd_map());
-        let Some((handle, _)) =
-            carrick_el1_abi::fd_map_lookup(tables.fd_map(), file_table, guest_fd)
-        else {
-            return Ok(None);
-        };
-        if handle == 0 {
-            return Ok(None);
-        }
-        Ok(tables
-            .opens()
-            .get((handle - 1) as usize)
-            .filter(|open| {
-                open.state.load(Ordering::Acquire) == carrick_el1_abi::DELEGATED_STATE_GUEST
-                    && open.flags.load(Ordering::Acquire) & carrick_el1_abi::DELEGATED_FLAG_WRITABLE
-                        != 0
-            })
-            .and_then(carrick_el1_abi::DelegatedOpenFile::host_object))
-    }
-
     /// Authenticate that the stopped task's own CPL0 file table holds a live
     /// writable open description bound to `expected`.
     pub fn stopped_task_has_writable_host_object(

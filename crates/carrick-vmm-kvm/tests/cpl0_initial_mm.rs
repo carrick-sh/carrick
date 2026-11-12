@@ -1848,24 +1848,33 @@ fn forward_authority_fixture(variant: &str) -> Vec<u8> {
 
 /// Ruling 2 on #542: a forked child's forward never borrows the root's host
 /// `KernelContext`. The child's `read(0)` needs a host task context the
-/// child does not own, so the run is refused, typed and counted, before any
-/// forward token is taken. Before the ruling the root's context served it
-/// and the run exited 7.
+/// child does not own. Before the ruling the root's context served it; until
+/// #2157 B0 the run failed with a typed `HostTaskContext` refusal. Now the
+/// ring answers it like ARM: a counted ENOSYS (38) in ring, and the run
+/// completes with the parent reaping that status.
 #[test]
-fn in_zone_child_host_read_is_refused_not_served_under_root_context() {
+fn in_zone_child_host_read_is_counted_enosys_not_served_under_root_context() {
     let elf = forward_authority_fixture("CHILD_STDIN_READ");
-    let failure = match try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER) {
-        Ok(outcome) => panic!(
-            "the child's read was served under another task's authority: exit {}",
-            outcome.run.exit_code
-        ),
-        Err(failure) => failure,
-    };
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "the child's read must be answered in ring: {:?} ({})",
+                failure.authority_refusals, failure.error
+            )
+        });
     assert_eq!(
-        failure.authority_refusals,
-        vec![carrick_runtime::prepare::ForwardAuthorityRefusal::HostTaskContext { native: 0 }],
-        "unexpected refusal error: {}",
-        failure.error
+        outcome.run.exit_code, 7,
+        "91 = the child's status was not ENOSYS: {:?}",
+        outcome.run
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    assert_eq!(
+        counters.refused_child[0].load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the child's read is a counted descendant refusal"
     );
 }
 
