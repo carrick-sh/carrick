@@ -114,10 +114,11 @@ use carrick_vfs::rootfs::RootFs;
 // `pub(crate)` so `vcpu_loop` can reach the same helpers.
 pub(crate) mod exec;
 use crate::vcpu_loop::{
-    apply_exec_image_proc_state, apply_image_proc_state, deliver_pending_signal,
-    dispatch_with_panic_backstop, partial_write_interrupt_outcome,
-    raise_sigpipe_for_blocking_write, signal_wait_expired, signal_wait_slice,
+    apply_image_proc_state, deliver_pending_signal, dispatch_with_panic_backstop,
+    partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write, signal_wait_expired,
+    signal_wait_slice,
 };
+use carrick_kernel::kernel::exec_transaction::apply_exec_image_proc_state;
 use carrick_kernel::kernel::identity_page::stamp_identity_page;
 use exec::{load_execve_image, stop_after_traced_exec, stop_by_signal};
 

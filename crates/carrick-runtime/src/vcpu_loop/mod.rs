@@ -90,8 +90,8 @@ pub(crate) mod native_probe;
 pub(crate) use memory::apply_image_proc_state;
 pub(crate) use memory::{
     KernelFrameCowAuthority, RefuseAliasInstallSpec, apply_alias_frame_inventory,
-    apply_exec_image_proc_state, refuse_alias_install, requires_no_unwind_host_exit,
-    stamp_ns_visible_guest_tid, syscall_edits_stage1,
+    refuse_alias_install, requires_no_unwind_host_exit, stamp_ns_visible_guest_tid,
+    syscall_edits_stage1,
 };
 #[cfg(test)]
 pub(crate) use memory::{

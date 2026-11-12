@@ -14,6 +14,7 @@
 use super::*;
 
 use carrick_fatal::carrick_fatal;
+use carrick_kernel::kernel::exec_transaction::apply_exec_image_proc_state;
 
 #[expect(
     clippy::large_enum_variant,
