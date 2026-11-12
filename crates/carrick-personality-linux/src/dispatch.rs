@@ -1033,6 +1033,59 @@ impl OperandSpec {
     }
 }
 
+/// Where a crossing writes its result into guest memory, so the ring can
+/// make the destination writable before the effect. A host crossing copies
+/// out through the venue, which cannot supply a page: an untouched or
+/// copy-on-write destination would answer EFAULT where Linux succeeds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputOperand {
+    /// Writes no guest memory, or its venue stages the output itself.
+    None,
+    /// A fixed-size record at argument `ptr`.
+    Record { ptr: u8, bytes: u64 },
+    /// At most the count in argument `len`, at argument `ptr`. Only the
+    /// first page is prepared: the result length is not known before the
+    /// effect.
+    Buffer { ptr: u8, len: u8 },
+}
+
+/// Bytes of a guest page, the unit [`OutputOperand::Buffer`] prepares.
+const OUTPUT_PAGE: u64 = 4096;
+
+impl OperandSpec {
+    /// The guest output of this crossing. A crossing that writes guest memory
+    /// must be declared here before an ISA flips it (the x86 table test
+    /// names every flipped crossing without one).
+    pub const fn output_operand(self) -> OutputOperand {
+        use crate::crossing::AllowedHostCrossing as C;
+        match self.crossing {
+            C::Getcwd => OutputOperand::Buffer { ptr: 0, len: 1 },
+            C::Statfs | C::Fstatfs => OutputOperand::Record { ptr: 1, bytes: 120 },
+            C::Readlinkat => OutputOperand::Buffer { ptr: 2, len: 3 },
+            C::Getxattr | C::Lgetxattr | C::Fgetxattr => OutputOperand::Buffer { ptr: 2, len: 3 },
+            C::Listxattr | C::Llistxattr | C::Flistxattr => {
+                OutputOperand::Buffer { ptr: 1, len: 2 }
+            }
+            _ => OutputOperand::None,
+        }
+    }
+
+    /// The guest range to make writable before the crossing runs, as
+    /// `(address, length)`; `None` when it writes nothing there.
+    pub fn output_range(self, args: &[u64; 6]) -> Option<(u64, u64)> {
+        let (address, length) = match self.output_operand() {
+            OutputOperand::None => return None,
+            OutputOperand::Record { ptr, bytes } => (args[ptr as usize], bytes),
+            OutputOperand::Buffer { ptr, len } => {
+                let address = args[ptr as usize];
+                let to_page_end = OUTPUT_PAGE - (address % OUTPUT_PAGE);
+                (address, args[len as usize].min(to_page_end))
+            }
+        };
+        (length != 0).then_some((address, length))
+    }
+}
+
 impl ServiceOwner {
     /// Preserve the existing family fallback path. Crossing permission is still
     /// evaluated separately on a decline, including terminal carrier handbacks.

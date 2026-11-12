@@ -584,6 +584,47 @@ mod tests {
         }
     }
 
+    /// A host crossing copies out through a venue that cannot supply a page,
+    /// so every x86 crossing that writes guest memory declares its output
+    /// (T3, #2157). Adding an x86 crossing that writes guest memory means
+    /// declaring it in `OperandSpec::output_operand` and listing it here.
+    #[test]
+    fn x86_crossings_that_write_guest_memory_declare_their_output() {
+        use crate::dispatch::OutputOperand;
+        let mut declared: std::vec::Vec<usize> = HOST_CROSSINGS
+            .iter()
+            .flatten()
+            .filter(|(_, x86, _)| *x86)
+            .filter(|(crossing, _, _)| {
+                crossing.operand_spec().output_operand() != OutputOperand::None
+            })
+            .map(|(crossing, _, _)| crossing.canonical().raw() as usize)
+            .collect();
+        declared.sort_unstable();
+        // getcwd, statfs, fstatfs, readlinkat, getxattr, lgetxattr, listxattr,
+        // llistxattr.
+        assert_eq!(declared, [8, 9, 11, 12, 17, 43, 44, 78]);
+        let spec = AllowedHostCrossing::Readlinkat.operand_spec();
+        // A buffer is prepared to the end of its first page at most.
+        let args = [0, 0, 0x1ff0, 0x4000, 0, 0];
+        assert_eq!(spec.output_range(&args), Some((0x1ff0, 0x10)));
+        let args = [0, 0, 0x1000, 32, 0, 0];
+        assert_eq!(spec.output_range(&args), Some((0x1000, 32)));
+        assert_eq!(spec.output_range(&[0, 0, 0x1000, 0, 0, 0]), None);
+        assert_eq!(
+            AllowedHostCrossing::Statfs
+                .operand_spec()
+                .output_range(&[0, 0x2000, 0, 0, 0, 0]),
+            Some((0x2000, 120))
+        );
+        assert_eq!(
+            AllowedHostCrossing::Mkdirat
+                .operand_spec()
+                .output_range(&[0; 6]),
+            None
+        );
+    }
+
     #[test]
     fn test_x86_crossings_exact() {
         assert_eq!(

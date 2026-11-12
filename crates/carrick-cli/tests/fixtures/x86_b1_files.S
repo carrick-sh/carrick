@@ -73,6 +73,13 @@ child_script:
     jmp child_done
 
 parent_script:
+    /* The parent's pages are copy-on-write after the fork: a result copied
+     * into one is made writable by the ring first. */
+    movb $1, scratch(%rip)
+    PATH %rdi, scratch
+    mov $256, %esi
+    SYS SYS_getcwd
+    EXPECT_OK 20
     /* The child's mkdirat never reached the host: the name is still free. */
     mov $AT_FDCWD, %edi
     AT_PATH %rsi, dir
@@ -87,6 +94,7 @@ parent_script:
     jmp pass
 #else
 root_script:
+    MMAP_UNTOUCHED 59
     mov $AT_FDCWD, %edi
     AT_PATH %rsi, dir
     mov $0755, %edx
@@ -147,11 +155,11 @@ root_script:
     EXPECT 23, 0
     mov $AT_FDCWD, %edi
     AT_PATH %rsi, link
-    PATH %rdx, scratch
+    lea 4096(%r13), %rdx
     mov $16, %r10d
     SYS SYS_readlinkat
     EXPECT 24, 1
-    cmpb $'f', scratch(%rip)
+    cmpb $'f', 4096(%r13)
     je 1f
     mov $25, %edi
     jmp fail
@@ -208,7 +216,7 @@ root_script:
     AT_PATH %rdi, dir
     SYS SYS_chdir
     EXPECT 50, 0
-    PATH %rdi, scratch
+    mov %r13, %rdi
     mov $256, %esi
     SYS SYS_getcwd
     cmp $7, %rax
@@ -216,7 +224,7 @@ root_script:
     mov $51, %edi
     jmp fail
 3:
-    cmpl $0x72696431, scratch-5(%rax) /* "1dir" before the NUL */
+    cmpl $0x72696431, -5(%r13,%rax) /* "1dir" before the NUL */
     je 4f
     mov $52, %edi
     jmp fail

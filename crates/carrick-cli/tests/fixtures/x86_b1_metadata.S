@@ -101,6 +101,12 @@ child_script:
     jmp child_done
 
 parent_script:
+    /* The parent's pages are copy-on-write after the fork: a result copied
+     * into one is made writable by the ring first. */
+    PATH %rdi, dot
+    PATH %rsi, statfs_buf
+    SYS SYS_statfs
+    EXPECT 22, 0
     /* The child's truncate and chmod never reached the host: still absent. */
     mov $AT_FDCWD, %edi
     PATH %rsi, file
@@ -111,6 +117,7 @@ parent_script:
     jmp pass
 #else
 root_script:
+    MMAP_UNTOUCHED 50
     mov $AT_FDCWD, %edi
     PATH %rsi, file
     mov $O_RDWR_CREAT, %edx
@@ -231,19 +238,19 @@ root_script:
     EXPECT 38, -2
     /* statfs and fstatfs: f_type is nonzero for any mounted filesystem. */
     PATH %rdi, dot
-    PATH %rsi, statfs_buf
+    lea 4096(%r13), %rsi
     SYS SYS_statfs
     EXPECT 39, 0
-    cmpq $0, statfs_buf(%rip)
+    cmpq $0, 4096(%r13)
     jne 5f
     mov $40, %edi
     jmp fail
 5:
     mov $5, %edi
-    PATH %rsi, statfs_buf
+    lea 8192(%r13), %rsi
     SYS SYS_fstatfs
     EXPECT 41, 0
-    cmpl $0x50495045, statfs_buf(%rip) /* PIPEFS_MAGIC */
+    cmpl $0x50495045, 8192(%r13) /* PIPEFS_MAGIC */
     je 7f
     mov $47, %edi
     jmp fail
