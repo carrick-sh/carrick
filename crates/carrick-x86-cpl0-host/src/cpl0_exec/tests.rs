@@ -172,6 +172,10 @@ impl Fixture {
     }
 
     fn stage(&mut self, request: X86ExecRequest) -> X86ExecStage {
+        self.stage_waking(request, StockReleaseWake::new(|| {}))
+    }
+
+    fn stage_waking(&mut self, request: X86ExecRequest, wake: StockReleaseWake) -> X86ExecStage {
         stage_x86_exec(
             CpuId::new(0),
             request,
@@ -180,6 +184,7 @@ impl Fixture {
             &mut self.frames,
             self.region.roots(),
             self.region.zone(),
+            wake,
         )
         .unwrap()
     }
@@ -431,10 +436,12 @@ fn exec_service_refuses_with_exact_execve_errnos() {
 
 /// The contract's own shape, "Busy once, then success": a pending fork
 /// holds the stock the successor needs, so the exec parks with nothing
-/// reserved and no errno; the fork's abort is the release it enrolled on,
-/// one probe hands the operation back, and the rerun stages it.
+/// reserved, no errno and its wake enrolled on the stock's release. The
+/// fork's abort, on another thread, delivers that wake; nothing probes the
+/// parked exec until it is woken, then one probe hands the operation back
+/// and the rerun stages it.
 #[test]
-fn a_pending_fork_parks_the_exec_until_its_release_then_stages() {
+fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
     let mut fixture = Fixture::new(10);
     let parent = GrantExecution::new(
         CpuId::new(1),
@@ -471,7 +478,12 @@ fn a_pending_fork_parks_the_exec_until_its_release_then_stages() {
         .unwrap();
     assert_eq!(fixture.stock.table_stock().len(), 7);
 
-    let X86ExecStage::Parked(parked) = fixture.stage(request(image(argv(), vec![]).unwrap()))
+    let (woken, wakes) = std::sync::mpsc::sync_channel(1);
+    let wake = StockReleaseWake::new(move || {
+        let _ = woken.try_send(());
+    });
+    let X86ExecStage::Parked(parked) =
+        fixture.stage_waking(request(image(argv(), vec![]).unwrap()), wake)
     else {
         panic!("the fork holds the tables: not now");
     };
@@ -481,21 +493,33 @@ fn a_pending_fork_parks_the_exec_until_its_release_then_stages() {
     assert!(fixture.preparations.is_empty());
     assert_eq!(fixture.frames.mapped(), 0);
     assert_eq!(fixture.imported(), 0, "the import was aborted");
-    // Probed before the holder releases: still parked.
-    let parked = parked.probe(&fixture.stock).unwrap_err();
+    assert_eq!(
+        fixture.stock.release_waiters(),
+        1,
+        "enrolled on the holder's release"
+    );
+    assert!(wakes.try_recv().is_err(), "nothing has returned yet");
 
-    let mut abort = ForkStockSettlement::abort(fork);
-    fixture
-        .stock
-        .settle(
-            &mut NoTableLedger,
-            parent,
-            &mut abort,
-            |_| true,
-            |_| true,
-            |_| true,
-        )
-        .unwrap();
+    let stock = &mut fixture.stock;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut abort = ForkStockSettlement::abort(fork);
+            stock
+                .settle(
+                    &mut NoTableLedger,
+                    parent,
+                    &mut abort,
+                    |_| true,
+                    |_| true,
+                    |_| true,
+                )
+                .unwrap();
+        });
+        wakes
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the fork's abort wakes the enrolled exec");
+    });
+    assert_eq!(fixture.stock.release_waiters(), 0, "woken once");
     let rerun = parked.probe(&fixture.stock).unwrap();
     let X86ExecStage::Staged(backing, _) = fixture.stage(rerun) else {
         panic!("the released stock grants the rerun");

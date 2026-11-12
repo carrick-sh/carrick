@@ -3986,21 +3986,23 @@ impl Cpl0Carrier {
 /// The host Exec service (#1093 S4c slice c) on this stopped carrier.
 impl Cpl0Carrier {
     /// Stage an exec successor on stopped `cpu`: reserve its fork-stock
-    /// tables and data frames and import its rows before the arm.
+    /// tables and data frames and import its rows before the arm. If a
+    /// holder has the stock, `wake` is enrolled on its release.
     pub fn stage_exec_successor(
         &mut self,
         cpu: usize,
         request: carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecRequest,
+        wake: carrick_hal::fork_stock::StockReleaseWake,
     ) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecStage, TrapError> {
         let cpu = u32::try_from(cpu)
             .ok()
             .filter(|cpu| (*cpu as usize) < self.cpus.len())
             .ok_or_else(|| fail("exec service CPU"))?;
         self.custody
-            .stage_native_exec(carrick_guest_arch::CpuId::new(cpu), request)
+            .stage_native_exec(carrick_guest_arch::CpuId::new(cpu), request, wake)
     }
 
-    /// Probe a parked exec once against this carrier's fork stock.
+    /// Probe a woken parked exec once against this carrier's fork stock.
     pub fn probe_parked_exec(
         &self,
         parked: carrick_x86_cpl0_host::cpl0_boot::exec_service::ParkedX86Exec,
@@ -4030,6 +4032,11 @@ impl Cpl0Carrier {
     /// Reusable fork-stock table pages.
     pub fn fork_table_stock(&self) -> usize {
         self.custody.fork_table_stock()
+    }
+
+    /// Waiters enrolled on the fork stock's release and not yet woken.
+    pub fn fork_stock_release_waiters(&self) -> usize {
+        self.custody.fork_stock_release_waiters()
     }
 
     /// Publish the closed successor root the ring publishes before an exec.

@@ -10,8 +10,10 @@
 //! Contention is "not now", never an errno: when the stock cannot grant the
 //! tables because a holder (a pending fork, a live child) has them, nothing
 //! stays reserved, and the owned operation is kept with the stock release
-//! it observed ([`ParkedX86Exec`]); once the holder returns tables, one
-//! probe hands the operation back to rerun.
+//! it observed ([`ParkedX86Exec`]). The caller's wake is enrolled on that
+//! release under the same stock phase that refused, before its one probe;
+//! the holder's table return delivers it, and one probe then hands the
+//! operation back to rerun.
 //!
 //! The service takes the host's exec lock order
 //! ([`carrick_hal::exec_lock_order::ExecCrossingOrder`]): preparations, then
@@ -29,7 +31,8 @@ use carrick_el1::memory::reservations::{
 };
 use carrick_hal::exec_lock_order::{Exclusive, ExecCrossingOrder};
 use carrick_hal::fork_stock::{
-    ChildAddressTags, ForkStock, ForkStockServiceError, StockRelease, SuccessorTables,
+    ChildAddressTags, ForkStock, ForkStockServiceError, StockRelease, StockReleaseWake,
+    SuccessorTables,
 };
 use carrick_mem::elf::{ElfProgram, SegmentPerms};
 use carrick_mem::x86_initial_image::{X86InitialImage, X86InitialRegion, prepare_x86_elf};
@@ -305,7 +308,9 @@ impl<D: X86ExecData> X86ExecPreparations<D> {
 }
 
 /// Not now: an exec whose tables a holder has. Owns the operation and the
-/// stock release it observed before the refused reservation.
+/// stock release it observed before the refused reservation; the wake
+/// [`stage_x86_exec`] was given is enrolled on that release, so the
+/// holder's return (or one that already landed) wakes it exactly once.
 #[derive(::core::fmt::Debug)]
 #[must_use]
 pub struct ParkedX86Exec {
@@ -314,8 +319,8 @@ pub struct ParkedX86Exec {
 }
 
 impl ParkedX86Exec {
-    /// Probe once: the operation back to rerun if the holder has returned
-    /// tables since the refusal, else still parked.
+    /// Probe once, after the enrolled wake: the operation back to rerun if
+    /// the holder has returned tables since the refusal, else still parked.
     pub fn probe<T: ChildAddressTags, C>(
         self,
         stock: &ForkStock<T, C>,
@@ -438,9 +443,11 @@ fn root_fault(refusal: Refusal) -> TrapError {
 /// Stage `request` on the stopped `cpu`: check its successor is not already
 /// prepared, import its rows into the closed successor root, reserve its
 /// exact tables from the fork stock, then stage its data frames, and retain
-/// the result in `preparations`. A Busy root is a broken invariant, not
-/// contention: the successor is closed, and its only other owner (the
-/// ring's successor slot) is parked in this very service call.
+/// the result in `preparations`. When a holder has the stock, `wake` is
+/// enrolled on its release ([`ParkedX86Exec`]); it is dropped otherwise.
+/// A Busy root is a broken invariant, not contention: the successor is
+/// closed, and its only other owner (the ring's successor slot) is parked
+/// in this very service call.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_x86_exec<T, C, F>(
     cpu: carrick_guest_arch::CpuId,
@@ -450,6 +457,7 @@ pub fn stage_x86_exec<T, C, F>(
     frames: &mut F,
     roots: &X86Cpl0Reservations,
     zone: &X86Cpl0Zone,
+    wake: StockReleaseWake,
 ) -> Result<X86ExecStage, TrapError>
 where
     T: ChildAddressTags,
@@ -477,7 +485,15 @@ where
         Err(_) => return Ok(X86ExecStage::Refused(LINUX_ENOMEM)),
     }
     let (bound, ()) = rooted.bind_zone(|| ());
-    let reserved = bound.fork_stock(|stock| stock.reserve_successor_tables(demand.tables));
+    // Enrolled under the phase that refused, before its one probe, so the
+    // holder's return cannot land between the refusal and the enrolment.
+    let reserved = bound.fork_stock(|stock| {
+        let reserved = stock.reserve_successor_tables(demand.tables);
+        if let Err(ForkStockServiceError::SuccessorTableCapacity) = reserved {
+            stock.enrol_release(observed, wake);
+        }
+        reserved
+    });
     let tables = match reserved {
         Ok(tables) => tables,
         Err(ForkStockServiceError::SuccessorTableCapacity) => {
@@ -665,6 +681,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         &mut self,
         cpu: carrick_guest_arch::CpuId,
         request: X86ExecRequest,
+        wake: StockReleaseWake,
     ) -> Result<X86ExecStage, TrapError> {
         let ram = Arc::clone(&self.ram);
         let (roots, zone) = Self::exec_tables(&ram)?;
@@ -682,6 +699,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             &mut frames,
             roots,
             zone,
+            wake,
         )
     }
 
@@ -707,16 +725,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
 }
 
 impl<M: CarrierMemoryIo> BootstrapCustody<M> {
-    /// The host Exec service on the stopped `cpu` (#1093 S4c slice c).
+    /// The host Exec service on the stopped `cpu` (#1093 S4c slice c);
+    /// `wake` is enrolled on the stock's release if the exec parks.
     pub fn stage_native_exec(
         &mut self,
         cpu: carrick_guest_arch::CpuId,
         request: X86ExecRequest,
+        wake: StockReleaseWake,
     ) -> Result<X86ExecStage, TrapError> {
-        self.0.stage_native_exec(cpu, request)
+        self.0.stage_native_exec(cpu, request, wake)
     }
 
-    /// Probe a parked exec once against this carrier's fork stock.
+    /// Probe a woken parked exec once against this carrier's fork stock.
     pub fn probe_parked_exec(
         &self,
         parked: ParkedX86Exec,
@@ -746,6 +766,11 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     /// Reusable fork-stock table pages.
     pub fn fork_table_stock(&self) -> usize {
         self.0.fork_stock.table_stock().len()
+    }
+
+    /// Waiters enrolled on the fork stock's release and not yet woken.
+    pub fn fork_stock_release_waiters(&self) -> usize {
+        self.0.fork_stock.release_waiters()
     }
 
     /// Publish the closed, unadmitted successor root the ring publishes

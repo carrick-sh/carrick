@@ -969,18 +969,45 @@ pub fn take_successor_table_runs(stock: &mut Vec<RootGpa>, count: usize) -> Opti
 /// back to the reusable stock (an aborted or partly used loan, a reclaimed
 /// child, unused descriptor grants, a returned successor reservation)
 /// advances it; taking pages never does. An exec successor reservation
-/// refused for capacity observes it first and reruns once it has moved:
-/// the stock's release is the holder's release notification.
+/// refused for capacity observes it first, enrols a [`StockReleaseWake`]
+/// on it ([`ForkStock::enrol_release`]) and reruns once woken: the stock's
+/// release is the holder's release notification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct StockRelease(u64);
 
-/// The reusable table pages and their [`StockRelease`]. Reads see the pages;
-/// adding pages goes through [`Extend`], which advances the release; taking
+/// A host waiter enrolled on the stock's [`StockRelease`]: the same owned
+/// wake a physical memory dependency enrols (`PhysicalMemoryWait::enroll`).
+/// It is delivered once, by the first table return after it enrolled (or
+/// at enrolment, when a return already landed since the refusal), and runs
+/// inside the stock's owner, so it must be bounded and never block.
+#[derive(Clone)]
+pub struct StockReleaseWake(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl StockReleaseWake {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(wake))
+    }
+
+    fn deliver(&self) {
+        (self.0)()
+    }
+}
+
+impl core::fmt::Debug for StockReleaseWake {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("StockReleaseWake")
+    }
+}
+
+/// The reusable table pages, their [`StockRelease`] and the waiters
+/// enrolled on it. Reads see the pages; adding pages goes through
+/// [`Extend`], which advances the release and wakes every waiter; taking
 /// pages goes through [`TableStock::taking`], which never does.
 #[derive(Debug, Default)]
 struct TableStock {
     pages: Vec<RootGpa>,
     returns: u64,
+    waiters: Vec<StockReleaseWake>,
 }
 
 impl TableStock {
@@ -1918,6 +1945,28 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// True once some table page has returned since `observed`.
     pub fn released_since(&self, observed: StockRelease) -> bool {
         self.table_release() > observed
+    }
+
+    /// Enrol `wake` on the table release a refused reservation observed,
+    /// then probe once: if a return already landed since `observed`, the
+    /// wake is delivered now instead of waiting for the next. Either way the
+    /// waiter hears of the first return after `observed` exactly once, so
+    /// nothing between the refusal and this enrolment is missed. True when
+    /// the probe delivered it.
+    pub fn enrol_release(&mut self, observed: StockRelease, wake: StockReleaseWake) -> bool {
+        self.tables.waiters.push(wake);
+        if !self.released_since(observed) {
+            return false;
+        }
+        if let Some(wake) = self.tables.waiters.pop() {
+            wake.deliver();
+        }
+        true
+    }
+
+    /// Waiters enrolled on the table release and not yet woken.
+    pub fn release_waiters(&self) -> usize {
+        self.tables.waiters.len()
     }
 
     /// Reserve `count` table pages for an exec successor build, in as many
