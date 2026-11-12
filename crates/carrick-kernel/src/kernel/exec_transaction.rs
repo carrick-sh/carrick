@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use carrick_observability::probes::HvpatchExecRuntimeStagePhase;
+pub use carrick_signal_core::policy::ExecPastNoReturn;
 use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 
 use crate::dispatch::executable_authority::ExecSource;
@@ -158,8 +159,12 @@ pub trait RootExecVenue {
 
     fn record_stage(&self, phase: HvpatchExecRuntimeStagePhase, started: Instant);
 
-    /// Kill the process after the point of no return.
-    fn fail_past_no_return(&mut self, cause: &str) -> ExecExit<Self::Outcome>;
+    /// Kill the process after the point of no return with `verdict`.
+    fn fail_past_no_return(
+        &mut self,
+        verdict: ExecPastNoReturn,
+        cause: &str,
+    ) -> ExecExit<Self::Outcome>;
 
     /// `Drained` -> `Prepared`: prepare the Kernel exec and reserve the
     /// replacement MM's custody.
@@ -290,9 +295,10 @@ fn run<V: RootExecVenue>(
         venue.image(),
     ));
     if let Err(error) = prepared.acknowledge_staged_vma_revision() {
-        return Err(
-            venue.fail_past_no_return(&format!("acknowledge staged exec VMA revision: {error}"))
-        );
+        return Err(venue.fail_past_no_return(
+            ExecPastNoReturn,
+            &format!("acknowledge staged exec VMA revision: {error}"),
+        ));
     }
     venue.record_stage(HvpatchExecRuntimeStagePhase::ProcState, proc_state_started);
 

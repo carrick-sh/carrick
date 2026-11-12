@@ -1283,6 +1283,7 @@ where
     fn exec_failed_past_no_return(
         kernel: &Kernel,
         engine: &mut E,
+        verdict: carrick_signal_core::policy::ExecPastNoReturn,
         cause: &str,
     ) -> Result<VcpuLoopOutcome, RuntimeError> {
         tracing::error!(
@@ -1292,7 +1293,7 @@ where
         engine
             .discard_terminal_syscall_continuation()
             .map_err(RuntimeError::Trap)?;
-        let sigsegv = carrick_signal_core::policy::ExecPastNoReturn::SIGNAL.number();
+        let sigsegv = verdict.signal().number();
         if super::requires_no_unwind_host_exit(kernel, engine.is_forked_child()) {
             if let Err(error) = engine.process_exit_cleanup() {
                 tracing::error!(
@@ -1764,7 +1765,13 @@ where
         cause: &str,
     ) -> ExecExit<VcpuLoopOutcome> {
         ExecExit::new(
-            ThreadRuntimeState::<E>::exec_failed_past_no_return(kernel, engine, cause).map(Some),
+            ThreadRuntimeState::<E>::exec_failed_past_no_return(
+                kernel,
+                engine,
+                carrick_signal_core::policy::ExecPastNoReturn,
+                cause,
+            )
+            .map(Some),
         )
     }
 }
@@ -1779,7 +1786,13 @@ where
         cause: &str,
     ) -> ExecExit<VcpuLoopOutcome> {
         ExecExit::new(
-            ThreadRuntimeState::<E>::exec_failed_past_no_return(kernel, engine, cause).map(Some),
+            ThreadRuntimeState::<E>::exec_failed_past_no_return(
+                kernel,
+                engine,
+                carrick_signal_core::policy::ExecPastNoReturn,
+                cause,
+            )
+            .map(Some),
         )
     }
 }
@@ -1830,8 +1843,20 @@ where
         );
     }
 
-    fn fail_past_no_return(&mut self, cause: &str) -> ExecExit<VcpuLoopOutcome> {
-        Self::exec_failed_past_no_return(self.kernel, self.engine, cause)
+    fn fail_past_no_return(
+        &mut self,
+        verdict: carrick_kernel::kernel::exec_transaction::ExecPastNoReturn,
+        cause: &str,
+    ) -> ExecExit<VcpuLoopOutcome> {
+        ExecExit::new(
+            ThreadRuntimeState::<E>::exec_failed_past_no_return(
+                self.kernel,
+                self.engine,
+                verdict,
+                cause,
+            )
+            .map(Some),
+        )
     }
 
     fn prepare_mm(&mut self) -> ExecStep<(RuntimePreparedExec, Self::Envelope), VcpuLoopOutcome> {

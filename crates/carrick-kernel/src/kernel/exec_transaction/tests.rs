@@ -74,10 +74,32 @@ fn record_failure(fail_at: Option<&'static str>, step: &str) -> ExecStep<(), Str
     Ok(())
 }
 
+struct RecordingPreparedExec {
+    inner: PreparedExec,
+    fail_ack: bool,
+}
+
+impl PreparedRootExec for RecordingPreparedExec {
+    fn replacement_mm_id(&self) -> MmId {
+        self.inner.replacement_mm_id()
+    }
+
+    fn old_file_table(&self) -> Arc<FileTable> {
+        self.inner.old_file_table()
+    }
+
+    fn acknowledge_staged_vma_revision(&mut self) -> Result<(), String> {
+        if self.fail_ack {
+            return Err("staged revision mismatch".to_owned());
+        }
+        Ok(())
+    }
+}
+
 impl ImageReplacement<RecordingVenue> for RecordingTransaction<'_> {
     fn arm_no_return(
         &mut self,
-        prepared: PreparedExec,
+        prepared: RecordingPreparedExec,
         dispatch_mm: Option<&PreparedDispatchMmExec>,
     ) -> ExecStep<PreparedExec, String> {
         assert!(
@@ -86,7 +108,7 @@ impl ImageReplacement<RecordingVenue> for RecordingTransaction<'_> {
         );
         self.steps.borrow_mut().push("arm_no_return".to_owned());
         record_failure(self.fail_at, "arm_no_return")?;
-        Ok(prepared)
+        Ok(prepared.inner)
     }
 
     fn install_image(&mut self, armed: PreparedExec) -> ExecStep<PreparedExec, String> {
@@ -104,7 +126,7 @@ impl ImageReplacement<RecordingVenue> for RecordingTransaction<'_> {
 
 impl RootExecVenue for RecordingVenue {
     type Outcome = String;
-    type Prepared = PreparedExec;
+    type Prepared = RecordingPreparedExec;
     type Envelope = ();
     type Armed = PreparedExec;
     type Installed = PreparedExec;
@@ -133,14 +155,14 @@ impl RootExecVenue for RecordingVenue {
         self.steps.borrow_mut().push(format!("stage:{phase:?}"));
     }
 
-    fn fail_past_no_return(&mut self, cause: &str) -> ExecExit<String> {
+    fn fail_past_no_return(&mut self, verdict: ExecPastNoReturn, cause: &str) -> ExecExit<String> {
         self.steps
             .borrow_mut()
-            .push("fail_past_no_return".to_owned());
+            .push(format!("fail_past_no_return:{}", verdict.signal().number()));
         ExecExit::new(Ok(Some(cause.to_owned())))
     }
 
-    fn prepare_mm(&mut self) -> ExecStep<(PreparedExec, ()), String> {
+    fn prepare_mm(&mut self) -> ExecStep<(RecordingPreparedExec, ()), String> {
         assert!(
             !self.proc_state_published(),
             "Kernel preparation precedes proc-state mutation"
@@ -150,14 +172,23 @@ impl RootExecVenue for RecordingVenue {
             .dispatcher
             .prepare_one_task_kernel_exec(&self.context)
             .expect("prepare one-task exec");
-        Ok((prepared, ()))
+        Ok((
+            RecordingPreparedExec {
+                inner: prepared,
+                fail_ack: self.fail_at == Some("acknowledge_staged_vma_revision"),
+            },
+            (),
+        ))
     }
 
     fn replace_image<R>(
         &mut self,
-        prepared: PreparedExec,
+        prepared: RecordingPreparedExec,
         _topology_lock_started: Instant,
-        replace: impl FnOnce(&mut dyn ImageReplacement<Self>, PreparedExec) -> ExecStep<R, String>,
+        replace: impl FnOnce(
+            &mut dyn ImageReplacement<Self>,
+            RecordingPreparedExec,
+        ) -> ExecStep<R, String>,
     ) -> ExecStep<R, String> {
         assert!(
             self.proc_state_published(),
@@ -308,6 +339,22 @@ fn a_failure_past_the_no_return_arm_stops_the_driver_with_the_venue_outcome() {
         "nothing after the failed hook runs: {steps:?}"
     );
     assert!(!steps.iter().any(|step| step == "commit"));
+}
+
+#[test]
+fn staged_vma_revision_failure_kills_past_no_return_with_sigsegv() {
+    let mut venue = RecordingVenue::new(Some("acknowledge_staged_vma_revision"));
+
+    let outcome = drive(&mut venue).expect("a kill, not a runtime fault");
+
+    assert_eq!(
+        outcome.as_deref(),
+        Some("acknowledge staged exec VMA revision: staged revision mismatch")
+    );
+    assert_eq!(
+        steps(&venue),
+        ["stage:SiblingDrain", "prepare_mm", "fail_past_no_return:11"]
+    );
 }
 
 #[test]
