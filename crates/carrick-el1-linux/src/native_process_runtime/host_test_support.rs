@@ -5107,6 +5107,260 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
     );
 }
 
+/// #2206 review P0-2: a fork child's served `fchdir` lands in its own ring
+/// row through the runtime's one cwd writer (the host-file completion's
+/// `complete_chdir`), not a hand-built cwd. Its next relative call carries
+/// that cwd to the carrier, while its live parent's cwd stays where it was.
+#[cfg(test)]
+#[test]
+fn native_child_fchdir_completion_moves_only_the_childs_cwd() {
+    use carrick_core_abi::host_file::{AccessContext, HostFileOp, HostFileRequestView};
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_personality_linux::native_host_file::{
+        DescriptionAccess, HostFileCall, HostFileStage, NativeDescriptor, NativeNamespace,
+    };
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    // The root forks one child, then parks in `wait4`: both stay live.
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let root_key = fixture.runtime.graph.lock().root_key;
+    let cwd = |key| {
+        let graph = fixture.runtime.graph.lock();
+        let task = graph.owner.task(key).unwrap();
+        task.fs.as_ref().map(|fs| fs.cwd.as_bytes().to_vec())
+    };
+    let parent_cwd = cwd(root_key);
+    assert_eq!(
+        parent_cwd,
+        Some(b"/".to_vec()),
+        "the parent's row has a cwd"
+    );
+
+    // Stage `call` through the production staging the child's owner runs.
+    let stage = |call: HostFileCall| {
+        let mut resolve = |_| {
+            Some(NativeDescriptor::HostBacked {
+                access: DescriptionAccess::ReadWrite,
+            })
+        };
+        let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
+        match crate::dispatch::stage_native_host_file(
+            call,
+            fixture.task,
+            &ResidentUser,
+            &mut NativeNamespace {
+                table: [1, 1, 1],
+                resolve: &mut resolve,
+                releases: &mut releases,
+            },
+        ) {
+            Some(HostFileStage::Request {
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+            }) => (record, output, resolves_path, map, chdir),
+            other => panic!("{call:?} crosses to the carrier: {other:?}"),
+        }
+    };
+    // Claim the published request's service ticket, as the carrier does.
+    let claim = |record: RecordRef| {
+        let notice = fixture.task.service_notice.take().unwrap().unwrap();
+        let identity = fixture.zone.record(record.id).identity();
+        // SAFETY: the real native owner retains this exact control allocation.
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        let _queue = fixture
+            .zone
+            .object_wait(
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            )
+            .unwrap();
+        // SAFETY: the service queue authenticates the notice and excludes
+        // cancellation.
+        unsafe { ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity) }
+            .unwrap()
+    };
+    // Serve the claimed request as the carrier does: check it, write the
+    // reply, acknowledge, and wake the child's service queue.
+    let serve = |ticket: carrick_core_abi::service::ServiceTicket<&ServiceCell>,
+                 check: &mut dyn FnMut(&HostFileRequestView<'_>),
+                 result: i64,
+                 reply: &[u8]| {
+        let ServiceOperation::HostFile { payload, .. } = ticket.request().operation else {
+            panic!("host file notice expected")
+        };
+        let record = ticket.request().identity.birth.record;
+        // SAFETY: the ticket retains the request box; no ring execution can
+        // mutate it.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                payload.ring_storage().raw() as *mut u8,
+                payload.length().raw() as usize,
+            )
+        };
+        let view = HostFileRequestView::parse(bytes).unwrap();
+        check(&view);
+        view.reply(result, reply).unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            )
+            .unwrap();
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+    };
+    let access = |view: &HostFileRequestView<'_>| {
+        let (context, path) = AccessContext::decode(view.input()).unwrap();
+        (context.cwd.to_vec(), path.to_vec())
+    };
+
+    let (record, address, words) = capacity.select().unwrap();
+    // SAFETY: the real fork publication retained this live child's record.
+    let child_key = unsafe { fixture.runtime.record_binding(record) }
+        .unwrap()
+        .key;
+    assert_ne!(child_key, root_key);
+    assert_eq!(cwd(child_key), Some(b"/".to_vec()));
+    let mut service = fixture.service();
+    let mut child = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &words,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        child.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::NoPending)
+    ));
+    let fchdir = HostFileCall::decode(
+        carrick_personality_linux::crossing::nr::FCHDIR,
+        &[3, 0, 0, 0, 0, 0],
+    )
+    .expect("fchdir decodes to the native venue");
+    let (staged, output, resolves_path, map, chdir) = stage(fchdir);
+    assert!(chdir, "fchdir stages a chdir lookup");
+    assert!(matches!(
+        child.begin_host_file_service(
+            staged,
+            output,
+            resolves_path,
+            map,
+            chdir,
+            NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(50), counters)
+        ),
+        Ok(NativeResume::Left(None))
+    ));
+    assert!(child.take_handoff_receipt().is_some());
+    drop(child);
+    let ticket = claim(record);
+    let mut stat = carrick_syscall_abi::LinuxStat::from_fields(
+        &carrick_syscall_abi::LinuxPipeIdentity::new(1, 1).stat_fields(),
+    );
+    stat.st_mode = carrick_syscall_abi::LINUX_S_IFDIR | 0o755;
+    let mut reply = zerocopy::IntoBytes::as_bytes(&stat).to_vec();
+    reply.extend_from_slice(b"/tmp/a");
+    serve(
+        ticket,
+        &mut |view| {
+            assert_eq!(view.header().op, HostFileOp::Fchdir);
+            assert_eq!(view.header().fd, 3);
+            assert_eq!(access(view), (b"/".to_vec(), Vec::new()));
+        },
+        0,
+        &reply,
+    );
+    // The child resumes through the host-file completion, whose chdir arm
+    // is the runtime's one cwd writer.
+    let (resumed, address, words) = capacity.select().unwrap();
+    assert_eq!(resumed, record);
+    let mut service = fixture.service();
+    let mut child = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &words,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        child.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::Returned(result)) if result.raw() == 0
+    ));
+    assert_eq!(cwd(root_key), parent_cwd, "the parent's cwd is its own");
+    assert_eq!(cwd(child_key), Some(b"/tmp/a".to_vec()));
+
+    // `mkdir("b")` in the child now resolves against its new cwd.
+    let path = *b"b\0";
+    let (staged, output, resolves_path, map, chdir) = stage(HostFileCall::Mkdirat {
+        dirfd: -100,
+        path: path.as_ptr() as u64,
+        mode: 0o755,
+    });
+    assert!(matches!(
+        child.begin_host_file_service(
+            staged,
+            output,
+            resolves_path,
+            map,
+            chdir,
+            NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(34), counters)
+        ),
+        Ok(NativeResume::Left(None))
+    ));
+    assert!(child.take_handoff_receipt().is_some());
+    drop(child);
+    let ticket = claim(record);
+    serve(
+        ticket,
+        &mut |view| {
+            assert_eq!(view.header().op, HostFileOp::Mkdirat);
+            assert_eq!(access(view), (b"/tmp/a".to_vec(), b"b".to_vec()));
+        },
+        0,
+        &[],
+    );
+    let (resumed, address, words) = capacity.select().unwrap();
+    assert_eq!(resumed, record);
+    let mut service = fixture.service();
+    let mut child = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &words,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        child.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::Returned(result)) if result.raw() == 0
+    ));
+    assert_eq!(cwd(child_key), Some(b"/tmp/a".to_vec()));
+    assert_eq!(cwd(root_key), parent_cwd);
+}
+
 #[cfg(test)]
 #[test]
 fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
