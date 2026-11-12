@@ -15,7 +15,7 @@ _start:
     lea vec(%rip), %rsi
     mov $1, %rdx
     syscall
-    # Native writes two bytes; Carrick must refuse this unsupported forward.
+    # Native writes two bytes to the remapped stderr; Carrick must match.
     cmp $2, %rax
     je native_done
     cmp $-38, %rax
