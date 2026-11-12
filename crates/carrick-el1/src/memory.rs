@@ -1403,7 +1403,7 @@ impl AnonymousDiscardEditor for HardwareAnonymousEditor {
         #[cfg(target_arch = "aarch64")]
         {
             use carrick_el1_abi::AnonymousLeave as Leave;
-            with_live_aarch64_words(ttbr0, |words, root| {
+            let discarded = with_live_aarch64_words(ttbr0, |words, root| {
                 discard_aarch64_anonymous_steps(
                     words,
                     root,
@@ -1421,13 +1421,17 @@ impl AnonymousDiscardEditor for HardwareAnonymousEditor {
                         }
                     },
                 )
-            })
-            .map_err(|live| {
-                AnonymousDiscardError::Refused(match live {
-                    LiveWordsRefusal::NotLive => Leave::NoGrant,
-                    LiveWordsRefusal::Malformed => Leave::BackingMalformed,
-                })
-            })?
+            });
+            // Each refusal keeps its exact leave.
+            match discarded {
+                Ok(discarded) => discarded,
+                Err(LiveWordsRefusal::NotLive) => {
+                    Err(AnonymousDiscardError::Refused(Leave::NoGrant))
+                }
+                Err(LiveWordsRefusal::Malformed) => {
+                    Err(AnonymousDiscardError::Refused(Leave::BackingMalformed))
+                }
+            }
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
