@@ -325,6 +325,10 @@ struct TestStockCrossing {
     /// caller still holds its birth reservation, as a real vCPU's synchronous
     /// crossing does while sibling vCPUs keep running.
     on_loan: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once at the next fork's commit crossing, before the host
+    /// authenticates the stopped lane: sibling vCPUs keep running between
+    /// the guest's MM commit and its custody settlement.
+    on_commit: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     commit_fault: std::sync::Mutex<CommitFault>,
     pending_loan: std::sync::Mutex<Option<ForkStockLoan>>,
@@ -416,6 +420,7 @@ impl TestStockCrossing {
             reserved_custody_rows: AtomicUsize::new(0),
             refuse_reserve: std::sync::Mutex::new(None),
             on_loan: std::sync::Mutex::new(None),
+            on_commit: std::sync::Mutex::new(None),
             #[cfg(test)]
             commit_fault: std::sync::Mutex::new(CommitFault::None),
             pending_loan: std::sync::Mutex::new(None),
@@ -776,6 +781,10 @@ impl ForkStockCrossing for TestStockCrossing {
                     native_child_handoff_tests::assert_current_stack_commit(record_gpa);
                 }
                 self.settlements_committed.fetch_add(1, Ordering::AcqRel);
+                let on_commit = self.on_commit.lock().unwrap().take();
+                if let Some(hook) = on_commit {
+                    hook();
+                }
                 let settlement = unsafe { &mut *(record_gpa as *mut ForkStockSettlement) };
                 #[cfg(test)]
                 match *self.commit_fault.lock().unwrap() {

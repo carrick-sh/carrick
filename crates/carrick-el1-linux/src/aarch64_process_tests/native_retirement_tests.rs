@@ -1296,3 +1296,101 @@ fn physical_stock_live_lane_checks_execution_mm_root_and_generation() {
         .publish_root_generation(ContextGeneration::new(NonZeroU64::new(102).unwrap()));
     assert_ne!(stock.execution(0).unwrap().context, original.context);
 }
+
+/// #1742: a Go parent vforks while a sibling thread of the same process runs
+/// on another vCPU. That sibling's host stage-1 edit raises the parent MM's
+/// space gate (`raise_and_wait_for_editor`), a counted page-table pause.
+/// The fork's MM commit has already published the child when its custody
+/// settlement crosses; the host then re-authenticates the stopped forking
+/// lane. A pause holds new installs and EL1 editors, not the identity of a
+/// lane that already runs the MM, so the commit must settle, never be
+/// refused into the `ForkCustodyRefused` fatal.
+#[test]
+fn arm_vfork_custody_commits_while_a_sibling_pauses_the_parent_space() {
+    use std::sync::mpsc;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let mut crossing =
+        TestStockCrossing::new(&[0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000]);
+    let mut physical = PhysicalStock::new(&fixture.tables);
+    physical.bind_lane(
+        &fixture.task,
+        fixture.zone,
+        carrick_guest_arch::CpuId::new(0),
+        fixture.address.root,
+    );
+    crossing.physical = Some(Mutex::new(physical));
+
+    // The sibling's vCPU: its host excludes the parent MM's EL1 editor for
+    // a stage-1 edit, and holds that pause until the sibling's edit ends.
+    let zone = fixture.zone;
+    let parent_space = zone.spaces.find(fixture.address.mm.raw().get()).unwrap();
+    let (pause_tx, pause_rx) = mpsc::channel::<()>();
+    let (paused_tx, paused_rx) = mpsc::channel::<()>();
+    let (end_tx, end_rx) = mpsc::channel::<()>();
+    let sibling = std::thread::spawn(move || {
+        pause_rx.recv().unwrap();
+        let excluded = zone
+            .spaces
+            .raise_and_wait_for_editor(parent_space, core::hint::spin_loop);
+        assert_eq!(excluded.key(), 1);
+        paused_tx.send(()).unwrap();
+        end_rx.recv().unwrap();
+        zone.spaces.lower(parent_space);
+    });
+    *crossing.on_commit.lock().unwrap() = Some(Box::new(move || {
+        pause_tx.send(()).unwrap();
+        paused_rx.recv().unwrap();
+    }));
+
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(4096);
+    let outcome = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap()
+        .fork(ProcessForkChildTid::vfork(UserVa::new(stack.arg() + 4096)));
+    // The pause is still held: the child was settled under it.
+    assert!(zone.spaces.grant(parent_space, 1).is_none());
+    end_tx.send(()).unwrap();
+    sibling.join().unwrap();
+
+    assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 0);
+    let physical = crossing.physical.as_ref().unwrap().lock().unwrap();
+    assert_eq!(physical.owner.live_children(), 1);
+    drop(physical);
+    let parent_key = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child_pid = match outcome {
+        LifecycleOutcome::Returned { result, .. } => result.raw() as u32,
+        _ => panic!("vfork parent must observe its born child"),
+    };
+    let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
+    assert!(runtime.task_binding(parent_key).is_some());
+    assert!(runtime.task_binding(child_key).is_some());
+}
