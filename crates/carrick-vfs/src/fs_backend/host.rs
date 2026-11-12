@@ -681,10 +681,7 @@ impl Drop for HostFsBackend {
             // the user waits through for a tree nobody will read again.
             if let Some(scratch) = self._scratch.take() {
                 let path = scratch.keep();
-                LIVE_SCRATCH
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .retain(|live| *live != path);
+                scratch_exit_state().live.retain(|live| *live != path);
                 let _ = defer_remove_tree(path);
             }
             if let Some(path) = self._attached_cleanup_path.take() {
@@ -1246,33 +1243,47 @@ fn discover_orphans_after_root_lock(
     discover_orphans(scratch_root, limit)
 }
 
-/// Scratch roots this process has created backends under, and the pid that
-/// registered the exit hook (a forked helper inheriting the hook must not run
-/// the owner's reclamation).
-static SCRATCH_ROOTS_IN_USE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-/// Per-run scratch trees this process created and has not yet retired. A run
-/// that leaves through `process::exit` never drops its backend, so the exit
-/// hook retires these itself.
-static LIVE_SCRATCH: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-static EXIT_HOOK_OWNER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// What the process-exit hook reclaims. Every `carrick run` path ends in
+/// `std::process::exit`, which skips `Drop` and never joins the deferred-removal
+/// worker, so the hook retires whatever is still registered here.
+struct ScratchExitState {
+    /// The pid that armed the hook (0 until armed): a forked helper inheriting
+    /// the hook must not run the owner's reclamation.
+    owner: u32,
+    /// Scratch roots this process has created backends under.
+    roots: Vec<PathBuf>,
+    /// Per-run scratch trees this process created and has not yet retired.
+    live: Vec<PathBuf>,
+}
+
+static SCRATCH_EXIT: std::sync::Mutex<ScratchExitState> = std::sync::Mutex::new(ScratchExitState {
+    owner: 0,
+    roots: Vec::new(),
+    live: Vec::new(),
+});
+
+fn scratch_exit_state() -> std::sync::MutexGuard<'static, ScratchExitState> {
+    SCRATCH_EXIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Record `scratch_root` for exit-time reclamation and arm the process exit
-/// hook once. Every `carrick run` path ends in `std::process::exit`, which
-/// skips `Drop` and never joins the deferred-removal worker.
+/// hook once.
 fn note_scratch_root_in_use(scratch_root: &Path) {
-    static ARM: std::sync::Once = std::sync::Once::new();
-    {
-        let mut roots = SCRATCH_ROOTS_IN_USE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !roots.iter().any(|root| root == scratch_root) {
-            roots.push(scratch_root.to_path_buf());
+    let arm = {
+        let mut state = scratch_exit_state();
+        if !state.roots.iter().any(|root| root == scratch_root) {
+            state.roots.push(scratch_root.to_path_buf());
         }
-    }
-    ARM.call_once(|| {
-        EXIT_HOOK_OWNER.store(std::process::id(), std::sync::atomic::Ordering::Relaxed);
+        let arm = state.owner == 0;
+        state.owner = std::process::id();
+        arm
+    };
+    if arm {
         extern "C" fn at_exit() {
-            if EXIT_HOOK_OWNER.load(std::sync::atomic::Ordering::Relaxed) == std::process::id() {
+            let owner = scratch_exit_state().owner;
+            if owner == std::process::id() {
                 finish_scratch_cleanup();
             }
         }
@@ -1280,7 +1291,7 @@ fn note_scratch_root_in_use(scratch_root: &Path) {
         unsafe {
             libc::atexit(at_exit);
         }
-    });
+    }
 }
 
 /// Finish scratch reclamation before the process exits, so a `--rm` (or any)
@@ -1297,11 +1308,7 @@ pub fn finish_scratch_cleanup() {
     {
         let _ = done.recv();
     }
-    let live = std::mem::take(
-        &mut *LIVE_SCRATCH
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    );
+    let live = std::mem::take(&mut scratch_exit_state().live);
     for path in live {
         // Detach an overlay first, exactly as `Drop` does, so the reclaim
         // cannot descend into a live mount.
@@ -1309,10 +1316,7 @@ pub fn finish_scratch_cleanup() {
         unmount_overlay_at(&path.join("merged"));
         let _ = rename_scratch_to_trash(&path);
     }
-    let roots = SCRATCH_ROOTS_IN_USE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+    let roots = scratch_exit_state().roots.clone();
     for root in roots {
         reclaim_scratch_root(&root);
     }
@@ -1384,10 +1388,7 @@ impl HostFsBackend {
 
         let scratch = tempfile::TempDir::new_in(scratch_root)?;
         let lock = acquire_lockfile(scratch.path())?;
-        LIVE_SCRATCH
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(scratch.path().to_path_buf());
+        scratch_exit_state().live.push(scratch.path().to_path_buf());
         drop(root_guard);
         let scratch_c = std::ffi::CString::new(scratch.path().as_os_str().as_encoded_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
