@@ -39,6 +39,8 @@ pub use open_lifetime::*;
 mod seqlock;
 pub use seqlock::*;
 
+pub mod successor_image;
+
 pub mod clock;
 pub mod host_file;
 pub mod service;
