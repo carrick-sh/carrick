@@ -387,7 +387,7 @@ fn regular_path(root: &Path, relative: &Path, directory: bool) -> Result<bool, R
 /// Anything less certain keeps scanning, so the scan fails closed.
 fn collect_rs_files(
     crate_dir: &Path,
-    explicit_targets: &[PathBuf],
+    explicit_targets: &[ExplicitTarget],
     dir: &Path,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), ReceiptError> {
@@ -410,7 +410,7 @@ fn collect_rs_files(
 
 fn separate_package(
     crate_dir: &Path,
-    explicit_targets: &[PathBuf],
+    explicit_targets: &[ExplicitTarget],
     dir: &Path,
 ) -> Result<bool, ReceiptError> {
     let Ok(relative) = dir.strip_prefix(crate_dir) else {
@@ -420,7 +420,16 @@ fn separate_package(
         matches!(c, std::path::Component::Normal(n)
             if ["src", "tests", "benches", "examples"].iter().any(|t| n == *t))
     });
-    if auto_target || explicit_targets.iter().any(|t| t.starts_with(relative)) {
+    // An explicit target's modules resolve beside it (`mod x;` in
+    // `fixture/main.rs` loads `fixture/x/`), so its whole parent directory is
+    // reachable: a target at the crate root makes every subdirectory so.
+    let reachable = explicit_targets.iter().any(|target| match target {
+        ExplicitTarget::Contained(path) => {
+            path.starts_with(relative) || path.parent().is_some_and(|p| relative.starts_with(p))
+        }
+        ExplicitTarget::Unresolvable => true,
+    });
+    if auto_target || reachable {
         return Ok(false);
     }
     if !regular_path(dir, Path::new("Cargo.toml"), false)? {
@@ -432,9 +441,18 @@ fn separate_package(
         .is_ok_and(|m| m.get("package").is_some() || m.get("workspace").is_some()))
 }
 
+/// An explicit target `path`, normalized for prefix comparison.
+enum ExplicitTarget {
+    /// Crate-relative, with `.` components dropped.
+    Contained(PathBuf),
+    /// Escapes the crate or isn't plain (`..`, absolute, prefix): treated
+    /// as reaching every directory, so nothing is skipped.
+    Unresolvable,
+}
+
 /// Every explicit `path` of the manifest's lib, bin, test, bench and example
-/// targets, as written (crate-relative).
-fn explicit_target_paths(manifest: &toml::Value) -> Vec<PathBuf> {
+/// targets.
+fn explicit_target_paths(manifest: &toml::Value) -> Vec<ExplicitTarget> {
     ["test", "bin", "bench", "example"]
         .into_iter()
         .flat_map(|kind| {
@@ -446,7 +464,17 @@ fn explicit_target_paths(manifest: &toml::Value) -> Vec<PathBuf> {
         })
         .chain(manifest.get("lib"))
         .filter_map(|target| target.get("path").and_then(toml::Value::as_str))
-        .map(PathBuf::from)
+        .map(|raw| {
+            let mut normal = PathBuf::new();
+            for component in Path::new(raw).components() {
+                match component {
+                    std::path::Component::Normal(part) => normal.push(part),
+                    std::path::Component::CurDir => {}
+                    _ => return ExplicitTarget::Unresolvable,
+                }
+            }
+            ExplicitTarget::Contained(normal)
+        })
         .collect()
 }
 

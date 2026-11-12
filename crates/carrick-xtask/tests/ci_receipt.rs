@@ -3328,6 +3328,67 @@ fn explicit_target_into_a_nested_package_is_still_scanned() {
 }
 
 #[test]
+fn module_dir_beside_an_explicit_target_is_still_scanned() {
+    // `mod x;` in `fixture/main.rs` loads `fixture/x/`; a package manifest
+    // there must not hide it.
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    write_source(
+        root,
+        "crates/example/Cargo.toml",
+        "[package]\nname = \"example\"\nversion = \"0.0.0\"\n[[bin]]\nname = \"probe\"\npath = \"fixture/main.rs\"\n",
+    );
+    write_source(
+        root,
+        "crates/example/fixture/main.rs",
+        "mod x;\nfn main() {}\n",
+    );
+    write_source(
+        root,
+        "crates/example/fixture/x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.0.0\"\n",
+    );
+    write_source(
+        root,
+        "crates/example/fixture/x/mod.rs",
+        "#[test]\nfn kept() {}\n",
+    );
+    assert!(carrick_xtask::ci_receipt::tree_has_test(root, "probe", "kept").unwrap());
+}
+
+#[test]
+fn dot_prefixed_targets_never_hide_a_nested_package() {
+    // A `./` bin path is refused outright; a `./` bench path (not validated by
+    // `check_target_paths`) is normalized, so its directory stays scanned.
+    for (kind, name) in [("bin", "probe"), ("bench", "probe")] {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_source(
+            root,
+            "crates/example/Cargo.toml",
+            &format!(
+                "[package]\nname = \"example\"\nversion = \"0.0.0\"\n[[{kind}]]\nname = \"{name}\"\npath = \"./fixture/main.rs\"\n"
+            ),
+        );
+        write_source(
+            root,
+            "crates/example/fixture/Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n",
+        );
+        write_source(
+            root,
+            "crates/example/fixture/main.rs",
+            "fn main() {}\n#[test]\nfn kept() {}\n",
+        );
+        let found = carrick_xtask::ci_receipt::tree_has_test(root, "example", "kept");
+        assert!(
+            matches!(found, Ok(true) | Err(_)),
+            "{kind}: a ./ target hid its nested package: {found:?}"
+        );
+    }
+}
+
+#[test]
 fn unparseable_nested_manifest_keeps_its_directory_scanned() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path();
