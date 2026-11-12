@@ -210,6 +210,11 @@ pub enum HostFileCall {
     Chdir {
         path: u64,
     },
+    /// `fchdir(2)`: the chdir lookup of the directory a descriptor names,
+    /// completed as [`HostFileCall::Chdir`] is (#2206).
+    Fchdir {
+        fd: i32,
+    },
     /// `ppoll(2)` that its in-ring owner left unrouted. Only a set whose
     /// every live entry is host-backed (or absent) and that installs no
     /// signal mask crosses, as a non-blocking readiness snapshot
@@ -257,12 +262,14 @@ pub const LINUX_MAP_PRIVATE: u64 = 0x02;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 
 impl HostFileCall {
-    /// These native-child mutations reuse host syscall cores. The initial
-    /// task keeps its existing host-task route and publication authority.
+    /// These native-child mutations (of the namespace, or of the caller's
+    /// cwd for `fchdir`) reuse host syscall cores. The initial task keeps
+    /// its existing host-task route and publication authority.
     pub const fn uses_child_mutation_venue(self) -> bool {
         matches!(
             self,
             Self::Mkdirat { .. }
+                | Self::Fchdir { .. }
                 | Self::Unlinkat { .. }
                 | Self::Symlinkat { .. }
                 | Self::Linkat { .. }
@@ -447,6 +454,7 @@ impl HostFileCall {
                 request: args[1],
             },
             c if c == nr::CHDIR => Self::Chdir { path: args[0] },
+            c if c == nr::FCHDIR => Self::Fchdir { fd },
             c if c == nr::PPOLL => Self::Ppoll {
                 fds: args[0],
                 nfds: args[1],
@@ -1556,7 +1564,7 @@ fn stage_call(
             }
             // The reply area holds the directory's `struct stat` and then
             // its cwd spelling: the carrier's chdir lookup.
-            match staging.request_with_reply(
+            chdir_lookup(staging.request_with_reply(
                 HostFileOp::Newfstatat,
                 LINUX_AT_FDCWD,
                 0,
@@ -1564,22 +1572,42 @@ fn stage_call(
                 &path,
                 None,
                 CHDIR_REPLY_BYTES,
-            ) {
-                HostFileStage::Request {
-                    record,
-                    resolves_path,
-                    ..
-                } => HostFileStage::Request {
-                    record,
-                    output: None,
-                    resolves_path,
-                    map: None,
-                    chdir: true,
-                },
-                other => other,
-            }
+            ))
         }
+        HostFileCall::Fchdir { fd } => match staging.descriptor(fd)? {
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            // Pipes, eventfds and epoll instances are never directories.
+            NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENOTDIR),
+            NativeDescriptor::HostBacked { .. } => chdir_lookup(staging.request_with_reply(
+                HostFileOp::Fchdir,
+                fd,
+                0,
+                [0; 4],
+                &[],
+                None,
+                CHDIR_REPLY_BYTES,
+            )),
+        },
     })
+}
+
+/// A staged chdir lookup: on success the ring stores the reply's directory
+/// spelling as the caller's cwd ([`chdir_target`]).
+fn chdir_lookup(staged: HostFileStage) -> HostFileStage {
+    match staged {
+        HostFileStage::Request {
+            record,
+            resolves_path,
+            ..
+        } => HostFileStage::Request {
+            record,
+            output: None,
+            resolves_path,
+            map: None,
+            chdir: true,
+        },
+        other => other,
+    }
 }
 
 /// Linux `ppoll` timespec validation and conversion to whole milliseconds,

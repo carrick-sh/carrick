@@ -1082,6 +1082,52 @@ fn chdir_stages_one_lookup_and_reads_the_directory_from_its_reply() {
     assert!(chdir_target(&file).is_err());
 }
 
+/// #2206: a child's `fchdir` of a host-backed descriptor stages the chdir
+/// lookup of that descriptor, completed exactly as `chdir`'s. Only a fork
+/// descendant stages it; an in-zone object is never a directory and a
+/// closed number is EBADF, both in ring.
+#[test]
+fn fchdir_stages_one_descriptor_lookup_for_a_descendant() {
+    let call = HostFileCall::decode(crate::crossing::nr::FCHDIR, &[3, 0, 0, 0, 0, 0]).unwrap();
+    assert_eq!(call, HostFileCall::Fchdir { fd: 3 });
+    assert!(call.uses_child_mutation_venue());
+    let mut user = memory(b"");
+    let Some(HostFileStage::Request {
+        mut record,
+        output,
+        resolves_path,
+        map,
+        chdir,
+    }) = run(call, &mut user)
+    else {
+        panic!("fchdir of a host-backed descriptor crosses for its lookup");
+    };
+    assert_eq!(
+        (output, resolves_path, map, chdir),
+        (None, true, None, true),
+        "the caller's access context authorizes the search check"
+    );
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Fchdir);
+    assert_eq!(view.header().fd, 3);
+    assert_eq!(view.header().table, TABLE);
+    assert_eq!(view.input(), b"");
+    assert_eq!(view.output_capacity(), CHDIR_REPLY_BYTES);
+
+    for (fd, errno) in [
+        (0, carrick_syscall_abi::LINUX_ENOTDIR),
+        (4, carrick_syscall_abi::LINUX_ENOTDIR),
+        (2, carrick_syscall_abi::LINUX_EBADF),
+        (-1, carrick_syscall_abi::LINUX_EBADF),
+    ] {
+        assert_eq!(
+            run(HostFileCall::Fchdir { fd }, &mut user),
+            returned(errno),
+            "fd {fd}"
+        );
+    }
+}
+
 /// #1392: a path record is re-staged with its caller's access context
 /// leading the input; a descriptor record is left exactly as staged.
 #[test]
