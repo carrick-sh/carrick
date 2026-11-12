@@ -2708,13 +2708,11 @@ fn assert_zone_epoll_pipe_wake(flags: &[&str]) {
 }
 
 #[test]
-#[ignore = "#1756: x86 has no ring IPC venue for the child's zone pipe write"]
 fn zone_pipe_ppoll_blocks_until_peer_write_and_preserves_pollfd() {
     zone_pipe_poll_wake(&[]);
 }
 
 #[test]
-#[ignore = "#1756: x86 has no ring IPC venue for the child's zone pipe write"]
 fn zone_pipe_poll_blocks_until_peer_write_and_preserves_pollfd() {
     zone_pipe_poll_wake(&["-DUSE_POLL"]);
 }
