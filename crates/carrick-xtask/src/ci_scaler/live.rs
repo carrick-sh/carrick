@@ -5124,6 +5124,9 @@ case "$method:$url" in
       *'newid\":309'*|*'newid":309'*) vmid=309 ;;
       *) exit 95 ;;
     esac
+    if [ ! -f "$CARRICK_BURST_DIR/name_$vmid" ]; then
+      printf '%s\n' "$stdin" | sed -n 's/.*name\\*":\\*"\([a-z0-9-]*\).*/\1/p' | head -n 1 > "$CARRICK_BURST_DIR/name_$vmid"
+    fi
     echo "clone:$vmid" >> "$CARRICK_BURST_DIR/clone_calls"
     if [ -f "$CARRICK_BURST_DIR/busy_always_$vmid" ]; then
       body="\"UPID:willow:busy$vmid\""
@@ -5640,8 +5643,28 @@ printf '{"data":%s}\n200' "$body"
                 "over-ceiling reconcile pass must log projected CPU once: {stderr}"
             );
             assert!(
-                stderr.contains("vm=308 state=Cloning task=UPID:willow:clone308 deferred"),
-                "deferral log must identify vm, state, and task: {stderr}"
+                stderr.contains(
+                    "vm=308 state=Cloning task=UPID:willow:clone308 deferred (projected clone CPU 87.5% exceeds the 80% admission ceiling); retained for next reconcile"
+                ),
+                "reconcile deferral log must identify vm, state, task, and projected CPU: {stderr}"
+            );
+            assert_eq!(
+                stderr
+                    .matches(
+                        "admission pass deferred (projected clone CPU 95.0% exceeds the 80% admission ceiling); retrying next pass"
+                    )
+                    .count(),
+                1,
+                "over-ceiling admission pass must log projected CPU once: {stderr}"
+            );
+            assert_eq!(
+                stderr
+                    .matches(
+                        "vm=308 state=Cloning task=UPID:willow:clone308 deferred (projected clone CPU 90.0% exceeds the 80% admission ceiling); provisioning retained for reconciliation"
+                    )
+                    .count(),
+                1,
+                "over-ceiling provisioner outcome must log projected CPU once: {stderr}"
             );
             return;
         }
@@ -5658,6 +5681,13 @@ printf '{"data":%s}\n200' "$body"
             );
             std::env::set_var("CARRICK_BURST_DIR", dir.path());
         }
+        let roomy = HostSample {
+            busy: 0.05,
+            threads: 32,
+            available: 128 << 30,
+        };
+
+        // 1. Synchronous reconcile_all_with pre-boot CpuCeiling defers and retries.
         let dir_reconcile = dir.path().join("reconcile_cpu_ceiling");
         std::fs::create_dir_all(&dir_reconcile).unwrap();
         let mut ledger = Ledger::default();
@@ -5701,11 +5731,6 @@ printf '{"data":%s}\n200' "$body"
         assert_eq!(status["admission_frozen"], false);
         assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Cloning);
 
-        let roomy = HostSample {
-            busy: 0.05,
-            threads: 32,
-            available: 128 << 30,
-        };
         let pass2 = reconcile_all(
             &Pve::test_fixture(site::WILLOW, Some(roomy)),
             &Github,
@@ -5720,6 +5745,204 @@ printf '{"data":%s}\n200' "$body"
             Ledger::load(&path).unwrap().rows[0].state,
             State::Running,
             "clone deferred by CPU ceiling must reach Running on the next pass"
+        );
+
+        // 2. Controller admission pass (admit_one) CpuCeiling defers without
+        // freezing or backing off, then admits and boots on the next pass.
+        std::fs::remove_file(dir.path().join("name_308")).unwrap();
+        std::fs::remove_file(dir.path().join("present_308")).unwrap();
+        let dir_admit = dir.path().join("admit_cpu_ceiling");
+        std::fs::create_dir_all(&dir_admit).unwrap();
+        let path_admit = dir_admit.join("ledger.json");
+        let mut admit_ledger = Ledger::default();
+        admit_ledger.save(&path_admit).unwrap();
+        let pub_admit = assignment::Publication::new(admit_ledger.clone());
+        admit_ledger.publication = Some(pub_admit.clone());
+        let admit_provisioners = Provisioners::new();
+        let mut admit_gate = AdmissionGate {
+            frozen: false,
+            backoff: Backoff::default(),
+            admit_after: Instant::now(),
+        };
+        let budget = CloneBudget {
+            kvm: Concurrency::ONE,
+            agents: AgentClones::DEFAULT,
+        };
+        let enabled = Lanes::select(false, true, |_| None).unwrap();
+        let job = JobKey {
+            run: RunId(1),
+            attempt: 1,
+            job: JobId(2),
+        };
+        let over_admit = HostSample {
+            busy: 0.825,
+            threads: 16,
+            available: 128 << 30,
+        };
+        settle_and_admit(
+            &Pve::test_fixture(site::WILLOW, Some(over_admit)),
+            &Github,
+            &mut admit_ledger,
+            (&dir_admit, &path_admit),
+            (1, &Admission::Standing, Ok(vec![job])),
+            (budget, enabled),
+            &admit_provisioners,
+            &mut admit_gate,
+            None,
+        )
+        .expect("over-ceiling admission pass must defer without error");
+        assert!(!admit_gate.frozen);
+        assert_eq!(admit_gate.backoff.0, 0);
+        assert!(!dir_admit.join("reconcile-status.json").exists());
+        assert!(Ledger::load(&path_admit).unwrap().rows.is_empty());
+
+        settle_and_admit(
+            &Pve::test_fixture(site::WILLOW, Some(roomy)),
+            &Github,
+            &mut admit_ledger,
+            (&dir_admit, &path_admit),
+            (1, &Admission::Standing, Ok(vec![job])),
+            (budget, enabled),
+            &admit_provisioners,
+            &mut admit_gate,
+            None,
+        )
+        .expect("next admission pass must admit once CPU clears");
+        let bound = Instant::now() + Duration::from_secs(10);
+        loop {
+            admit_ledger.refresh().unwrap();
+            if admit_ledger.rows.len() == 1
+                && !pub_admit
+                    .owners()
+                    .owned()
+                    .contains(&admit_ledger.rows[0].name)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < bound,
+                "admitted provisioner did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        settle_and_admit(
+            &Pve::test_fixture(site::WILLOW, Some(roomy)),
+            &Github,
+            &mut admit_ledger,
+            (&dir_admit, &path_admit),
+            (1, &Admission::Standing, Ok(Vec::new())),
+            (budget, enabled),
+            &admit_provisioners,
+            &mut admit_gate,
+            None,
+        )
+        .unwrap();
+        assert!(!admit_gate.frozen);
+        assert_eq!(
+            Ledger::load(&path_admit).unwrap().rows[0].state,
+            State::Running,
+            "job deferred by admission CPU ceiling must reach Running on the next pass"
+        );
+
+        // 3. Finished background provisioner CpuCeiling outcome defers without
+        // freezing or backing off, and the next reconcile resumes it to Running.
+        std::fs::remove_file(dir.path().join("name_308")).unwrap();
+        std::fs::remove_file(dir.path().join("present_308")).unwrap();
+        let dir_prov = dir.path().join("provisioner_cpu_ceiling");
+        std::fs::create_dir_all(&dir_prov).unwrap();
+        let path_prov = dir_prov.join("ledger.json");
+        let mut prov_ledger = Ledger::default();
+        let row308 = prov_ledger.reserve(job, &[], 1, Concurrency::ONE).unwrap();
+        prov_ledger.save(&path_prov).unwrap();
+        let pub_prov = assignment::Publication::new(prov_ledger.clone());
+        prov_ledger.publication = Some(pub_prov.clone());
+        std::fs::write(dir.path().join("name_308"), &row308.name).unwrap();
+        let prov_workers = Provisioners::new();
+        let over_prov = HostSample {
+            busy: 0.775,
+            threads: 16,
+            available: 128 << 30,
+        };
+        prov_workers
+            .start(
+                &prov_ledger,
+                row308.clone(),
+                Pve::test_fixture(site::WILLOW, Some(over_prov)),
+                (&dir_prov, &path_prov),
+                (1, Admission::Standing),
+            )
+            .unwrap();
+        let bound = Instant::now() + Duration::from_secs(10);
+        loop {
+            prov_ledger.refresh().unwrap();
+            if !pub_prov.owners().owned().contains(&row308.name) {
+                break;
+            }
+            assert!(Instant::now() < bound, "provisioner did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut prov_gate = AdmissionGate {
+            frozen: false,
+            backoff: Backoff::default(),
+            admit_after: Instant::now(),
+        };
+        settle_and_admit(
+            &Pve::test_fixture(site::WILLOW, Some(over_prov)),
+            &Github,
+            &mut prov_ledger,
+            (&dir_prov, &path_prov),
+            (1, &Admission::Standing, Ok(Vec::new())),
+            (budget, enabled),
+            &prov_workers,
+            &mut prov_gate,
+            None,
+        )
+        .expect("over-ceiling provisioner outcome must defer without error");
+        assert!(!prov_gate.frozen);
+        assert_eq!(prov_gate.backoff.0, 0);
+        assert!(!dir_prov.join("reconcile-status.json").exists());
+        assert_eq!(
+            Ledger::load(&path_prov).unwrap().rows[0].state,
+            State::Cloning
+        );
+
+        let resume_pass = reconcile_all_with(
+            &Pve::test_fixture(site::WILLOW, Some(roomy)),
+            &Github,
+            &mut prov_ledger,
+            &dir_prov,
+            &path_prov,
+            (1, &Admission::Standing),
+            Some(&prov_workers),
+        )
+        .expect("next reconcile must resume deferred provisioner clone");
+        assert!(resume_pass.frozen.is_none());
+        let bound = Instant::now() + Duration::from_secs(10);
+        loop {
+            prov_ledger.refresh().unwrap();
+            if !pub_prov.owners().owned().contains(&row308.name) {
+                break;
+            }
+            assert!(Instant::now() < bound, "resumed boot did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        settle_and_admit(
+            &Pve::test_fixture(site::WILLOW, Some(roomy)),
+            &Github,
+            &mut prov_ledger,
+            (&dir_prov, &path_prov),
+            (1, &Admission::Standing, Ok(Vec::new())),
+            (budget, enabled),
+            &prov_workers,
+            &mut prov_gate,
+            None,
+        )
+        .unwrap();
+        assert!(!prov_gate.frozen);
+        assert_eq!(
+            Ledger::load(&path_prov).unwrap().rows[0].state,
+            State::Running,
+            "provisioner clone deferred by CPU ceiling must resume to Running on next reconcile"
         );
     }
 
