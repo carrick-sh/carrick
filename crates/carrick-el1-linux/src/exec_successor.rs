@@ -220,21 +220,30 @@ pub struct AdoptedSuccessor {
     pub address: AddressContext<RootGpa>,
 }
 
-/// Authenticate `manifest`, check the ISA's sealed identity against the
-/// published space, run the consuming adoption crossing, and return the
-/// successor's address context.
-///
-/// `expected_identity` runs before the crossing: a refusal there leaves the
-/// receipt unconsumed and every published state unchanged, because the
-/// crossing is the point of no return. It returns the root identity the
-/// closed space must carry afterwards (`closed_root_identity`). `cross`
-/// receives the adoption record's address and performs the physical crossing.
+/// The per-ISA step before the consuming adoption crossing: everything an
+/// ISA can refuse, and any successor build it runs there. AArch64 only checks
+/// its sealed translation identity; x86 also builds the successor's tables.
+pub trait PrepareCross {
+    /// Check the opened `successor`, and return the root identity its closed
+    /// space must carry once the crossing binds it (`closed_root_identity`).
+    /// This runs before the crossing, the point of no return: a refusal
+    /// leaves the receipt unconsumed and every published state unchanged.
+    fn prepare_cross(
+        &mut self,
+        successor: &ExecSuccessorManifestView,
+    ) -> Result<u64, NativeProcessError>;
+}
+
+/// Authenticate `manifest`, run the ISA's `prepare` against the published
+/// space, run the consuming adoption crossing, and return the successor's
+/// address context. `cross` receives the adoption record's address and
+/// performs the physical crossing.
 pub fn adopt_closed_exec_successor<C: ProcessContext>(
     zone: &ZoneTables<C>,
     identity: ServiceIdentity,
     receipt: ExecAdoptionReceipt,
     manifest: &ExecSuccessorManifest,
-    expected_identity: impl FnOnce(&ExecSuccessorManifestView) -> Option<u64>,
+    prepare: &mut impl PrepareCross,
     cross: impl FnOnce(u64) -> Result<(), NativeProcessError>,
 ) -> Result<AdoptedSuccessor, NativeProcessError> {
     let successor = manifest
@@ -244,7 +253,7 @@ pub fn adopt_closed_exec_successor<C: ProcessContext>(
         .spaces
         .find(successor.successor_mm.raw())
         .ok_or(NativeProcessError::Stale)?;
-    let expected = expected_identity(&successor).ok_or(NativeProcessError::Stale)?;
+    let expected = prepare.prepare_cross(&successor)?;
     let manifest_address = KernelVa::new(core::ptr::from_ref(manifest).addr() as u64);
     let mut adoption = carrick_el1_abi::NativeExecAdoption::new(receipt, manifest_address)
         .ok_or(NativeProcessError::Invalid)?;

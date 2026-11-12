@@ -1417,6 +1417,20 @@ pub type Portal<'a> = carrick_core::mm::transaction::MmPortal<
     Aarch64ParkedContext,
 >;
 
+/// AArch64's pre-crossing identity: the sealed ASID over the root, the
+/// TTBR0 the closed successor must be bound with. It refuses nothing; the
+/// host built and sealed the successor's tables before the arm.
+pub struct Aarch64PrepareCross;
+
+impl crate::exec_successor::PrepareCross for Aarch64PrepareCross {
+    fn prepare_cross(
+        &mut self,
+        successor: &carrick_core_abi::service::ExecSuccessorManifestView,
+    ) -> Result<u64, NativeProcessError> {
+        Ok((u64::from(successor.asid.raw()) << 48) | successor.root.address().raw())
+    }
+}
+
 pub struct Aarch64NativeProcessService<'a, X = HvcForkStockCrossing> {
     pub task: &'a CurrentTask,
     pub slot: SlotId,
@@ -1780,9 +1794,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             identity,
             receipt,
             manifest,
-            |successor| {
-                Some((u64::from(successor.asid.raw()) << 48) | successor.root.address().raw())
-            },
+            &mut Aarch64PrepareCross,
             |record| {
                 self.crossing
                     .cross_exec_adopt(record, u64::from(self.worker()))
