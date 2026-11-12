@@ -1329,8 +1329,8 @@ fn physical_stock_live_lane_checks_execution_mm_root_and_generation() {
 }
 
 /// #1742: a Go parent vforks while a sibling thread of the same process runs
-/// on another vCPU. That sibling's host stage-1 edit raises the parent MM's
-/// space gate (`raise_and_wait_for_editor`), a counted page-table pause.
+/// on another vCPU. That sibling's host stage-1 edit excludes the parent MM's
+/// EL1 editor by raising its space gate, a counted page-table pause.
 /// The fork's MM commit has already published the child when its custody
 /// settlement crosses; the host then re-authenticates the stopped forking
 /// lane. A pause holds new installs and EL1 editors, not the identity of a
@@ -1375,14 +1375,17 @@ fn arm_vfork_custody_commits_while_a_sibling_pauses_the_parent_space() {
     let (paused_tx, paused_rx) = mpsc::channel::<()>();
     let (end_tx, end_rx) = mpsc::channel::<()>();
     let sibling = std::thread::spawn(move || {
+        use carrick_core::mm::transaction::OwnerVenue;
         pause_rx.recv().unwrap();
-        let excluded = zone
-            .spaces
-            .raise_and_wait_for_editor(parent_space, core::hint::spin_loop);
-        assert_eq!(excluded.key(), 1);
+        let pause = <crate::aarch64_process::Aarch64Venue as OwnerVenue<_>>::space_access(
+            zone,
+            carrick_sched_core::SlotId::new(1),
+        )
+        .try_exclude_editor(parent_space, 1)
+        .unwrap();
         paused_tx.send(()).unwrap();
         end_rx.recv().unwrap();
-        zone.spaces.lower(parent_space);
+        drop(pause);
     });
     *crossing.on_commit.lock().unwrap() = Some(Box::new(move || {
         pause_tx.send(()).unwrap();
