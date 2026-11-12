@@ -1,0 +1,3 @@
+# Follow-up: Cpl0TaskBinding terminal settlement after exec transfer
+
+`Cpl0TaskBinding::mark_exec_transferred` only records the transfer, and a transferred binding refuses every saved image. CPL0 has no per-binding terminal publication (`after_terminal_settlement` is the trait default), so nothing else consumes the flag. When CPL0 gains per-binding terminal or job publication, it must treat `ExecTransferred` the way `HvpatchBindingTerminalGeneration` does, so the transferred predecessor cannot publish its job result. Consider moving that terminal-role state machine into a shared type instead of keeping two.
