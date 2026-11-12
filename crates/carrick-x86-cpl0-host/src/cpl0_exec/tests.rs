@@ -283,7 +283,7 @@ fn image(argv: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<X86ExecImage, LinuxErr
 
 fn request(image: X86ExecImage) -> X86ExecRequest {
     X86ExecRequest {
-        image,
+        image: Box::new(image),
         successor: ReservationMm::new(SUCCESSOR).unwrap(),
         root_generation: ROOT_GENERATION,
     }
