@@ -260,7 +260,15 @@ fn snapshot_counters(
         wall_ns: STARTED
             .get()
             .map_or(0, |start| start.elapsed().as_nanos() as u64),
-        ipc_leaves: std::collections::BTreeMap::new(),
+        ipc_leaves: counters.map_or_else(Default::default, |c| {
+            carrick_el1_abi::IpcLeave::ALL
+                .into_iter()
+                .filter_map(|why| {
+                    let count = c.ipc_leaves[why as usize].load(Ordering::Relaxed);
+                    (count != 0).then(|| (why.name().to_owned(), count))
+                })
+                .collect()
+        }),
         rows,
     }
 }
