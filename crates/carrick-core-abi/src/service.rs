@@ -371,6 +371,59 @@ pub enum ExecPayloadError {
     TooLarge,
 }
 
+/// Linux's argv/envp charge for execve(2)'s E2BIG: each string's bytes with
+/// its NUL, at most [`MAX_ARG_STRLEN`], and one 64-bit pointer slot per
+/// entry plus the two terminators, at most [`EXEC_ARGUMENT_BYTES_MAX`] in
+/// all. The ring's payload parser and the host loader (which may add a
+/// shebang interpreter's strings) charge through this one account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecArgumentCharge(usize);
+
+impl ExecArgumentCharge {
+    /// The pointer slots for `entries` strings and both terminators.
+    pub fn for_entries(entries: usize) -> Result<Self, ExecPayloadError> {
+        entries
+            .checked_add(2)
+            .and_then(|entries| entries.checked_mul(8))
+            .filter(|charged| *charged <= EXEC_ARGUMENT_BYTES_MAX)
+            .map(Self)
+            .ok_or(ExecPayloadError::TooLarge)
+    }
+
+    /// Charge one string of `len` bytes including its NUL.
+    pub fn charge(&mut self, len: usize) -> Result<(), ExecPayloadError> {
+        if len == 0 || len > MAX_ARG_STRLEN {
+            return Err(ExecPayloadError::TooLarge);
+        }
+        self.0 = self
+            .0
+            .checked_add(len)
+            .filter(|charged| *charged <= EXEC_ARGUMENT_BYTES_MAX)
+            .ok_or(ExecPayloadError::TooLarge)?;
+        Ok(())
+    }
+
+    /// Charge every string of `vectors`, each given without its NUL.
+    pub fn of_strings<'s>(
+        vectors: impl IntoIterator<Item = &'s [u8]> + Clone,
+    ) -> Result<Self, ExecPayloadError> {
+        let mut charge = Self::for_entries(vectors.clone().into_iter().count())?;
+        for string in vectors {
+            charge.charge(
+                string
+                    .len()
+                    .checked_add(1)
+                    .ok_or(ExecPayloadError::TooLarge)?,
+            )?;
+        }
+        Ok(charge)
+    }
+
+    pub fn bytes(self) -> usize {
+        self.0
+    }
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(offset..offset + 2)?.try_into().ok()?,
@@ -470,17 +523,13 @@ impl<'a> ExecPayloadView<'a> {
             return Err(ExecPayloadError::Invalid);
         }
         let mut cursor = path_end;
-        let mut accounting = (argc + envc)
-            .checked_add(2)
-            .and_then(|entries| entries.checked_mul(8))
-            .ok_or(ExecPayloadError::TooLarge)?;
-        for _ in 0..argc.checked_add(envc).ok_or(ExecPayloadError::TooLarge)? {
+        let entries = argc.checked_add(envc).ok_or(ExecPayloadError::TooLarge)?;
+        let mut accounting = ExecArgumentCharge::for_entries(entries)?;
+        for _ in 0..entries {
             let len = read_u32(bytes, cursor)
                 .and_then(|raw| usize::try_from(raw).ok())
                 .ok_or(ExecPayloadError::Invalid)?;
-            if len == 0 || len > MAX_ARG_STRLEN {
-                return Err(ExecPayloadError::TooLarge);
-            }
+            accounting.charge(len)?;
             cursor = cursor.checked_add(4).ok_or(ExecPayloadError::Invalid)?;
             let string = bytes
                 .get(cursor..cursor.checked_add(len).ok_or(ExecPayloadError::Invalid)?)
@@ -489,12 +538,6 @@ impl<'a> ExecPayloadView<'a> {
                 return Err(ExecPayloadError::Invalid);
             }
             cursor += len;
-            accounting = accounting
-                .checked_add(len)
-                .ok_or(ExecPayloadError::TooLarge)?;
-            if accounting > EXEC_ARGUMENT_BYTES_MAX {
-                return Err(ExecPayloadError::TooLarge);
-            }
         }
         // The caller's access context and descriptor table, once the ring
         // owner has sealed them.
