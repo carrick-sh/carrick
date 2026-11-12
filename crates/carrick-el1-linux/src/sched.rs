@@ -187,11 +187,15 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
         Some(Served::Returned { switched: false })
     }
     fn wake(&mut self, mm: ReservationMm, address: UserVa, bitset: u32, limit: u32) -> Served {
-        let key = if self.shared.is_some() {
+        let Some(key) = (if self.shared {
             MmFutexKey::shared_private(address)
         } else {
             MmFutexKey::private(address)
-        }.expect("policy admitted an aligned futex word").scheduler_address();
+        }) else {
+            self.frame.x[0] = carrick_syscall_abi::LINUX_EINVAL.guest_retval() as u64;
+            return Served::Returned { switched: false };
+        };
+        let key = key.scheduler_address();
         self.sched
             .wake_word(self.frame, mm.raw(), key, bitset, limit)
     }
@@ -392,15 +396,6 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
             shared,
             authenticate,
         };
-        if adapter.shared.is_some()
-            && call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
-            && adapter.key(UserVa::new(call.args[0])).is_none()
-        {
-            return match adapter.refusal {
-                Some(refusal) => Err(refusal),
-                None => Ok(None),
-            };
-        }
         let served = ::carrick_personality_linux::sched::serve_futex(call, &mut adapter);
         match adapter.refusal {
             Some(refusal) => Err(refusal),
