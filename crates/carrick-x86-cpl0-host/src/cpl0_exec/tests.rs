@@ -16,26 +16,18 @@ const ENTRY: u64 = 0x40_1000;
 
 /// A zeroed carrier region holding the zone and reservation table at their
 /// real CPL0 offsets.
-struct Region {
-    ptr: NonNull<u8>,
-    layout: std::alloc::Layout,
-}
+struct Region(Box<carrick_test_support::TestEl1Region>);
 
 impl Region {
     fn new() -> Self {
-        let layout =
-            std::alloc::Layout::from_size_align(carrick_el1_abi::EL1_REGION_SIZE as usize, 64)
-                .unwrap();
-        // SAFETY: a nonzero layout; the region frees it on drop.
-        let ptr = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap();
-        Self { ptr, layout }
+        Self(carrick_test_support::TestEl1Region::zeroed())
     }
     fn zone(&self) -> &X86Cpl0Zone {
         // SAFETY: the retained aligned region owns the zero-valid zone at its
         // real CPL0 offset for the fixture's life.
         unsafe {
             &*self
-                .ptr
+                .0
                 .as_ptr()
                 .add(carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize)
                 .cast()
@@ -45,18 +37,11 @@ impl Region {
         // SAFETY: as for `zone`.
         unsafe {
             &*self
-                .ptr
+                .0
                 .as_ptr()
                 .add(carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
                 .cast()
         }
-    }
-}
-
-impl Drop for Region {
-    fn drop(&mut self) {
-        // SAFETY: allocated in `new` with exactly this layout.
-        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
     }
 }
 
