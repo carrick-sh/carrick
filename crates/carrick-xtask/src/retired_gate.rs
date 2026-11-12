@@ -127,7 +127,12 @@ fn extract(root: &Path, rev: &str, dest: &Path) -> Result<(), ReceiptError> {
     let tar = Command::new("tar")
         .args(["-x", "-C"])
         .arg(dest)
-        .stdin(child.stdout.take().expect("piped"))
+        .stdin(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| ReceiptError::Retired("git archive: no stdout".into()))?,
+        )
         .status()
         .map_err(|e| ReceiptError::Retired(format!("tar: {e}")))?;
     let archived = child

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! End-to-end: a real git history with a renamed gated test.
 
 use carrick_xtask::retired_gate::{RetiredTestsArgs, run};
