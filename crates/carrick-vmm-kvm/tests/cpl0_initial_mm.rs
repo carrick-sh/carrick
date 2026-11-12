@@ -472,6 +472,123 @@ fn native_exit_workers(
     )
 }
 
+/// A booted production carrier with its initial MM loaded and every vCPU
+/// stopped, before any worker lane runs, with the issuing host owner.
+fn booted_production_carrier(
+    elf: &[u8],
+) -> (Cpl0Carrier, carrick_kernel::dispatch::SyscallDispatcher) {
+    let program = carrick_mem::elf::ElfProgram::load(elf, ELF_X86_64_MACHINE, &|_| None)
+        .expect("ELF program");
+    let image = prepare_x86_elf(&program).expect("static ELF");
+    let extent = Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("extent");
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let mut carrier = Cpl0Carrier::boot_production(
+        physical_inventory(),
+        extent,
+        carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher),
+    )
+    .expect("real KVM");
+    let issued = dispatcher.capture_one_task_context().expect("issued root");
+    issued
+        .kernel()
+        .bind_initial_birth_source(
+            carrier
+                .birth_serial_source()
+                .expect("stopped carrier source"),
+        )
+        .expect("bind initial carrier birth and MM source");
+    carrier
+        .bind_initial_task_identity(InitialTaskBinding {
+            task: issued.task().key(),
+            mm: carrick_guest_arch::MmGeneration::new(issued.shared().mm().id().nonzero()),
+            thread: carrick_sched_core::ThreadIdentity {
+                tid: issued.thread().key().tid.raw() as u64,
+                serial: issued.thread().key().serial.raw(),
+                mm: 0,
+                file_table: issued.resources().files().id().raw(),
+                generation: 77,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 3,
+                lifecycle_page: 0,
+                control_slot: 0,
+            },
+        })
+        .expect("issued root binding");
+    carrier
+        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
+        .expect("guest MM");
+    (carrier, dispatcher)
+}
+
+/// #1093 S4c slice c: on a booted production carrier, the host Exec service
+/// reserves a static successor from the carrier's own fork stock (the boot
+/// table grants it left unused), stages its data frames in the carrier's
+/// frame inventory and memory, and imports its rows into a closed successor
+/// root in the guest's real CPL0 tables; an unused preparation returns
+/// whole. While a holder has the stock it parks with nothing reserved and
+/// no errno, stays parked when probed early, and stages after the release.
+#[test]
+fn production_exec_service_stages_parks_and_reruns_a_successor() {
+    use carrick_x86_cpl0_host::cpl0_boot::exec_service::{
+        X86ExecImage, X86ExecRequest, X86ExecStage,
+    };
+    let (mut carrier, _dispatcher) =
+        booted_production_carrier(&native_exit_fixture("native_exit_order.S"));
+    let successor = carrick_el1_abi::ReservationMm::new(900).expect("successor MM");
+    let root_generation = carrier
+        .fixture_publish_exec_successor(successor)
+        .expect("closed successor root");
+    let marker = native_exit_fixture("native_exec_marker.S");
+    let program = carrick_mem::elf::ElfProgram::load(&marker, ELF_X86_64_MACHINE, &|_| None)
+        .expect("successor ELF");
+    let request = || X86ExecRequest {
+        image: Box::new(
+            X86ExecImage::from_program(&program, vec![b"/successor".to_vec()], vec![])
+                .expect("checked successor"),
+        ),
+        successor,
+        root_generation,
+    };
+    let demand = request().image.demand();
+    let stock = carrier.fork_table_stock();
+    assert!(stock >= demand.tables, "boot left the stock {stock} tables");
+
+    let X86ExecStage::Staged(backing, entry) =
+        carrier.stage_exec_successor(0, request()).expect("service")
+    else {
+        panic!("the stock grants the successor");
+    };
+    let (tables, data) = carrier.exec_reservation(successor).expect("retained");
+    assert_eq!(tables.len(), demand.tables);
+    assert_eq!(data.len(), demand.data);
+    assert_eq!(backing.root, tables[0]);
+    assert_eq!(entry.entry, request().image.entry().entry);
+    assert_eq!(carrier.fork_table_stock(), stock - demand.tables);
+    carrier
+        .release_exec_successor(successor)
+        .expect("unused preparation returns");
+    assert_eq!(carrier.fork_table_stock(), stock);
+    assert!(carrier.exec_reservation(successor).is_none());
+
+    let held = carrier
+        .fixture_hold_fork_stock(demand.tables - 1)
+        .expect("hold stock");
+    let X86ExecStage::Parked(parked) = carrier.stage_exec_successor(0, request()).expect("service")
+    else {
+        panic!("a holder has the stock: not now");
+    };
+    assert_eq!(carrier.fork_table_stock(), demand.tables - 1);
+    assert!(carrier.exec_reservation(successor).is_none());
+    let parked = carrier.probe_parked_exec(parked).expect_err("still held");
+    carrier.fixture_release_fork_stock(held);
+    let rerun = carrier.probe_parked_exec(parked).expect("released");
+    assert!(matches!(
+        carrier.stage_exec_successor(0, rerun).expect("service"),
+        X86ExecStage::Staged(..)
+    ));
+    assert_eq!(carrier.fork_table_stock(), stock - demand.tables);
+}
+
 fn run_to_marker(
     cpu: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
     task: carrick_guest_arch::TaskIdentity,

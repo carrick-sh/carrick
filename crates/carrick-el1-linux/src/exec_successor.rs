@@ -123,7 +123,7 @@ where
 
 /// The heap and mmap arena every Linux successor root starts with. The same
 /// constants lay out every ISA's guest (`guest_setup_x86` shares them).
-fn successor_layout() -> Result<Layout, NativeProcessError> {
+pub fn successor_layout() -> Result<Layout, NativeProcessError> {
     let heap = ReservationRange::new(
         carrick_personality_linux::mm::LINUX_HEAP_BASE,
         carrick_personality_linux::mm::LINUX_HEAP_BASE
