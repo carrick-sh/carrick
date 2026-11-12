@@ -20,14 +20,16 @@ Carrick expresses that rule once in `carrick_signal_core::policy::ExecPastNoRetu
   `exec`, `exit_group`, or fatal `SIGKILL` already won process closing, keeping
   that winner's terminal status via `resume_pending_lifecycle`);
 - `carrick-runtime` root exec venue (`ThreadRuntimeState::exec_failed_past_no_return`);
-- `#2152` follow-up: wire `RootExecVenue::fail_past_no_return` to
-  `ExecPastNoReturn::SIGNAL` once `#2152` merges.
+- `carrick-kernel` shared root exec transaction driver
+  (`RootExecVenue::fail_past_no_return`, landed in `#2152`), passing
+  `ExecPastNoReturn` directly at the venue boundary.
 
 ## VM-free witnesses (both ISAs)
 
 - `carrick_signal_core::policy::tests::exec_past_no_return_verdict_is_terminal_sigsegv`
+- `carrick_kernel::kernel::exec_transaction::tests::staged_vma_revision_failure_kills_past_no_return_with_sigsegv`
 - `carrick_el1_linux::native_process_runtime::host_test_support::post_arm_exec_adoption_failure_is_sigsegv`
-  (red at `097a7aa54`: `Some(9)` vs `Some(11)`; green on both
+  (red at `c11c9eed5`: `Some(9)` vs `Some(11)`; green on both
   `ParkedContextWords` / `X86Mmu` and `Aarch64ParkedContext` / `Aarch64Mmu`)
 - `carrick_el1_linux::native_process_runtime::host_test_support::refused_exec_preparation_is_cancelled_exactly_once`
   (both ISAs)
