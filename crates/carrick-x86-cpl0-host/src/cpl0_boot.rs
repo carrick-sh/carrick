@@ -559,6 +559,85 @@ pub fn initial_stack_pages(
     Ok((INITIAL_STACK_SIZE / 4096) as usize)
 }
 
+/// The shared successor validator's view of an x86 image: one row per
+/// page-rounded PT_LOAD region, executable regions first.
+pub fn x86_image_rows(
+    image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+) -> Vec<carrick_core_abi::successor_image::ImageRow> {
+    image
+        .regions
+        .iter()
+        .map(|region| carrick_core_abi::successor_image::ImageRow {
+            start: UserVa::new(region.start),
+            len: carrick_guest_arch::GuestLen::new(region.end.saturating_sub(region.start)),
+            initialized_offset: carrick_guest_arch::GuestLen::new(region.initialized_offset),
+            initialized_len: carrick_guest_arch::GuestLen::new(region.file_bytes.len() as u64),
+            readable: region.perms.read,
+            writable: region.perms.write,
+            executable: region.perms.execute,
+        })
+        .collect()
+}
+
+/// Import `image`'s rows and the stack reservation below the stack the
+/// editor builds into an unadmitted reservation root, after the shared
+/// successor validator accepts them. Boot and exec share this projection:
+/// the carrier built each image page as a private frame (`Prepare`), so it
+/// is root-editable private memory marked `IMAGE`, and the rest of the
+/// stack reservation is private anonymous memory the ring supplies on
+/// first touch. Boot then finishes its own import and inserts the stack it
+/// built; an exec successor's import is finished by its adopter.
+pub fn import_x86_image_rows<P: carrick_core::mm::reservation::ReservationPolicy>(
+    model: &mut carrick_core::mm::reservation::Reservations<
+        '_,
+        P,
+        carrick_el1::memory::reservations::X86Cpl0ReservationGeometry,
+        carrick_sched_core::ParkedContextWords,
+    >,
+    image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+    stack_top: u64,
+) -> Result<(), carrick_el1::memory::reservations::Refusal> {
+    use carrick_core_abi::successor_image::{ImageGeometry, ImageStack, validate_image_rows};
+    use carrick_el1::memory::reservations::Refusal;
+    use carrick_el1_abi::{ReservationNodeFlags, ReservationProtection};
+    let rows = x86_image_rows(image);
+    validate_image_rows(
+        &rows,
+        image.executable_region_count,
+        UserVa::new(image.entry),
+        ImageStack {
+            top: UserVa::new(stack_top),
+            size: carrick_guest_arch::GuestLen::new(INITIAL_STACK_SIZE),
+        },
+        ImageGeometry::X86_64,
+    )
+    .map_err(|_| Refusal::Invalid)?;
+    for region in &image.regions {
+        let bits = u64::from(region.perms.read)
+            | (u64::from(region.perms.write) << 1)
+            | (u64::from(region.perms.execute) << 2);
+        model.import_with(
+            ReservationRange::new(region.start, region.end).ok_or(Refusal::Invalid)?,
+            ReservationProtection::from_bits(bits).ok_or(Refusal::Invalid)?,
+            ReservationNodeFlags::ANONYMOUS_PRIVATE.union(ReservationNodeFlags::IMAGE),
+        )?;
+    }
+    // Below the stack the editor builds, the rest of the stack reservation
+    // grows on first touch, as Linux grows the stack VMA (#1714: a fixed
+    // 64 KiB stack faulted CPython's compiler).
+    model.import_with(
+        ReservationRange::new(
+            stack_top
+                .checked_sub(INITIAL_STACK_RESERVATION)
+                .ok_or(Refusal::Invalid)?,
+            stack_top - INITIAL_STACK_SIZE,
+        )
+        .ok_or(Refusal::Invalid)?,
+        ReservationProtection::READ_WRITE,
+        ReservationNodeFlags::ANONYMOUS_PRIVATE.union(ReservationNodeFlags::GROWSDOWN),
+    )
+}
+
 pub fn record_bytes<T: Copy>(record: &T) -> &[u8] {
     // SAFETY: every caller passes a fully initialized fixed-layout ABI
     // record; its storage remains live for the returned borrow.

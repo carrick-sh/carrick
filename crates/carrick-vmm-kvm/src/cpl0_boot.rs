@@ -1463,38 +1463,8 @@ impl Cpl0Carrier {
             .map_err(|error| fail(format!("production root authority: {error:?}")))?
             .lock(index.index(), mm, &NoRootWait)
             .and_then(|mut model| {
-                // The initial ELF image is the root's own: the carrier built
-                // each page as a private frame (`Prepare`), so it is imported
-                // as root-editable private memory marked `IMAGE`, exactly as a
-                // native exec successor's image rows are. The ring then edits
-                // it itself: glibc's RELRO `mprotect` of the executable and its
-                // interpreter (#1714) has no host route on x86.
-                for region in &image.regions {
-                    let bits = u64::from(region.perms.read)
-                        | (u64::from(region.perms.write) << 1)
-                        | (u64::from(region.perms.execute) << 2);
-                    model.import_with(
-                        ReservationRange::new(region.start, region.end)
-                            .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
-                        carrick_el1_abi::ReservationProtection::from_bits(bits)
-                            .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
-                        carrick_el1_abi::ReservationNodeFlags::ANONYMOUS_PRIVATE
-                            .union(carrick_el1_abi::ReservationNodeFlags::IMAGE),
-                    )?;
-                }
-                // Below the stack the carrier built, the rest of the stack
-                // reservation is private anonymous memory the ring supplies
-                // on first touch, as Linux grows the stack VMA (#1714: a
-                // fixed 64 KiB stack faulted CPython's compiler).
-                model.import_with(
-                    ReservationRange::new(
-                        stack_top - INITIAL_STACK_RESERVATION,
-                        stack_top - INITIAL_STACK_SIZE,
-                    )
-                    .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
-                    carrick_el1_abi::ReservationProtection::READ_WRITE,
-                    carrick_el1_abi::ReservationNodeFlags::ANONYMOUS_PRIVATE
-                        .union(carrick_el1_abi::ReservationNodeFlags::GROWSDOWN),
+                carrick_x86_cpl0_host::cpl0_boot::import_x86_image_rows(
+                    &mut model, image, stack_top,
                 )?;
                 model.finish_import()?;
                 model.insert_opaque(
