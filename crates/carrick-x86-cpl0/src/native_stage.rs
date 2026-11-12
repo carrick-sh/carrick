@@ -53,6 +53,25 @@ pub(crate) fn admits(
     }
 }
 
+/// A host crossing copies its result out through a venue that cannot supply a
+/// page, so the ring makes the declared destination writable first, through
+/// the same owner fault path a staged call uses (T3, #2157). `None`: nothing
+/// to prepare, the crossing proceeds.
+fn prepare_crossing_output<V: MemoryValidator>(
+    canonical: carrick_syscall_abi::CanonicalNr,
+    args: &[u64; 6],
+    validator: &V,
+) -> Option<HostFileStage> {
+    let crossing =
+        carrick_personality_linux::crossing::AllowedHostCrossing::from_canonical_x86(canonical)?;
+    let (address, length) = crossing.operand_spec().output_range(args)?;
+    let writable = validator.writable_bytes(address, usize::try_from(length).ok()?) as u64;
+    (writable < length).then_some(HostFileStage::Fault {
+        address: address.wrapping_add(writable),
+        access: carrick_guest_arch::Access::Write,
+    })
+}
+
 /// Decode, admit and stage `call` against the caller's ring namespace.
 /// `None` keeps the call on its existing route, including when no ring
 /// namespace is published.
@@ -68,10 +87,10 @@ where
     V: MemoryValidator,
     R: FnMut(i32) -> Option<NativeDescriptor>,
 {
-    let decoded = HostFileCall::decode(
-        carrick_syscall_abi::CanonicalNr::new(call.canonical.raw()),
-        &call.args,
-    )?;
+    let canonical = carrick_syscall_abi::CanonicalNr::new(call.canonical.raw());
+    let Some(decoded) = HostFileCall::decode(canonical, &call.args) else {
+        return prepare_crossing_output(canonical, &call.args, validator);
+    };
     if !admits(decoded, origin, delegated) {
         return None;
     }
@@ -355,6 +374,65 @@ mod tests {
         let bytes = *b"x";
         let args = [1, bytes.as_ptr() as u64, 1, 0, 0, 0];
         assert_eq!(stage(1, args, CHILD, pipe), Some(HostFileStage::InRing));
+    }
+
+    struct Untouched;
+    impl MemoryValidator for Untouched {
+        fn writable_bytes(&self, _user_va: u64, _len: usize) -> usize {
+            0
+        }
+        fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+            len
+        }
+    }
+
+    fn stage_output(
+        validator: &impl MemoryValidator,
+        nr: u64,
+        args: [u64; 6],
+    ) -> Option<HostFileStage> {
+        let call = decode_x86_64(nr, args, 0x8000);
+        stage_call(
+            &call,
+            &CurrentTask::new(),
+            validator,
+            INITIAL,
+            |_| false,
+            || Some(([3, 4, 5], |_| None)),
+        )
+    }
+
+    #[test]
+    fn a_crossing_output_is_made_writable_before_the_effect() {
+        // x86_64 statfs 137, readlinkat 267, getxattr 191, mkdirat 258.
+        let (path, out) = (0x7000_0000u64, 0x7000_1000u64);
+        let fault = Some(HostFileStage::Fault {
+            address: out,
+            access: carrick_guest_arch::Access::Write,
+        });
+        assert_eq!(
+            stage_output(&Untouched, 137, [path, out, 0, 0, 0, 0]),
+            fault
+        );
+        assert_eq!(
+            stage_output(&Untouched, 267, [!99u64, path, out, 64, 0, 0]),
+            fault
+        );
+        assert_eq!(
+            stage_output(&Untouched, 191, [path, path, out, 16, 0, 0]),
+            fault
+        );
+        // Already writable, a zero-length buffer, and a call with no
+        // guest output all proceed to the crossing.
+        assert_eq!(stage_output(&Resident, 137, [path, out, 0, 0, 0, 0]), None);
+        assert_eq!(
+            stage_output(&Untouched, 191, [path, path, out, 0, 0, 0]),
+            None
+        );
+        assert_eq!(
+            stage_output(&Untouched, 258, [!99u64, path, 0o755, 0, 0, 0]),
+            None
+        );
     }
 
     #[test]
