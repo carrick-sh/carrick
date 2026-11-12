@@ -471,10 +471,10 @@ pub fn witness_kvm_exec_retarget(
             binding: &binding,
             thread,
             generation,
+            authority,
         },
         executor::PendingExecReplacement::cpl0(committed, successor_arch)?,
         successor_lease,
-        authority,
     );
     let successor = replacement.binding;
     if let Some(authority) = replacement.authority {

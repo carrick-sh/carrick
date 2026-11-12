@@ -281,11 +281,13 @@ where
     }
 }
 
-/// The running predecessor a committed exec retargets away from.
+/// The running predecessor a committed exec retargets away from, with the
+/// submission authority its worker took for the quantum.
 pub(crate) struct ExecRetargetPredecessor<'a, B> {
     pub(crate) binding: &'a Arc<B>,
     pub(crate) thread: ThreadKey,
     pub(crate) generation: ExecutionGeneration,
+    pub(crate) authority: Option<carrick_kernel::kernel::SubmissionAuthority>,
 }
 
 /// Move this worker's running claim, combined binding record and loaded
@@ -302,7 +304,6 @@ pub(crate) fn retarget_exec_replacement<F, R>(
     predecessor: ExecRetargetPredecessor<'_, F::TaskBinding>,
     replacement: PendingExecReplacement,
     lease: carrick_kernel::kernel::objects::ThreadExecutionLease,
-    authority: Option<carrick_kernel::kernel::SubmissionAuthority>,
 ) -> (
     ExecBindingReplacement<F::TaskBinding>,
     Option<crate::hvpatch::Stage1MmRetirement>,
@@ -336,7 +337,7 @@ where
                         custody: Some(custody),
                         context: committed.context().retain_exact(),
                     },
-                    authority,
+                    authority: predecessor.authority,
                 },
             )?;
             binding.mark_exec_transferred()?;
@@ -700,7 +701,6 @@ where
                 TakenExecutionAuthority::Live(lease) => {
                     if let Some(replacement) = exec_replacement {
                         let successor_generation = lease.generation();
-                        let authority = submission_authority.take();
                         let (replacement_record, retired_mm) = retarget_exec_replacement(
                             scheduler,
                             resolver.as_ref(),
@@ -710,10 +710,10 @@ where
                                 binding: &binding,
                                 thread,
                                 generation,
+                                authority: submission_authority.take(),
                             },
                             replacement,
                             lease,
-                            authority,
                         );
                         binding = replacement_record.binding;
                         pending_exec_retirement = retired_mm;
