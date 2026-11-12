@@ -1299,6 +1299,18 @@ pub(crate) fn route_native_handback(record: RecordRef) -> bool {
         .is_some_and(|zone| route_native_handback_in_zone(zone, record))
 }
 
+/// Affinity publication owes a scan after all graph/identity locks are gone.
+pub fn probe_held_completions() {
+    if let Some(zone) = zone_tables() {
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        zone.probe_held(&mut effects);
+        for slot in effects.sgi_slots() {
+            zone.owe_resched(slot);
+            resched_slot(slot);
+        }
+    }
+}
+
 fn route_native_handback_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
     let Some(rec) = zone.live(record) else {
         return false;

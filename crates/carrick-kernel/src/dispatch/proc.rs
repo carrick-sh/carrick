@@ -2121,6 +2121,7 @@ impl<'a> ProcView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             target.set_affinity(carrick_hal::CpuAffinity::from_words(effective.words()));
+            crate::el1_zone::probe_held_completions();
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 

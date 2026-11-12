@@ -9215,6 +9215,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                 .affinity_change_effects(record, &mut notification.0);
         }
         drop(graph);
+        self.source.zone.probe_held(&mut notification.0);
         if notification.0.sgi_slots().next().is_some() {
             self.service.wake_effects(notification.0);
         }

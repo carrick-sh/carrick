@@ -5211,3 +5211,38 @@ fn a_held_completion_can_be_cancelled_and_reused_before_a_trigger() {
     assert_eq!(zone.record(reused).claim(), before);
     assert_eq!(zone.slot(OTHER).queued(), 0);
 }
+
+#[test]
+fn an_affinity_change_places_a_held_completion() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let (record, seq) = held_completion(&zone);
+    zone.record(record.id).set_affinity(1);
+    let mut effects = WakeEffects::default();
+    zone.probe_held(&mut effects);
+    assert_eq!(
+        zone.record(record.id).claim(),
+        Claim::Queued { slot: SLOT, seq }
+    );
+    zone.probe_held(&mut effects);
+    assert_eq!(zone.slot(SLOT).queued(), 1);
+}
+
+#[test]
+fn a_signal_claims_held_custody_without_overwriting_the_wake_result() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let (record, seq) = held_completion(&zone);
+    assert_eq!(
+        zone.claim_for_host(record, Some(seq), Handback::Signal, &HostWait, &|owned| {
+            let _ = owned.into_parts();
+        }),
+        HostClaim::Claimed
+    );
+    assert_eq!(zone.record(record.id).handback(), Some(Handback::Woken));
+    assert_eq!(zone.record(record.id).result(), 0);
+    assert_eq!(
+        zone.place_native_handback(record),
+        Some(NativePlacement::Held)
+    );
+}

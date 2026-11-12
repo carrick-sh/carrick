@@ -5127,6 +5127,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         cpu: Option<u32>,
         source: AffinitySource,
     ) {
+        let guard = self.slot_lock(slot, &SpinForever);
         let s = self.slot(slot);
         s.terminal[0].store(0, Ordering::Release);
         s.mm.store(mm, Ordering::Release);
@@ -5135,6 +5136,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             Ordering::Release,
         );
         self.bind_slot_affinity(slot, source);
+        drop(guard);
+        // CPU is now published. Only this returning driver is targeted, so
+        // its entry consumes resched debt without a remote host kick.
+        self.probe_held_inner(Some(slot), &mut |_| {});
     }
 
     /// Refresh only the retained affinity source on re-entry. Terminal
@@ -5308,11 +5313,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             .fetch_or(1 << (record.id.index() % 64), Ordering::SeqCst);
         // Post before probing: a concurrent driver either observes our bit,
         // or this probe observes its published CPU and driver.
-        self.probe_held_record(record.id)
+        self.probe_held_record(record.id, None)
             .or(Some(NativePlacement::Held))
     }
 
-    fn probe_held_record(&self, id: RecordId) -> Option<NativePlacement> {
+    fn probe_held_record(&self, id: RecordId, target: Option<SlotId>) -> Option<NativePlacement> {
         let bit = 1 << (id.index() % 64);
         let word = &self.held_map[id.index() / 64];
         if word.fetch_and(!bit, Ordering::SeqCst) & bit == 0 {
@@ -5322,24 +5327,85 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if !matches!(from, Claim::Held { .. }) {
             return None;
         }
-        if let Some(placement) = self.place_from_claim(id, from) {
+        if let Some(placement) = self.place_held_claim(id, from, target) {
             return Some(NativePlacement::Placed(placement));
         }
         word.fetch_or(bit, Ordering::SeqCst);
         // One post-publication probe closes the race with a trigger that
         // took the bit before a new driver/affinity was published.
-        if let Some(placement) = self.place_from_claim(id, from) {
+        if let Some(placement) = self.place_held_claim(id, from, target) {
             // Leave any stale hint: clearing it could erase a new hold.
             return Some(NativePlacement::Placed(placement));
         }
         Some(NativePlacement::Held)
     }
 
+    fn place_held_claim(
+        &self,
+        id: RecordId,
+        from: Claim,
+        target: Option<SlotId>,
+    ) -> Option<HostPlacement> {
+        let Some(slot) = target else {
+            return self.place_from_claim(id, from);
+        };
+        let rec = self.record(id);
+        if rec.home().is_some_and(|home| home != slot) {
+            return None;
+        }
+        let guard = self.slot_lock(slot, &SpinForever)?;
+        if !OwnerCustody::Driven.holds(self, slot, rec)
+            || !rec.cas(
+                from,
+                Claim::Queued {
+                    slot,
+                    seq: from.seq(),
+                },
+            )
+        {
+            return None;
+        }
+        self.push_locked(&guard, id, None);
+        let resched = matches!(
+            self.slot(slot).state(),
+            SlotState::Running | SlotState::IdleWfi
+        );
+        if resched {
+            self.owe_resched(slot);
+        }
+        Some(HostPlacement { slot, resched })
+    }
+
+    fn probe_held_inner(&self, target: Option<SlotId>, placed: &mut impl FnMut(HostPlacement)) {
+        for (index, word) in self.held_map.iter().enumerate() {
+            let mut bits = word.load(Ordering::SeqCst);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(NativePlacement::Placed(p)) =
+                    self.probe_held_record(RecordId((index * 64 + bit) as u32), target)
+                {
+                    placed(p);
+                }
+            }
+        }
+    }
+
+    /// Pay affinity probe debt only after releasing the process graph lock.
+    /// Each held record is taken by clearing its hint; claim CAS is authority.
+    pub fn probe_held(&self, effects: &mut WakeEffects) {
+        self.probe_held_inner(None, &mut |placement| {
+            if placement.resched {
+                effects.request_reschedule(placement.slot);
+            }
+        });
+    }
+
     /// Native handbacks never borrow an unchecked default slot. Host-backed
     /// continuations keep their existing owner-queue policy.
     pub fn place_host_handback(&self, record: RecordRef) -> Option<HostHandback> {
         let rec = self.live(record)?;
-        let placement = if rec.needs_native_handback() {
+        let placement = if rec.is_native_owned() {
             self.place_native_handback(record)?
         } else {
             let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
