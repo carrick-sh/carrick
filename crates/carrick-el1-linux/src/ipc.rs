@@ -3184,6 +3184,8 @@ mod tests {
         on_yield: Option<Box<dyn FnOnce() + 'a>>,
         mask: &'a MaskState,
         probes: Vec<Option<u64>>,
+        /// A signal the temporary mask does not block is pending.
+        signal: bool,
     }
     impl<'a> NativeOwner<'a> {
         fn new(w: &'a World, page: u64, mask: &'a MaskState) -> Self {
@@ -3202,6 +3204,7 @@ mod tests {
                 on_yield: None,
                 mask,
                 probes: Vec::new(),
+                signal: false,
             }
         }
     }
@@ -3231,8 +3234,10 @@ mod tests {
         ) -> carrick_core::mm::transaction::CopyoutPreparation {
             use carrick_core::mm::transaction::CopyoutPreparation;
             self.preparations += 1;
-            if !self.answers.is_empty() && self.answers.remove(0) == "busy" {
-                return CopyoutPreparation::Busy(operation);
+            match (!self.answers.is_empty()).then(|| self.answers.remove(0)) {
+                Some("busy") => return CopyoutPreparation::Busy(operation),
+                Some("fault") => return CopyoutPreparation::Fault(operation),
+                _ => {}
             }
             self.inner.mem.map(MM, self.page, PAGE);
             self.mapped = true;
@@ -3269,7 +3274,7 @@ mod tests {
         }
         fn interrupt_pending_wait(&mut self) -> bool {
             self.probes.push(self.mask.armed.get());
-            false
+            self.signal
         }
     }
 
@@ -3565,6 +3570,377 @@ mod tests {
         );
         let current = w.zone.slot(SLOT).current().unwrap();
         assert!(!w.zone.record(current).has_object_operation());
+    }
+
+    /// The slot-wait witnesses' accepted mask, its buffer, and A's events
+    /// page (refused by the ring's copy until the native owner prepares it).
+    const SIGPROF: u64 = 1 << 26;
+    const MASK_VA: u64 = 0x50000;
+    const EVENTS: u64 = 0x40000;
+    const VA: u64 = 0x20000;
+
+    /// #1671 round 4: A's ring epoll reports eventfd `e` (count 1) with data
+    /// `0xfeed`; B (tid 202) is queued to run while A waits; every operation
+    /// slot is held, so A's refused events copy-out waits for a slot.
+    struct SlotWait {
+        w: World,
+        e: i32,
+        ep: i32,
+        r2: i32,
+        held: Vec<IpcOpToken>,
+    }
+
+    fn slot_wait_world() -> SlotWait {
+        let w = world();
+        let a = w.table(w.a_tid);
+        let e = w.eventfd(a, 1, EventMode::Counter, NONBLOCK);
+        let (ep, _) = zone_epoll(&w, a, e, 0xfeed);
+        let (r2, _w2, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        w.mem.map(MM, VA, PAGE);
+        w.mem.map(OTHER_MM, VA, PAGE);
+        w.mem.map(MM, MASK_VA, PAGE);
+        w.mem.write(MM, MASK_VA, &SIGPROF.to_le_bytes());
+        w.queue(202, OTHER_MM, &syscall(SYS_READ, r2, VA, 16, B_SVC), B_SVC);
+        let mut held = Vec::new();
+        while let Ok(token) = w.region.begin_operation(IpcOperation::EMPTY) {
+            held.push(token);
+        }
+        assert_eq!(held.len(), carrick_el1_abi::ipc::IPC_OPERATIONS);
+        SlotWait { w, e, ep, r2, held }
+    }
+
+    /// A's `epoll_pwait(ep, EVENTS, 8, timeout, SIGPROF)`.
+    fn masked_pwait(ep: i32, timeout: i32) -> TrapFrame {
+        let mut frame = epoll_pwait(ep, EVENTS, 8, timeout, A_SVC);
+        frame.x[4] = MASK_VA;
+        frame.x[5] = 8;
+        frame
+    }
+
+    fn slot_sched<'a>(w: &'a World, cpu: &'a mut FakeCpu) -> Sched<'a, FakeCpu, HardwareUserWord> {
+        Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        }
+    }
+
+    /// A call through the native adapter, as A's native owner makes it.
+    fn native_call(
+        w: &World,
+        cpu: &mut FakeCpu,
+        frame: &mut TrapFrame,
+        owner: &mut NativeOwner<'_>,
+    ) -> IpcServed {
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let mut sched = slot_sched(w, cpu);
+        serve_ipc_with_signals(&mut sched, frame, &venue, owner, true, &mut || false).0
+    }
+
+    /// A call through the owner-less adapter (B's calls, and A's checks).
+    fn plain_call(w: &World, cpu: &mut FakeCpu, frame: &mut TrapFrame) -> IpcServed {
+        let venue = IpcVenue {
+            region: *w.region,
+            tables: &w.tables,
+        };
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        let mut sched = slot_sched(w, cpu);
+        serve_ipc(&mut sched, frame, &venue, &mut user)
+    }
+
+    /// A's call meets the full arena: it waits on the slot release, B runs.
+    fn wait_for_a_slot(
+        w: &World,
+        cpu: &mut FakeCpu,
+        frame: &mut TrapFrame,
+        owner: &mut NativeOwner<'_>,
+    ) {
+        let slots = carrick_sched_core::object_wait::ObjectWaitKey::ipc_operation_slots(
+            w.region.operation_slot_generation(),
+        )
+        .index();
+        assert_eq!(
+            native_call(w, cpu, frame, owner),
+            SWITCHED,
+            "a full arena retains the call on its slot release"
+        );
+        assert_eq!(frame.elr, B_SVC, "A waits, B runs");
+        assert_eq!(w.zone.object_queue_census(slots).unwrap().waiters, 1);
+        assert_eq!(owner.preparations, 0);
+    }
+
+    /// Retirements return slots (the first wakes A). B, still running, can
+    /// then consume eventfd `consume`'s readiness (its read takes a slot);
+    /// it blocks on the empty pipe, so the vCPU goes back to A, which
+    /// re-enters its call.
+    fn return_to_a(
+        w: &World,
+        cpu: &mut FakeCpu,
+        held: &mut Vec<IpcOpToken>,
+        r2: i32,
+        consume: Option<i32>,
+        a_regs: [u64; 31],
+    ) -> TrapFrame {
+        let mut sched = slot_sched(w, cpu);
+        for _ in 0..4 {
+            finish(&mut sched, held.pop().unwrap(), w.region);
+        }
+        if let Some(e) = consume {
+            let mut f = syscall(SYS_READ, e, VA, 8, B_SVC);
+            assert_eq!(
+                (plain_call(w, cpu, &mut f), f.x[0]),
+                (RETURNED, 8),
+                "B consumes the readiness"
+            );
+        }
+        let mut g = syscall(SYS_READ, r2, VA, 16, B_SVC);
+        assert_eq!(plain_call(w, cpu, &mut g), SWITCHED, "B blocks");
+        assert_eq!(g.x, a_regs, "A re-enters its original call");
+        reenter(&mut g, A_SVC);
+        g
+    }
+
+    fn finish_held(w: &World, cpu: &mut FakeCpu, held: Vec<IpcOpToken>) {
+        let mut sched = slot_sched(w, cpu);
+        for token in held {
+            finish(&mut sched, token, w.region);
+        }
+    }
+
+    fn accepting_mask() -> MaskState {
+        MaskState {
+            armed: Default::default(),
+            arms: Default::default(),
+            accept: Cell::new(true),
+        }
+    }
+
+    /// #1671 round-3 re-review P0: epoll_pwait(2) reads its mask once, at
+    /// entry. A call that waits for an operation slot keeps the mask it
+    /// accepted: its buffer is rewritten and then unmapped meanwhile, and the
+    /// replayed call still reports the event in ring, never forwarding.
+    #[test]
+    fn el1_epoll_slot_wait_keeps_the_accepted_sigmask_when_its_buffer_goes_away() {
+        let SlotWait {
+            w,
+            ep,
+            r2,
+            mut held,
+            ..
+        } = slot_wait_world();
+        let mask = accepting_mask();
+        let mut cpu = w.cpu.clone();
+        let mut owner = NativeOwner::new(&w, EVENTS, &mask);
+        let mut frame = masked_pwait(ep, -1);
+        let a_regs = frame.x;
+        wait_for_a_slot(&w, &mut cpu, &mut frame, &mut owner);
+        w.mem.write(MM, MASK_VA, &u64::MAX.to_le_bytes());
+        w.mem.pages.borrow_mut().remove(&(MM, MASK_VA));
+        let mut g = return_to_a(&w, &mut cpu, &mut held, r2, None, a_regs);
+        assert_eq!(
+            native_call(&w, &mut cpu, &mut g, &mut owner),
+            RETURNED,
+            "the replay never rereads the mask argument"
+        );
+        assert_eq!((g.x[0], owner.preparations), (1, 1), "one report");
+        let event = w.mem.read(MM, EVENTS, 32);
+        assert_eq!(event[..4], EPOLL_IN.to_ne_bytes());
+        assert_eq!(event[8..16], 0xfeedu64.to_ne_bytes());
+        assert_eq!(event[16..], [0; 16], "no duplicate");
+        assert_eq!(mask.arms.get(), 1, "the mask argument is accepted once");
+        assert_eq!(mask.armed.get(), None, "completion restores the mask");
+        assert_eq!(host_calls(&w), 0, "never forwarded");
+        assert_eq!(
+            [
+                leaves(&w, IpcLeave::EpollSigmask),
+                leaves(&w, IpcLeave::EpollCopyOut),
+            ],
+            [0, 0]
+        );
+        finish_held(&w, &mut cpu, held);
+    }
+
+    /// While A waits for an operation slot, another waiter consumes the
+    /// readiness and A's mask buffer is rewritten. The replay harvests
+    /// nothing and keeps waiting, parked under the mask it accepted: never
+    /// 0 early, never forwarded.
+    #[test]
+    fn el1_epoll_slot_wait_that_loses_readiness_keeps_waiting_under_the_accepted_mask() {
+        let SlotWait {
+            w,
+            e,
+            ep,
+            r2,
+            mut held,
+        } = slot_wait_world();
+        let mask = accepting_mask();
+        let mut cpu = w.cpu.clone();
+        let mut owner = NativeOwner::new(&w, EVENTS, &mask);
+        let mut frame = masked_pwait(ep, -1);
+        let a_regs = frame.x;
+        wait_for_a_slot(&w, &mut cpu, &mut frame, &mut owner);
+        w.mem.write(MM, MASK_VA, &u64::MAX.to_le_bytes());
+        let mut g = return_to_a(&w, &mut cpu, &mut held, r2, Some(e), a_regs);
+        // Host work is pending, so a park leaves the vCPU at once.
+        w.task.linux.mark_pending_host_work();
+        let parks = w.zone.counters.el1_parks.load(Ordering::Relaxed);
+        assert_eq!(
+            native_call(&w, &mut cpu, &mut g, &mut owner),
+            IpcServed::Idle,
+            "the replay keeps waiting"
+        );
+        assert_eq!(
+            w.zone.counters.el1_parks.load(Ordering::Relaxed),
+            parks + 1,
+            "parked on the epoll's readiness"
+        );
+        assert_eq!(
+            owner.probes.last(),
+            Some(&Some(SIGPROF)),
+            "the replay parks under the accepted mask, not the rewritten one"
+        );
+        assert_eq!(mask.arms.get(), 1, "the mask argument is accepted once");
+        assert_eq!(owner.preparations, 0);
+        assert_eq!(host_calls(&w), 0, "never forwarded");
+        finish_held(&w, &mut cpu, held);
+    }
+
+    /// A signal the accepted mask does not block arrives while A waits for
+    /// an operation slot: the call ends with EINTR (whatever SA_RESTART),
+    /// leaving the accepted mask for the signal checkpoint, which runs the
+    /// handler under it and then restores the original. The report stays
+    /// queued.
+    #[test]
+    fn el1_epoll_slot_wait_interrupted_by_a_signal_returns_eintr() {
+        let SlotWait {
+            w,
+            ep,
+            r2,
+            mut held,
+            ..
+        } = slot_wait_world();
+        let mask = accepting_mask();
+        let mut cpu = w.cpu.clone();
+        let mut owner = NativeOwner::new(&w, EVENTS, &mask);
+        let mut frame = masked_pwait(ep, -1);
+        let a_regs = frame.x;
+        wait_for_a_slot(&w, &mut cpu, &mut frame, &mut owner);
+        owner.signal = true;
+        let mut g = return_to_a(&w, &mut cpu, &mut held, r2, None, a_regs);
+        assert_eq!(native_call(&w, &mut cpu, &mut g, &mut owner), RETURNED);
+        assert_eq!(
+            g.x[0] as i64,
+            carrick_syscall_abi::LINUX_EINTR.guest_retval(),
+            "a signal ends the slot wait with EINTR"
+        );
+        assert_eq!(
+            mask.armed.get(),
+            Some(SIGPROF),
+            "the checkpoint selects the handler under the accepted mask"
+        );
+        assert_eq!((mask.arms.get(), owner.preparations), (1, 0));
+        // The checkpoint restores the original mask; the report is queued.
+        owner.disarm_wait_sigmask();
+        let mut f = epoll_pwait(ep, VA, 8, 0, A_SVC);
+        assert_eq!((plain_call(&w, &mut cpu, &mut f), f.x[0]), (RETURNED, 1));
+        assert_eq!(w.mem.read(MM, VA + 8, 8), 0xfeedu64.to_ne_bytes());
+        assert_eq!(host_calls(&w), 0, "never forwarded");
+        finish_held(&w, &mut cpu, held);
+    }
+
+    /// The owner faults A's events buffer once the slot wait ends: EFAULT
+    /// in ring, its report still queued (as on Linux), under the mask A
+    /// accepted even though the mask buffer went away meanwhile.
+    #[test]
+    fn el1_epoll_slot_wait_then_a_faulted_buffer_is_efault_with_the_report_queued() {
+        let SlotWait {
+            w,
+            ep,
+            r2,
+            mut held,
+            ..
+        } = slot_wait_world();
+        let mask = accepting_mask();
+        let mut cpu = w.cpu.clone();
+        let mut owner = NativeOwner::new(&w, EVENTS, &mask);
+        owner.answers = vec!["fault"];
+        let mut frame = masked_pwait(ep, -1);
+        let a_regs = frame.x;
+        wait_for_a_slot(&w, &mut cpu, &mut frame, &mut owner);
+        w.mem.pages.borrow_mut().remove(&(MM, MASK_VA));
+        let mut g = return_to_a(&w, &mut cpu, &mut held, r2, None, a_regs);
+        assert_eq!(native_call(&w, &mut cpu, &mut g, &mut owner), RETURNED);
+        assert_eq!(
+            (g.x[0] as i64, owner.preparations),
+            (carrick_syscall_abi::LINUX_EFAULT.guest_retval(), 1),
+            "the owner's fault is EFAULT"
+        );
+        assert_eq!(mask.armed.get(), None, "the ended call restores the mask");
+        assert_eq!(mask.arms.get(), 1);
+        let mut f = epoll_pwait(ep, VA, 8, 0, A_SVC);
+        assert_eq!(
+            (plain_call(&w, &mut cpu, &mut f), f.x[0]),
+            (RETURNED, 1),
+            "the report refused by EFAULT is not lost"
+        );
+        assert_eq!(w.mem.read(MM, VA + 8, 8), 0xfeedu64.to_ne_bytes());
+        assert_eq!(host_calls(&w), 0, "never forwarded");
+        finish_held(&w, &mut cpu, held);
+    }
+
+    /// epoll_wait(2)'s timeout runs from the call's start. A 100 ms call
+    /// waits 60 ms for an operation slot and loses its readiness meanwhile:
+    /// the replay parks until the deadline the call accepted at entry and
+    /// returns 0 there, not 100 ms after the replay.
+    #[test]
+    fn el1_epoll_slot_wait_keeps_the_absolute_deadline_accepted_at_entry() {
+        let SlotWait {
+            w,
+            e,
+            ep,
+            r2,
+            mut held,
+        } = slot_wait_world();
+        let mask = accepting_mask();
+        let mut cpu = w.cpu.clone();
+        let mut owner = NativeOwner::new(&w, EVENTS, &mask);
+        let mut frame = epoll_pwait(ep, EVENTS, 8, 100, A_SVC);
+        let a_regs = frame.x;
+        // The deadline A accepts at entry: 100 ms, rounded up by one tick.
+        let accepted = cpu.now + 100 * cpu.freq / 1000 + 1;
+        wait_for_a_slot(&w, &mut cpu, &mut frame, &mut owner);
+        cpu.now += 60 * cpu.freq / 1000;
+        let mut g = return_to_a(&w, &mut cpu, &mut held, r2, Some(e), a_regs);
+        // Nothing is ready: A parks timed, and with nothing else to run the
+        // slot's timer switches it back in at its deadline.
+        assert_eq!(native_call(&w, &mut cpu, &mut g, &mut owner), SWITCHED);
+        assert!(cpu.now >= accepted, "never before the timeout");
+        assert!(
+            cpu.now < accepted + cpu.freq / 1000,
+            "the timer fired at {}, not at the deadline accepted at entry ({accepted})",
+            cpu.now
+        );
+        assert_eq!(g.x, a_regs);
+        reenter(&mut g, A_SVC);
+        assert_eq!(
+            (native_call(&w, &mut cpu, &mut g, &mut owner), g.x[0]),
+            (RETURNED, 0)
+        );
+        assert_eq!(owner.preparations, 0);
+        assert_eq!(host_calls(&w), 0, "never forwarded");
+        assert_eq!(leaves(&w, IpcLeave::EpollTimedWait), 0);
+        finish_held(&w, &mut cpu, held);
     }
 
     /// What the native owner stand-in saw: the armed mask, and each arm.
