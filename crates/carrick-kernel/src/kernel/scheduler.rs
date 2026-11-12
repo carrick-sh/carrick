@@ -10734,6 +10734,7 @@ mod tests {
             struct Restore(usize);
             impl Drop for Restore {
                 fn drop(&mut self) {
+                    crate::el1_delegation::clear_el1_region_host_ptr();
                     carrick_el1_abi::record_el1_region_host_ptr(self.0);
                 }
             }
