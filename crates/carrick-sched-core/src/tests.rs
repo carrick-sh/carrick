@@ -5114,3 +5114,37 @@ fn claim_for_el1_probes_a_busy_candidate_only_once() {
         true
     ));
 }
+
+#[test]
+fn native_handback_admits_a_stepped_away_allowed_driver() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    assert!(zone.step_away(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    for last in [None, Some(SLOT)] {
+        let (record, _) = park_pinned(&zone, 3, 0x4000, 1 << 1);
+        let reference = zone.record_ref(record);
+        zone.record(record).native_owned.store(1, Ordering::Release);
+        zone.record(record)
+            .last_slot
+            .store(last.map_or(0, SlotId::plus_one), Ordering::Relaxed);
+        assert_eq!(
+            zone.claim_for_host(reference, None, Handback::Woken, &HostWait, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            HostClaim::Claimed
+        );
+        let placement = zone
+            .place_native_handback(reference)
+            .expect("retained completion");
+        assert_eq!(placement.slot, OTHER);
+        assert_eq!(zone.slot(SLOT).queued(), 0);
+        assert_eq!(
+            zone.claim_for_host(reference, None, Handback::Cancelled, &HostWait, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            HostClaim::Claimed
+        );
+        zone.free_record(record);
+    }
+}
