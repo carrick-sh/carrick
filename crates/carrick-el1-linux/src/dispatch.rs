@@ -2658,8 +2658,7 @@ pub enum NativeInvariant {
     SignalNumber,
     ProcessGraph(super::process_owner::GuestProcessInvariant),
     PipeOutput,
-    /// [`NativeUnstagedExit::OwnedFamilyForward`]: an owned family's forward
-    /// for a task with no host route.
+    /// An owned family tried to forward for a task with no host route.
     OwnedFamilyForward,
 }
 

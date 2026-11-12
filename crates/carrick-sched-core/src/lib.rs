@@ -3321,7 +3321,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// is in the guest. When no slot in the guest may take it now, or the
     /// slot it planned changed meanwhile, a thread the waker may run goes on
     /// the waker's own run queue (which is unbounded); any other goes on the
-    /// slot that owns it ([`Self::owner_candidates`]: home, last or an
+    /// slot that owns it (home, last or an
     /// eligible slot an executor drives, busy, contended or stopped at a
     /// host exit, re-checked under that slot's lock), whose driver runs it
     /// when that slot is in the guest again. A thread no other slot owns
