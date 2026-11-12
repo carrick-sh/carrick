@@ -13,11 +13,14 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue};
-use carrick_core_abi::service::{ExecAdoptionReceipt, ExecSuccessorManifest, ServiceIdentity};
+use carrick_core_abi::service::{
+    ExecAdoptionReceipt, ExecSuccessorManifest, ExecSuccessorManifestView, ServiceIdentity,
+};
 use carrick_core_abi::{PinnedMetadataExtent, ReservationMm};
 use carrick_el1::memory::reservations::{X86Cpl0ReservationGeometry, X86Cpl0Reservations};
 use carrick_el1_linux::exec_successor::{
-    adopt_closed_exec_successor, cancel_prepared_exec, prepare_closed_exec_successor_slot,
+    PrepareCross, adopt_closed_exec_successor, cancel_prepared_exec,
+    prepare_closed_exec_successor_slot,
 };
 use carrick_el1_linux::native_process_runtime::{
     ExecSuccessorSlot, NativeExecSuccessor, NativeProcessError,
@@ -47,6 +50,31 @@ pub(crate) trait X86ExecMachine {
     /// The live-context census a first syscall capture authenticates against.
     fn admit_context(&self, address: Mm) -> bool;
     fn retire_context(&self, address: Mm) -> bool;
+}
+
+/// x86's pre-crossing step. No PCID: the only identity this adopter accepts
+/// is the one `Asid::x86_untagged()` names, and the generation the manifest
+/// seals beside it is the root's. Any other value is a manifest built for
+/// another ISA's translation identity. The closed space carries the root
+/// alone.
+pub(crate) struct X86PrepareCross;
+
+impl PrepareCross for X86PrepareCross {
+    fn prepare_cross(
+        &mut self,
+        successor: &ExecSuccessorManifestView,
+    ) -> Result<u64, NativeProcessError> {
+        let untagged = successor.asid.is_x86_untagged()
+            && successor.asid_generation == successor.root_generation;
+        let enterable = ParkedContextWords::valid_user_entry(
+            successor.entry.raw(),
+            successor.stack_pointer.raw(),
+        );
+        if !(untagged && enterable) {
+            return Err(NativeProcessError::Stale);
+        }
+        Ok(successor.root.address().raw())
+    }
 }
 
 /// One execution slot's exec custody over the CPL0 zone and reservations.
@@ -126,19 +154,7 @@ where
             identity,
             receipt,
             manifest,
-            |successor| {
-                // No PCID: the only identity this adopter accepts is the one
-                // `Asid::x86_untagged()` names, and the generation the manifest
-                // seals beside it is the root's. Any other value is a manifest
-                // built for another ISA's translation identity.
-                let untagged = successor.asid.is_x86_untagged()
-                    && successor.asid_generation == successor.root_generation;
-                let enterable = ParkedContextWords::valid_user_entry(
-                    successor.entry.raw(),
-                    successor.stack_pointer.raw(),
-                );
-                (untagged && enterable).then(|| successor.root.address().raw())
-            },
+            &mut X86PrepareCross,
             |record| self.machine.cross_adopt(record),
         )?;
         let address = adopted.address;
