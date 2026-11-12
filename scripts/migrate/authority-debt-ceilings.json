@@ -7690,14 +7690,14 @@
     {
       "family": "host_backing",
       "operation": "std::fs::File::open",
-      "owner": "carrick_runtime::runtime::exec::load_execve_image",
+      "owner": "carrick_runtime::runtime::exec::acquire_exec_source",
       "lane": "macos_cli_default",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::File::open",
-      "owner": "carrick_runtime::runtime::exec::load_execve_image",
+      "owner": "carrick_runtime::runtime::exec::acquire_exec_source",
       "lane": "macos_runtime_default",
       "ceiling": 1
     },
@@ -13045,14 +13045,14 @@
     {
       "family": "host_backing",
       "operation": "std::fs::read",
-      "owner": "carrick_runtime::runtime::exec::load_execve_image",
+      "owner": "carrick_runtime::runtime::exec::acquire_exec_source",
       "lane": "macos_cli_default",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::read",
-      "owner": "carrick_runtime::runtime::exec::load_execve_image",
+      "owner": "carrick_runtime::runtime::exec::acquire_exec_source",
       "lane": "macos_runtime_default",
       "ceiling": 1
     },

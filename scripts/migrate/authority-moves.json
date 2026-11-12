@@ -130,6 +130,11 @@
       "from": "carrick_runtime::vcpu_loop::executor::run_executor_loop",
       "to": "carrick_runtime::vcpu_loop::executor::retarget_exec_replacement",
       "issue": 2142
+    },
+    {
+      "from": "carrick_runtime::runtime::exec::load_execve_image",
+      "to": "carrick_runtime::runtime::exec::acquire_exec_source",
+      "issue": 1093
     }
   ],
   "authority_debt_admissions": [
