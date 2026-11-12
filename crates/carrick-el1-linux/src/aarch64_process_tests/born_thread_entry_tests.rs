@@ -3968,7 +3968,7 @@ fn arm_pinned_glibc_member_raw_exit_on_an_idle_executor_retires_in_ring() {
     assert_eq!(zone.slot(pinned).host_record(), None);
     assert!(!zone.current_affinity_excludes_cpu(pinned));
 
-    let mut call = |nr: u64, args: &[u64], cpu: &mut crate::sched::FakeCpu| {
+    let call = |nr: u64, args: &[u64], cpu: &mut crate::sched::FakeCpu| {
         let mut frame = carrick_el1_abi::TrapFrame::default();
         frame.x[8] = nr;
         frame.x[..args.len()].copy_from_slice(args);
