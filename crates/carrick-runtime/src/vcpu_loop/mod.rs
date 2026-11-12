@@ -112,9 +112,7 @@ pub(crate) use memory::{
 // `hardware_tso_for_debug` (Apple TSO) remain macOS-only stubs.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "platform-macos")]
-use crate::runtime::exec::{
-    forked_child_die_by_signal, load_execve_image, stop_after_traced_exec, stop_by_signal,
-};
+use crate::runtime::exec::{forked_child_die_by_signal, load_execve_image, stop_by_signal};
 #[cfg(feature = "platform-macos")]
 use crate::runtime::hardware_tso_for_debug;
 
@@ -362,9 +360,7 @@ mod macos_helper_stubs {
     // so the `use macos_helper_stubs::{…}` import at the bottom of this module
     // (line ~281) continues to resolve without change.
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-    pub(super) use carrick_kernel::exec_helpers::{
-        forked_child_die_by_signal, stop_after_traced_exec, stop_by_signal,
-    };
+    pub(super) use carrick_kernel::exec_helpers::{forked_child_die_by_signal, stop_by_signal};
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
     pub(super) fn hardware_tso_for_debug(_requested: bool) -> bool {
@@ -377,9 +373,7 @@ mod macos_helper_stubs {
     feature = "platform-netbsd"
 ))]
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-use macos_helper_stubs::{
-    forked_child_die_by_signal, hardware_tso_for_debug, stop_after_traced_exec, stop_by_signal,
-};
+use macos_helper_stubs::{forked_child_die_by_signal, hardware_tso_for_debug, stop_by_signal};
 
 // ===================================================================
 // Ownership-aligned submodules (Task A2). Each concern owns a disjoint file so
