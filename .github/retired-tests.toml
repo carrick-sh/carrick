@@ -23,3 +23,9 @@ test = "carrick_el1_linux::sched::tests::timed_waits_this_vcpu_cannot_keep_forwa
 reason = "#1894: a switched-in thread's timed wait is now served in ring on its own timer lease (`timed_wait_allowed` no longer forwards when the thread is not the vCPU's host record), so the forwarding witness became a witness that the wait times out in ring with ETIMEDOUT and consumes its lease; the invalid-timespec refusal is still asserted in the same test."
 replaced_by = "carrick_el1_linux::sched::tests::switched_in_timed_wait_uses_its_own_timer_lease"
 pr = 1894
+
+[[retired]]
+test = "cpl0_initial_mm::in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring"
+reason = "#1671: an in-zone child's pipe write on x86 CPL0 is now served through the shared IPC owner instead of returning a counted ENOSYS, so the refusal witness became a witness that the write is served (9968c4138)."
+replaced_by = "cpl0_initial_mm::in_zone_child_pipe_write_uses_shared_ipc_execution"
+pr = 2153
