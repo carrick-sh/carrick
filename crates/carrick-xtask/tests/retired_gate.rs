@@ -176,7 +176,7 @@ fn the_printed_entry_for_a_nested_test_is_the_one_the_receipt_gate_consumes() {
     write(root, "crates/demo/Cargo.toml", &manifest("", ""));
     write(root, "crates/demo/src/lib.rs", NESTED_OLD);
     let base = commit(root, "base");
-    write(root, "crates/demo/src/lib.rs", "pub fn lib() {}\n");
+    write(root, "crates/demo/src/lib.rs", "#[test]\nfn kept() {}\n");
     let removed = commit(root, "remove the test");
 
     let (code, out) = check(root, &base, &removed);
@@ -223,9 +223,9 @@ fn the_printed_entry_for_a_nested_test_is_the_one_the_receipt_gate_consumes() {
             "clean_tree": true,
             "phase": "host",
             "profile": "no-docker",
-            "overall": "PASS",
+            "overall": "PASS", "failures": [],
             "steps": [{
-                "name": "unit", "passed": true, "duration_secs": 0.0,
+                "name": "unit", "command": "just unit", "exit_code": 0, "log_path": "unit.log", "duration_s": 1.0, "passed": true,
                 "started_tests": started, "finished_binaries": ["demo"],
             }],
         }))
@@ -233,8 +233,8 @@ fn the_printed_entry_for_a_nested_test_is_the_one_the_receipt_gate_consumes() {
     };
     let retired = parse_retired_tests(&toml, Path::new(".github/retired-tests.toml")).unwrap();
     let diff = diff_with_retired(
-        &receipt(&["demo::tests::old"]),
-        &receipt(&[]),
+        &receipt(&["demo::kept", "demo::tests::old"]),
+        &receipt(&["demo::kept"]),
         &retired,
         &base_tree,
         &cand_tree,
