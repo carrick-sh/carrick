@@ -4389,8 +4389,7 @@ impl<
             process.store_handoff_receipt(receipt);
         }
         if let Some(request) = input_wait {
-            let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
-            return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+            return self.ipc_input_wait(request);
         }
         if let Some(output) = output {
             let bytes = output.pollfd.revents.to_ne_bytes();
@@ -5303,6 +5302,21 @@ impl<
         }
     }
 
+    // IPC families publish their own frame result; unlike poll, their
+    // completion lowering does not install a LifecycleOutcome's return word.
+    #[inline(always)]
+    fn ipc_input_wait(
+        &mut self,
+        request: carrick_core::user_copy::GuestCopyRequest,
+    ) -> FamilyCompletion {
+        let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+        if let lifecycle::LifecycleOutcome::Returned { result, .. } = &outcome {
+            self.frame
+                .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
+        }
+        carrick_personality_linux::lifecycle::lifecycle_effect(&outcome)
+    }
+
     fn ipc_transfer(&mut self) -> FamilyCompletion
     where
         F: Fn(u32) -> *mut u8,
@@ -5363,14 +5377,7 @@ impl<
                 && let Some(request) = user.input_wait.take()
             {
                 frame.x[0] = orig_x0;
-                let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
-                // IPC families publish immediate results in their frame;
-                // unlike Poll, their shared completion does not install one.
-                if let lifecycle::LifecycleOutcome::Returned { result, .. } = &outcome {
-                    self.frame
-                        .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
-                }
-                return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+                return self.ipc_input_wait(request);
             }
             let result = frame.x[0] as i64;
             if sigpipe_owed {

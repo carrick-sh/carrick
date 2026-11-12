@@ -230,7 +230,7 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
         mm: mm_key(task),
         buf: IpcUserVa(argument_word(frame, 1)),
         orig_x0: argument_word(frame, 0),
-        nr: super::ordinal(frame) as u32,
+        nr: frame.native_number().raw() as u32,
         ..IpcOperation::EMPTY
     };
     let (pin, desc) = match fda.pin(table, fd) {

@@ -22,6 +22,7 @@ semantic_authority = [
   "man 7 epoll: level-triggered members are reported while ready; edge-triggered members once per new arrival; EPOLLONESHOT disarms after one report until EPOLL_CTL_MOD; an item is removed only when the last descriptor of its open description closes",
   "man 2 epoll_wait / epoll_pwait: timeout 0 returns at once, -1 blocks until an event or a signal, a finite timeout returns 0 when it expires; EINTR when a signal handler interrupts the wait; the sigmask of epoll_pwait replaces the thread mask for exactly the call; EINVAL for maxevents <= 0 or a non-epoll fd, EBADF for a bad epfd, EFAULT for an unwritable events buffer",
   "man 2 epoll_ctl: EEXIST, ENOENT, EBADF, EINVAL (self add)",
+  "man 2 epoll_pwait2: unreadable timeout memory returns EFAULT; a native input owner result must replace the syscall ordinal in the ABI return register",
   "man 7 signal: epoll_wait and epoll_pwait are never restarted after a handler, SA_RESTART or not",
   "man 7 pipe / man 2 eventfd: readiness of the member objects",
 ]
@@ -56,6 +57,7 @@ vm_free = [
 embed = [
   "carrick-embed::el1_sched::el1_epoll_eventfd_pingpong_stays_in_guest",
   "carrick-vmm-kvm::cpl0_initial_mm::zone_epoll_pwait_blocks_until_child_pipe_write (production CPL0 guest execution; epoll_create1, pipe ADD, parent pwait(-1), child write, packed readiness cookie, no epoll forwarding or ring refusals)",
+  "carrick-vmm-kvm::cpl0_initial_mm::zone_epoll_pwait2_bad_timeout_returns_input_owner_fault (production CPL0 guest execution with a real unmapped timeout; EFAULT reaches rax, no forwarding or ring refusal)",
 ]
 docker = [
   "probe:epollzonepingpong|epollzonetrigger|epollzonetimeout|epollzoneeintr|epollzoneclose|epollzonemixed|epollzonesigmask",
