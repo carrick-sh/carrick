@@ -97,8 +97,10 @@ mod tests {
             ("el1_census.rs", [0, 0, 1]),
             // `carrick_home_scratch_tests` (#1852) re-runs one ignored unit
             // test in a child process because it must own CARRICK_HOME and
-            // HOME. A test; no production host-process creation.
-            ("execute.rs", [0, 0, 1]),
+            // HOME, and its child re-runs a second ignored test that leaves
+            // through `process::exit` to exercise the exit hook. Tests; no
+            // production host-process creation.
+            ("execute.rs", [0, 0, 2]),
             // This unit test self-spawns to isolate a process-global abort
             // boundary while proving pending exec error preservation. It is
             // not production host-process-per-guest architecture.
