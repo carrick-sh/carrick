@@ -13825,6 +13825,12 @@ fn native_descriptor_argument_witness(
             0
         );
         assert_eq!(events.as_bytes(), &[0xa5; 16]);
+        // epoll_pwait2 shares this ring-created object and must not cross.
+        let zero_timeout = carrick_test_support::GuestUserBuffer::zeroed(16);
+        assert_eq!(
+            completed(sys::EPOLL_PWAIT2.raw(), [epoll, events.arg(), 1, zero_timeout.arg()]),
+            0
+        );
         let value = carrick_test_support::GuestUserBuffer::from_value(1u64);
         let counter = carrick_test_support::GuestUserBuffer::zeroed(8);
         assert_eq!(completed(sys::WRITE.raw(), [event, value.arg(), 8, 0]), 8);
