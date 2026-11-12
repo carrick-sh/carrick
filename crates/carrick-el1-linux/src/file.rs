@@ -355,6 +355,14 @@ impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, 
             owner.disarm_wait_sigmask();
         }
     }
+    fn retain_accepted_epoll_wait(&mut self, wait: carrick_core_abi::wait::AcceptedWait) -> bool {
+        self.owner
+            .as_deref_mut()
+            .is_some_and(|owner| owner.retain_accepted_epoll_wait(wait))
+    }
+    fn take_accepted_epoll_wait(&mut self) -> Option<carrick_core_abi::wait::AcceptedWait> {
+        self.owner.as_deref_mut()?.take_accepted_epoll_wait()
+    }
 }
 
 #[cfg(test)]

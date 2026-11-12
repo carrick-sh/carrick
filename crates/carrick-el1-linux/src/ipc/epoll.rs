@@ -24,10 +24,12 @@
 //! With a native owner, a refused copy-out never leaves the ring: the items
 //! are put back, the owner prepares the buffer (a first touch is supplied,
 //! or waited for) and the call harvests again; a buffer the owner faults is
-//! EFAULT, its reports still queued, as on Linux. A full operation arena is
-//! "not now": the call parks on the arena's slot release and replays. A
-//! pwait mask is armed before the preparation, so a suspended preparation
-//! keeps it like a parked wait does.
+//! EFAULT, its reports still queued, as on Linux. A pwait mask is armed
+//! before the preparation, so a suspended preparation keeps it like a parked
+//! wait does. A full operation arena is "not now": the call parks on the
+//! arena's slot release and reruns, keeping what it accepted at entry (its
+//! armed mask, and its timeout's absolute expiry, retained by the native
+//! owner); a signal the mask does not block ends that wait with EINTR.
 //!
 //! A blocking wait parks on the epoll's `Readable` lane with an
 //! [`IpcOpKind::EpollWait`] operation that pins the epoll's description, so
@@ -56,6 +58,7 @@ use super::{
 };
 use crate::dispatch::GuestDispatchFrame;
 use carrick_core::mm::transaction::{CopyoutPreparation, CopyoutRequest, OwnedOperationYield};
+use carrick_core_abi::wait::AcceptedWait;
 use carrick_el1_abi::IpcLeave;
 use carrick_el1_abi::ipc::epoll::{EpollItemRef, EpollReport};
 use carrick_el1_abi::ipc::fd::{Error as FdError, Fd, TableId};
@@ -64,6 +67,7 @@ use carrick_el1_abi::ipc::{
     BackingToken, IpcBacking, IpcCounterDeadline, IpcHandback, IpcObjectHandle, IpcOpKind,
     IpcOpToken, IpcOperation, IpcUserVa, OfdPin, RawIpcObject, RawOfdPin,
 };
+use carrick_guest_arch::CounterTick;
 
 /// `epoll_pwait` on AArch64 (`epoll_wait` is not in its table).
 pub const SYS_EPOLL_PWAIT: usize = 22;
@@ -126,7 +130,9 @@ pub(super) fn resume<E: IpcExecution, M: UserCopy>(
     served
 }
 
-/// Serve a fresh `epoll_pwait` (see the module docs for what forwards).
+/// Serve a fresh `epoll_pwait` (see the module docs for what forwards), or
+/// the rerun of one that accepted its mask and timeout and then waited for
+/// an operation slot (`admit_output`).
 pub(super) fn serve<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
@@ -134,21 +140,38 @@ pub(super) fn serve<E: IpcExecution, M: UserCopy>(
     user: &mut M,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
-    let mut armed = false;
-    let served = serve_with(sched, frame, venue, user, None, &mut armed, interrupt);
+    let (wait, mut armed) = match user.take_accepted_epoll_wait() {
+        None => (None, false),
+        // The rerun keeps what the call accepted: its mask is still armed,
+        // and its timeout ends at the expiry it accepted at entry.
+        Some(accepted) => {
+            if user.interrupt_pending_wait() || interrupt() {
+                // A signal ended the slot wait: EINTR whatever SA_RESTART.
+                // The signal checkpoint selects the handler under the
+                // accepted mask, then restores the persistent one.
+                return returned(frame, carrick_syscall_abi::LINUX_EINTR.guest_retval());
+            }
+            let wait = accepted
+                .deadline
+                .map_or(Wait::Forever, |deadline| Wait::Until(deadline.raw()));
+            (Some(wait), true)
+        }
+    };
+    let served = serve_with(sched, frame, venue, user, wait, &mut armed, interrupt);
     // A call that ends here restores the mask it armed. One that parked, or
     // whose preparation suspended, handed it to its continuation, which
-    // resumes through `resume` and never reads the mask argument again.
+    // resumes through `resume` (or reruns, after an operation-slot wait) and
+    // never reads the mask argument again.
     if armed {
         user.disarm_wait_sigmask();
     }
     served
 }
 
-/// `wait`: what is left of a resumed call's wait (`None`: a fresh call,
-/// whose timeout argument starts now). `armed`: set while this call owns
-/// restoring the accepted temporary mask it armed; cleared when a
-/// continuation takes it over (a resumed call's mask is its continuation's).
+/// `wait`: what is left of a resumed or rerun call's wait (`None`: a fresh
+/// call, whose timeout argument starts now). `armed`: set while this call
+/// owns restoring the accepted temporary mask; cleared when a continuation
+/// takes it over (a resumed call's mask is its continuation's).
 fn serve_with<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
@@ -251,6 +274,19 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
                     // A resumed operation keeps a reached deadline: it harvests once.
                     op.deadline = IpcCounterDeadline::at(sched.now());
                 }
+                // The accepted mask covers the preparation and any wait for
+                // its operation slot: a suspended preparation resumes through
+                // `resume`, and a slot wait reruns, and neither reads the
+                // mask argument again.
+                if let Some(mask) = sigmask
+                    && !*armed
+                {
+                    if !user.arm_wait_sigmask(mask) {
+                        release_pin(sched, OfdPin::from_raw(op.pin), region);
+                        return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
+                    }
+                    *armed = true;
+                }
                 let token = match admit_output(sched, frame, venue, user, op, armed, interrupt) {
                     Admitted::Operation(token) => token,
                     Admitted::Parked(served) => return served,
@@ -263,18 +299,6 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
                         continue;
                     }
                 };
-                // The accepted mask covers the preparation too: a suspended
-                // preparation resumes through `resume`, which harvests again
-                // (and may park) without reading the mask argument again.
-                if let Some(mask) = sigmask
-                    && !*armed
-                {
-                    if !user.arm_wait_sigmask(mask) {
-                        finish(sched, token, region);
-                        return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
-                    }
-                    *armed = true;
-                }
                 match prepare_output(sched, frame, region, user, token, request, prepared) {
                     Output::Rerun(back, ready) => {
                         op = back;
@@ -345,9 +369,8 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
                 return served;
             }
             // Readiness moved before the park: retire the record (the pin
-            // stays with `op`) and harvest again.
+            // stays with `op`) and harvest again, still under the mask.
             Parked::Retry(token) => {
-                disarm(user, armed);
                 match region.finish_operation(token, || {
                     notify_operation_release(region, sched.zone(), sched.slot())
                 }) {
@@ -435,8 +458,8 @@ fn pin_epoll<E: IpcExecution>(
     Ok((op, object))
 }
 
-/// A temporary mask this call armed is restored when it harvests again
-/// (readiness moved before its park) or leaves without a continuation.
+/// A temporary mask this call armed is restored when it leaves without a
+/// continuation.
 fn disarm<M: UserCopy>(user: &mut M, armed: &mut bool) {
     if core::mem::take(armed) {
         user.disarm_wait_sigmask();
@@ -455,15 +478,18 @@ enum Admitted {
 }
 
 /// Admit a refused copy-out's preparation as its `EpollWait` record. A full
-/// arena is contention, "not now": never a forward or an errno. Nothing is
-/// retained yet (the items are queued again), so the pin is dropped and the
-/// thread parks on the arena's slot release (`admit_operation_wait`, the
-/// source every retirement publishes to) with a replay receipt that owns
-/// nothing; the scheduler re-runs the call once a slot returns. A mask this
-/// call armed is restored first: the replay is a fresh call, which arms its
-/// mask argument afresh. A resumed call's mask stays its continuation's: the
-/// native resume's signal checkpoint restores it once the receipt (which
-/// owns no adapter operation) is consumed.
+/// arena is contention, "not now": never a forward or an errno. No record
+/// holds the call yet (the items are queued again), so the pin is dropped
+/// and the thread parks on the arena's slot release (`admit_operation_wait`,
+/// the source every retirement publishes to) with a replay receipt that
+/// owns nothing; the scheduler re-runs the call once a slot returns.
+///
+/// The call stays accepted across that wait (epoll_pwait(2) reads its mask
+/// once, and its timeout runs from the call's start). Its mask, armed by the
+/// caller, stays armed, so a signal it blocks cannot end the wait; the
+/// operation's absolute expiry is retained by the native owner for the
+/// rerun ([`serve`]), which reads neither argument again. A signal the mask
+/// does not block ends the wait, and the rerun returns EINTR.
 fn admit_output<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
@@ -501,7 +527,14 @@ fn admit_output<E: IpcExecution, M: UserCopy>(
         }
     };
     release_pin(sched, OfdPin::from_raw(op.pin), region);
-    disarm(user, armed);
+    // Retained before the park: once parked, the rerun may begin on another
+    // vCPU. A refused copy-out was recorded only for a native owner.
+    let accepted = AcceptedWait {
+        deadline: op.deadline.get().map(CounterTick::new),
+    };
+    if !user.retain_accepted_epoll_wait(accepted) {
+        invalid::<()>();
+    }
     // SAFETY: observed before the arena probe that found no free slot.
     let snapshot = unsafe { ObjectStateSnapshot::before_object_probe(observed) };
     match sched.park(
@@ -512,8 +545,16 @@ fn admit_output<E: IpcExecution, M: UserCopy>(
         None,
         Some(&mut || user.interrupt_pending_wait() || interrupt()),
     ) {
-        Ok(served) => Admitted::Parked(served),
-        Err((ObjectWaitError::Changed, _)) => Admitted::Rerun,
+        // The rerun owns the armed mask now.
+        Ok(served) => {
+            *armed = false;
+            Admitted::Parked(served)
+        }
+        // This pass keeps both: the call harvests again at once.
+        Err((ObjectWaitError::Changed, _)) => {
+            let _ = user.take_accepted_epoll_wait();
+            Admitted::Rerun
+        }
         Err(_) => invalid(),
     }
 }

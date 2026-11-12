@@ -395,6 +395,18 @@ pub trait UserCopy {
     /// call, or a park that did not happen). A no-op when nothing is armed.
     fn disarm_wait_sigmask(&mut self) {}
 
+    /// Retain an `epoll_pwait` that accepted its mask and timeout for the
+    /// rerun of its call (it waits for an operation slot). `false`: no
+    /// native owner retains this caller's reruns.
+    fn retain_accepted_epoll_wait(&mut self, _wait: carrick_core_abi::wait::AcceptedWait) -> bool {
+        false
+    }
+
+    /// The accepted `epoll_pwait` this call reruns, consumed once.
+    fn take_accepted_epoll_wait(&mut self) -> Option<carrick_core_abi::wait::AcceptedWait> {
+        None
+    }
+
     /// A pre-effect argument read can retain its exact owner-preparation
     /// request rather than turn a preparable refusal into an address errno.
     fn has_copyin_refusal(&self) -> bool {

@@ -1421,6 +1421,9 @@ enum MemberWait<'a> {
 #[derive(Default)]
 struct MemberWaitState<'a> {
     relative_futex_wait: Option<carrick_personality_linux::sched::RelativeFutexWait>,
+    /// An `epoll_pwait` that accepted its mask and timeout and then waited
+    /// for an operation slot, retained for its rerun the same way.
+    accepted_epoll_wait: Option<carrick_core_abi::wait::AcceptedWait>,
     wait: Option<MemberWait<'a>>,
     suspend_mask: Option<carrick_signal_core::policy::SigBlockMask>,
     /// The carrier's answer to this member's last unmanaged thread-stock
@@ -1433,6 +1436,7 @@ struct MemberWaitState<'a> {
 impl MemberWaitState<'_> {
     fn is_empty(&self) -> bool {
         self.relative_futex_wait.is_none()
+            && self.accepted_epoll_wait.is_none()
             && self.wait.is_none()
             && self.suspend_mask.is_none()
             && self.thread_stock_reply.is_none()
@@ -1657,10 +1661,24 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
         operation
     }
 
+    fn take_accepted_epoll_wait(
+        &mut self,
+        record: &RecordRef,
+    ) -> Option<carrick_core_abi::wait::AcceptedWait> {
+        let state = self.pending.member_mut(record)?;
+        let wait = state.accepted_epoll_wait.take();
+        if state.is_empty() {
+            self.pending.remove_member(record);
+        }
+        wait
+    }
+
     /// A retiring member's retained per-call state goes with it: its
-    /// relative futex wait and any thread-stock answer its rerun never read.
+    /// relative futex wait, its accepted epoll wait and any thread-stock
+    /// answer its rerun never read.
     fn retire_member_retained(&mut self, record: &RecordRef) {
         let _ = self.take_relative_futex_wait(record);
+        let _ = self.take_accepted_epoll_wait(record);
         let _ = self.take_thread_stock_reply(record);
     }
 
@@ -4346,6 +4364,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let retained = graph.pending.member(&source.zone.record_ref(record));
         let relative_futex_pending =
             retained.is_some_and(|state| state.relative_futex_wait.is_some());
+        let accepted_epoll_pending =
+            retained.is_some_and(|state| state.accepted_epoll_wait.is_some());
         let thread_stock_pending = retained.is_some_and(|state| state.thread_stock_reply.is_some());
         drop(graph);
         Ok(NativeProcessEntry {
@@ -4374,6 +4394,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             slot,
             owner_continuation,
             relative_futex_pending,
+            accepted_epoll_pending,
             thread_stock_pending,
             thread_stock_reply: None,
             signal_work_deferred: false,
@@ -4403,6 +4424,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             owner_continuation,
             relative_futex_pending,
+            accepted_epoll_pending,
             thread_stock_pending,
         } = self.authenticate_registered(registry, source, current, address, words)?;
         Ok(Box::new(NativeProcessEntry {
@@ -4431,6 +4453,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             slot: Some(member_control),
             owner_continuation,
             relative_futex_pending,
+            accepted_epoll_pending,
             thread_stock_pending,
             thread_stock_reply: None,
             signal_work_deferred: false,
@@ -4522,6 +4545,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let retained = graph.pending.member(&record_ref);
         let relative_futex_pending =
             retained.is_some_and(|state| state.relative_futex_wait.is_some());
+        let accepted_epoll_pending =
+            retained.is_some_and(|state| state.accepted_epoll_wait.is_some());
         let thread_stock_pending = retained.is_some_and(|state| state.thread_stock_reply.is_some());
         drop(graph);
         Ok(AuthenticatedProcessEntry {
@@ -4532,6 +4557,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             owner_continuation,
             relative_futex_pending,
+            accepted_epoll_pending,
             thread_stock_pending,
         })
     }
@@ -4724,6 +4750,7 @@ struct AuthenticatedProcessEntry<'a> {
     calling_tid: u32,
     owner_continuation: bool,
     relative_futex_pending: bool,
+    accepted_epoll_pending: bool,
     thread_stock_pending: bool,
 }
 
@@ -4759,6 +4786,8 @@ pub struct NativeProcessEntry<
     owner_continuation: bool,
     // Absence is captured under admission's graph guard; custody stays in the row.
     relative_futex_pending: bool,
+    // Captured the same way for a retained accepted `epoll_pwait`.
+    accepted_epoll_pending: bool,
     // Captured the same way for a retained thread-stock answer (#1974).
     thread_stock_pending: bool,
     // The retained answer this entry's syscall may read, moved out of the
@@ -5553,6 +5582,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// other than that rerun runs: a signal frame, an exit, a run failure.
     pub(super) fn discard_rerun_answers(&mut self) {
         let _ = ProcessNative::take_relative_futex_wait(self);
+        let _ = ProcessNative::take_accepted_epoll_wait(self);
         let _ = self.take_retained_thread_stock_reply();
         self.thread_stock_reply = None;
     }
@@ -8557,6 +8587,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .lock()
             .member_wait_state(self.record)
             .relative_futex_wait = Some(operation);
+    }
+    fn take_accepted_epoll_wait(&mut self) -> Option<carrick_core_abi::wait::AcceptedWait> {
+        if !core::mem::take(&mut self.accepted_epoll_pending) {
+            return None;
+        }
+        self.runtime
+            .graph
+            .lock()
+            .take_accepted_epoll_wait(&self.record)
+    }
+    fn retain_accepted_epoll_wait(&mut self, wait: carrick_core_abi::wait::AcceptedWait) -> bool {
+        self.accepted_epoll_pending = true;
+        self.runtime
+            .graph
+            .lock()
+            .member_wait_state(self.record)
+            .accepted_epoll_wait = Some(wait);
+        true
     }
     fn scope_rerun_answers_to_entry(&mut self) {
         self.thread_stock_reply = self.take_retained_thread_stock_reply();

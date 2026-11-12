@@ -457,7 +457,7 @@ pub fn serve_ipc_with_signals<E: IpcExecution, M: UserCopy>(
     }
     let taken = match sched.take_object_operation() {
         // The replay receipt of an operation-slot wait (`epoll::admit_output`)
-        // owns nothing: the call runs afresh.
+        // owns nothing: what the call accepted is its native owner's.
         Ok(Some(t)) if t.metadata_generation().is_some() => Ok(None),
         taken => taken,
     };
@@ -3186,6 +3186,8 @@ mod tests {
         probes: Vec<Option<u64>>,
         /// A signal the temporary mask does not block is pending.
         signal: bool,
+        /// The thread's retained rerun answer.
+        accepted: Option<carrick_core_abi::wait::AcceptedWait>,
     }
     impl<'a> NativeOwner<'a> {
         fn new(w: &'a World, page: u64, mask: &'a MaskState) -> Self {
@@ -3205,6 +3207,7 @@ mod tests {
                 mask,
                 probes: Vec::new(),
                 signal: false,
+                accepted: None,
             }
         }
     }
@@ -3275,6 +3278,16 @@ mod tests {
         fn interrupt_pending_wait(&mut self) -> bool {
             self.probes.push(self.mask.armed.get());
             self.signal
+        }
+        fn retain_accepted_epoll_wait(
+            &mut self,
+            wait: carrick_core_abi::wait::AcceptedWait,
+        ) -> bool {
+            assert!(self.accepted.replace(wait).is_none(), "retained twice");
+            true
+        }
+        fn take_accepted_epoll_wait(&mut self) -> Option<carrick_core_abi::wait::AcceptedWait> {
+            self.accepted.take()
         }
     }
 
@@ -3760,6 +3773,7 @@ mod tests {
         assert_eq!(event[16..], [0; 16], "no duplicate");
         assert_eq!(mask.arms.get(), 1, "the mask argument is accepted once");
         assert_eq!(mask.armed.get(), None, "completion restores the mask");
+        assert!(owner.accepted.is_none(), "the rerun consumed its answer");
         assert_eq!(host_calls(&w), 0, "never forwarded");
         assert_eq!(
             [
