@@ -1,3 +1,7 @@
+# #1093 S4c slice a: `native_process_runtime/{service,host_test_support}.rs`
+# split `kill_refused_exec` into `exec_past_no_return` (`ExecPastNoReturn::SIGNAL`)
+# and `retire_lost_exec_race` (witnesses bound under process.exec.custody).
+# No change to this contract's guest semantics, bindings or budgets.
 # #1845: ReadinessLockCustody types the physical readiness-lock handoff in
 # sched-core::object_wait and the zone accessor in el1_zone.rs. This family's
 # operations and budgets are unchanged. The change is witnessed under
