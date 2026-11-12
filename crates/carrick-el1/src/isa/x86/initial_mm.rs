@@ -321,8 +321,31 @@ pub struct ImageFrameDemand {
 /// The editor's exact demand for `rows` and `stack`; `None` when a count
 /// overflows. The rows are assumed valid (`validate_image_rows`).
 pub fn image_frame_demand(rows: &[ImageRow], stack: ImageStack) -> Option<ImageFrameDemand> {
-    let _ = (rows, stack);
-    Some(ImageFrameDemand { tables: 0, data: 0 })
+    // The editor's own walk: one table per new prefix at the page that
+    // first uses it (`install_initial_image`), so the prefixes are counted
+    // over the same pages it maps.
+    let floor = stack.top.raw().checked_sub(stack.size.raw())?;
+    let spans = rows
+        .iter()
+        .map(|row| (row.start.raw(), row.len.raw()))
+        .chain(core::iter::once((floor, stack.size.raw())));
+    let mut prefixes = [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()];
+    let mut data = 0usize;
+    for (start, len) in spans {
+        let end = start.checked_add(len)?;
+        for va in (start..end).step_by(PAGE as usize) {
+            data = data.checked_add(1)?;
+            for (prefixes, shift) in prefixes.iter_mut().zip([39, 30, 21]) {
+                prefixes.insert(va >> shift);
+            }
+        }
+    }
+    let tables = prefixes
+        .iter()
+        .map(BTreeSet::len)
+        .try_fold(1usize, usize::checked_add)?
+        .checked_add(carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES)?;
+    Some(ImageFrameDemand { tables, data })
 }
 
 /// One completed but still unpublished address space. The caller consumes all
