@@ -175,7 +175,7 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
     match fda.get(table, fd) {
         Ok(snapshot) if epoll_of(snapshot.backing).is_some() => {}
         // Not a zone epoll (EINVAL, or a host-backed epoll): the host.
-        Ok(_) => return IpcServed::Forward,
+        Ok(_) => return leave(sched, IpcLeave::EpollNotZone, IpcServed::Forward),
         Err(FdError::BadFd) => return returned(frame, linux::EBADF),
         Err(FdError::Contended) => {
             return leave(sched, IpcLeave::TableContended, IpcServed::Forward);

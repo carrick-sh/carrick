@@ -13705,7 +13705,10 @@ fn native_descriptor_argument_witness(
             || counters.ipc_leaves[IpcLeave::EpollNotZone as usize].load(Ordering::Relaxed);
         assert_eq!(not_zone(), 0);
         let (route, _) = run_binding6(waiter, pwait, [3, events.arg(), 1, 0, 0, 0]);
-        assert_eq!(route, CompletionRoute::Forward);
+        assert!(
+            matches!(route, CompletionRoute::Forward | CompletionRoute::WithWork),
+            "{route:?}"
+        );
         assert_eq!(forwarded(), 1);
         assert_eq!(not_zone(), 1, "the forward must name its arm");
         return;

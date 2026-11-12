@@ -2186,10 +2186,10 @@ fn epoll_pwait_leave(
             |_| core::ptr::null_mut(),
         )
     };
-    assert_eq!(
-        route,
-        CompletionRoute::Forward,
-        "x86={x86} venue={with_venue}"
+    // Pending host work only changes how the unserved call is completed.
+    assert!(
+        matches!(route, CompletionRoute::Forward | CompletionRoute::WithWork),
+        "x86={x86} venue={with_venue} work={work}: {route:?}"
     );
     let counts = core::array::from_fn(|i| counters.ipc_leaves[i].load(Ordering::Relaxed));
     assert_eq!(

@@ -3760,6 +3760,11 @@ impl<
                 [carrick_el1_abi::LifecycleDecline::CloneDispatchHostWork as usize],
         })
     }
+    fn declined_before_service(&self, ordinal: u64) {
+        if self.ipc.is_none() {
+            self.note_epoll_leave(ordinal, carrick_el1_abi::IpcLeave::EpollNoVenue);
+        }
+    }
     fn anonymous_declined_for_work(&self, _ordinal: u64) {
         #[cfg(target_os = "none")]
         if let (Some(zone), Some(task), Some(slot)) =
@@ -5294,11 +5299,21 @@ impl<
         }
     }
 
+    /// Name why an `epoll_pwait` left the ring before the IPC owner ran
+    /// (read and write have their own host-backed routing, not counted).
+    fn note_epoll_leave(&self, ordinal: u64, why: carrick_el1_abi::IpcLeave) {
+        if ordinal == ipc::SYS_EPOLL_PWAIT as u64 {
+            self.counters.ipc_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn ipc_transfer(&mut self) -> FamilyCompletion
     where
         F: Fn(u32) -> *mut u8,
     {
+        let ordinal = self.frame.canonical_ordinal().raw();
         let Some(venue) = self.ipc else {
+            self.note_epoll_leave(ordinal, carrick_el1_abi::IpcLeave::EpollNoVenue);
             return FamilyCompletion::Forward;
         };
         let native_signals = self.process.is_some();
@@ -5312,6 +5327,7 @@ impl<
         ) else {
             // No execution binding for this entry: an explicit, counted
             // refusal rather than a transfer without a park boundary.
+            self.note_epoll_leave(ordinal, carrick_el1_abi::IpcLeave::EpollNoExecution);
             self.frame.record_isa_unsupported_forward();
             return FamilyCompletion::Forward;
         };
