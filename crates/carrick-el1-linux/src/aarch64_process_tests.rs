@@ -7190,6 +7190,117 @@ fn arm_glibc_pthread_join_shared_bitset_wait_wakes_on_child_exit() {
     assert_eq!(resumed.x[0], 0, "pthread_join's futex returns 0");
 }
 
+/// A joiner parked on a private-anonymous CLEARTID word with `wait_op`
+/// (`FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` when 265), then the child
+/// issues `wake_op` through the production AArch64 entry. Returns whether
+/// the wake released the joiner, and the wake's count; a still-parked joiner
+/// is cleaned up with a private wake that must find it.
+#[cfg(test)]
+fn shared_wake_meets_wait(wait_op: u64, wake_op: u64) -> (bool, i64) {
+    let words = Box::leak(Box::new(carrick_test_support::GuestUserBuffer::zeroed(
+        0x4000,
+    )));
+    let tid_word = words.arg();
+    let fixture = Box::leak(Box::new(Fixture::with_private_anonymous(
+        0x10000,
+        asid(1),
+        carrick_el1_abi::ReservationRange::new(tid_word, tid_word + 0x4000).unwrap(),
+    )));
+    let (control, child) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    words.set::<u32>(0, 42);
+    let mut wait = carrick_el1_abi::TrapFrame::default();
+    wait.x[8] = crate::sched::SYS_FUTEX as u64;
+    wait.x[0] = tid_word;
+    wait.x[1] = wait_op;
+    wait.x[2] = 42;
+    wait.x[5] = 0xffff_ffff;
+    let route =
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut wait, &mut cpu).unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served,
+        "the wait parks in ring; it is never forwarded"
+    );
+    let waiter = (1..carrick_sched_core::ZONE_RECORDS as u32)
+        .filter_map(carrick_sched_core::RecordId::from_raw)
+        .find(|&id| {
+            fixture.zone.record(id).identity().tid == 41
+                && matches!(
+                    fixture.zone.record(id).claim(),
+                    carrick_sched_core::Claim::Parked { .. }
+                )
+        })
+        .expect("the waiter is parked on the word");
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child.id));
+
+    run_as(fixture, 42, 12, 102, control);
+    let mut wake = carrick_el1_abi::TrapFrame::default();
+    wake.x[8] = crate::sched::SYS_FUTEX as u64;
+    wake.x[0] = tid_word;
+    wake.x[1] = wake_op;
+    wake.x[2] = 1;
+    wake.x[5] = 0xffff_ffff;
+    arm_call_with_cpu(fixture, control, &mut service, &mut wake, &mut cpu).unwrap();
+    let count = wake.x[0] as i64;
+    let released = matches!(
+        fixture.zone.record(waiter).claim(),
+        carrick_sched_core::Claim::Queued { .. }
+    );
+    if !released {
+        assert!(
+            matches!(
+                fixture.zone.record(waiter).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ),
+            "found {:?}",
+            fixture.zone.record(waiter).claim()
+        );
+        // Clean up: the private wake meets the private waiter.
+        let mut cleanup = carrick_el1_abi::TrapFrame::default();
+        cleanup.x[8] = crate::sched::SYS_FUTEX as u64;
+        cleanup.x[0] = tid_word;
+        cleanup.x[1] = crate::sched::FUTEX_WAKE_PRIVATE;
+        cleanup.x[2] = 1;
+        arm_call_with_cpu(fixture, control, &mut service, &mut cleanup, &mut cpu).unwrap();
+        assert_eq!(cleanup.x[0], 1, "the private wake finds the private waiter");
+        assert!(matches!(
+            fixture.zone.record(waiter).claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ));
+    }
+    (released, count)
+}
+
+/// A shared `FUTEX_WAKE` (op 1) releases a shared waiter on the same word of
+/// private anonymous memory, through the production AArch64 entry (#2124).
+#[test]
+fn arm_shared_futex_wake_releases_a_shared_waiter() {
+    for wait_op in [0, 265] {
+        assert_eq!(
+            shared_wake_meets_wait(wait_op, 1),
+            (true, 1),
+            "shared wait op {wait_op}"
+        );
+    }
+    // FUTEX_WAKE_BITSET (op 10) with MATCH_ANY is the same shared key.
+    assert_eq!(shared_wake_meets_wait(265, 10), (true, 1));
+}
+
+/// Linux keeps private and shared keys distinct: a shared wake never finds a
+/// private waiter on the same word.
+#[test]
+fn arm_shared_futex_wake_does_not_release_a_private_waiter() {
+    assert_eq!(
+        shared_wake_meets_wait(crate::sched::FUTEX_WAIT_PRIVATE, 1),
+        (false, 0)
+    );
+}
+
 // Robust-list exit plus host queue completion of an in-ring join.
 #[test]
 fn arm_glibc_pthread_join_robust_host_wake_meets_ring_wait() {
@@ -16960,6 +17071,7 @@ fn futex_owner_wait_episode(
     wake.x[0] = VA;
     wake.x[1] = crate::sched::FUTEX_WAKE_PRIVATE;
     wake.x[2] = 1;
+    wake.x[5] = 0xffff_ffff;
     let waker_slot = SlotId::new(1);
     fixture.zone.drive(waker_slot, 2);
     fixture.zone.publish_slot(waker_slot, 1, Some(0), 1);
