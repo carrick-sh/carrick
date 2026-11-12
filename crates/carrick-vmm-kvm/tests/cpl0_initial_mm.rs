@@ -45,10 +45,22 @@ fn try_run_pool_fixture_with_loaded_pre_entry_hook(
     let image = prepare_x86_elf(&program).expect("x86 ELF program");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
-    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent, None)
-        .expect("production KVM image");
+    // Boot and publish the root's ring descriptor table as production does
+    // (`prepare.rs`), so a child's write stages on its own fd-core table.
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let ipc = carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher);
+    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent, ipc)
+        .expect("production KVM image");
     let root = dispatcher.capture_one_task_context().expect("issued root");
+    root.resources()
+        .files()
+        .publish_ipc(
+            root.kernel().ipc().expect("IPC owner"),
+            carrick_kernel::kernel::objects::IpcTableMapBinding::Retained(
+                carrier.ipc_table_map().expect("retained descriptor map"),
+            ),
+        )
+        .expect("publish exact table");
     root.kernel()
         .bind_initial_birth_source(
             carrier
@@ -1766,14 +1778,16 @@ fn loaded_lane_child_syscall_trap_hands_task_back_to_host_and_delivers_stdout() 
 }
 
 /// Ruling 3 on #542: every idle-lane early return completes the run. With a
-/// zero-exit budget is independent per lane, so the child's first forwarded
-/// call exhausts the idle budget while the loaded root is parked in `wait4`;
+/// zero-exit budget is independent per lane, so the child's first carrier
+/// exit (its `ppoll` host-readiness crossing; since #2157 a child's write is
+/// served in ring and costs no exit) exhausts the idle budget while the
+/// loaded root is parked in `wait4`;
 /// before the single `settle_lane` path an idle
 /// lane error skipped the `Err` completion and the run hung, and before the
 /// shutdown kick the root vCPU stayed in `KVM_RUN` under the halted parent.
 #[test]
 fn idle_lane_exit_budget_failure_completes_the_run() {
-    let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
+    let elf = forward_authority_fixture("CHILD_POLL_WAIT");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result =
