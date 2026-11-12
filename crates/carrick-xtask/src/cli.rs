@@ -87,6 +87,8 @@ pub enum Commands {
 
     #[command(about = "Hold checkout admission through a foreground command")]
     WorktreeRun(crate::worktree_admission::WorktreeRunArgs),
+    #[command(about = "Fail when a gated test is dropped or renamed without a retired-tests entry")]
+    RetiredTests(crate::retired_gate::RetiredTestsArgs),
     #[command(about = "Live position-free authority debt and PR-base ratchet")]
     AuthorityDebt(crate::authority_debt::AuthorityDebtArgs),
 
@@ -768,6 +770,11 @@ where
         Commands::AuthorityDebt(args) => {
             let root = resolve_repo_info(cli.root.as_deref())?.repository_root;
             crate::authority_debt::run(&root, &args)?;
+            Ok(())
+        }
+        Commands::RetiredTests(args) => {
+            let root = resolve_repo_info(cli.root.as_deref())?.repository_root;
+            crate::retired_gate::run(&root, &args)?;
             Ok(())
         }
         Commands::TestLanes(args) => {
