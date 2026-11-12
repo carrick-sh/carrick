@@ -90,6 +90,11 @@ impl PrepareCross for X86PrepareCross<'_> {
         if !(untagged && enterable) {
             return Err(NativeProcessError::Stale);
         }
+        if let Some(build) = self.build.as_deref_mut()
+            && build.build(successor)? != successor.root
+        {
+            return Err(NativeProcessError::Stale);
+        }
         Ok(successor.root.address().raw())
     }
 }
