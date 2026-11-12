@@ -2978,12 +2978,13 @@ fn crossing_operand_duplicated_stdin_reads_through_its_binding() {
 
 
 fn cwd_run(mode: &[&str]) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("cwd witness directory");
     let mut flags = mode.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     for (name, leaf) in [("BASE", "a"), ("PARENT", "b"), ("CHILD", "c")] {
         let path = dir.path().join(leaf);
-        std::fs::create_dir(&path).unwrap();
-        std::fs::write(path.join("marker"), leaf.as_bytes()).unwrap();
+        std::fs::create_dir(&path).expect("create cwd directory");
+        std::fs::write(path.join("marker"), leaf.as_bytes())
+            .expect("write directory-specific marker");
         flags.push(format!("-D{name}_PATH=\"{}\"", path.display()));
     }
     let flags = flags.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2994,13 +2995,14 @@ fn cwd_run(mode: &[&str]) {
         .arg("10")
         .arg(&oracle)
         .output()
-        .unwrap();
+        .expect("bounded native cwd control");
     assert!(native.status.success(), "native: {native:?}");
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     dispatcher.set_fs_backend(Box::new(
-        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/")).unwrap(),
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
     ));
-    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).unwrap();
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("cwd ELF program");
     let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
         &program,
         512,
@@ -3012,7 +3014,7 @@ fn cwd_run(mode: &[&str]) {
         |_| {},
         dispatcher,
     )
-    .unwrap();
+    .expect("cwd production runtime");
     assert_eq!(outcome.run.exit_code, 0, "{mode:?}: {:?}", outcome.run);
     assert!(!outcome.run.trap_limit_hit);
 }
