@@ -42,6 +42,13 @@ impl owner::ReservationGeometry for X86Cpl0ReservationGeometry {
 pub type X86Cpl0Reservations =
     owner::SharedReservations<LinuxReservationPolicy, X86Cpl0ReservationGeometry>;
 pub type X86Cpl0Zone = carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>;
+/// One locked root of the x86 CPL0 table, as its release venue hands it out.
+pub type X86Cpl0Root<'a> = owner::Reservations<
+    'a,
+    LinuxReservationPolicy,
+    X86Cpl0ReservationGeometry,
+    carrick_sched_core::ParkedContextWords,
+>;
 pub type X86Cpl0RootReleaseVenue<'a> = owner::RootReleaseVenue<
     'a,
     LinuxReservationPolicy,
