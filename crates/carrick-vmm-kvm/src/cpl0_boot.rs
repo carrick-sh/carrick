@@ -29,8 +29,7 @@ use carrick_el1_abi::GuestMmuPublication;
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
     BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE, El1TaskId, ReservationMm,
-    ReservationRange, ThreadControlSlot, ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE,
-    X86_CPL0_REGION_BASE,
+    ThreadControlSlot, ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_REGION_BASE,
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
