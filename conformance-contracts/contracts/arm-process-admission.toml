@@ -84,6 +84,13 @@ rationale = "Admission creates one native process owner for the retained root an
 # restoration on a reused slot for a host-loaded thread (#2044 review P0 1),
 # and the checkpoint returns a refused admission (`Stale`) or delivery
 # (`Quarantined`, at the declined-fault seam) instead of serving it (P0 2).
+# #1958 (third cause): a host-loaded thread's park record that its executor
+# unhomed into a host zone wait is woken and switched in on another vCPU
+# after another process's record ran there. It is neither home nor
+# registered, so its resume published no process binding and the thread ran
+# with the other process's PID and root incarnation; its return checkpoint
+# refused it (`entry_binding`). Semantics and budgets are unchanged:
+# carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_unhomed_host_thread_*.
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue",
@@ -91,6 +98,8 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_host_loaded_root_delivers_pending_signal_once_after_another_process_on_the_vcpu",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_signal_checkpoint_returns_a_stale_admission_refusal",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_declined_fault_returns_a_quarantined_delivery_refusal",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_unhomed_host_thread_switched_in_after_another_process_admits",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_unhomed_host_thread_switched_in_after_another_process_delivers_pending_signal_once",
   "carrick-kernel::el1_delegation::tests::serial_host::host_loaded_thread_home_resume_restores_the_published_binding",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_born_thread_first_entry_after_another_process_on_the_vcpu",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_born_thread_first_entry_on_a_detached_executor",
