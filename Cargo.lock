@@ -1334,6 +1334,7 @@ dependencies = [
  "carrick-syscall-abi",
  "carrick-test-support",
  "carrick-x86-carrier",
+ "zerocopy",
 ]
 
 [[package]]
