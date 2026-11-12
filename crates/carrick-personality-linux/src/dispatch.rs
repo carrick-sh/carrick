@@ -285,6 +285,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
         None
     }
     fn anonymous_declined_for_work(&self, _: u64) {}
+    /// The family was declined for pending host work before it was offered
+    /// to its owner (so the owner never counted its own leave).
+    fn declined_before_service(&self, _: u64) {}
     fn declined_for_work(&self, ordinal: u64) {
         if let Some(counters) = self.lifecycle_work_counters() {
             counters.declined(ordinal);
@@ -1370,6 +1373,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && !owned_allocator_control
         && !owned_continuation
     {
+        pending.declined_before_service(ordinal);
         pending.declined_for_work(ordinal);
         return finish(
             ordinal,
