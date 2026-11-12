@@ -2976,7 +2976,6 @@ fn crossing_operand_duplicated_stdin_reads_through_its_binding() {
     );
 }
 
-
 fn cwd_run(mode: &[&str]) {
     let dir = tempfile::tempdir().expect("cwd witness directory");
     let mut flags = mode.iter().map(|s| s.to_string()).collect::<Vec<_>>();
