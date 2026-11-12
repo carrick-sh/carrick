@@ -54,6 +54,46 @@
 //! # }
 //! ```
 //!
+//! A borrowed handle to a lock is not an owner: the order cannot hold it
+//! exclusively, and a guard taken through it would outlive its phase. The
+//! preparations' lock guard cannot ride out into the stock phase:
+//!
+//! ```compile_fail
+//! # use carrick_hal::exec_lock_order::ExecCrossingOrder;
+//! # use carrick_guest_arch::CpuId;
+//! # use std::sync::Mutex;
+//! let preparations = Mutex::new(0_u32);
+//! let stock = Mutex::new(0_u32);
+//! let mut prep_ref = &preparations;
+//! let mut stock_ref = &stock;
+//! let (released, held_preparations) =
+//!     ExecCrossingOrder::on_stopped(CpuId::new(0), &mut prep_ref, &mut stock_ref)
+//!         .preparations(|p| p.lock().unwrap());
+//! let (rooted, ()) = released.root_release(|| ());
+//! let (bound, ()) = rooted.bind_zone(|| ());
+//! bound.fork_stock(|s| {
+//!     let _held_stock = s.lock().unwrap();
+//!     assert!(preparations.try_lock().is_err());
+//! });
+//! drop(held_preparations);
+//! ```
+//!
+//! nor can the stock be locked from inside the preparations through one:
+//!
+//! ```compile_fail
+//! # use carrick_hal::exec_lock_order::ExecCrossingOrder;
+//! # use carrick_guest_arch::CpuId;
+//! # use std::sync::Mutex;
+//! let preparations = Mutex::new(0_u32);
+//! let stock = Mutex::new(0_u32);
+//! let (mut prep_ref, mut stock_ref) = (&preparations, &stock);
+//! let order = ExecCrossingOrder::on_stopped(CpuId::new(0), &mut prep_ref, &mut stock_ref);
+//! let (_released, ()) = order.preparations(|p| {
+//!     let _held_preparations = p.lock().unwrap();
+//!     let _held_stock = stock.lock().unwrap();
+//! });
+//! ```
+//!
 //! The x86 fork commit already follows this order with no preparations at
 //! all: physical custody, the stopped-CPU lease, then `ForkStock::settle`.
 use carrick_guest_arch::CpuId;
