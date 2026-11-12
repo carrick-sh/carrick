@@ -2764,28 +2764,81 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }))
     }
 
-    /// A prepared exec refusal is a process outcome, not a carrier failure.
-    /// Exec never returns to the losing caller: once preparation was accepted,
-    /// an authentication/adoption race retires it through the same SIGKILL
-    /// close transaction used for a losing sibling.
+    /// Retire an exec caller after a concurrent `exec`, `exit_group`, or fatal
+    /// `SIGKILL` won process closing, keeping that winner's terminal status
+    /// through `resume_pending_lifecycle` rather than overwriting it with
+    /// `SIGSEGV`.
     #[inline(never)]
-    fn kill_refused_exec(&mut self) -> NativeResume {
-        if self
-            .exit_with_signal(carrick_signal_core::policy::Signal::KILL)
-            .is_ok()
+    fn retire_lost_exec_race(&mut self) -> NativeResume {
+        if !self.runtime.graph.lock().pending.has_exit(&self.key)
+            && self
+                .exit_with_signal(carrick_signal_core::policy::Signal::KILL)
+                .is_ok()
         {
             return NativeResume::Left(None);
         }
-        // A concurrent terminal transition can consume the direct exit
-        // admission.  Drive its already-owned lifecycle continuation instead
-        // of escalating one process's failed exec into a carrier failure.
-        let _ = self.resume_pending_lifecycle();
+        // SAFETY: this exact selected record consumed its exec continuation on
+        // entry to `finish_exec_closing_ready`; republishing syscall owner
+        // continuation hands custody directly to `resume_pending_lifecycle`
+        // below without returning to user mode.
+        unsafe {
+            self.source
+                .zone
+                .record(self.record.id)
+                .publish_owner_continuation(OwnerEntry::Syscall);
+        }
+        if let Some(LifecycleOutcome::HostCustody) = self.resume_pending_lifecycle() {
+            self.handoff = carrick_core::entry::yield_current_to_host(
+                self.binding,
+                self.source,
+                self.record.id,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            );
+            if self.handoff.is_some() {
+                self.current.linux.mark_pending_host_work();
+            }
+        }
         if self.handoff.is_some() {
             NativeResume::Left(None)
         } else {
             let _ = self.run_failed(NativeProcessError::Quarantined.run_failure_reason());
             NativeResume::Left(None)
         }
+    }
+
+    /// A prepared exec failure past the point of no return is a process
+    /// outcome, not a carrier failure: `execve(2)` kills the process with
+    /// `ExecPastNoReturn` (`SIGSEGV`). If a concurrent `exec`, `exit_group`, or
+    /// fatal `SIGKILL` already won, yield to that winner's terminal status.
+    #[inline(never)]
+    fn exec_past_no_return(&mut self) -> NativeResume {
+        let lost_race = {
+            let graph = self.runtime.graph.lock();
+            graph.pending.has_exit(&self.key)
+                || graph.owner.task(self.key).is_ok_and(|row| {
+                    matches!(
+                        row.native()
+                            .resources()
+                            .page
+                            .process_exit_custody()
+                            .cancellation(),
+                        Some(
+                            carrick_core::terminal::ProcessCancellation::FatalSignal
+                                | carrick_core::terminal::ProcessCancellation::GroupExit
+                        )
+                    )
+                })
+        };
+        if lost_race {
+            return self.retire_lost_exec_race();
+        }
+        if self
+            .exit_with_signal(carrick_signal_core::policy::ExecPastNoReturn::SIGNAL)
+            .is_ok()
+        {
+            return NativeResume::Left(None);
+        }
+        self.retire_lost_exec_race()
     }
 
     #[inline(never)]
@@ -2800,7 +2853,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let _ = self.run_failed(error.run_failure_reason());
             return NativeResume::Left(None);
         }
-        self.kill_refused_exec()
+        self.exec_past_no_return()
     }
 
     #[inline(never)]
@@ -2911,14 +2964,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let Some(successor_slot) = pending.exec_successor.take() else {
             drop(prepared_fds);
             let _ = self.release_service_claim(pending.claim);
-            return Ok(self.kill_refused_exec());
+            return Ok(self.exec_past_no_return());
         };
         successor_slot.commit();
         if successor.address != expected_address {
             drop(prepared_fds);
             let _ = self.release_service_claim(pending.claim);
-            return Ok(self.kill_refused_exec());
-        }
+            return Ok(self.exec_past_no_return());
+        };
         let predecessor = self.caller_address;
         let successor_address = successor.address;
         let (table_custody, releases) = carrick_fd_core::exec::commit(prepared_fds);
@@ -2935,7 +2988,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .exec_deferred(carrick_fd_core::TableId::from_raw(raw))
                 .is_err()
             {
-                return Ok(self.kill_refused_exec());
+                return Ok(self.exec_past_no_return());
             }
             self.current.linux.mark_pending_host_work();
         }
@@ -2949,7 +3002,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .is_err()
         {
             let _ = self.release_service_claim(pending.claim);
-            return Ok(self.kill_refused_exec());
+            return Ok(self.exec_past_no_return());
         }
         self.release_service_claim(pending.claim)?;
         Ok(NativeResume::NoPending)
@@ -3037,7 +3090,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // converted into process closing and must never resurrect the
             // predecessor gate.
             if settled.retract_exec_cancellation(page).is_err() {
-                return Ok(self.kill_refused_exec());
+                return Ok(self.retire_lost_exec_race());
             }
             page.reopen_after_exec_binding()
                 .map_err(|_| NativeProcessError::Stale)?;
