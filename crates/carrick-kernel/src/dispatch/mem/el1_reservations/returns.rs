@@ -9,20 +9,27 @@
 //! the extent and acknowledges its sequence.
 //!
 //! [`MemView::reconcile_el1_deferred_returns`] is that reconciliation, ONE
-//! transaction per boundary: every owed extent is retired through the
-//! backend's ordinary unmap (stage-1 retired leaves and their tables,
-//! stage-2, the frame inventory, returning the frames to the host), its host
-//! residency and mapping metadata are removed, and only after all of them
-//! succeeded is the journal acknowledged through the newest sequence
-//! observed. A backend failure acknowledges nothing: the extents stay owed
-//! (their frames unreusable) and the next boundary retries; the backend
-//! retirement is idempotent over an already-retired range.
+//! transaction per boundary, run through the neutral settlement routine
+//! ([`carrick_hal::return_settlement::settle_owed_returns`]): every owed
+//! extent is retired through the backend's ordinary unmap (stage-1 retired
+//! leaves and their tables, stage-2, the frame inventory, returning the
+//! frames to the host); only after all of them succeeded are the extents'
+//! host residency and mapping metadata removed, and then each journal slot
+//! is acknowledged by its (slot, epoch, start). A backend failure applies
+//! and acknowledges nothing: the extents stay owed (their frames
+//! unreusable) and the next boundary retries; the backend retirement is
+//! idempotent over an already-retired range.
 //!
 //! It runs under the MM's mutation authority, whose EL1 editor exclusion
-//! keeps guest EL1 from journaling a new return meanwhile.
+//! keeps guest EL1 from journaling a new return meanwhile, and under the
+//! MM's settlement lock. #1393 deletes this host venue once every root is
+//! ring-owned; the routine stays.
 
 use super::*;
-use carrick_el1_abi::ReservationSequence;
+use carrick_el1_abi::{ReservationSequence, ReturnJournal, SettlementOutcome};
+use carrick_hal::return_settlement::{
+    OwedReturnRetirement, ReturnJournalAccess, ReturnSettlementError, settle_owed_returns,
+};
 
 /// Why a reconciliation acknowledged nothing. The owed extents stay owed.
 #[derive(::core::fmt::Debug)]
@@ -130,41 +137,110 @@ impl MemView<'_> {
         let Some(root) = self.mem().lock().delegated_root().cloned() else {
             return Ok(0);
         };
-        // The root guard is released before any backend service runs.
-        let (owed, through) = root
-            .with_root(|model| Ok(owed_returns(model)))
-            .map_err(El1ReturnError::Authority)?;
-        // Unused first-touch stock returns with the owed extents: a host
-        // mapping step must never place over backing EL1 holds for no node.
-        let (stock_spans, stock) = self.take_first_touch_stock();
-        if through.is_none() && stock.is_empty() {
-            return Ok(0);
-        }
-        {
-            let mut dispatch = self.begin_conditional_vma_dispatch(permit);
-            for range in owed.iter().chain(&stock) {
-                let len = usize::try_from(range.len())
-                    .map_err(|_| El1ReturnError::Authority(Refusal::Invalid.into()))?;
-                if let Err(error) = memory.unmap_range(range.start(), len) {
-                    // Nothing is acknowledged; the stock is retried too.
-                    self.restore_first_touch_stock(stock_spans);
-                    return Err(El1ReturnError::Backend {
-                        range: *range,
-                        error,
-                    });
+        crate::kernel::mm_occupancy::with_excluded_el1_editor(
+            authority.mm_id,
+            permit.excluded_editor(),
+            |excluded| {
+                let guard = authority.return_settlement.lock(excluded);
+                let mut retirement = HostReturnRetirement {
+                    view: self,
+                    permit,
+                    memory,
+                    dispatch: None,
+                    stock_spans: Vec::new(),
+                    stock: Vec::new(),
+                };
+                match settle_owed_returns(excluded, &guard, &root, &mut retirement) {
+                    Ok(SettlementOutcome::Settled(receipt)) => Ok(receipt.freed),
+                    // The permit's MM is the excluded MM's, and the host
+                    // venue never defers its own returns.
+                    Ok(SettlementOutcome::Stale | SettlementOutcome::Skipped(_)) => {
+                        Err(El1ReturnError::Authority(Refusal::Stale.into()))
+                    }
+                    Err(ReturnSettlementError::Journal(refusal)) => {
+                        Err(El1ReturnError::Authority(refusal))
+                    }
+                    Err(ReturnSettlementError::Backend(error)) => Err(error),
                 }
-                // The VA is the root's to place again once acknowledged:
-                // leave no host protection fact behind for its next mapping.
-                memory.return_to_root(range.start(), len);
-                self.remove_mapping_metadata(range.start(), range.len());
-            }
-            self.mark_vma_dispatch(&mut dispatch);
+            },
+        )
+    }
+}
+
+impl ReturnJournalAccess for DelegatedRoot {
+    type Error = RootAccessRefusal;
+    fn with_journal<R>(
+        &self,
+        step: impl FnOnce(&mut dyn ReturnJournal) -> Result<R, Refusal>,
+    ) -> Result<R, RootAccessRefusal> {
+        self.with_root(|model| step(model))
+    }
+}
+
+/// The host venue's retirement of owed extents: the backend's ordinary unmap
+/// for each, then, once all succeeded, the host's residency and mapping
+/// facts for them. Unused first-touch stock retires with them: a host
+/// mapping step must never place over backing EL1 holds for no node.
+struct HostReturnRetirement<'v, 'p, 'g, M: CurrentMmMemory + ?Sized> {
+    view: &'v MemView<'v>,
+    permit: &'p HostAliasPermit<'g>,
+    memory: &'v mut M,
+    dispatch: Option<crate::dispatch::HostAliasDispatchGuard<'p>>,
+    /// The stock spans taken for this settlement, restored if it fails.
+    stock_spans: Vec<ReservationRange>,
+    stock: Vec<ReservationRange>,
+}
+
+impl<M: CurrentMmMemory + ?Sized> OwedReturnRetirement for HostReturnRetirement<'_, '_, '_, M> {
+    type Prepared = Vec<ReservationRange>;
+    type Error = El1ReturnError;
+    fn prepare(
+        &mut self,
+        request: &carrick_el1_abi::ReturnSettlementRequest,
+    ) -> Result<Vec<ReservationRange>, El1ReturnError> {
+        (self.stock_spans, self.stock) = self.view.take_first_touch_stock();
+        if request.is_empty() && self.stock.is_empty() {
+            return Ok(Vec::new());
         }
-        match through {
-            Some(through) => root
-                .with_root(|model| model.acknowledge_deferred_returns(through))
-                .map_err(El1ReturnError::Authority),
-            None => Ok(0),
+        let ranges: Vec<ReservationRange> = request
+            .iter()
+            .map(|owed| owed.range)
+            .chain(self.stock.iter().copied())
+            .collect();
+        self.dispatch = Some(self.view.begin_conditional_vma_dispatch(self.permit));
+        for range in &ranges {
+            let retired = usize::try_from(range.len())
+                .map_err(|_| El1ReturnError::Authority(Refusal::Invalid.into()))
+                .and_then(|len| {
+                    self.memory
+                        .unmap_range(range.start(), len)
+                        .map_err(|error| El1ReturnError::Backend {
+                            range: *range,
+                            error,
+                        })
+                });
+            if let Err(error) = retired {
+                // Nothing is acknowledged; the stock is retried too.
+                self.dispatch = None;
+                self.view
+                    .restore_first_touch_stock(std::mem::take(&mut self.stock_spans));
+                return Err(error);
+            }
+        }
+        Ok(ranges)
+    }
+    fn apply(&mut self, retired: Vec<ReservationRange>) {
+        for range in &retired {
+            // Lossless: `prepare` converted every length.
+            let len = range.len() as usize;
+            // The VA is the root's to place again once acknowledged:
+            // leave no host protection fact behind for its next mapping.
+            self.memory.return_to_root(range.start(), len);
+            self.view
+                .remove_mapping_metadata(range.start(), range.len());
+        }
+        if let Some(mut dispatch) = self.dispatch.take() {
+            self.view.mark_vma_dispatch(&mut dispatch);
         }
     }
 }

@@ -142,6 +142,7 @@ impl ForkCommit<'_> {
             coordinator: Arc::clone(&self.child_coordinator),
             mm: self.child_mm,
             guest_tid: None,
+            excluded: None,
             _guard: PhantomData,
         }
     }
@@ -176,6 +177,7 @@ impl ForkCommit<'_> {
             coordinator: Arc::clone(&self.parent_coordinator),
             mm: self.parent_mm,
             guest_tid: None,
+            excluded: None,
             _guard: PhantomData,
         };
         let permit = self.child_permit();
@@ -200,6 +202,7 @@ impl ForkCommit<'_> {
             coordinator: Arc::clone(&self.parent_coordinator),
             mm: self.parent_mm,
             guest_tid: None,
+            excluded: None,
             _guard: PhantomData,
         };
         self.child.admit_el1_reservations(

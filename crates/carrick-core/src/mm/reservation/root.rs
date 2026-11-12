@@ -11,7 +11,7 @@ use super::{
     ReservationNodePayload as NodePayload,
 };
 use carrick_core_abi::*;
-pub use carrick_core_abi::{Decision, Layout, MoveTarget, Placement, Refusal};
+pub use carrick_core_abi::{Decision, DeferredReturn, Layout, MoveTarget, Placement, Refusal};
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -144,7 +144,7 @@ const NODE_OWNED: u64 = 1 << 63;
 const NODE_CUSTODY_BITS: u64 = 3 << 62;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
-const VERSION: u64 = 9;
+const VERSION: u64 = 10;
 /// Nodes each root keeps for its host venue: enough for the net growth of
 /// any one host syscall's mirror (at most two straddler splits per edit
 /// boundary pair, demotion and placeholder included).
@@ -152,28 +152,10 @@ pub const HOST_RESERVE: u32 = 8;
 /// Retired resident extents one root can hold between EL1 retirement and the
 /// host's stage-2/inventory receipt. A full journal forwards the next
 /// resident retirement, so the host drains before serving it.
-pub const DEFERRED_RETURNS: usize = 8;
+pub const DEFERRED_RETURNS: usize = OWED_RETURNS_PER_MM;
 /// Table-wide journal slots shared by every root (at most
 /// [`DEFERRED_RETURNS`] each). Per-root state has no room to grow.
 const DEFERRED_SLOTS: usize = 64;
-
-/// A resident extent EL1 retired at stage-1 (its terminals keep their output
-/// as `SW_RETIRED`) whose stage-2 and frame-inventory return is still owed.
-/// The frames stay unreusable, and no `Prepare` may hand the range out again,
-/// until the host venue reconciles the extent and acknowledges `sequence`
-/// ([`Reservations::acknowledge_deferred_returns`]).
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-)]
-pub struct DeferredReturn {
-    pub range: ReservationRange,
-    /// The newest completed request whose retirement this extent covers.
-    pub sequence: ReservationSequence,
-}
 
 /// One root's journal slot, reserved by [`Reservations::reserve_return`]
 /// before a retirement's descriptor step and consumed by its commit or
@@ -301,12 +283,61 @@ struct Root {
 /// One owed return ([`DeferredReturn`]). `mm` is the owning root's published
 /// key (never reused), 0 when free. A slot is claimed, written, edited and
 /// freed only under its owner's root guard; other roots read `mm` alone.
+/// `epoch` advances each time the slot is freed, so a (slot, epoch) pair
+/// names one owed extent and never its successor.
 #[repr(C)]
 struct DeferredSlot {
     mm: AtomicU64,
     start: AtomicU64,
     end: AtomicU64,
     sequence: AtomicU64,
+    epoch: AtomicU64,
+}
+impl DeferredSlot {
+    /// Free the slot. Only a [`ReturnSettlement`] reaches here: a matched
+    /// chunk acknowledgement or whole-MM teardown.
+    fn free(&self, _settlement: ReturnSettlement) {
+        self.start.store(0, Ordering::Relaxed);
+        self.end.store(0, Ordering::Relaxed);
+        self.sequence.store(0, Ordering::Relaxed);
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.mm.store(0, Ordering::Release);
+    }
+    /// Give back a claimed slot whose retirement never committed: it never
+    /// held an extent, so no settlement is owed and its epoch is unchanged.
+    fn abandon(&self) {
+        self.mm.store(0, Ordering::Release);
+    }
+}
+
+/// The authority that frees an owed-return slot. Settlement is the only way
+/// a slot's frames and VA become reusable, so freeing takes one of these:
+/// a chunk acknowledgement that matched the slot's (epoch, start) and
+/// reached its end, or the teardown of the whole MM.
+#[must_use]
+struct ReturnSettlement {
+    _kind: ReturnSettlementKind,
+}
+enum ReturnSettlementKind {
+    /// `acknowledge_chunk` reached the extent's end.
+    Chunk,
+    /// The MM is being destroyed: its frames retire with its own inventory
+    /// (`retire_final`), so no VA is ever placed again.
+    WholeMm,
+}
+impl ReturnSettlement {
+    fn chunk() -> Self {
+        Self {
+            _kind: ReturnSettlementKind::Chunk,
+        }
+    }
+    /// Teardown's acknowledgement, minted only by `retire_final` once the
+    /// root is closed for good (no pending edit, no fork, gate closed).
+    fn whole_mm() -> Self {
+        Self {
+            _kind: ReturnSettlementKind::WholeMm,
+        }
+    }
 }
 // Access to state requires the root's nonblocking exclusive guard.
 unsafe impl Sync for Root {}
@@ -1490,10 +1521,6 @@ impl<
         self.reap_prepared();
         self.pending().is_none() && !self.state().fork_pending && !self.has_prepared_copy()
     }
-    pub fn fork_settled(&self) -> bool {
-        self.pending().is_none() && !self.state().fork_pending && self.deferred().next().is_none()
-    }
-
     pub fn generation(&self) -> ReservationGeneration {
         self.state().generation
     }
@@ -2837,15 +2864,23 @@ impl<
             .filter(move |slot| slot.mm.load(Ordering::Acquire) == mm)
     }
     fn deferred(&self) -> impl Iterator<Item = DeferredReturn> + '_ {
-        self.deferred_slots().filter_map(|slot| {
-            Some(DeferredReturn {
-                range: ReservationRange::new(
-                    slot.start.load(Ordering::Relaxed),
-                    slot.end.load(Ordering::Relaxed),
-                )?,
-                sequence: ReservationSequence::new(slot.sequence.load(Ordering::Relaxed))?,
+        let mm = self.mm.raw();
+        self.table
+            .deferred
+            .iter()
+            .enumerate()
+            .filter(move |(_, slot)| slot.mm.load(Ordering::Acquire) == mm)
+            .filter_map(|(index, slot)| {
+                Some(DeferredReturn {
+                    range: ReservationRange::new(
+                        slot.start.load(Ordering::Relaxed),
+                        slot.end.load(Ordering::Relaxed),
+                    )?,
+                    sequence: ReservationSequence::new(slot.sequence.load(Ordering::Relaxed))?,
+                    slot: OwedSlot::new(index)?,
+                    epoch: OwedSlotEpoch::new(slot.epoch.load(Ordering::Relaxed)),
+                })
             })
-        })
     }
     fn return_owed_within(&self, range: ReservationRange) -> bool {
         self.deferred()
@@ -2903,7 +2938,7 @@ impl<
     pub fn release_return(&mut self, slot: ReturnSlot) {
         let entry = &self.table.deferred[slot.index];
         if !slot.merge && entry.mm.load(Ordering::Acquire) == self.mm.raw() {
-            entry.mm.store(0, Ordering::Release);
+            entry.abandon();
         }
     }
     /// Host venue, at its next boundary for this MM: every extent whose
@@ -2914,28 +2949,43 @@ impl<
             visit(owed);
         }
     }
-    /// Host venue: stage-1 retired leaves, stage-2 and the frame inventory
-    /// of every owed extent up to `through` were reconciled as one
-    /// transaction. Only then do those frames and VAs become reusable.
-    /// Returns the number of extents released.
-    pub fn acknowledge_deferred_returns(
+    /// Settlement: `[expected_start, new_start)` of the owed extent in
+    /// `slot` was retired (stage-1 retired leaves, stage-2 and the frame
+    /// inventory) and its batch applied. Only then do those frames and VAs
+    /// become reusable. A compare-and-swap of the slot's `start`, the
+    /// settlement cursor: effective only while the slot is this root's,
+    /// still holds `epoch` and starts at `expected_start`, and `new_start`
+    /// lies in `(expected_start, end]`. `new_start == end` frees the slot
+    /// and advances its epoch. Anything else is `Stale` with no effect.
+    pub fn acknowledge_chunk(
         &mut self,
-        through: ReservationSequence,
-    ) -> Result<usize, Refusal> {
+        slot: OwedSlot,
+        epoch: OwedSlotEpoch,
+        expected_start: u64,
+        new_start: u64,
+    ) -> Result<ChunkAcknowledgement, Refusal> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
-        let mut released = 0;
-        for slot in self.deferred_slots() {
-            if slot.sequence.load(Ordering::Relaxed) <= through.raw() {
-                slot.start.store(0, Ordering::Relaxed);
-                slot.end.store(0, Ordering::Relaxed);
-                slot.sequence.store(0, Ordering::Relaxed);
-                slot.mm.store(0, Ordering::Release);
-                released += 1;
-            }
+        let Some(entry) = self.table.deferred.get(slot.index()) else {
+            return Ok(ChunkAcknowledgement::Stale);
+        };
+        let end = entry.end.load(Ordering::Relaxed);
+        if entry.mm.load(Ordering::Acquire) != self.mm.raw()
+            || entry.epoch.load(Ordering::Relaxed) != epoch.raw()
+            || entry.start.load(Ordering::Relaxed) != expected_start
+            || new_start <= expected_start
+            || new_start > end
+            || !new_start.is_multiple_of(4096)
+        {
+            return Ok(ChunkAcknowledgement::Stale);
         }
-        Ok(released)
+        if new_start == end {
+            entry.free(ReturnSettlement::chunk());
+            return Ok(ChunkAcknowledgement::Freed);
+        }
+        entry.start.store(new_start, Ordering::Relaxed);
+        Ok(ChunkAcknowledgement::Advanced)
     }
     /// Complete a pending `Retire`, `Decommit` (or a `Prepare` replacing resident memory)
     /// whose stage-1 terminals the guest venue retired, and journal the
@@ -3596,7 +3646,7 @@ impl<
         }
         let released = self.deferred().count();
         for slot in self.deferred_slots() {
-            slot.mm.store(0, Ordering::Release);
+            slot.free(ReturnSettlement::whole_mm());
         }
         self.release_tree(self.state().tree);
         let source_tree = self.source_tree();
@@ -3828,7 +3878,7 @@ mod tests {
         let first = root.mmap(Placement::Anywhere, MIB, rw).unwrap();
         assert_eq!(complete(&mut root, first), 0x100000);
         let owed = range(0x100000, 0x100000 + MIB);
-        let sequence = retire_owed(&mut root, owed);
+        retire_owed(&mut root, owed);
         assert!(root.mapping(0x100000).is_none());
 
         // mmap(NULL) of the same size lands outside the owed extent.
@@ -3860,9 +3910,158 @@ mod tests {
 
         // Settled, the VA is reusable again and placement returns to it.
         let mut root = table.lock(0, child).unwrap();
-        root.acknowledge_deferred_returns(sequence).unwrap();
+        for owed in ReturnJournal::owed_returns(&root).unwrap().iter() {
+            root.acknowledge_chunk(owed.slot, owed.epoch, owed.range.start(), owed.range.end())
+                .unwrap();
+        }
         let decision = root.mmap(Placement::Anywhere, MIB, rw).unwrap();
         assert_eq!(complete(&mut root, decision), 0x100000);
+    }
+    fn owed_rows(root: &Reservations<'_>) -> Vec<DeferredReturn> {
+        ReturnJournal::owed_returns(root)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// #1480: a settlement handle names one slot lifetime. Once the slot is
+    /// freed (its epoch advances) and a successor extent reuses it, the old
+    /// handle acknowledges nothing: the successor stays owed, untouched.
+    #[test]
+    fn stale_owed_return_handle_never_acknowledges_its_successor() {
+        let table = table();
+        let mm = ReservationMm::new(1480).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        table.lock(0, mm).unwrap().finish_import().unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        let mut root = table.lock(0, mm).unwrap();
+        let first = root.mmap(Placement::Fixed(0x100000), 0x4000, rw).unwrap();
+        complete(&mut root, first);
+        retire_owed(&mut root, range(0x100000, 0x102000));
+        let [old] = owed_rows(&root)[..] else {
+            panic!("one owed extent");
+        };
+        assert_eq!(
+            root.acknowledge_chunk(old.slot, old.epoch, 0x100000, 0x102000),
+            Ok(ChunkAcknowledgement::Freed)
+        );
+        // The successor lands in the same (now free) slot, one epoch on.
+        retire_owed(&mut root, range(0x102000, 0x104000));
+        let [successor] = owed_rows(&root)[..] else {
+            panic!("one owed extent");
+        };
+        assert_eq!(successor.slot, old.slot);
+        assert_ne!(successor.epoch, old.epoch);
+        // A retried or duplicated settlement of the old extent: no effect.
+        for (start, end) in [(0x100000, 0x102000), (0x102000, 0x104000)] {
+            assert_eq!(
+                root.acknowledge_chunk(old.slot, old.epoch, start, end),
+                Ok(ChunkAcknowledgement::Stale)
+            );
+        }
+        assert_eq!(owed_rows(&root), vec![successor]);
+        assert_eq!(
+            root.mmap(Placement::Fixed(0x102000), 0x1000, rw),
+            Err(Refusal::Busy),
+            "the successor's VA stays unplaceable"
+        );
+    }
+
+    /// #1480: the slot's `start` is the settlement cursor. A chunk shrinks
+    /// the extent from the front; a front merge after the walk moves `start`
+    /// back over unsettled pages, so the walked chunk's acknowledgement is
+    /// stale; the extent's end frees the slot.
+    #[test]
+    fn owed_return_chunks_acknowledge_by_compare_and_swap_on_start() {
+        let table = table();
+        let mm = ReservationMm::new(1481).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        table.lock(0, mm).unwrap().finish_import().unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        let mut root = table.lock(0, mm).unwrap();
+        let mapped = root.mmap(Placement::Fixed(0x100000), 0x8000, rw).unwrap();
+        complete(&mut root, mapped);
+        retire_owed(&mut root, range(0x103000, 0x106000));
+        let [walked] = owed_rows(&root)[..] else {
+            panic!("one owed extent");
+        };
+        // Out of the extent, not page aligned, or not past the cursor.
+        for new_start in [0x107000, 0x103800, 0x103000] {
+            assert_eq!(
+                root.acknowledge_chunk(walked.slot, walked.epoch, 0x103000, new_start),
+                Ok(ChunkAcknowledgement::Stale)
+            );
+        }
+        // A front merge after the walk: the walked chunk is stale.
+        retire_owed(&mut root, range(0x101000, 0x103000));
+        assert_eq!(
+            root.acknowledge_chunk(walked.slot, walked.epoch, 0x103000, 0x106000),
+            Ok(ChunkAcknowledgement::Stale)
+        );
+        let [merged] = owed_rows(&root)[..] else {
+            panic!("one merged extent");
+        };
+        assert_eq!(merged.range, range(0x101000, 0x106000));
+        assert_eq!(merged.slot, walked.slot);
+        assert_eq!(
+            root.acknowledge_chunk(merged.slot, merged.epoch, 0x101000, 0x104000),
+            Ok(ChunkAcknowledgement::Advanced)
+        );
+        let [rest] = owed_rows(&root)[..] else {
+            panic!("one owed extent");
+        };
+        assert_eq!(rest.range, range(0x104000, 0x106000));
+        assert_eq!(
+            rest.epoch, merged.epoch,
+            "a chunk keeps the slot's lifetime"
+        );
+        assert_eq!(
+            root.acknowledge_chunk(rest.slot, rest.epoch, 0x104000, 0x106000),
+            Ok(ChunkAcknowledgement::Freed)
+        );
+        assert!(owed_rows(&root).is_empty());
+    }
+
+    /// #1480: whole-MM teardown is a settlement too: it frees the closed
+    /// root's slots with their epochs advanced, so a settlement handle
+    /// observed before teardown cannot free the slot's next owner.
+    #[test]
+    fn whole_mm_teardown_advances_the_epoch_of_every_owed_slot() {
+        let table = table();
+        let (gone, next) = (
+            ReservationMm::new(1482).unwrap(),
+            ReservationMm::new(1483).unwrap(),
+        );
+        for (slot, mm) in [(0, gone), (1, next)] {
+            table.publish(slot, mm, layout()).unwrap();
+            table.lock(slot, mm).unwrap().finish_import().unwrap();
+        }
+        let rw = ReservationProtection::READ_WRITE;
+        let mut root = table.lock(0, gone).unwrap();
+        let mapped = root.mmap(Placement::Fixed(0x100000), 0x2000, rw).unwrap();
+        complete(&mut root, mapped);
+        retire_owed(&mut root, range(0x100000, 0x102000));
+        let [old] = owed_rows(&root)[..] else {
+            panic!("one owed extent");
+        };
+        assert_eq!(root.retire_final(), Ok(1));
+        let mut successor = table.lock(1, next).unwrap();
+        let mapped = successor
+            .mmap(Placement::Fixed(0x100000), 0x2000, rw)
+            .unwrap();
+        complete(&mut successor, mapped);
+        retire_owed(&mut successor, range(0x100000, 0x102000));
+        let [reused] = owed_rows(&successor)[..] else {
+            panic!("one owed extent");
+        };
+        assert_eq!(reused.slot, old.slot);
+        assert_ne!(reused.epoch, old.epoch);
+        assert_eq!(
+            successor.acknowledge_chunk(old.slot, old.epoch, 0x100000, 0x102000),
+            Ok(ChunkAcknowledgement::Stale)
+        );
+        assert_eq!(owed_rows(&successor), vec![reused]);
     }
     fn first_fit_avoids(root: &mut Reservations<'_>, owed: ReservationRange, len: u64) -> bool {
         let start = root.first_fit(len).unwrap();
@@ -4132,7 +4331,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(owed_plan.range().end(), 0x208000);
-        root.acknowledge_deferred_returns(request.sequence).unwrap();
+        for owed in ReturnJournal::owed_returns(&root).unwrap().iter() {
+            root.acknowledge_chunk(owed.slot, owed.epoch, owed.range.start(), owed.range.end())
+                .unwrap();
+        }
         assert_eq!(
             root.revalidate_private_stock_plan(&owed_plan, &empty),
             Err(Refusal::Stale)
@@ -6674,7 +6876,11 @@ mod tests {
             g.commit_range(commit_span, ReservationProtection::READ_WRITE),
             Err(Refusal::Busy)
         );
-        assert_eq!(g.acknowledge_deferred_returns(request.sequence).unwrap(), 1);
+        let [owed] = owed[..] else { unreachable!() };
+        assert_eq!(
+            g.acknowledge_chunk(owed.slot, owed.epoch, owed.range.start(), owed.range.end()),
+            Ok(ChunkAcknowledgement::Freed)
+        );
         assert!(g.is_reserved(reserve_span));
         let decision = g
             .commit_range(commit_span, ReservationProtection::READ_WRITE)
@@ -6807,6 +7013,35 @@ mod tests {
             ),
             Err(Refusal::ForeignMapping)
         );
+    }
+}
+
+/// The neutral settlement routine's view of this root's journal
+/// (`carrick_hal::return_settlement`).
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> ReturnJournal for Reservations<'_, Policy, Geometry, C>
+{
+    fn owed_returns(&self) -> Result<ReturnSettlementRequest, Refusal> {
+        if !self.state().admitted {
+            return Err(Refusal::Stale);
+        }
+        let mut request = ReturnSettlementRequest::new(self.mm);
+        for owed in self.deferred() {
+            request.push(owed)?;
+        }
+        Ok(request)
+    }
+    fn acknowledge_chunk(
+        &mut self,
+        slot: OwedSlot,
+        epoch: OwedSlotEpoch,
+        expected_start: u64,
+        new_start: u64,
+    ) -> Result<ChunkAcknowledgement, Refusal> {
+        Reservations::acknowledge_chunk(self, slot, epoch, expected_start, new_start)
     }
 }
 
