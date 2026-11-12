@@ -2565,14 +2565,47 @@ fn post_arm_exec_adoption_failure_is_sigsegv() {
 }
 
 #[cfg(test)]
+#[test]
+fn lost_exec_race_keeps_winner_signal_instead_of_sigsegv() {
+    for adoption_failure in [false, true] {
+        lost_exec_fatal_signal_case_for::<
+            ParkedContextWords,
+            carrick_mmu_core::x86::owner_mmu::X86Mmu,
+        >(words, adoption_failure);
+        lost_exec_fatal_signal_case_for::<
+            carrick_el1_abi::Aarch64ParkedContext,
+            carrick_mmu_core::owner_mmu::Aarch64Mmu,
+        >(arm_words, adoption_failure);
+    }
+}
+
+#[cfg(test)]
 fn refused_exec_case(adoption_failure: bool) {
-    let fixture = native_exec_fixture();
+    refused_exec_case_for::<ParkedContextWords, carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        words,
+        adoption_failure,
+    );
+    refused_exec_case_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, adoption_failure);
+}
+
+#[cfg(test)]
+fn refused_exec_case_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    adoption_failure: bool,
+) {
+    let _ = take_exec_cancellations();
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
     };
     let mut service = fixture.service();
-    assert!(take_exec_cancellations().is_empty());
     {
         let mut entry = fixture
             .runtime
@@ -2581,7 +2614,7 @@ fn refused_exec_case(adoption_failure: bool) {
                 source,
                 fixture.task,
                 fixture.address,
-                &words(fixture.address),
+                &(fixture.make_words)(fixture.address),
                 &mut service,
             )
             .unwrap();
@@ -2639,12 +2672,105 @@ fn refused_exec_case(adoption_failure: bool) {
         Ok(NativeResume::Left(None))
     ));
     assert!(entry.take_run_failure().is_none());
-    if adoption_failure {
-        assert_eq!(entry.take_root_exit().map(|status| status.raw()), Some(11));
-    }
+    assert_eq!(
+        entry.take_root_exit().map(|status| status.raw()),
+        Some(carrick_signal_core::policy::ExecPastNoReturn::SIGNAL.number()),
+    );
     assert_eq!(take_exec_cancellations(), vec![113]);
     assert_eq!(fixture.task.mm.key.load(Ordering::Acquire), 1);
     assert!(fixture.zone.spaces.find(successor_mm.raw()).is_none());
+}
+
+#[cfg(test)]
+fn lost_exec_fatal_signal_case_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    adoption_failure: bool,
+) {
+    let _ = take_exec_cancellations();
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(
+                test_exec_payload(b"/bin/static"),
+                None,
+                NativeServiceCall::new(
+                    carrick_guest_arch::NativeOrdinal::new(221),
+                    &carrick_el1_abi::Counters::new()
+                )
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let successor_mm = publish_test_exec_reply_with(
+        &fixture,
+        fixture.control,
+        fixture.slot,
+        119,
+        0xc0_0000,
+        false,
+    );
+    if adoption_failure {
+        let index = fixture.zone.spaces.find(successor_mm.raw()).unwrap();
+        assert!(fixture.zone.spaces.bind_initial_root(
+            index,
+            successor_mm.raw(),
+            0xd0_0000,
+            0xd0_0000,
+        ));
+    }
+    // Simulate a concurrent SIGKILL upgrading the process cancellation cause
+    // before the exec caller finishes adoption or retracts exec cancellation.
+    fixture
+        .page
+        .process_exit_custody()
+        .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    // SAFETY: the prepared-service wake selected this exact record.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::Left(None))
+    ));
+    assert!(entry.take_run_failure().is_none());
+    assert_eq!(
+        entry.take_root_exit().map(|status| status.raw()),
+        Some(carrick_signal_core::policy::Signal::KILL.number()),
+    );
 }
 
 struct ExecSibling {
@@ -4538,9 +4664,27 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
 
 #[cfg(test)]
 fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
-    let fixture = native_exec_fixture();
-    let sibling = add_exec_sibling(&fixture, false);
-    assert!(take_exec_cancellations().is_empty());
+    exec_drain_is_upgraded_by_terminal_sibling_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words, signal);
+    exec_drain_is_upgraded_by_terminal_sibling_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words, signal);
+}
+
+#[cfg(test)]
+fn exec_drain_is_upgraded_by_terminal_sibling_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+    signal: Option<u8>,
+) {
+    let _ = take_exec_cancellations();
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_service_sibling(&fixture, None);
     let root_source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -4554,7 +4698,7 @@ fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
                 root_source,
                 fixture.task,
                 fixture.address,
-                &words(fixture.address),
+                &(fixture.make_words)(fixture.address),
                 &mut root_service,
             )
             .unwrap();
@@ -4571,8 +4715,14 @@ fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
         ));
         assert!(root.take_handoff_receipt().is_some());
     }
-    let _successor =
-        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 181, 0xf0_0000);
+    let _successor = publish_test_exec_reply_with(
+        &fixture,
+        fixture.control,
+        fixture.slot,
+        181,
+        0xf0_0000,
+        false,
+    );
     let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -4610,7 +4760,7 @@ fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
                 sibling_source,
                 sibling.task,
                 fixture.address,
-                &words(fixture.address),
+                &(fixture.make_words)(fixture.address),
                 &mut sibling_service,
             )
             .unwrap();
@@ -4715,6 +4865,7 @@ fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
         Some(LifecycleOutcome::Transferred { .. })
     ));
     assert!(terminator.take_run_failure().is_none());
+    assert_eq!(terminator.take_root_exit(), Some(expected));
 }
 
 #[cfg(test)]

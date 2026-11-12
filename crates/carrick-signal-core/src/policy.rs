@@ -464,3 +464,36 @@ pub fn child_decision(action: Action, event: ChildEvent, interest: ChildInterest
         && (caught || interest.blocked || interest.synchronous_wait);
     ChildDecision { auto_reap, notify }
 }
+
+/// Terminal verdict for an `execve(2)` failure past the point of no return.
+///
+/// Authority: `execve(2)` — once the predecessor image or thread group can no
+/// longer resume, the kernel kills the process with `SIGSEGV` (`SIGKILL` only
+/// prior to Linux 3.17). Concurrent `exec`, `exit_group`, or fatal `SIGKILL`
+/// winners retain their own terminal status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecPastNoReturn;
+
+impl ExecPastNoReturn {
+    pub const SIGNAL: Signal = Signal::SEGV;
+
+    pub const fn signal(self) -> Signal {
+        Self::SIGNAL
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_past_no_return_verdict_is_terminal_sigsegv() {
+        assert_eq!(ExecPastNoReturn::SIGNAL, Signal::SEGV);
+        assert_eq!(ExecPastNoReturn.signal(), Signal::SEGV);
+        assert_eq!(ExecPastNoReturn::SIGNAL.number(), 11);
+        assert_eq!(
+            default_delivery(ExecPastNoReturn::SIGNAL),
+            Delivery::Terminate { core_dump: true }
+        );
+    }
+}

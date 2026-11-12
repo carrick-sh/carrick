@@ -1292,7 +1292,7 @@ where
         engine
             .discard_terminal_syscall_continuation()
             .map_err(RuntimeError::Trap)?;
-        let sigsegv = crate::linux_abi::LINUX_SIGSEGV;
+        let sigsegv = carrick_signal_core::policy::ExecPastNoReturn::SIGNAL.number();
         if super::requires_no_unwind_host_exit(kernel, engine.is_forked_child()) {
             if let Err(error) = engine.process_exit_cleanup() {
                 tracing::error!(

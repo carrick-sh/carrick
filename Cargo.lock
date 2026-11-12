@@ -980,6 +980,7 @@ dependencies = [
  "carrick-portable",
  "carrick-runtime",
  "carrick-sched-core",
+ "carrick-signal-core",
  "carrick-signal-linux",
  "carrick-spec",
  "carrick-syscall-abi",
