@@ -1059,6 +1059,11 @@ impl OpenedStartGate {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static PREPARE_ZONE_HANDBACK_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 impl Thread {
     /// Durable receipt copied from this exact birth entry's ExitedInZone
     /// transition before the reusable ABI entry is reaped.
@@ -1647,6 +1652,11 @@ impl Thread {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepare_zone_handback_calls() -> usize {
+        PREPARE_ZONE_HANDBACK_CALLS.with(core::cell::Cell::get)
+    }
+
     /// The host owns `record` now (a wake, or the executor of the vCPU slot
     /// that ran it handing it back): if this thread's blocked continuation is
     /// the zone wait on `record`, make it ready. A thread still settling (its
@@ -1657,6 +1667,8 @@ impl Thread {
         &self,
         record: carrick_el1_abi::RecordRef,
     ) -> Option<crate::kernel::scheduler::ExactWakeTarget> {
+        #[cfg(test)]
+        PREPARE_ZONE_HANDBACK_CALLS.with(|calls| calls.set(calls.get() + 1));
         if carrick_el1_abi::zone_tables()
             .is_some_and(|zone| zone.host_resume_readiness(record) == Some(false))
         {
