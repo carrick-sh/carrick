@@ -91,6 +91,10 @@ rationale = "Admission creates one native process owner for the retained root an
 # with the other process's PID and root incarnation; its return checkpoint
 # refused it (`entry_binding`). Semantics and budgets are unchanged:
 # carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_unhomed_host_thread_*.
+# Diagnostic only: the checkpoint's fatal now carries the refusal's kind
+# (NativeService* reason at the checkpoint's own coordinates); the existing
+# mapping witness is dispatch::tests::
+# native_service_refusals_keep_the_error_in_the_fatal_transport.
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue",
