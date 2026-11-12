@@ -3929,12 +3929,12 @@ fn arm_empty_pool_clone_loser_of_the_stock_race_waits_again() {
 /// a sibling stay live. It runs from the zone on CPU 1's slot, whose executor
 /// waits in the guest with no host task loaded: nothing on the host can take
 /// the thread's exit there. glibc registers a robust list for every thread,
-/// and before the fix the ring declined that exit (`ExitRobust`) into host
-/// custody: the vector captured the SVC for that executor, which had no task
-/// to give it to, and the carrier died ("tried to park off-guest").
+/// and before the fix the ring declined that exit for its robust list into
+/// host custody: the vector captured the SVC for that executor, which had no
+/// task to give it to, and the carrier died ("tried to park off-guest").
 #[test]
 fn arm_pinned_glibc_member_raw_exit_on_an_idle_executor_retires_in_ring() {
-    use carrick_el1_abi::{Lifecycle, LifecycleDecline};
+    use carrick_el1_abi::Lifecycle;
     use carrick_personality_linux::dispatch::CompletionRoute;
     let mut h = setup_native_owned_ring_birth_before_first_entry();
     let zone = h.env.fixture.zone;
@@ -3968,7 +3968,7 @@ fn arm_pinned_glibc_member_raw_exit_on_an_idle_executor_retires_in_ring() {
     assert_eq!(zone.slot(pinned).host_record(), None);
     assert!(!zone.current_affinity_excludes_cpu(pinned));
 
-    let mut call = |nr: u64, args: &[u64]| {
+    let mut call = |nr: u64, args: &[u64], cpu: &mut crate::sched::FakeCpu| {
         let mut frame = carrick_el1_abi::TrapFrame::default();
         frame.x[8] = nr;
         frame.x[..args.len()].copy_from_slice(args);
@@ -3978,28 +3978,28 @@ fn arm_pinned_glibc_member_raw_exit_on_an_idle_executor_retires_in_ring() {
             h.born_control,
             &counters,
             &mut frame,
-            &mut cpu,
+            cpu,
         );
         (route, frame.x[0] as i64)
     };
     // glibc's thread start: its own clear_child_tid word and robust list.
     let child_tid = carrick_test_support::GuestUserBuffer::from_value(h.born_tid);
-    assert_eq!(call(96, &[child_tid.arg()]).1, i64::from(h.born_tid));
+    assert_eq!(
+        call(96, &[child_tid.arg()], &mut cpu).1,
+        i64::from(h.born_tid)
+    );
     let robust = carrick_test_support::GuestUserBuffer::zeroed(24);
-    assert_eq!(call(99, &[robust.arg(), 24]).1, 0);
+    assert_eq!(call(99, &[robust.arg(), 24], &mut cpu).1, 0);
     assert_ne!(h.born_control.robust_list().0, 0);
 
     let live = h.target_page.live();
-    let (route, _) = call(93, &[0]);
+    // Nothing else runs on CPU 1: the vCPU idles until a host kick.
+    cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
+    let (route, _) = call(93, &[0], &mut cpu);
     assert_ne!(
         route,
         CompletionRoute::HostCustody,
         "the raw exit left for an executor with no host task loaded"
-    );
-    assert_eq!(
-        counters.lifecycle_declines[LifecycleDecline::ExitRobust as usize].load(Ordering::Relaxed),
-        0,
-        "a registered robust list declined the raw exit"
     );
     assert_eq!(route, CompletionRoute::Suspended);
     // Retired in ring: one fewer live member, its clear_child_tid word
