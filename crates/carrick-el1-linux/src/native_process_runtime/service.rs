@@ -483,7 +483,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             );
             if matches!(claimed, carrick_sched_core::HostClaim::Claimed)
                 && member.is_native_owned()
-                && let Some(placement) = self.zone.place_native_handback(record)
+                && let Some(carrick_sched_core::NativePlacement::Placed(placement)) =
+                    self.zone.place_native_handback(record)
                 && placement.resched
             {
                 let mut effects = WakeEffects::default();

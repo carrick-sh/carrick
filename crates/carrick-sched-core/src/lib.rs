@@ -306,6 +306,8 @@ pub enum Claim {
     },
     /// Owned by the host; the context is frozen until the thread is loaded.
     Host { seq: u32 },
+    /// Native runnable custody waiting for an allowed driven slot.
+    Held { seq: u32 },
     /// A producer is routing a first entry; a claimant may record a request.
     Placing {
         incarnation: u64,
@@ -338,6 +340,7 @@ const STATE_PLACING_REQUESTED: u64 = 10;
 const STATE_ACTIVATING: u64 = 11;
 const STATE_RETIRING: u64 = 12;
 const STATE_FIRST_ENTRY_HOST: u64 = 13;
+const STATE_HELD: u64 = 14;
 
 /// First-entry words carry their entire 60-bit incarnation above a 4-bit tag.
 pub const CLAIM_WORD_PROTOCOL: u64 = 2;
@@ -356,6 +359,7 @@ impl Claim {
             Self::OnCpuRequested { slot, seq } => {
                 STATE_ONCPU_REQUESTED | ((slot.raw() as u64) << 8) | ((seq as u64) << 16)
             }
+            Self::Held { seq } => STATE_HELD | ((seq as u64) << 16),
             Self::Host { seq } => STATE_HOST | ((seq as u64) << 16),
             Self::Placing {
                 incarnation,
@@ -416,6 +420,7 @@ impl Claim {
             STATE_ONCPU => Self::OnCpu { slot, seq },
             STATE_ONCPU_REQUESTED => Self::OnCpuRequested { slot, seq },
             STATE_HOST => Self::Host { seq },
+            STATE_HELD => Self::Held { seq },
             STATE_TRANSFERRING => Self::Transferring {
                 seq,
                 cancelled: false,
@@ -444,6 +449,7 @@ impl Claim {
             | Self::OnCpu { seq, .. }
             | Self::OnCpuRequested { seq, .. }
             | Self::Host { seq }
+            | Self::Held { seq }
             | Self::Transferring { seq, .. } => seq,
             Self::FirstEntryHost { .. }
             | Self::Placing { .. }
@@ -1590,6 +1596,8 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     online_cpus: AtomicU64,
     /// One namespace allocator shared by host and ring; append-only ABI field.
     namespace: process::identity_allocator::NamespaceTable,
+    /// Hint only; the Held claim is the custody authority. Appended ABI field.
+    held_map: [AtomicU64; ZONE_RECORDS.div_ceil(64)],
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -2172,10 +2180,17 @@ pub struct HostPlacement {
     pub resched: bool,
 }
 
-/// Where [`ZoneTables::place_host_handback`] queued a record.
+/// Native completion custody after a host handback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePlacement {
+    Placed(HostPlacement),
+    Held,
+}
+
+/// Where [`ZoneTables::place_host_handback`] retained a record.
 #[derive(Clone, Copy, Debug)]
 pub struct HostHandback {
-    pub placement: HostPlacement,
+    pub placement: NativePlacement,
     /// The record has no home slot: any live eligible driver may take it.
     pub homeless: bool,
 }
@@ -5273,7 +5288,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// is outside the guest. Queue custody survives a driver stepping away;
     /// an eligible returning or idle driver can take/steal it. This does not
     /// grant execution on the queue's CPU or bypass MM/affinity admission.
-    pub fn place_native_handback(&self, record: RecordRef) -> Option<HostPlacement> {
+    pub fn place_native_handback(&self, record: RecordRef) -> Option<NativePlacement> {
         let rec = self.live(record)?;
         if !rec.needs_native_handback() {
             return None;
@@ -5282,22 +5297,54 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if !matches!(from, Claim::Host { .. }) {
             return None;
         }
-        self.place_from_claim(record.id, from).or_else(|| {
-            let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
-            self.requeue_from_claim(owner, record.id, from)
-        })
+        if let Some(placement) = self.place_from_claim(record.id, from) {
+            return Some(NativePlacement::Placed(placement));
+        }
+        let held = Claim::Held { seq: from.seq() };
+        if !rec.cas(from, held) {
+            return None;
+        }
+        self.held_map[record.id.index() / 64]
+            .fetch_or(1 << (record.id.index() % 64), Ordering::SeqCst);
+        // Post before probing: a concurrent driver either observes our bit,
+        // or this probe observes its published CPU and driver.
+        self.probe_held_record(record.id)
+            .or(Some(NativePlacement::Held))
     }
 
-    /// Place a record the host holds with no guest CPU able to take it: its
-    /// native handback if it owes one, else a queue on its owner's slot for
-    /// that slot's driver. `None` when the incarnation retired or another
-    /// owner settled the record, leaving nothing to deliver.
+    fn probe_held_record(&self, id: RecordId) -> Option<NativePlacement> {
+        let bit = 1 << (id.index() % 64);
+        let word = &self.held_map[id.index() / 64];
+        if word.fetch_and(!bit, Ordering::SeqCst) & bit == 0 {
+            return None;
+        }
+        let from = self.record(id).claim();
+        if !matches!(from, Claim::Held { .. }) {
+            return None;
+        }
+        if let Some(placement) = self.place_from_claim(id, from) {
+            return Some(NativePlacement::Placed(placement));
+        }
+        word.fetch_or(bit, Ordering::SeqCst);
+        // One post-publication probe closes the race with a trigger that
+        // took the bit before a new driver/affinity was published.
+        if let Some(placement) = self.place_from_claim(id, from) {
+            // Leave any stale hint: clearing it could erase a new hold.
+            return Some(NativePlacement::Placed(placement));
+        }
+        Some(NativePlacement::Held)
+    }
+
+    /// Native handbacks never borrow an unchecked default slot. Host-backed
+    /// continuations keep their existing owner-queue policy.
     pub fn place_host_handback(&self, record: RecordRef) -> Option<HostHandback> {
         let rec = self.live(record)?;
-        let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
-        let placement = self
-            .place_native_handback(record)
-            .or_else(|| self.requeue_on(owner, record.id))?;
+        let placement = if rec.needs_native_handback() {
+            self.place_native_handback(record)?
+        } else {
+            let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
+            NativePlacement::Placed(self.requeue_on(owner, record.id)?)
+        };
         Some(HostHandback {
             placement,
             homeless: rec.home().is_none(),
@@ -5308,16 +5355,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let rec = self.record(record);
         let seq = rec.parked_sequence(from);
         let service = rec.needs_host() || rec.needs_host_first_entry();
-        let driven = service || rec.has_native_execution_owner();
+        let native = rec.has_native_execution_owner();
+        let driven = service || native;
         if let Some(home) = rec.home() {
             // The host believes its thread runs on its home slot: only that
             // slot may run it, and only while it is in the guest.
             let guard = self.slot_lock(home, &SpinForever)?;
             let state = self.slot(home).state();
-            if !(if driven {
+            if !(if native {
                 OwnerCustody::Driven.holds(self, home, rec)
             } else {
-                state.in_guest()
+                state.in_guest() || (rec.requires_native_entry() && self.slot(home).is_live())
             }) || !rec.cas(from, Claim::Queued { slot: home, seq })
             {
                 return None;
@@ -5347,15 +5395,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 None
             },
         ];
-        for slot in candidates.into_iter().flatten().filter(|_| !driven).chain(
-            rec.last_slot()
-                .into_iter()
-                .chain(
-                    (0..ZONE_SLOTS)
-                        .filter_map(SlotId::from_index)
-                        .filter(|slot| Some(*slot) != rec.last_slot()),
-                )
-                .filter(|_| driven),
+        for slot in candidates.into_iter().flatten().chain(
+            (0..ZONE_SLOTS)
+                .filter_map(SlotId::from_index)
+                .filter(|slot| native && !candidates.contains(&Some(*slot))),
         ) {
             let Some(guard) = self.slot_lock(slot, &SpinForever) else {
                 continue;
@@ -5365,7 +5408,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 // Only a slot whose driver comes back to it takes a thread
                 // that needs an executor or has no host continuation: checked
                 // under the lock every drive change holds.
-                OwnerCustody::Driven.holds(self, slot, rec)
+                OwnerCustody::Driven.holds(self, slot, rec) && (native || self.slot(slot).is_live())
             } else {
                 state.in_guest() && self.accepts_running(slot, rec)
             };
@@ -5769,6 +5812,23 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 return HostClaim::Stale;
             }
             match claim {
+                Claim::Held { seq: current } => {
+                    if seq.is_some_and(|wanted| wanted != current) {
+                        return HostClaim::Stale;
+                    }
+                    if let Some(transfer) = self.begin_host_transfer(r, claim) {
+                        if kind == Handback::Cancelled
+                            || !matches!(rec.handback(), Some(Handback::Woken | Handback::Resumed))
+                        {
+                            rec.handback.store(kind as u32, Ordering::Release);
+                        }
+                        return if transfer.publish().is_some() {
+                            HostClaim::Claimed
+                        } else {
+                            HostClaim::Stale
+                        };
+                    }
+                }
                 Claim::Parked { seq: current } => {
                     if seq.is_some_and(|wanted| wanted != current) {
                         return HostClaim::Stale;

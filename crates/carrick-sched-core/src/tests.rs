@@ -1556,7 +1556,13 @@ fn native_readiness_handback_preserves_the_execution_owner() {
             let placed = zone.place_native_handback(exact);
             assert_eq!(placed.is_some(), native_ready);
             if native_ready {
-                assert_eq!(placed.unwrap().slot, SLOT);
+                assert_eq!(
+                    match placed.unwrap() {
+                        NativePlacement::Placed(p) => p.slot,
+                        NativePlacement::Held => panic!("expected placement"),
+                    },
+                    SLOT
+                );
                 assert_eq!(zone.slot(SLOT).queued(), 1);
                 assert!(
                     zone.place_native_handback(exact).is_none(),
@@ -4975,7 +4981,7 @@ fn unhoming_a_native_root_cannot_cancel_carrier_deadline_custody() {
 }
 
 #[test]
-fn native_handback_without_an_allowed_driver_stays_host_owned() {
+fn native_handback_without_an_allowed_driver_is_held() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
@@ -4992,10 +4998,10 @@ fn native_handback_without_an_allowed_driver_stays_host_owned() {
         zone.take_completion_handbacks(&HostWait, &mut |_| {});
         assert_eq!(
             zone.place_native_handback(reference),
-            None,
+            Some(NativePlacement::Held),
             "no admitted native slot"
         );
-        assert_eq!(zone.record(record).claim(), Claim::Host { seq });
+        assert_eq!(zone.record(record).claim(), Claim::Held { seq });
         assert_eq!(zone.slot(SLOT).queued(), 0);
         assert_eq!(zone.slot(OTHER).queued(), 0);
         zone.free_record(record);
@@ -5134,9 +5140,12 @@ fn native_handback_admits_a_stepped_away_allowed_driver() {
             }),
             HostClaim::Claimed
         );
-        let placement = zone
+        let NativePlacement::Placed(placement) = zone
             .place_native_handback(reference)
-            .expect("retained completion");
+            .expect("retained completion")
+        else {
+            panic!("expected driven placement")
+        };
         assert_eq!(placement.slot, OTHER);
         assert_eq!(zone.slot(SLOT).queued(), 0);
         assert_eq!(
