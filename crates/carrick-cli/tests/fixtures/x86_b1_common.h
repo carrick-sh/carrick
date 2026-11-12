@@ -48,6 +48,20 @@
 9:
 .endm
 
+/* Four never-touched anonymous pages at %r13: a result copied into one must
+ * be made writable by the ring first, as Linux faults it in. */
+.macro MMAP_UNTOUCHED step
+    xor %edi, %edi
+    mov $16384, %esi
+    mov $3, %edx
+    mov $0x22, %r10d
+    mov $-1, %r8
+    xor %r9d, %r9d
+    SYS 9
+    EXPECT_OK \step
+    mov %rax, %r13
+.endm
+
 .macro PATH reg, sym
     lea \sym(%rip), \reg
 .endm

@@ -67,6 +67,7 @@ parent_script:
     jmp pass
 #else
 root_script:
+    MMAP_UNTOUCHED 40
     mov $AT_FDCWD, %edi
     PATH %rsi, file
     mov $O_RDWR_CREAT, %edx
@@ -91,11 +92,11 @@ root_script:
     /* get returns the length and writes the value. */
     PATH %rdi, file
     PATH %rsi, name_k
-    PATH %rdx, scratch
+    mov %r13, %rdx
     mov $16, %r10d
     SYS SYS_getxattr
     EXPECT 15, 2
-    cmpw $0x3156, scratch(%rip) /* "V1" */
+    cmpw $0x3156, (%r13) /* "V1" */
     je 1f
     mov $16, %edi
     jmp fail
@@ -127,7 +128,7 @@ root_script:
     SYS SYS_listxattr
     EXPECT 22, LIST_LEN
     PATH %rdi, file
-    PATH %rsi, scratch
+    lea 4096(%r13), %rsi
     mov $64, %edx
     SYS SYS_listxattr
     EXPECT 23, LIST_LEN
