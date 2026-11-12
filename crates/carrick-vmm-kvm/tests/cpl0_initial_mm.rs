@@ -2777,3 +2777,174 @@ fn serial_host_initial_write_without_ring_table_keeps_stdout_route() {
         },
     );
 }
+
+/// #2157 B0 T1: a fork child's x86-allowed crossing that no ring stage serves
+/// is a counted ENOSYS in ring, as ARM answers a fork child's unclaimed
+/// native call, never a carrier failure. Two live children (A sleeps after
+/// its `read(0, buf, 0)` while B makes its `lseek(0, 0, SEEK_CUR)`) each get
+/// errno 38, and the root's own `read(0, buf, 0)` keeps its host route and
+/// returns 0. Red on main: the run failed with a typed `HostTaskContext`.
+#[test]
+fn two_live_children_unstaged_crossings_are_counted_enosys_and_root_is_served() {
+    let elf = native_exit_fixture("native_child_unstaged_crossing.S");
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 256, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "a child's unstaged crossing must be answered in ring, not fail the run: \
+                 {:?} ({})",
+                failure.authority_refusals, failure.error
+            )
+        });
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "81/82 root read, 64|status child A, 128|status child B, 91 fork/wait: {:?}",
+        outcome.run
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let load = |counter: &[std::sync::atomic::AtomicU64], nr: usize| {
+        counter[nr].load(std::sync::atomic::Ordering::Acquire)
+    };
+    const X86_SYS_READ: usize = 0;
+    const X86_SYS_LSEEK: usize = 8;
+    for (name, nr) in [("read", X86_SYS_READ), ("lseek", X86_SYS_LSEEK)] {
+        assert_eq!(
+            load(&counters.refused_child, nr),
+            1,
+            "child {name} refusal credits descendant origin"
+        );
+        assert_eq!(
+            load(&counters.refused, nr),
+            1,
+            "only the child's {name} is refused; the root's read is served"
+        );
+        assert_eq!(
+            load(&counters.venue_refused, nr),
+            0,
+            "child {name} is refused in ring, not by the carrier venue"
+        );
+    }
+}
+
+/// Assemble one `native_crossing_operand.S` variant, run it natively as the
+/// Linux oracle, and return the ELF with the oracle's exit code.
+fn crossing_operand_fixture(flags: &[&str]) -> (Vec<u8>, i32) {
+    let elf = native_exit_fixture_with_flags("native_crossing_operand.S", flags);
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("bounded native oracle");
+    (elf, native.status.code().expect("native oracle exit code"))
+}
+
+/// #2157 B0 T2, stdio host object: fd 5 names the stderr host object, so the
+/// resolver sends the write as a host-object write and "S" reaches stderr.
+#[test]
+fn crossing_operand_stdio_host_object_writes_through_its_binding() {
+    let (elf, oracle) = crossing_operand_fixture(&["-DSTDIO_OBJECT"]);
+    assert_eq!(oracle, 1, "native oracle");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_LOADED)
+        .expect("stdio host object run");
+    assert_eq!(outcome.run.exit_code, oracle, "{:?}", outcome.run);
+    assert_eq!(outcome.run.stderr, b"S");
+    assert!(outcome.run.stdout.is_empty(), "{:?}", outcome.run.stdout);
+}
+
+/// #2157 B0 T2, host-backed: a host file seeded before entry passes to the
+/// host unchanged, and `pread64` returns its first four bytes.
+#[test]
+fn crossing_operand_host_backed_fd_passes_to_the_host() {
+    let dir = tempfile::tempdir().expect("host-backed directory");
+    let path = dir.path().join("source");
+    std::fs::write(&path, b"ABCDEFGH").expect("host-backed source");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let root = dispatcher.capture_one_task_context().expect("source task");
+    let mut path_bytes = path.as_os_str().as_encoded_bytes().to_vec();
+    path_bytes.push(0);
+    let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x4000, path_bytes);
+    let opened = dispatcher
+        .dispatch(
+            &root,
+            carrick_kernel::dispatch::SyscallRequest::new(
+                56,
+                carrick_kernel::compat::SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &carrick_kernel::compat::CompatReporter::default(),
+        )
+        .expect("production source open");
+    let carrick_kernel::dispatch::DispatchOutcome::Returned { value: fd } = opened else {
+        panic!("source open failed: {opened:?}");
+    };
+    let preopened = format!("-DPREOPENED_FD={fd}");
+    let elf =
+        native_exit_fixture_with_flags("native_crossing_operand.S", &["-DHOST_BACKED", &preopened]);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        64,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .expect("host-backed run");
+    assert_eq!(
+        outcome.run.exit_code, 4,
+        "pread64 result (70 = wrong bytes, 9 = EBADF, 38 = ENOSYS): {:?}",
+        outcome.run
+    );
+}
+
+/// #2157 B0 T2, in-zone: a pipe is the ring's object, so its `lseek` is
+/// answered in ring and never reaches the host under the guest's number.
+#[test]
+fn crossing_operand_in_zone_fd_is_answered_in_ring() {
+    let (elf, oracle) = crossing_operand_fixture(&["-DIN_ZONE"]);
+    assert_eq!(oracle, 29, "native oracle: ESPIPE");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_LOADED)
+        .expect("in-zone run");
+    assert_eq!(
+        outcome.run.exit_code, oracle,
+        "lseek errno on a pipe (29 = ESPIPE, 38 = ENOSYS, 9 = EBADF): {:?}",
+        outcome.run
+    );
+}
+
+/// #2157 B0 T2, absent: a closed descriptor is EBADF (errno 9).
+#[test]
+fn crossing_operand_absent_fd_is_ebadf() {
+    let (elf, oracle) = crossing_operand_fixture(&["-DABSENT"]);
+    assert_eq!(oracle, 9, "native oracle: EBADF");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_LOADED)
+        .expect("absent run");
+    assert_eq!(outcome.run.exit_code, oracle, "{:?}", outcome.run);
+}
+
+/// #2157 B0 T2: a stdio host object under a number outside 0..=2 resolves
+/// through its binding for every fd-operand crossing, not only for a
+/// hand-listed call and fd range. `dup2(0, 5); read(5, buf, 0)` reads the
+/// stdin object (0, as Linux with stdin on /dev/null). Red on main: the
+/// guest's fd 5 crossed to the host unchanged.
+#[test]
+fn crossing_operand_duplicated_stdin_reads_through_its_binding() {
+    let (elf, oracle) = crossing_operand_fixture(&["-DDUP_STDIN"]);
+    assert_eq!(oracle, 0, "native oracle");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_LOADED)
+        .expect("duplicated stdin run");
+    assert_eq!(
+        outcome.run.exit_code, oracle,
+        "read(5) errno (9 = EBADF, 38 = ENOSYS): {:?}",
+        outcome.run
+    );
+}
