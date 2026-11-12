@@ -1495,6 +1495,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
                         },
                     )
                 },
+                |_| None,
             )
             .preflight()
         }

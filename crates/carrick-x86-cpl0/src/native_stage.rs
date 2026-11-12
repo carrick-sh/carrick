@@ -9,69 +9,6 @@ use carrick_personality_linux::native_host_file::{
     HostFileCall, HostFileStage, NativeDescriptor, NativeNamespace,
 };
 
-/// Whether CPL0 stages this decoded call for `origin`. `delegated(fd)`
-/// says whether the carrier's file table delegates `fd` to a host object
-/// (the run's stdio streams).
-///
-/// - Path opens, access checks and stats, descriptor stats, and reads,
-///   seeks and directory reads are staged for every task: the descriptor an
-///   open installs lives in the caller's ring namespace, so every later call
-///   on it must resolve there too (#1714: glibc's loader opened a library
-///   in ring and then read it through the host table, EBADF).
-/// - A read, seek or `write` of a delegated stdio descriptor keeps its host
-///   route, which owns the terminal and blocking-read semantics. `writev` has
-///   no x86 host route, so it is staged for every descriptor and a stdio
-///   stream reaches the run's stdio sink through the shared venue.
-/// - Path mutations stay child-scoped: the initial task keeps its host route.
-///   `ftruncate` names a descriptor, so it follows the descriptor: one the
-///   root's `openat` installed lives in the ring namespace and the host task
-///   has nothing under its number (#2157 B1).
-pub(crate) fn admits(
-    call: HostFileCall,
-    origin: ServiceOrigin,
-    delegated: impl FnOnce(i32) -> bool,
-) -> bool {
-    match call {
-        HostFileCall::Chdir { .. } => origin != ServiceOrigin::Initial,
-        HostFileCall::Ftruncate { fd, .. } if origin == ServiceOrigin::Initial => !delegated(fd),
-        call if call.uses_child_mutation_venue() => origin != ServiceOrigin::Initial,
-        HostFileCall::Openat { .. }
-        | HostFileCall::Faccessat { .. }
-        | HostFileCall::Statx { .. }
-        | HostFileCall::Newfstatat { .. }
-        | HostFileCall::Fstat { .. }
-        | HostFileCall::Getdents64 { .. }
-        | HostFileCall::Writev { .. } => true,
-        // A child's write has no host route; it is staged for every
-        // descriptor, as before.
-        HostFileCall::Write { .. } if origin != ServiceOrigin::Initial => true,
-        HostFileCall::Write { fd, .. }
-        | HostFileCall::Read { fd, .. }
-        | HostFileCall::Pread { fd, .. }
-        | HostFileCall::Lseek { fd, .. } => !delegated(fd),
-        _ => false,
-    }
-}
-
-/// A host crossing copies its result out through a venue that cannot supply a
-/// page, so the ring makes the declared destination writable first, through
-/// the same owner fault path a staged call uses (T3, #2157). `None`: nothing
-/// to prepare, the crossing proceeds.
-fn prepare_crossing_output<V: MemoryValidator>(
-    canonical: carrick_syscall_abi::CanonicalNr,
-    args: &[u64; 6],
-    validator: &V,
-) -> Option<HostFileStage> {
-    let crossing =
-        carrick_personality_linux::crossing::AllowedHostCrossing::from_canonical_x86(canonical)?;
-    let (address, length) = crossing.operand_spec().output_range(args)?;
-    let writable = validator.writable_bytes(address, usize::try_from(length).ok()?) as u64;
-    (writable < length).then_some(HostFileStage::Fault {
-        address: address.wrapping_add(writable),
-        access: carrick_guest_arch::Access::Write,
-    })
-}
-
 /// Decode, admit and stage `call` against the caller's ring namespace.
 /// `None` keeps the call on its existing route, including when no ring
 /// namespace is published.
@@ -89,9 +26,14 @@ where
 {
     let canonical = carrick_syscall_abi::CanonicalNr::new(call.canonical.raw());
     let Some(decoded) = HostFileCall::decode(canonical, &call.args) else {
-        return prepare_crossing_output(canonical, &call.args, validator);
+        return carrick_personality_linux::native_host_file::crossing_output_stage(
+            HostCrossingSet::X86,
+            canonical,
+            &call.args,
+            |address, len| validator.writable_bytes(address, len),
+        );
     };
-    if !admits(decoded, origin, delegated) {
+    if !decoded.admitted_for(origin, delegated) {
         return None;
     }
     // No published ring namespace (venue or table unavailable): keep the
@@ -406,10 +348,7 @@ mod tests {
     fn a_crossing_output_is_made_writable_before_the_effect() {
         // x86_64 statfs 137, readlinkat 267, getxattr 191, mkdirat 258.
         let (path, out) = (0x7000_0000u64, 0x7000_1000u64);
-        let fault = Some(HostFileStage::Fault {
-            address: out,
-            access: carrick_guest_arch::Access::Write,
-        });
+        let fault = Some(HostFileStage::PrepareOutput { address: out });
         assert_eq!(
             stage_output(&Untouched, 137, [path, out, 0, 0, 0, 0]),
             fault
@@ -421,6 +360,28 @@ mod tests {
         assert_eq!(
             stage_output(&Untouched, 191, [path, path, out, 16, 0, 0]),
             fault
+        );
+        // A buffer that reaches into the next page prepares that page too:
+        // the result may land on either side of the boundary. The first page
+        // is resident, so the next is the one supplied.
+        struct FirstPage(u64);
+        impl MemoryValidator for FirstPage {
+            fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
+                (self.0 + 0x1000).saturating_sub(user_va).min(len as u64) as usize
+            }
+            fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+        }
+        assert_eq!(
+            stage_output(&FirstPage(out), 191, [path, path, out + 0xffe, 16, 0, 0]),
+            Some(HostFileStage::PrepareOutput {
+                address: out + 0x1000
+            })
+        );
+        assert_eq!(
+            HostFileStage::PrepareOutput { address: out }.refused(),
+            HostFileStage::Crossing
         );
         // Already writable, a zero-length buffer, and a call with no
         // guest output all proceed to the crossing.

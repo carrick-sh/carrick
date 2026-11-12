@@ -219,6 +219,20 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
                     },
                 )
             },
+            |address| {
+                let task = venue?.task;
+                let mut copy = carrick_el1_linux::file::ValidatedCopy {
+                    task,
+                    validator: &carrick_el1_linux::file::HardwareValidator,
+                };
+                let mut byte = [0u8];
+                carrick_el1_linux::file::UserCopy::copy_in(
+                    &mut copy,
+                    &mut byte,
+                    address,
+                )
+                .then_some(byte[0])
+            },
         );
         self.crossing_operand = Some(operand);
         operand.preflight()
@@ -1292,6 +1306,7 @@ impl Personality for LinuxPersonality {
                 // EOF) completes without it: EFAULT, or the short write of
                 // the bytes gathered before it, as Linux's user copy does.
                 let mut retry = false;
+                let mut crosses = false;
                 let stage = match stage.fault() {
                     Some((address, access)) => {
                         match supply_syscall_fault(binding, task, counters, slot, address, access) {
@@ -1352,10 +1367,17 @@ impl Personality for LinuxPersonality {
                             },
                         )
                     }
-                    // `refused` answers every fault it is given.
-                    Some(HostFileStage::Fault { .. } | HostFileStage::FaultAfterPrefix { .. }) => {
-                        fatal_boot()
+                    // A refused output supply: the crossing runs as it is.
+                    Some(HostFileStage::Crossing) => {
+                        crosses = true;
+                        None
                     }
+                    // `refused` answers every fault it is given.
+                    Some(
+                        HostFileStage::Fault { .. }
+                        | HostFileStage::FaultAfterPrefix { .. }
+                        | HostFileStage::PrepareOutput { .. },
+                    ) => fatal_boot(),
                     Some(HostFileStage::InRing) => {
                         counters.record_refusal(
                             carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
@@ -1371,6 +1393,8 @@ impl Personality for LinuxPersonality {
                     frame.rax = call.native.raw();
                     frame.rcx = frame.rcx.checked_sub(2).unwrap_or_else(|| fatal_boot());
                     CompletionRoute::Served
+                } else if crosses {
+                    route
                 } else if let Some(result) = result {
                     frame.rax = result as u64;
                     CompletionRoute::Served

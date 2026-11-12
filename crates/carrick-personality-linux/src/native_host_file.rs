@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 use carrick_core_abi::host_file::{
     self, HOST_FILE_CHUNK_BYTES, HostFileHeader, HostFileOp, record_len,
 };
+use carrick_core_abi::service::ServiceOrigin;
 use carrick_guest_arch::Access;
 use carrick_syscall_abi::{CanonicalNr, LinuxErrno};
 
@@ -270,6 +271,44 @@ impl HostFileCall {
                 | Self::Truncate { .. }
                 | Self::Ftruncate { .. }
         )
+    }
+
+    /// Whether the CPL0 venue stages this decoded call for `origin`.
+    /// `delegated(fd)` says whether the carrier's file table delegates `fd` to
+    /// a host object (the run's stdio streams).
+    ///
+    /// - Path opens, access checks and stats, descriptor stats, and reads,
+    ///   seeks and directory reads are staged for every task: the descriptor
+    ///   an open installs lives in the caller's ring namespace, so every later
+    ///   call on it must resolve there too (#1714).
+    /// - A read, seek or `write` of a delegated stdio descriptor keeps its
+    ///   host route, which owns the terminal and blocking-read semantics.
+    ///   `writev` has no host route, so it is staged for every descriptor.
+    /// - Path mutations stay child-scoped: the initial task keeps its host
+    ///   route. `ftruncate` names a descriptor, so it follows the descriptor:
+    ///   one the root's `openat` installed lives in the ring namespace and the
+    ///   host task has nothing under its number (#2157 B1).
+    pub fn admitted_for(self, origin: ServiceOrigin, delegated: impl FnOnce(i32) -> bool) -> bool {
+        match self {
+            Self::Chdir { .. } => origin != ServiceOrigin::Initial,
+            Self::Ftruncate { fd, .. } if origin == ServiceOrigin::Initial => !delegated(fd),
+            call if call.uses_child_mutation_venue() => origin != ServiceOrigin::Initial,
+            Self::Openat { .. }
+            | Self::Faccessat { .. }
+            | Self::Statx { .. }
+            | Self::Newfstatat { .. }
+            | Self::Fstat { .. }
+            | Self::Getdents64 { .. }
+            | Self::Writev { .. } => true,
+            // A child's write has no host route; it is staged for every
+            // descriptor.
+            Self::Write { .. } if origin != ServiceOrigin::Initial => true,
+            Self::Write { fd, .. }
+            | Self::Read { fd, .. }
+            | Self::Pread { fd, .. }
+            | Self::Lseek { fd, .. } => !delegated(fd),
+            _ => false,
+        }
     }
 
     /// Decode a canonical syscall the venue may serve. `None` for every
@@ -539,6 +578,14 @@ pub enum HostFileStage {
     /// A user page must be supplied before staging can continue; the ring
     /// retries the exact call afterwards.
     Fault { address: u64, access: Access },
+    /// A host crossing's declared output page must be supplied before the
+    /// crossing runs (its venue cannot supply one); the ring retries the exact
+    /// call afterwards. A refused supply is no error: the result may be
+    /// shorter than the declared bound, and a page it does touch fails in the
+    /// crossing as it does in Linux ([`HostFileStage::Crossing`]).
+    PrepareOutput { address: u64 },
+    /// Nothing is staged: the call crosses to the host unchanged.
+    Crossing,
     /// A write gathered `prefix`'s bytes before the user read at `address`
     /// stopped it. The ring supplies `address` and retries the exact call,
     /// as for [`HostFileStage::Fault`]; if the supply is refused, the call
@@ -567,6 +614,7 @@ impl HostFileStage {
     pub fn fault(&self) -> Option<(u64, Access)> {
         match self {
             Self::Fault { address, access } => Some((*address, *access)),
+            Self::PrepareOutput { address } => Some((*address, Access::Write)),
             Self::FaultAfterPrefix { address, .. } => Some((*address, Access::Read)),
             _ => None,
         }
@@ -578,6 +626,7 @@ impl HostFileStage {
     pub fn refused(self) -> Self {
         match self {
             Self::Fault { .. } => errno(carrick_syscall_abi::LINUX_EFAULT),
+            Self::PrepareOutput { .. } => Self::Crossing,
             Self::FaultAfterPrefix { prefix, .. } => Self::Request {
                 record: prefix,
                 output: None,
@@ -933,6 +982,30 @@ pub fn stage(
         }
     }
     Some(staged)
+}
+
+/// Stage the declared guest output of a host crossing `set` allows. A
+/// crossing copies its result out through a venue that cannot supply a page,
+/// so the ring makes every page of the output writable first, through the
+/// owner fault path a staged call uses (T3, #2157): the first page
+/// `writable` does not cover is a [`HostFileStage::PrepareOutput`]. `None`:
+/// nothing to prepare, the crossing proceeds.
+pub fn crossing_output_stage(
+    set: crate::crossing::HostCrossingSet,
+    canonical: CanonicalNr,
+    args: &[u64; 6],
+    writable: impl FnOnce(u64, usize) -> usize,
+) -> Option<HostFileStage> {
+    use crate::crossing::{AllowedHostCrossing, HostCrossingSet};
+    let crossing = match set {
+        HostCrossingSet::X86 => AllowedHostCrossing::from_canonical_x86(canonical),
+        HostCrossingSet::Aarch64 => AllowedHostCrossing::from_canonical_aarch64(canonical),
+    }?;
+    let (address, length) = crossing.operand_spec().output_range(args)?;
+    let covered = writable(address, usize::try_from(length).ok()?) as u64;
+    (covered < length).then_some(HostFileStage::PrepareOutput {
+        address: address.wrapping_add(covered),
+    })
 }
 
 fn stage_call(

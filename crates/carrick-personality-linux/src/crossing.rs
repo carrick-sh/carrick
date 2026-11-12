@@ -605,9 +605,11 @@ mod tests {
         // llistxattr.
         assert_eq!(declared, [8, 9, 11, 12, 17, 43, 44, 78]);
         let spec = AllowedHostCrossing::Readlinkat.operand_spec();
-        // A buffer is prepared to the end of its first page at most.
+        // A buffer is prepared across every page of the bound: the result
+        // may land on either side of a boundary. The bound is the longest
+        // result the call produces (PATH_MAX for readlinkat).
         let args = [0, 0, 0x1ff0, 0x4000, 0, 0];
-        assert_eq!(spec.output_range(&args), Some((0x1ff0, 0x10)));
+        assert_eq!(spec.output_range(&args), Some((0x1ff0, 4096)));
         let args = [0, 0, 0x1000, 32, 0, 0];
         assert_eq!(spec.output_range(&args), Some((0x1000, 32)));
         assert_eq!(spec.output_range(&[0, 0, 0x1000, 0, 0, 0]), None);

@@ -1046,43 +1046,70 @@ pub enum OutputOperand {
     None,
     /// A fixed-size record at argument `ptr`.
     Record { ptr: u8, bytes: u64 },
-    /// At most the count in argument `len`, at argument `ptr`. Only the
-    /// first page is prepared: the result length is not known before the
-    /// effect.
-    Buffer { ptr: u8, len: u8 },
+    /// At most the count in argument `len`, at argument `ptr`, and never more
+    /// than `max` bytes (the longest result the call can produce). The result
+    /// length is not known before the effect, so the ring prepares every page
+    /// of the bound, as far as the owner can supply them.
+    Buffer { ptr: u8, len: u8, max: u64 },
 }
 
-/// Bytes of a guest page, the unit [`OutputOperand::Buffer`] prepares.
-const OUTPUT_PAGE: u64 = 4096;
+/// `PATH_MAX`: the longest path `getcwd` and `readlinkat` produce.
+const OUTPUT_PATH_MAX: u64 = 4096;
+/// `XATTR_SIZE_MAX` and `XATTR_LIST_MAX`: the longest xattr value or name list.
+const OUTPUT_XATTR_MAX: u64 = 65536;
 
 impl OperandSpec {
+    /// The second `(dirfd, path)` pair of a crossing that names two, as the
+    /// index of its dirfd (the path follows it).
+    pub const fn second_dirfd(self) -> Option<u8> {
+        use crate::crossing::AllowedHostCrossing as C;
+        match self.crossing {
+            C::Linkat | C::Renameat | C::Renameat2 => Some(2),
+            _ => None,
+        }
+    }
+
     /// The guest output of this crossing. A crossing that writes guest memory
     /// must be declared here before an ISA flips it (the x86 table test
     /// names every flipped crossing without one).
     pub const fn output_operand(self) -> OutputOperand {
         use crate::crossing::AllowedHostCrossing as C;
         match self.crossing {
-            C::Getcwd => OutputOperand::Buffer { ptr: 0, len: 1 },
+            C::Getcwd => OutputOperand::Buffer {
+                ptr: 0,
+                len: 1,
+                max: OUTPUT_PATH_MAX,
+            },
             C::Statfs | C::Fstatfs => OutputOperand::Record { ptr: 1, bytes: 120 },
-            C::Readlinkat => OutputOperand::Buffer { ptr: 2, len: 3 },
-            C::Getxattr | C::Lgetxattr | C::Fgetxattr => OutputOperand::Buffer { ptr: 2, len: 3 },
-            C::Listxattr | C::Llistxattr | C::Flistxattr => {
-                OutputOperand::Buffer { ptr: 1, len: 2 }
-            }
+            C::Readlinkat => OutputOperand::Buffer {
+                ptr: 2,
+                len: 3,
+                max: OUTPUT_PATH_MAX,
+            },
+            C::Getxattr | C::Lgetxattr | C::Fgetxattr => OutputOperand::Buffer {
+                ptr: 2,
+                len: 3,
+                max: OUTPUT_XATTR_MAX,
+            },
+            C::Listxattr | C::Llistxattr | C::Flistxattr => OutputOperand::Buffer {
+                ptr: 1,
+                len: 2,
+                max: OUTPUT_XATTR_MAX,
+            },
             _ => OutputOperand::None,
         }
     }
 
     /// The guest range to make writable before the crossing runs, as
-    /// `(address, length)`; `None` when it writes nothing there.
+    /// `(address, length)`; `None` when it writes nothing there. A result
+    /// shorter than the range still copies out, so a page past what the owner
+    /// can supply is not an error here.
     pub fn output_range(self, args: &[u64; 6]) -> Option<(u64, u64)> {
         let (address, length) = match self.output_operand() {
             OutputOperand::None => return None,
             OutputOperand::Record { ptr, bytes } => (args[ptr as usize], bytes),
-            OutputOperand::Buffer { ptr, len } => {
-                let address = args[ptr as usize];
-                let to_page_end = OUTPUT_PAGE - (address % OUTPUT_PAGE);
-                (address, args[len as usize].min(to_page_end))
+            OutputOperand::Buffer { ptr, len, max } => {
+                (args[ptr as usize], args[len as usize].min(max))
             }
         };
         (length != 0).then_some((address, length))
