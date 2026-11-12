@@ -392,7 +392,15 @@ impl SyscallDispatcher {
             // not served rather than altered.
             let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal)?;
             let capacity = view.output_capacity();
-            if path.is_empty() {
+            if header.op == HostFileOp::Fchdir {
+                if !path.is_empty() {
+                    return Err(NativeHostFileRefusal);
+                }
+                super::resources::with_native_fs_scope(&authority, || {
+                    self.serve_native_fchdir(owner, table, header)
+                })
+                .ok_or(NativeHostFileRefusal)?
+            } else if path.is_empty() {
                 // The descriptor form of a path call (`statx(fd, "",
                 // AT_EMPTY_PATH)`): it names the caller's descriptor, which
                 // lives in its ring table, never a host fd table (#1503).
@@ -748,7 +756,59 @@ impl SyscallDispatcher {
             | HostFileOp::Utimensat
             | HostFileOp::Truncate
             | HostFileOp::Renameat
+            | HostFileOp::Fchdir
             | HostFileOp::Poll => Served::Refused,
+        }
+    }
+
+    /// A ring task's `fchdir` ([`HostFileOp::Fchdir`]): the host task's own
+    /// fchdir lookup ([`super::FsView::fchdir_target`]) of the description
+    /// the caller's descriptor names, pinned in its ring table now, under
+    /// the caller's access context. Replies as the chdir lookup does
+    /// ([`native_chdir_lookup`]): the directory's `struct stat`, then the
+    /// cwd spelling the ring stores in the caller's row. The implicit stdio
+    /// streams are never directories. A resource this venue does not hold
+    /// as a description is refused, never guessed.
+    fn serve_native_fchdir(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        header: HostFileHeader,
+    ) -> Served {
+        let fs = self.fs_view();
+        let lookup = |description: &Arc<crate::kernel::FileDescription>| {
+            let target = match fs.fchdir_target(description) {
+                Ok(target) => target,
+                Err(errno) => return Served::errno(errno),
+            };
+            let record = match fs.description_stat_record(description, None) {
+                Ok(record) => record,
+                Err(errno) => return Served::errno(errno),
+            };
+            let mut reply = native_stat_bytes(HostFileOp::Newfstatat, &record);
+            reply.extend_from_slice(target.as_bytes());
+            Served::Reply(0, reply)
+        };
+        match owner.with_pinned_host_resource(table, fd::Fd(header.fd), |resource| {
+            if resource.downcast_ref::<ImplicitHostStdio>().is_some() {
+                return Served::errno(carrick_abi::LINUX_ENOTDIR);
+            }
+            if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
+                return lookup(&file.description);
+            }
+            if let Some(hold) = resource.downcast_ref::<crate::kernel::objects::IpcPhysicalHold>() {
+                return match hold.retain_io() {
+                    Some(lease) => lookup(lease.description()),
+                    None => Served::Refused,
+                };
+            }
+            Served::Refused
+        }) {
+            Ok(served) => served,
+            Err(PinnedHostResourceError::BadFd) => Served::errno(carrick_abi::LINUX_EBADF),
+            Err(PinnedHostResourceError::InZone | PinnedHostResourceError::Unavailable) => {
+                Served::Refused
+            }
         }
     }
 
@@ -1647,6 +1707,52 @@ mod tests {
                 fchdir(&tmp, -1),
                 Err(carrick_abi::LINUX_EBADF.guest_retval())
             );
+            // Search permission is the caller's: root bypasses it, a
+            // non-root caller without it is EACCES.
+            assert_eq!(
+                fixture.child_call(
+                    &tmp,
+                    34,
+                    [FDCWD as u64, 0, 0o600, 0, 0, 0],
+                    &[(1, b"sealed")],
+                ),
+                0
+            );
+            let sealed = fixture.venue_open(&tmp, b"sealed", DIRECTORY, 0);
+            assert!(sealed >= 0, "{upper:?}: open sealed: {sealed}");
+            assert_eq!(fchdir(&tmp, sealed), Ok("/tmp/sealed".to_owned()));
+            let mut user = tmp.clone();
+            user.credentials = Arc::new(crate::kernel::Credentials::from_values(
+                crate::kernel::CredentialsValues {
+                    id: fixture
+                        .dispatcher
+                        .kernel_binding
+                        .read()
+                        .kernel()
+                        .object_ids()
+                        .credentials_id()
+                        .unwrap(),
+                    ruid: carrick_abi::NsUid::new(4321),
+                    euid: carrick_abi::NsUid::new(4321),
+                    suid: carrick_abi::NsUid::new(4321),
+                    rgid: carrick_abi::NsGid::new(4321),
+                    egid: carrick_abi::NsGid::new(4321),
+                    sgid: carrick_abi::NsGid::new(4321),
+                    fsuid: carrick_abi::NsUid::new(4321),
+                    fsgid: carrick_abi::NsGid::new(4321),
+                    umask: 0o022,
+                },
+            ));
+            // The shared lookup re-stats through the host upper; an
+            // in-memory upper's directory is not re-checked, exactly as for
+            // the host task's own fchdir (followup-2206-fchdir-memory-dac).
+            if matches!(upper, Upper::Host) {
+                assert_eq!(
+                    fchdir(&user, sealed),
+                    Err(carrick_abi::LINUX_EACCES.guest_retval())
+                );
+            }
+            assert_eq!(fchdir(&user, a), Ok("/tmp/a".to_owned()), "{upper:?}");
         }
     }
 

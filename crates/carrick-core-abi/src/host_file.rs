@@ -82,6 +82,12 @@ pub enum HostFileOp {
     /// `renameat`/`renameat2`: source path, NUL, target path;
     /// `flags` carries the Linux rename flags.
     Renameat = 21,
+    /// `fchdir` of a host-backed descriptor: the chdir lookup of the
+    /// directory it names, searchable by the caller. The input is the
+    /// caller's [`AccessContext`] alone (no path); the reply area is laid
+    /// out as [`HostFileOp::Newfstatat`]'s chdir lookup: `struct stat`, then
+    /// the cwd spelling.
+    Fchdir = 22,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -208,13 +214,15 @@ impl HostFileOp {
             19 => Self::Truncate,
             20 => Self::Ftruncate,
             21 => Self::Renameat,
+            22 => Self::Fchdir,
             _ => return None,
         })
     }
 
-    /// Whether the operation resolves a path. Its input then leads with
+    /// Whether the operation resolves a path, or checks the caller's access
+    /// to a directory ([`HostFileOp::Fchdir`]). Its input then leads with
     /// the caller's [`AccessContext`] (credentials, umask, cwd, root),
-    /// followed by the path.
+    /// followed by the path, if any.
     pub const fn resolves_path(self) -> bool {
         matches!(
             self,
@@ -229,6 +237,7 @@ impl HostFileOp {
                 | Self::Utimensat
                 | Self::Truncate
                 | Self::Renameat
+                | Self::Fchdir
         )
     }
 }
