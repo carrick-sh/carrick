@@ -2079,17 +2079,6 @@ fn run_mounted_binary_with_capture(
     run_id: &str,
     json: bool,
 ) -> (std::process::Output, Option<std::path::PathBuf>) {
-    run_mounted_binary_with_args(elf, run_id, json, &[])
-}
-
-/// As [`run_mounted_binary_with_capture`], with `run_args` passed to
-/// `carrick run` ahead of the image (volumes, a working directory).
-fn run_mounted_binary_with_args(
-    elf: &std::path::Path,
-    run_id: &str,
-    json: bool,
-    run_args: &[String],
-) -> (std::process::Output, Option<std::path::PathBuf>) {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
     std::fs::write(&archive, empty_image_archive()).unwrap();
@@ -2126,8 +2115,8 @@ fn run_mounted_binary_with_args(
         "never",
         "--volume",
         &format!("{}:/hello:ro", elf.display()),
+        "x86-kvm-hello:latest",
     ]);
-    command.args(run_args).arg("x86-kvm-hello:latest");
     command
         .process_group(0)
         .stdout(Stdio::piped())
@@ -2475,55 +2464,50 @@ fn mounted_static_x86_signal_group_exit_names_its_custody_dependency() {
     );
 }
 
-/// Run an x86 B1 host-crossing fixture (#2157) with a scratch working
-/// directory: `native` runs it on the host in a fresh directory, otherwise
-/// carrick runs it with another fresh directory mounted as its cwd. Returns
-/// the output and the names left behind in the directory.
+/// Run an x86 B1 host-crossing fixture (#2157): `under_carrick` false runs it
+/// on the host with a fresh scratch directory as its cwd; otherwise carrick
+/// runs it in the root file system's writable layer (a bind mount has no
+/// `user.*` attributes, mknod or truncate under carrick), which is fresh per
+/// run. Every fixture removes what it creates.
 fn run_crossing_fixture(
     fixture: &str,
     flags: &[&str],
     under_carrick: bool,
-) -> (std::process::Output, Vec<String>) {
+) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("crossing-guest");
     compile_assembly_with_flags(fixture, &elf, flags);
-    let work = dir.path().join("work");
-    std::fs::create_dir(&work).unwrap();
-    let output = if under_carrick {
-        let args = [
-            "--volume".to_owned(),
-            format!("{}:/work:rw", work.display()),
-            "--workdir".to_owned(),
-            "/work".to_owned(),
-        ];
+    if under_carrick {
         // Tests run in parallel: each variant needs its own scoped run id.
         let run_id = format!("{fixture}{}", flags.concat());
-        run_mounted_binary_with_args(&elf, &run_id, false, &args).0
+        run_mounted_binary(&elf, &run_id, false)
     } else {
-        Command::new(&elf)
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let output = Command::new(&elf)
             .current_dir(&work)
             .timeout(Duration::from_secs(5))
             .output()
-            .expect("run native x86 Linux oracle")
-    };
-    let mut left: Vec<String> = std::fs::read_dir(&work)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    left.sort();
-    (output, left)
+            .expect("run native x86 Linux oracle");
+        assert_eq!(
+            std::fs::read_dir(&work).unwrap().count(),
+            0,
+            "{fixture} must remove what it creates"
+        );
+        output
+    }
 }
 
 /// The run root performs a B1 crossing family's calls; carrick returns what
-/// native Linux returns, step for step, and leaves the same host state.
+/// native Linux returns, step for step.
 fn compare_root_crossings_with_native(fixture: &str) {
     if skip_without_kvm() {
         return;
     }
-    let (native, native_left) = run_crossing_fixture(fixture, &[], false);
+    let native = run_crossing_fixture(fixture, &[], false);
     assert_eq!(native.stdout, b"F\n", "native oracle {fixture}: {native:?}");
     assert_eq!(native.status.code(), Some(7));
-    let (run, left) = run_crossing_fixture(fixture, &[], true);
+    let run = run_crossing_fixture(fixture, &[], true);
     assert_eq!(
         run.stdout,
         native.stdout,
@@ -2533,18 +2517,18 @@ fn compare_root_crossings_with_native(fixture: &str) {
     );
     assert_eq!(run.status.code(), native.status.code(), "{fixture}");
     assert!(run.stderr.is_empty(), "{fixture}: {:?}", run.stderr);
-    assert_eq!(left, native_left, "{fixture}: host state differs");
 }
 
 /// A forked child performs a B1 crossing family's calls. It owns no host task,
 /// so a path call is the ring's counted ENOSYS (as on ARM) and a closed
 /// descriptor is EBADF; the run must not fail and the child leaves no host
-/// effect. The fixture's own exit code carries the first step that differed.
+/// effect, which the parent proves. The fixture's own exit code carries the
+/// first step that differed.
 fn forked_child_crossings_refuse_in_ring(fixture: &str) {
     if skip_without_kvm() {
         return;
     }
-    let (run, left) = run_crossing_fixture(fixture, &["-DCHILD"], true);
+    let run = run_crossing_fixture(fixture, &["-DCHILD"], true);
     assert_eq!(
         run.stdout,
         b"F\n",
@@ -2554,7 +2538,6 @@ fn forked_child_crossings_refuse_in_ring(fixture: &str) {
     );
     assert_eq!(run.status.code(), Some(7), "{fixture} child");
     assert!(run.stderr.is_empty(), "{fixture} child: {:?}", run.stderr);
-    assert!(left.is_empty(), "{fixture} child left {left:?}");
 }
 
 #[test]

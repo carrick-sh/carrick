@@ -23,7 +23,8 @@ pub enum FdOperandClass {
     /// No ring description: the number is the root's host task's own
     /// descriptor, which crosses unchanged.
     HostBacked,
-    /// The ring's own object (pipe, eventfd, epoll, in-zone file, inotify).
+    /// The ring's own object (pipe, eventfd, epoll, in-zone file, inotify, or
+    /// a host file held by the ring's descriptor table).
     InZone,
     /// No open descriptor with this number.
     Absent,
@@ -59,9 +60,12 @@ impl CrossingOperand {
 }
 
 /// Classify `fd` in the caller's ring tables. `ring` resolves it in the
-/// caller's fd-core namespace when one is published; only its in-zone answer
-/// is used, since a host-backed or absent fd-core entry says nothing about a
-/// descriptor the root's host task opened.
+/// caller's fd-core namespace when one is published. A description the ring
+/// holds, in-zone or backed by a host file the carrier opened for a staged
+/// `openat`, is the ring's: its number names nothing in the root's host task,
+/// so crossing with it unchanged would reach whatever that task has under the
+/// number. An absent fd-core entry says nothing about a descriptor the root's
+/// host task opened.
 pub fn classify_fd_operand(
     fd_map: &[FdMapSlot],
     opens: &[DelegatedOpenFile],
@@ -81,7 +85,13 @@ pub fn classify_fd_operand(
                     .map_or(FdOperandClass::InZone, FdOperandClass::HostObject)
             }),
         Some((FdSlotKind::Inotify(_), _)) => FdOperandClass::InZone,
-        None if matches!(ring(fd), Some(NativeDescriptor::InZone(_))) => FdOperandClass::InZone,
+        None if matches!(
+            ring(fd),
+            Some(NativeDescriptor::InZone(_) | NativeDescriptor::HostBacked { .. })
+        ) =>
+        {
+            FdOperandClass::InZone
+        }
         // The ring admits stdio for every table it serves, so a missing
         // 0..=2 was closed; a higher number is the host task's own.
         None if (0..=2).contains(&fd) => FdOperandClass::Absent,
@@ -233,6 +243,17 @@ mod tests {
         };
         assert_eq!(
             classify_fd_operand(&fd_map, &opens, table, 7, pipe),
+            FdOperandClass::InZone
+        );
+        // A host file the ring holds for a staged open is the ring's too: the
+        // root's host task has nothing under its number.
+        let held = |_| {
+            Some(NativeDescriptor::HostBacked {
+                access: carrick_personality_linux::native_host_file::DescriptionAccess::ReadWrite,
+            })
+        };
+        assert_eq!(
+            classify_fd_operand(&fd_map, &opens, table, 3, held),
             FdOperandClass::InZone
         );
     }

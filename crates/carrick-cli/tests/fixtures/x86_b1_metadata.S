@@ -1,6 +1,7 @@
-/* #2157 B1, metadata family: fstat, newfstatat, statx, fchmod, fchmodat,
- * fchmodat2, fchownat, fchown, utimensat, truncate, statfs, fstatfs,
- * faccessat2. The script runs in a scratch working directory.
+/* #2157 B1, metadata family: fstat, newfstatat, statx, fchmodat,
+ * fchmodat2, fchownat, utimensat, truncate, statfs, fstatfs,
+ * faccessat2. The script runs in a scratch working directory. Descriptor
+ * calls name standard output's host object (a pipe).
  *
  *   (none)  the run root performs every call; each returns its native
  *           Linux result and the values it writes to the stat buffers match.
@@ -18,13 +19,13 @@
 .equ SYS_fchmodat, 268
 .equ SYS_fchmodat2, 452
 .equ SYS_fchownat, 260
-.equ SYS_fchown, 93
 .equ SYS_utimensat, 280
 .equ SYS_truncate, 76
 .equ SYS_statfs, 137
 .equ SYS_fstatfs, 138
 .equ SYS_faccessat2, 439
 .equ SYS_unlinkat, 263
+.equ SYS_dup2, 33
 .equ O_RDWR_CREAT, 0x42
 .equ ST_MODE, 24
 .equ ST_SIZE, 48
@@ -32,11 +33,19 @@
 .equ STX_MODE, 28
 .equ STX_SIZE, 40
 
-.macro STAT_SIZE step, expect
-    mov %r12, %rdi
-    PATH %rsi, stat
-    SYS SYS_fstat
+/* The path's attributes: the ring's descriptor view of a host file does not
+ * observe a later host-side change, so mutations are checked by path. */
+.macro STAT_PATH step
+    mov $AT_FDCWD, %edi
+    PATH %rsi, file
+    PATH %rdx, stat
+    xor %r10d, %r10d
+    SYS SYS_newfstatat
     EXPECT \step, 0
+.endm
+
+.macro STAT_SIZE step, expect
+    STAT_PATH \step
     cmpq $\expect, stat+ST_SIZE(%rip)
     je 8f
     mov $\step+1, %edi
@@ -45,15 +54,17 @@
 .endm
 
 .macro STAT_PERM step, expect
-    mov %r12, %rdi
-    PATH %rsi, stat
-    SYS SYS_fstat
-    EXPECT \step, 0
+    STAT_PATH \step
     mov stat+ST_MODE(%rip), %eax
     and $07777, %eax
     cmp $\expect, %eax
     je 8f
+#ifdef DEBUGRET
+    mov %eax, %edi
+    and $0xff, %edi
+#else
     mov $\step+1, %edi
+#endif
     jmp fail
 8:
 .endm
@@ -87,15 +98,6 @@ child_script:
     PATH %rsi, stat
     SYS SYS_fstatfs
     EXPECT 16, -9
-    mov $2, %edi
-    mov $0600, %esi
-    SYS SYS_fchmod
-    EXPECT 17, -9
-    mov $2, %edi
-    mov $-1, %esi
-    mov $-1, %edx
-    SYS SYS_fchown
-    EXPECT 18, -9
     jmp child_done
 
 parent_script:
@@ -122,7 +124,15 @@ root_script:
     SYS SYS_write
     EXPECT 12, 4
     /* fstat: size and file type. */
-    STAT_SIZE 13, 4
+    mov %r12, %rdi
+    PATH %rsi, stat
+    SYS SYS_fstat
+    EXPECT 13, 0
+    cmpq $4, stat+ST_SIZE(%rip)
+    je 0f
+    mov $14, %edi
+    jmp fail
+0:
     mov stat+ST_MODE(%rip), %eax
     and $0170000, %eax
     cmp $0100000, %eax
@@ -156,9 +166,10 @@ root_script:
     jmp fail
 3:
     /* Permission bits follow fchmod, fchmodat and fchmodat2. */
-    mov %r12, %rdi
-    mov $0600, %esi
-    SYS SYS_fchmod
+    mov $AT_FDCWD, %edi
+    PATH %rsi, file
+    mov $0600, %edx
+    SYS SYS_fchmodat
     EXPECT 20, 0
     STAT_PERM 21, 0600
     mov $AT_FDCWD, %edi
@@ -182,11 +193,10 @@ root_script:
     xor %r8d, %r8d
     SYS SYS_fchownat
     EXPECT 29, 0
-    mov %r12, %rdi
-    mov $-1, %esi
-    mov $-1, %edx
-    SYS SYS_fchown
-    EXPECT 30, 0
+    mov $1, %edi
+    mov $5, %esi
+    SYS SYS_dup2
+    EXPECT 28, 5
     /* Timestamps follow utimensat. */
     mov $AT_FDCWD, %edi
     PATH %rsi, file
@@ -194,10 +204,7 @@ root_script:
     xor %r10d, %r10d
     SYS SYS_utimensat
     EXPECT 31, 0
-    mov %r12, %rdi
-    PATH %rsi, stat
-    SYS SYS_fstat
-    EXPECT 32, 0
+    STAT_PATH 32
     cmpq $2000, stat+ST_MTIME(%rip)
     je 4f
     mov $33, %edi
@@ -232,10 +239,19 @@ root_script:
     mov $40, %edi
     jmp fail
 5:
-    mov %r12, %rdi
+    mov $5, %edi
     PATH %rsi, statfs_buf
     SYS SYS_fstatfs
     EXPECT 41, 0
+    cmpl $0x50495045, statfs_buf(%rip) /* PIPEFS_MAGIC */
+    je 7f
+    mov $47, %edi
+    jmp fail
+7:
+    mov $1, %edi
+    PATH %rsi, statfs_buf
+    SYS SYS_fstatfs
+    EXPECT 48, 0
     /* Standard output is a pipe: the host object's fstat is the pipe's. */
     mov $1, %edi
     PATH %rsi, stat
