@@ -5574,6 +5574,112 @@ printf '{"data":%s}\n200' "$body"
         );
     }
 
+    #[test]
+    fn serial_host_cpu_ceiling_defers_and_retries_next_pass() {
+        const CHILD: &str = "CARRICK_CPU_CEILING_2151";
+        if std::env::var_os(CHILD).is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ci_scaler::live::tests::serial_host_cpu_ceiling_defers_and_retries_next_pass",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stderr}");
+            assert_eq!(
+                stderr
+                    .matches("projected clone CPU 87.5% exceeds the 80% admission ceiling")
+                    .count(),
+                1,
+                "over-ceiling reconcile pass must log projected CPU once: {stderr}"
+            );
+            assert!(
+                stderr.contains("vm=308 state=Cloning task=UPID:willow:clone308 deferred"),
+                "deferral log must identify vm, state, and task: {stderr}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_provision_fixture_tools(dir.path());
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            );
+            std::env::set_var("CARRICK_BURST_DIR", dir.path());
+        }
+        let dir_reconcile = dir.path().join("reconcile_cpu_ceiling");
+        std::fs::create_dir_all(&dir_reconcile).unwrap();
+        let mut ledger = Ledger::default();
+        let mut r = row();
+        r.state = State::Cloning;
+        r.task = Some("UPID:willow:clone308".into());
+        let (key, _) = key_paths(&dir_reconcile, &r);
+        std::fs::write(&key, "private\n").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(
+            key.with_extension("key.pub"),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture runner@test\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("name_308"), &r.name).unwrap();
+        std::fs::write(dir.path().join("present_308"), "").unwrap();
+        ledger.rows.push(r);
+        let path = dir_reconcile.join("ledger.json");
+        ledger.save(&path).unwrap();
+
+        let over_ceiling = HostSample {
+            busy: 0.75,
+            threads: 16,
+            available: 128 << 30,
+        };
+        let pass1 = reconcile_all(
+            &Pve::test_fixture(site::WILLOW, Some(over_ceiling)),
+            &Github,
+            &mut ledger,
+            &dir_reconcile,
+            &path,
+            (1, &Admission::Standing),
+        )
+        .expect("over-ceiling CPU must defer without ending reconcile");
+        assert!(pass1.frozen.is_none());
+        assert_eq!(pass1.finished, 0);
+        let status: Value = serde_json::from_slice(
+            &std::fs::read(dir_reconcile.join("reconcile-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["admission_frozen"], false);
+        assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Cloning);
+
+        let roomy = HostSample {
+            busy: 0.05,
+            threads: 32,
+            available: 128 << 30,
+        };
+        let pass2 = reconcile_all(
+            &Pve::test_fixture(site::WILLOW, Some(roomy)),
+            &Github,
+            &mut ledger,
+            &dir_reconcile,
+            &path,
+            (1, &Admission::Standing),
+        )
+        .expect("next reconcile pass must retry once CPU clears");
+        assert!(pass2.frozen.is_none());
+        assert_eq!(
+            Ledger::load(&path).unwrap().rows[0].state,
+            State::Running,
+            "clone deferred by CPU ceiling must reach Running on the next pass"
+        );
+    }
+
     fn row() -> Record {
         Ledger::default()
             .reserve(
