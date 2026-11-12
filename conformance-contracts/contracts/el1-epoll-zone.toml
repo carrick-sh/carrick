@@ -45,13 +45,13 @@ an epoll costs no host exit in steady state.
 [bindings]
 # VM-free component evidence; signed execution and exit budgets stay unchanged.
 vm_free = [
-  "carrick-el1-linux::x86_production_forward::x86_clone_child_serves_stdout_stat_write_and_own_redirect (production CPL0 frame, ring epoll and eventfd creation, ADD, packed event copyout, read/write and pwait/pwait2 readiness)",
   "carrick-el1-abi::ipc::epoll::tests::{bounded_ready_count_preserves_edges_and_oneshots,ready_count_survives_cursor_replacement_between_batches,ready_count_requires_shared_zone_only_proof}",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::{s1_empty_epoll_skips_owner_preparation,s1_host_epoll_refusals_preserve_edge_and_empty_host_policy}",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_epoll_pwait_sigmask_on_a_ring_epoll_is_never_forwarded (production native-child entry, #1671: two live tasks share one ring epoll; libuv's epoll_pwait with a SIGPROF mask EINVALs on a bad sigsetsize, parks in ring with the initial mask snapshot retained across lost-readiness repark despite buffer overwrite, harvests after buffer unmapping and restores the original mask on completion, and is never forwarded to the host; no signed, EINTR-handler or x86 execution claim)",
   "carrick-el1-linux::ipc::tests::el1_epoll_zone_sigmask_wait_arms_while_parked_and_never_forwards_a_native_call",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_pipe_writer_reaches_its_parent (production native-child entry, #1671: epoll_pwait into an events page the ring's copy refuses until the native owner prepares it reports the ET event once with the right bytes, never forwarded (ipc_leaves[EpollCopyOut] 0, forwarded[22] unchanged); an owner-faulted buffer is EFAULT in ring and its report stays queued; no signed or x86 execution claim)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_netpoll_eventfd_wait (production native-child entry, child-created eventfd and epoll, EPOLLIN|EPOLLET ADD/MOD/DEL, timeout-zero readiness, epoll_pwait2 zero/invalid timespec and finite park with retained deadline despite timespec mutation, and inherited eventfd writer wake; zero forwarded calls and released execution capacity, no signed or x86 execution claim)",
+  "carrick-el1-linux::x86_production_forward::x86_clone_child_serves_stdout_stat_write_and_own_redirect (production CPL0 frame, ring epoll and eventfd creation, ADD, packed event copyout, read/write and pwait/pwait2 readiness)",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_epoll_eventfd_pingpong_stays_in_guest",
