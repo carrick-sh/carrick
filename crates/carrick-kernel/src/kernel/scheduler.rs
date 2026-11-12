@@ -10728,6 +10728,77 @@ mod tests {
 
         include!("scheduler/exit_drain_tests.rs");
 
+        #[test]
+        fn native_held_publication_never_prepares_a_host_continuation() {
+            let region = carrick_test_support::TestEl1Region::zeroed();
+            struct Restore(usize);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    carrick_el1_abi::record_el1_region_host_ptr(self.0);
+                }
+            }
+            let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
+            carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+            let zone = carrick_el1_abi::zone_tables().unwrap();
+            let (kernel, root) = bootstrap(12_480);
+            publish(&root, 36);
+            let scheduler = Scheduler::new(Arc::clone(&kernel));
+            let record_id = zone
+                .alloc_record(carrick_el1_abi::ThreadIdentity {
+                    tid: root.thread().key().tid.raw() as u64,
+                    serial: root.thread().key().serial.raw(),
+                    mm: root.shared().mm().id().raw(),
+                    file_table: 0,
+                    generation: root.thread().execution_state().generation().unwrap().raw(),
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 2,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            assert!(zone.mark_native_owned(record_id));
+            let seq = zone.next_seq(record_id);
+            zone.publish_park(record_id, seq);
+            let record = zone.record_ref(record_id);
+            assert_eq!(
+                zone.claim_for_host(
+                    record,
+                    None,
+                    carrick_sched_core::Handback::Woken,
+                    &carrick_sched_core::ShortLockSpin,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    }
+                ),
+                carrick_sched_core::HostClaim::Claimed
+            );
+            let calls = crate::kernel::Thread::prepare_zone_handback_calls();
+            scheduler.publish_zone_handback(record);
+            assert_eq!(
+                zone.record(record_id).claim(),
+                carrick_sched_core::Claim::Held { seq }
+            );
+            assert_eq!(crate::kernel::Thread::prepare_zone_handback_calls(), calls);
+            assert_eq!(scheduler.queued_len(), 0);
+            // Known-answer check: the observer covers even the defensive refusal.
+            assert!(root.thread().prepare_zone_handback(record).is_none());
+            assert_eq!(
+                crate::kernel::Thread::prepare_zone_handback_calls(),
+                calls + 1
+            );
+            zone.claim_for_host(
+                record,
+                None,
+                carrick_sched_core::Handback::Cancelled,
+                &carrick_sched_core::ShortLockSpin,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+            );
+            zone.free_record(record_id);
+            scheduler.close();
+        }
+
         /// #1134 (#1106): a guest service the zone hands back unplaced moves
         /// its held row to a host CPU queue. That row is new fairness demand
         /// on that CPU: the compute thread already running there must get a
