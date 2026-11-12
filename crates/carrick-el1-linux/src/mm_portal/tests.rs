@@ -4418,7 +4418,9 @@ fn owner_fork_preserves_parent_owed_return_and_omits_retired_child_leaf() {
         .unwrap();
         root.complete_deferring_return(completion, slot).unwrap();
         assert!(root.fork_ready());
-        assert!(!root.fork_settled());
+        let mut owed = 0;
+        root.observe_deferred_returns(&mut |_| owed += 1);
+        assert_eq!(owed, 1, "the retirement is owed until settled");
     }
     let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
     let parent_tables = Tables::new(ROOT, IPA, 2);
@@ -4487,13 +4489,23 @@ fn owner_fork_preserves_parent_owed_return_and_omits_retired_child_leaf() {
         .lock_el1_resolved(spaces.find(78).unwrap().index(), request.child_mm, &view, 0)
         .unwrap();
     child_root.observe_deferred_returns(&mut |_| panic!("parent return leaked into child"));
+    let ack = |root: &mut _| {
+        carrick_el1_abi::ReturnJournal::acknowledge_chunk(
+            root,
+            owed[0].slot,
+            owed[0].epoch,
+            retired_range.start(),
+            retired_range.end(),
+        )
+        .unwrap()
+    };
     assert_eq!(
-        parent_root.acknowledge_deferred_returns(sequence).unwrap(),
-        1
+        ack(&mut parent_root),
+        carrick_el1_abi::ChunkAcknowledgement::Freed
     );
     assert_eq!(
-        parent_root.acknowledge_deferred_returns(sequence).unwrap(),
-        0
+        ack(&mut parent_root),
+        carrick_el1_abi::ChunkAcknowledgement::Stale
     );
 }
 

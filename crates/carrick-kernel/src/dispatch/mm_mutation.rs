@@ -235,6 +235,10 @@ impl<'authority> MmMutationGuard<'authority> {
             coordinator: Arc::clone(&self.coordinator),
             mm: self.mm,
             guest_tid: self.guest_tid,
+            excluded: self
+                ._el1_editor
+                .as_ref()
+                .map(crate::kernel::mm_occupancy::El1EditorExclusion::excluded),
             _guard: PhantomData,
         }
     }
@@ -285,6 +289,7 @@ impl<'authority> MmMutationGuard<'authority> {
             coordinator: Arc::clone(&coordinator),
             mm: self.mm,
             guest_tid: self.guest_tid,
+            excluded: None,
             _guard: PhantomData,
         };
         let _alias = coordinator.begin_alias(&permit);
@@ -567,6 +572,9 @@ pub struct HostAliasPermit<'guard> {
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
     guest_tid: Option<carrick_hal::ThreadId>,
+    /// The guard's exclusion of the MM's published EL1 editor, if it holds
+    /// one.
+    excluded: Option<&'guard carrick_sched_core::ExcludedEditor<'guard>>,
     _guard: PhantomData<&'guard MmMutationGuard<'guard>>,
 }
 
@@ -580,6 +588,12 @@ impl HostAliasPermit<'_> {
 
     pub(crate) fn authorizes(&self, coordinator: &Arc<MmMutationCoordinator>, mm: MmId) -> bool {
         self.mm == mm && coordinator.mm == mm && Arc::ptr_eq(&self.coordinator, coordinator)
+    }
+
+    /// The minting guard's exclusion of this MM's published EL1 editor.
+    /// `None`: the guard holds none (the MM had no published space).
+    pub(crate) fn excluded_editor(&self) -> Option<&carrick_sched_core::ExcludedEditor<'_>> {
+        self.excluded
     }
 }
 

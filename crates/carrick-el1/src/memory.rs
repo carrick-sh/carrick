@@ -3155,9 +3155,13 @@ mod tests {
                     owed[0].range,
                     ReservationRange::new(ARENA, ARENA + 0x2000).unwrap()
                 );
-                // An older receipt does not release a newer retirement.
-                let older = ReservationSequence::new(owed[0].sequence.raw() - 1).unwrap();
-                assert_eq!(model.acknowledge_deferred_returns(older), Ok(0));
+                // A handle from another slot lifetime releases nothing.
+                let older =
+                    carrick_el1_abi::OwedSlotEpoch::new(owed[0].epoch.raw().wrapping_sub(1));
+                assert_eq!(
+                    model.acknowledge_chunk(owed[0].slot, older, ARENA, ARENA + 0x2000),
+                    Ok(carrick_el1_abi::ChunkAcknowledgement::Stale)
+                );
                 owed[0]
             };
             assert_eq!(
@@ -3167,8 +3171,13 @@ mod tests {
             // The host reconciled stage-2 and the inventory: its receipt
             // releases the frames and the VA.
             assert_eq!(
-                root(&spaces, &table, &task).acknowledge_deferred_returns(owed.sequence),
-                Ok(1)
+                root(&spaces, &table, &task).acknowledge_chunk(
+                    owed.slot,
+                    owed.epoch,
+                    owed.range.start(),
+                    owed.range.end()
+                ),
+                Ok(carrick_el1_abi::ChunkAcknowledgement::Freed)
             );
             let mut returned_backing = Editor::over(RangeBacking::Retired);
             let (route, address) = syscall(
@@ -3238,8 +3247,13 @@ mod tests {
             assert_eq!(before_ack, DelegatedAnonymous::Forward);
 
             assert_eq!(
-                root(&spaces, &table, &task).acknowledge_deferred_returns(owed[0].sequence),
-                Ok(1)
+                root(&spaces, &table, &task).acknowledge_chunk(
+                    owed[0].slot,
+                    owed[0].epoch,
+                    owed[0].range.start(),
+                    owed[0].range.end()
+                ),
+                Ok(carrick_el1_abi::ChunkAcknowledgement::Freed)
             );
             let mut returned = Editor::over(RangeBacking::Retired);
             let (after_ack, address) = syscall(
