@@ -1907,7 +1907,8 @@ pub(crate) mod tests {
 
     #[test]
     fn serial_host_watchdog_scope_survives_unprepared_and_successive_carriers() {
-        if isolated_fixture_process(&[]) {
+        // This fixture tests generated scopes, independently of the caller's run stamp.
+        if isolated_fixture_process(&[("CARRICK_RUN_ID", "")]) {
             return;
         }
         let query: fn() -> Option<CarrierScopeId> = active_carrier_scope;
