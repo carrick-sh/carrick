@@ -40,6 +40,41 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+/// Import an image and its stack into the exact closed reservation owner.
+/// Boot and exec must use the same region-to-reservation projection. The caller
+/// holds the stopped-vCPU root-release lease; this does not open the space.
+pub fn import_x86_image_regions<P: carrick_core::mm::reservation::ReservationPolicy>(
+    model: &mut carrick_core::mm::reservation::Reservations<
+        '_,
+        P,
+        carrick_el1::memory::reservations::X86Cpl0ReservationGeometry,
+        carrick_sched_core::ParkedContextWords,
+    >,
+    image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+    stack_top: u64,
+) -> Result<(), carrick_el1::memory::reservations::Refusal> {
+    model.finish_import()?;
+    for region in &image.regions {
+        let bits = u64::from(region.perms.read)
+            | (u64::from(region.perms.write) << 1)
+            | (u64::from(region.perms.execute) << 2);
+        model.insert_opaque(
+            ReservationRange::new(region.start, region.end)
+                .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
+            carrick_el1_abi::ReservationProtection::from_bits(bits)
+                .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
+            carrick_el1_abi::ReservationNodeFlags::PRIVATE,
+        )?;
+    }
+    model.insert_opaque(
+        ReservationRange::new(stack_top - INITIAL_STACK_SIZE, stack_top)
+            .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
+        carrick_el1_abi::ReservationProtection::READ_WRITE,
+        carrick_el1_abi::ReservationNodeFlags::PRIVATE
+            .union(carrick_el1_abi::ReservationNodeFlags::GROWSDOWN),
+    )
+}
+
 pub const RAM_SIZE: usize = 16 * 1024 * 1024;
 pub const META_GPA: u64 = carrick_core_abi::X86_CPL0_METADATA_GPA;
 pub const META_LEN: u64 = 0x10_0000;

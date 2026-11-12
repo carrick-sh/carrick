@@ -1462,28 +1462,7 @@ impl Cpl0Carrier {
         X86Cpl0RootReleaseVenue::new(table, release)
             .map_err(|error| fail(format!("production root authority: {error:?}")))?
             .lock(index.index(), mm, &NoRootWait)
-            .and_then(|mut model| {
-                model.finish_import()?;
-                for region in &image.regions {
-                    let bits = u64::from(region.perms.read)
-                        | (u64::from(region.perms.write) << 1)
-                        | (u64::from(region.perms.execute) << 2);
-                    model.insert_opaque(
-                        ReservationRange::new(region.start, region.end)
-                            .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
-                        carrick_el1_abi::ReservationProtection::from_bits(bits)
-                            .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
-                        carrick_el1_abi::ReservationNodeFlags::PRIVATE,
-                    )?;
-                }
-                model.insert_opaque(
-                    ReservationRange::new(stack_top - INITIAL_STACK_SIZE, stack_top)
-                        .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
-                    carrick_el1_abi::ReservationProtection::READ_WRITE,
-                    carrick_el1_abi::ReservationNodeFlags::PRIVATE
-                        .union(carrick_el1_abi::ReservationNodeFlags::GROWSDOWN),
-                )
-            })
+            .and_then(|mut model| import_x86_image_regions(&mut model, image, stack_top))
             .map_err(|error| fail(format!("production root admission: {error:?}")))?;
         SpaceAccess::notified(release).open(index);
         if let Some(error) = wake_error.into_inner() {
