@@ -3,6 +3,8 @@
 //! process exited. One test per binary: it owns the process environment and
 //! the scratch-root resolution.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

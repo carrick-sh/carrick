@@ -1475,9 +1475,5 @@ pub fn carrick_home_from(
 
 /// [`carrick_home_from`] over the process environment.
 pub fn carrick_home() -> std::path::PathBuf {
-    carrick_home_from(
-        std::env::var_os("CARRICK_HOME"),
-        std::env::var_os("HOME"),
-    )
+    carrick_home_from(std::env::var_os("CARRICK_HOME"), std::env::var_os("HOME"))
 }
-
