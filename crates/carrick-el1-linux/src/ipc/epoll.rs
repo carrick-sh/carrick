@@ -17,8 +17,14 @@
 //! - host-half items (only the host harvests both halves);
 //! - a finite timeout with nothing ready while another thread's timed
 //!   park holds the slot's timer (a slot's timer has one owner);
-//! - a buffer the reports cannot be copied to (the harvested items are put
-//!   back first, so the host's harvest reports them again).
+//! - a buffer the reports cannot be copied to, when no native owner retains
+//!   the caller's memory (the harvested items are put back first, so the
+//!   host's harvest reports them again).
+//!
+//! With a native owner, a refused copy-out never leaves the ring: the items
+//! are put back, the owner prepares the buffer (a first touch is supplied,
+//! or waited for) and the call harvests again; a buffer the owner faults is
+//! EFAULT, its reports still queued, as on Linux.
 //!
 //! A blocking wait parks on the epoll's `Readable` lane with an
 //! [`IpcOpKind::EpollWait`] operation that pins the epoll's description, so
@@ -40,11 +46,13 @@
 //! reports `Changed`.
 
 use super::{
-    EL1_WAIT, Finish, IpcExecution, IpcServed, IpcVenue, Parked, UserCopy, argument_word, finish,
-    leave, linux, mm_key, notify_operation_release, park, release_pin, set_result, snapshot,
-    task_key,
+    EL1_WAIT, Finish, IpcExecution, IpcRegion, IpcServed, IpcVenue, Parked, UserCopy,
+    argument_word, finish, from_sched_token, leave, linux, mm_key, notify_operation_release, park,
+    park_result, release_pin, retain_native_operation, set_result, snapshot, task_key,
+    to_sched_token,
 };
 use crate::dispatch::GuestDispatchFrame;
+use carrick_core::mm::transaction::{CopyoutPreparation, CopyoutRequest, OwnedOperationYield};
 use carrick_el1_abi::IpcLeave;
 use carrick_el1_abi::ipc::epoll::{EpollItemRef, EpollReport};
 use carrick_el1_abi::ipc::fd::{Error as FdError, Fd, TableId};
@@ -221,6 +229,8 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
     }
     let buf = argument_word(frame, 1);
     let limit = usize::try_from(maxevents).map_or(BATCH, |n| n.min(BATCH));
+    // The owner prepared the events buffer for the last refused copy-out.
+    let mut prepared = false;
     loop {
         // Before the harvest: an item queued after it moves this snapshot.
         let wait = match wait {
@@ -263,11 +273,27 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
                 event[8..].copy_from_slice(&report.data.to_ne_bytes());
             }
             if !user.copy_out(buf, &bytes[..harvest.reported * EVENT_BYTES]) {
-                // Not delivered: queue the items again; the host resolves the
-                // fault (first touch, or EFAULT) and reports them.
+                // Not delivered: queue the items again, so a later harvest
+                // reports them exactly once (Linux re-queues on a failed copy).
                 let _ = region.epoll_restore(object, taken, &Finish);
-                release_pin(sched, OfdPin::from_raw(op.pin), region);
-                return leave(sched, IpcLeave::EpollCopyOut, IpcServed::Forward);
+                let Some(request) = user.take_copyout_refusal() else {
+                    // No native owner retains this caller's memory: the
+                    // host-owned lane resolves the fault and reports them.
+                    release_pin(sched, OfdPin::from_raw(op.pin), region);
+                    return leave(sched, IpcLeave::EpollCopyOut, IpcServed::Forward);
+                };
+                if wait == Wait::Poll {
+                    // A resumed operation keeps a reached deadline: it harvests once.
+                    op.deadline = IpcCounterDeadline::at(sched.now());
+                }
+                match prepare_output(sched, frame, region, user, op, request, prepared) {
+                    Output::Rerun(back, ready) => {
+                        op = back;
+                        prepared = ready;
+                        continue;
+                    }
+                    Output::Done(served) => return served,
+                }
             }
             release_pin(sched, OfdPin::from_raw(op.pin), region);
             return returned(frame, harvest.reported as i64);
@@ -342,6 +368,99 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
             }
         }
     }
+}
+
+/// How an events buffer the ring's copy refused was settled.
+enum Output {
+    /// Harvest again with this operation (its pin kept); `true` when the
+    /// owner prepared the buffer, so the next copy must succeed.
+    Rerun(IpcOperation, bool),
+    Done(IpcServed),
+}
+
+/// Settle a refused events copy-out through the native owner's exact-MM
+/// output preparation, the one the ring pipe read uses (`run`): a first
+/// touch is supplied (or waited for) and the call harvests again; only a
+/// buffer the owner faults is EFAULT. The harvested items are already
+/// queued again, and the call is retained as its `EpollWait` operation
+/// while the owner prepares, so a suspended call resumes through
+/// [`resume`] and harvests afresh.
+#[allow(clippy::too_many_arguments)]
+fn prepare_output<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
+    region: &IpcRegion<'_>,
+    user: &mut M,
+    op: IpcOperation,
+    request: CopyoutRequest,
+    prepared: bool,
+) -> Output {
+    let token = match region.begin_operation(op) {
+        Ok(token) => token,
+        Err(_) => {
+            release_pin(sched, OfdPin::from_raw(op.pin), region);
+            return Output::Done(leave(
+                sched,
+                IpcLeave::NoOperationRecord,
+                IpcServed::Forward,
+            ));
+        }
+    };
+    let operation = to_sched_token(token).unwrap_or_else(|_| invalid());
+    // One preparation may retry the hardware copy once. A refusal right
+    // after the owner reported the buffer ready has no errno authority.
+    let preparation = if prepared {
+        CopyoutPreparation::Unrouted(operation)
+    } else {
+        user.prepare_copyout(request, operation)
+    };
+    let ipc_token = |operation| from_sched_token(operation).unwrap_or_else(invalid);
+    let rerun = |sched: &mut E, token, ready| match region.finish_operation(token, || {
+        notify_operation_release(region, sched.zone(), sched.slot())
+    }) {
+        Ok(op) => Output::Rerun(op, ready),
+        Err(_) => invalid(),
+    };
+    match preparation {
+        CopyoutPreparation::Ready(operation) => rerun(sched, ipc_token(operation), true),
+        CopyoutPreparation::Fault(operation) => {
+            finish(sched, ipc_token(operation), region);
+            Output::Done(returned(
+                frame,
+                carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+            ))
+        }
+        CopyoutPreparation::Wait { operation, wait } => {
+            if wait.handle().mm().raw() != mm_key(sched.task()).0 {
+                invalid::<()>();
+            }
+            match park_result(sched.park_owner(frame, wait, operation)) {
+                Parked::Done(served) => Output::Done(served),
+                Parked::Retry(token) => rerun(sched, token, false),
+                Parked::Refused(_) => invalid(),
+            }
+        }
+        // Contention is not now: yield the same operation through its
+        // carrier-work owner; it resumes and harvests again.
+        CopyoutPreparation::Busy(operation) => match user.yield_owned_operation(operation) {
+            OwnedOperationYield::Ready(operation) => rerun(sched, ipc_token(operation), false),
+            OwnedOperationYield::Suspended => Output::Done(IpcServed::Idle),
+            OwnedOperationYield::Complete(result) => Output::Done(returned(frame, result)),
+            OwnedOperationYield::Unrouted(_) => invalid(),
+        },
+        CopyoutPreparation::Unrouted(operation) => {
+            // Stale or quarantined execution keeps terminal custody.
+            retain_native_operation(sched, ipc_token(operation));
+            invalid()
+        }
+        CopyoutPreparation::Complete(result) => Output::Done(returned(frame, result)),
+        CopyoutPreparation::Suspended => Output::Done(IpcServed::Idle),
+    }
+}
+
+/// A broken custody invariant: fail the run.
+fn invalid<T>() -> T {
+    crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
 }
 
 fn returned(frame: &mut impl GuestDispatchFrame, result: i64) -> IpcServed {
