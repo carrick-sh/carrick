@@ -600,7 +600,7 @@ fn tables_are_zero<M: CarrierMemoryIo>(memory: &CarrierMemory<M>, pages: &[RootG
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
-    fn physical_execution<I: CarrierCpuIo>(
+    pub(super) fn physical_execution<I: CarrierCpuIo>(
         &self,
         lease: &StoppedCpuLease<'_, I>,
     ) -> Result<GrantExecution, TrapError> {

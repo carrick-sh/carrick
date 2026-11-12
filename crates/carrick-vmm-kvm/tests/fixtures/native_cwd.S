@@ -29,15 +29,19 @@ _start:
     mov %rax, %r15
 #ifdef CONCURRENT
     /* Child has changed cwd and remains blocked until our own change. */
+    mov $13, %r14d
+    mov pipes+4(%rip), %edi
+    call close
     mov pipes(%rip), %edi
-    call receive
+    call wait_close
     lea parent(%rip), %r12
     inc %r14d
     call change
     call check
     mov pipes+12(%rip), %edi
-    call send
+    call close
 #endif
+    mov $12, %r14d
     mov %r15, %rdi
     lea status(%rip), %rsi
     xor %edx, %edx
@@ -47,7 +51,16 @@ _start:
     cmp %r15, %rax
     jne fail
     cmpl $0, status(%rip)
-    jne fail
+    je 4f
+    mov status(%rip), %edi
+    test $0x7f, %edi
+    jz 5f
+    and $0x7f, %edi
+    add $128, %edi
+    jmp exit
+5:  shr $8, %edi
+    jmp exit
+4:
     call check
     jmp success
 child:
@@ -58,10 +71,12 @@ child:
     call change
     call check
 #ifdef CONCURRENT
+    mov pipes+12(%rip), %edi
+    call close
     mov pipes+4(%rip), %edi
-    call send
+    call close
     mov pipes+8(%rip), %edi
-    call receive
+    call wait_close
     call check
 #endif
 #endif
@@ -69,17 +84,24 @@ success:
     xor %edi, %edi
     jmp exit
 #ifdef CONCURRENT
-send:
-    mov $1, %eax
-    jmp exchange
-receive:
-    xor %eax, %eax
-exchange:
-    lea token(%rip), %rsi
-    mov $1, %edx
+close:
+    mov $3, %eax
+    syscall
+    test %rax, %rax
+    jne fail
+    ret
+wait_close:
+    mov %edi, pollfd(%rip)
+    movl $1, pollfd+4(%rip)
+    lea pollfd(%rip), %rdi
+    mov $1, %esi
+    mov $-1, %edx
+    mov $7, %eax
     syscall
     cmp $1, %rax
     jne fail
+    testw $16, pollfd+6(%rip)
+    jz fail
     ret
 #endif
 change:
@@ -137,6 +159,11 @@ check:
     ret
 fail:
     mov %r14d, %edi
+    test %rax, %rax
+    jns exit
+    mov %eax, %edi
+    neg %edi
+    add $100, %edi
 exit:
     mov $231, %eax
     syscall
@@ -148,9 +175,10 @@ childdir: .asciz CHILD_PATH
 relative: .asciz "marker"
 .section .bss
 .balign 64
-buf: .skip 4096
-byte: .skip 1
 status: .skip 8
 pipes: .skip 16
-token: .skip 1
+pollfd: .skip 8
+byte: .skip 1
+.balign 64
+buf: .skip 4096
 .section .note.GNU-stack,"",@progbits

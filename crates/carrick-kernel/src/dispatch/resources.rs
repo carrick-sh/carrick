@@ -196,6 +196,18 @@ pub struct HostRootResources {
 }
 
 impl HostRootResources {
+    /// Seed the ring child's own filesystem values from the exact live root.
+    /// Both carrier transports call this owner while the forking root is stopped.
+    pub fn seed_fork(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
+        let Ok(snapshot) = self.snapshot() else {
+            return false;
+        };
+        snapshot
+            .filesystem
+            .fs_context
+            .with_cwd_and_root(|cwd, root| record.serve(cwd.as_bytes(), root.map(str::as_bytes)))
+    }
+
     pub fn capture(context: &crate::kernel::KernelContext) -> Self {
         Self {
             binding: context.task_binding(),

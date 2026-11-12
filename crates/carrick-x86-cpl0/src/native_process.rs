@@ -536,6 +536,24 @@ fn abort_child(
 }
 
 impl NativeProcessService<'static, ParkedContextWords> for Service {
+    fn root_fork_seed(
+        &mut self,
+        capability: carrick_core_abi::service::ExecCapabilityId,
+    ) -> Result<carrick_el1_linux::native_process_runtime::RootFsSeed, NativeProcessError> {
+        use carrick_core_abi::service::{ROOT_FORK_SEED_PORT, RootForkSeed};
+        use carrick_el1_linux::native_process_runtime::{FallibleBox, RootFsSeed};
+        let mut record = FallibleBox::<RootForkSeed>::try_reserve()?.zeroed();
+        record.request(capability);
+        // SAFETY: the synchronous crossing retains this supervisor box and
+        // the stopped root's exact execution context until the reply returns.
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") ROOT_FORK_SEED_PORT,
+                in("eax") 0u32, in("rdi") core::ptr::from_mut(&mut *record),
+                options(nostack));
+        }
+        Ok(RootFsSeed::from_record(&record))
+    }
+
     fn exec_ipc_binding(
         &self,
     ) -> Option<(

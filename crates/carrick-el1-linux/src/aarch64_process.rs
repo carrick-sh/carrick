@@ -2024,7 +2024,6 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         capability: carrick_core_abi::service::ExecCapabilityId,
     ) -> Result<super::native_process_runtime::RootFsSeed, NativeProcessError> {
         use super::native_process_runtime::RootFsSeed;
-        use carrick_personality_linux::task_fs::{TaskFs, TaskPath};
         let mut record = super::native_process_runtime::FallibleBox::<
             carrick_core_abi::service::RootForkSeed,
         >::try_reserve()?
@@ -2040,20 +2039,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         {
             return Ok(RootFsSeed::Refused);
         }
-        let Some((cwd, root)) = record.served() else {
-            return Ok(RootFsSeed::Refused);
-        };
-        let Some(cwd) = TaskPath::new(cwd) else {
-            return Ok(RootFsSeed::Refused);
-        };
-        let root = match root {
-            Some(root) => match TaskPath::new(root) {
-                Some(root) => Some(root),
-                None => return Ok(RootFsSeed::Refused),
-            },
-            None => None,
-        };
-        Ok(RootFsSeed::Seeded(TaskFs { cwd, root }))
+        Ok(RootFsSeed::from_record(&record))
     }
 
     fn prepare_mm(

@@ -899,6 +899,9 @@ pub struct RootForkSeed {
     root: [u8; crate::host_file::ACCESS_MAX_PATH_BYTES],
 }
 
+/// x86 synchronous transport for the same root-only seed crossing as ARM.
+pub const ROOT_FORK_SEED_PORT: u16 = 0xd9;
+
 const ROOT_FORK_SEED_REQUESTED: u64 = 1;
 const ROOT_FORK_SEED_SERVED: u64 = 2;
 const ROOT_FORK_SEED_NO_ROOT: u32 = u32::MAX;

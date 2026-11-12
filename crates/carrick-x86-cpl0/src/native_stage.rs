@@ -29,6 +29,7 @@ pub(crate) fn admits(
     delegated: impl FnOnce(i32) -> bool,
 ) -> bool {
     match call {
+        HostFileCall::Chdir { .. } => origin != ServiceOrigin::Initial,
         call if call.uses_child_mutation_venue() => origin != ServiceOrigin::Initial,
         HostFileCall::Openat { .. }
         | HostFileCall::Faccessat { .. }
