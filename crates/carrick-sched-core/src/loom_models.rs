@@ -809,6 +809,10 @@ fn native_hold_races_driver_cpu_publication() {
         });
         assert!(zone.place_native_handback(record).is_some());
         actor.join().unwrap();
+        assert_eq!(zone.slot(SLOT).driver(), Some(1));
+        assert_eq!(zone.slot(SLOT).cpu.load(Ordering::Acquire), 2);
+        assert!(zone.record(id).allows_cpu(2));
+        assert_eq!(zone.record(id).home(), None);
         assert_eq!(zone.record(id).claim(), Claim::Queued { slot: SLOT, seq });
         assert_eq!(zone.slot(SLOT).queued(), 1);
     });
