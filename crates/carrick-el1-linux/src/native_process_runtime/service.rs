@@ -3414,8 +3414,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             && reply.output.len() <= destination.len
         {
             output = Some(Box::new(OwnedCopyout {
-                address: UserVa::new(destination.address),
-                bytes: reply.output.to_vec(),
+                data: CopyoutData::Bytes {
+                    address: UserVa::new(destination.address),
+                    bytes: reply.output.to_vec(),
+                },
                 offset: 0,
                 result: SyscallResult::new(reply.result),
                 prefix_on_fault: false,
