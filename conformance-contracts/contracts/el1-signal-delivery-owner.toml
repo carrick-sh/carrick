@@ -1,3 +1,7 @@
+# #1093 S4c slice a: `carrick-signal-core/src/policy.rs` defines the neutral
+# `ExecPastNoReturn` (`Signal::SEGV`) verdict and `host_test_support.rs` adds
+# dual-ISA post-no-return exec witnesses bound under process.exec.custody.
+# Signal-frame delivery semantics, bindings and budgets are unchanged.
 # #2070: signal-frame setup preserves CopyOutcome::NotYet on PortalOwnerWait and
 # service-busy contention instead of collapsing temporary address-space exclusion
 # into a delivery fault. The shared EL1 signal_delivery owner retains the

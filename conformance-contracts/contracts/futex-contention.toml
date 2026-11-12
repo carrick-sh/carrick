@@ -1,3 +1,7 @@
+# #1093 S4c slice a: `native_process_runtime/service.rs` splits
+# `kill_refused_exec` into `exec_past_no_return` (`ExecPastNoReturn::SIGNAL`)
+# and `retire_lost_exec_race` (witnesses bound under process.exec.custody).
+# No change to this contract's guest semantics, bindings or budgets.
 # #1733: `vcpu_loop/mod.rs` only gains a test-engine frame-COW resolver hook.
 # #1733/#2020: `vcpu_loop/binding.rs` settles the faulting MM's EL1 COW
 # completions before the EL0 fault refill (witness bound under

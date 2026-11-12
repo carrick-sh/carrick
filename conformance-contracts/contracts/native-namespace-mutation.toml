@@ -1,3 +1,7 @@
+# #1093 S4c slice a: `native_process_runtime/host_test_support.rs` adds dual-ISA
+# post-no-return exec SIGSEGV and lost-race witnesses bound under
+# process.exec.custody. No change to this contract's guest semantics, bindings
+# or budgets.
 # #1881: shared thread registration prepares custody before publication.
 # This family's operations and budgets are unchanged. Atomicity is witnessed by
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable

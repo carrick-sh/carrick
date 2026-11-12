@@ -1,3 +1,9 @@
+# #1093 S4c slice a: `native_process_runtime/{service,host_test_support}.rs`
+# split `kill_refused_exec` into `exec_past_no_return` (`ExecPastNoReturn::SIGNAL`
+# / SIGSEGV) and `retire_lost_exec_race` so post-no-return exec failures deliver
+# SIGSEGV while concurrent exit_group and SIGKILL winners retain their status
+# (witnesses bound under process.exec.custody). Non-exec thread lifecycle
+# semantics, bindings and budgets are unchanged.
 # #1733/#2020: `vcpu_loop/binding.rs` settles the faulting MM's EL1 COW
 # completions before the EL0 fault refill (witness bound under
 # kernel.el1.fork-cow) and records ProcessExit from the identity the exit

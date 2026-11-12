@@ -1,3 +1,7 @@
+# #1093 S4c slice a: `native_process_runtime/host_test_support.rs` adds dual-ISA
+# post-no-return exec SIGSEGV and lost-race witnesses bound under
+# process.exec.custody. No change to this contract's guest semantics, bindings
+# or budgets.
 # #2020: `PreparedTaskExit::identity` exposes the exiting task's identity
 # from the exit reservation; exit topology and publication are unchanged.
 # No change to this contract's guest semantics, bindings or budgets.

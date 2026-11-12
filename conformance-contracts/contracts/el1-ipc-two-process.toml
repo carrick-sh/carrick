@@ -1,3 +1,7 @@
+# #1093 S4c slice a: `native_process_runtime/{service,host_test_support}.rs`
+# split `kill_refused_exec` into `exec_past_no_return` (`ExecPastNoReturn::SIGNAL`)
+# and `retire_lost_exec_race` (witnesses bound under process.exec.custody).
+# No change to this contract's guest semantics, bindings or budgets.
 # #1881: shared thread registration prepares custody before publication.
 # This family's operations and budgets are unchanged. Atomicity is witnessed by
 # native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable

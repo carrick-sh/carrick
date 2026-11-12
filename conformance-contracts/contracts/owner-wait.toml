@@ -1,3 +1,7 @@
+# #1093 S4c slice a: `native_process_runtime/host_test_support.rs` adds dual-ISA
+# post-no-return exec SIGSEGV and lost-race witnesses bound under
+# process.exec.custody. No change to this contract's guest semantics, bindings
+# or budgets.
 # #1733: `vcpu_loop/mod.rs` only gains a test-engine frame-COW resolver hook.
 # #1733: `vcpu_loop/signal.rs` adds `exclude_settling_guest_cow`, a held
 # use of the existing `exclude_el1_editor` settlement for the EL0 COW refill.

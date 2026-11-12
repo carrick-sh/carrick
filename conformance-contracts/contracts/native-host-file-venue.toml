@@ -1,3 +1,7 @@
+# #1093 S4c slice a: `native_process_runtime/host_test_support.rs` adds dual-ISA
+# post-no-return exec SIGSEGV and lost-race witnesses bound under
+# process.exec.custody. No change to this contract's guest semantics, bindings
+# or budgets.
 schema_version = 1
 id = "kernel.native.host-file-venue"
 title = "Native processes cross to the host only for host files, through the dispatcher's own path"

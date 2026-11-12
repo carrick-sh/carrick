@@ -1,3 +1,7 @@
+# #1093 S4c slice a: `vcpu_loop/exec.rs` reads `ExecPastNoReturn::SIGNAL`
+# (`Signal::SEGV`) from `carrick-signal-core::policy` in
+# `exec_failed_past_no_return` (witnesses bound under process.exec.custody).
+# Task-load entry mechanics, bindings and budgets are unchanged.
 # #1666: terminal-only CPU saves now materialize from the current MM lease.
 # The two-live-thread production exit_group binding in
 # carrick-runtime::vcpu_loop::binding::tests::
