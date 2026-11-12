@@ -5179,7 +5179,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         fence(Ordering::SeqCst);
         // CPU is now published. Only this returning driver is targeted, so
         // its entry consumes resched debt without a remote host kick.
-        self.probe_held_inner(Some(slot), &mut |_| {});
+        self.probe_held_inner(Some(slot), &mut |_, _| {});
     }
 
     /// Refresh only the retained affinity source on re-entry. Terminal
@@ -5418,7 +5418,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         Some(HostPlacement { slot, resched })
     }
 
-    fn probe_held_inner(&self, target: Option<SlotId>, placed: &mut impl FnMut(HostPlacement)) {
+    fn probe_held_inner(
+        &self,
+        target: Option<SlotId>,
+        placed: &mut impl FnMut(RecordId, HostPlacement),
+    ) {
         for (index, word) in self.held_map.iter().enumerate() {
             let mut bits = word.load(Ordering::SeqCst);
             while bits != 0 {
@@ -5427,7 +5431,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 if let Some(NativePlacement::Placed(p)) =
                     self.probe_held_record(RecordId((index * 64 + bit) as u32), target)
                 {
-                    placed(p);
+                    placed(RecordId((index * 64 + bit) as u32), p);
                 }
             }
         }
@@ -5437,10 +5441,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Each held record is taken by clearing its hint; claim CAS is authority.
     pub fn probe_held(&self, effects: &mut WakeEffects) {
         fence(Ordering::SeqCst);
-        self.probe_held_inner(None, &mut |placement| {
+        self.probe_held_inner(None, &mut |id, placement| {
             if placement.resched {
                 effects.request_reschedule(placement.slot);
             }
+            self.kick_peers_of_away_owner(self.record(id), placement.slot, effects);
         });
     }
 
