@@ -710,6 +710,112 @@ pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<boo
     Ok(scan.tests.contains(fn_name))
 }
 
+/// The `[package.metadata.carrick.test-lanes]` lane of one test binary; a
+/// binary with no declaration is in the default (`host`) lane.
+fn declared_lane<'m>(manifest: &'m toml::Value, bin: &str) -> &'m str {
+    let declared = manifest
+        .get("package")
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("carrick"))
+        .and_then(|c| c.get("test-lanes"));
+    declared
+        .and_then(|lanes| lanes.get(bin).or_else(|| lanes.get("*")))
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("lane").and_then(toml::Value::as_str))
+        })
+        .unwrap_or(crate::test_lanes::DEFAULT_LANE)
+}
+
+/// One owning crate's attributed tests, keyed by the test binary that runs
+/// them (`<bin>` of a receipt's `<bin>::<test>`).
+#[derive(Debug, Default)]
+pub struct CrateTestInventory {
+    /// Crate directory name, for messages.
+    pub crate_name: String,
+    /// `(bin, fn name)` of every attributed test, with its declared lane.
+    pub tests: BTreeMap<(String, String), String>,
+    /// First source the scanner cannot fully resolve (same refusals as
+    /// `tree_has_test`); tests it generates are not in the inventory.
+    pub unresolved: Option<String>,
+}
+
+/// The test binary a source file's tests run in: `tests/<x>.rs` and
+/// `tests/<x>/…` are binary `<x>`, `src/bin/<x>…` is `<x>`, anything else
+/// belongs to the package's lib/main binary.
+fn bin_of_source(crate_dir: &Path, file: &Path, package_bin: &str) -> String {
+    let relative = file.strip_prefix(crate_dir).unwrap_or(file);
+    let parts: Vec<_> = relative
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    let stem = |name: &str| name.strip_suffix(".rs").unwrap_or(name).to_string();
+    match parts.as_slice() {
+        ["tests", name, ..] | ["src", "bin", name, ..] => stem(name),
+        _ => package_bin.to_string(),
+    }
+}
+
+/// Every attributed test of every owning crate in `tree_root`, found with the
+/// same source scanner as `tree_has_test` and the lane metadata as
+/// `binary_runs_in_receipt_lane`.
+pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, ReceiptError> {
+    use syn::visit::Visit;
+    let mut out = Vec::new();
+    for crate_dir in candidate_crate_dirs(tree_root)? {
+        let manifest = crate_manifest(&crate_dir)?;
+        check_target_paths(&crate_dir, &manifest)?;
+        let crate_name = crate_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let package_bin = manifest
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or(&crate_name)
+            .replace('-', "_");
+        let mut inventory = CrateTestInventory {
+            crate_name,
+            ..Default::default()
+        };
+        let mut files = Vec::new();
+        collect_rs_files(&crate_dir, &mut files)?;
+        let mut scan = TestSourceScan {
+            scanned: files.iter().filter_map(|f| f.canonicalize().ok()).collect(),
+            crate_root: crate_dir.clone(),
+            ..Default::default()
+        };
+        for file in files {
+            let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
+            let syntax = syn::parse_file(&source).map_err(|e| {
+                ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
+            })?;
+            scan.file_dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+            scan.tests.clear();
+            scan.visit_file(&syntax);
+            // Unlike `tree_has_test`, an inventory has no proof of absence to
+            // protect: a generator can only hide tests, so keep scanning and
+            // report it.
+            if let Some(reason) = scan.unresolved.take() {
+                inventory.unresolved.get_or_insert_with(|| {
+                    let relative = file.strip_prefix(tree_root).unwrap_or(&file);
+                    format!("{reason} in {}", relative.display())
+                });
+            }
+            let bin = bin_of_source(&crate_dir, &file, &package_bin);
+            let lane = declared_lane(&manifest, &bin).to_string();
+            for name in std::mem::take(&mut scan.tests) {
+                inventory.tests.insert((bin.clone(), name), lane.clone());
+            }
+        }
+        out.push(inventory);
+    }
+    Ok(out)
+}
+
 fn binary_runs_in_receipt_lane(
     tree_root: &Path,
     bin: &str,
@@ -722,19 +828,7 @@ fn binary_runs_in_receipt_lane(
             continue;
         }
         found = true;
-        let declared = manifest
-            .get("package")
-            .and_then(|p| p.get("metadata"))
-            .and_then(|m| m.get("carrick"))
-            .and_then(|c| c.get("test-lanes"));
-        let lane = declared.and_then(|lanes| lanes.get(bin).or_else(|| lanes.get("*")));
-        let lane = lane
-            .and_then(|value| {
-                value
-                    .as_str()
-                    .or_else(|| value.get("lane").and_then(toml::Value::as_str))
-            })
-            .unwrap_or(crate::test_lanes::DEFAULT_LANE);
+        let lane = declared_lane(&manifest, bin);
         let runs = match lane {
             "kvm" => receipt.profile == "kvm",
             "signed-hvf" | "signed-cli" => receipt.phase == "signed",

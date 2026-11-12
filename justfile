@@ -291,6 +291,9 @@ actionlint *ARGS:
 # pending; a partial local pass is not matrix completeness.
 lint-domains: lint-domains-source
     {{_admit}} {{_xtask}} authority-debt
+    # A gated test dropped or renamed without a `.github/retired-tests.toml`
+    # entry (#2228). Base: CARRICK_AUTHORITY_BASE, as for authority-debt.
+    {{_admit}} {{_xtask}} retired-tests
 
 # Emit exact compiler diagnostics for the selected native host profiles.
 # Output is transient; accepted authority identity uses symbolic cohorts only.
