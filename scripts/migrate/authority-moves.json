@@ -166,6 +166,18 @@
     {
       "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
       "issue": 2148
+    },
+    {
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "issue": 1852
+    },
+    {
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "issue": 1852
+    },
+    {
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "issue": 1852
     }
   ],
   "terminal_custody": []
