@@ -3923,3 +3923,101 @@ fn arm_empty_pool_clone_loser_of_the_stock_race_waits_again() {
         Some(f.zone.record_ref(born_record))
     );
 }
+
+/// #2109: a glibc thread of a native fork child, pinned with
+/// `sched_setaffinity` to CPU 1, ends with a raw `exit` while its leader and
+/// a sibling stay live. It runs from the zone on CPU 1's slot, whose executor
+/// waits in the guest with no host task loaded: nothing on the host can take
+/// the thread's exit there. glibc registers a robust list for every thread,
+/// and before the fix the ring declined that exit for its robust list into
+/// host custody: the vector captured the SVC for that executor, which had no
+/// task to give it to, and the carrier died ("tried to park off-guest").
+#[test]
+fn arm_pinned_glibc_member_raw_exit_on_an_idle_executor_retires_in_ring() {
+    use carrick_el1_abi::Lifecycle;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    let mut h = setup_native_owned_ring_birth_before_first_entry();
+    let zone = h.env.fixture.zone;
+    zone.publish_carrier_cpu_count(2);
+    let counters = carrick_el1_abi::Counters::new();
+    // The leader pins the new thread to CPU 1 before it first runs.
+    let mask = carrick_test_support::GuestUserBuffer::from_value(1u64 << 1);
+    let mut pin = carrick_el1_abi::TrapFrame::default();
+    pin.x[8] = 122;
+    pin.x[..3].copy_from_slice(&[u64::from(h.born_tid), 8, mask.arg()]);
+    h.env.call(
+        SlotId::new(0),
+        h.target_page,
+        h.leader_control,
+        &counters,
+        &mut pin,
+        &mut h.leader_cpu,
+    );
+    assert_eq!(pin.x[0], 0);
+    // Slot 3's executor waits in the guest on CPU 1 with no host task.
+    let pinned = SlotId::new(3);
+    zone.drive(pinned, 4);
+    zone.publish_slot(pinned, 0, Some(1), 0);
+    zone.enter_guest(pinned);
+    let mut cpu = crate::sched::FakeCpu::default();
+    assert_eq!(
+        h.env.switch_in(pinned, &mut cpu),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(zone.slot(pinned).current(), Some(h.born_record));
+    assert_eq!(zone.slot(pinned).host_record(), None);
+    assert!(!zone.current_affinity_excludes_cpu(pinned));
+
+    let call = |nr: u64, args: &[u64], cpu: &mut crate::sched::FakeCpu| {
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = nr;
+        frame.x[..args.len()].copy_from_slice(args);
+        let route = h.env.call(
+            pinned,
+            h.target_page,
+            h.born_control,
+            &counters,
+            &mut frame,
+            cpu,
+        );
+        (route, frame.x[0] as i64)
+    };
+    // glibc's thread start: its own clear_child_tid word and robust list.
+    let child_tid = carrick_test_support::GuestUserBuffer::from_value(h.born_tid);
+    assert_eq!(
+        call(96, &[child_tid.arg()], &mut cpu).1,
+        i64::from(h.born_tid)
+    );
+    let robust = carrick_test_support::GuestUserBuffer::zeroed(24);
+    assert_eq!(call(99, &[robust.arg(), 24], &mut cpu).1, 0);
+    assert_ne!(h.born_control.robust_list().0, 0);
+
+    let live = h.target_page.live();
+    // Nothing else runs on CPU 1: the vCPU idles until a host kick.
+    cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
+    let (route, _) = call(93, &[0], &mut cpu);
+    assert_ne!(
+        route,
+        CompletionRoute::HostCustody,
+        "the raw exit left for an executor with no host task loaded"
+    );
+    assert_eq!(route, CompletionRoute::Suspended);
+    // Retired in ring: one fewer live member, its clear_child_tid word
+    // cleared for the joiner, and the slot no longer runs it.
+    assert_eq!(h.target_page.live(), live - 1);
+    assert_eq!(child_tid.get::<u32>(0), 0);
+    assert_ne!(zone.slot(pinned).current(), Some(h.born_record));
+
+    // The sibling is still live and keeps running.
+    let mut gettid = carrick_el1_abi::TrapFrame::default();
+    gettid.x[8] = 178;
+    h.env.call(
+        SlotId::new(1),
+        h.target_page,
+        h.sibling_control,
+        &counters,
+        &mut gettid,
+        &mut h.sibling_cpu,
+    );
+    assert!(gettid.x[0] as i64 > 0);
+}

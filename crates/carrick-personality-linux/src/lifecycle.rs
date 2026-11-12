@@ -1569,11 +1569,8 @@ fn serve_exit<'a>(
     ) {
         return decline!(LifecycleDecline::ExitEntryState);
     }
-    // No robust-list walker exists yet (it will live in sched-core, shared
-    // with the host lane): a registered list is walked by nobody here.
-    if slot.robust_list().0 != 0 {
-        return decline!(LifecycleDecline::ExitRobust);
-    }
+    // A registered robust list is no reason to leave the ring: no lane walks
+    // it yet, and a ring-born member has no host lane to leave to (#2109).
     // A pending signal is delivered (or re-targeted) by the host.
     if page.pending().load().0 != 0 || slot.pending().load().0 != 0 {
         return decline!(LifecycleDecline::ExitPending);
