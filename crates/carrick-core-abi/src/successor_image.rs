@@ -99,9 +99,78 @@ pub fn validate_image_rows(
     stack: ImageStack,
     geometry: ImageGeometry,
 ) -> Result<ValidatedImage, ImageRowError> {
-    let _ = (rows, executable_rows, entry, stack, geometry);
+    if rows.is_empty() {
+        return Err(ImageRowError::NoRows);
+    }
+    if executable_rows == 0 || executable_rows > rows.len() {
+        return Err(ImageRowError::ExecutablePrefix);
+    }
+    let page = geometry.page;
+    let mut spans = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let start = row.start.raw();
+        let len = row.len.raw();
+        if !start.is_multiple_of(page) || !len.is_multiple_of(page) {
+            return Err(ImageRowError::Unaligned { row: index });
+        }
+        if len == 0 {
+            return Err(ImageRowError::EmptyRow { row: index });
+        }
+        let end = start
+            .checked_add(len)
+            .filter(|end| start >= page && *end <= geometry.user_end)
+            .ok_or(ImageRowError::OutsideUser { row: index })?;
+        if row
+            .initialized_offset
+            .raw()
+            .checked_add(row.initialized_len.raw())
+            .is_none_or(|initialized| initialized > len)
+        {
+            return Err(ImageRowError::Initialized { row: index });
+        }
+        if !row.readable && (row.writable || row.executable) {
+            return Err(ImageRowError::Permissions { row: index });
+        }
+        spans.push((start, end, index));
+    }
+    let top = stack.top.raw();
+    let floor = top
+        .checked_sub(stack.size.raw())
+        .filter(|floor| {
+            stack.size.raw() != 0
+                && top.is_multiple_of(page)
+                && stack.size.raw().is_multiple_of(page)
+                && *floor >= page
+                && top <= geometry.user_end
+        })
+        .ok_or(ImageRowError::Stack)?;
+    spans.sort_unstable_by_key(|&(start, _, _)| start);
+    if let Some(pair) = spans.windows(2).find(|pair| pair[0].1 > pair[1].0) {
+        return Err(ImageRowError::Overlap {
+            first: pair[0].2,
+            second: pair[1].2,
+        });
+    }
+    if let Some(&(_, _, row)) = spans
+        .iter()
+        .find(|&&(start, end, _)| start < top && floor < end)
+    {
+        return Err(ImageRowError::StackOverlap { row });
+    }
+    if !rows.iter().any(|row| {
+        row.executable
+            && entry.raw() >= row.start.raw()
+            && entry.raw() - row.start.raw() < row.len.raw()
+    }) {
+        return Err(ImageRowError::Entry);
+    }
+    let initial_break = rows[..executable_rows]
+        .iter()
+        .map(|row| row.start.raw() + row.len.raw())
+        .max()
+        .ok_or(ImageRowError::ExecutablePrefix)?;
     Ok(ValidatedImage {
-        initial_break: UserVa::new(0),
+        initial_break: UserVa::new(initial_break),
     })
 }
 
@@ -131,8 +200,42 @@ pub enum FrameRunError {
 /// Split a grant list into its contiguous runs. A grant may span any number
 /// of runs; every frame must be page-aligned, nonzero and granted once.
 pub fn frame_runs(frames: &[FrameGpa], page: u64) -> Result<Vec<FrameRun>, FrameRunError> {
-    let _ = (frames, page);
-    Ok(Vec::new())
+    if frames.is_empty() {
+        return Err(FrameRunError::NoFrames);
+    }
+    let mut runs: Vec<FrameRun> = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        if frame.raw() == 0 {
+            return Err(FrameRunError::Null { index });
+        }
+        if !frame.raw().is_multiple_of(page) {
+            return Err(FrameRunError::Unaligned { index });
+        }
+        match runs.last_mut() {
+            Some(run)
+                if run
+                    .pages
+                    .checked_mul(page)
+                    .and_then(|bytes| run.start.raw().checked_add(bytes))
+                    == Some(frame.raw()) =>
+            {
+                run.pages += 1;
+            }
+            _ => runs.push(FrameRun {
+                start: *frame,
+                pages: 1,
+            }),
+        }
+    }
+    let mut order: Vec<usize> = (0..frames.len()).collect();
+    order.sort_unstable_by_key(|&index| (frames[index].raw(), index));
+    if let Some(pair) = order
+        .windows(2)
+        .find(|pair| frames[pair[0]] == frames[pair[1]])
+    {
+        return Err(FrameRunError::Duplicate { index: pair[1] });
+    }
+    Ok(runs)
 }
 
 #[cfg(test)]
