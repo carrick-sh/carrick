@@ -3,6 +3,7 @@
 //! stack bytes, frame initialization and descriptor edits belong to CPL0.
 extern crate alloc as image_alloc;
 
+use carrick_core_abi::successor_image::{ImageGeometry, ImageRow, ImageStack, validate_image_rows};
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, EditBacking, EditIntent, EditOperation, EditOwner,
@@ -320,29 +321,17 @@ fn valid_page(frame: FrameGpa) -> bool {
     frame.raw() != 0 && frame.raw() & (PAGE - 1) == 0 && frame.raw() < (1 << 52)
 }
 
-fn checked_region(region: &MappedRegion<'_>) -> Result<u64, InitialMmError> {
-    let end = region
-        .start
-        .checked_add(region.len)
-        .ok_or(InitialMmError::InvalidRange)?;
-    let initialized_end = region
+/// What the shared row validator leaves to this owner: the staged file bytes
+/// must name real physical memory, the stack bytes must fit their row, and
+/// every leaf is a user leaf.
+fn owner_checked(region: &MappedRegion<'_>) -> bool {
+    region
         .initialized_offset
         .checked_add(region.contents.len())
-        .ok_or(InitialMmError::InvalidRange)?;
-    if region.start < PAGE
-        || region.start & (PAGE - 1) != 0
-        || region.len == 0
-        || region.len & (PAGE - 1) != 0
-        || end > USER_END
-        || initialized_end > region.len
-        || matches!(region.contents, RegionContents::Guest(source) if source.start.raw() == 0
+        .is_some_and(|initialized_end| initialized_end <= region.len)
+        && !matches!(region.contents, RegionContents::Guest(source) if source.start.raw() == 0
             || source.start.raw().checked_add(source.len.raw()).is_none_or(|end| end > (1 << 52)))
-        || !region.perms.user
-        || (!region.perms.readable && (region.perms.writable || region.perms.executable))
-    {
-        return Err(InitialMmError::InvalidRange);
-    }
-    Ok(end)
+        && region.perms.user
 }
 
 /// Build a fresh x86 address space under the closed exact-MM editor.
@@ -361,10 +350,33 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     generation: NonZeroU64,
     image: &InitialImageSpec<'_>,
 ) -> Result<InitialMmImage, InitialMmError> {
-    if image.executable_region_count == 0 || image.executable_region_count > image.regions.len() {
-        return Err(InitialMmError::InvalidRange);
-    }
     let stack = build_initial_stack(&image.stack)?;
+    let rows: Vec<ImageRow> = image
+        .regions
+        .iter()
+        .map(|region| ImageRow {
+            start: region.start,
+            len: region.len,
+            initialized_offset: region.initialized_offset,
+            initialized_len: region.initialized.len,
+            readable: region.perms.readable,
+            writable: region.perms.writable,
+            executable: region.perms.executable,
+        })
+        .collect();
+    // Boot and exec share the row checks; the editor refuses any of them
+    // as one range refusal.
+    let validated = validate_image_rows(
+        &rows,
+        image.executable_region_count,
+        image.entry,
+        ImageStack {
+            top: UserVa::new(image.stack.stack_top),
+            size: GuestLen::new(image.stack.stack_size),
+        },
+        ImageGeometry::X86_64,
+    )
+    .map_err(|_| InitialMmError::InvalidRange)?;
     let stack_floor = image.stack.stack_top - image.stack.stack_size;
     let stack_region = MappedRegion {
         start: stack_floor,
@@ -390,31 +402,11 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
         })
         .collect();
     spans.push(stack_region);
-    spans.sort_by_key(|region| region.start);
-    let mut previous_end = 0;
-    for region in &spans {
-        let end = checked_region(region)?;
-        if region.start < previous_end {
-            return Err(InitialMmError::InvalidRange);
-        }
-        previous_end = end;
-    }
-    if !image.regions.iter().any(|region| {
-        region.perms.executable
-            && image.entry.raw() >= region.start.raw()
-            && image.entry.raw() < region.start.raw() + region.len.raw()
-    }) {
+    if !spans.iter().all(owner_checked) {
         return Err(InitialMmError::InvalidRange);
     }
-    let initial_break = UserVa::new(
-        image
-            .regions
-            .iter()
-            .take(image.executable_region_count)
-            .map(|region| region.start.raw() + region.len.raw())
-            .max()
-            .ok_or(InitialMmError::InvalidRange)?,
-    );
+    spans.sort_by_key(|region| region.start);
+    let initial_break = validated.initial_break;
     let root = source
         .take_zeroed_table()
         .ok_or(InitialMmError::FrameUnavailable)?;
@@ -605,6 +597,9 @@ mod tests {
 
     struct TestFrames {
         next_table: u64,
+        /// Reserved stock pages, taken in order before `next_table`.
+        table_stock: Vec<u64>,
+        taken_tables: Vec<u64>,
         next_data: u64,
         data: BTreeMap<u64, Box<[u8; 4096]>>,
         staged: BTreeMap<u64, Vec<u8>>,
@@ -613,6 +608,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 next_table: 0x80_0000,
+                table_stock: Vec::new(),
+                taken_tables: Vec::new(),
                 next_data: 0x90_0000,
                 data: BTreeMap::new(),
                 staged: BTreeMap::new(),
@@ -624,8 +621,14 @@ mod tests {
     }
     impl InitialFrameSource for TestFrames {
         fn take_zeroed_table(&mut self) -> Option<RootGpa> {
-            let address = self.next_table;
-            self.next_table += PAGE;
+            let address = if self.table_stock.is_empty() {
+                let address = self.next_table;
+                self.next_table += PAGE;
+                address
+            } else {
+                self.table_stock.remove(0)
+            };
+            self.taken_tables.push(address);
             RootGpa::page_aligned(FrameGpa::new(address))
         }
         fn take_zeroed_data(&mut self) -> Option<InitialDataGrant> {
@@ -678,6 +681,166 @@ mod tests {
             target.copy_from_slice(bytes);
             true
         }
+    }
+
+    fn static_successor(text: u64) -> [InitialImageRegion; 2] {
+        let perms = |writable, executable| EditPermissions {
+            readable: true,
+            writable,
+            executable,
+            user: true,
+        };
+        [
+            InitialImageRegion {
+                start: UserVa::new(text),
+                len: GuestLen::new(PAGE),
+                initialized_offset: GuestLen::new(0),
+                initialized: InitialSourceRange {
+                    start: FrameGpa::new(0x10_000),
+                    len: GuestLen::new(12),
+                },
+                perms: perms(false, true),
+            },
+            InitialImageRegion {
+                start: UserVa::new(0x40_2000),
+                len: GuestLen::new(PAGE),
+                initialized_offset: GuestLen::new(0),
+                initialized: InitialSourceRange {
+                    start: FrameGpa::new(0x11_000),
+                    len: GuestLen::new(3),
+                },
+                perms: perms(true, false),
+            },
+        ]
+    }
+
+    fn successor_stack() -> InitialStackSpec<'static> {
+        InitialStackSpec {
+            entry: 0x40_0000,
+            interpreter_base: 0,
+            phdr: 0x40_0040,
+            phent: 56,
+            phnum: 1,
+            argv: &[b"/successor"],
+            envp: &[],
+            random: [0x11; 16],
+            stack_top: 0x7fff_0000,
+            stack_size: 0x4000,
+        }
+    }
+
+    /// The exec successor is the boot editor run over reserved fork-stock
+    /// table frames, which need not be one contiguous run, with the
+    /// predecessor's live root (not the bootstrap root) as the source of the
+    /// shared supervisor entries.
+    #[test]
+    fn successor_editor_builds_over_multi_run_stock_tables_from_the_predecessor_root() {
+        let words = TestWords::new();
+        let predecessor = RootGpa::page_aligned(FrameGpa::new(0x70_0000)).unwrap();
+        words
+            .store_unlinked(predecessor.address().raw() + 511 * 8, 0x20_0003)
+            .unwrap();
+        carrick_mmu_core::x86::copy_window::provision_cow_copy_window(
+            &words,
+            predecessor,
+            [0x71_0000, 0x71_1000, 0x71_2000]
+                .map(|pa| RootGpa::page_aligned(FrameGpa::new(pa)).unwrap()),
+        )
+        .unwrap();
+        let mut frames = TestFrames::new();
+        // Two runs: neither alone holds the successor's nine tables.
+        frames.table_stock = (0..3)
+            .map(|page| 0xa0_0000 + page * PAGE)
+            .chain((0..8).map(|page| 0xc0_0000 + page * PAGE))
+            .collect();
+        frames.next_table = 0;
+        frames
+            .staged
+            .insert(0x10_000, b"\xb8\xe7\0\0\0\xbf\x07\0\0\0\x0f\x05".to_vec());
+        frames.staged.insert(0x11_000, b"ok\n".to_vec());
+        let regions = static_successor(0x40_0000);
+        // SAFETY: this isolated fixture owns the predecessor root and every
+        // stock table and data frame until the unpublished image is read.
+        let loaded = unsafe {
+            install_initial_image(
+                &words,
+                &mut frames,
+                predecessor,
+                NonZeroU64::new(91).unwrap(),
+                NonZeroU64::MIN,
+                &InitialImageSpec {
+                    regions: &regions,
+                    executable_region_count: 2,
+                    entry: UserVa::new(0x40_0000),
+                    stack: successor_stack(),
+                },
+            )
+        }
+        .unwrap();
+        assert_eq!(loaded.address.root.address().raw(), 0xa0_0000);
+        assert!(
+            frames
+                .taken_tables
+                .iter()
+                .all(|table| (0xa0_0000..0xa0_3000).contains(table)
+                    || (0xc0_0000..0xc0_8000).contains(table)),
+            "every successor table is a reserved stock frame"
+        );
+        let taken: Vec<FrameGpa> = frames
+            .taken_tables
+            .iter()
+            .map(|pa| FrameGpa::new(*pa))
+            .collect();
+        let runs = carrick_core_abi::successor_image::frame_runs(&taken, PAGE).unwrap();
+        assert_eq!(runs.len(), 2, "the build spans both stock runs");
+        assert_eq!(
+            words.load(loaded.address.root.address().raw() + 511 * 8),
+            Ok(0x20_0003),
+            "the shared supervisor entry is the predecessor's"
+        );
+        let leaf = translate_leaf(
+            &words,
+            loaded.address.root,
+            UserVa::new(0x40_0000),
+            Access::Execute,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            frames.data_at(leaf.output.raw())[..12],
+            frames.staged[&0x10_000][..]
+        );
+        assert_eq!(loaded.initial_break.raw(), 0x40_3000);
+    }
+
+    /// The editor refuses through the shared row validator, before it takes a
+    /// single frame, so a refused successor leaves the stock untouched.
+    #[test]
+    fn editor_refuses_an_overlapping_successor_before_taking_a_frame() {
+        let words = TestWords::new();
+        let mut frames = TestFrames::new();
+        let mut regions = static_successor(0x40_0000);
+        regions[1].start = UserVa::new(0x40_0000);
+        let source_root = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
+        // SAFETY: isolated fixture; the refusal precedes any descriptor edit.
+        let refused = unsafe {
+            install_initial_image(
+                &words,
+                &mut frames,
+                source_root,
+                NonZeroU64::new(92).unwrap(),
+                NonZeroU64::MIN,
+                &InitialImageSpec {
+                    regions: &regions,
+                    executable_region_count: 2,
+                    entry: UserVa::new(0x40_0000),
+                    stack: successor_stack(),
+                },
+            )
+        };
+        assert!(matches!(refused, Err(InitialMmError::InvalidRange)));
+        assert!(frames.taken_tables.is_empty());
+        assert!(frames.data.is_empty());
     }
 
     #[test]
