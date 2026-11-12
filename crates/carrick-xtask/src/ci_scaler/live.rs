@@ -2971,7 +2971,7 @@ fn settle_and_admit(
             }
             Ok(())
         });
-        if let Some(claims) = claims.as_deref_mut() {
+        if let Some(claims) = claims {
             claims.forget_stale(Instant::now());
         }
         match admitted {
