@@ -36,6 +36,7 @@ pub mod asid;
 pub mod birth_serial;
 pub mod core_read;
 pub mod el1_editor_exclusion;
+pub mod exec_lock_order;
 pub mod fork_stock;
 pub mod native_exec;
 pub mod physical_grants;
