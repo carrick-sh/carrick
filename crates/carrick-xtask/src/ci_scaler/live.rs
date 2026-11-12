@@ -1257,9 +1257,9 @@ struct HostSample {
     available: u64,
 }
 /// Whether one more clone of `(cores, memory_mib)` fits `sample` with
-/// `pending` clones still booting. The fatal CPU ceiling looks at the live
-/// reading only: pending charges defer a clone, they never end the
-/// controller.
+/// `pending` clones still booting. The 80% CPU ceiling looks at the live
+/// reading only; both it and pending charges defer the pass without ending
+/// the controller.
 fn admission_verdict(
     sample: &HostSample,
     (cores, memory_mib): (u32, u64),
@@ -1927,9 +1927,9 @@ struct Pass {
     /// Unknown outcomes freeze admission; storage contention retains only its operation.
     frozen: Option<ScalerError>,
 }
-/// Reconcile every active clone. One row's error does not starve the others.
-/// KVM CPU-ceiling stops retain their existing policy. Agent admission
-/// pressure freezes new work while reconciliation continues for live agents.
+/// Reconcile every active clone. One row's error does not starve the others;
+/// storage, CPU-ceiling, and pre-boot deferrals retain their row for the next
+/// reconcile without freezing admission.
 #[cfg(test)]
 fn reconcile_all(
     pve: &Pve,
@@ -1960,15 +1960,15 @@ fn reconcile_all_with(
     let mut finished = 0;
     let mut first_error = None;
     for row in active {
-        let lane = row.lane;
         let snapshot = row.clone();
         match reconcile_one(pve, gh, ledger, dir, path, approval, row, provisioners) {
             Ok(true) => finished += 1,
             Ok(false) => {}
-            Err(error @ ScalerError::CpuCeiling { .. }) if lane == CloneLane::Kvm => {
-                return Err(error);
-            }
-            Err(error @ (ScalerError::StorageBusy | ScalerError::Deferred(_))) => {
+            Err(
+                error @ (ScalerError::StorageBusy
+                | ScalerError::Deferred(_)
+                | ScalerError::CpuCeiling { .. }),
+            ) => {
                 let current = ledger
                     .rows
                     .iter()
@@ -2798,9 +2798,11 @@ pub(super) fn controller(
     }
 
     let mut reconcile = Instant::now() - RECONCILE_INTERVAL;
-    let mut frozen = true;
-    let mut backoff = Backoff::default();
-    let mut admit_after = Instant::now();
+    let mut gate = AdmissionGate {
+        frozen: true,
+        backoff: Backoff::default(),
+        admit_after: Instant::now(),
+    };
     let provisioners = Provisioners::new();
     // The last live-row count a drain reported, so it logs only changes.
     let mut drained_from = None;
@@ -2841,7 +2843,7 @@ pub(super) fn controller(
                 ledger.refresh()?;
                 return one_job_result(ledger.rows.last());
             }
-            frozen = match pass.frozen {
+            gate.frozen = match pass.frozen {
                 Some(error) => {
                     eprintln!("reconcile failed: {error}; admission frozen for active ledger");
                     true
@@ -2878,79 +2880,120 @@ pub(super) fn controller(
         if let Err(error) = &demand {
             eprintln!("queued push coalescing failed: {error}");
         }
-        // Only enabled lanes count against the cap: rows a disabled lane
-        // still finishes after a restart don't block the lanes left on.
-        let active = ledger
-            .rows
-            .iter()
-            .filter(|r| r.state != State::Destroyed && enabled.admits(r.lane))
-            .count();
-        // A failed provisioning worker freezes admission exactly as a failed
-        // in-line provision did.
-        let mut provision_failed = None;
-        for outcome in provisioners.finished_outcomes() {
-            match outcome.result {
-                Ok(()) => {}
-                Err(error @ (ScalerError::StorageBusy | ScalerError::Deferred(_))) => {
-                    eprintln!(
-                        "vm={} state={:?} task={} deferred ({error}); provisioning retained for reconciliation",
-                        outcome.vm.get(),
-                        outcome.state,
-                        outcome.task.as_deref().unwrap_or("none")
-                    );
-                }
-                Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
-                Err(error) => {
-                    provision_failed.get_or_insert(error);
-                }
-            }
-        }
-        if let Some(error) = provision_failed {
-            eprintln!("provisioning failed: {error}; backing off");
-            publish_reconcile_status(&ledger, dir, Some(&error))?;
-            frozen = true;
-            backoff.grow();
-            admit_after = Instant::now() + backoff.delay();
-        }
-        let cap = enabled.cap(budget);
-        if !frozen && active < cap && Instant::now() >= admit_after {
-            // Admit until demand or the budget runs out; each worker boots
-            // its clone while the next is reserved.
-            let admitted = demand.and_then(|demand| {
-                let mut admitted = active;
-                while admitted < cap
-                    && admit_one(
-                        &pve,
-                        &gh,
-                        &mut ledger,
-                        dir,
-                        &path,
-                        (group, admission, demand.clone()),
-                        (budget, enabled, &provisioners, claims.as_mut()),
-                    )?
-                {
-                    admitted += 1;
-                }
-                Ok(())
-            });
-            if let Some(claims) = claims.as_mut() {
-                claims.forget_stale(Instant::now());
-            }
-            match admitted {
-                Ok(()) => backoff.reset(),
-                Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
-                Err(error) => {
-                    // Transient GitHub/PVE failures never end the controller.
-                    eprintln!("admission pass failed: {error}; backing off");
-                    publish_reconcile_status(&ledger, dir, Some(&error))?;
-                    frozen = true;
-                    backoff.grow();
-                    admit_after = Instant::now() + backoff.delay();
-                }
-            }
-        }
+        settle_and_admit(
+            &pve,
+            &gh,
+            &mut ledger,
+            (dir, &path),
+            (group, admission, demand),
+            (budget, enabled),
+            &provisioners,
+            &mut gate,
+            claims.as_mut(),
+        )?;
         std::thread::sleep(POLL);
     }
+}
+
+struct AdmissionGate {
+    frozen: bool,
+    backoff: Backoff,
+    admit_after: Instant,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_and_admit(
+    pve: &Pve,
+    gh: &Github,
+    ledger: &mut Ledger,
+    (dir, path): (&Path, &Path),
+    (group, admission, demand): (u64, &Admission, Result<Vec<JobKey>, ScalerError>),
+    (budget, enabled): (CloneBudget, Lanes),
+    provisioners: &Provisioners,
+    gate: &mut AdmissionGate,
+    mut claims: Option<&mut super::claim::Claims>,
+) -> Result<(), ScalerError> {
+    // Only enabled lanes count against the cap: rows a disabled lane
+    // still finishes after a restart don't block the lanes left on.
+    let active = ledger
+        .rows
+        .iter()
+        .filter(|r| r.state != State::Destroyed && enabled.admits(r.lane))
+        .count();
+    // A failed provisioning worker freezes admission exactly as a failed
+    // in-line provision did.
+    let mut provision_failed = None;
+    for outcome in provisioners.finished_outcomes() {
+        match outcome.result {
+            Ok(()) => {}
+            Err(
+                error @ (ScalerError::StorageBusy
+                | ScalerError::Deferred(_)
+                | ScalerError::CpuCeiling { .. }),
+            ) => {
+                eprintln!(
+                    "vm={} state={:?} task={} deferred ({error}); provisioning retained for reconciliation",
+                    outcome.vm.get(),
+                    outcome.state,
+                    outcome.task.as_deref().unwrap_or("none")
+                );
+            }
+            Err(error) => {
+                provision_failed.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = provision_failed {
+        eprintln!("provisioning failed: {error}; backing off");
+        publish_reconcile_status(ledger, dir, Some(&error))?;
+        gate.frozen = true;
+        gate.backoff.grow();
+        gate.admit_after = Instant::now() + gate.backoff.delay();
+    }
+    let cap = enabled.cap(budget);
+    if !gate.frozen && active < cap && Instant::now() >= gate.admit_after {
+        // Admit until demand or the budget runs out; each worker boots
+        // its clone while the next is reserved.
+        let admitted = demand.and_then(|demand| {
+            let mut admitted = active;
+            while admitted < cap
+                && admit_one(
+                    pve,
+                    gh,
+                    ledger,
+                    dir,
+                    path,
+                    (group, admission, demand.clone()),
+                    (budget, enabled, provisioners, claims.as_deref_mut()),
+                )?
+            {
+                admitted += 1;
+            }
+            Ok(())
+        });
+        if let Some(claims) = claims.as_deref_mut() {
+            claims.forget_stale(Instant::now());
+        }
+        match admitted {
+            Ok(()) => gate.backoff.reset(),
+            Err(
+                error @ (ScalerError::StorageBusy
+                | ScalerError::Deferred(_)
+                | ScalerError::CpuCeiling { .. }),
+            ) => {
+                eprintln!("admission pass deferred ({error}); retrying next pass");
+            }
+            Err(error) => {
+                // Transient GitHub/PVE failures never end the controller.
+                eprintln!("admission pass failed: {error}; backing off");
+                publish_reconcile_status(ledger, dir, Some(&error))?;
+                gate.frozen = true;
+                gate.backoff.grow();
+                gate.admit_after = Instant::now() + gate.backoff.delay();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Poll delay: 30 s, doubling on consecutive failures up to 10 minutes.
