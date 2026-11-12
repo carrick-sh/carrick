@@ -356,12 +356,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             frequency,
             retained,
         };
+        let wake = call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
+            || call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_BITSET_PRIVATE;
         let result = if shared.is_some()
-            && matches!(
-                call.args[1],
-                carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
-                    | carrick_personality_linux::sched::FUTEX_WAKE_BITSET_PRIVATE
-            )
+            && wake
             && adapter.authenticate_mapping(UserVa::new(call.args[0])) != Some(true)
         {
             None
