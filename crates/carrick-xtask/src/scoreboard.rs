@@ -533,8 +533,6 @@ mod tests {
             reaper: Some(reaper.clone()),
         };
         let mut table = Vec::new();
-        // The fake reaper is not run under sudo in tests: sudo -n fails, which
-        // run() tolerates. Reaping is asserted via the run id the row carried.
         let receipt = run(dir.path(), args, &mut table).unwrap_or_else(|_| std::process::abort());
         let by: Vec<_> = receipt
             .rows
@@ -564,9 +562,77 @@ mod tests {
                 "id=score-go-version"
             ]
         );
+        // The reaper runs directly (no sudo) once per row, by run id.
+        assert_eq!(
+            read_lossy(&dir.path().join("reap.log"))
+                .lines()
+                .collect::<Vec<_>>(),
+            ["score-py-version", "score-node-version", "score-go-version"]
+        );
         let on_disk: Receipt =
             serde_json::from_str(&read_lossy(&out)).unwrap_or_else(|_| std::process::abort());
         assert_eq!(on_disk.main_sha, "0123456789abcdef");
         assert_eq!(on_disk.binary_sha256.len(), 64);
+    }
+
+    fn alive(pid: libc::pid_t) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !stat.rsplit(") ").next().unwrap_or("").starts_with('Z'),
+            Err(_) => false,
+        }
+    }
+
+    /// A `go` row whose carrick forks a grandchild and hangs; `prelude` runs
+    /// first. After the timeout nothing from the row's process group may live.
+    fn assert_timeout_kills_the_group(prelude: &str) {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let carrick = dir.path().join("carrick");
+        write_executable_mode(
+            &carrick,
+            &format!(
+                "#!/bin/sh\n{prelude}echo $$ > \"$0.pid\"\n\
+                 sleep 30 &\necho $! > \"$0.gc\"\nwait\n"
+            ),
+            0o755,
+        );
+        let reaper = dir.path().join("reap");
+        write_executable_mode(&reaper, "#!/bin/sh\necho \"$1\" >> \"$0.log\"\n", 0o755);
+        let args = ScoreboardArgs {
+            carrick,
+            rows: vec!["go-version".into()],
+            out: dir.path().join("receipt.json"),
+            sha: Some("abc".into()),
+            evidence: None,
+            bound_secs: 1,
+            reaper: Some(reaper),
+        };
+        let receipt =
+            run(dir.path(), args, &mut Vec::new()).unwrap_or_else(|_| std::process::abort());
+        assert!(receipt.rows[0].timed_out);
+        let pid_of = |name: &str| -> libc::pid_t {
+            read_lossy(&dir.path().join(name))
+                .trim()
+                .parse()
+                .unwrap_or(-1)
+        };
+        let (leader, grandchild) = (pid_of("carrick.pid"), pid_of("carrick.gc"));
+        assert!(leader > 0 && grandchild > 0, "fixture did not record pids");
+        // SAFETY: signal 0 only probes for a process group.
+        let group_gone = unsafe { libc::kill(-leader, 0) } == -1;
+        assert!(group_gone, "row's process group {leader} still has members");
+        assert!(
+            !alive(grandchild),
+            "grandchild {grandchild} survived the row"
+        );
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_row() {
+        assert_timeout_kills_the_group("");
+    }
+
+    #[test]
+    fn timeout_escalates_to_sigkill_when_sigterm_is_ignored() {
+        assert_timeout_kills_the_group("trap '' TERM ALRM\n");
     }
 }
