@@ -1522,6 +1522,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("idle peer service requires physical doorbell"));
         };
+        // A carrier without a runtime resource service has no fs authority.
+        // Authenticate the synchronous request, then leave its record refused.
+        if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT {
+            self.service_root_fork_seed(None, |_| false)?;
+            return Ok(None);
+        }
         let file = if *port == OWNER_GRANT_PORT || *port == NATIVE_SERVICE_PORT {
             self.read_owner_file(None, *port == NATIVE_SERVICE_PORT)?
         } else {
@@ -1779,6 +1785,82 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         })
     }
 
+    /// Synchronous root-only fs seed transport. Resource authority is supplied
+    /// by the runtime; the carrier authenticates only execution and storage.
+    pub fn service_root_fork_seed(
+        &mut self,
+        task: Option<carrick_guest_arch::TaskIdentity>,
+        service: impl FnOnce(&mut carrick_core_abi::service::RootForkSeed) -> bool,
+    ) -> Result<(), TrapError> {
+        use carrick_core_abi::service::RootForkSeed;
+        use carrick_guest_arch::KernelVa;
+        let cpu = self
+            .physical_slot()
+            .ok_or_else(|| fail("seed CPU absent"))?;
+        let custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("seed custody poisoned"))?;
+        let capture = |io: &mut M| {
+            let lease = StoppedCpuLease { cpu, io };
+            let execution = custody.physical_execution(&lease)?;
+            let initial = custody
+                .initial_task
+                .ok_or_else(|| fail("seed root absent"))?;
+            if execution.context.mm != initial.mm {
+                return Err(fail("fork seed requested outside the root"));
+            }
+            let address = KernelVa::new(lease.io.get_gpr(X86Reg::Rdi)?);
+            let pointer = custody.native_service_pointer(
+                execution.context,
+                address,
+                size_of::<RootForkSeed>(),
+                align_of::<RootForkSeed>(),
+            )?;
+            // SAFETY: supervisor translation and retained RAM were authenticated
+            // above. The stopped entry owns the box through this synchronous call.
+            let record = unsafe { *pointer.cast::<RootForkSeed>() };
+            Ok((execution, address, record))
+        };
+        let (execution, address, mut record) = match task {
+            Some(task) => self.cpu.with_stopped_io(task, capture)?,
+            None => self.cpu.with_idle_peer_io(capture)?,
+        };
+        drop(custody);
+        if record.requested().is_none() {
+            return Err(fail("seed request invalid"));
+        }
+        if !service(&mut record) {
+            return Ok(());
+        }
+        let custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("seed custody poisoned"))?;
+        let finish = |io: &mut M| {
+            let lease = StoppedCpuLease { cpu, io };
+            let current = custody.physical_execution(&lease)?;
+            if current.context != execution.context || current.binding != execution.binding {
+                return Err(fail("seed execution changed"));
+            }
+            let pointer = custody.native_service_pointer(
+                current.context,
+                address,
+                size_of::<RootForkSeed>(),
+                align_of::<RootForkSeed>(),
+            )?;
+            // SAFETY: same stopped execution and retained supervisor storage.
+            unsafe {
+                pointer.cast::<RootForkSeed>().write(record);
+            }
+            Ok(())
+        };
+        match task {
+            Some(task) => self.cpu.with_stopped_io(task, finish),
+            None => self.cpu.with_idle_peer_io(finish),
+        }
+    }
+
     /// Service one physical doorbell on the stopped worker CPU. Task
     /// identity is supplied by the executor's claimed binding, never by the
     /// doorbell payload or the physical slot.
@@ -1803,6 +1885,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("physical service requires a doorbell exit"));
         };
+        if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT {
+            self.service_root_fork_seed(Some(task), |_| false)?;
+            return Ok(None);
+        }
         let slot = self
             .physical_slot()
             .ok_or_else(|| fail("production CPU has no physical slot"))?;

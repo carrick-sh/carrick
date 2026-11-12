@@ -71,8 +71,10 @@ vm_free = [
 ]
 
 embed = [
-  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_cwd_and_relative_open_agree, serial_host_fork_cwd_is_inherited_and_isolated, serial_host_two_live_processes_keep_distinct_cwds (native Linux control and exact directory-specific marker bytes)",
   "KVM production carrier: carrick-vmm-kvm::cpl0_initial_mm::serial_host_loader_open_close_reopen_uses_one_native_descriptor_namespace (three open/close pairs reuse one ring descriptor; exit 0, seven entries, zero refusals)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_root_cwd_and_relative_open_agree (native Linux control and directory-specific marker bytes)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_fork_cwd_is_inherited_and_isolated (native Linux control and directory-specific marker bytes)",
+  "KVM production: carrick-vmm-kvm::cpl0_initial_mm::serial_host_two_live_processes_keep_distinct_cwds (native Linux control and directory-specific marker bytes)",
 ]
 
 [bindings.unresolved]

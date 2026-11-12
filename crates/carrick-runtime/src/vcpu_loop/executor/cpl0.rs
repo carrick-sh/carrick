@@ -1215,16 +1215,25 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                         &self.dispatcher,
                         &self.root_binding.host_root_resources,
                     );
-                    self.physical.service_physical_doorbell_with_host_file(
-                        task,
-                        &stopped.exit,
-                        |served, doorbell| {
-                            carrick_kernel::el1_delegation::settle_host_work_boundary(
-                                kernel, served, doorbell,
-                            );
-                        },
-                        &mut host_file,
-                    )?
+                    if matches!(&stopped.exit, CarrierRunExit::PhysicalDoorbell { port, .. }
+                        if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT)
+                    {
+                        self.physical.service_root_fork_seed(Some(task), |record| {
+                            self.root_binding.host_root_resources.seed_fork(record)
+                        })?;
+                        None
+                    } else {
+                        self.physical.service_physical_doorbell_with_host_file(
+                            task,
+                            &stopped.exit,
+                            |served, doorbell| {
+                                carrick_kernel::el1_delegation::settle_host_work_boundary(
+                                    kernel, served, doorbell,
+                                );
+                            },
+                            &mut host_file,
+                        )?
+                    }
                 };
                 self.scheduler.poke_executor_control();
                 if let Some(status) = status {
@@ -1272,15 +1281,24 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                         &self.dispatcher,
                         &self.root_binding.host_root_resources,
                     );
-                    self.physical.service_idle_peer_doorbell_with_host_file(
-                        &exit,
-                        |served, doorbell| {
-                            carrick_kernel::el1_delegation::settle_host_work_boundary(
-                                kernel, served, doorbell,
-                            );
-                        },
-                        &mut host_file,
-                    )?
+                    if matches!(&exit, CarrierRunExit::PhysicalDoorbell { port, .. }
+                        if *port == carrick_core_abi::service::ROOT_FORK_SEED_PORT)
+                    {
+                        self.physical.service_root_fork_seed(None, |record| {
+                            self.root_binding.host_root_resources.seed_fork(record)
+                        })?;
+                        None
+                    } else {
+                        self.physical.service_idle_peer_doorbell_with_host_file(
+                            &exit,
+                            |served, doorbell| {
+                                carrick_kernel::el1_delegation::settle_host_work_boundary(
+                                    kernel, served, doorbell,
+                                );
+                            },
+                            &mut host_file,
+                        )?
+                    }
                 };
                 if let Some(status) = status {
                     let exits = self.total_exits.load(Ordering::Acquire);

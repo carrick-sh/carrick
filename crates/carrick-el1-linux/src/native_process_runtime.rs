@@ -522,7 +522,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     /// The live cwd and root of the host-served root, read once for a child
     /// the root is forking (the #1393(a) `RootOnly` seed). A venue without
     /// the seed crossing fails closed: the child's cwd is unknown and its
-    /// path calls stay unrouted (x86 CPL0 until its seam lands).
+    /// path calls stay unrouted.
     fn root_fork_seed(
         &mut self,
         capability: carrick_core_abi::service::ExecCapabilityId,
@@ -4619,6 +4619,27 @@ pub enum RootFsSeed {
     /// unknown, and its path and exec crossings are left unrouted (counted
     /// ENOSYS), never resolved against a guessed cwd.
     Refused,
+}
+
+impl RootFsSeed {
+    /// Decode the carrier reply through one owner for both ISA transports.
+    pub fn from_record(record: &carrick_core_abi::service::RootForkSeed) -> Self {
+        use carrick_personality_linux::task_fs::{TaskFs, TaskPath};
+        let Some((cwd, root)) = record.served() else {
+            return Self::Refused;
+        };
+        let Some(cwd) = TaskPath::new(cwd) else {
+            return Self::Refused;
+        };
+        let root = match root {
+            Some(root) => match TaskPath::new(root) {
+                Some(root) => Some(root),
+                None => return Self::Refused,
+            },
+            None => None,
+        };
+        Self::Seeded(TaskFs { cwd, root })
+    }
 }
 
 /// What a fork reserves and captures from its parent before preparing the

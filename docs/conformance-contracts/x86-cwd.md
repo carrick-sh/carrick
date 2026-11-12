@@ -15,3 +15,15 @@ stale relative path cannot pass merely because both files exist. Native Linux
 executes each identical freestanding ELF before Carrick. The bounded work is
 one root seed capture per root fork and one native lookup per descendant chdir;
 no polling, retries, or extra readiness objects are introduced.
+
+The synchronous x86 seed transport authenticates the stopped initial MM and
+retained supervisor storage, releases physical custody while the shared host
+resource owner captures cwd/root, and authenticates the same execution again
+before publishing the record. The decoder is shared with ARM. The process graph
+remains the authority deciding which fork needs a root seed. A fork of a
+non-root process copies that process's existing TaskFs without a host seed.
+
+The two-live-process witness uses pipe-close/poll notifications, since x86
+in-zone pipe byte I/O remains #1756. The child stays alive waiting for the
+parent's close after changing its own cwd. Native outputs share an already
+touched BSS page; untouched wait4 output pages expose the separate #2101 family.

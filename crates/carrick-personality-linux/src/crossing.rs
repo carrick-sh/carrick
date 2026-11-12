@@ -206,7 +206,7 @@ host_crossings! {
     Removexattr = nr::REMOVEXATTR, false, Permanent;
     Lremovexattr = nr::LREMOVEXATTR, false, Permanent;
     Fremovexattr = nr::FREMOVEXATTR, false, Permanent;
-    Getcwd = nr::GETCWD, false, Permanent;
+    Getcwd = nr::GETCWD, true, Permanent;
     Ioctl = nr::IOCTL, false, Permanent;
     Flock = nr::FLOCK, false, Permanent;
     Mknodat = nr::MKNODAT, false, Permanent;
@@ -221,7 +221,7 @@ host_crossings! {
     Ftruncate = nr::FTRUNCATE, false, Permanent;
     Fallocate = nr::FALLOCATE, false, Permanent;
     Faccessat = nr::FACCESSAT, true, Permanent;
-    Chdir = nr::CHDIR, false, Permanent;
+    Chdir = nr::CHDIR, true, Permanent;
     Fchdir = nr::FCHDIR, false, Permanent;
     Chroot = nr::CHROOT, false, Permanent;
     Fchmod = nr::FCHMOD, false, Permanent;
@@ -517,7 +517,10 @@ mod tests {
             );
             assert_eq!(
                 HostCrossingSet::X86.is_allowed(canonical),
-                matches!(ordinal, 22 | 48 | 56 | 62 | 63 | 64 | 67 | 68 | 93 | 94),
+                matches!(
+                    ordinal,
+                    17 | 22 | 48 | 49 | 56 | 62 | 63 | 64 | 67 | 68 | 93 | 94
+                ),
                 "x86 canonical={ordinal}"
             );
         }
@@ -553,7 +556,7 @@ mod tests {
                 .flatten()
                 .filter(|(_, x86, _)| *x86)
                 .count(),
-            10
+            12
         );
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten().filter(|(_, x86, _)| *x86) {
             let nr = crossing.canonical();
@@ -565,7 +568,6 @@ mod tests {
         // Known non-crossing calls on x86
         for non_crossing in [
             CanonicalNr(0),   // io_setup
-            CanonicalNr(17),  // getcwd
             CanonicalNr(113), // clock_gettime
             CanonicalNr(148), // getresuid
             CanonicalNr(174), // getuid
