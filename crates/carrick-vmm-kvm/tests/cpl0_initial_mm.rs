@@ -2045,7 +2045,16 @@ fn zone_pipe_poll_wake_with_affinity(flags: &[&str], affinity: u64) {
 
 #[test]
 fn zone_epoll_pwait_blocks_until_child_pipe_write() {
-    let elf = native_exit_fixture_with_flags("native_pipe_poll_wake.S", &["-DUSE_EPOLL"]);
+    assert_zone_epoll_pipe_wake(&["-DUSE_EPOLL"]);
+}
+
+#[test]
+fn zone_epoll_pwait2_bad_timeout_returns_input_owner_fault() {
+    assert_zone_epoll_pipe_wake(&["-DUSE_EPOLL", "-DEPOLL_INPUT_FAULT"]);
+}
+
+fn assert_zone_epoll_pipe_wake(flags: &[&str]) {
+    let elf = native_exit_fixture_with_flags("native_pipe_poll_wake.S", flags);
     let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
         .unwrap_or_else(|failure| panic!("epoll pipe wake: {}", failure.error));
     assert_eq!(outcome.run.exit_code, 7, "epoll readiness/wake stage");
