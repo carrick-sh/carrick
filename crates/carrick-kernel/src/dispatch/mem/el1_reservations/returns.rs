@@ -164,6 +164,7 @@ impl MemView<'_> {
                 }
             },
         )
+        .unwrap_or_else(|| Err(El1ReturnError::Authority(Refusal::Stale.into())))
     }
 }
 
