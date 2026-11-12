@@ -228,12 +228,18 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     {
         return None;
     }
-    for (index, grant) in grants.iter().enumerate() {
-        if grant.gpa != first_grant.checked_add(index as u64 * PAGE)?
-            || grant.gpa < request.publications_gpa
-        {
-            return None;
-        }
+    // Boot admits its tables as one global span (`admit_tables`), so its
+    // grant is a single run. An exec successor's grant may span several.
+    let frames: Vec<FrameGpa> = grants
+        .iter()
+        .map(|grant| FrameGpa::new(grant.gpa))
+        .collect();
+    let runs = carrick_core_abi::successor_image::frame_runs(&frames, PAGE).ok()?;
+    if runs.len() != 1
+        || runs[0].start.raw() != first_grant
+        || first_grant < request.publications_gpa
+    {
+        return None;
     }
     let occupied_end = first_grant.checked_add(grant_count.checked_mul(PAGE as usize)? as u64)?;
     let working = carrick_core_abi::X86PrepareTableSpan::derive(
