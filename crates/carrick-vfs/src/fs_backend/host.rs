@@ -1367,20 +1367,83 @@ fn reclaim_scratch_root(scratch_root: &Path) {
     };
     // The returned names are already in the trash; the loop below owns them.
     let _ = discover_orphans(scratch_root, None);
-    // A tree that cannot make progress is quarantined by the pass itself, so
-    // this ends; the cap only guards a quarantine that also fails.
-    let mut idle_passes = 0;
-    while idle_passes < 3 {
-        let pass = cleanup_oldest_trash_with_limit(scratch_root, usize::MAX);
-        if !pass.found {
+    // Terminates by construction: each round lists the trash once and removes
+    // each listed tree exactly once (a survivor is quarantined, never
+    // retried), and there are at most `SCRATCH_RECLAIM_ROUNDS` rounds. Trees
+    // other runs retire meanwhile belong to the next start's sweep.
+    for _ in 0..SCRATCH_RECLAIM_ROUNDS {
+        let trees = list_retired_scratch(scratch_root);
+        if trees.is_empty() {
             break;
         }
-        idle_passes = if pass.removed == 0 {
-            idle_passes + 1
-        } else {
-            0
-        };
+        let failures = cleanup_failure_root(scratch_root);
+        for tree in trees {
+            reclaim_retired_tree(&tree, &failures);
+        }
     }
+}
+
+/// Upper bound on listing rounds of [`reclaim_scratch_root`].
+const SCRATCH_RECLAIM_ROUNDS: usize = 3;
+
+/// Every retired tree currently under `scratch_root`'s trash, oldest first.
+fn list_retired_scratch(scratch_root: &Path) -> Vec<PathBuf> {
+    let dedicated = scratch_root.join(SCRATCH_TRASH_DIRECTORY);
+    let search_root = if dedicated.is_dir() {
+        dedicated.as_path()
+    } else {
+        scratch_root
+    };
+    let Ok(entries) = std::fs::read_dir(search_root) else {
+        return Vec::new();
+    };
+    let mut trees: Vec<_> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| is_retired_scratch(path))
+        .map(|path| {
+            let modified = std::fs::symlink_metadata(&path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (modified, path)
+        })
+        .collect();
+    trees.sort();
+    trees.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Remove one retired tree in place, once. A tree that survives (or is
+/// already gone, because another cleaner took it) is moved to `failures` if
+/// it is still there, and is not retried.
+fn reclaim_retired_tree(tree: &Path, failures: &Path) {
+    remove_tree_making_writable(tree);
+    if std::fs::symlink_metadata(tree).is_ok() && std::fs::create_dir_all(failures).is_ok() {
+        let sequence = SCRATCH_TRASH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::rename(
+            tree,
+            failures.join(format!("{}-{sequence}", std::process::id())),
+        );
+    }
+}
+
+/// Depth-first removal that chmods each directory it descends into, so a
+/// retired tree with read-only directories does not stall the drain.
+fn remove_tree_making_writable(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !metadata.file_type().is_dir() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            remove_tree_making_writable(&entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(path);
 }
 
 impl std::fmt::Debug for HostFsBackend {
