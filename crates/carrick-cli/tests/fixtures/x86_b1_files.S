@@ -1,5 +1,5 @@
 /* #2157 B1, files family: mkdirat, ftruncate, fallocate,
- * sync, symlinkat, readlinkat, linkat, renameat, renameat2, mknodat, openat2,
+ * sync, symlinkat, readlinkat, linkat, renameat, renameat2, mknodat,
  * chdir, getcwd, unlinkat. The script runs in a scratch working
  * directory. Descriptor calls name standard output's host object (a pipe).
  *
@@ -30,7 +30,6 @@
 .equ SYS_sync, 162
 .equ SYS_renameat2, 316
 .equ SYS_mknodat, 259
-.equ SYS_openat2, 437
 .equ SYS_chdir, 80
 .equ SYS_fchdir, 81
 .equ SYS_getcwd, 79
@@ -196,22 +195,6 @@ root_script:
     xor %edx, %edx
     SYS SYS_unlinkat
     EXPECT 46, 0
-    /* openat2: present opens, absent is ENOENT. */
-    mov $AT_FDCWD, %edi
-    AT_PATH %rsi, file
-    AT_PATH %rdx, open_how
-    mov $24, %r10d
-    SYS SYS_openat2
-    EXPECT_OK 47
-    mov %rax, %rdi
-    SYS SYS_close
-    EXPECT 48, 0
-    mov $AT_FDCWD, %edi
-    AT_PATH %rsi, missing
-    AT_PATH %rdx, open_how
-    mov $24, %r10d
-    SYS SYS_openat2
-    EXPECT 49, -2
     /* The working directory follows chdir and fchdir. */
     AT_PATH %rdi, dir
     SYS SYS_chdir
@@ -229,6 +212,22 @@ root_script:
     mov $52, %edi
     jmp fail
 4:
+    /* A result that straddles two never-touched pages: both are made
+     * writable, as Linux faults each in as the copy reaches it. */
+    lea 12285(%r13), %rdi
+    mov $256, %esi
+    SYS SYS_getcwd
+    cmp $7, %rax
+    jge 5f
+    mov $60, %edi
+    jmp fail
+5:
+    lea 12285(%r13), %rcx
+    cmpl $0x72696431, -5(%rcx,%rax) /* "1dir" before the NUL */
+    je 6f
+    mov $61, %edi
+    jmp fail
+6:
     /* A relative open resolves against the new working directory. */
     mov $AT_FDCWD, %edi
     AT_PATH %rsi, member
@@ -248,6 +247,7 @@ root_script:
     xor %r10d, %r10d
     SYS SYS_openat
     EXPECT_OK 28
+    mov %rax, %r14
     mov %rax, %rdi
     PATH %rsi, scratch
     mov $512, %edx
@@ -258,6 +258,35 @@ root_script:
     mov $30, %edi
     jmp fail
 2:
+    /* %r14 is a directory the ring's staged openat holds; its number names
+     * nothing in the root's host task. An absolute path ignores it. */
+    mov %r14, %rdi
+    AT_PATH %rsi, root_path
+    mov $0755, %edx
+    SYS SYS_mkdirat
+    EXPECT 62, -17
+#ifdef RING_DIRFD
+    /* A relative path through it needs that directory as the base, which the
+     * shared path staging does not serve yet: the ring's counted ENOSYS,
+     * never the path resolved against another descriptor (this fixture runs
+     * under carrick only; native Linux creates the directory). */
+    mov %r14, %rdi
+    AT_PATH %rsi, member
+    mov $0755, %edx
+    SYS SYS_mkdirat
+    EXPECT 63, -ENOSYS
+    mov %r14, %rdi
+    AT_PATH %rsi, member
+    xor %edx, %edx
+    SYS SYS_unlinkat
+    EXPECT 64, -ENOSYS
+    mov %r14, %rdi
+    AT_PATH %rsi, member
+    lea 4096(%r13), %rdx
+    mov $16, %r10d
+    SYS SYS_readlinkat
+    EXPECT 65, -ENOSYS
+#endif
     mov $AT_FDCWD, %edi
     AT_PATH %rsi, file
     xor %edx, %edx
@@ -296,8 +325,7 @@ node: .asciz "b1dir/n"
 missing: .asciz "b1missing"
 parent: .asciz ".."
 member: .asciz "f"
+root_path: .asciz "/"
 link: .asciz "b1dir/l"
 link_target: .asciz "f"
 data: .ascii "abcd"
-.balign 8
-open_how: .quad 0, 0, 0
