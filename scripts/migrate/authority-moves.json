@@ -2,6 +2,11 @@
   "schema": 1,
   "authority_debt": [
     {
+      "from": "carrick_vfs::fs_backend::host::cleanup_oldest_trash_checkpoint",
+      "to": "carrick_vfs::fs_backend::host::cleanup_oldest_trash_with_limit",
+      "issue": 1852
+    },
+    {
       "from": "carrick_kernel::dispatch::fs::attr::FsView<'a>::set_fd_times",
       "to": "carrick_kernel::dispatch::fs::attr::FsView<'a>::set_description_times",
       "issue": 1335
@@ -145,6 +150,18 @@
     {
       "owner": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::publish_replacement",
       "issue": 2142
+    },
+    {
+      "owner": "carrick_vfs::fs_backend::host::SCRATCH_EXIT",
+      "issue": 1852
+    },
+    {
+      "owner": "carrick_vfs::fs_backend::host::note_scratch_root_in_use",
+      "issue": 1852
+    },
+    {
+      "owner": "carrick_vfs::fs_backend::host::note_scratch_root_in_use::at_exit",
+      "issue": 1852
     }
   ],
   "terminal_custody": []
