@@ -2555,6 +2555,17 @@ fn publish_test_exec_reply_for<C: ProcessContext + 'static>(
 #[cfg(test)]
 #[test]
 fn refused_exec_preparation_is_cancelled_exactly_once() {
+    refused_exec_case(false);
+}
+
+#[cfg(test)]
+#[test]
+fn post_arm_exec_adoption_failure_is_sigsegv() {
+    refused_exec_case(true);
+}
+
+#[cfg(test)]
+fn refused_exec_case(adoption_failure: bool) {
     let fixture = native_exec_fixture();
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -2593,8 +2604,19 @@ fn refused_exec_preparation_is_cancelled_exactly_once() {
         fixture.slot,
         113,
         0xc0_0000,
-        true,
+        !adoption_failure,
     );
+    if adoption_failure {
+        // A valid sealed preparation reaches the production adopter after
+        // the exec gate arms; a conflicting physical bind refuses adoption.
+        let index = fixture.zone.spaces.find(successor_mm.raw()).unwrap();
+        assert!(fixture.zone.spaces.bind_initial_root(
+            index,
+            successor_mm.raw(),
+            0xd0_0000,
+            0xd0_0000,
+        ));
+    }
     let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
     assert_eq!(selected.record, fixture.record.id);
     // SAFETY: the prepared-service wake selected this exact record.
@@ -2617,6 +2639,9 @@ fn refused_exec_preparation_is_cancelled_exactly_once() {
         Ok(NativeResume::Left(None))
     ));
     assert!(entry.take_run_failure().is_none());
+    if adoption_failure {
+        assert_eq!(entry.take_root_exit().map(|status| status.raw()), Some(11));
+    }
     assert_eq!(take_exec_cancellations(), vec![113]);
     assert_eq!(fixture.task.mm.key.load(Ordering::Acquire), 1);
     assert!(fixture.zone.spaces.find(successor_mm.raw()).is_none());
