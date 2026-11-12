@@ -145,9 +145,9 @@ pub use spaces::{
 
 use core::cell::UnsafeCell;
 #[cfg(not(all(test, feature = "loom")))]
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 #[cfg(all(test, feature = "loom"))]
-use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Parked-thread records (index 0 is reserved as "none").
 #[cfg(not(all(test, feature = "loom")))]
@@ -945,8 +945,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     }
 
     fn settle_claimed_handback(&self, kind: Handback) {
-        if self.has_object_operation() || kind == Handback::Cancelled
-            || !matches!(self.handback(), Some(Handback::Woken | Handback::Resumed | Handback::Service)) {
+        if self.has_object_operation()
+            || kind == Handback::Cancelled
+            || !matches!(
+                self.handback(),
+                Some(Handback::Woken | Handback::Resumed | Handback::Service)
+            )
+        {
             self.handback.store(kind as u32, Ordering::Release);
         }
     }
@@ -5171,6 +5176,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             s.drive.store(driver, Ordering::Release);
         }
         drop(guard);
+        fence(Ordering::SeqCst);
         // CPU is now published. Only this returning driver is targeted, so
         // its entry consumes resched debt without a remote host kick.
         self.probe_held_inner(Some(slot), &mut |_| {});
@@ -5345,6 +5351,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         self.held_map[record.id.index() / 64]
             .fetch_or(1 << (record.id.index() % 64), Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         // Post before probing: a concurrent driver either observes our bit,
         // or this probe observes its published CPU and driver.
         self.probe_held_record(record.id, None)
@@ -5365,6 +5372,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return Some(NativePlacement::Placed(placement));
         }
         word.fetch_or(bit, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         // One post-publication probe closes the race with a trigger that
         // took the bit before a new driver/affinity was published.
         if let Some(placement) = self.place_held_claim(id, from, target) {
@@ -5428,6 +5436,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Pay affinity probe debt only after releasing the process graph lock.
     /// Each held record is taken by clearing its hint; claim CAS is authority.
     pub fn probe_held(&self, effects: &mut WakeEffects) {
+        fence(Ordering::SeqCst);
         self.probe_held_inner(None, &mut |placement| {
             if placement.resched {
                 effects.request_reschedule(placement.slot);
@@ -5868,7 +5877,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         {
             return None;
         }
-        self.timers.cancel_record(record.id);
+        // Held was published only after the original host transfer removed
+        // its wait entries and timer. Claiming it needs no queue/index lock.
+        if !matches!(from, Claim::Held { .. }) {
+            self.timers.cancel_record(record.id);
+        }
         Some(HostTransfer {
             zone: self,
             record,
