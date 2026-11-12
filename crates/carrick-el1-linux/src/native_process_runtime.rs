@@ -7532,10 +7532,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .service
                 .copy_signal_bytes(&mm, UserVa::new(clear_child_tid), &0_u32.to_ne_bytes())
                 .is_ok()
+                && let Some(key) = carrick_personality_linux::sched::MmFutexKey::shared_private(
+                    UserVa::new(clear_child_tid),
+                )
             {
                 let zone = self.source.zone;
                 let guard = zone.short_lock(
-                    ZoneTables::<C>::bucket_of_with_context(self.binding.mm.raw(), clear_child_tid),
+                    ZoneTables::<C>::bucket_of_with_context(
+                        self.binding.mm.raw(),
+                        key.scheduler_address(),
+                    ),
                     &NativeBucketWait {
                         lifetime: core::marker::PhantomData,
                         #[cfg(test)]
@@ -7546,7 +7552,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 zone.wake_placed(
                     &guard,
                     self.binding.mm.raw(),
-                    clear_child_tid,
+                    key.scheduler_address(),
                     carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
                     carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
                     carrick_sched_core::Waker::El1 {

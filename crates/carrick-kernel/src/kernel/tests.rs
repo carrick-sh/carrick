@@ -1778,13 +1778,23 @@ mod futex_queue_authority {
             let guard = queue
                 .tables()
                 .lock(
-                    ZoneTables::bucket_of_with_context(queue.key(), uaddr),
+                    ZoneTables::bucket_of_with_context(queue.key(), uaddr.scheduler_address()),
                     &HostLockWait,
                 )
                 .expect("bucket lock");
-            let word = self.memory.read_bytes(uaddr, 4).expect("word");
+            let word = self
+                .memory
+                .read_bytes(uaddr.guest_address().raw(), 4)
+                .expect("word");
             assert_eq!(u32::from_ne_bytes(word.try_into().expect("u32")), value);
-            Self::enqueue_locked(&guard, queue, thread, uaddr, bitset, index)
+            Self::enqueue_locked(
+                &guard,
+                queue,
+                thread,
+                uaddr.scheduler_address(),
+                bitset,
+                index,
+            )
         }
 
         /// EL1's park of a thread it serves a `FUTEX_WAIT` for, in the queue
@@ -1794,17 +1804,25 @@ mod futex_queue_authority {
             thread: &super::super::KernelContext,
             bitset: u32,
         ) -> RecordId {
+            self.el1_park_key(thread, bitset, WORD)
+        }
+        fn el1_park_key(
+            &self,
+            thread: &super::super::KernelContext,
+            bitset: u32,
+            address: u64,
+        ) -> RecordId {
             let queue = FutexQueueAuthority::of_context(thread)
                 .zone()
                 .expect("zone mm");
             let guard = self
                 .zone
                 .lock(
-                    ZoneTables::bucket_of_with_context(queue.key(), WORD),
+                    ZoneTables::bucket_of_with_context(queue.key(), address),
                     &HostLockWait,
                 )
                 .expect("bucket lock");
-            Self::enqueue_locked(&guard, queue, thread, WORD, bitset, 0)
+            Self::enqueue_locked(&guard, queue, thread, address, bitset, 0)
         }
 
         fn enqueue_locked(
@@ -1845,6 +1863,15 @@ mod futex_queue_authority {
             bitset: u32,
             count: u32,
         ) -> u32 {
+            self.el1_wake_key(thread, bitset, count, WORD)
+        }
+        fn el1_wake_key(
+            &self,
+            thread: &super::super::KernelContext,
+            bitset: u32,
+            count: u32,
+            address: u64,
+        ) -> u32 {
             let mm = thread.shared().mm_id().raw();
             let zone = self.zone;
             if zone.slot(EL1_SLOT).mm() == 0 {
@@ -1855,13 +1882,16 @@ mod futex_queue_authority {
                 assert!(zone.occupancy.replace(here, 0, mm));
             }
             let guard = zone
-                .lock(ZoneTables::bucket_of_with_context(mm, WORD), &HostLockWait)
+                .lock(
+                    ZoneTables::bucket_of_with_context(mm, address),
+                    &HostLockWait,
+                )
                 .expect("bucket lock");
             let mut effects = WakeEffects::default();
             zone.wake_placed(
                 &guard,
                 mm,
-                WORD,
+                address,
                 bitset,
                 count,
                 Waker::El1 { slot: EL1_SLOT },
@@ -1873,6 +1903,46 @@ mod futex_queue_authority {
         pub(super) fn parked(&self, record: RecordId) -> bool {
             matches!(self.zone.record(record).claim(), Claim::Parked { .. })
         }
+    }
+
+    #[test]
+    fn shared_host_wait_meets_ring_wake() {
+        let mut f = Fixture::new(9321);
+        crate::el1_zone::with_test_zone(f.zone, || {
+            let root = f.root.retain_exact();
+            let sibling = f.sibling.retain_exact();
+            f.write_word(0);
+            let outcome = f.futex(&root, f.root_tid, LINUX_FUTEX_WAIT, 0);
+            let waiter = f.host_park(&root, outcome);
+            let key = carrick_personality_linux::sched::MmFutexKey::shared_private(
+                carrick_core::personality::UserVa::new(WORD),
+            )
+            .unwrap();
+            assert_eq!(
+                f.el1_wake_key(&sibling, u32::MAX, 1, key.scheduler_address()),
+                1
+            );
+            assert!(!f.parked(waiter));
+        });
+    }
+
+    #[test]
+    fn shared_ring_wait_meets_host_wake() {
+        let mut f = Fixture::new(9322);
+        crate::el1_zone::with_test_zone(f.zone, || {
+            let root = f.root.retain_exact();
+            let sibling = f.sibling.retain_exact();
+            let key = carrick_personality_linux::sched::MmFutexKey::shared_private(
+                carrick_core::personality::UserVa::new(WORD),
+            )
+            .unwrap();
+            let waiter = f.el1_park_key(&sibling, u32::MAX, key.scheduler_address());
+            match f.futex(&root, f.root_tid, LINUX_FUTEX_WAKE, 1) {
+                DispatchOutcome::ZoneFutexWoken { value, .. } => assert_eq!(value, 1),
+                other => panic!("expected zone wake: {other:?}"),
+            }
+            assert!(!f.parked(waiter));
+        });
     }
 
     /// Host-parked waiter (root, through the dispatcher) and EL1-side waker

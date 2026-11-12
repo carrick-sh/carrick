@@ -791,7 +791,8 @@ pub enum DispatchOutcome {
         /// dispatcher from its mm: the backend parks there and nowhere else.
         #[serde(skip)]
         queue: crate::el1_zone::ZoneFutexQueue,
-        uaddr: u64,
+        #[serde(serialize_with = "serialize_futex_address")]
+        uaddr: carrick_personality_linux::sched::MmFutexKey,
         value: u32,
         bitset: u32,
         timeout: Option<Duration>,
@@ -1319,4 +1320,11 @@ pub(crate) fn lower_handler_result(
         Err(DispatchError::Errno(errno)) => Ok(DispatchOutcome::Errno { errno }),
         other => other,
     }
+}
+
+fn serialize_futex_address<S: serde::Serializer>(
+    key: &carrick_personality_linux::sched::MmFutexKey,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u64(key.guest_address().raw())
 }

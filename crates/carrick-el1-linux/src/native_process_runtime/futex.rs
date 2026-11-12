@@ -357,7 +357,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             retained,
         };
         let result = if shared.is_some()
-            && call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
+            && matches!(
+                call.args[1],
+                carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
+                    | carrick_personality_linux::sched::FUTEX_WAKE_BITSET_PRIVATE
+            )
             && adapter.authenticate_mapping(UserVa::new(call.args[0])) != Some(true)
         {
             None

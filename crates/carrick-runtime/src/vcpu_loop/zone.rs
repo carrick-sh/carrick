@@ -758,7 +758,7 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         frame: carrick_hal::RawSyscall,
         queue: carrick_kernel::el1_zone::ZoneFutexQueue,
-        uaddr: u64,
+        uaddr: carrick_personality_linux::sched::MmFutexKey,
         value: u32,
         bitset: u32,
         timeout: Option<std::time::Duration>,
@@ -791,15 +791,16 @@ where
             control_slot: 0,
         };
         let parked = {
-            let Some(guard) =
-                zone.lock(ZoneTables::bucket_of_with_context(mm, uaddr), &HostLockWait)
-            else {
+            let Some(guard) = zone.lock(
+                ZoneTables::bucket_of_with_context(mm, uaddr.scheduler_address()),
+                &HostLockWait,
+            ) else {
                 return Err(RuntimeError::Configuration(
                     "zone park: host bucket lock gave up".to_owned(),
                 )
                 .into());
             };
-            match load_zone_futex_word(engine, uaddr) {
+            match load_zone_futex_word(engine, uaddr.guest_address().raw()) {
                 Err(error) => Err(DispatchOutcome::from_owner_memory_error(error).unwrap_or(
                     DispatchOutcome::Errno {
                         errno: crate::linux_abi::LINUX_EFAULT,
@@ -819,7 +820,15 @@ where
                         };
                         let seq = zone.next_seq(record);
                         if zone
-                            .enqueue(&guard, record, seq, mm, uaddr, bitset, index)
+                            .enqueue(
+                                &guard,
+                                record,
+                                seq,
+                                mm,
+                                uaddr.scheduler_address(),
+                                bitset,
+                                index,
+                            )
                             .is_err()
                         {
                             zone.free_record(record);

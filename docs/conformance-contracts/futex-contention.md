@@ -684,3 +684,28 @@ placement and publication operations. The ARM fork-child handback binding now
 re-drives CPU 1 and requires the waiter to switch in with result zero. The x86
 LaneWake binding holds and then places the same native completion. This changes
 no x86 switch-time affinity guard; affinity publication remains #2131.
+
+### Shared-private keys across custody (#2124)
+
+The existing `MmFutexKey` owns the mapping-kind encoding. The host dispatcher
+carries that typed key in `ZoneFutexWait`, and the runtime uses its guest address
+for the final atomic word read and its scheduler address for bucket admission.
+WAKE, REQUEUE, CMP_REQUEUE, timed bitset waits and waitv use the same constructor.
+Both architectures' clear-child-tid wakes and process-terminal wakes select the
+shared-private kind. `Claim::Held` still owns completion placement when no driver
+is available; key construction changes neither the park sequence nor that custody.
+
+PRIVATE operations and shared operations on private anonymous storage remain
+distinct. Clean-room reference: gVisor's Apache-2.0
+`pkg/sentry/kernel/futex/futex.go`, `KeyKind`, documents Linux's
+`FUT_OFF_MMSHARED` distinction. Its LICENSE was checked before reading the source.
+https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/futex/futex.go
+The futex(2) manual's description of PRIVATE as an optimization does not promise
+interoperation between those two operation kinds.
+
+`arm_glibc_pthread_join_robust_host_wake_meets_ring_wait` uses production ARM
+syscall dispatch with the scheduler active, calls `set_robust_list` (99), parks
+a joiner with op 265, verifies the child's raw exit enters host custody, then
+applies the production host `FutexQueueAuthority::wake_child_tid` API after the
+clear-word copyout. Before repair, that wake finds zero waiters instead of one.
+This is a VM-free custody-boundary witness, not a signed runtime retirement demo.

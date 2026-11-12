@@ -32,15 +32,36 @@ pub const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
 /// guest memory access. Shared mappings require a different object authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MmFutexKey(u64);
+/// Storage identity selected after authenticating the mapping. Linux keeps
+/// PRIVATE operations separate from shared operations on private anonymous
+/// storage (gVisor, Apache-2.0, pkg/sentry/kernel/futex/futex.go: KeyKind).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MmFutexMapping {
+    Private,
+    SharedPrivate,
+}
 impl MmFutexKey {
+    pub fn for_mapping(address: UserVa, mapping: MmFutexMapping) -> Option<Self> {
+        if address.raw() & 3 != 0 {
+            return None;
+        }
+        let tag = match mapping {
+            MmFutexMapping::Private => 0,
+            MmFutexMapping::SharedPrivate => 1,
+        };
+        Some(Self(address.raw() | tag))
+    }
+    pub fn guest_address(self) -> UserVa {
+        UserVa::new(self.0 & !3)
+    }
     pub fn private(address: UserVa) -> Option<Self> {
-        (address.raw() & 3 == 0).then_some(Self(address.raw()))
+        Self::for_mapping(address, MmFutexMapping::Private)
     }
     /// Linux distinguishes shared operations on private anonymous memory from
     /// PRIVATE operations (gVisor's KindSharedPrivate). This alignment bit is
     /// never passed back to a user-copy operation.
     pub fn shared_private(address: UserVa) -> Option<Self> {
-        Self::private(address).map(|key| Self(key.0 | 1))
+        Self::for_mapping(address, MmFutexMapping::SharedPrivate)
     }
     pub fn scheduler_address(self) -> u64 {
         self.0
