@@ -2803,10 +2803,13 @@ fn serial_host_initial_write_without_ring_table_keeps_stdout_route() {
 
 /// #2157 B0 T1: a fork child's x86-allowed crossing that no ring stage serves
 /// is a counted ENOSYS in ring, as ARM answers a fork child's unclaimed
-/// native call, never a carrier failure. Two live children (A sleeps after
-/// its `read(0, buf, 0)` while B makes its `lseek(0, 0, SEEK_CUR)`) each get
-/// errno 38, and the root's own `read(0, buf, 0)` keeps its host route and
-/// returns 0. Red on main: the run failed with a typed `HostTaskContext`.
+/// native call, never a carrier failure. Two children (A's `read(0, buf, 0)`,
+/// B's `lseek(0, 0, SEEK_CUR)`) each report to the root by signal and then
+/// block until their sibling has made its own call, so children that ran one
+/// after another fail. The handshake, not a delay, proves both were live;
+/// every wait is a bounded 5 s `rt_sigtimedwait`. Each child exits with errno
+/// 38, and the root's own `read(0, buf, 0)` keeps its host route and returns
+/// 0. Red on main: the run failed with a typed `HostTaskContext`.
 #[test]
 fn two_live_children_unstaged_crossings_are_counted_enosys_and_root_is_served() {
     let elf = native_exit_fixture("native_child_unstaged_crossing.S");
@@ -2820,7 +2823,8 @@ fn two_live_children_unstaged_crossings_are_counted_enosys_and_root_is_served() 
         });
     assert_eq!(
         outcome.run.exit_code, 7,
-        "81/82 root read, 64|status child A, 128|status child B, 91 fork/wait: {:?}",
+        "81/82 root read, 83/84 child A/B result, 91 fork/wait/pipe, 92 report timeout, \
+         95 child status: {:?}",
         outcome.run
     );
     let counters = outcome
