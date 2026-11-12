@@ -129,6 +129,35 @@ fn prepare_native_exec_image(
         LinuxErrno,
     >,
 ) -> Result<LoadedExecImage, LinuxErrno> {
+    prepare_native_exec(
+        capability,
+        payload,
+        descriptor_source,
+        |files, target, argv, env| {
+            load_execve_image(&capability.loader, files, target, argv, env, false)
+        },
+    )
+}
+
+/// Parse a native child's staged exec request under the caller's sealed
+/// access, and hand what it names to `load`.
+fn prepare_native_exec<R>(
+    capability: &NativeExecCapability,
+    payload: &[u8],
+    descriptor_source: impl FnOnce(
+        [u64; 3],
+        i32,
+    ) -> Result<
+        carrick_kernel::dispatch::executable_authority::ExecSource,
+        LinuxErrno,
+    >,
+    load: impl FnOnce(
+        &carrick_kernel::dispatch::exec_files::ExecFiles,
+        ExecTarget<'_>,
+        Vec<Vec<u8>>,
+        Vec<Vec<u8>>,
+    ) -> Result<R, LinuxErrno>,
+) -> Result<R, LinuxErrno> {
     let view = carrick_core_abi::service::ExecPayloadView::parse(payload)
         .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
     // Served exactly or left unrouted: counted ENOSYS, never a guess.
@@ -167,8 +196,7 @@ fn prepare_native_exec_image(
                 let source = descriptor_source(table, dirfd)?;
                 let argv = view.argv().map(<[u8]>::to_vec).collect();
                 let env = view.envp().map(<[u8]>::to_vec).collect();
-                return load_execve_image(
-                    &capability.loader,
+                return load(
                     &files,
                     ExecTarget::Descriptor {
                         spelling: format!("/dev/fd/{dirfd}"),
@@ -176,7 +204,6 @@ fn prepare_native_exec_image(
                     },
                     argv,
                     env,
-                    false,
                 );
             } else if path.starts_with('/') || dirfd == -100 {
                 path.to_owned()
@@ -192,7 +219,7 @@ fn prepare_native_exec_image(
     }
     let argv = view.argv().map(<[u8]>::to_vec).collect();
     let env = view.envp().map(<[u8]>::to_vec).collect();
-    load_execve_image(&capability.loader, &files, &path, argv, env, false)
+    load(&files, ExecTarget::Path(&path), argv, env)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -475,19 +502,54 @@ impl<'a> From<&'a String> for ExecTarget<'a> {
     }
 }
 
-pub(crate) fn load_execve_image<'a>(
-    loader: &ExecLoaderCapabilities,
-    files: &carrick_kernel::dispatch::exec_files::ExecFiles,
-    // A path to resolve, or an open descriptor's own object (`fexecve`).
-    target: impl Into<ExecTarget<'a>>,
-    // argv/env are opaque BYTE strings (Linux ABI), not UTF-8. `path` is a
-    // String (resolved against the String/Path fs layer); argv[0] / shebang
-    // interpreters are pushed as their UTF-8 bytes.
+/// An exec target once resolved: the final image source after any `#!`
+/// chain, the argv that chain built, and the names the image carries.
+struct ResolvedExecTarget {
+    /// The final image's path: the last interpreter of a `#!` chain.
+    path: String,
+    /// The path the caller named (`/dev/fd/N` for a descriptor), which a
+    /// descriptor's image carries as AT_EXECFN.
+    execfn: String,
+    descriptor: bool,
     argv: Vec<Vec<u8>>,
-    env: Vec<Vec<u8>>,
-    requires_syscall_traps: bool,
-) -> Result<LoadedExecImage, LinuxErrno> {
-    use crate::linux_abi::LINUX_ENOENT;
+    source: carrick_kernel::dispatch::executable_authority::ExecSource,
+    /// The final source is a direct little-endian AArch64 ELF.
+    direct_aarch64: bool,
+}
+
+/// Acquire an exec image source under `files`. The bare-run host-file
+/// fallback is the HVF embedding's physical file service. Other carriers
+/// supply none until their host-file venue serves exec (#1093 S4): the
+/// retained filesystem alone resolves the image.
+fn acquire_exec_source(
+    files: &carrick_kernel::dispatch::exec_files::ExecFiles,
+    path: &str,
+) -> Result<
+    carrick_kernel::dispatch::executable_authority::ExecSource,
+    carrick_kernel::dispatch::executable_authority::ExecSourceError,
+> {
+    #[cfg(feature = "platform-macos")]
+    {
+        files.acquire_with_host_file_service(path, &|path: &str| std::fs::File::open(path))
+    }
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
+    {
+        files.acquire(path)
+    }
+}
+
+/// Resolve what an exec runs, as Linux does before it reads the image:
+/// the target's resolution and execute permission, FAN_OPEN_EXEC, and up
+/// to four `#!` interpreters. Every exec loader starts here.
+fn resolve_exec_target<'a>(
+    files: &carrick_kernel::dispatch::exec_files::ExecFiles,
+    target: impl Into<ExecTarget<'a>>,
+    argv: Vec<Vec<u8>>,
+) -> Result<ResolvedExecTarget, LinuxErrno> {
     // Absolutize a RELATIVE execve target against the guest cwd before any
     // layer lookup (Linux resolves `execve("b/foo")` against the caller's cwd;
     // carrick's layers key on absolute guest paths). See `resolve_exec_path`.
@@ -498,25 +560,7 @@ pub(crate) fn load_execve_image<'a>(
     // interpreter (execve03/execve02). Then resolve any `#!` shebang script to
     // its interpreter (shared with the initial entrypoint load via
     // `resolve_shebang`).
-    // The bare-run host-file fallback is the HVF embedding's physical file
-    // service. Other carriers supply none until their host-file venue serves
-    // exec (#1093 S4): the retained filesystem alone resolves the image.
-    #[cfg(feature = "platform-macos")]
-    let host_open = |path: &str| std::fs::File::open(path);
-    let acquire_source = |path: &str| {
-        #[cfg(feature = "platform-macos")]
-        {
-            files.acquire_with_host_file_service(path, &host_open)
-        }
-        #[cfg(any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
-        {
-            files.acquire(path)
-        }
-    };
+    let acquire_source = |path: &str| acquire_exec_source(files, path);
     let (abs_path, named_source, descriptor) = match target.into() {
         ExecTarget::Path(path) => (
             files.resolve_path(path),
@@ -593,6 +637,38 @@ pub(crate) fn load_execve_image<'a>(
     if path != named_target {
         files.notify_exec(&path);
     }
+    Ok(ResolvedExecTarget {
+        path,
+        execfn,
+        descriptor,
+        argv,
+        source,
+        direct_aarch64,
+    })
+}
+
+pub(crate) fn load_execve_image<'a>(
+    loader: &ExecLoaderCapabilities,
+    files: &carrick_kernel::dispatch::exec_files::ExecFiles,
+    // A path to resolve, or an open descriptor's own object (`fexecve`).
+    target: impl Into<ExecTarget<'a>>,
+    // argv/env are opaque BYTE strings (Linux ABI), not UTF-8. `path` is a
+    // String (resolved against the String/Path fs layer); argv[0] / shebang
+    // interpreters are pushed as their UTF-8 bytes.
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+    requires_syscall_traps: bool,
+) -> Result<LoadedExecImage, LinuxErrno> {
+    use crate::linux_abi::LINUX_ENOENT;
+    let ResolvedExecTarget {
+        path,
+        execfn,
+        descriptor,
+        argv,
+        source,
+        direct_aarch64,
+    } = resolve_exec_target(files, target, argv)?;
+    let acquire_source = |path: &str| acquire_exec_source(files, path);
 
     // Read the main binary AND resolve its interpreter OVERLAY-FIRST via
     // the retained file capabilities, so execve works for guest-created/overlay binaries
