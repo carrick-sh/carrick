@@ -455,7 +455,13 @@ pub fn serve_ipc_with_signals<E: IpcExecution, M: UserCopy>(
     if nr != SYS_READ && nr != SYS_WRITE && nr != 66 && nr != SYS_EPOLL_PWAIT {
         return (IpcServed::Forward, false);
     }
-    let (token, op, resumed) = match sched.take_object_operation() {
+    let taken = match sched.take_object_operation() {
+        // The replay receipt of an operation-slot wait (`epoll::admit_output`)
+        // owns nothing: the call runs afresh.
+        Ok(Some(t)) if t.metadata_generation().is_some() => Ok(None),
+        taken => taken,
+    };
+    let (token, op, resumed) = match taken {
         // The slot's record is not this task's: the host settles it.
         Err(_) => {
             return (

@@ -24,7 +24,10 @@
 //! With a native owner, a refused copy-out never leaves the ring: the items
 //! are put back, the owner prepares the buffer (a first touch is supplied,
 //! or waited for) and the call harvests again; a buffer the owner faults is
-//! EFAULT, its reports still queued, as on Linux.
+//! EFAULT, its reports still queued, as on Linux. A full operation arena is
+//! "not now": the call parks on the arena's slot release and replays. A
+//! pwait mask is armed before the preparation, so a suspended preparation
+//! keeps it like a parked wait does.
 //!
 //! A blocking wait parks on the epoll's `Readable` lane with an
 //! [`IpcOpKind::EpollWait`] operation that pins the epoll's description, so
@@ -112,9 +115,10 @@ pub(super) fn resume<E: IpcExecution, M: UserCopy>(
     };
     let record = sched.zone().slot(sched.slot()).current();
     finish(sched, token, &venue.region);
-    // A continuation keeps the accepted mask in the control slot. In
+    // A continuation keeps the accepted mask in the control slot, whether it
+    // parked on readiness or on the owner's events-buffer preparation. In
     // particular, lost readiness must re-park under that same snapshot.
-    let served = serve_with(sched, frame, venue, user, Some(wait), interrupt);
+    let served = serve_with(sched, frame, venue, user, Some(wait), &mut false, interrupt);
     let parked = record.is_some_and(|id| sched.zone().record(id).has_object_operation());
     if !parked || matches!(served, IpcServed::Forward | IpcServed::Handback) {
         user.disarm_wait_sigmask();
@@ -130,17 +134,28 @@ pub(super) fn serve<E: IpcExecution, M: UserCopy>(
     user: &mut M,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
-    serve_with(sched, frame, venue, user, None, interrupt)
+    let mut armed = false;
+    let served = serve_with(sched, frame, venue, user, None, &mut armed, interrupt);
+    // A call that ends here restores the mask it armed. One that parked, or
+    // whose preparation suspended, handed it to its continuation, which
+    // resumes through `resume` and never reads the mask argument again.
+    if armed {
+        user.disarm_wait_sigmask();
+    }
+    served
 }
 
 /// `wait`: what is left of a resumed call's wait (`None`: a fresh call,
-/// whose timeout argument starts now).
+/// whose timeout argument starts now). `armed`: set while this call owns
+/// restoring the accepted temporary mask it armed; cleared when a
+/// continuation takes it over (a resumed call's mask is its continuation's).
 fn serve_with<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     wait: Option<Wait>,
+    armed: &mut bool,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
     // epoll_pwait(2) checks the mask argument before the set.
@@ -172,61 +187,11 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
                 .saturating_add(1),
         ),
     });
-    let task = sched.task();
     let region = &venue.region;
-    let Some(table) = venue.tables.table_of(task) else {
-        return leave(sched, IpcLeave::NoTable, IpcServed::Forward);
+    let (mut op, mut object) = match pin_epoll(sched, frame, venue, wait) {
+        Ok(pinned) => pinned,
+        Err(served) => return served,
     };
-    let table = TableId::from_raw(table);
-    let fd = Fd(argument_word(frame, 0) as i32);
-    let fda = region.fd(EL1_WAIT);
-    match fda.get(table, fd) {
-        Ok(snapshot) if epoll_of(snapshot.backing).is_some() => {}
-        // Not a zone epoll (EINVAL, or a host-backed epoll): the host.
-        Ok(_) => return leave(sched, IpcLeave::EpollNotZone, IpcServed::Forward),
-        Err(FdError::BadFd) => return returned(frame, linux::EBADF),
-        Err(FdError::Contended) => {
-            return leave(sched, IpcLeave::TableContended, IpcServed::Forward);
-        }
-        Err(_) => return leave(sched, IpcLeave::TableRefused, IpcServed::Forward),
-    }
-    let operation = |pin: RawOfdPin, object: RawIpcObject| IpcOperation {
-        kind: IpcOpKind::EpollWait,
-        pin,
-        object,
-        task: task_key(task),
-        mm: mm_key(task),
-        buf: IpcUserVa(argument_word(frame, 1)),
-        orig_x0: argument_word(frame, 0),
-        nr: SYS_EPOLL_PWAIT as u32,
-        ..IpcOperation::EMPTY
-    };
-    let (pin, desc) = match fda.pin(table, fd) {
-        Ok(found) => found,
-        Err(FdError::BadFd) => return returned(frame, linux::EBADF),
-        Err(FdError::Contended) => {
-            return leave(sched, IpcLeave::PinContended, IpcServed::Forward);
-        }
-        // A pin on a reused record the fd did not name: the host drops it
-        // (possibly a final release EL1 cannot perform) and runs the call.
-        Err(FdError::PinRaced(raw)) => {
-            return restart(sched, frame, venue, operation(raw, RawIpcObject::default()));
-        }
-        Err(_) => return leave(sched, IpcLeave::PinRefused, IpcServed::Forward),
-    };
-    let Some(object) = epoll_of(desc.backing) else {
-        // Replaced since the snapshot by a description EL1 does not serve.
-        return restart(
-            sched,
-            frame,
-            venue,
-            operation(pin.into_raw(), RawIpcObject::default()),
-        );
-    };
-    let mut op = operation(pin.into_raw(), object.to_raw());
-    if let Wait::Until(deadline) = wait {
-        op.deadline = IpcCounterDeadline::at(deadline);
-    }
     let buf = argument_word(frame, 1);
     let limit = usize::try_from(maxevents).map_or(BATCH, |n| n.min(BATCH));
     // The owner prepared the events buffer for the last refused copy-out.
@@ -286,13 +251,41 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
                     // A resumed operation keeps a reached deadline: it harvests once.
                     op.deadline = IpcCounterDeadline::at(sched.now());
                 }
-                match prepare_output(sched, frame, region, user, op, request, prepared) {
+                let token = match admit_output(sched, frame, venue, user, op, armed, interrupt) {
+                    Admitted::Operation(token) => token,
+                    Admitted::Parked(served) => return served,
+                    Admitted::Rerun => {
+                        (op, object) = match pin_epoll(sched, frame, venue, wait) {
+                            Ok(pinned) => pinned,
+                            Err(served) => return served,
+                        };
+                        prepared = false;
+                        continue;
+                    }
+                };
+                // The accepted mask covers the preparation too: a suspended
+                // preparation resumes through `resume`, which harvests again
+                // (and may park) without reading the mask argument again.
+                if let Some(mask) = sigmask
+                    && !*armed
+                {
+                    if !user.arm_wait_sigmask(mask) {
+                        finish(sched, token, region);
+                        return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
+                    }
+                    *armed = true;
+                }
+                match prepare_output(sched, frame, region, user, token, request, prepared) {
                     Output::Rerun(back, ready) => {
                         op = back;
                         prepared = ready;
                         continue;
                     }
                     Output::Done(served) => return served,
+                    Output::Retained(served) => {
+                        *armed = false;
+                        return served;
+                    }
                 }
             }
             release_pin(sched, OfdPin::from_raw(op.pin), region);
@@ -318,17 +311,19 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
         };
         // Armed before the park, whose post-enrollment probe must already see
         // the temporary mask.
-        let armed = sigmask.is_some_and(|mask| user.arm_wait_sigmask(mask));
-        if sigmask.is_some() && !armed {
-            release_pin(sched, OfdPin::from_raw(op.pin), region);
-            return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
+        if let Some(mask) = sigmask
+            && !*armed
+        {
+            if !user.arm_wait_sigmask(mask) {
+                release_pin(sched, OfdPin::from_raw(op.pin), region);
+                return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
+            }
+            *armed = true;
         }
         let token = match region.begin_operation(op) {
             Ok(token) => token,
             Err(_) => {
-                if armed {
-                    user.disarm_wait_sigmask();
-                }
+                disarm(user, armed);
                 release_pin(sched, OfdPin::from_raw(op.pin), region);
                 return leave(sched, IpcLeave::NoOperationRecord, IpcServed::Forward);
             }
@@ -345,13 +340,14 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
             deadline,
             &mut || user.interrupt_pending_wait() || interrupt(),
         ) {
-            Parked::Done(served) => return served,
+            Parked::Done(served) => {
+                *armed = false;
+                return served;
+            }
             // Readiness moved before the park: retire the record (the pin
             // stays with `op`) and harvest again.
             Parked::Retry(token) => {
-                if armed {
-                    user.disarm_wait_sigmask();
-                }
+                disarm(user, armed);
                 match region.finish_operation(token, || {
                     notify_operation_release(region, sched.zone(), sched.slot())
                 }) {
@@ -360,13 +356,165 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
                 }
             }
             Parked::Refused(token) => {
-                if armed {
-                    user.disarm_wait_sigmask();
-                }
+                disarm(user, armed);
                 finish(sched, token, region);
                 return leave(sched, IpcLeave::ParkRefused, IpcServed::Forward);
             }
         }
+    }
+}
+
+/// Pin the call's epoll description for one pass (`Err`: how the call was
+/// served instead). The operation carries the pin and a finite deadline.
+fn pin_epoll<E: IpcExecution>(
+    sched: &mut E,
+    frame: &mut E::Frame,
+    venue: &IpcVenue<'_>,
+    wait: Wait,
+) -> Result<(IpcOperation, IpcObjectHandle), IpcServed> {
+    let task = sched.task();
+    let region = &venue.region;
+    let Some(table) = venue.tables.table_of(task) else {
+        return Err(leave(sched, IpcLeave::NoTable, IpcServed::Forward));
+    };
+    let table = TableId::from_raw(table);
+    let fd = Fd(argument_word(frame, 0) as i32);
+    let fda = region.fd(EL1_WAIT);
+    match fda.get(table, fd) {
+        Ok(snapshot) if epoll_of(snapshot.backing).is_some() => {}
+        // Not a zone epoll (EINVAL, or a host-backed epoll): the host.
+        Ok(_) => return Err(leave(sched, IpcLeave::EpollNotZone, IpcServed::Forward)),
+        Err(FdError::BadFd) => return Err(returned(frame, linux::EBADF)),
+        Err(FdError::Contended) => {
+            return Err(leave(sched, IpcLeave::TableContended, IpcServed::Forward));
+        }
+        Err(_) => return Err(leave(sched, IpcLeave::TableRefused, IpcServed::Forward)),
+    }
+    let operation = |pin: RawOfdPin, object: RawIpcObject| IpcOperation {
+        kind: IpcOpKind::EpollWait,
+        pin,
+        object,
+        task: task_key(task),
+        mm: mm_key(task),
+        buf: IpcUserVa(argument_word(frame, 1)),
+        orig_x0: argument_word(frame, 0),
+        nr: SYS_EPOLL_PWAIT as u32,
+        ..IpcOperation::EMPTY
+    };
+    let (pin, desc) = match fda.pin(table, fd) {
+        Ok(found) => found,
+        Err(FdError::BadFd) => return Err(returned(frame, linux::EBADF)),
+        Err(FdError::Contended) => {
+            return Err(leave(sched, IpcLeave::PinContended, IpcServed::Forward));
+        }
+        // A pin on a reused record the fd did not name: the host drops it
+        // (possibly a final release EL1 cannot perform) and runs the call.
+        Err(FdError::PinRaced(raw)) => {
+            return Err(restart(
+                sched,
+                frame,
+                venue,
+                operation(raw, RawIpcObject::default()),
+            ));
+        }
+        Err(_) => return Err(leave(sched, IpcLeave::PinRefused, IpcServed::Forward)),
+    };
+    let Some(object) = epoll_of(desc.backing) else {
+        // Replaced since the snapshot by a description EL1 does not serve.
+        return Err(restart(
+            sched,
+            frame,
+            venue,
+            operation(pin.into_raw(), RawIpcObject::default()),
+        ));
+    };
+    let mut op = operation(pin.into_raw(), object.to_raw());
+    if let Wait::Until(deadline) = wait {
+        op.deadline = IpcCounterDeadline::at(deadline);
+    }
+    Ok((op, object))
+}
+
+/// A temporary mask this call armed is restored when it harvests again
+/// (readiness moved before its park) or leaves without a continuation.
+fn disarm<M: UserCopy>(user: &mut M, armed: &mut bool) {
+    if core::mem::take(armed) {
+        user.disarm_wait_sigmask();
+    }
+}
+
+/// How a refused copy-out's preparation was admitted to the operation arena.
+enum Admitted {
+    /// The `EpollWait` record the preparation retains (with the pin).
+    Operation(IpcOpToken),
+    /// Parked on the arena's slot release with the pin dropped: the thread
+    /// replays the call when a slot returns.
+    Parked(IpcServed),
+    /// A slot returned before the park: pin and harvest again now.
+    Rerun,
+}
+
+/// Admit a refused copy-out's preparation as its `EpollWait` record. A full
+/// arena is contention, "not now": never a forward or an errno. Nothing is
+/// retained yet (the items are queued again), so the pin is dropped and the
+/// thread parks on the arena's slot release (`admit_operation_wait`, the
+/// source every retirement publishes to) with a replay receipt that owns
+/// nothing; the scheduler re-runs the call once a slot returns. A mask this
+/// call armed is restored first: the replay is a fresh call, which arms its
+/// mask argument afresh. A resumed call's mask stays its continuation's: the
+/// native resume's signal checkpoint restores it once the receipt (which
+/// owns no adapter operation) is consumed.
+fn admit_output<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
+    venue: &IpcVenue<'_>,
+    user: &mut M,
+    op: IpcOperation,
+    armed: &mut bool,
+    interrupt: &mut dyn FnMut() -> bool,
+) -> Admitted {
+    use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitError, OperationToken};
+    use carrick_sched_core::refusal::Refusal;
+    let region = &venue.region;
+    let replay = OperationToken::metadata_request(region.operation_slot_generation().get())
+        .unwrap_or_else(invalid);
+    let (replay, key, observed) = {
+        let zone = sched.zone();
+        let slot = sched.slot();
+        let completion =
+            |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, E::Context>| {
+                crate::sched::object_wait::deliver_completion(zone, slot, owned)
+            };
+        match super::admit_operation_wait(region, zone, op, &completion).result {
+            Ok(token) => return Admitted::Operation(token),
+            // SAFETY: the enrollment's key and its observation (sampled
+            // before the failed arena probe) go straight to this lane's
+            // scheduler park below, which revalidates that exact epoch and
+            // either retains the receipt on the slot queue or returns it for
+            // an immediate rerun. No guard crosses the park.
+            Err(Refusal::Contended(ticket)) => unsafe {
+                ticket.park_and_rerun(replay, |replay, enrollment| {
+                    (replay, enrollment.key(), enrollment.observed())
+                })
+            },
+            Err(Refusal::Invariant(_) | Refusal::Guest(_)) => invalid(),
+        }
+    };
+    release_pin(sched, OfdPin::from_raw(op.pin), region);
+    disarm(user, armed);
+    // SAFETY: observed before the arena probe that found no free slot.
+    let snapshot = unsafe { ObjectStateSnapshot::before_object_probe(observed) };
+    match sched.park(
+        frame,
+        key,
+        snapshot,
+        replay,
+        None,
+        Some(&mut || user.interrupt_pending_wait() || interrupt()),
+    ) {
+        Ok(served) => Admitted::Parked(served),
+        Err((ObjectWaitError::Changed, _)) => Admitted::Rerun,
+        Err(_) => invalid(),
     }
 }
 
@@ -375,7 +523,11 @@ enum Output {
     /// Harvest again with this operation (its pin kept); `true` when the
     /// owner prepared the buffer, so the next copy must succeed.
     Rerun(IpcOperation, bool),
+    /// The call ended.
     Done(IpcServed),
+    /// The call's operation is retained (parked on the owner, or suspended
+    /// in the owner's service) and resumes through [`resume`].
+    Retained(IpcServed),
 }
 
 /// Settle a refused events copy-out through the native owner's exact-MM
@@ -385,27 +537,15 @@ enum Output {
 /// queued again, and the call is retained as its `EpollWait` operation
 /// while the owner prepares, so a suspended call resumes through
 /// [`resume`] and harvests afresh.
-#[allow(clippy::too_many_arguments)]
 fn prepare_output<E: IpcExecution, M: UserCopy>(
     sched: &mut E,
     frame: &mut E::Frame,
     region: &IpcRegion<'_>,
     user: &mut M,
-    op: IpcOperation,
+    token: IpcOpToken,
     request: CopyoutRequest,
     prepared: bool,
 ) -> Output {
-    let token = match region.begin_operation(op) {
-        Ok(token) => token,
-        Err(_) => {
-            release_pin(sched, OfdPin::from_raw(op.pin), region);
-            return Output::Done(leave(
-                sched,
-                IpcLeave::NoOperationRecord,
-                IpcServed::Forward,
-            ));
-        }
-    };
     let operation = to_sched_token(token).unwrap_or_else(|_| invalid());
     // One preparation may retry the hardware copy once. A refusal right
     // after the owner reported the buffer ready has no errno authority.
@@ -435,7 +575,7 @@ fn prepare_output<E: IpcExecution, M: UserCopy>(
                 invalid::<()>();
             }
             match park_result(sched.park_owner(frame, wait, operation)) {
-                Parked::Done(served) => Output::Done(served),
+                Parked::Done(served) => Output::Retained(served),
                 Parked::Retry(token) => rerun(sched, token, false),
                 Parked::Refused(_) => invalid(),
             }
@@ -444,7 +584,7 @@ fn prepare_output<E: IpcExecution, M: UserCopy>(
         // carrier-work owner; it resumes and harvests again.
         CopyoutPreparation::Busy(operation) => match user.yield_owned_operation(operation) {
             OwnedOperationYield::Ready(operation) => rerun(sched, ipc_token(operation), false),
-            OwnedOperationYield::Suspended => Output::Done(IpcServed::Idle),
+            OwnedOperationYield::Suspended => Output::Retained(IpcServed::Idle),
             OwnedOperationYield::Complete(result) => Output::Done(returned(frame, result)),
             OwnedOperationYield::Unrouted(_) => invalid(),
         },
@@ -454,7 +594,7 @@ fn prepare_output<E: IpcExecution, M: UserCopy>(
             invalid()
         }
         CopyoutPreparation::Complete(result) => Output::Done(returned(frame, result)),
-        CopyoutPreparation::Suspended => Output::Done(IpcServed::Idle),
+        CopyoutPreparation::Suspended => Output::Retained(IpcServed::Idle),
     }
 }
 
