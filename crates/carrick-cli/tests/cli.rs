@@ -12,13 +12,10 @@ fn command() -> Command {
     Command::cargo_bin("carrick").expect("carrick test binary")
 }
 
-// Each child selects this host layout using its own CARRICK_HOME and TMPDIR.
+// Every host keeps scratch under `<carrick_home>/scratch` (see
+// `container::registry_root`); each child sets its own CARRICK_HOME.
 fn scratch_root(home: &std::path::Path) -> std::path::PathBuf {
-    home.join(if cfg!(target_os = "macos") {
-        "scratch"
-    } else {
-        "carrick"
-    })
+    home.join("scratch")
 }
 
 #[test]
