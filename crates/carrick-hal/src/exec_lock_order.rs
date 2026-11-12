@@ -2,10 +2,18 @@
 //! the stopped-CPU lease, then the exec preparations (validate and release),
 //! then the root-release lease, then the zone bind, then the fork stock.
 //!
-//! Preparations and the fork stock are never held together. Each phase
-//! consumes the one before it, and the order borrows both owners from its
-//! first phase on, so the caller cannot reach either one except through its
-//! phase. In order, it reads:
+//! What the type enforces is **phase sequencing**: each phase consumes the
+//! one before it, the order borrows both owners from its first phase on, and
+//! a phase's borrow cannot escape its closure. So a caller cannot reach the
+//! preparations or the stock out of order *through this order*.
+//!
+//! It does **not** enforce lock exclusion for owners that are independently
+//! reachable: with `&'static` owners (for example a `static Mutex`), a guard
+//! taken inside one phase can still be returned through `R` and held while a
+//! later phase runs. Exclusion for the production locks is owed by the first
+//! production caller (#1093 S4c slice c), which must hand each phase a scoped,
+//! non-cloneable lock capability instead of a free reference. In order, it
+//! reads:
 //!
 //! ```
 //! # use carrick_hal::exec_lock_order::ExecCrossingOrder;
