@@ -974,6 +974,40 @@ pub fn take_successor_table_runs(stock: &mut Vec<RootGpa>, count: usize) -> Opti
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct StockRelease(u64);
 
+/// The reusable table pages and their [`StockRelease`]. Reads see the pages;
+/// adding pages goes through [`Extend`], which advances the release; taking
+/// pages goes through [`TableStock::taking`], which never does.
+#[derive(Debug, Default)]
+struct TableStock {
+    pages: Vec<RootGpa>,
+    returns: u64,
+}
+
+impl TableStock {
+    /// The pages, for removing some. Anything added here would bypass the
+    /// release; return pages with `extend`.
+    fn taking(&mut self) -> &mut Vec<RootGpa> {
+        &mut self.pages
+    }
+}
+
+impl core::ops::Deref for TableStock {
+    type Target = [RootGpa];
+    fn deref(&self) -> &[RootGpa] {
+        &self.pages
+    }
+}
+
+impl Extend<RootGpa> for TableStock {
+    fn extend<I: IntoIterator<Item = RootGpa>>(&mut self, pages: I) {
+        let before = self.pages.len();
+        self.pages.extend(pages);
+        if self.pages.len() != before {
+            self.returns = self.returns.saturating_add(1);
+        }
+    }
+}
+
 /// Table pages reserved from the fork stock for one exec successor build.
 /// They are out of the reusable stock until the build is committed to the
 /// successor or returned with [`ForkStock::return_successor_tables`].
@@ -1057,7 +1091,7 @@ pub struct ForkStock<T: ChildAddressTags, C = ()> {
     carrier: NonZeroU64,
     controls: Vec<ForkControlCapacity>,
     unused_control: Option<ForkControlCapacity>,
-    tables: Vec<RootGpa>,
+    tables: TableStock,
     lifecycles: Vec<ForkLifecycleLoan>,
     pending: Vec<Option<PendingForkLoan<T::Tag, C>>>,
     next_loan: NonZeroU64,
@@ -1086,7 +1120,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 .into_iter()
                 .collect(),
             unused_control: control.filter(|control| !control.is_exclusive()),
-            tables: Vec::new(),
+            tables: TableStock::default(),
             lifecycles: Vec::new(),
             pending: Vec::new(),
             next_loan: NonZeroU64::MIN,
@@ -1256,9 +1290,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 self.counters.descriptor_capacity_refusals.saturating_add(1);
             return Err(ForkStockServiceError::DescriptorTableCapacity);
         }
-        self.tables
-            .sort_unstable_by_key(|page| page.address().raw());
-        let pages = self.tables.split_off(self.tables.len() - count);
+        let stock = self.tables.taking();
+        stock.sort_unstable_by_key(|page| page.address().raw());
+        let pages = stock.split_off(stock.len() - count);
         for (charged, page) in pages.iter().enumerate() {
             if !ledger.grant(*page, mm) {
                 for page in pages.iter().take(charged) {
@@ -1878,7 +1912,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
     /// The current table-return revision; see [`StockRelease`].
     pub fn table_release(&self) -> StockRelease {
-        StockRelease(0)
+        StockRelease(self.tables.returns)
     }
 
     /// True once some table page has returned since `observed`.
@@ -1892,7 +1926,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         &mut self,
         count: usize,
     ) -> Result<SuccessorTables, ForkStockServiceError> {
-        let Some(pages) = take_successor_table_runs(&mut self.tables, count) else {
+        let Some(pages) = take_successor_table_runs(self.tables.taking(), count) else {
             self.counters.successor_table_refusals =
                 self.counters.successor_table_refusals.saturating_add(1);
             return Err(ForkStockServiceError::SuccessorTableCapacity);
@@ -1929,7 +1963,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         {
             return Err(ForkStockServiceError::InvalidRecord);
         }
-        self.tables = tables;
+        self.tables.extend(tables);
         self.lifecycles = lifecycles;
         Ok(())
     }
@@ -2054,9 +2088,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         if self.controls.is_empty() && self.unused_control.is_none() {
             return self.refuse_capacity(exchange, ForkCapacityResource::Control, execution.cpu);
         }
-        let Some((child_tables, parent_tables)) =
-            take_fork_table_stock(&mut self.tables, request.child_bytes, request.parent_bytes)
-        else {
+        let Some((child_tables, parent_tables)) = take_fork_table_stock(
+            self.tables.taking(),
+            request.child_bytes,
+            request.parent_bytes,
+        ) else {
             return self.refuse_capacity(exchange, ForkCapacityResource::Tables, execution.cpu);
         };
         let Some(next) = self.next_loan.checked_add(1) else {

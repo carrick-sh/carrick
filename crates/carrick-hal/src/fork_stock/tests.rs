@@ -2127,7 +2127,7 @@ fn empty_native_descriptor_demand_does_not_touch_unrelated_stock() {
         let owner = stock.child_owner(granted.request.child_mm).unwrap();
         // Returned spare pages need not be sorted. An empty demand has no
         // authority or work reason to visit/reorder this unrelated population.
-        stock.tables.reverse();
+        stock.tables.taking().reverse();
         let before = stock.table_stock().to_vec();
         let reservation = stock
             .reserve_native_descriptor_tables(&mut NoTableLedger, owner, child.context.root, 0)
