@@ -2566,3 +2566,23 @@ fn mounted_static_x86_files_crossings_match_native() {
 fn mounted_static_x86_files_crossings_in_a_fork_child_refuse_in_ring() {
     forked_child_crossings_refuse_in_ring("x86_b1_files.S");
 }
+
+#[test]
+fn mounted_static_x86_metadata_crossings_match_native() {
+    compare_root_crossings_with_native("x86_b1_metadata.S");
+}
+
+#[test]
+fn mounted_static_x86_metadata_crossings_in_a_fork_child_refuse_in_ring() {
+    forked_child_crossings_refuse_in_ring("x86_b1_metadata.S");
+}
+
+#[test]
+fn mounted_static_x86_xattr_crossings_match_native() {
+    compare_root_crossings_with_native("x86_b1_xattr.S");
+}
+
+#[test]
+fn mounted_static_x86_xattr_crossings_in_a_fork_child_refuse_in_ring() {
+    forked_child_crossings_refuse_in_ring("x86_b1_xattr.S");
+}
