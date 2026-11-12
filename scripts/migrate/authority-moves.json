@@ -162,6 +162,10 @@
     {
       "owner": "carrick_vfs::fs_backend::host::note_scratch_root_in_use::at_exit",
       "issue": 1852
+    },
+    {
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "issue": 2148
     }
   ],
   "terminal_custody": []

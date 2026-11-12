@@ -9544,6 +9544,118 @@
     },
     {
       "family": "host_backing",
+      "operation": "std::fs::OpenOptions::new",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::new",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::new",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::new",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::new",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::new",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::new",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::new",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::open",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::open",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::open",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::open",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::open",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::open",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::open",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::OpenOptions::open",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_scratch_root",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
       "operation": "std::fs::OpenOptions::open",
       "owner": "carrick_vfs::fs_resolve_cache::BindCacheCohorts::admit",
       "lane": "freebsd_cli",
