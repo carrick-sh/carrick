@@ -1415,9 +1415,47 @@ mod tests {
             &self,
             authority: &CallerAccess,
             ordinal: u64,
-            mut args: [u64; 6],
+            args: [u64; 6],
             inputs: &[(usize, &[u8])],
         ) -> i64 {
+            match self.child_served(authority, ordinal, args, inputs) {
+                Ok(ChildServed { record, output, .. }) => {
+                    carrick_personality_linux::native_host_file::complete(
+                        &record,
+                        output,
+                        &mut |_, _| panic!("a mutation has no user output"),
+                    )
+                    .raw()
+                }
+                Err(result) => result,
+            }
+        }
+
+        /// A child's chdir-family call, completed as its ring owner does: the
+        /// served lookup's directory spelling, or the call's result.
+        fn child_chdir(
+            &self,
+            authority: &CallerAccess,
+            ordinal: u64,
+            args: [u64; 6],
+            inputs: &[(usize, &[u8])],
+        ) -> Result<String, i64> {
+            let served = self.child_served(authority, ordinal, args, inputs)?;
+            assert!(served.chdir, "a chdir-family call stages a chdir lookup");
+            carrick_personality_linux::native_host_file::chdir_target(&served.record)
+                .map(|target| String::from_utf8(target.as_bytes().to_vec()).unwrap())
+                .map_err(|result| result.raw())
+        }
+
+        /// Decode, stage and serve one call through the production venue,
+        /// or the result the ring answers without crossing.
+        fn child_served(
+            &self,
+            authority: &CallerAccess,
+            ordinal: u64,
+            mut args: [u64; 6],
+            inputs: &[(usize, &[u8])],
+        ) -> Result<ChildServed, i64> {
             use carrick_personality_linux::native_host_file::{
                 HostFileCall, HostFileStage, NativeNamespace,
             };
@@ -1430,7 +1468,7 @@ mod tests {
             }
             let Some(call) = HostFileCall::decode(carrick_abi::CanonicalNr::new(ordinal), &args)
             else {
-                return -38;
+                return Err(-38);
             };
             let tables = carrick_el1_linux::ipc::MapTables(map());
             let venue = carrick_el1_linux::ipc::IpcVenue {
@@ -1455,6 +1493,7 @@ mod tests {
                     record,
                     resolves_path,
                     output,
+                    chdir,
                     ..
                 }) => {
                     let mut record = record.into_vec();
@@ -1467,21 +1506,27 @@ mod tests {
                     )
                     .unwrap();
                     match self.dispatcher.serve_native_host_file(&mut record) {
-                        Ok(_) => carrick_personality_linux::native_host_file::complete(
-                            &record,
+                        Ok(_) => Ok(ChildServed {
+                            record,
                             output,
-                            &mut |_, _| panic!("a mutation has no user output"),
-                        )
-                        .raw(),
-                        Err(NativeHostFileRefusal) => -38,
+                            chdir,
+                        }),
+                        Err(NativeHostFileRefusal) => Err(-38),
                     }
                 }
-                Some(HostFileStage::Returned(result)) => result.raw(),
-                Some(HostFileStage::Fault { .. }) => -14,
-                Some(HostFileStage::InRing) | None => -38,
+                Some(HostFileStage::Returned(result)) => Err(result.raw()),
+                Some(HostFileStage::Fault { .. }) => Err(-14),
+                Some(HostFileStage::InRing) | None => Err(-38),
                 other => panic!("unexpected mutation staging: {other:?}"),
             }
         }
+    }
+
+    /// A child's served venue record, before its ring owner completes it.
+    struct ChildServed {
+        record: Vec<u8>,
+        output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+        chdir: bool,
     }
 
     #[test]
@@ -1528,6 +1573,79 @@ mod tests {
                     .layered_metadata("/tmp/child-dir")
                     .is_ok(),
                 "the parent sees the child's namespace mutation"
+            );
+        }
+    }
+
+    /// #2206: `mkdir -p a/b` in a forked child. coreutils creates `a`, opens
+    /// it `O_DIRECTORY|O_NOFOLLOW`, then `fchdir`s into it to create `b`. A
+    /// counted ENOSYS from that `fchdir` failed every `mkdir -p` with
+    /// "cannot create directory 'a': Function not implemented".
+    #[test]
+    fn native_child_mkdir_p_fchdirs_into_each_created_directory() {
+        const DIRECTORY: u64 = carrick_abi::LINUX_O_RDONLY
+            | carrick_abi::LINUX_O_NONBLOCK
+            | carrick_abi::LINUX_O_DIRECTORY
+            | carrick_abi::LINUX_O_NOFOLLOW;
+        const FCHDIR: u64 = 50;
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = mutation_child(upper);
+            let tmp = authority_of(&fixture.dispatcher).in_cwd("/tmp");
+            let mkdir = |authority: &CallerAccess, path: &[u8]| {
+                fixture.child_call(
+                    authority,
+                    34,
+                    [FDCWD as u64, 0, 0o777, 0, 0, 0],
+                    &[(1, path)],
+                )
+            };
+            let fchdir = |authority: &CallerAccess, fd: i64| {
+                fixture.child_chdir(authority, FCHDIR, [fd as u64, 0, 0, 0, 0, 0], &[])
+            };
+            assert_eq!(mkdir(&tmp, b"a"), 0, "{upper:?}");
+            let a = fixture.venue_open(&tmp, b"a", DIRECTORY, 0);
+            assert!(a >= 0, "{upper:?}: open a: {a}");
+            assert_eq!(fchdir(&tmp, a), Ok("/tmp/a".to_owned()), "{upper:?}");
+            // The ring stores the spelling as the child's cwd; `b` lands
+            // inside `a`.
+            let inside = tmp.in_cwd("/tmp/a");
+            assert_eq!(mkdir(&inside, b"b"), 0, "{upper:?}");
+            assert!(
+                fixture
+                    .dispatcher
+                    .fs_view()
+                    .layered_metadata("/tmp/a/b")
+                    .is_ok(),
+                "{upper:?}: the parent sees /tmp/a/b"
+            );
+            // An O_PATH directory descriptor is a valid fchdir target.
+            let path_fd = fixture.venue_open(
+                &tmp,
+                b"/tmp/a/b",
+                carrick_abi::LINUX_O_PATH | carrick_abi::LINUX_O_DIRECTORY,
+                0,
+            );
+            assert!(path_fd >= 0, "{upper:?}: O_PATH open: {path_fd}");
+            assert_eq!(fchdir(&tmp, path_fd), Ok("/tmp/a/b".to_owned()));
+            // A regular file and the implicit stdio streams are not
+            // directories; a closed number is EBADF.
+            let file = fixture.venue_open(&tmp, b"plain", CREATE, 0o644);
+            assert!(file >= 0, "{upper:?}: create plain: {file}");
+            assert_eq!(
+                fchdir(&tmp, file),
+                Err(carrick_abi::LINUX_ENOTDIR.guest_retval())
+            );
+            assert_eq!(
+                fchdir(&tmp, 1),
+                Err(carrick_abi::LINUX_ENOTDIR.guest_retval())
+            );
+            assert_eq!(
+                fchdir(&tmp, 999),
+                Err(carrick_abi::LINUX_EBADF.guest_retval())
+            );
+            assert_eq!(
+                fchdir(&tmp, -1),
+                Err(carrick_abi::LINUX_EBADF.guest_retval())
             );
         }
     }
