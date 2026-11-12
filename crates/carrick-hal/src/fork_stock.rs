@@ -879,8 +879,58 @@ pub fn take_fork_table_stock(
 /// fork's contiguous arenas: the shortest run that holds them all, else the
 /// longest runs first. Pages are returned in address order within each run.
 pub fn take_successor_table_runs(stock: &mut Vec<RootGpa>, count: usize) -> Option<Vec<RootGpa>> {
-    let _ = (stock, count);
-    None
+    if count == 0 || stock.len() < count {
+        return None;
+    }
+    let mut available = stock.clone();
+    available.sort_unstable_by_key(|page| page.address().raw());
+    if available.windows(2).any(|pair| pair[0] == pair[1]) {
+        return None;
+    }
+    // (first index, length) of each maximal contiguous run.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (index, pair) in core::iter::once(None)
+        .chain(available.windows(2).map(Some))
+        .enumerate()
+    {
+        let joins = pair.is_some_and(|pair| {
+            pair[0].address().raw().checked_add(TABLE_PAGE_BYTES) == Some(pair[1].address().raw())
+        });
+        match runs.last_mut() {
+            Some(run) if joins => run.1 += 1,
+            _ => runs.push((index, 1)),
+        }
+    }
+    let chosen: Vec<(usize, usize)> = if let Some(&(start, _)) = runs
+        .iter()
+        .filter(|(_, len)| *len >= count)
+        .min_by_key(|(start, len)| (*len, *start))
+    {
+        vec![(start, count)]
+    } else {
+        runs.sort_by_key(|&(start, len)| (core::cmp::Reverse(len), start));
+        let mut remaining = count;
+        let mut chosen = Vec::new();
+        for (start, len) in runs {
+            if remaining == 0 {
+                break;
+            }
+            let take = len.min(remaining);
+            chosen.push((start, take));
+            remaining -= take;
+        }
+        chosen
+    };
+    let mut taken = Vec::with_capacity(count);
+    let mut keep = vec![true; available.len()];
+    for (start, len) in chosen {
+        taken.extend_from_slice(&available[start..start + len]);
+        keep[start..start + len].fill(false);
+    }
+    let mut kept = keep.into_iter();
+    available.retain(|_| kept.next().unwrap_or(true));
+    *stock = available;
+    Some(taken)
 }
 
 /// Table pages reserved from the fork stock for one exec successor build.
@@ -1791,13 +1841,17 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         &mut self,
         count: usize,
     ) -> Result<SuccessorTables, ForkStockServiceError> {
-        let _ = count;
-        Err(ForkStockServiceError::SuccessorTableCapacity)
+        let Some(pages) = take_successor_table_runs(&mut self.tables, count) else {
+            self.counters.successor_table_refusals =
+                self.counters.successor_table_refusals.saturating_add(1);
+            return Err(ForkStockServiceError::SuccessorTableCapacity);
+        };
+        Ok(SuccessorTables { pages })
     }
 
     /// Return an unused successor reservation to the reusable stock.
     pub fn return_successor_tables(&mut self, tables: SuccessorTables) {
-        let _ = tables;
+        self.tables.extend(tables.pages);
     }
 
     /// Seed the bounded stock before any guest can request it. Pages and
