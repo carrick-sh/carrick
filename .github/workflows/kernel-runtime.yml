@@ -129,6 +129,10 @@ jobs:
       group: hvf-kernel-${{ github.event_name }}
       cancel-in-progress: false
     timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+      issues: write
     steps:
       # Disk admission and the checkout build both need the root-owned lease
       # supervisor. There is deliberately no unleased fallback: measuring free
@@ -334,6 +338,70 @@ jobs:
             RUST_TEST_THREADS=1 just test-embed
             RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes
           ' signed-fixtures "${bundles[0]}"
+
+      - name: Goal scoreboard (nightly)
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          test -n "${CARRICK_XTASK_BIN:-}"
+          test -x "$CARRICK_XTASK_BIN"
+          test -x target/release/carrick
+          rm -rf target/scoreboard
+          mkdir -p target/scoreboard
+          export CARRICK_RUN_ID="scoreboard-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          just lease gate "$CARRICK_XTASK_BIN" scoreboard --carrick target/release/carrick \
+            --sha "$GITHUB_SHA" \
+            --out target/scoreboard/receipt.json \
+            | tee target/scoreboard/table.txt
+          test -s target/scoreboard/receipt.json
+          test -s target/scoreboard/table.txt
+
+      - name: Upload scoreboard receipt
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoreboard-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/scoreboard/
+          if-no-files-found: warn
+
+      - name: "Post scoreboard to #231"
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ ! -s target/scoreboard/receipt.json ]; then
+            echo "scoreboard receipt missing at target/scoreboard/receipt.json; skipping #231 comment"
+            exit 0
+          fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            printf '### Goal scoreboard (nightly)\n\n'
+            printf 'Commit: %s ([workflow run](%s))\n\n' "$GITHUB_SHA" "$run_url"
+            cat <<'EOF'
+          ```text
+          EOF
+            if [ -s target/scoreboard/table.txt ]; then
+              cat target/scoreboard/table.txt
+            else
+              python3 - <<'PYTHON'
+          import json
+          with open("target/scoreboard/receipt.json", encoding="utf-8") as f:
+              r = json.load(f)
+          print(f"main {r['main_sha'][:10]}  sha256={r['binary_sha256'][:16]}")
+          for row in r.get("rows", []):
+              out = row.get("first_stdout_line", "")[:60]
+              print(f"{row['name']:<16} exit={row['exit_code']:<4} {out}")
+          PYTHON
+            fi
+            cat <<'EOF'
+          ```
+          EOF
+          } > target/scoreboard/comment.md
+          gh issue comment 231 --repo "$GITHUB_REPOSITORY" --body-file target/scoreboard/comment.md
 
       - name: Upload signed failure evidence
         if: ${{ failure() || steps.signed-receipt.outputs.failed == 'true' }}
