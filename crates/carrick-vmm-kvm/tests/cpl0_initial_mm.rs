@@ -2199,6 +2199,39 @@ fn production_initial_stack_grows_below_the_built_pages() {
     );
 }
 
+/// #2217: a brk shrink retires its resident pages as an owed return, and
+/// nothing on x86 settles it, so regrowing the break over those pages is
+/// refused `Busy`, forwarded and answered ENOSYS. glibc stores that errno as
+/// its break and the next allocation faults: CPython's compiler exits 139.
+/// The settlement owner is #1369's slice 3 (#1482).
+#[test]
+#[ignore = "#1482: x86 has no owner that settles a brk shrink's owed return"]
+fn production_brk_regrows_over_its_released_pages() {
+    let elf = native_exit_fixture("native_brk_regrow.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native Linux oracle: {:?}",
+        native.status
+    );
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_LOADED)
+        .expect("brk regrow run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_brk_regrow.S): {:?}",
+        outcome.run
+    );
+}
+
 #[test]
 fn block_then_user_page_fault_terminates_with_sigsegv_in_ring() {
     let elf = block_then_fault_elf();
