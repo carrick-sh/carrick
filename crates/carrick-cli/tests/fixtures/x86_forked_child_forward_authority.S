@@ -8,8 +8,10 @@
  *                         and the run exits 7 (the child's exit is not the
  *                         run's exit).
  *   CHILD_STDIN_READ      child read(0); a host read needs a host task
- *                         context the child does not have, so the run is
- *                         refused.
+ *                         context the child does not have, so the ring
+ *                         answers it with a counted ENOSYS (#2157). The
+ *                         child exits with the negated result, the parent
+ *                         reaps status 38<<8 and the run exits 7.
  *   CHILD_POLL_WAIT       child ppoll({1, POLLIN}, 50 ms): stdout never
  *                         becomes readable, so the host readiness crossing
  *                         must wait, and a wait needs the child's own
@@ -80,6 +82,8 @@ _start:
     js failure
 #ifdef CHILD_EXIT_STATUS
     cmpl $0x300, status(%rip)
+#elif defined(CHILD_STDIN_READ)
+    cmpl $0x2600, status(%rip)
 #else
     cmpl $0, status(%rip)
 #endif
@@ -98,8 +102,9 @@ child:
     mov $1, %edx
     xor %eax, %eax
     syscall
-    test %rax, %rax
-    js child_failure
+    neg %rax
+    mov %eax, %edi
+    jmp exit
 #endif
 #ifdef CHILD_POLL_WAIT
     lea pollfd(%rip), %rdi

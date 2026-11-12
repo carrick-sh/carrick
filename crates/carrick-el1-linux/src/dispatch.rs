@@ -768,9 +768,10 @@ pub fn capture_native_service_exit(
 }
 
 /// Where a native-owned syscall goes when its owner claimed none of it.
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+/// Linux policy shared by every ISA: ARM's owned native entry and x86 CPL0's
+/// Forward arm both ask [`unclaimed_native_syscall`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UnclaimedNativeSyscall {
+pub enum UnclaimedNativeSyscall {
     /// A root (host-loaded) or unadmitted task keeps its existing route: an
     /// unclaimed exec leaves for its host task, any other call is captured
     /// as a crossing for the carrier.
@@ -785,9 +786,9 @@ enum UnclaimedNativeSyscall {
 /// The one place that decides an unclaimed native syscall's route, so a
 /// future unclaimed ordinal is covered too. Both of an owned native entry's
 /// unclaimed exits ask it: an unclaimed exec ([`arm_native_service_exit`])
-/// and a syscall no ring stage served ([`native_unstaged_exit`]).
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn unclaimed_native_syscall(
+/// and a syscall no ring stage served ([`native_unstaged_exit`]). x86 CPL0
+/// asks it for a call its Forward arm would send to a host task.
+pub fn unclaimed_native_syscall(
     owner: super::native_process_runtime::NativeThreadGroupOwner,
 ) -> UnclaimedNativeSyscall {
     use super::native_process_runtime::NativeThreadGroupOwner;
@@ -799,12 +800,15 @@ fn unclaimed_native_syscall(
     }
 }
 
-/// Answer an unclaimed native syscall with a counted ENOSYS in ring.
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
-    let ordinal = carrick_guest_arch::NativeOrdinal::new(frame.x[8]);
-    // Only CountedEnosys reaches this boundary: its admitted owner is a
-    // fork child, including an exec successor with the same lineage.
+/// Count an unclaimed native syscall's in-ring refusal and return the
+/// ENOSYS the caller installs in its ISA's return register. Only
+/// [`UnclaimedNativeSyscall::CountedEnosys`] reaches this boundary: its
+/// admitted owner is a fork child, including an exec successor with the
+/// same lineage.
+pub fn count_unclaimed_native_refusal(
+    ordinal: carrick_guest_arch::NativeOrdinal,
+    counters: &Counters,
+) -> carrick_guest_arch::NativeReturnWord {
     counters.record_refusal(
         ordinal,
         carrick_core_abi::service::ServiceOrigin::Descendant,
@@ -813,7 +817,17 @@ fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -
     if let Some(served) = counters.served.get(ordinal.raw() as usize) {
         served.fetch_add(1, Ordering::Relaxed);
     }
-    frame.x[0] = carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64;
+    carrick_guest_arch::NativeReturnWord(carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64)
+}
+
+/// Answer an unclaimed native syscall with a counted ENOSYS in ring.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
+    frame.x[0] = count_unclaimed_native_refusal(
+        carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+        counters,
+    )
+    .0;
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         arm_signal_user_return(frame)
