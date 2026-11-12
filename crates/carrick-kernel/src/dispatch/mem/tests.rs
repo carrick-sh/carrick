@@ -92,6 +92,8 @@ pub struct CountingMmapMemory {
     pub(crate) owner_protect_log: RefCell<Vec<(u64, usize, u64)>>,
     /// Every backend retirement (`unmap_range`), in order.
     pub(crate) unmap_log: RefCell<Vec<(u64, usize)>>,
+    /// Every range handed back to the EL1 root (`return_to_root`), in order.
+    pub(crate) root_return_log: RefCell<Vec<(u64, usize)>>,
 }
 
 #[test]
@@ -158,6 +160,7 @@ impl CountingMmapMemory {
             protect_log: RefCell::new(Vec::new()),
             owner_protect_log: RefCell::new(Vec::new()),
             unmap_log: RefCell::new(Vec::new()),
+            root_return_log: RefCell::new(Vec::new()),
         }
     }
 
@@ -404,6 +407,12 @@ impl GuestMemory for CountingMmapMemory {
         }
         self.unmap_log.borrow_mut().push((address, len));
         Ok(())
+    }
+
+    fn return_to_root(&mut self, address: u64, len: usize) {
+        self.root_return_log.borrow_mut().push((address, len));
+        self.set_unmapped(address, len, true);
+        self.set_unmapped(address, len, false);
     }
 
     fn supports_concurrent_exec_protection(&self) -> bool {
