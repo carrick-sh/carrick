@@ -609,6 +609,20 @@ struct TestSourceScan {
     /// Nesting depth of inline `mod x { … }` blocks: rustc resolves a nested
     /// `#[path]` against a subdirectory, so only depth 0 is resolvable here.
     inline_depth: usize,
+    /// Inline `mod x { … }` names around the item being visited.
+    module: Vec<String>,
+    /// Module-relative path (`a::b::fn`) of each attributed test in the file.
+    test_paths: BTreeSet<String>,
+    /// Out-of-line `mod x;` declarations in the file, for following into the
+    /// files they name.
+    mod_decls: Vec<ModDecl>,
+}
+
+/// A `mod name;` declaration, with the inline modules it sits in.
+struct ModDecl {
+    inline: Vec<String>,
+    name: String,
+    path: Option<String>,
 }
 
 impl TestSourceScan {
@@ -717,6 +731,9 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         if item.attrs.iter().any(|a| meta_is_test(&a.meta)) {
             self.tests.insert(item.sig.ident.to_string());
+            let mut path = self.module.clone();
+            path.push(item.sig.ident.to_string());
+            self.test_paths.insert(path.join("::"));
         }
         syn::visit::visit_item_fn(self, item);
     }
@@ -729,10 +746,27 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
         }
         if let Some((_, items)) = &item.content {
             self.inline_depth += 1;
+            self.module.push(item.ident.to_string());
             for nested in items {
                 self.visit_item(nested);
             }
+            self.module.pop();
             self.inline_depth -= 1;
+        } else {
+            self.mod_decls.push(ModDecl {
+                inline: self.module.clone(),
+                name: item.ident.to_string(),
+                path: item.attrs.iter().find_map(|a| match &a.meta {
+                    syn::Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(lit),
+                            ..
+                        }) => Some(lit.value()),
+                        _ => None,
+                    },
+                    _ => None,
+                }),
+            });
         }
     }
 
@@ -824,25 +858,211 @@ pub struct CrateTestInventory {
     pub unresolved: Option<String>,
 }
 
-/// The test binary a source file's tests run in: `tests/<x>.rs` and
-/// `tests/<x>/…` are binary `<x>`, `src/bin/<x>…` is `<x>`, anything else
-/// belongs to the package's lib/main binary.
-fn bin_of_source(crate_dir: &Path, file: &Path, package_bin: &str) -> String {
-    let relative = file.strip_prefix(crate_dir).unwrap_or(file);
-    let parts: Vec<_> = relative
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .collect();
-    let stem = |name: &str| name.strip_suffix(".rs").unwrap_or(name).to_string();
-    match parts.as_slice() {
-        ["tests", name, ..] | ["src", "bin", name, ..] => stem(name),
-        _ => package_bin.to_string(),
+/// One cargo target of a crate: its name and the root source file whose `mod`
+/// tree is the binary's tests.
+struct Target {
+    name: String,
+    root: PathBuf,
+}
+
+/// Targets of `manifest`, declared or auto-discovered. A file reached by
+/// `mod` from a root belongs to that root's target, whatever directory it
+/// lives in; the directory names a target only for an auto-discovered
+/// `tests/<x>/main.rs` or `src/bin/<x>/main.rs`.
+fn crate_targets(
+    crate_dir: &Path,
+    manifest: &toml::Value,
+    package_bin: &str,
+) -> Result<Vec<Target>, ReceiptError> {
+    let mut targets = Vec::new();
+    let add = |name: &str, relative: &Path, targets: &mut Vec<Target>| {
+        targets.push(Target {
+            name: name.to_string(),
+            root: crate_dir.join(relative),
+        });
+    };
+    let package_name = manifest
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(toml::Value::as_str);
+    let flag = |key: &str| {
+        manifest
+            .get("package")
+            .and_then(|p| p.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    };
+    let table_path = |target: &toml::Value| {
+        target
+            .get("path")
+            .and_then(toml::Value::as_str)
+            .map(PathBuf::from)
+    };
+    if regular_path(crate_dir, Path::new("src/lib.rs"), false)?
+        || manifest.get("lib").is_some_and(|l| table_path(l).is_some())
+    {
+        let path = manifest
+            .get("lib")
+            .and_then(table_path)
+            .unwrap_or_else(|| PathBuf::from("src/lib.rs"));
+        add(package_bin, &path, &mut targets);
     }
+    for (kind, auto_dir) in [("test", "tests"), ("bin", "src/bin")] {
+        for target in manifest
+            .get(kind)
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(name) = target.get("name").and_then(toml::Value::as_str) else {
+                continue;
+            };
+            let path = match table_path(target) {
+                Some(path) => path,
+                None if kind == "bin" && Some(name) == package_name => "src/main.rs".into(),
+                None => {
+                    let flat = PathBuf::from(format!("{auto_dir}/{name}.rs"));
+                    if regular_path(crate_dir, &flat, false)? {
+                        flat
+                    } else {
+                        PathBuf::from(format!("{auto_dir}/{name}/main.rs"))
+                    }
+                }
+            };
+            add(name, &path, &mut targets);
+        }
+    }
+    let main = PathBuf::from("src/main.rs");
+    if flag("autobins") && regular_path(crate_dir, &main, false)? {
+        let root = crate_dir.join(&main);
+        if !targets.iter().any(|t| t.root == root) {
+            add(package_bin, &main, &mut targets);
+        }
+    }
+    for (auto_dir, enabled) in [("tests", flag("autotests")), ("src/bin", flag("autobins"))] {
+        if !enabled || !regular_path(crate_dir, Path::new(auto_dir), true)? {
+            continue;
+        }
+        let dir = crate_dir.join(auto_dir);
+        for entry in std::fs::read_dir(&dir).map_err(|e| source_io(&dir, e))? {
+            let entry = entry.map_err(|e| source_io(&dir, e))?;
+            let path = entry.path();
+            let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let metadata = std::fs::symlink_metadata(&path).map_err(|e| source_io(&path, e))?;
+            let (name, relative) = if metadata.is_file() {
+                match file_name.strip_suffix(".rs") {
+                    Some(stem) => (stem.to_string(), PathBuf::from(auto_dir).join(&file_name)),
+                    None => continue,
+                }
+            } else if metadata.is_dir() && regular_path(&path, Path::new("main.rs"), false)? {
+                (
+                    file_name.clone(),
+                    PathBuf::from(auto_dir).join(&file_name).join("main.rs"),
+                )
+            } else {
+                continue;
+            };
+            if !targets.iter().any(|t| t.root == crate_dir.join(&relative)) {
+                add(&name, &relative, &mut targets);
+            }
+        }
+    }
+    Ok(targets)
+}
+
+/// Attribute the tests of `file` and of every file it reaches by `mod` to
+/// `bin`, with their module paths. `mod_rs` is whether `file` locates child
+/// module files beside itself (a crate root, `mod.rs`, a `#[path]` target)
+/// rather than under a directory named for it.
+#[allow(clippy::too_many_arguments)]
+fn attribute_module_file(
+    file: &Path,
+    prefix: &[String],
+    mod_rs: bool,
+    scans: &BTreeMap<PathBuf, TestSourceScan>,
+    bin: &str,
+    lane: &str,
+    inventory: &mut CrateTestInventory,
+    stack: &mut Vec<PathBuf>,
+) {
+    let Ok(canonical) = file.canonicalize() else {
+        return;
+    };
+    let Some(scan) = scans.get(&canonical) else {
+        inventory
+            .unresolved
+            .get_or_insert_with(|| format!("module file {} was not scanned", file.display()));
+        return;
+    };
+    if stack.contains(&canonical) {
+        return;
+    }
+    stack.push(canonical.clone());
+    for relative in &scan.test_paths {
+        let mut path = prefix.to_vec();
+        path.push(relative.clone());
+        inventory
+            .tests
+            .insert((bin.to_string(), path.join("::")), lane.to_string());
+    }
+    let parent = canonical.parent().unwrap_or(Path::new(""));
+    let child_dir = if mod_rs {
+        parent.to_path_buf()
+    } else {
+        parent.join(canonical.file_stem().unwrap_or_default())
+    };
+    for decl in &scan.mod_decls {
+        let mut module = prefix.to_vec();
+        module.extend(decl.inline.iter().cloned());
+        module.push(decl.name.clone());
+        let candidates: Vec<(PathBuf, bool)> = match &decl.path {
+            Some(_) if !decl.inline.is_empty() => Vec::new(),
+            Some(path) => vec![(parent.join(path), true)],
+            None => {
+                let dir = decl
+                    .inline
+                    .iter()
+                    .fold(child_dir.clone(), |dir, name| dir.join(name));
+                vec![
+                    (dir.join(format!("{}.rs", decl.name)), false),
+                    (dir.join(&decl.name).join("mod.rs"), true),
+                ]
+            }
+        };
+        let found = candidates.into_iter().find(|(path, _)| {
+            std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+        });
+        match found {
+            Some((path, child_mod_rs)) => attribute_module_file(
+                &path,
+                &module,
+                child_mod_rs,
+                scans,
+                bin,
+                lane,
+                inventory,
+                stack,
+            ),
+            None => {
+                inventory.unresolved.get_or_insert_with(|| {
+                    format!(
+                        "module `{}` in {} has no file",
+                        module.join("::"),
+                        file.display()
+                    )
+                });
+            }
+        }
+    }
+    stack.pop();
 }
 
 /// Every attributed test of every owning crate in `tree_root`, found with the
 /// same source scanner as `tree_has_test` and the lane metadata as
-/// `binary_runs_in_receipt_lane`.
+/// `binary_runs_in_receipt_lane`. A test is keyed by the cargo target whose
+/// `mod` tree contains it and its module path inside that target.
 pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, ReceiptError> {
     use syn::visit::Visit;
     let mut out = Vec::new();
@@ -866,18 +1086,20 @@ pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, 
         };
         let mut files = Vec::new();
         collect_rs_files(&crate_dir, &mut files)?;
-        let mut scan = TestSourceScan {
-            scanned: files.iter().filter_map(|f| f.canonicalize().ok()).collect(),
-            crate_root: crate_dir.clone(),
-            ..Default::default()
-        };
+        let scanned: BTreeSet<PathBuf> =
+            files.iter().filter_map(|f| f.canonicalize().ok()).collect();
+        let mut scans = BTreeMap::new();
         for file in files {
             let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
             let syntax = syn::parse_file(&source).map_err(|e| {
                 ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
             })?;
-            scan.file_dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
-            scan.tests.clear();
+            let mut scan = TestSourceScan {
+                scanned: scanned.clone(),
+                crate_root: crate_dir.clone(),
+                file_dir: file.parent().map(Path::to_path_buf).unwrap_or_default(),
+                ..Default::default()
+            };
             scan.visit_file(&syntax);
             // Unlike `tree_has_test`, an inventory has no proof of absence to
             // protect: a generator can only hide tests, so keep scanning and
@@ -888,11 +1110,22 @@ pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, 
                     format!("{reason} in {}", relative.display())
                 });
             }
-            let bin = bin_of_source(&crate_dir, &file, &package_bin);
-            let lane = declared_lane(&manifest, &bin).to_string();
-            for name in std::mem::take(&mut scan.tests) {
-                inventory.tests.insert((bin.clone(), name), lane.clone());
+            if let Ok(canonical) = file.canonicalize() {
+                scans.insert(canonical, scan);
             }
+        }
+        for target in crate_targets(&crate_dir, &manifest, &package_bin)? {
+            let lane = declared_lane(&manifest, &target.name).to_string();
+            attribute_module_file(
+                &target.root,
+                &[],
+                true,
+                &scans,
+                &target.name,
+                &lane,
+                &mut inventory,
+                &mut Vec::new(),
+            );
         }
         out.push(inventory);
     }

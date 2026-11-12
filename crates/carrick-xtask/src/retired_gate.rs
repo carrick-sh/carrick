@@ -6,8 +6,11 @@
 //! and lane metadata over the merge base and the head instead, so the PR that
 //! drops the test fails its own CI and is told which entry to add.
 //!
-//! Presence is by `(test binary, fn name)`, like the receipt gate's source
-//! check: a module path change without a fn rename is not seen.
+//! Presence is by `(test binary, module path::fn name)`, the identity a
+//! receipt records and `[[retired]]` declares. The binary is the cargo target
+//! whose `mod` tree holds the test, not a directory name. A test moved to
+//! another module of its binary therefore reads as dropped, as the receipt
+//! gate reads it.
 
 use crate::ci_receipt::{
     CrateTestInventory, RETIRED_TESTS_PATH, ReceiptError, load_retired_tests, tree_test_inventory,
@@ -179,8 +182,7 @@ pub fn run(root: &Path, args: &RetiredTestsArgs) -> Result<(), ReceiptError> {
         .iter()
         .filter_map(|entry| {
             let (bin, path) = entry.test.split_once("::")?;
-            let name = path.rsplit("::").next()?;
-            Some((bin.to_string(), name.to_string()))
+            Some((bin.to_string(), path.to_string()))
         })
         .collect();
     let mut warnings = Vec::new();
