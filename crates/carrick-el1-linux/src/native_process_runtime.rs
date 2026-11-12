@@ -7454,10 +7454,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .resources()
                 .mm
                 .clone();
-            if self
+            let cleared = self
                 .service
                 .copy_signal_bytes(&mm, UserVa::new(clear_child_tid), &0_u32.to_ne_bytes())
-                .is_ok()
+                .is_ok();
+            if cleared
                 && let Some(key) = carrick_personality_linux::sched::MmFutexKey::shared_private(
                     UserVa::new(clear_child_tid),
                 )
@@ -7489,6 +7490,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 );
                 drop(guard);
                 self.service.wake_effects(effects);
+            }
+            if cleared {
                 self.control.set_clear_child_tid(0);
             }
         }
