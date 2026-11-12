@@ -384,6 +384,38 @@ fn native_exit_fixture(name: &str) -> Vec<u8> {
     native_exit_fixture_with_flags(name, &[])
 }
 
+/// #2142: root exec must replace the production CPL0 image, not return ENOSYS.
+#[test]
+fn production_root_exec_replaces_image_and_runs_static_successor() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    let successor_elf = native_exit_fixture("native_root_exec_successor.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &successor_elf, 0o700);
+    let define = format!("-DEXEC_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_root_exec.S", &[&define]);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("root ELF");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        128,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .map_err(|failure| failure.error)
+    .expect("production CPL0 root exec");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (0, b"root-exec-ok\n".as_slice()),
+        "root exec must run the successor; 38 is ENOSYS"
+    );
+    assert!(outcome.run.stderr.is_empty());
+}
+
 fn native_exit_fixture_with_flags(name: &str, flags: &[&str]) -> Vec<u8> {
     kvm_pool_fixture::assemble_fixture(name, flags)
 }
