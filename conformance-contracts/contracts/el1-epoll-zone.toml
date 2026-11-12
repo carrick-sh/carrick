@@ -16,6 +16,7 @@ guest_surfaces = [
   "syscall:fork",
   "signal:asynchronous-delivery",
   "vmm:hvf",
+  "vmm:kvm",
 ]
 semantic_authority = [
   "man 7 epoll: level-triggered members are reported while ready; edge-triggered members once per new arrival; EPOLLONESHOT disarms after one report until EPOLL_CTL_MOD; an item is removed only when the last descriptor of its open description closes",
@@ -55,6 +56,7 @@ vm_free = [
 ]
 embed = [
   "carrick-embed::el1_sched::el1_epoll_eventfd_pingpong_stays_in_guest",
+  "carrick-vmm-kvm::cpl0_initial_mm::zone_epoll_pwait_blocks_until_child_pipe_write (production CPL0 guest execution; epoll_create1, pipe ADD, parent pwait(-1), child write, packed readiness cookie, no epoll forwarding or ring refusals)",
 ]
 docker = [
   "probe:epollzonepingpong|epollzonetrigger|epollzonetimeout|epollzoneeintr|epollzoneclose|epollzonemixed|epollzonesigmask",
