@@ -1267,10 +1267,10 @@ fn stage_call(
                 0,
                 [0; 4],
                 &path,
-                Some(HostFileOutput {
-                    address: buf.raw(),
-                    len: (size as usize).min(HOST_FILE_CHUNK_BYTES),
-                }),
+                Some(HostFileOutput::bytes(
+                    buf.raw(),
+                    (size as usize).min(HOST_FILE_CHUNK_BYTES),
+                )),
             )
         }
         HostFileCall::Openat {
