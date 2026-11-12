@@ -1,6 +1,7 @@
-/* #2157 B1, files family: mkdirat, openat, ftruncate, fallocate, fsync,
- * fdatasync, flock, fadvise64, symlinkat, readlinkat, linkat, renameat,
- * getdents64, unlinkat. The script runs in a scratch working directory.
+/* #2157 B1, files family: mkdirat, ftruncate, fallocate,
+ * sync, symlinkat, readlinkat, linkat, renameat, renameat2, mknodat, openat2,
+ * chdir, getcwd, unlinkat. The script runs in a scratch working
+ * directory. Descriptor calls name standard output's host object (a pipe).
  *
  *   (none)  the run root performs every call; each returns its native
  *           Linux result. Expected stdout "F\n", exit 7.
@@ -23,6 +24,17 @@
 .equ SYS_flock, 73
 .equ SYS_fallocate, 285
 .equ SYS_fadvise64, 221
+.equ SYS_readahead, 187
+.equ SYS_sync_file_range, 277
+.equ SYS_syncfs, 306
+.equ SYS_sync, 162
+.equ SYS_renameat2, 316
+.equ SYS_mknodat, 259
+.equ SYS_openat2, 437
+.equ SYS_chdir, 80
+.equ SYS_fchdir, 81
+.equ SYS_getcwd, 79
+.equ SYS_dup2, 33
 .equ O_RDWR_CREAT, 0x42
 .equ O_RDONLY_DIRECTORY, 0x10000
 .equ AT_REMOVEDIR, 0x200
@@ -46,22 +58,6 @@ child_script:
     xor %esi, %esi
     SYS SYS_ftruncate
     EXPECT 13, -9
-    mov $2, %edi
-    SYS SYS_fsync
-    EXPECT 14, -9
-    mov $2, %edi
-    SYS SYS_fdatasync
-    EXPECT 15, -9
-    mov $2, %edi
-    mov $2, %esi
-    SYS SYS_flock
-    EXPECT 16, -9
-    mov $2, %edi
-    xor %esi, %esi
-    xor %edx, %edx
-    xor %r10d, %r10d
-    SYS SYS_fadvise64
-    EXPECT 17, -9
     mov $2, %edi
     xor %esi, %esi
     xor %edx, %edx
@@ -122,33 +118,27 @@ root_script:
     mov $2, %edx
     SYS SYS_lseek
     EXPECT 16, 2
-    mov %r12, %rdi
+    /* The descriptor calls below name the host object standard output is
+     * bound to, as 1 and as the duplicate 5 (a rewritten operand). A file the
+     * root opened lives in the ring's table; the ring's venue owns it. */
+    mov $1, %edi
+    mov $5, %esi
+    SYS SYS_dup2
+    EXPECT 17, 5
+    mov $5, %edi
     xor %esi, %esi
     xor %edx, %edx
     mov $8, %r10d
     SYS SYS_fallocate
-    EXPECT 17, 0
-    mov %r12, %rdi
-    xor %esi, %esi
-    mov $2, %edx
-    SYS SYS_lseek
-    EXPECT 18, 8
-    mov %r12, %rdi
-    SYS SYS_fsync
-    EXPECT 19, 0
-    mov %r12, %rdi
-    SYS SYS_fdatasync
-    EXPECT 20, 0
-    mov %r12, %rdi
-    mov $2, %esi
-    SYS SYS_flock
-    EXPECT 21, 0
-    mov %r12, %rdi
+    EXPECT 18, -29
+    mov $1, %edi
     xor %esi, %esi
     xor %edx, %edx
-    xor %r10d, %r10d
-    SYS SYS_fadvise64
-    EXPECT 22, 0
+    mov $8, %r10d
+    SYS SYS_fallocate
+    EXPECT 19, -29
+    SYS SYS_sync
+    EXPECT 56, 0
     /* symlinkat(target, newdirfd, linkpath) */
     AT_PATH %rdi, link_target
     mov $AT_FDCWD, %esi
@@ -180,6 +170,71 @@ root_script:
     SYS SYS_renameat
     EXPECT 27, 0
     mov $AT_FDCWD, %edi
+    AT_PATH %rsi, renamed
+    mov $AT_FDCWD, %edx
+    AT_PATH %r10, renamed2
+    xor %r8d, %r8d
+    SYS SYS_renameat2
+    EXPECT 44, 0
+    /* mknodat: a fifo needs no privilege. */
+    mov $AT_FDCWD, %edi
+    AT_PATH %rsi, node
+    mov $010600, %edx
+    xor %r10d, %r10d
+    SYS SYS_mknodat
+    EXPECT 45, 0
+    mov $AT_FDCWD, %edi
+    AT_PATH %rsi, node
+    xor %edx, %edx
+    SYS SYS_unlinkat
+    EXPECT 46, 0
+    /* openat2: present opens, absent is ENOENT. */
+    mov $AT_FDCWD, %edi
+    AT_PATH %rsi, file
+    AT_PATH %rdx, open_how
+    mov $24, %r10d
+    SYS SYS_openat2
+    EXPECT_OK 47
+    mov %rax, %rdi
+    SYS SYS_close
+    EXPECT 48, 0
+    mov $AT_FDCWD, %edi
+    AT_PATH %rsi, missing
+    AT_PATH %rdx, open_how
+    mov $24, %r10d
+    SYS SYS_openat2
+    EXPECT 49, -2
+    /* The working directory follows chdir and fchdir. */
+    AT_PATH %rdi, dir
+    SYS SYS_chdir
+    EXPECT 50, 0
+    PATH %rdi, scratch
+    mov $256, %esi
+    SYS SYS_getcwd
+    cmp $7, %rax
+    jge 3f
+    mov $51, %edi
+    jmp fail
+3:
+    cmpl $0x72696431, scratch-5(%rax) /* "1dir" before the NUL */
+    je 4f
+    mov $52, %edi
+    jmp fail
+4:
+    /* A relative open resolves against the new working directory. */
+    mov $AT_FDCWD, %edi
+    AT_PATH %rsi, member
+    xor %edx, %edx
+    xor %r10d, %r10d
+    SYS SYS_openat
+    EXPECT_OK 57
+    mov %rax, %rdi
+    SYS SYS_close
+    EXPECT 58, 0
+    AT_PATH %rdi, parent
+    SYS SYS_chdir
+    EXPECT 54, 0
+    mov $AT_FDCWD, %edi
     AT_PATH %rsi, dir
     mov $O_RDONLY_DIRECTORY, %edx
     xor %r10d, %r10d
@@ -206,7 +261,7 @@ root_script:
     SYS SYS_unlinkat
     EXPECT 32, 0
     mov $AT_FDCWD, %edi
-    AT_PATH %rsi, renamed
+    AT_PATH %rsi, renamed2
     xor %edx, %edx
     SYS SYS_unlinkat
     EXPECT 33, 0
@@ -228,6 +283,13 @@ dir: .asciz "b1dir"
 file: .asciz "b1dir/f"
 hard: .asciz "b1dir/h"
 renamed: .asciz "b1dir/r"
+renamed2: .asciz "b1dir/s"
+node: .asciz "b1dir/n"
+missing: .asciz "b1missing"
+parent: .asciz ".."
+member: .asciz "f"
 link: .asciz "b1dir/l"
 link_target: .asciz "f"
 data: .ascii "abcd"
+.balign 8
+open_how: .quad 0, 0, 0

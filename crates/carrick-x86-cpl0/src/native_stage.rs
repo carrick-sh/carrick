@@ -22,13 +22,17 @@ use carrick_personality_linux::native_host_file::{
 ///   route, which owns the terminal and blocking-read semantics. `writev` has
 ///   no x86 host route, so it is staged for every descriptor and a stdio
 ///   stream reaches the run's stdio sink through the shared venue.
-/// - Mutations stay child-scoped: the initial task keeps its host route.
+/// - Path mutations stay child-scoped: the initial task keeps its host route.
+///   `ftruncate` names a descriptor, so it follows the descriptor: one the
+///   root's `openat` installed lives in the ring namespace and the host task
+///   has nothing under its number (#2157 B1).
 pub(crate) fn admits(
     call: HostFileCall,
     origin: ServiceOrigin,
     delegated: impl FnOnce(i32) -> bool,
 ) -> bool {
     match call {
+        HostFileCall::Ftruncate { fd, .. } if origin == ServiceOrigin::Initial => !delegated(fd),
         call if call.uses_child_mutation_venue() => origin != ServiceOrigin::Initial,
         HostFileCall::Openat { .. }
         | HostFileCall::Faccessat { .. }
@@ -261,22 +265,18 @@ mod tests {
 
     #[test]
     fn root_bad_descriptor_without_a_host_crossing_is_the_ring_ebadf() {
-        // #2138 P0-1: writev, getdents64 and statx have no x86 host
-        // crossing, so declining an absent descriptor made them a counted
-        // ENOSYS. The ring answers them: EBADF (9).
+        // #2138 P0-1: writev and getdents64 have no x86 host crossing, so
+        // declining an absent descriptor made them a counted ENOSYS. The ring
+        // answers them: EBADF (9). (statx became a crossing in #2157 B1: an
+        // absent descriptor keeps the host route, whose resolver answers
+        // EBADF.)
         let mut buf = [0u8; 256];
         let out = buf.as_mut_ptr() as u64;
         let iov = [out, 1];
-        let empty = *b"\0";
         for fd in [u64::MAX, 3] {
             for (name, nr, args) in [
                 ("writev", 20, [fd, iov.as_ptr() as u64, 1, 0, 0, 0]),
                 ("getdents64", 217, [fd, out, 64, 0, 0, 0]),
-                (
-                    "statx",
-                    332,
-                    [fd, empty.as_ptr() as u64, 0x1000, 0x7ff, out, 0],
-                ),
             ] {
                 let staged = stage(nr, args, INITIAL, Some(NativeDescriptor::Absent));
                 assert_eq!(
@@ -357,12 +357,35 @@ mod tests {
     }
 
     #[test]
+    fn ftruncate_follows_its_descriptor_for_the_root_too() {
+        // The root's ring-held file has no host-task descriptor to truncate:
+        // the ring venue stages it, as for a descendant. A descriptor the
+        // host table opened keeps the host route; a delegated stdio stream
+        // does too.
+        let args = [3, 0, 0, 0, 0, 0];
+        for origin in [INITIAL, CHILD] {
+            assert!(
+                matches!(
+                    stage(77, args, origin, host()),
+                    Some(HostFileStage::Request { .. })
+                ),
+                "{origin:?}"
+            );
+        }
+        assert_eq!(
+            stage(77, args, INITIAL, Some(NativeDescriptor::Absent)),
+            None
+        );
+        assert_eq!(stage_delegated(77, args, INITIAL, true), None);
+    }
+
+    #[test]
     fn mutations_are_descendant_only() {
         // x86_64 numbers: mkdirat 258, unlinkat 263, renameat2 316,
         // truncate 76, ftruncate 77, symlinkat 266, linkat 265, utimensat 280.
         let path = *b"/x\0";
         let p = path.as_ptr() as u64;
-        let cases: [(&str, u64, [u64; 6]); 8] = [
+        let cases: [(&str, u64, [u64; 6]); 7] = [
             ("mkdirat", 258, [!99u64, p, 0o755, 0, 0, 0]),
             ("unlinkat", 263, [!99u64, p, 0, 0, 0, 0]),
             ("symlinkat", 266, [p, !99u64, p, 0, 0, 0]),
@@ -370,7 +393,6 @@ mod tests {
             ("renameat2", 316, [!99u64, p, !99u64, p, 0, 0]),
             ("utimensat", 280, [!99u64, p, 0, 0, 0, 0]),
             ("truncate", 76, [p, 0, 0, 0, 0, 0]),
-            ("ftruncate", 77, [3, 0, 0, 0, 0, 0]),
         ];
         for (name, nr, args) in cases {
             assert!(
