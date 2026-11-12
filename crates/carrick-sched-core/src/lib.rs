@@ -944,6 +944,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
                 ))
     }
 
+    fn settle_claimed_handback(&self, kind: Handback) {
+        if self.has_object_operation() || kind == Handback::Cancelled
+            || !matches!(self.handback(), Some(Handback::Woken | Handback::Resumed | Handback::Service)) {
+            self.handback.store(kind as u32, Ordering::Release);
+        }
+    }
+
     /// Adopted exception owners may predate the native-owned allocation hint.
     pub fn has_native_execution_owner(&self) -> bool {
         self.is_native_owned() || self.requires_native_entry()
@@ -5432,7 +5439,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// continuations keep their existing owner-queue policy.
     pub fn place_host_handback(&self, record: RecordRef) -> Option<HostHandback> {
         let rec = self.live(record)?;
-        let placement = if rec.is_native_owned() {
+        let placement = if rec.has_native_execution_owner() {
             self.place_native_handback(record)?
         } else {
             let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
@@ -5914,10 +5921,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                         return HostClaim::Stale;
                     }
                     if let Some(transfer) = self.begin_host_transfer(r, claim) {
-                        if kind == Handback::Cancelled
-                            || !matches!(rec.handback(), Some(Handback::Woken | Handback::Resumed))
-                        {
-                            rec.handback.store(kind as u32, Ordering::Release);
+                        rec.settle_claimed_handback(kind);
+                        if let Some(counter) = self.counters.host_claims.get(kind as usize) {
+                            counter.fetch_add(1, Ordering::Relaxed);
                         }
                         return if transfer.publish().is_some() {
                             HostClaim::Claimed
@@ -5975,15 +5981,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     // Service is custody of an exact held scheduler row,
                     // not a return reason. GroupStop already published its
                     // incarnation-tagged request; compose it with custody.
-                    if rec.has_object_operation()
-                        || kind == Handback::Cancelled
-                        || !matches!(
-                            rec.handback(),
-                            Some(Handback::Woken | Handback::Resumed | Handback::Service)
-                        )
-                    {
-                        rec.handback.store(kind as u32, Ordering::Release);
-                    }
+                    rec.settle_claimed_handback(kind);
                     if let Some(counter) = self.counters.host_claims.get(kind as usize) {
                         counter.fetch_add(1, Ordering::Relaxed);
                     }
