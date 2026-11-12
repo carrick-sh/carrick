@@ -4819,10 +4819,10 @@ fn delegated_final_settlement_drains_owed_returns() {
     );
     root.lock().refuse(pending).unwrap();
     // Final-MM settlement (`mm_occupancy::retire_reservation_root`): owed
-    // returns never make the root Busy; every extent is released with it.
+    // returns never make the root Busy; both extents stay owed under the
+    // retired key until the MM's frames are released.
     assert_eq!(root.lock().retire_final(), Ok(2));
     let slot = root.carrier.slot(root.mm).unwrap();
-    // The root is gone and its journal slots are free for another MM.
     assert_eq!(
         root.carrier.table.lock(slot, root.mm).err(),
         Some(Refusal::Stale)
@@ -4835,7 +4835,22 @@ fn delegated_final_settlement_drains_owed_returns() {
     let model = other_root.lock();
     let mut owed = 0;
     model.observe_deferred_returns(&mut |_| owed += 1);
-    assert_eq!(owed, 0);
+    assert_eq!(owed, 0, "the retired MM's debt is its own");
+    drop(model);
+    // The host venue released the MM's frames: its receipt frees exactly
+    // the retired root's two slots.
+    let venue = Box::new(carrick_sched_core::AddressSpaces::new());
+    let absent = venue.unpublished(root.mm.raw()).unwrap();
+    let receipt = carrick_el1_abi::MmReleaseReceipt::released(&absent, |_| true).unwrap();
+    assert_eq!(
+        carrick_el1_abi::RetiredReturns::settle_whole_mm(&**root.carrier.table, receipt),
+        Ok(2)
+    );
+    let receipt = carrick_el1_abi::MmReleaseReceipt::released(&absent, |_| true).unwrap();
+    assert_eq!(
+        carrick_el1_abi::RetiredReturns::settle_whole_mm(&**root.carrier.table, receipt),
+        Ok(0)
+    );
 }
 
 /// The parent's fork transaction over `child`, as `commit_parent` holds it.

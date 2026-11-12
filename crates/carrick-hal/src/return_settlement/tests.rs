@@ -72,16 +72,14 @@ impl ReturnJournal for Guarded<'_> {
     }
     fn acknowledge_chunk(
         &mut self,
-        slot: OwedSlot,
-        epoch: OwedSlotEpoch,
-        expected_start: u64,
-        new_start: u64,
+        chunk: carrick_core_abi::SettledChunk,
     ) -> Result<ChunkAcknowledgement, Refusal> {
         self.0.log.borrow_mut().push("acknowledge");
+        let (expected_start, new_start) = (chunk.expected_start(), chunk.new_start());
         let mut slots = self.0.slots.borrow_mut();
-        let entry = &mut slots[slot.index()];
+        let entry = &mut slots[chunk.slot().index()];
         if entry.owner != self.0.mm
-            || entry.epoch != epoch.raw()
+            || entry.epoch != chunk.epoch().raw()
             || entry.start != expected_start
             || new_start <= expected_start
             || new_start > entry.end

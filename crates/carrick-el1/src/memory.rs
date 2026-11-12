@@ -2404,6 +2404,29 @@ mod tests {
             model.observe_deferred_returns(&mut |entry| owed.push(entry));
             owed
         }
+        /// The host venue's settlement of every extent `model` owes, minus
+        /// its physical work: the only mint of acknowledgement authority.
+        fn settled(model: &reservations::Reservations<'_>) -> Vec<carrick_el1_abi::SettledChunk> {
+            struct NoBacking;
+            impl carrick_el1_abi::OwedReturnRetirement for NoBacking {
+                type Prepared = ();
+                type Error = core::convert::Infallible;
+                fn prepare(
+                    &mut self,
+                    _: &carrick_el1_abi::ReturnSettlementRequest,
+                ) -> Result<(), Self::Error> {
+                    Ok(())
+                }
+                fn apply(&mut self, (): ()) {}
+            }
+            let venue = Box::new(AddressSpaces::new());
+            let request = carrick_el1_abi::ReturnJournal::owed_returns(model).unwrap();
+            let excluded = venue.unpublished(request.mm().raw()).unwrap();
+            match request.retire_and_apply(&excluded, &mut NoBacking) {
+                Ok(settled) => settled.unwrap().into_chunks().collect(),
+                Err(never) => match never {},
+            }
+        }
 
         #[test]
         fn delegated_descriptor_steps_bind_distinct_owner_operations() {
@@ -3155,30 +3178,36 @@ mod tests {
                     owed[0].range,
                     ReservationRange::new(ARENA, ARENA + 0x2000).unwrap()
                 );
-                // A handle from another slot lifetime releases nothing.
-                let older =
-                    carrick_el1_abi::OwedSlotEpoch::new(owed[0].epoch.raw().wrapping_sub(1));
-                assert_eq!(
-                    model.acknowledge_chunk(owed[0].slot, older, ARENA, ARENA + 0x2000),
-                    Ok(carrick_el1_abi::ChunkAcknowledgement::Stale)
-                );
                 owed[0]
             };
+            // Two settlements observe the extent; only the first frees it.
+            let (settled_once, replayed) = {
+                let model = root(&spaces, &table, &task);
+                (settled(&model), settled(&model))
+            };
+            assert_eq!(settled_once.len(), 1);
             assert_eq!(
                 root(&spaces, &table, &task).retire().err(),
                 Some(Refusal::Busy)
             );
             // The host reconciled stage-2 and the inventory: its receipt
             // releases the frames and the VA.
-            assert_eq!(
-                root(&spaces, &table, &task).acknowledge_chunk(
-                    owed.slot,
-                    owed.epoch,
-                    owed.range.start(),
-                    owed.range.end()
-                ),
-                Ok(carrick_el1_abi::ChunkAcknowledgement::Freed)
-            );
+            let mut model = root(&spaces, &table, &task);
+            for chunk in settled_once {
+                assert_eq!((chunk.slot(), chunk.epoch()), (owed.slot, owed.epoch));
+                assert_eq!(
+                    model.acknowledge_chunk(chunk),
+                    Ok(carrick_el1_abi::ChunkAcknowledgement::Freed)
+                );
+            }
+            // A replay from the same slot lifetime releases nothing.
+            for chunk in replayed {
+                assert_eq!(
+                    model.acknowledge_chunk(chunk),
+                    Ok(carrick_el1_abi::ChunkAcknowledgement::Stale)
+                );
+            }
+            drop(model);
             let mut returned_backing = Editor::over(RangeBacking::Retired);
             let (route, address) = syscall(
                 &task,
@@ -3246,15 +3275,19 @@ mod tests {
             );
             assert_eq!(before_ack, DelegatedAnonymous::Forward);
 
+            let mut model = root(&spaces, &table, &task);
+            let chunks = settled(&model);
             assert_eq!(
-                root(&spaces, &table, &task).acknowledge_chunk(
-                    owed[0].slot,
-                    owed[0].epoch,
-                    owed[0].range.start(),
-                    owed[0].range.end()
-                ),
-                Ok(carrick_el1_abi::ChunkAcknowledgement::Freed)
+                (chunks[0].slot(), chunks[0].epoch()),
+                (owed[0].slot, owed[0].epoch)
             );
+            for chunk in chunks {
+                assert_eq!(
+                    model.acknowledge_chunk(chunk),
+                    Ok(carrick_el1_abi::ChunkAcknowledgement::Freed)
+                );
+            }
+            drop(model);
             let mut returned = Editor::over(RangeBacking::Retired);
             let (after_ack, address) = syscall(
                 &task,

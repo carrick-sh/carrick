@@ -283,8 +283,11 @@ struct Root {
 /// One owed return ([`DeferredReturn`]). `mm` is the owning root's published
 /// key (never reused), 0 when free. A slot is claimed, written, edited and
 /// freed only under its owner's root guard; other roots read `mm` alone.
-/// `epoch` advances each time the slot is freed, so a (slot, epoch) pair
-/// names one owed extent and never its successor.
+/// Once that root retires, its slots stay owed under its key, which no root
+/// publishes again, until the MM's release receipt frees them
+/// ([`RetiredReturns::settle_whole_mm`]). `epoch` advances each time the
+/// slot is freed, so a (slot, epoch) pair names one owed extent and never
+/// its successor.
 #[repr(C)]
 struct DeferredSlot {
     mm: AtomicU64,
@@ -295,7 +298,7 @@ struct DeferredSlot {
 }
 impl DeferredSlot {
     /// Free the slot. Only a [`ReturnSettlement`] reaches here: a matched
-    /// chunk acknowledgement or whole-MM teardown.
+    /// settled chunk or a retired MM's release receipt.
     fn free(&self, _settlement: ReturnSettlement) {
         self.start.store(0, Ordering::Relaxed);
         self.end.store(0, Ordering::Relaxed);
@@ -311,32 +314,23 @@ impl DeferredSlot {
 }
 
 /// The authority that frees an owed-return slot. Settlement is the only way
-/// a slot's frames and VA become reusable, so freeing takes one of these:
-/// a chunk acknowledgement that matched the slot's (epoch, start) and
-/// reached its end, or the teardown of the whole MM.
-#[must_use]
+/// a slot's frames and VA become reusable, so each constructor consumes
+/// evidence the settlement minted: a [`SettledChunk`] whose (epoch, start)
+/// matched the slot and that reaches its end, or the [`MmReleaseReceipt`]
+/// of the retired MM that owes it.
 struct ReturnSettlement {
-    _kind: ReturnSettlementKind,
-}
-enum ReturnSettlementKind {
-    /// `acknowledge_chunk` reached the extent's end.
-    Chunk,
-    /// The MM is being destroyed: its frames retire with its own inventory
-    /// (`retire_final`), so no VA is ever placed again.
-    WholeMm,
+    _private: (),
 }
 impl ReturnSettlement {
-    fn chunk() -> Self {
-        Self {
-            _kind: ReturnSettlementKind::Chunk,
-        }
+    /// `acknowledge_chunk` reached the extent's end.
+    fn chunk(_settled: SettledChunk) -> Self {
+        Self { _private: () }
     }
-    /// Teardown's acknowledgement, minted only by `retire_final` once the
-    /// root is closed for good (no pending edit, no fork, gate closed).
-    fn whole_mm() -> Self {
-        Self {
-            _kind: ReturnSettlementKind::WholeMm,
-        }
+    /// Teardown's acknowledgement: the retired MM's carrier-wide release
+    /// succeeded, so its frames returned with its own inventory, and no root
+    /// places its VAs again ([`RetiredReturns::settle_whole_mm`]).
+    fn whole_mm(_released: &MmReleaseReceipt) -> Self {
+        Self { _private: () }
     }
 }
 // Access to state requires the root's nonblocking exclusive guard.
@@ -2855,14 +2849,6 @@ impl<
     fn mark_admitted(&self) {
         self.table.set_admitted(self.index(), true);
     }
-    /// This root's journal slots. Only this root's guard edits them.
-    fn deferred_slots(&self) -> impl Iterator<Item = &DeferredSlot> + '_ {
-        let mm = self.mm.raw();
-        self.table
-            .deferred
-            .iter()
-            .filter(move |slot| slot.mm.load(Ordering::Acquire) == mm)
-    }
     fn deferred(&self) -> impl Iterator<Item = DeferredReturn> + '_ {
         let mm = self.mm.raw();
         self.table
@@ -2949,12 +2935,13 @@ impl<
             visit(owed);
         }
     }
-    /// Settlement: `[expected_start, new_start)` of the owed extent in
-    /// `slot` was retired (stage-1 retired leaves, stage-2 and the frame
-    /// inventory) and its batch applied. Only then do those frames and VAs
-    /// become reusable. A compare-and-swap of the slot's `start`, the
-    /// settlement cursor: effective only while the slot is this root's,
-    /// still holds `epoch` and starts at `expected_start`, and `new_start`
+    /// Settlement: the chunk `[expected_start, new_start)` of one owed
+    /// extent was retired (stage-1 retired leaves, stage-2 and the frame
+    /// inventory) and its batch applied, as the [`SettledChunk`] minted by
+    /// the settlement proves. Only then do those frames and VAs become
+    /// reusable. A compare-and-swap of the slot's `start`, the settlement
+    /// cursor: effective only while the slot is this root's, still holds the
+    /// chunk's epoch and starts at its `expected_start`, and its `new_start`
     /// lies in `(expected_start, end]`. `new_start == end` frees the slot
     /// and advances its epoch. Anything else is `Stale` with no effect.
     ///
@@ -2973,22 +2960,31 @@ impl<
     ///     );
     /// }
     /// ```
+    ///
+    /// and only the settlement mints the authority:
+    ///
+    /// ```compile_fail,E0451
+    /// let _ = carrick_core_abi::SettledChunk {
+    ///     slot: carrick_core_abi::OwedSlot::new(0).unwrap(),
+    ///     epoch: carrick_core_abi::OwedSlotEpoch::new(0),
+    ///     expected_start: 0x1000,
+    ///     new_start: 0x2000,
+    /// };
+    /// ```
     pub fn acknowledge_chunk(
         &mut self,
-        slot: OwedSlot,
-        epoch: OwedSlotEpoch,
-        expected_start: u64,
-        new_start: u64,
+        chunk: SettledChunk,
     ) -> Result<ChunkAcknowledgement, Refusal> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
-        let Some(entry) = self.table.deferred.get(slot.index()) else {
+        let Some(entry) = self.table.deferred.get(chunk.slot().index()) else {
             return Ok(ChunkAcknowledgement::Stale);
         };
+        let (expected_start, new_start) = (chunk.expected_start(), chunk.new_start());
         let end = entry.end.load(Ordering::Relaxed);
         if entry.mm.load(Ordering::Acquire) != self.mm.raw()
-            || entry.epoch.load(Ordering::Relaxed) != epoch.raw()
+            || entry.epoch.load(Ordering::Relaxed) != chunk.epoch().raw()
             || entry.start.load(Ordering::Relaxed) != expected_start
             || new_start <= expected_start
             || new_start > end
@@ -2997,7 +2993,7 @@ impl<
             return Ok(ChunkAcknowledgement::Stale);
         }
         if new_start == end {
-            entry.free(ReturnSettlement::chunk());
+            entry.free(ReturnSettlement::chunk(chunk));
             return Ok(ChunkAcknowledgement::Freed);
         }
         entry.start.store(new_start, Ordering::Relaxed);
@@ -3624,12 +3620,23 @@ impl<
         }
         self.retire_final().map(|_| ())
     }
-    /// Final-MM settlement: retire the closed root and its owed returns together.
-    /// The caller retains all physical custody until whole-MM inventory
-    /// retirement; no range is made reusable by acknowledging its journal.
-    /// Unlike ordinary retirement (also used for fork rollback), this consumes
-    /// deferred returns because the entire MM is being destroyed. Refusal
-    /// preserves the journal, so a still-borrowed root can be retried safely.
+    /// Final-MM settlement: retire the closed root even though it still owes
+    /// returns. Unlike ordinary retirement (also used for fork rollback),
+    /// owed returns do not make it `Busy`, because the entire MM is being
+    /// destroyed: they stay owed under the retired key (no root places those
+    /// VAs again), and only the MM's release receipt frees them
+    /// ([`RetiredReturns::settle_whole_mm`]), once the carrier released the
+    /// MM's frames. Returns how many extents stay owed for that receipt.
+    /// Refusal preserves the journal, so a still-borrowed root can be retried
+    /// safely.
+    ///
+    /// Only the venue's successful release mints the receipt:
+    ///
+    /// ```compile_fail,E0451
+    /// let _ = carrick_core_abi::MmReleaseReceipt {
+    ///     mm: carrick_core_abi::ReservationMm::new(1).unwrap(),
+    /// };
+    /// ```
     pub fn retire_final(mut self) -> Result<usize, Refusal> {
         self.reap_prepared();
         if self.has_prepared_copy() || self.pending().is_some() || self.state().fork_pending {
@@ -3660,10 +3667,7 @@ impl<
             self.retiring_notifications = true;
             self.unlocked = ResourceUnlocked::Plain;
         }
-        let released = self.deferred().count();
-        for slot in self.deferred_slots() {
-            slot.free(ReturnSettlement::whole_mm());
-        }
+        let owed = self.deferred().count();
         self.release_tree(self.state().tree);
         let source_tree = self.source_tree();
         self.release_tree(source_tree);
@@ -3682,7 +3686,7 @@ impl<
             .store(self.state().generation.raw(), Ordering::Relaxed);
         self.table.set_admitted(self.index(), false);
         self.root.key.store(0, Ordering::Release);
-        Ok(released)
+        Ok(owed)
     }
     /// Return every node of the tree at `id` to the pool without a stack:
     /// rotate each left child up over its parent until the head has no left
@@ -3926,10 +3930,7 @@ mod tests {
 
         // Settled, the VA is reusable again and placement returns to it.
         let mut root = table.lock(0, child).unwrap();
-        for owed in ReturnJournal::owed_returns(&root).unwrap().iter() {
-            root.acknowledge_chunk(owed.slot, owed.epoch, owed.range.start(), owed.range.end())
-                .unwrap();
-        }
+        settle_all(&mut root);
         let decision = root.mmap(Placement::Anywhere, MIB, rw).unwrap();
         assert_eq!(complete(&mut root, decision), 0x100000);
     }
@@ -3940,10 +3941,28 @@ mod tests {
             .copied()
             .collect()
     }
+    fn settled(root: &Reservations<'_>) -> Vec<SettledChunk> {
+        super::settled_for_test(root)
+    }
+    fn settle_all(root: &mut Reservations<'_>) -> Vec<ChunkAcknowledgement> {
+        super::settle_all_for_test(root)
+    }
+    /// The venue's whole-MM release of `mm` (its address space excluded)
+    /// succeeded or failed; a success spends its receipt on `table`.
+    fn release(table: &SharedReservations, mm: ReservationMm, released: bool) -> Option<usize> {
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let excluded = spaces.unpublished(mm.raw()).unwrap();
+        MmReleaseReceipt::released(&excluded, |named| {
+            assert_eq!(named, mm);
+            released
+        })
+        .map(|receipt| table.settle_whole_mm(receipt).unwrap())
+    }
 
-    /// #1480: a settlement handle names one slot lifetime. Once the slot is
-    /// freed (its epoch advances) and a successor extent reuses it, the old
-    /// handle acknowledges nothing: the successor stays owed, untouched.
+    /// #1480: a settlement names one slot lifetime. Once the slot is freed
+    /// (its epoch advances) and a successor extent reuses it, a replayed
+    /// settlement of the old extent acknowledges nothing: the successor
+    /// stays owed, untouched.
     #[test]
     fn stale_owed_return_handle_never_acknowledges_its_successor() {
         let table = table();
@@ -3958,8 +3977,11 @@ mod tests {
         let [old] = owed_rows(&root)[..] else {
             panic!("one owed extent");
         };
+        // Two settlements observed the same extent.
+        let [first] = <[SettledChunk; 1]>::try_from(settled(&root)).unwrap();
+        let [replay] = <[SettledChunk; 1]>::try_from(settled(&root)).unwrap();
         assert_eq!(
-            root.acknowledge_chunk(old.slot, old.epoch, 0x100000, 0x102000),
+            root.acknowledge_chunk(first),
             Ok(ChunkAcknowledgement::Freed)
         );
         // The successor lands in the same (now free) slot, one epoch on.
@@ -3969,13 +3991,11 @@ mod tests {
         };
         assert_eq!(successor.slot, old.slot);
         assert_ne!(successor.epoch, old.epoch);
-        // A retried or duplicated settlement of the old extent: no effect.
-        for (start, end) in [(0x100000, 0x102000), (0x102000, 0x104000)] {
-            assert_eq!(
-                root.acknowledge_chunk(old.slot, old.epoch, start, end),
-                Ok(ChunkAcknowledgement::Stale)
-            );
-        }
+        // The replayed settlement of the old extent: no effect.
+        assert_eq!(
+            root.acknowledge_chunk(replay),
+            Ok(ChunkAcknowledgement::Stale)
+        );
         assert_eq!(owed_rows(&root), vec![successor]);
         assert_eq!(
             root.mmap(Placement::Fixed(0x102000), 0x1000, rw),
@@ -3984,10 +4004,11 @@ mod tests {
         );
     }
 
-    /// #1480: the slot's `start` is the settlement cursor. A chunk shrinks
-    /// the extent from the front; a front merge after the walk moves `start`
-    /// back over unsettled pages, so the walked chunk's acknowledgement is
-    /// stale; the extent's end frees the slot.
+    /// #1480: the slot's `start` is the settlement cursor. A front merge
+    /// after the walk moves `start` back over unsettled pages, so the walked
+    /// chunk's acknowledgement is stale; the merged extent's own settlement
+    /// frees the slot. (Partial chunks, `Advanced`, have no mint until the
+    /// bounded chunks of #1369 slice 3.)
     #[test]
     fn owed_return_chunks_acknowledge_by_compare_and_swap_on_start() {
         let table = table();
@@ -4002,17 +4023,15 @@ mod tests {
         let [walked] = owed_rows(&root)[..] else {
             panic!("one owed extent");
         };
-        // Out of the extent, not page aligned, or not past the cursor.
-        for new_start in [0x107000, 0x103800, 0x103000] {
-            assert_eq!(
-                root.acknowledge_chunk(walked.slot, walked.epoch, 0x103000, new_start),
-                Ok(ChunkAcknowledgement::Stale)
-            );
-        }
+        let [walked_chunk] = <[SettledChunk; 1]>::try_from(settled(&root)).unwrap();
+        assert_eq!(
+            (walked_chunk.expected_start(), walked_chunk.new_start()),
+            (0x103000, 0x106000)
+        );
         // A front merge after the walk: the walked chunk is stale.
         retire_owed(&mut root, range(0x101000, 0x103000));
         assert_eq!(
-            root.acknowledge_chunk(walked.slot, walked.epoch, 0x103000, 0x106000),
+            root.acknowledge_chunk(walked_chunk),
             Ok(ChunkAcknowledgement::Stale)
         );
         let [merged] = owed_rows(&root)[..] else {
@@ -4021,27 +4040,17 @@ mod tests {
         assert_eq!(merged.range, range(0x101000, 0x106000));
         assert_eq!(merged.slot, walked.slot);
         assert_eq!(
-            root.acknowledge_chunk(merged.slot, merged.epoch, 0x101000, 0x104000),
-            Ok(ChunkAcknowledgement::Advanced)
+            merged.epoch, walked.epoch,
+            "a merge keeps the slot's lifetime"
         );
-        let [rest] = owed_rows(&root)[..] else {
-            panic!("one owed extent");
-        };
-        assert_eq!(rest.range, range(0x104000, 0x106000));
-        assert_eq!(
-            rest.epoch, merged.epoch,
-            "a chunk keeps the slot's lifetime"
-        );
-        assert_eq!(
-            root.acknowledge_chunk(rest.slot, rest.epoch, 0x104000, 0x106000),
-            Ok(ChunkAcknowledgement::Freed)
-        );
+        assert_eq!(settle_all(&mut root), vec![ChunkAcknowledgement::Freed]);
         assert!(owed_rows(&root).is_empty());
     }
 
-    /// #1480: whole-MM teardown is a settlement too: it frees the closed
-    /// root's slots with their epochs advanced, so a settlement handle
-    /// observed before teardown cannot free the slot's next owner.
+    /// #1480: whole-MM teardown is a settlement too, through the retired
+    /// MM's release receipt: it frees the retired root's slots with their
+    /// epochs advanced, so a settlement observed before teardown cannot
+    /// free the slot's next owner.
     #[test]
     fn whole_mm_teardown_advances_the_epoch_of_every_owed_slot() {
         let table = table();
@@ -4061,7 +4070,9 @@ mod tests {
         let [old] = owed_rows(&root)[..] else {
             panic!("one owed extent");
         };
+        let [observed] = <[SettledChunk; 1]>::try_from(settled(&root)).unwrap();
         assert_eq!(root.retire_final(), Ok(1));
+        assert_eq!(release(&table, gone, true), Some(1));
         let mut successor = table.lock(1, next).unwrap();
         let mapped = successor
             .mmap(Placement::Fixed(0x100000), 0x2000, rw)
@@ -4074,14 +4085,15 @@ mod tests {
         assert_eq!(reused.slot, old.slot);
         assert_ne!(reused.epoch, old.epoch);
         assert_eq!(
-            successor.acknowledge_chunk(old.slot, old.epoch, 0x100000, 0x102000),
+            successor.acknowledge_chunk(observed),
             Ok(ChunkAcknowledgement::Stale)
         );
         assert_eq!(owed_rows(&successor), vec![reused]);
     }
     /// #1480 P0-2: final retirement is no settlement. A retired MM's owed
     /// slots stay owed under its key until its release receipt, so another
-    /// MM's retirement never lands in them meanwhile.
+    /// MM's retirement never lands in them meanwhile. A failed release mints
+    /// no receipt and frees nothing; the venue's retry does.
     #[test]
     fn retire_final_leaves_the_retired_mm_returns_owed() {
         let table = table();
@@ -4104,7 +4116,7 @@ mod tests {
         assert_eq!(root.retire_final(), Ok(1));
         let mut successor = table.lock(1, next).unwrap();
         let mapped = successor
-            .mmap(Placement::Fixed(0x100000), 0x2000, rw)
+            .mmap(Placement::Fixed(0x100000), 0x4000, rw)
             .unwrap();
         complete(&mut successor, mapped);
         retire_owed(&mut successor, range(0x100000, 0x102000));
@@ -4114,6 +4126,103 @@ mod tests {
         assert_ne!(
             placed.slot, old.slot,
             "the retired MM's slot stays owed until its release receipt"
+        );
+        drop(successor);
+        // The release fails: no receipt, the retired MM's slot stays owed.
+        assert_eq!(release(&table, gone, false), None);
+        let mut successor = table.lock(1, next).unwrap();
+        retire_owed(&mut successor, range(0x103000, 0x104000));
+        assert!(
+            owed_rows(&successor)
+                .iter()
+                .all(|owed| owed.slot != old.slot),
+            "still owed after a failed release"
+        );
+        drop(successor);
+        // The retry succeeds: its receipt frees exactly that slot.
+        assert_eq!(release(&table, gone, true), Some(1));
+        assert_eq!(release(&table, gone, true), Some(0), "nothing owed twice");
+        let mut successor = table.lock(1, next).unwrap();
+        settle_all(&mut successor);
+        retire_owed(&mut successor, range(0x100000, 0x101000));
+        let [reused] = owed_rows(&successor)[..] else {
+            panic!("one owed extent");
+        };
+        assert_eq!(reused.slot, old.slot);
+        assert_ne!(reused.epoch, old.epoch);
+    }
+    /// #1480 P0-2: a receipt for an MM whose root has not retired frees
+    /// nothing while that root owes returns: they are still its own.
+    #[test]
+    fn a_release_receipt_never_frees_a_live_root_returns() {
+        let table = table();
+        let live = ReservationMm::new(1486).unwrap();
+        table.publish(0, live, layout()).unwrap();
+        table.lock(0, live).unwrap().finish_import().unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        let mut root = table.lock(0, live).unwrap();
+        let mapped = root.mmap(Placement::Fixed(0x100000), 0x2000, rw).unwrap();
+        complete(&mut root, mapped);
+        drop(root);
+        // A rolled-back fork's root that owes nothing: nothing to settle.
+        assert_eq!(release(&table, live, true), Some(0));
+        let mut root = table.lock(0, live).unwrap();
+        retire_owed(&mut root, range(0x100000, 0x102000));
+        let owed = owed_rows(&root);
+        drop(root);
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let excluded = spaces.unpublished(live.raw()).unwrap();
+        let receipt = MmReleaseReceipt::released(&excluded, |_| true).unwrap();
+        assert_eq!(table.settle_whole_mm(receipt), Err(Refusal::Busy));
+        assert_eq!(owed_rows(&table.lock(0, live).unwrap()), owed);
+    }
+    /// #1480 P0-2: a reused slot's successor is never freed by the old MM's
+    /// teardown. The old MM settled one extent (its slot went to another
+    /// MM) and retired owing another: its receipt frees only its own.
+    #[test]
+    fn old_mm_release_never_frees_a_reused_slot_successor() {
+        let table = table();
+        let (gone, next) = (
+            ReservationMm::new(1487).unwrap(),
+            ReservationMm::new(1488).unwrap(),
+        );
+        for (slot, mm) in [(0, gone), (1, next)] {
+            table.publish(slot, mm, layout()).unwrap();
+            table.lock(slot, mm).unwrap().finish_import().unwrap();
+        }
+        let rw = ReservationProtection::READ_WRITE;
+        let mut root = table.lock(0, gone).unwrap();
+        let mapped = root.mmap(Placement::Fixed(0x100000), 0x8000, rw).unwrap();
+        complete(&mut root, mapped);
+        retire_owed(&mut root, range(0x100000, 0x102000));
+        let [settled_slot] = owed_rows(&root)[..] else {
+            panic!("one owed extent");
+        };
+        assert_eq!(settle_all(&mut root), vec![ChunkAcknowledgement::Freed]);
+        drop(root);
+        // The successor MM takes the freed slot.
+        let mut successor = table.lock(1, next).unwrap();
+        let mapped = successor
+            .mmap(Placement::Fixed(0x100000), 0x2000, rw)
+            .unwrap();
+        complete(&mut successor, mapped);
+        retire_owed(&mut successor, range(0x100000, 0x102000));
+        let successor_owed = owed_rows(&successor);
+        assert_eq!(successor_owed[0].slot, settled_slot.slot);
+        drop(successor);
+        // The old MM retires owing another extent, in another slot.
+        let mut root = table.lock(0, gone).unwrap();
+        retire_owed(&mut root, range(0x104000, 0x106000));
+        let [own] = owed_rows(&root)[..] else {
+            panic!("one owed extent");
+        };
+        assert_ne!(own.slot, settled_slot.slot);
+        assert_eq!(root.retire_final(), Ok(1));
+        assert_eq!(release(&table, gone, true), Some(1));
+        assert_eq!(
+            owed_rows(&table.lock(1, next).unwrap()),
+            successor_owed,
+            "the successor stays owed"
         );
     }
     fn first_fit_avoids(root: &mut Reservations<'_>, owed: ReservationRange, len: u64) -> bool {
@@ -4384,10 +4493,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(owed_plan.range().end(), 0x208000);
-        for owed in ReturnJournal::owed_returns(&root).unwrap().iter() {
-            root.acknowledge_chunk(owed.slot, owed.epoch, owed.range.start(), owed.range.end())
-                .unwrap();
-        }
+        settle_all(&mut root);
         assert_eq!(
             root.revalidate_private_stock_plan(&owed_plan, &empty),
             Err(Refusal::Stale)
@@ -6929,11 +7035,7 @@ mod tests {
             g.commit_range(commit_span, ReservationProtection::READ_WRITE),
             Err(Refusal::Busy)
         );
-        let [owed] = owed[..] else { unreachable!() };
-        assert_eq!(
-            g.acknowledge_chunk(owed.slot, owed.epoch, owed.range.start(), owed.range.end()),
-            Ok(ChunkAcknowledgement::Freed)
-        );
+        assert_eq!(settle_all(&mut g), vec![ChunkAcknowledgement::Freed]);
         assert!(g.is_reserved(reserve_span));
         let decision = g
             .commit_range(commit_span, ReservationProtection::READ_WRITE)
@@ -7087,15 +7189,92 @@ impl<
         }
         Ok(request)
     }
-    fn acknowledge_chunk(
-        &mut self,
-        slot: OwedSlot,
-        epoch: OwedSlotEpoch,
-        expected_start: u64,
-        new_start: u64,
-    ) -> Result<ChunkAcknowledgement, Refusal> {
-        Reservations::acknowledge_chunk(self, slot, epoch, expected_start, new_start)
+    fn acknowledge_chunk(&mut self, chunk: SettledChunk) -> Result<ChunkAcknowledgement, Refusal> {
+        Reservations::acknowledge_chunk(self, chunk)
     }
+}
+
+/// Whole-MM settlement of a retired root's owed returns, at table level: no
+/// root guard exists for a retired MM, and nothing else touches its slots
+/// (claims take only free slots, and no root publishes its key again).
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> RetiredReturns
+    for SharedReservations<Policy, Geometry>
+{
+    fn settle_whole_mm(&self, receipt: MmReleaseReceipt) -> Result<usize, Refusal> {
+        let mm = receipt.mm().raw();
+        let owed = || {
+            self.deferred
+                .iter()
+                .filter(move |slot| slot.mm.load(Ordering::Acquire) == mm)
+        };
+        if self
+            .roots
+            .iter()
+            .any(|root| root.key.load(Ordering::Acquire) == mm)
+        {
+            // The root has not retired: its returns are still its own to
+            // settle, and they stay owed until the venue reruns its release
+            // after that root retires. A root that owes nothing (a fork
+            // rolled back before its child ran) needs no settlement.
+            return match owed().next() {
+                Some(_) => Err(Refusal::Busy),
+                None => Ok(0),
+            };
+        }
+        let mut freed = 0;
+        for slot in owed() {
+            slot.free(ReturnSettlement::whole_mm(&receipt));
+            freed += 1;
+        }
+        Ok(freed)
+    }
+}
+
+/// The settlement venue of VM-free tests: nothing to retire or apply.
+#[cfg(test)]
+struct NoBackingForTest;
+#[cfg(test)]
+impl OwedReturnRetirement for NoBackingForTest {
+    type Prepared = ();
+    type Error = core::convert::Infallible;
+    fn prepare(&mut self, _: &ReturnSettlementRequest) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn apply(&mut self, (): ()) {}
+}
+/// Every extent `root` owes now, settled through the one mint of
+/// acknowledgement authority (`retire_and_apply`), not yet acknowledged.
+#[cfg(test)]
+pub(crate) fn settled_for_test<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    root: &Reservations<'_, Policy, Geometry, C>,
+) -> alloc::vec::Vec<SettledChunk> {
+    let spaces = alloc::boxed::Box::new(carrick_sched_core::AddressSpaces::new());
+    let request = ReturnJournal::owed_returns(root).unwrap();
+    let excluded = spaces.unpublished(request.mm().raw()).unwrap();
+    match request.retire_and_apply(&excluded, &mut NoBackingForTest) {
+        Ok(settled) => settled.expect("the exclusion names the request's MM"),
+        Err(never) => match never {},
+    }
+    .into_chunks()
+    .collect()
+}
+/// Settle and acknowledge every extent `root` owes now.
+#[cfg(test)]
+pub(crate) fn settle_all_for_test<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    root: &mut Reservations<'_, Policy, Geometry, C>,
+) -> alloc::vec::Vec<ChunkAcknowledgement> {
+    settled_for_test(root)
+        .into_iter()
+        .map(|chunk| root.acknowledge_chunk(chunk).unwrap())
+        .collect()
 }
 
 #[cfg(test)]

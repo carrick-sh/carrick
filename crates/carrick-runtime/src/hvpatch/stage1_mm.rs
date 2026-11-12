@@ -915,7 +915,7 @@ impl PreparedStage1MmRetirement {
             residency,
             root_quarantine,
             extension_slots,
-            space: Mutex::new(space),
+            space: Mutex::new(space.map_or(RetiringSpace::Settled, RetiringSpace::Published)),
         }
     }
 }
@@ -1097,8 +1097,19 @@ pub(crate) struct Stage1MmRetirement {
     residency: AsidRetirement,
     root_quarantine: RootQuarantine<Stage1RootSlot>,
     extension_slots: Vec<Stage1RootSlot>,
-    /// The closed publication of the retiring address space, if it had one.
-    space: Mutex<Option<carrick_kernel::kernel::AddressSpacePublication>>,
+    /// The closed publication of the retiring address space, if it had one,
+    /// then the owed returns its retired reservation root left.
+    space: Mutex<RetiringSpace>,
+}
+
+/// The retiring address space's publication, then, once it dropped, the
+/// owed returns its retired reservation root left until the MM's frames are
+/// released ([`Stage1MmRetirement::settle_retired_returns`]).
+#[derive(Debug)]
+enum RetiringSpace {
+    Published(carrick_kernel::kernel::AddressSpacePublication),
+    Owed(Box<carrick_kernel::kernel::RetiredHostReturns>),
+    Settled,
 }
 
 impl Stage1MmRetirement {
@@ -1106,8 +1117,43 @@ impl Stage1MmRetirement {
     /// has the address space installed by EL1 any more, and its published
     /// entry is freed.
     pub(crate) fn retire_address_space(&self) {
-        let space = self.space.lock().take();
+        let space = {
+            let mut space = self.space.lock();
+            match std::mem::replace(&mut *space, RetiringSpace::Settled) {
+                RetiringSpace::Published(publication) => {
+                    if let Some(returns) = publication.retired_returns() {
+                        *space = RetiringSpace::Owed(Box::new(returns));
+                    }
+                    Some(publication)
+                }
+                owed => {
+                    *space = owed;
+                    None
+                }
+            }
+        };
         carrick_core::mm::retirement::drain_publication(space, &self.residency);
+    }
+
+    /// The executor's release of this MM's frames (its whole-MM inventory
+    /// retirement) finished, `released` saying whether it succeeded: only
+    /// a success frees the owed returns the MM's retired reservation root
+    /// left ([`Self::retire_address_space`]). Each slot names frames that
+    /// release returned, so none is acknowledged before it. A failure leaves
+    /// them owed, as the frames are.
+    pub(crate) fn settle_retired_returns(&self, released: bool) {
+        let mut space = self.space.lock();
+        let RetiringSpace::Owed(retired) = &*space else {
+            return;
+        };
+        match retired.settle(released) {
+            Ok(_) => *space = RetiringSpace::Settled,
+            Err(refusal) => tracing::error!(
+                ?refusal,
+                released,
+                "retired host-served root's owed returns stay owed"
+            ),
+        }
     }
 
     pub(crate) fn asid_generation(&self) -> AsidGeneration {
