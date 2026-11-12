@@ -21,6 +21,7 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
 enum DiscardScenario {
     ZeroLength,
     V8CodeRangeAndRootForward,
+    V8CodeRangeExecuteRoundTrip,
 }
 
 #[test]
@@ -45,6 +46,22 @@ fn serial_host_native_fork_exec_v8_code_range_discard_and_root_forward() {
         None,
         None,
         Some(DiscardScenario::V8CodeRangeAndRootForward),
+        false,
+    );
+}
+
+/// #1846: the signed `nativeexecmadvise` probe's V8 code-range sequence in a
+/// fork/exec child. A page first touched while RW carries no execute ceiling
+/// of its own; its root's `VM_MAYEXEC` authorizes `mprotect(RX)` in ring.
+#[test]
+fn serial_host_native_fork_exec_v8_code_range_execute_round_trip() {
+    fork_exec_probe_with_scenario(
+        None,
+        u32::MAX as u64,
+        false,
+        None,
+        None,
+        Some(DiscardScenario::V8CodeRangeExecuteRoundTrip),
         false,
     );
 }
@@ -672,6 +689,7 @@ fn fork_exec_probe_with_scenario(
     let successor_words = successor_tables.live(&fixture.maintenance);
     let fault_pages = std::cell::RefCell::new(BTreeMap::new());
     let scrubs = std::cell::Cell::new(0usize);
+    let cleans = std::cell::RefCell::new(Vec::new());
     if discard.is_some() {
         let successor_raw = fixture.task.mm.key.load(Ordering::Acquire);
         let successor_mm = carrick_el1_abi::ReservationMm::new(successor_raw).unwrap();
@@ -895,6 +913,7 @@ fn fork_exec_probe_with_scenario(
                 },
                 pages: &fault_pages,
                 scrubs: &scrubs,
+                cleans: &cleans,
             },
         });
         let route = crate::dispatch::dispatch_syscall_with_native(
@@ -1193,6 +1212,115 @@ fn fork_exec_probe_with_scenario(
                 assert_eq!(
                     counters.forwarded[233].load(Ordering::Relaxed),
                     forwarded_before + 1
+                );
+                registry.unregister_root_for_test(&runtime);
+            }
+            DiscardScenario::V8CodeRangeExecuteRoundTrip => {
+                use carrick_mmu_core::aarch64::descriptor_txn::{
+                    BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan,
+                    TableGrants, execute_descriptor_op,
+                };
+                use carrick_mmu_core::aarch64::{
+                    GuestLeafPublication, LeafAccess, terminal_descriptor_permits_el0,
+                };
+                const BASE: u64 = 0x4000_0000;
+                const CODE: u64 = 2 * 4096;
+                let leaf =
+                    |va| super::native_fault_supply_tests::leaf(&successor_words, 0xb00000, va);
+                let permits = |va, access| terminal_descriptor_permits_el0(leaf(va), access);
+                // mmap(4 pages, PROT_NONE, PRIVATE|ANONYMOUS|FIXED|NORESERVE).
+                assert_eq!(call_full(222, BASE, 4 * 4096, 0, 0x4032), BASE);
+                settle();
+                // code_commit_rw: mprotect(base, 2 pages, RW) on the lazy range.
+                assert_eq!(call_full(226, BASE, CODE, 3, 0) as i64, 0, "code_commit_rw");
+                settle();
+                // First touch while RW: the carrier's grant publishes the
+                // window's RW protection, so neither leaf records execute.
+                let nz = |v| NonZeroU64::new(v).unwrap();
+                assert!(matches!(
+                    execute_descriptor_op(
+                        &successor_words,
+                        carrick_mmu_core::aarch64::SubstrateGpa(0xb00000),
+                        DescriptorOp::Prepare {
+                            publication: GuestLeafPublication {
+                                va: BASE,
+                                ipa: 0xc00000,
+                                len: CODE,
+                                writable: true,
+                                executable: false,
+                            },
+                            resident: PageSpan::new(BASE, 4096),
+                            backing: BackingIdentity {
+                                frame_id: nz(1),
+                                mapping_id: nz(2),
+                                owner_generation: nz(3),
+                                inventory_revision: nz(4),
+                            },
+                        },
+                        &TableGrants::NONE,
+                        &mut InlineJournal::new(),
+                    ),
+                    DescriptorOutcome::Applied(_)
+                ));
+                fault_pages.borrow_mut().insert(0xc00000, vec![0xa5; 4096]);
+                fault_pages.borrow_mut().insert(0xc01000, vec![0xa5; 4096]);
+                assert!(permits(BASE, LeafAccess::Write));
+                assert!(!permits(BASE, LeafAccess::Execute));
+
+                // code_rx: mprotect(base, 2 pages, RX) must be served in ring.
+                assert_eq!(call_full(226, BASE, CODE, 5, 0) as i64, 0, "code_rx");
+                settle();
+                assert!(permits(BASE, LeafAccess::Read));
+                assert!(permits(BASE, LeafAccess::Execute));
+                assert!(!permits(BASE, LeafAccess::Write));
+                assert_eq!(leaf(BASE) & AARCH64_ROOT_ADDRESS_MASK, 0xc00000);
+                assert_eq!(leaf(BASE + 4096) & 1, 0, "the prepared page stays lazy");
+                assert_eq!(
+                    cleans.borrow().as_slice(),
+                    &[0xc00000, 0xc01000],
+                    "both frames gain execute once, after their instruction stream is cleaned"
+                );
+                // code_rx_readback: the frames kept their bytes.
+                assert!(fault_pages.borrow()[&0xc00000].iter().all(|&b| b == 0xa5));
+
+                // code_madvise: the whole reservation is discarded.
+                assert_eq!(
+                    call_full(233, BASE, 4 * 4096, 4, 0) as i64,
+                    0,
+                    "code_madvise"
+                );
+                settle();
+                assert!(fault_pages.borrow()[&0xc00000].iter().all(|&b| b == 0));
+                assert!(permits(BASE, LeafAccess::Execute), "discard keeps RX");
+
+                // code_recommit_rw, refill, code_recommit_rx.
+                assert_eq!(
+                    call_full(226, BASE, CODE, 3, 0) as i64,
+                    0,
+                    "code_recommit_rw"
+                );
+                settle();
+                assert!(permits(BASE, LeafAccess::Write));
+                assert!(!permits(BASE, LeafAccess::Execute));
+                fault_pages.borrow_mut().insert(0xc00000, vec![0x5a; 4096]);
+                assert_eq!(
+                    call_full(226, BASE, CODE, 5, 0) as i64,
+                    0,
+                    "code_recommit_rx"
+                );
+                settle();
+                assert!(permits(BASE, LeafAccess::Execute));
+                assert!(!permits(BASE, LeafAccess::Write));
+                assert_eq!(
+                    cleans.borrow().len(),
+                    2,
+                    "an execute ceiling already recorded needs no second clean"
+                );
+                assert!(fault_pages.borrow()[&0xc00000].iter().all(|&b| b == 0x5a));
+                assert_eq!(
+                    counters.refused_child[226].load(Ordering::Relaxed),
+                    0,
+                    "no mprotect fell back to the counted ENOSYS"
                 );
                 registry.unregister_root_for_test(&runtime);
             }
@@ -3256,6 +3384,8 @@ struct FixtureDiscardMapping<'a> {
     mapping: super::native_fault_supply_tests::FixtureMapping<'a>,
     pages: &'a std::cell::RefCell<BTreeMap<u64, Vec<u8>>>,
     scrubs: &'a std::cell::Cell<usize>,
+    /// Frames whose instruction stream an execute widening cleaned.
+    cleans: &'a std::cell::RefCell<Vec<u64>>,
 }
 impl carrick_el1::memory::AnonymousBackingProbe for FixtureDiscardMapping<'_> {
     fn bind_operation(&mut self, sequence: carrick_el1_abi::ReservationSequence) {
@@ -3286,7 +3416,25 @@ impl carrick_el1::memory::AnonymousPermissionEditor for FixtureDiscardMapping<'_
         root: carrick_guest_arch::AddressSpaceRegister,
         edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
     ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
-        self.mapping.protect_and_invalidate(root, edit)
+        use carrick_mmu_core::aarch64::GuestPermissionEditError;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, DescriptorRefusal, InlineJournal, TableGrants,
+            execute_descriptor_op,
+        };
+        // A refusal is the editor's answer, not a fixture failure.
+        match execute_descriptor_op(
+            self.mapping.words,
+            carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
+            DescriptorOp::Protect(edit),
+            &TableGrants::NONE,
+            &mut InlineJournal::new(),
+        ) {
+            DescriptorOutcome::Applied(_) => Ok(()),
+            DescriptorOutcome::Refused(
+                DescriptorRefusal::PermissionWidening | DescriptorRefusal::CowArmed,
+            ) => Err(GuestPermissionEditError::PermissionWidening),
+            _ => Err(GuestPermissionEditError::NotPrivateAnonymous),
+        }
     }
 }
 impl carrick_el1::memory::AnonymousRetirementEditor for FixtureDiscardMapping<'_> {
