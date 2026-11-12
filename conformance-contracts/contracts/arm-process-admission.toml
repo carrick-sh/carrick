@@ -95,6 +95,13 @@ rationale = "Admission creates one native process owner for the retained root an
 # (NativeService* reason at the checkpoint's own coordinates); the existing
 # mapping witness is dispatch::tests::
 # native_service_refusals_keep_the_error_in_the_fatal_transport.
+# #1742: the host re-authenticates the stopped forking lane at each fork-stock
+# crossing. A sibling thread's host page-table pause of the shared MM (a
+# raised space gate) made that lane look dead, so the custody commit of an
+# already published vfork child was refused into `ForkCustodyRefused`. A pause
+# is contention; only a closed or re-keyed space refuses. Semantics and
+# budgets are unchanged:
+# native_retirement_tests::arm_vfork_custody_commits_while_a_sibling_pauses_the_parent_space.
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue",
@@ -110,6 +117,7 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::register_thread_busy_keeps_birth_authenticable",
   "carrick-el1-linux::native_process_runtime::host_test_support::register_thread_preserves_existing_credential_storage",
   "carrick-el1-linux::aarch64_process_tests::native_retirement_tests::two_live_processes_reauthenticate_birth_settlement_after_parent_generation_moves",
+  "carrick-el1-linux::aarch64_process_tests::native_retirement_tests::arm_vfork_custody_commits_while_a_sibling_pauses_the_parent_space",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused",
   "carrick-el1-abi::tests::layout_hash_changes_when_any_fact_changes",
