@@ -3,6 +3,7 @@
 use carrick_core_abi::service::ServiceOrigin;
 use carrick_el1_abi::CurrentTask;
 use carrick_el1_linux::file::MemoryValidator;
+use carrick_personality_linux::crossing::HostCrossingSet;
 use carrick_personality_linux::entry::CanonicalCall;
 use carrick_personality_linux::native_host_file::{
     HostFileCall, HostFileStage, NativeDescriptor, NativeNamespace,
@@ -76,7 +77,11 @@ where
     // A descriptor is owned by exactly one table. The run root's ring
     // namespace holds what its staged calls opened; a descriptor absent
     // there (one the host table opened) keeps the host route, which answers
-    // it, rather than a ring EBADF.
+    // it, rather than a ring EBADF. Only a call with an x86 host crossing
+    // has that route: the ring answers the rest, so a bad or closed
+    // descriptor is EBADF there, not a counted ENOSYS (#2138 P0-1).
+    let canonical = carrick_syscall_abi::CanonicalNr::new(call.canonical.raw());
+    let host_route = origin == ServiceOrigin::Initial && HostCrossingSet::X86.is_allowed(canonical);
     let mut absent = false;
     let mut resolve = |fd| {
         let descriptor = resolve(fd);
@@ -94,7 +99,7 @@ where
             releases: &mut releases,
         },
     );
-    if absent && origin == ServiceOrigin::Initial {
+    if absent && host_route {
         return None;
     }
     Some(staged.unwrap_or(HostFileStage::InRing))
@@ -251,6 +256,40 @@ mod tests {
                 expected_route_kept,
                 "{origin:?}: {staged:?}"
             );
+        }
+    }
+
+    #[test]
+    fn root_bad_descriptor_without_a_host_crossing_is_the_ring_ebadf() {
+        // #2138 P0-1: writev, getdents64 and statx have no x86 host
+        // crossing, so declining an absent descriptor made them a counted
+        // ENOSYS. The ring answers them: EBADF (9).
+        let mut buf = [0u8; 256];
+        let out = buf.as_mut_ptr() as u64;
+        let iov = [out, 1];
+        let empty = *b"\0";
+        for fd in [u64::MAX, 3] {
+            for (name, nr, args) in [
+                ("writev", 20, [fd, iov.as_ptr() as u64, 1, 0, 0, 0]),
+                ("getdents64", 217, [fd, out, 64, 0, 0, 0]),
+                (
+                    "statx",
+                    332,
+                    [fd, empty.as_ptr() as u64, 0x1000, 0x7ff, out, 0],
+                ),
+            ] {
+                let staged = stage(nr, args, INITIAL, Some(NativeDescriptor::Absent));
+                assert_eq!(
+                    staged,
+                    Some(HostFileStage::Returned(
+                        carrick_personality_linux::entry::SyscallResult::from_errno(
+                            carrick_syscall_abi::LINUX_EBADF
+                        )
+                    )),
+                    "{name} fd {}",
+                    fd as i64
+                );
+            }
         }
     }
 
