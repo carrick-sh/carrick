@@ -816,6 +816,26 @@ impl NativeLane<'_> {
                 .checked_add(size as u64)
                 .is_some_and(|end| end <= self.lane.data_end)
     }
+    /// The bounded carrier retains this eagerly backed private RAM aperture.
+    /// Shared spellings use the same neutral admission and key rule as the
+    /// production process owner; no mapping outside the aperture is admitted.
+    fn futex_key(&self, address: UserVa) -> Option<carrick_personality_linux::sched::MmFutexKey> {
+        use carrick_personality_linux::sched::{MmFutexKey, MmFutexMapping};
+        let shared = FutexCall { args: self.args }
+            .shared_private_candidate()
+            .is_some();
+        if shared && !self.valid_user_range(address.raw(), 4) {
+            return None;
+        }
+        MmFutexKey::for_mapping(
+            address,
+            if shared {
+                MmFutexMapping::SharedPrivate
+            } else {
+                MmFutexMapping::Private
+            },
+        )
+    }
     /// A futex wake always finishes in the ring (#1941): the bucket lock is
     /// short, and [`ZoneTables::wake_placed`] never refuses an EL1 waker.
     fn wake_word(&mut self, mm: u64, address: u64, mask: u32, limit: u32) {
@@ -1553,13 +1573,18 @@ impl FutexVenue for NativeLane<'_> {
         mask: u32,
         limit: u32,
     ) -> Self::Served {
-        self.wake_word(mm.raw(), address.raw(), mask, limit);
+        let Some(key) = self.futex_key(address) else {
+            self.frame.rax = carrick_abi::LINUX_EINVAL.guest_retval() as u64;
+            return carrick_core::Served::Returned { switched: false };
+        };
+        self.wake_word(mm.raw(), key.scheduler_address(), mask, limit);
         carrick_core::Served::Returned { switched: false }
     }
     fn wait(&mut self, wait: FutexWait) -> Option<Self::Served> {
+        let key = self.futex_key(wait.address)?;
         let zone = self.zone;
         let guard = zone.lock(
-            ZoneTables::bucket_of(wait.mm.raw(), wait.address.raw()),
+            ZoneTables::bucket_of(wait.mm.raw(), key.scheduler_address()),
             &BoundedSpin(1024),
         )?;
         let mut word = 0;
@@ -1628,7 +1653,7 @@ impl FutexVenue for NativeLane<'_> {
                 record,
                 seq,
                 wait.mm.raw(),
-                wait.address.raw(),
+                key.scheduler_address(),
                 wait.bitset,
                 0,
             )
@@ -1693,8 +1718,13 @@ impl<'a> PendingFamilies<'a> for NativeLane<'a> {
     }
     fn futex(&mut self) -> FamilyCompletion {
         let original = self.args[0];
+        let call = FutexCall { args: self.args };
+        let candidate = call.shared_private_candidate();
+        if candidate.is_some() && self.futex_key(UserVa::new(original)).is_none() {
+            return FamilyCompletion::Forward;
+        }
         let Some(served) =
-            carrick_personality_linux::sched::serve_futex(FutexCall { args: self.args }, self)
+            carrick_personality_linux::sched::serve_futex(candidate.unwrap_or(call), self)
         else {
             return FamilyCompletion::Forward;
         };

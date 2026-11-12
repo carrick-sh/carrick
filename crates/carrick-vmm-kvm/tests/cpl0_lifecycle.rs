@@ -25,7 +25,7 @@ fn mov(bytes: &mut Vec<u8>, opcode: &[u8], value: u64) {
 fn program(index: u64) -> Vec<u8> {
     program_with_timeout(index, None)
 }
-/// `timeout`: seconds of a relative FUTEX_WAIT timespec the parent's join
+/// `timeout`: seconds of a relative shared FUTEX_WAIT timespec the parent's join
 /// wait carries; `None` joins with no timeout.
 fn program_with_timeout(index: u64, timeout: Option<u64>) -> Vec<u8> {
     let mut p = Vec::new();
@@ -42,7 +42,7 @@ fn program_with_timeout(index: u64, timeout: Option<u64>) -> Vec<u8> {
     p.extend_from_slice(&0i32.to_le_bytes());
     p.extend_from_slice(&[0x48, 0x89, 0xc2]); // RDX clone result, expected tid
     mov(&mut p, &[0x48, 0xbf], LIFECYCLE_DATA + 8);
-    p.extend_from_slice(&[0xbe, 128, 0, 0, 0]); // ESI FUTEX_WAIT_PRIVATE
+    p.extend_from_slice(&[0xbe, 0, 0, 0, 0]); // ESI shared FUTEX_WAIT: clear-tid uses a shared wake
     match timeout {
         None => p.extend_from_slice(&[0x45, 0x31, 0xd2]), // R10 no timeout
         Some(secs) => {

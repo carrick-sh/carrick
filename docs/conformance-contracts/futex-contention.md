@@ -709,3 +709,12 @@ a joiner with op 265, verifies the child's raw exit enters host custody, then
 applies the production host `FutexQueueAuthority::wake_child_tid` API after the
 clear-word copyout. Before repair, that wake finds zero waiters instead of one.
 This is a VM-free custody-boundary witness, not a signed runtime retirement demo.
+
+The bounded CPL0 lifecycle carrier also selects shared keys for shared waits
+inside its existing eagerly backed private RAM aperture. It reuses
+`FutexCall::shared_private_candidate` and `MmFutexKey::for_mapping`; it does not
+admit shared addresses outside the retained aperture. Its clear-tid programs
+issue shared FUTEX_WAIT, including the relative timed variant. The executing
+KVM fixtures retain their repeated birth/retirement, exact wake cardinality,
+TLS/extended-context and timer-release assertions. This bounded sidecar does
+not establish production executor-pool exhaustion or signed ARM execution.
