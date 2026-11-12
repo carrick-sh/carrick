@@ -48,6 +48,70 @@ impl<'a> FsView<'a> {
         self.check_directory_search_access(&target)?;
         Ok(target)
     }
+
+    /// The directory `fchdir` makes the cwd, as the cwd spells it: the one
+    /// lookup the host task's `fchdir` and a ring task's fchdir crossing
+    /// share (#2206). EBADF for a closed description, ENOTDIR for anything
+    /// but a directory, and EACCES without search permission on it.
+    pub(in crate::dispatch) fn fchdir_target(
+        &self,
+        description: &crate::kernel::FileDescription,
+    ) -> Result<String, LinuxErrno> {
+        let Some(open) = crate::kernel::FileDescription::inspect(description) else {
+            return Err(LINUX_EBADF);
+        };
+        match &*open {
+            OpenDescription::Closed { .. } => Err(LINUX_EBADF),
+            OpenDescription::Directory { metadata, .. } => {
+                let dir_path = display_rootfs_path(&metadata.path);
+                // fchdir(2) requires search (execute) permission on the
+                // directory the fd refers to. The fd may have been opened
+                // O_RDONLY (needing only read) and the directory later
+                // chmod'd to drop its search bit — so re-stat to observe the
+                // CURRENT mode/owner rather than the value captured at open
+                // time. A non-root euid lacking X on the directory gets
+                // EACCES (fchdir03); root (euid 0) bypasses via
+                // CAP_DAC_OVERRIDE.
+                let creds = self.cred_snapshot();
+                if !creds.euid.is_root()
+                    && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&dir_path, true)
+                    && crate::dispatch::dac_check(
+                        creds.euid, creds.egid, real.uid, real.gid, real.mode, true, LINUX_X_OK,
+                    )
+                    .is_err()
+                {
+                    return Err(LINUX_EACCES);
+                }
+                Ok(dir_path)
+            }
+            OpenDescription::File { .. }
+            | OpenDescription::InMemoryFile { .. }
+            | OpenDescription::HostFile { .. }
+            | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::ProcExecutable { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. }
+            | OpenDescription::Fanotify { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::SignalFd { .. }
+            | OpenDescription::PerfEvent { .. }
+            | OpenDescription::FsContext { .. }
+            | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
+            | OpenDescription::SyntheticDevice { .. }
+            | OpenDescription::VirtualConsole { .. }
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::Packet { .. } => Err(LINUX_ENOTDIR),
+        }
+    }
 }
 
 impl<'a> FsView<'a> {
@@ -139,68 +203,13 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            Ok(match &*open {
-                OpenDescription::Closed { .. } => DispatchOutcome::errno(LINUX_EBADF),
-                OpenDescription::Directory { metadata, .. } => {
-                    let dir_path = display_rootfs_path(&metadata.path);
-                    // fchdir(2) requires search (execute) permission on the
-                    // directory the fd refers to. The fd may have been opened
-                    // O_RDONLY (needing only read) and the directory later
-                    // chmod'd to drop its search bit — so re-stat to observe the
-                    // CURRENT mode/owner rather than the value captured at open
-                    // time. A non-root euid lacking X on the directory gets
-                    // EACCES (fchdir03); root (euid 0) bypasses via
-                    // CAP_DAC_OVERRIDE.
-                    let creds = this.cred_snapshot();
-                    if !creds.euid.is_root()
-                        && let Some(real) =
-                            this.fs.rootfs_vfs.overlay.real_stat(&dir_path, true)
-                        && crate::dispatch::dac_check(
-                            creds.euid,
-                            creds.egid,
-                            real.uid,
-                            real.gid,
-                            real.mode,
-                            true,
-                            LINUX_X_OK,
-                        )
-                        .is_err()
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                    }
+            Ok(match this.fchdir_target(&open_file.description) {
+                Ok(dir_path) => {
                     this.captured_fs_context().set_cwd(dir_path);
                     crate::el1_inotify::bump_cwd_generation();
                     DispatchOutcome::Returned { value: 0 }
                 }
-                OpenDescription::File { .. }
-                | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::HostFile { .. }
-                | OpenDescription::SyntheticFile { .. }
-                | OpenDescription::ProcExecutable { .. }
-                | OpenDescription::EventFd { .. }
-                | OpenDescription::TimerFd { .. }
-                | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. }
-                | OpenDescription::Fanotify { .. }
-                | OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
-                | OpenDescription::HostPipe { .. }
-                | OpenDescription::HostSocket { .. }
-                | OpenDescription::InMemorySocket { .. }
-                | OpenDescription::SignalFd { .. }
-                | OpenDescription::PerfEvent { .. }
-                | OpenDescription::FsContext { .. }
-                | OpenDescription::Mqueue { .. }
-                | OpenDescription::BpfMap { .. }
-                | OpenDescription::BpfProg { .. }
-                | OpenDescription::SyntheticDevice { .. }
-                | OpenDescription::VirtualConsole { .. }
-                | OpenDescription::Netlink { .. }
-                | OpenDescription::Packet { .. } => DispatchOutcome::errno(LINUX_ENOTDIR),
+                Err(errno) => DispatchOutcome::errno(errno),
             })
         }
     }
