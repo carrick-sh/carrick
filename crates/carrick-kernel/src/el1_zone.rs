@@ -629,7 +629,17 @@ impl FutexQueueAuthority {
     pub fn wake_child_tid(self, futex: &crate::thread::FutexTable, address: u64) -> ZoneWake {
         let wake = match self.0 {
             FutexQueueVenue::Zone(queue) => queue.wake(
-                address,
+                match carrick_personality_linux::sched::MmFutexKey::shared_private(
+                    carrick_core::personality::UserVa::new(address),
+                ) {
+                    Some(key) => key,
+                    None => {
+                        return ZoneWake {
+                            count: 0,
+                            handed: Vec::new(),
+                        };
+                    }
+                },
                 carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
                 carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
             ),
@@ -671,15 +681,26 @@ impl ZoneFutexQueue {
     }
 
     /// Host `FUTEX_WAKE(_BITSET)` on this queue.
-    pub fn wake(self, uaddr: u64, bitset: u32, count: u32) -> ZoneWake {
-        wake(self.tables, self.key(), uaddr, bitset, count)
+    pub fn wake(
+        self,
+        uaddr: carrick_personality_linux::sched::MmFutexKey,
+        bitset: u32,
+        count: u32,
+    ) -> ZoneWake {
+        wake(
+            self.tables,
+            self.key(),
+            uaddr.scheduler_address(),
+            bitset,
+            count,
+        )
     }
 
     /// Host `FUTEX_(CMP_)REQUEUE` on this queue ([`requeue`]).
     pub fn requeue<E>(
         self,
-        from: u64,
-        to: u64,
+        from: carrick_personality_linux::sched::MmFutexKey,
+        to: carrick_personality_linux::sched::MmFutexKey,
         wake_count: u32,
         requeue_count: u32,
         check: impl FnOnce() -> Result<(), E>,
@@ -687,8 +708,8 @@ impl ZoneFutexQueue {
         requeue(
             self.tables,
             self.key(),
-            from,
-            to,
+            from.scheduler_address(),
+            to.scheduler_address(),
             wake_count,
             requeue_count,
             check,

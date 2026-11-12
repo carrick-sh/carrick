@@ -601,6 +601,18 @@ pub(crate) fn dispatch_zone_futex(
     relative_wait: Option<&super::request::RelativeFutexWait>,
 ) -> DispatchOutcome {
     let address = request.arg(0);
+    let mapping = if futex_flags.contains(LinuxFutexFlags::PRIVATE) {
+        carrick_personality_linux::sched::MmFutexMapping::Private
+    } else {
+        carrick_personality_linux::sched::MmFutexMapping::SharedPrivate
+    };
+    let Some(key) =
+        carrick_personality_linux::sched::MmFutexKey::for_mapping(UserVa::new(address), mapping)
+    else {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    };
     let value = request.arg(2) as u32;
     let timeout_address = request.arg(3);
     let bitset = if matches!(
@@ -613,7 +625,7 @@ pub(crate) fn dispatch_zone_futex(
     };
     match command {
         LINUX_FUTEX_WAKE => {
-            let woken = queue.wake(address, bitset, value);
+            let woken = queue.wake(key, bitset, value);
             DispatchOutcome::ZoneFutexWoken {
                 value: i64::from(woken.count),
                 woken: woken.handed,
@@ -652,7 +664,7 @@ pub(crate) fn dispatch_zone_futex(
             };
             DispatchOutcome::ZoneFutexWait {
                 queue,
-                uaddr: address,
+                uaddr: key,
                 value,
                 bitset,
                 timeout,
@@ -672,7 +684,15 @@ pub(crate) fn dispatch_zone_futex(
                 };
             }
             let val3 = request.arg(5) as u32;
-            let result = queue.requeue(address, uaddr2, value, request.arg(3) as u32, || {
+            let Some(key2) = carrick_personality_linux::sched::MmFutexKey::for_mapping(
+                UserVa::new(uaddr2),
+                mapping,
+            ) else {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            };
+            let result = queue.requeue(key, key2, value, request.arg(3) as u32, || {
                 if raw_command != LINUX_FUTEX_CMP_REQUEUE {
                     return Ok(());
                 }
@@ -838,7 +858,21 @@ pub(crate) fn dispatch_futex_waitv_args(
         if let Some(queue) = queue.zone() {
             return DispatchOutcome::ZoneFutexWait {
                 queue,
-                uaddr: entry.address,
+                uaddr: match carrick_personality_linux::sched::MmFutexKey::for_mapping(
+                    UserVa::new(entry.address),
+                    if entry.private {
+                        carrick_personality_linux::sched::MmFutexMapping::Private
+                    } else {
+                        carrick_personality_linux::sched::MmFutexMapping::SharedPrivate
+                    },
+                ) {
+                    Some(key) => key,
+                    None => {
+                        return DispatchOutcome::Errno {
+                            errno: LINUX_EINVAL,
+                        };
+                    }
+                },
                 value: entry.value,
                 bitset: u32::MAX,
                 timeout,

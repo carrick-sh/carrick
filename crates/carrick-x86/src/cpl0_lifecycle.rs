@@ -459,6 +459,9 @@ mod process_exit_tests {
         }
 
         fn new(busy: &[(super::SlotId, u32)], waiter_cpus: u64) -> Self {
+            Self::new_key(busy, waiter_cpus, Self::UADDR)
+        }
+        fn new_key(busy: &[(super::SlotId, u32)], waiter_cpus: u64, key: u64) -> Self {
             use super::*;
             let zone = unsafe {
                 // SAFETY: aligned zeroed allocation is the empty ZoneTables representation.
@@ -485,12 +488,9 @@ mod process_exit_tests {
             let seq = zone.next_seq(waiter);
             {
                 let guard = zone
-                    .lock(
-                        ZoneTables::bucket_of(Self::MM, Self::UADDR),
-                        &BoundedSpin(0),
-                    )
+                    .lock(ZoneTables::bucket_of(Self::MM, key), &BoundedSpin(0))
                     .expect("bucket");
-                zone.enqueue(&guard, waiter, seq, Self::MM, Self::UADDR, u32::MAX, 0)
+                zone.enqueue(&guard, waiter, seq, Self::MM, key, u32::MAX, 0)
                     .expect("park");
                 zone.publish_park(waiter, seq);
             }
@@ -509,6 +509,9 @@ mod process_exit_tests {
         /// `serve_futex` -> `FutexVenue::wake` -> `NativeLane::wake_word`.
         /// Returns the completion, the syscall result and the lane's wakes.
         fn serve_wake(&self) -> (super::FamilyCompletion, u64, u64) {
+            self.serve_wake_kind(false)
+        }
+        fn serve_wake_kind(&self, child_tid: bool) -> (super::FamilyCompletion, u64, u64) {
             use super::*;
             let counters = Counters::new();
             let page = ThreadLifecyclePage::new();
@@ -548,9 +551,36 @@ mod process_exit_tests {
                 // FUTEX_WAKE | FUTEX_PRIVATE_FLAG, one waiter.
                 args: [Self::UADDR, 129, 1, 0, 0, 0],
             };
-            let completion = PendingFamilies::futex(&mut native);
+            let completion = if child_tid {
+                assert!(LifecycleNative::wake_child_tid(
+                    &mut native,
+                    EntryMmKey::from_raw(Self::MM),
+                    UserVa::new(Self::UADDR),
+                ));
+                FamilyCompletion::Complete(0)
+            } else {
+                PendingFamilies::futex(&mut native)
+            };
             (completion, native.frame.rax, native.lane.wakes)
         }
+    }
+
+    #[test]
+    fn cpl0_child_tid_wake_meets_shared_private_waiter() {
+        use super::*;
+        let key = carrick_personality_linux::sched::MmFutexKey::shared_private(UserVa::new(
+            LaneWake::UADDR,
+        ))
+        .unwrap();
+        let fixture = LaneWake::new_key(&[], 1, key.scheduler_address());
+        fixture.serve_wake_kind(true);
+        assert!(
+            matches!(
+                fixture.zone.record(fixture.waiter).claim(),
+                Claim::Queued { .. }
+            ),
+            "CPL0 exit must release the shared join waiter"
+        );
     }
 
     /// #1941 x86 parity: the lane's `FUTEX_WAKE_PRIVATE`
@@ -1137,9 +1167,13 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         })
     }
     fn wake_child_tid(&mut self, mm: EntryMmKey, address: UserVa) -> bool {
+        let Some(key) = carrick_personality_linux::sched::MmFutexKey::shared_private(address)
+        else {
+            return true;
+        };
         self.wake_word(
             mm.raw(),
-            address.raw(),
+            key.scheduler_address(),
             carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
             carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
         );
