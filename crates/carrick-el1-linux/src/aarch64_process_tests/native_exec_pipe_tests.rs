@@ -352,6 +352,18 @@ fn fork_exec_probe_with_departure(
         )
         .unwrap(),
     );
+    // As the carrier does before publishing a region (`stage2_backend`): a
+    // full operation arena is then contention with a release source.
+    fixture
+        .zone
+        .bind_ipc_operation_slots(
+            owner.region().operation_slot_generation(),
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+        )
+        .unwrap();
     let table = Arc::new(HostTable::create(owner.clone(), 64, 64).unwrap());
     let object = owner.create_pipe(65536).unwrap();
     for (number, end, access) in [
