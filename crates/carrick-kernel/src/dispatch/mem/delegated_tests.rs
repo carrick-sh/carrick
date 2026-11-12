@@ -8659,8 +8659,10 @@ mod private_file_owner {
             }
             if !owner_reserved && prot & RWX != 0 {
                 for page in Self::pages(address, len) {
-                    if !self.leaves.contains_key(&page) {
-                        self.leaves.insert(page, Leaf::HostZero);
+                    if let std::collections::btree_map::Entry::Vacant(leaf) =
+                        self.leaves.entry(page)
+                    {
+                        leaf.insert(Leaf::HostZero);
                         self.inner.zero_backing(page, PAGE as usize)?;
                     }
                 }
