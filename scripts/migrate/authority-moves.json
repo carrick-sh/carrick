@@ -115,6 +115,11 @@
       "from": "carrick_runtime::vcpu_loop::exec::ThreadRuntimeState<E>::drive_execve::CARRICK_HVPATCH_VERIFY_EXEC_CODE",
       "to": "carrick_runtime::vcpu_loop::exec::<HvpatchExecVenue<'a,E> as RootExecVenue>::verify_image::CARRICK_HVPATCH_VERIFY_EXEC_CODE",
       "issue": 2142
+    },
+    {
+      "from": "carrick_runtime::vcpu_loop::executor::run_executor_loop",
+      "to": "carrick_runtime::vcpu_loop::executor::retarget_exec_replacement",
+      "issue": 2142
     }
   ],
   "authority_debt_admissions": [

@@ -3623,7 +3623,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:vcpu_loop::executor_exec_transfer",
-      "owner": "carrick_runtime::vcpu_loop::executor::run_executor_loop",
+      "owner": "carrick_runtime::vcpu_loop::executor::retarget_exec_replacement",
       "lane": "shared",
       "ceiling": 2
     },
