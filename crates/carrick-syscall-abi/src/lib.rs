@@ -208,6 +208,10 @@ pub const LINUX_CLOCK_TAI: u64 = 11;
 pub const LINUX_CLOCK_CPU_WHICH_MASK: u32 = 0b011;
 pub const LINUX_CLOCK_CPU_PERTHREAD: u32 = 0b100;
 pub const LINUX_CLOCK_FD: u32 = 0b011;
+/// The `clock_getres` stand-in (1 ms): the resolution low-res Docker host
+/// kernels report, and the grid COARSE reads truncate to. Shared by the host
+/// dispatcher and the ring clock owner.
+pub const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
 /// `clock_nanosleep`/`timer_settime` absolute-deadline flag.
 pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
 

@@ -48,10 +48,18 @@ pub fn edit_x86_anonymous(
     Ok(execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome)
 }
 
+#[cfg(target_os = "none")]
+use crate::rust_alloc::vec::Vec;
+#[cfg(not(target_os = "none"))]
+use std::vec::Vec;
+
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
 const SYS_MPROTECT: u64 = 226;
+const SYS_MADVISE: u64 = 233;
+const ARM_EL0_CLOCK_STUB_BASE: u64 = 0x2E_0002_0000;
+const ARM_EL0_CLOCK_STUB_SIZE: u64 = 0x4000;
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const PROT_EXEC: u64 = 4;
@@ -455,6 +463,29 @@ impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
         let words =
             carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64;
         let byte_len = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize;
+        // Only a root ceiling can newly grant execute in ring; make those
+        // frames' instruction stream coherent first.
+        #[cfg(target_arch = "aarch64")]
+        if edit.executable && edit.root_ceiling.is_some_and(|ceiling| ceiling.executable) {
+            with_live_aarch64_words(
+                carrick_guest_arch::AddressSpaceRegister::from_register(ttbr0),
+                |words, root| {
+                    clean_aarch64_execute_widening(
+                        words,
+                        root,
+                        carrick_el1_abi::EL1_COW_COPY_BASE,
+                        edit.va,
+                        edit.len,
+                        // SAFETY: `with_cow_write_alias` mapped `alias_va` as an
+                        // exclusive live 4 KiB EL1 page for this closure.
+                        |alias_va| unsafe {
+                            crate::isa::aarch64::clean_executable_alias_page(alias_va)
+                        },
+                    )
+                },
+            )
+            .map_err(|_| GuestPermissionEditError::NotPrivateAnonymous)??;
+        }
         unsafe {
             carrick_mmu_core::aarch64::protect_existing_el1_private_pages(
                 words,
@@ -861,6 +892,557 @@ impl AnonymousRetirementEditor for HardwareAnonymousEditor {
     }
 }
 
+/// One validated segment step of a delegated `madvise` discard plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonymousDiscardStep {
+    /// Validate and zero every owned, non-COW private-anonymous leaf in `[start, end)`.
+    DiscardPrivateAnonymous { start: u64, end: u64 },
+    /// Validate that `[start, end)` holds no resident, prepared, or unowned leaves.
+    ValidateEmptyPrivateFile { start: u64, end: u64 },
+}
+
+/// Outcome of an all-or-nothing delegated discard step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonymousDiscardError {
+    /// Refused before any frame byte was modified; caller forwards or declines.
+    Refused(carrick_el1_abi::AnonymousLeave),
+    /// Copy-window revocation failed; caller must quarantine the MM editor.
+    Indeterminate,
+}
+
+/// Exact-MM page-scrubbing editor for delegated `madvise` discard plans.
+pub trait AnonymousDiscardEditor {
+    fn bind_discard_edit(&mut self, _generation: AnonymousEditGeneration) {}
+
+    fn check_discard_range(
+        &self,
+        _range: carrick_personality_linux::mm::madvise::Range,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        Ok(())
+    }
+
+    fn discard_and_scrub(
+        &mut self,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        steps: &[AnonymousDiscardStep],
+    ) -> Result<(), AnonymousDiscardError>;
+}
+
+/// True when `[address, end)` overlaps the ARM64 EL0 raw-clock stub aperture.
+#[must_use]
+pub const fn overlaps_arm_el0_clock_stub(address: u64, end: u64) -> bool {
+    address < end
+        && address < ARM_EL0_CLOCK_STUB_BASE + ARM_EL0_CLOCK_STUB_SIZE
+        && ARM_EL0_CLOCK_STUB_BASE < end
+}
+
+fn walk_discard_leaves<A: AnonymousDescriptorDecode>(
+    read: &dyn Fn(u64) -> Option<u64>,
+    root: u64,
+    start: u64,
+    end: u64,
+    visit: &mut dyn FnMut(u64, usize, u64) -> Result<(), AnonymousDiscardError>,
+) -> Result<(), AnonymousDiscardError> {
+    use carrick_el1_abi::AnonymousLeave as Leave;
+    const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
+    if start > end || !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE) {
+        return Err(AnonymousDiscardError::Refused(Leave::BackingMalformed));
+    }
+    let mut cursor = start;
+    while cursor < end {
+        let index = A::indices(UserVa::new(cursor));
+        let mut table = root;
+        let mut level = 0;
+        let descriptor = loop {
+            let Some(descriptor) = read(table + index[level] as u64 * 8) else {
+                return Err(AnonymousDiscardError::Refused(Leave::BackingMalformed));
+            };
+            if let Some(next_table) = A::next_table(descriptor, level) {
+                table = next_table.raw();
+                level += 1;
+                continue;
+            }
+            break descriptor;
+        };
+        let span = SPANS[level];
+        let next = (cursor & !(span - 1)).saturating_add(span);
+        if descriptor != 0 {
+            visit(cursor, level, descriptor)?;
+        }
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
+    }
+    Ok(())
+}
+
+/// Validate every step in `steps` over live AArch64 stage-1 words before any
+/// write, then zero each owned, non-COW private-anonymous page in place via
+/// [`carrick_mmu_core::aarch64::descriptor_txn::copy_window::with_cow_write_alias`].
+pub fn discard_aarch64_anonymous_steps<W>(
+    words: &W,
+    root: carrick_mmu_core::aarch64::SubstrateGpa,
+    copy_base: u64,
+    steps: &[AnonymousDiscardStep],
+    mut scrub_page: impl FnMut(u64, bool),
+) -> Result<(), AnonymousDiscardError>
+where
+    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+{
+    use carrick_el1_abi::AnonymousLeave as Leave;
+    use carrick_mmu_core::aarch64::El1PrivateLeafState;
+    use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+    use carrick_mmu_core::aarch64::descriptor_txn::copy_window::{
+        validate_cow_copy_window, with_cow_write_alias,
+    };
+    const PA_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    let read = |pa: u64| words.load(pa).ok();
+    let mut needs_window = false;
+    for &step in steps {
+        match step {
+            AnonymousDiscardStep::ValidateEmptyPrivateFile { start, end } => {
+                walk_discard_leaves::<ArmAnonymousDecode>(
+                    &read,
+                    root.raw(),
+                    start,
+                    end,
+                    &mut |_, level, descriptor| match ArmAnonymousDecode::private_state(descriptor)
+                    {
+                        El1PrivateLeafState::Retired => Ok(()),
+                        El1PrivateLeafState::Resident | El1PrivateLeafState::Prepared => {
+                            Err(AnonymousDiscardError::Refused(Leave::RootDeclined))
+                        }
+                        El1PrivateLeafState::Unowned if level < 3 => {
+                            Err(AnonymousDiscardError::Refused(Leave::BackingBlock))
+                        }
+                        El1PrivateLeafState::Unowned => {
+                            Err(AnonymousDiscardError::Refused(Leave::BackingHostOwnedLeaf))
+                        }
+                        El1PrivateLeafState::Malformed => {
+                            Err(AnonymousDiscardError::Refused(Leave::BackingMalformed))
+                        }
+                    },
+                )?;
+            }
+            AnonymousDiscardStep::DiscardPrivateAnonymous { start, end } => {
+                walk_discard_leaves::<ArmAnonymousDecode>(
+                    &read,
+                    root.raw(),
+                    start,
+                    end,
+                    &mut |_, level, descriptor| {
+                        if level < 3 {
+                            return Err(AnonymousDiscardError::Refused(Leave::BackingBlock));
+                        }
+                        match ArmAnonymousDecode::private_state(descriptor) {
+                            El1PrivateLeafState::Retired => Ok(()),
+                            El1PrivateLeafState::Resident | El1PrivateLeafState::Prepared => {
+                                if carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(
+                                    descriptor,
+                                ) || carrick_mmu_core::aarch64::terminal_descriptor_defers_fork_cow(
+                                    descriptor,
+                                ) {
+                                    return Err(AnonymousDiscardError::Refused(Leave::EditRefused));
+                                }
+                                if descriptor & PA_MASK == 0 {
+                                    return Err(AnonymousDiscardError::Refused(
+                                        Leave::BackingMalformed,
+                                    ));
+                                }
+                                needs_window = true;
+                                Ok(())
+                            }
+                            El1PrivateLeafState::Unowned => {
+                                Err(AnonymousDiscardError::Refused(Leave::BackingHostOwnedLeaf))
+                            }
+                            El1PrivateLeafState::Malformed => {
+                                Err(AnonymousDiscardError::Refused(Leave::BackingMalformed))
+                            }
+                        }
+                    },
+                )?;
+            }
+        }
+    }
+    if !needs_window {
+        return Ok(());
+    }
+    validate_cow_copy_window(words, root, copy_base)
+        .map_err(|_| AnonymousDiscardError::Refused(Leave::EditRefused))?;
+
+    for &step in steps {
+        let AnonymousDiscardStep::DiscardPrivateAnonymous { start, end } = step else {
+            continue;
+        };
+        walk_discard_leaves::<ArmAnonymousDecode>(
+            &read,
+            root.raw(),
+            start,
+            end,
+            &mut |_, _, descriptor| match ArmAnonymousDecode::private_state(descriptor) {
+                El1PrivateLeafState::Retired => Ok(()),
+                El1PrivateLeafState::Resident | El1PrivateLeafState::Prepared => {
+                    let ipa = carrick_mmu_core::aarch64::SubstrateGpa(descriptor & PA_MASK);
+                    let executable =
+                        carrick_mmu_core::aarch64::terminal_descriptor_may_execute(descriptor);
+                    with_cow_write_alias(words, root, copy_base, ipa, |alias_va| {
+                        scrub_page(alias_va, executable);
+                    })
+                    .map_err(|outcome| match outcome {
+                        DescriptorOutcome::Indeterminate(_) => AnonymousDiscardError::Indeterminate,
+                        _ => AnonymousDiscardError::Refused(Leave::EditRefused),
+                    })
+                }
+                _ => Err(AnonymousDiscardError::Refused(Leave::BackingMalformed)),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Before a root-authorized `mprotect` grants execute in ring, clean each
+/// frame in `[va, va + len)` whose leaf records no execute ceiling yet.
+/// AArch64 instruction fetch is not coherent with data writes: the carrier
+/// cleans a frame only when it publishes the frame executable, and EL1 now
+/// grants execute itself. Every leaf is validated before the first clean.
+/// COW-armed leaves are skipped, because the descriptor edit refuses to widen
+/// them. `clean_page` gets each frame's exclusive EL1 alias.
+pub fn clean_aarch64_execute_widening<W>(
+    words: &W,
+    root: carrick_mmu_core::aarch64::SubstrateGpa,
+    copy_base: u64,
+    va: u64,
+    len: u64,
+    mut clean_page: impl FnMut(u64),
+) -> Result<(), GuestPermissionEditError>
+where
+    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+{
+    use carrick_mmu_core::aarch64::El1PrivateLeafState;
+    use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+    use carrick_mmu_core::aarch64::descriptor_txn::copy_window::{
+        validate_cow_copy_window, with_cow_write_alias,
+    };
+    const PA_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    let end = va
+        .checked_add(len)
+        .ok_or(GuestPermissionEditError::BadRange)?;
+    let read = |pa: u64| words.load(pa).ok();
+    let needs_clean = |descriptor: u64| {
+        matches!(
+            ArmAnonymousDecode::private_state(descriptor),
+            El1PrivateLeafState::Resident | El1PrivateLeafState::Prepared
+        ) && !carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(descriptor)
+            && !carrick_mmu_core::aarch64::terminal_descriptor_may_execute(descriptor)
+    };
+    let mut needs_window = false;
+    walk_discard_leaves::<ArmAnonymousDecode>(
+        &read,
+        root.raw(),
+        va,
+        end,
+        &mut |_, level, descriptor| {
+            if !needs_clean(descriptor) {
+                return Ok(());
+            }
+            // A coarse block or an output-less leaf has no exact page alias.
+            if level < 3 || descriptor & PA_MASK == 0 {
+                return Err(AnonymousDiscardError::Refused(
+                    carrick_el1_abi::AnonymousLeave::BackingMalformed,
+                ));
+            }
+            needs_window = true;
+            Ok(())
+        },
+    )
+    .map_err(|_| GuestPermissionEditError::NotPrivateAnonymous)?;
+    if !needs_window {
+        return Ok(());
+    }
+    validate_cow_copy_window(words, root, copy_base)
+        .map_err(|_| GuestPermissionEditError::NotPrivateAnonymous)?;
+    walk_discard_leaves::<ArmAnonymousDecode>(
+        &read,
+        root.raw(),
+        va,
+        end,
+        &mut |_, _, descriptor| {
+            if !needs_clean(descriptor) {
+                return Ok(());
+            }
+            let ipa = carrick_mmu_core::aarch64::SubstrateGpa(descriptor & PA_MASK);
+            with_cow_write_alias(words, root, copy_base, ipa, &mut clean_page).map_err(|outcome| {
+                match outcome {
+                    DescriptorOutcome::Indeterminate(_) => AnonymousDiscardError::Indeterminate,
+                    _ => {
+                        AnonymousDiscardError::Refused(carrick_el1_abi::AnonymousLeave::EditRefused)
+                    }
+                }
+            })
+        },
+    )
+    .map_err(|error| match error {
+        // The alias could not be revoked: the editor must not continue.
+        AnonymousDiscardError::Indeterminate => GuestPermissionEditError::RollbackFailed,
+        AnonymousDiscardError::Refused(_) => GuestPermissionEditError::NotPrivateAnonymous,
+    })
+}
+
+/// Validate every step in `steps` over live x86_64 PML4 words before any write,
+/// then zero each owned, exclusive private-anonymous page in place via
+/// [`carrick_mmu_core::x86::copy_window::with_cow_write_alias`].
+pub fn discard_x86_anonymous_steps<W>(
+    words: &W,
+    root: carrick_guest_arch::RootGpa,
+    steps: &[AnonymousDiscardStep],
+    mut scrub_page: impl FnMut(u64, bool),
+) -> Result<(), AnonymousDiscardError>
+where
+    W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords + ?Sized,
+{
+    use carrick_el1_abi::AnonymousLeave as Leave;
+    use carrick_mmu_core::aarch64::El1PrivateLeafState;
+    use carrick_mmu_core::x86::copy_window::{cow_copy_table_frames, with_cow_write_alias};
+    use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, COW, DescriptorOutcome, NX, WRITE};
+
+    let read = |pa: u64| words.load(pa).ok();
+    let mut needs_window = false;
+    let mut copy_tables = [carrick_guest_arch::RootGpa::page_aligned(FrameGpa::new(4096)); 3];
+    for &step in steps {
+        match step {
+            AnonymousDiscardStep::ValidateEmptyPrivateFile { start, end } => {
+                walk_discard_leaves::<X86AnonymousDecode>(
+                    &read,
+                    root.address().raw(),
+                    start,
+                    end,
+                    &mut |_, level, descriptor| match X86AnonymousDecode::private_state(descriptor)
+                    {
+                        El1PrivateLeafState::Retired => Ok(()),
+                        El1PrivateLeafState::Resident | El1PrivateLeafState::Prepared => {
+                            Err(AnonymousDiscardError::Refused(Leave::RootDeclined))
+                        }
+                        El1PrivateLeafState::Unowned if level < 3 => {
+                            Err(AnonymousDiscardError::Refused(Leave::BackingBlock))
+                        }
+                        El1PrivateLeafState::Unowned => {
+                            Err(AnonymousDiscardError::Refused(Leave::BackingHostOwnedLeaf))
+                        }
+                        El1PrivateLeafState::Malformed => {
+                            Err(AnonymousDiscardError::Refused(Leave::BackingMalformed))
+                        }
+                    },
+                )?;
+            }
+            AnonymousDiscardStep::DiscardPrivateAnonymous { start, end } => {
+                walk_discard_leaves::<X86AnonymousDecode>(
+                    &read,
+                    root.address().raw(),
+                    start,
+                    end,
+                    &mut |_, level, descriptor| {
+                        if level < 3 {
+                            return Err(AnonymousDiscardError::Refused(Leave::BackingBlock));
+                        }
+                        match X86AnonymousDecode::private_state(descriptor) {
+                            El1PrivateLeafState::Retired => Ok(()),
+                            El1PrivateLeafState::Resident | El1PrivateLeafState::Prepared => {
+                                // On x86, fork's `arm_cow_terminal` sets `COW` only when
+                                // `WRITE` was set; read-only private leaves can be shared
+                                // across fork with `COW == 0`, whereas `WRITE != 0 && COW == 0`
+                                // proves this MM holds exclusive frame write custody.
+                                if descriptor & COW != 0 || descriptor & WRITE == 0 {
+                                    return Err(AnonymousDiscardError::Refused(Leave::EditRefused));
+                                }
+                                let ipa = descriptor & ADDRESS;
+                                if ipa == 0 || ipa == root.address().raw() {
+                                    return Err(AnonymousDiscardError::Refused(
+                                        Leave::BackingMalformed,
+                                    ));
+                                }
+                                if !needs_window {
+                                    let frames =
+                                        cow_copy_table_frames(words, root).map_err(|_| {
+                                            AnonymousDiscardError::Refused(Leave::EditRefused)
+                                        })?;
+                                    for (dst, frame) in copy_tables.iter_mut().zip(frames) {
+                                        *dst = Some(frame);
+                                    }
+                                    needs_window = true;
+                                }
+                                if copy_tables
+                                    .iter()
+                                    .flatten()
+                                    .any(|frame| frame.address().raw() == ipa)
+                                {
+                                    return Err(AnonymousDiscardError::Refused(
+                                        Leave::BackingMalformed,
+                                    ));
+                                }
+                                Ok(())
+                            }
+                            El1PrivateLeafState::Unowned => {
+                                Err(AnonymousDiscardError::Refused(Leave::BackingHostOwnedLeaf))
+                            }
+                            El1PrivateLeafState::Malformed => {
+                                Err(AnonymousDiscardError::Refused(Leave::BackingMalformed))
+                            }
+                        }
+                    },
+                )?;
+            }
+        }
+    }
+    if !needs_window {
+        return Ok(());
+    }
+
+    for &step in steps {
+        let AnonymousDiscardStep::DiscardPrivateAnonymous { start, end } = step else {
+            continue;
+        };
+        walk_discard_leaves::<X86AnonymousDecode>(
+            &read,
+            root.address().raw(),
+            start,
+            end,
+            &mut |_, _, descriptor| match X86AnonymousDecode::private_state(descriptor) {
+                El1PrivateLeafState::Retired => Ok(()),
+                El1PrivateLeafState::Resident | El1PrivateLeafState::Prepared => {
+                    let ipa = FrameGpa::new(descriptor & ADDRESS);
+                    let executable = descriptor & NX == 0;
+                    with_cow_write_alias(words, root, ipa, |alias_va| {
+                        scrub_page(alias_va, executable);
+                    })
+                    .map_err(|outcome| match outcome {
+                        DescriptorOutcome::Indeterminate(_) => AnonymousDiscardError::Indeterminate,
+                        _ => AnonymousDiscardError::Refused(Leave::EditRefused),
+                    })
+                }
+                _ => Err(AnonymousDiscardError::Refused(Leave::BackingMalformed)),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Why the calling MM's live stage-1 words were not available to EL1.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+enum LiveWordsRefusal {
+    /// `ttbr0` is not the live TTBR0 of this CPU.
+    NotLive,
+    Malformed,
+}
+
+/// Run `f` over the live, exact-MM stage-1 words of `ttbr0` (primary alias
+/// plus table pool), as the copy-window editors need them.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn with_live_aarch64_words<R>(
+    ttbr0: carrick_guest_arch::AddressSpaceRegister,
+    f: impl FnOnce(
+        &carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords<
+            '_,
+            crate::isa::arm_edit::El1TableMaintenance,
+        >,
+        carrick_mmu_core::aarch64::SubstrateGpa,
+    ) -> R,
+) -> Result<R, LiveWordsRefusal> {
+    use carrick_mmu_core::aarch64::SubstrateGpa;
+    use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
+    const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    let ttbr0 = ttbr0.raw();
+    let live = crate::isa::aarch64::hardware_live_ttbr();
+    if live == carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE
+        || (live & TTBR_BADDR_MASK) != (ttbr0 & TTBR_BADDR_MASK)
+    {
+        return Err(LiveWordsRefusal::NotLive);
+    }
+    let Some(table) = carrick_el1_abi::service_target_table_window(live, ttbr0) else {
+        return Err(LiveWordsRefusal::NotLive);
+    };
+    let maintenance = crate::isa::arm_edit::El1TableMaintenance { ttbr0 };
+    // SAFETY: the caller holds the exact-MM editor, `live` is this MM's
+    // active TTBR0, and the primary alias plus pool remain mapped.
+    let Ok(words) = (unsafe {
+        PrimaryTableWords::new(
+            table.words,
+            table.physical_base,
+            carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+            &maintenance,
+        )
+        .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
+    }) else {
+        return Err(LiveWordsRefusal::Malformed);
+    };
+    Ok(f(&words, SubstrateGpa(ttbr0 & TTBR_BADDR_MASK)))
+}
+
+#[cfg(target_os = "none")]
+impl AnonymousDiscardEditor for HardwareAnonymousEditor {
+    fn check_discard_range(
+        &self,
+        range: carrick_personality_linux::mm::madvise::Range,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        #[cfg(target_arch = "aarch64")]
+        if overlaps_arm_el0_clock_stub(range.start.raw(), range.end.raw()) {
+            return Err(carrick_syscall_abi::LINUX_EPERM);
+        }
+        let _ = range;
+        Ok(())
+    }
+
+    fn discard_and_scrub(
+        &mut self,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        steps: &[AnonymousDiscardStep],
+    ) -> Result<(), AnonymousDiscardError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use carrick_el1_abi::AnonymousLeave as Leave;
+            let discarded = with_live_aarch64_words(ttbr0, |words, root| {
+                discard_aarch64_anonymous_steps(
+                    words,
+                    root,
+                    carrick_el1_abi::EL1_COW_COPY_BASE,
+                    steps,
+                    |alias_va, executable| {
+                        // SAFETY: `with_cow_write_alias` mapped `alias_va` as an
+                        // exclusive 4 KiB EL1-RW page in the live TTBR0 and flushes
+                        // its TLB entry before and after this closure.
+                        unsafe {
+                            core::ptr::write_bytes(alias_va as *mut u8, 0, PAGE_SIZE as usize);
+                            if executable {
+                                crate::isa::aarch64::clean_executable_alias_page(alias_va);
+                            }
+                        }
+                    },
+                )
+            });
+            // Each refusal keeps its exact leave.
+            match discarded {
+                Ok(discarded) => discarded,
+                Err(LiveWordsRefusal::NotLive) => {
+                    Err(AnonymousDiscardError::Refused(Leave::NoGrant))
+                }
+                Err(LiveWordsRefusal::Malformed) => {
+                    Err(AnonymousDiscardError::Refused(Leave::BackingMalformed))
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (ttbr0, steps);
+            Err(AnonymousDiscardError::Refused(
+                carrick_el1_abi::AnonymousLeave::EditRefused,
+            ))
+        }
+    }
+}
+
 /// Where a delegated MM's anonymous syscall went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegatedAnonymous {
@@ -1186,7 +1768,7 @@ pub fn serve_delegated_anonymous<
         | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
             if request.operation == Protect || adopts_stock =>
         {
-            let cow_ceiling = if request.operation == Protect {
+            let root_ceiling = if request.operation == Protect {
                 let Some(ceiling) = model.protection_ceiling(request.range) else {
                     return refuse(pending, &mut model, Leave::RootUnavailable);
                 };
@@ -1204,7 +1786,7 @@ pub fn serve_delegated_anonymous<
                 readable: request.protection.bits() & PROT_READ != 0,
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
-                cow_ceiling,
+                root_ceiling,
             };
             match editor.protect_and_invalidate(
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -1307,6 +1889,353 @@ pub fn delegated_anonymous_root<
     let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
     let index = spaces.find(mm_key)?;
     table.admitted(index.index(), mm).then_some((mm, index))
+}
+
+/// The admitted root that owns a delegated MM's `madvise(2)` when the MM has
+/// no host VMA/residency venue.
+pub fn delegated_discard_root<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    nr: u64,
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+) -> Option<(
+    carrick_el1_abi::ReservationMm,
+    carrick_sched_core::spaces::SpaceIndex,
+)> {
+    if nr != SYS_MADVISE {
+        return None;
+    }
+    native_reservation_root(current, spaces, table)
+}
+
+/// Reprobe a delegated `madvise(2)` against the locked reservation root inside
+/// [`carrick_core::wait::coordinate_anonymous_edit_wait`]. Returns `None` when
+/// `frame` is not `SYS_MADVISE`, `Some(Some(cause))` on active root contention,
+/// or `Some(None)` when the caller may proceed to editor admission.
+pub fn probe_discard_root_conflict<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    frame: &(impl AnonymousCallView + ?Sized),
+    model: &mut ReservationModel<'_, G, C>,
+) -> Option<Option<SpaceWaitCause>> {
+    if frame.canonical().raw() != SYS_MADVISE {
+        return None;
+    }
+    if model.pending().is_some() || model.fork_pending() {
+        return Some(Some(SpaceWaitCause::PendingEdit));
+    }
+    let args = frame.arguments();
+    let address = args[0];
+    let length = args[1];
+    if length != 0
+        && address.is_multiple_of(PAGE_SIZE)
+        && let Some(end) = address
+            .checked_add(length)
+            .and_then(|raw_end| raw_end.checked_next_multiple_of(PAGE_SIZE))
+        && let Some(range) = carrick_el1_abi::ReservationRange::new(address, end)
+        && model.prepared_overlaps(range)
+    {
+        return Some(Some(SpaceWaitCause::PreparedOverlap));
+    }
+    Some(None)
+}
+
+#[derive(Clone, Copy)]
+struct ReservationMadviseSegment {
+    range: carrick_personality_linux::mm::madvise::Range,
+    class: carrick_personality_linux::mm::madvise::Class,
+    ring_owned: bool,
+    opaque_private: bool,
+}
+
+impl carrick_personality_linux::mm::madvise::Segment for ReservationMadviseSegment {
+    fn range(&self) -> carrick_personality_linux::mm::madvise::Range {
+        self.range
+    }
+    fn class(&self) -> carrick_personality_linux::mm::madvise::Class {
+        self.class
+    }
+    fn droppable(&self) -> bool {
+        false
+    }
+}
+
+struct ReservationMadviseCoverage<'a, E: ?Sized> {
+    editor: &'a E,
+    segments: Vec<ReservationMadviseSegment>,
+    locked: bool,
+}
+
+impl<E: AnonymousDiscardEditor + ?Sized> carrick_personality_linux::mm::madvise::Coverage
+    for ReservationMadviseCoverage<'_, E>
+{
+    type Segment = ReservationMadviseSegment;
+
+    fn check_range(
+        &self,
+        range: carrick_personality_linux::mm::madvise::Range,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        self.editor.check_discard_range(range)
+    }
+
+    fn snapshot(
+        &self,
+        range: carrick_personality_linux::mm::madvise::Range,
+    ) -> carrick_personality_linux::mm::madvise::Snapshot<Self::Segment> {
+        carrick_personality_linux::mm::madvise::Snapshot::new(
+            range,
+            self.segments.clone(),
+            self.locked,
+        )
+    }
+}
+
+fn classify_reservation_madvise_mapping(
+    mapping: &carrick_el1_abi::Mapping,
+    clip_start: u64,
+    clip_end: u64,
+) -> ReservationMadviseSegment {
+    use carrick_el1_abi::ReservationNodeFlags as Flags;
+    use carrick_guest_arch::GuestVa;
+    use carrick_personality_linux::mm::madvise::{Class, Range};
+
+    let start = mapping.range.start().max(clip_start);
+    let end = mapping.range.end().min(clip_end);
+    let flags = mapping.flags;
+    let is_file = flags.contains(Flags::FILE) || mapping.host_backing.is_some();
+    let (class, ring_owned, opaque_private) =
+        if flags.contains(Flags::ANONYMOUS_PRIVATE) && !is_file {
+            (Class::PrivateAnonymous, true, false)
+        } else if flags.contains(Flags::PRIVATE) && is_file {
+            (
+                Class::PrivateFile,
+                flags.contains(Flags::IMAGE) || mapping.host_backing.is_some(),
+                false,
+            )
+        } else if !flags.contains(Flags::PRIVATE)
+            && (flags.contains(Flags::SHARED_ANONYMOUS) || is_file)
+        {
+            (Class::Shared, false, false)
+        } else if flags.contains(Flags::PRIVATE) {
+            (Class::PrivateAnonymous, false, true)
+        } else {
+            (Class::Special, false, false)
+        };
+    ReservationMadviseSegment {
+        range: Range {
+            start: GuestVa::new(start),
+            end: GuestVa::new(end),
+        },
+        class,
+        ring_owned,
+        opaque_private,
+    }
+}
+
+/// Serve `madvise(2)` in ring for a native MM without a host VMA/residency
+/// venue. Uses [`carrick_personality_linux::mm::madvise::plan`] over the
+/// locked reservation root and scrubs owned, non-COW private-anonymous frames
+/// in place under the exact-MM page-table editor.
+#[inline(never)]
+pub fn serve_delegated_discard<
+    F: AnonymousCallView + ?Sized,
+    E: AnonymousDiscardEditor,
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    frame: &mut F,
+    counters: &carrick_el1_abi::Counters,
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    editor: &mut E,
+) -> DelegatedAnonymous {
+    use carrick_el1_abi::{AnonymousLeave as Leave, ReservationNodeFlags, ReservationRange};
+    use carrick_guest_arch::{GuestLen, GuestVa};
+    use carrick_personality_linux::mm::madvise::{self, Action, Advice};
+
+    let nr = frame.canonical().raw();
+    let Some((mm, index)) = delegated_discard_root(nr, current, spaces, table) else {
+        return DelegatedAnonymous::NotDelegated;
+    };
+    let mm_key = mm.raw();
+    let forward = |why: Leave| {
+        counters.anonymous_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
+        DelegatedAnonymous::Forward
+    };
+    let return_errno = |frame: &mut F, errno: carrick_syscall_abi::LinuxErrno| {
+        frame.set_result(carrick_guest_arch::NativeReturnWord(
+            errno.guest_retval() as u64
+        ));
+        DelegatedAnonymous::Served
+    };
+
+    let mut model = match table.lock_in(
+        spaces,
+        index.index(),
+        mm,
+        frame.slot().map_or(u32::MAX, |slot| slot.index() as u32),
+    ) {
+        Ok(model) => model,
+        Err(reservations::Refusal::Busy) => {
+            return DelegatedAnonymous::Contended(SpaceWaitCause::Reservations);
+        }
+        Err(_) => return forward(Leave::RootUnavailableStale),
+    };
+    if model.pending().is_some() || model.fork_pending() {
+        return DelegatedAnonymous::Contended(SpaceWaitCause::PendingEdit);
+    }
+
+    let args = frame.arguments();
+    let address = GuestVa::new(args[0]);
+    let length = GuestLen::new(args[1]);
+    let advice = Advice::from_guest_arg(args[2]);
+
+    let mut segments = Vec::new();
+    let mut locked = false;
+    if length.raw() != 0
+        && address.raw().is_multiple_of(PAGE_SIZE)
+        && advice != Advice::Unsupported
+        && usize::try_from(length.raw()).is_ok()
+        && let Some(raw_end) = address.raw().checked_add(length.raw())
+        && let Some(end) = raw_end.checked_next_multiple_of(PAGE_SIZE)
+    {
+        let range = madvise::Range {
+            start: address,
+            end: GuestVa::new(end),
+        };
+        if let Err(errno) = editor.check_discard_range(range) {
+            return return_errno(frame, errno);
+        }
+        let Some(res_range) = ReservationRange::new(address.raw(), end) else {
+            return forward(Leave::RootUnavailableStale);
+        };
+        if model.prepared_overlaps(res_range) {
+            return DelegatedAnonymous::Contended(SpaceWaitCause::PreparedOverlap);
+        }
+        let mut alloc_failed = false;
+        let observed = model.observe_range(res_range, &mut |mapping| {
+            if alloc_failed {
+                return;
+            }
+            if mapping.flags.contains(ReservationNodeFlags::LOCKED) {
+                locked = true;
+            }
+            if segments.try_reserve(1).is_err() {
+                alloc_failed = true;
+                return;
+            }
+            segments.push(classify_reservation_madvise_mapping(
+                &mapping,
+                address.raw(),
+                end,
+            ));
+        });
+        if observed.is_err() || alloc_failed {
+            return forward(Leave::RootUnavailableStale);
+        }
+        if advice.requires_host_attributes() && segments.iter().any(|seg| seg.opaque_private) {
+            return forward(Leave::RootDeclined);
+        }
+    }
+
+    let coverage = ReservationMadviseCoverage {
+        editor,
+        segments,
+        locked,
+    };
+    let plan = match madvise::plan(&coverage, address, length, advice, GuestLen::new(PAGE_SIZE)) {
+        Ok(plan) => plan,
+        Err(errno) => return return_errno(frame, errno),
+    };
+
+    let mut discard_steps = Vec::new();
+    for step in &plan.steps {
+        match step.action {
+            Action::None => {}
+            Action::UpdateAttributes(_) => return forward(Leave::RootDeclined),
+            Action::DiscardPrivateAnonymous => {
+                if !step.segment.ring_owned {
+                    return forward(Leave::BackingHostOwnedLeaf);
+                }
+                if discard_steps.try_reserve(1).is_err() {
+                    return forward(Leave::RootUnavailableMetadataRequired);
+                }
+                discard_steps.push(AnonymousDiscardStep::DiscardPrivateAnonymous {
+                    start: step.segment.range.start.raw(),
+                    end: step.segment.range.end.raw(),
+                });
+            }
+            Action::RestorePrivateFile => {
+                if !step.segment.ring_owned {
+                    return forward(Leave::RootDeclined);
+                }
+                if discard_steps.try_reserve(1).is_err() {
+                    return forward(Leave::RootUnavailableMetadataRequired);
+                }
+                discard_steps.push(AnonymousDiscardStep::ValidateEmptyPrivateFile {
+                    start: step.segment.range.start.raw(),
+                    end: step.segment.range.end.raw(),
+                });
+            }
+        }
+    }
+
+    if !discard_steps.is_empty() {
+        let (Some(grant), Some(owner)) = (
+            spaces.grant(index, mm_key),
+            frame
+                .slot()
+                .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1)),
+        ) else {
+            return forward(Leave::NoGrant);
+        };
+        let editor_guard =
+            match spaces
+                .table()
+                .try_begin_edit_cause(index, mm_key, owner, spaces.venue())
+            {
+                Ok(editor_guard) => editor_guard,
+                Err(carrick_sched_core::spaces::EditAdmissionRefusal::Editor) => {
+                    return DelegatedAnonymous::Contended(SpaceWaitCause::Editor);
+                }
+                Err(carrick_sched_core::spaces::EditAdmissionRefusal::Gate) => {
+                    return DelegatedAnonymous::Contended(SpaceWaitCause::Gate);
+                }
+                Err(carrick_sched_core::spaces::EditAdmissionRefusal::Stale) => {
+                    return forward(Leave::RootUnavailableStale);
+                }
+            };
+        let Some(generation) = AnonymousEditGeneration::resident() else {
+            return forward(Leave::NoGrant);
+        };
+        editor.bind_discard_edit(generation);
+        match editor.discard_and_scrub(
+            carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+            &discard_steps,
+        ) {
+            Ok(()) => {}
+            Err(AnonymousDiscardError::Refused(leave)) => return forward(leave),
+            Err(AnonymousDiscardError::Indeterminate) => {
+                // Quarantine this MM's page-table editor rather than re-exposing
+                // an indeterminate copy-window leaf.
+                core::mem::forget(editor_guard);
+                return forward(Leave::EditRefused);
+            }
+        }
+    }
+
+    match plan.result {
+        Ok(()) => {
+            frame.set_result(carrick_guest_arch::NativeReturnWord(0));
+            DelegatedAnonymous::Served
+        }
+        Err(errno) => return_errno(frame, errno),
+    }
 }
 
 /// Try to retire a complete resident private-anonymous `munmap(2)` range in
@@ -1436,7 +2365,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         readable: prot & PROT_READ != 0,
         writable: prot & PROT_WRITE != 0,
         executable: prot & PROT_EXEC != 0,
-        cow_ceiling: None,
+        root_ceiling: None,
     };
     let Some(generation) = AnonymousEditGeneration::resident() else {
         return MprotectDisposition::Forward;
@@ -1652,7 +2581,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: None,
+                    root_ceiling: None,
                 }
             )]
         );
@@ -2947,7 +3876,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: Some(GuestPermissionCeiling {
+                            root_ceiling: Some(GuestPermissionCeiling {
                                 readable: true,
                                 writable: true,
                                 executable: true,
@@ -3337,7 +4266,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: None,
+                            root_ceiling: None,
                         }
                     ),
                 ]
@@ -3418,7 +4347,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     }
                 )]
             );
@@ -3531,6 +4460,514 @@ mod tests {
                 cause(&words, va + 0x10000, 0x12000),
                 ForeignBacking::TooManyRuns
             );
+        }
+
+        #[test]
+        fn arm_clock_stub_constant_matches_carrick_mem() {
+            assert_eq!(
+                ARM_EL0_CLOCK_STUB_BASE,
+                carrick_mem::memory::LINUX_EL0_CLOCK_STUB_BASE
+            );
+            assert_eq!(
+                ARM_EL0_CLOCK_STUB_SIZE,
+                carrick_mem::memory::LINUX_EL0_CLOCK_STUB_SIZE
+            );
+            assert!(!overlaps_arm_el0_clock_stub(
+                ARM_EL0_CLOCK_STUB_BASE,
+                ARM_EL0_CLOCK_STUB_BASE
+            ));
+            assert!(overlaps_arm_el0_clock_stub(
+                ARM_EL0_CLOCK_STUB_BASE,
+                ARM_EL0_CLOCK_STUB_BASE + PAGE_SIZE
+            ));
+        }
+
+        #[test]
+        fn aarch64_discard_scrubs_exclusive_leaves_preserves_descriptors_and_refuses_all_or_nothing()
+         {
+            use carrick_mmu_core::aarch64::SubstrateGpa;
+            use carrick_mmu_core::aarch64::descriptor_txn::{
+                DescriptorRefusal, LiveDescriptorWords,
+            };
+            use std::cell::{Cell, RefCell};
+            use std::collections::BTreeMap;
+
+            const COPY_BASE: u64 = 0x1_0000;
+            const ROOT_PA: u64 = 0x1000;
+            const VA: u64 = 0x10_0000;
+            const TABLE: u64 = 0b11;
+            const AF: u64 = 1 << 10;
+            const AP_RW: u64 = 1 << 6;
+            const AP_RO: u64 = 3 << 6;
+            const UXN: u64 = 1 << 54;
+            const SW_COW_OR_RETIRED: u64 = 1 << 55;
+            const SW_PRIVATE: u64 = 1 << 56;
+            const SW_MAY_WRITE: u64 = 1 << 57;
+            const SW_MAY_EXEC: u64 = 1 << 58;
+            const SW_DEFERRED_COW: u64 = 1 << 59;
+
+            struct ArmDiscardWords {
+                words: Vec<Cell<u64>>,
+                pages: RefCell<BTreeMap<u64, [u8; 4096]>>,
+                exec_syncs: Cell<usize>,
+            }
+            impl ArmDiscardWords {
+                fn new() -> Self {
+                    let words = (0..0x6000 / 8).map(|_| Cell::new(0)).collect::<Vec<_>>();
+                    // L0[0] -> 0x2000, L1[0] -> 0x3000, L2[0] -> 0x4000 (covers COPY_BASE and VA).
+                    words[0x1000 / 8].set(0x2000 | TABLE);
+                    words[0x2000 / 8].set(0x3000 | TABLE);
+                    words[0x3000 / 8].set(0x4000 | TABLE);
+                    let copy_idx = ((COPY_BASE >> 12) & 511) as usize;
+                    words[0x4000 / 8 + copy_idx].set(COPY_BASE | 2);
+                    words[0x4000 / 8 + copy_idx + 1].set((COPY_BASE + PAGE_SIZE) | 2);
+                    Self {
+                        words,
+                        pages: RefCell::new(BTreeMap::new()),
+                        exec_syncs: Cell::new(0),
+                    }
+                }
+                fn set_leaf(&self, va: u64, desc: u64, fill: u8) {
+                    let idx = ((va >> 12) & 511) as usize;
+                    self.words[0x4000 / 8 + idx].set(desc);
+                    let ipa = desc & 0x0000_FFFF_FFFF_F000;
+                    if ipa != 0 {
+                        self.pages.borrow_mut().insert(ipa, [fill; 4096]);
+                    }
+                }
+                fn leaf(&self, va: u64) -> u64 {
+                    self.words[0x4000 / 8 + ((va >> 12) & 511) as usize].get()
+                }
+                fn scrub(&self, alias_va: u64, executable: bool) {
+                    assert_eq!(alias_va, COPY_BASE + PAGE_SIZE);
+                    let alias = self.leaf(alias_va);
+                    assert_eq!(alias & 3, 3);
+                    let ipa = alias & 0x0000_FFFF_FFFF_F000;
+                    self.pages.borrow_mut().insert(ipa, [0; 4096]);
+                    if executable {
+                        self.exec_syncs.set(self.exec_syncs.get() + 1);
+                    }
+                }
+            }
+            impl LiveDescriptorWords for ArmDiscardWords {
+                fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+                    self.words
+                        .get(pa as usize / 8)
+                        .map(Cell::get)
+                        .ok_or(DescriptorRefusal::TableOutsidePrimary)
+                }
+                fn compare_exchange(
+                    &self,
+                    pa: u64,
+                    before: u64,
+                    after: u64,
+                ) -> Result<bool, DescriptorRefusal> {
+                    if self.load(pa)? != before {
+                        return Ok(false);
+                    }
+                    self.words[pa as usize / 8].set(after);
+                    Ok(true)
+                }
+                fn store_unlinked(&self, _: u64, _: u64) -> Result<(), DescriptorRefusal> {
+                    Err(DescriptorRefusal::TableOutsidePrimary)
+                }
+                fn publish_barrier(&self) {}
+                fn invalidate_range(&self, va: u64, len: u64) {
+                    assert_eq!((va, len), (COPY_BASE, 2 * PAGE_SIZE));
+                }
+            }
+
+            let words = ArmDiscardWords::new();
+            assert_eq!(
+                discard_aarch64_anonymous_steps(
+                    &words,
+                    SubstrateGpa(ROOT_PA),
+                    COPY_BASE,
+                    &[AnonymousDiscardStep::DiscardPrivateAnonymous {
+                        start: VA,
+                        end: VA + 0x4000,
+                    }],
+                    |va, exec| words.scrub(va, exec),
+                ),
+                Ok(())
+            );
+
+            let rwx = 0x80000 | TABLE | AF | AP_RW | SW_PRIVATE | SW_MAY_WRITE | SW_MAY_EXEC;
+            let rw = 0x81000 | TABLE | AF | AP_RW | UXN | SW_PRIVATE | SW_MAY_WRITE;
+            let ro = 0x82000 | TABLE | AF | AP_RO | UXN | SW_PRIVATE;
+            let prep = 0x83000 | AP_RW | UXN | SW_PRIVATE | SW_MAY_WRITE;
+            let retired = 0x84000 | SW_PRIVATE | SW_COW_OR_RETIRED;
+            words.set_leaf(VA, rwx, 0x5a);
+            words.set_leaf(VA + 0x1000, rw, 0x5b);
+            words.set_leaf(VA + 0x2000, ro, 0x5c);
+            words.set_leaf(VA + 0x3000, prep, 0x5d);
+            words.set_leaf(VA + 0x4000, retired, 0x5e);
+
+            assert_eq!(
+                discard_aarch64_anonymous_steps(
+                    &words,
+                    SubstrateGpa(ROOT_PA),
+                    COPY_BASE,
+                    &[AnonymousDiscardStep::DiscardPrivateAnonymous {
+                        start: VA,
+                        end: VA + 0x5000,
+                    }],
+                    |va, exec| words.scrub(va, exec),
+                ),
+                Ok(())
+            );
+            assert_eq!(words.leaf(VA), rwx);
+            assert_eq!(words.leaf(VA + 0x1000), rw);
+            assert_eq!(words.leaf(VA + 0x2000), ro);
+            assert_eq!(words.leaf(VA + 0x3000), prep);
+            assert_eq!(words.leaf(VA + 0x4000), retired);
+            for ipa in [0x80000, 0x81000, 0x82000, 0x83000] {
+                assert_eq!(words.pages.borrow()[&ipa], [0; 4096]);
+            }
+            assert_eq!(words.pages.borrow()[&0x84000], [0x5e; 4096]);
+            assert_eq!(words.exec_syncs.get(), 1);
+
+            // Multi-segment refusal leaves earlier segment bytes untouched.
+            for bad in [
+                0x90000 | TABLE | AF | AP_RO | UXN | SW_PRIVATE | SW_COW_OR_RETIRED | SW_MAY_WRITE,
+                0x90000 | AP_RW | UXN | SW_PRIVATE | SW_MAY_WRITE | SW_DEFERRED_COW,
+                0x90000 | TABLE | AF | AP_RW | UXN,
+            ] {
+                words.set_leaf(VA, rw, 0x77);
+                words.set_leaf(VA + 0x8000, bad, 0x88);
+                assert!(
+                    discard_aarch64_anonymous_steps(
+                        &words,
+                        SubstrateGpa(ROOT_PA),
+                        COPY_BASE,
+                        &[
+                            AnonymousDiscardStep::DiscardPrivateAnonymous {
+                                start: VA,
+                                end: VA + 0x1000,
+                            },
+                            AnonymousDiscardStep::DiscardPrivateAnonymous {
+                                start: VA + 0x8000,
+                                end: VA + 0x9000,
+                            },
+                        ],
+                        |va, exec| words.scrub(va, exec),
+                    )
+                    .is_err()
+                );
+                assert_eq!(words.pages.borrow()[&0x81000], [0x77; 4096]);
+            }
+        }
+
+        #[test]
+        fn x86_discard_scrubs_exclusive_leaves_preserves_descriptors_and_refuses_shared_or_readonly()
+         {
+            use carrick_guest_arch::{FrameGpa, RootGpa};
+            use carrick_mmu_core::x86::copy_window::{
+                COW_COPY_WINDOW_BASE, COW_COPY_WINDOW_LEN, provision_cow_copy_window,
+            };
+            use carrick_mmu_core::x86::descriptor_txn::{
+                ADDRESS, COW, DescriptorRefusal, LiveDescriptorWords, MAY_EXEC, MAY_WRITE, NX,
+                PREPARED, PRESENT, PRIVATE, RETIRED, USER, WRITE,
+            };
+            use std::cell::{Cell, RefCell};
+            use std::collections::BTreeMap;
+
+            struct X86DiscardWords {
+                words: Vec<Cell<u64>>,
+                pages: RefCell<BTreeMap<u64, [u8; 4096]>>,
+            }
+            impl X86DiscardWords {
+                fn new() -> Self {
+                    let words = Self {
+                        words: (0..0x9000 / 8).map(|_| Cell::new(0)).collect(),
+                        pages: RefCell::new(BTreeMap::new()),
+                    };
+                    let root = RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap();
+                    let copy_tables = [0x2000, 0x3000, 0x4000]
+                        .map(|pa| RootGpa::page_aligned(FrameGpa::new(pa)).unwrap());
+                    provision_cow_copy_window(&words, root, copy_tables).unwrap();
+                    // User branch at PML4[0] -> 0x5000 -> 0x6000 -> 0x7000.
+                    words.words[0x1000 / 8].set(0x5000 | PRESENT | WRITE | USER);
+                    words.words[0x5000 / 8].set(0x6000 | PRESENT | WRITE | USER);
+                    words.words[0x6000 / 8].set(0x7000 | PRESENT | WRITE | USER);
+                    words
+                }
+                fn set_leaf(&self, va: u64, desc: u64, fill: u8) {
+                    let idx = ((va >> 12) & 511) as usize;
+                    self.words[0x7000 / 8 + idx].set(desc);
+                    let ipa = desc & ADDRESS;
+                    if ipa != 0 {
+                        self.pages.borrow_mut().insert(ipa, [fill; 4096]);
+                    }
+                }
+                fn leaf(&self, va: u64) -> u64 {
+                    self.words[0x7000 / 8 + ((va >> 12) & 511) as usize].get()
+                }
+                fn scrub(&self, alias_va: u64) {
+                    assert_eq!(alias_va, COW_COPY_WINDOW_BASE + PAGE_SIZE);
+                    let alias = self.words[0x4008 / 8].get();
+                    assert_eq!(alias & (PRESENT | WRITE | NX), PRESENT | WRITE | NX);
+                    self.pages.borrow_mut().insert(alias & ADDRESS, [0; 4096]);
+                }
+            }
+            impl LiveDescriptorWords for X86DiscardWords {
+                fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+                    self.words
+                        .get(pa as usize / 8)
+                        .map(Cell::get)
+                        .ok_or(DescriptorRefusal::TableOutsidePrimary)
+                }
+                fn compare_exchange(
+                    &self,
+                    pa: u64,
+                    old: u64,
+                    new: u64,
+                ) -> Result<bool, DescriptorRefusal> {
+                    if self.load(pa)? != old {
+                        return Ok(false);
+                    }
+                    self.words[pa as usize / 8].set(new);
+                    Ok(true)
+                }
+                fn store_unlinked(&self, _: u64, _: u64) -> Result<(), DescriptorRefusal> {
+                    Err(DescriptorRefusal::TableOutsidePrimary)
+                }
+                fn publish_barrier(&self) {}
+                fn invalidate_range(&self, va: u64, len: u64) {
+                    assert_eq!((va, len), (COW_COPY_WINDOW_BASE, COW_COPY_WINDOW_LEN));
+                }
+            }
+
+            let words = X86DiscardWords::new();
+            let root = RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap();
+            let va = 0x10_0000;
+            let rwx = 0x10_0000 | PRESENT | WRITE | USER | PRIVATE | MAY_WRITE | MAY_EXEC;
+            let rw = 0x10_1000 | PRESENT | WRITE | USER | NX | PRIVATE | MAY_WRITE;
+            let prep = 0x10_2000 | WRITE | USER | NX | PREPARED | PRIVATE | MAY_WRITE;
+            let retired = 0x10_3000 | PRIVATE | RETIRED;
+            words.set_leaf(va, rwx, 0x41);
+            words.set_leaf(va + 0x1000, rw, 0x42);
+            words.set_leaf(va + 0x2000, prep, 0x43);
+            words.set_leaf(va + 0x3000, retired, 0x44);
+
+            assert_eq!(
+                discard_x86_anonymous_steps(
+                    &words,
+                    root,
+                    &[AnonymousDiscardStep::DiscardPrivateAnonymous {
+                        start: va,
+                        end: va + 0x4000,
+                    }],
+                    |alias_va, _| words.scrub(alias_va),
+                ),
+                Ok(())
+            );
+            assert_eq!(words.leaf(va), rwx);
+            assert_eq!(words.leaf(va + 0x1000), rw);
+            assert_eq!(words.leaf(va + 0x2000), prep);
+            assert_eq!(words.leaf(va + 0x3000), retired);
+            for ipa in [0x10_0000, 0x10_1000, 0x10_2000] {
+                assert_eq!(words.pages.borrow()[&ipa], [0; 4096]);
+            }
+            assert_eq!(words.pages.borrow()[&0x10_3000], [0x44; 4096]);
+
+            for bad in [
+                0x20_0000 | PRESENT | USER | NX | PRIVATE | COW | MAY_WRITE,
+                0x20_0000 | PRESENT | USER | NX | PRIVATE | MAY_WRITE,
+                0x20_0000 | PRESENT | WRITE | USER | NX,
+            ] {
+                words.set_leaf(va, rw, 0x66);
+                words.set_leaf(va + 0x8000, bad, 0x99);
+                assert!(
+                    discard_x86_anonymous_steps(
+                        &words,
+                        root,
+                        &[
+                            AnonymousDiscardStep::DiscardPrivateAnonymous {
+                                start: va,
+                                end: va + 0x1000,
+                            },
+                            AnonymousDiscardStep::DiscardPrivateAnonymous {
+                                start: va + 0x8000,
+                                end: va + 0x9000,
+                            },
+                        ],
+                        |alias_va, _| words.scrub(alias_va),
+                    )
+                    .is_err()
+                );
+                assert_eq!(words.pages.borrow()[&0x10_1000], [0x66; 4096]);
+            }
+        }
+
+        #[test]
+        fn serve_delegated_discard_handles_holes_advices_and_declines_attributes() {
+            struct RecordingDiscardEditor {
+                steps: Vec<AnonymousDiscardStep>,
+                result: Result<(), AnonymousDiscardError>,
+                protect_clock_stub: bool,
+            }
+            impl AnonymousDiscardEditor for RecordingDiscardEditor {
+                fn check_discard_range(
+                    &self,
+                    range: carrick_personality_linux::mm::madvise::Range,
+                ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+                    if self.protect_clock_stub
+                        && overlaps_arm_el0_clock_stub(range.start.raw(), range.end.raw())
+                    {
+                        Err(carrick_syscall_abi::LINUX_EPERM)
+                    } else {
+                        Ok(())
+                    }
+                }
+                fn discard_and_scrub(
+                    &mut self,
+                    _ttbr0: carrick_guest_arch::AddressSpaceRegister,
+                    steps: &[AnonymousDiscardStep],
+                ) -> Result<(), AnonymousDiscardError> {
+                    self.steps.extend_from_slice(steps);
+                    self.result
+                }
+            }
+
+            let spaces = AddressSpaces::new();
+            let table = SharedReservations::new();
+            let counters = Counters::new();
+            let proc_mm = mm(&spaces, &table, 21, true);
+            let mut map_editor = Editor::over(RangeBacking::Empty);
+            let (_, first) = syscall(
+                &proc_mm,
+                &spaces,
+                &table,
+                &counters,
+                &mut map_editor,
+                SYS_MMAP,
+                [
+                    0,
+                    0x2000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ],
+            );
+            let first = first as u64;
+            let (_, second) = syscall(
+                &proc_mm,
+                &spaces,
+                &table,
+                &counters,
+                &mut map_editor,
+                SYS_MMAP,
+                [
+                    first + 0x3000,
+                    0x1000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ],
+            );
+            assert_eq!(second as u64, first + 0x3000);
+
+            let run_madvise = |editor: &mut RecordingDiscardEditor, args: [u64; 3]| {
+                let mut frame = TrapFrame {
+                    elr: 0x40004,
+                    ..TrapFrame::default()
+                };
+                frame.x[8] = SYS_MADVISE;
+                frame.x[..3].copy_from_slice(&args);
+                let route = serve_delegated_discard(
+                    &mut frame,
+                    &counters,
+                    &proc_mm.task,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                    &table,
+                    editor,
+                );
+                (route, frame.x[0] as i64)
+            };
+
+            // Two covered runs separated by a 1-page hole: both runs are scrubbed,
+            // then `-ENOMEM` (-12) is returned for the intervening hole.
+            let mut editor = RecordingDiscardEditor {
+                steps: Vec::new(),
+                result: Ok(()),
+                protect_clock_stub: true,
+            };
+            assert_eq!(
+                run_madvise(&mut editor, [first, 0x4000, 4]),
+                (DelegatedAnonymous::Served, -ENOMEM)
+            );
+            assert_eq!(
+                editor.steps,
+                vec![
+                    AnonymousDiscardStep::DiscardPrivateAnonymous {
+                        start: first,
+                        end: first + 0x2000,
+                    },
+                    AnonymousDiscardStep::DiscardPrivateAnonymous {
+                        start: first + 0x3000,
+                        end: first + 0x4000,
+                    },
+                ]
+            );
+
+            // Fully mapped `MADV_DONTNEED` (4) and `MADV_FREE` (8) return 0.
+            editor.steps.clear();
+            assert_eq!(
+                run_madvise(&mut editor, [first, 0x2000, 4]),
+                (DelegatedAnonymous::Served, 0)
+            );
+            assert_eq!(editor.steps.len(), 1);
+            editor.steps.clear();
+            assert_eq!(
+                run_madvise(&mut editor, [first, 0x2000, 8]),
+                (DelegatedAnonymous::Served, 0)
+            );
+            assert!(editor.steps.is_empty());
+
+            // Unaligned address, bad advice, zero length, and clock stub EPERM.
+            assert_eq!(
+                run_madvise(&mut editor, [first + 1, 0x1000, 4]),
+                (DelegatedAnonymous::Served, -EINVAL)
+            );
+            assert_eq!(
+                run_madvise(&mut editor, [first, 0x1000, 999]),
+                (DelegatedAnonymous::Served, -EINVAL)
+            );
+            assert_eq!(
+                run_madvise(&mut editor, [first, 0, 4]),
+                (DelegatedAnonymous::Served, 0)
+            );
+            assert_eq!(
+                run_madvise(&mut editor, [ARM_EL0_CLOCK_STUB_BASE, 0x1000, 4]),
+                (DelegatedAnonymous::Served, -1)
+            );
+
+            // Attribute advices (`MADV_DONTFORK` = 10, `MADV_DONTDUMP` = 16,
+            // `MADV_WIPEONFORK` = 18) decline (`Forward`) without editing.
+            for attr_advice in [10, 16, 18] {
+                assert_eq!(
+                    run_madvise(&mut editor, [first, 0x2000, attr_advice]),
+                    (DelegatedAnonymous::Forward, first as i64)
+                );
+            }
+
+            // Locked range with `MADV_DONTNEED` returns `-EINVAL` before scrubbing.
+            root(&spaces, &table, &proc_mm)
+                .set_flags(
+                    carrick_el1_abi::ReservationRange::new(first, first + 0x2000).unwrap(),
+                    carrick_el1_abi::ReservationNodeFlags::LOCKED,
+                    carrick_el1_abi::ReservationNodeFlags::EMPTY,
+                )
+                .unwrap();
+            editor.steps.clear();
+            assert_eq!(
+                run_madvise(&mut editor, [first, 0x2000, 4]),
+                (DelegatedAnonymous::Served, -EINVAL)
+            );
+            assert!(editor.steps.is_empty());
         }
     }
 }

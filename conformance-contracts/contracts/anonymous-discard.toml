@@ -9,6 +9,11 @@ rationale = "A contiguous private anonymous VMA requires one backend discard or 
 [bindings]
 vm_free = [
   "carrick-kernel::dispatch::mem::madvise::tests::readonly_private_anonymous_dontneed_retires_populated_residency",
+  "carrick-el1::memory::tests::delegated::{aarch64_discard_scrubs_exclusive_leaves_preserves_descriptors_and_refuses_all_or_nothing,x86_discard_scrubs_exclusive_leaves_preserves_descriptors_and_refuses_shared_or_readonly}",
+  "carrick-el1::memory::tests::delegated::serve_delegated_discard_handles_holes_advices_and_declines_attributes",
+  "carrick-el1-linux::mm_portal::tests::anonymous_madvise_busy_parks_once_then_completes",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::{serial_host_native_fork_exec_madvise_dontneed_returns_zero,serial_host_native_fork_exec_v8_code_range_discard_and_root_forward}",
+  "carrick-x86-cpl0::anonymous_refusal_tests::both_linux_decoders_project_the_same_anonymous_call",
 ]
 embed = [
   "carrick-conformance-next::deferred_anonymous_pristine_scrub_semantics",
@@ -17,6 +22,7 @@ docker = [
   "same-source fixtures/pristine_scrub.py; pinned native ARM64 cpython-test image; discard-boundary evidence",
 ]
 [bindings.unresolved]
+kvm = "Executing x86 bindings: carrick-vmm-kvm::cpl0_entry::{production_fork_child_v8_code_range_discard_scrubs_and_preserves_rwx,production_madvise_root_busy_once_parks_and_completes}. Requires real KVM; the contract evaluator has no registered KVM observation layer."
 embed_structural = "Actual zero-byte reduction and backing allocation budget require materialized backing retirement; current fallback eagerly clears."
 promotion = "Signed probe and ecosystem promotion pending."
 [[structural_budgets]]

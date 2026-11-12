@@ -3332,6 +3332,507 @@ fn production_pipe_metadata_stays_in_the_ring_namespace() {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// Generated x86-64 probe code: `mov r64, imm64`.
+fn mov(code: &mut Vec<u8>, reg: u8, value: u64) {
+    if reg < 8 {
+        code.extend_from_slice(&[0x48, 0xb8 + reg]);
+    } else {
+        code.extend_from_slice(&[0x49, 0xb8 + (reg - 8)]);
+    }
+    code.extend_from_slice(&value.to_le_bytes());
+}
+/// `cmp rax, expected; jne` a numbered failure slot.
+fn check(code: &mut Vec<u8>, failures: &mut Vec<usize>, expected: i32) {
+    code.extend_from_slice(&[0x48, 0x3d]); // cmp rax, imm32 (sign-extended)
+    code.extend_from_slice(&expected.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x85]); // jne fail_slot
+    failures.push(code.len());
+    code.extend_from_slice(&[0; 4]);
+}
+/// One six-argument syscall.
+fn syscall6(code: &mut Vec<u8>, nr: u64, args: [u64; 6]) {
+    for (reg, val) in [
+        (7, args[0]),
+        (6, args[1]),
+        (2, args[2]),
+        (10, args[3]),
+        (8, args[4]),
+        (9, args[5]),
+    ] {
+        mov(code, reg, val);
+    }
+    mov(code, 0, nr);
+    code.extend_from_slice(&[0x0f, 0x05]);
+}
+
+/// #1846 x86 CPL0 production witness: a forked child reserves a lazy V8-style
+/// anonymous code range (`PROT_NONE | MAP_NORESERVE`), trims its tail page,
+/// promotes `[base, base + 2*4096)` to `RWX`, populates and executes generated
+/// code on the first page while keeping the second page lazy, calls
+/// `madvise(MADV_DONTNEED)`, observes zeroed bytes, and writes + executes new
+/// code without re-protecting. Also verifies hole `-ENOMEM` after prefix
+/// scrub, `MADV_FREE` / `MADV_WILLNEED` non-scrubbing success, `-EINVAL` edges,
+/// and counted `-ENOSYS` declines on `MADV_DONTDUMP`, populated `PROT_READ`,
+/// COW-shared, and carrier-imported stack ranges while the waiting parent's
+/// memory survives.
+#[test]
+fn production_fork_child_v8_code_range_discard_scrubs_and_preserves_rwx() {
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+
+    // Reserve stack space and write parent stack sentinel 0x5a at [rsp + 8].
+    code.extend_from_slice(&[0x48, 0x83, 0xec, 0x20]); // sub rsp, 32
+    code.extend_from_slice(&[0xc6, 0x44, 0x24, 0x08, 0x5a]); // mov byte [rsp+8], 0x5a
+
+    // Parent maps one RW anonymous page (r15) and writes 0x33 so fork makes it COW-shared.
+    syscall6(&mut code, 9, [0, 4096, 3, 0x22, u64::MAX, 0]);
+    code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x88]); // test rax, rax; js fail
+    failures.push(code.len());
+    code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&[0x49, 0x89, 0xc7]); // mov r15, rax
+    code.extend_from_slice(&[0x41, 0xc6, 0x07, 0x33]); // mov byte [r15], 0x33
+
+    // fork() (x86_64 nr 57).
+    mov(&mut code, 0, 57);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x88]); // test rax, rax; js fail
+    failures.push(code.len());
+    code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&[0x0f, 0x84]); // jz child
+    let child_branch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // Parent path: wait4(child_pid, rsp, 0, NULL), verify sentinels, propagate child exit status.
+    code.extend_from_slice(&[0x41, 0x89, 0xc5]); // mov r13d, eax
+    code.extend_from_slice(&[0x44, 0x89, 0xef]); // mov edi, r13d
+    code.extend_from_slice(&[0x48, 0x89, 0xe6]); // mov rsi, rsp
+    mov(&mut code, 2, 0);
+    mov(&mut code, 10, 0);
+    mov(&mut code, 0, 61); // wait4
+    code.extend_from_slice(&[0x0f, 0x05]);
+    code.extend_from_slice(&[0x44, 0x39, 0xe8, 0x0f, 0x85]); // cmp eax, r13d; jne fail
+    failures.push(code.len());
+    code.extend_from_slice(&[0; 4]);
+
+    // Parent stack and COW page must remain untouched.
+    code.extend_from_slice(&[0x0f, 0xb6, 0x44, 0x24, 0x08]); // movzx eax, byte [rsp+8]
+    check(&mut code, &mut failures, 0x5a);
+    code.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x07]); // movzx eax, byte [r15]
+    check(&mut code, &mut failures, 0x33);
+
+    // Child must have exited normally (low 7 bits == 0); parent exits with WEXITSTATUS.
+    code.extend_from_slice(&[0x8b, 0x04, 0x24, 0x83, 0xe0, 0x7f]); // mov eax, [rsp]; and eax, 0x7f
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x8b, 0x3c, 0x24, 0xc1, 0xef, 0x08]); // mov edi, [rsp]; shr edi, 8
+    mov(&mut code, 0, 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+
+    // Child path.
+    let child_offset = i32::try_from(code.len() - (child_branch + 4)).unwrap();
+    code[child_branch..child_branch + 4].copy_from_slice(&child_offset.to_le_bytes());
+
+    // 1. Zero-length madvise(0x400000, 0, MADV_DONTNEED=4) (x86_64 nr 28).
+    // On negative errno (such as -38 ENOSYS when unrouted), exit with (-rax) directly.
+    syscall6(&mut code, 28, [0x40_0000, 0, 4, 0, 0, 0]);
+    code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x79, 0x0f]); // test rax, rax; jns +15
+    code.extend_from_slice(&[0x48, 0xf7, 0xd8, 0x48, 0x89, 0xc7]); // neg rax; mov rdi, rax
+    code.extend_from_slice(&[0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
+    check(&mut code, &mut failures, 0);
+
+    // 2. Reserve 4 pages PROT_NONE | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE (0x4022).
+    syscall6(&mut code, 9, [0, 4 * 4096, 0, 0x4022, u64::MAX, 0]);
+    code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x88]); // test rax, rax; js fail
+    failures.push(code.len());
+    code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12, rax
+
+    // 3. Trim the 4th page with munmap(r12 + 0x3000, 0x1000) so it becomes an unmapped hole.
+    code.extend_from_slice(&[0x49, 0x8d, 0xbc, 0x24, 0x00, 0x30, 0x00, 0x00]); // lea rdi, [r12+0x3000]
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 0, 11);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+
+    // 4. Promote [r12, r12 + 0x2000) to RWX (prot=7), leaving [r12 + 0x2000, r12 + 0x3000) PROT_NONE.
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
+    mov(&mut code, 6, 2 * 4096);
+    mov(&mut code, 2, 7);
+    mov(&mut code, 0, 10);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+
+    // 5. Write `mov eax, 0x5a; ret` (b8 5a 00 00 00 c3) to [r12] and call it; page 1 stays lazy.
+    code.extend_from_slice(&[0x41, 0xc7, 0x04, 0x24, 0xb8, 0x5a, 0x00, 0x00]);
+    code.extend_from_slice(&[0x41, 0xc7, 0x44, 0x24, 0x04, 0x00, 0xc3, 0x90, 0x90]);
+    code.extend_from_slice(&[0x41, 0xff, 0xd4]); // call r12
+    check(&mut code, &mut failures, 0x5a);
+
+    // 6. madvise(r12, 2 * 4096, MADV_DONTNEED=4) -> 0, scrubbing page 0 and skipping lazy page 1.
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
+    mov(&mut code, 6, 2 * 4096);
+    mov(&mut code, 2, 4);
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+
+    code.extend_from_slice(&[0x41, 0x8b, 0x04, 0x24]); // mov eax, [r12]
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x41, 0x8b, 0x44, 0x24, 0x04]); // mov eax, [r12+4]
+    check(&mut code, &mut failures, 0);
+
+    // 7. Without re-mprotecting, write `mov eax, 77; ret` to [r12] and execute it (RWX preserved).
+    code.extend_from_slice(&[0x41, 0xc7, 0x04, 0x24, 0xb8, 77, 0x00, 0x00]);
+    code.extend_from_slice(&[0x41, 0xc7, 0x44, 0x24, 0x04, 0x00, 0xc3, 0x90, 0x90]);
+    code.extend_from_slice(&[0x41, 0xff, 0xd4]); // call r12
+    check(&mut code, &mut failures, 77);
+
+    // 8. Spanning into the trimmed 4th page scrubs the covered prefix then returns -ENOMEM (-12).
+    code.extend_from_slice(&[0x41, 0xc6, 0x04, 0x24, 0xa5]); // mov byte [r12], 0xa5
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
+    mov(&mut code, 6, 4 * 4096);
+    mov(&mut code, 2, 4);
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, -12);
+    code.extend_from_slice(&[0x49, 0x0f, 0xb6, 0x04, 0x24]); // movzx rax, byte [r12]
+    check(&mut code, &mut failures, 0);
+
+    // 9. MADV_FREE (8) and MADV_WILLNEED (3) return 0 without eager scrubbing, and
+    // unpopulated PROT_NONE page (r12 + 0x2000) MADV_DONTNEED (4) returns 0.
+    code.extend_from_slice(&[0x41, 0xc6, 0x04, 0x24, 0x42]); // mov byte [r12], 0x42
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 8); // MADV_FREE
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 3); // MADV_WILLNEED
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x49, 0x0f, 0xb6, 0x04, 0x24]);
+    check(&mut code, &mut failures, 0x42);
+
+    code.extend_from_slice(&[0x49, 0x8d, 0xbc, 0x24, 0x00, 0x20, 0x00, 0x00]); // lea rdi, [r12+0x2000]
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 4); // MADV_DONTNEED on unpopulated PROT_NONE page
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+
+    // 10. Unaligned address and unsupported advice (999, MADV_COLD=20) return -EINVAL (-22).
+    code.extend_from_slice(&[0x49, 0x8d, 0x7c, 0x24, 0x01]); // lea rdi, [r12+1]
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 4);
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, -22);
+
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 999);
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, -22);
+
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 20); // MADV_COLD
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, -22);
+
+    // 11. MADV_DONTDUMP (16), populated PROT_READ DONTNEED, COW-shared page (r15), and carrier
+    // stack DONTNEED decline safely with counted -ENOSYS (-38), while stack WILLNEED returns 0.
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 16); // MADV_DONTDUMP
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, -38);
+
+    code.extend_from_slice(&[0x41, 0xc6, 0x04, 0x24, 0x77]); // mov byte [r12], 0x77
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 1); // PROT_READ
+    mov(&mut code, 0, 10);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 4); // MADV_DONTNEED on populated PROT_READ page -> -38
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, -38);
+    code.extend_from_slice(&[0x49, 0x0f, 0xb6, 0x04, 0x24]);
+    check(&mut code, &mut failures, 0x77);
+
+    code.extend_from_slice(&[0x4c, 0x89, 0xff]); // mov rdi, r15
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 4);
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, -38);
+    code.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x07]); // movzx eax, byte [r15]
+    check(&mut code, &mut failures, 0x33);
+
+    code.extend_from_slice(&[0x48, 0x89, 0xe7, 0x48, 0x81, 0xe7, 0x00, 0xf0, 0xff, 0xff]); // rdi = rsp & !0xfff
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 4);
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, -38);
+
+    code.extend_from_slice(&[0x48, 0x89, 0xe7, 0x48, 0x81, 0xe7, 0x00, 0xf0, 0xff, 0xff]);
+    mov(&mut code, 6, 4096);
+    mov(&mut code, 2, 3); // MADV_WILLNEED
+    mov(&mut code, 0, 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    check(&mut code, &mut failures, 0);
+
+    // Child exits 0.
+    syscall6(&mut code, 231, [0, 0, 0, 0, 0, 0]);
+    code.extend_from_slice(&[0x0f, 0x0b]);
+
+    for (index, offset) in failures.into_iter().enumerate() {
+        let relative = i32::try_from(code.len() - (offset + 4)).unwrap();
+        code[offset..offset + 4].copy_from_slice(&relative.to_le_bytes());
+        syscall6(&mut code, 231, [100 + index as u64 + 1, 0, 0, 0, 0, 0]);
+    }
+    code.extend_from_slice(&[0x0f, 0x0b]);
+
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 64);
+    assert_eq!(
+        outcome.run.exit_code,
+        0,
+        "fork child V8 discard witness failed (38 = ENOSYS, 101+ = step index): {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(28))
+            .unwrap(),
+        4,
+        "exact four intentional madvise declines (populated PROT_READ, COW-shared, carrier stack DONTNEED, MADV_DONTDUMP)"
+    );
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// #1846 x86 CPL0 production witness of the signed `nativeexecmadvise`
+/// probe's V8 code-range sequence in a fork child: reserve `PROT_NONE |
+/// MAP_NORESERVE`, commit two pages RW and fill them (first touch publishes
+/// RW, with no execute ceiling), `mprotect(RX)` and read back and run the
+/// code, recommit RW, discard the whole reservation, refill and go RX again.
+/// Every `mprotect` is served in ring (an unrouted one exits 38). The discard
+/// of the RX code is x86's one counted decline: see the step below.
+#[test]
+fn production_fork_child_v8_code_range_mprotect_execute_round_trip() {
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    let mprotect = |code: &mut Vec<u8>, failures: &mut Vec<usize>, prot: u64| {
+        code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
+        mov(code, 6, 2 * 4096);
+        mov(code, 2, prot);
+        mov(code, 0, 10);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        // A negative errno (such as -38 when unrouted) is the exit status.
+        code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x79, 0x0f]); // test rax, rax; jns +15
+        code.extend_from_slice(&[0x48, 0xf7, 0xd8, 0x48, 0x89, 0xc7]); // neg rax; mov rdi, rax
+        code.extend_from_slice(&[0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
+        check(code, failures, 0);
+    };
+    // `mov eax, imm8; ret` at [r12], and a marker byte on the second page.
+    let fill = |code: &mut Vec<u8>, value: u8| {
+        code.extend_from_slice(&[0x41, 0xc7, 0x04, 0x24, 0xb8, value, 0x00, 0x00]);
+        code.extend_from_slice(&[0x41, 0xc7, 0x44, 0x24, 0x04, 0x00, 0xc3, 0x90, 0x90]);
+        // mov byte [r12 + 0x1000], value
+        code.extend_from_slice(&[0x41, 0xc6, 0x84, 0x24, 0x00, 0x10, 0x00, 0x00, value]);
+    };
+    let readback = |code: &mut Vec<u8>, failures: &mut Vec<usize>, value: u8| {
+        code.extend_from_slice(&[0x41, 0x8b, 0x04, 0x24]); // mov eax, [r12]
+        check(code, failures, 0xb8 | i32::from(value) << 8);
+        // movzx eax, byte [r12 + 0x1000]
+        code.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x84, 0x24, 0x00, 0x10, 0x00, 0x00]);
+        check(code, failures, i32::from(value));
+        code.extend_from_slice(&[0x41, 0xff, 0xd4]); // call r12
+        check(code, failures, i32::from(value));
+    };
+
+    // fork(); the parent waits and exits with the child's status.
+    mov(&mut code, 0, 57);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x88]); // test rax, rax; js fail
+    failures.push(code.len());
+    code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&[0x0f, 0x84]); // jz child
+    let child_branch = code.len();
+    code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&[0x48, 0x83, 0xec, 0x10]); // sub rsp, 16
+    code.extend_from_slice(&[0x41, 0x89, 0xc5]); // mov r13d, eax
+    code.extend_from_slice(&[0x44, 0x89, 0xef]); // mov edi, r13d
+    code.extend_from_slice(&[0x48, 0x89, 0xe6]); // mov rsi, rsp
+    mov(&mut code, 2, 0);
+    mov(&mut code, 10, 0);
+    mov(&mut code, 0, 61); // wait4
+    code.extend_from_slice(&[0x0f, 0x05]);
+    code.extend_from_slice(&[0x44, 0x39, 0xe8, 0x0f, 0x85]); // cmp eax, r13d; jne fail
+    failures.push(code.len());
+    code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&[0x8b, 0x04, 0x24, 0x83, 0xe0, 0x7f]); // mov eax, [rsp]; and eax, 0x7f
+    check(&mut code, &mut failures, 0);
+    code.extend_from_slice(&[0x8b, 0x3c, 0x24, 0xc1, 0xef, 0x08]); // mov edi, [rsp]; shr edi, 8
+    mov(&mut code, 0, 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+
+    let child_offset = i32::try_from(code.len() - (child_branch + 4)).unwrap();
+    code[child_branch..child_branch + 4].copy_from_slice(&child_offset.to_le_bytes());
+    // Reserve 4 pages PROT_NONE | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE.
+    syscall6(&mut code, 9, [0, 4 * 4096, 0, 0x4022, u64::MAX, 0]);
+    code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x88]); // test rax, rax; js fail
+    failures.push(code.len());
+    code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12, rax
+    // code_commit_rw, fill (first touch while RW), code_rx and readback.
+    mprotect(&mut code, &mut failures, 3);
+    fill(&mut code, 0x5a);
+    mprotect(&mut code, &mut failures, 5);
+    readback(&mut code, &mut failures, 0x5a);
+    // code_madvise over the reservation while the code is RX: x86 fork
+    // shares a non-writable private leaf without arming COW, so the discard
+    // cannot prove the frame exclusive and declines (counted ENOSYS) with
+    // the code intact. Linux returns 0 here; that is the x86 discard seam.
+    let madvise = |code: &mut Vec<u8>, failures: &mut Vec<usize>, len: u64, expected: i32| {
+        code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
+        mov(code, 6, len);
+        mov(code, 2, 4); // MADV_DONTNEED
+        mov(code, 0, 28);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        check(code, failures, expected);
+    };
+    madvise(&mut code, &mut failures, 4 * 4096, -38);
+    readback(&mut code, &mut failures, 0x5a);
+    // code_recommit_rw; while writable the discard is served and reads zero.
+    mprotect(&mut code, &mut failures, 3);
+    madvise(&mut code, &mut failures, 4 * 4096, 0);
+    code.extend_from_slice(&[0x41, 0x8b, 0x04, 0x24]); // mov eax, [r12]
+    check(&mut code, &mut failures, 0);
+    // Refill, code_recommit_rx and readback.
+    fill(&mut code, 77);
+    mprotect(&mut code, &mut failures, 5);
+    readback(&mut code, &mut failures, 77);
+    syscall6(&mut code, 231, [0, 0, 0, 0, 0, 0]);
+    code.extend_from_slice(&[0x0f, 0x0b]);
+
+    for (index, offset) in failures.into_iter().enumerate() {
+        let relative = i32::try_from(code.len() - (offset + 4)).unwrap();
+        code[offset..offset + 4].copy_from_slice(&relative.to_le_bytes());
+        syscall6(&mut code, 231, [100 + index as u64 + 1, 0, 0, 0, 0, 0]);
+    }
+    code.extend_from_slice(&[0x0f, 0x0b]);
+
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 64);
+    assert_eq!(
+        outcome.run.exit_code,
+        0,
+        "fork child V8 code-range mprotect witness failed (38 = ENOSYS, 101+ = step index): {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(10))
+            .unwrap(),
+        0,
+        "no mprotect fell back to the counted ENOSYS"
+    );
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(28))
+            .unwrap(),
+        1,
+        "only the RX discard declines"
+    );
+}
+
+#[test]
+fn production_madvise_root_busy_once_parks_and_completes() {
+    const INJECT_ROOT_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe10;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    // mmap(NULL, 4096, RW, PRIVATE|ANONYMOUS, -1, 0) -> r12, populate 0x5a.
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12, rax
+    code.extend_from_slice(&[0x41, 0xc6, 0x04, 0x24, 0x5a]); // mov byte [r12], 0x5a
+
+    // Arm one reservation-root busy refusal, then call madvise(r12, 4096, MADV_DONTNEED=4).
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_ROOT_BUSY_ONCE);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
+    append_mov(&mut code, &[0x48, 0xbe], 0x1000);
+    append_mov(&mut code, &[0x48, 0xba], 4);
+    append_mov(&mut code, &[0x48, 0xb8], 28);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+
+    // Verify the call parked once and replayed to scrub [r12] to zero.
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 1);
+    code.extend_from_slice(&[0x49, 0x0f, 0xb6, 0x04, 0x24]); // movzx rax, byte [r12]
+    append_result_check(&mut code, &mut failures, 0);
+
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let outcome = run_instrumented_pool_fixture(&production_probe_elf(&code), 32);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "madvise must park on root contention, wake, replay and scrub: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(28))
+            .unwrap(),
+        0
+    );
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
 /// Witness 3 & 5 (#2070): CPL0 x86 signal-frame copy encountering address-space
 /// owner contention (`INJECT_ROOT_BUSY_ONCE`) or transient service refusal
 /// (`INJECT_OWNED_COPY_BUSY_ONCE`) must park on the existing continuation,

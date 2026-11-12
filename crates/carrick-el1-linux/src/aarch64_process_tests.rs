@@ -4,6 +4,8 @@
 #[cfg(test)]
 mod born_thread_entry_tests;
 #[cfg(test)]
+mod native_child_clock_tests;
+#[cfg(test)]
 mod native_child_handoff_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 mod native_exec_pipe_tests;
@@ -19,6 +21,8 @@ mod native_retirement_tests;
 mod native_signal_resume_tests;
 #[cfg(test)]
 mod native_signal_work_return_tests;
+#[cfg(test)]
+mod native_venue_notice_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 mod pipe_metadata_tests;
 
@@ -2399,19 +2403,45 @@ fn native_fork_child_clock_nanosleep_clocks_and_flags_match_linux() {
 }
 
 #[test]
-#[ignore = "#1808 slice 3: clock_gettime/adjtimex/clock_adjtime routing"]
 fn native_fork_child_clock_gettime_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_GETTIME);
 }
 
+/// #2028: the other routed readers answer as Linux does with null pointers.
+/// A bad clock id is EINVAL before the output is read, `clock_getres` with a
+/// null `res` only validates, `gettimeofday` with two null outputs succeeds,
+/// and a clock the ring cannot measure keeps the counted ENOSYS refusal.
 #[test]
-#[ignore = "#1808 slice 3: clock_gettime/adjtimex/clock_adjtime routing"]
+fn native_fork_child_clock_readers_match_linux_with_null_pointers() {
+    use carrick_abi::syscall::nr;
+    let thread_cpu = u64::from((!1_u32 << 3) | 0b110);
+    for (number, argument0, argument1, expected) in [
+        (nr::CLOCK_GETTIME, 12, 0, (-22, 0)),
+        (nr::CLOCK_GETTIME, 1, 0, (-14, 0)),
+        (nr::CLOCK_GETTIME, 2, 0, (-38, 1)),
+        (nr::CLOCK_GETTIME, thread_cpu, 0, (-38, 1)),
+        (nr::CLOCK_GETRES, 12, 0, (-22, 0)),
+        (nr::CLOCK_GETRES, 1, 0, (0, 0)),
+        (nr::CLOCK_GETRES, thread_cpu, 0, (-38, 1)),
+        (nr::GETTIMEOFDAY, 0, 0, (0, 0)),
+    ] {
+        assert_eq!(
+            native_fork_child_time_result(number, argument0, argument1),
+            expected,
+            "syscall {} ({argument0:#x}, {argument1:#x})",
+            number.raw()
+        );
+    }
+}
+
+#[test]
+#[ignore = "#1808 slice 3: adjtimex/clock_adjtime routing"]
 fn native_fork_child_clock_adjtime_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_ADJTIME);
 }
 
 #[test]
-#[ignore = "#1808 slice 3: clock_gettime/adjtimex/clock_adjtime routing"]
+#[ignore = "#1808 slice 3: adjtimex/clock_adjtime routing"]
 fn native_fork_child_adjtimex_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::ADJTIMEX);
 }

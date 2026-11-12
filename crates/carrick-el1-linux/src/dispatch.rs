@@ -1387,6 +1387,7 @@ pub(super) struct NativeServiceBegin {
         crate::native_process_runtime::NativeEntropyFlags,
         carrick_guest_arch::GuestLen,
     )>,
+    clock: Option<(carrick_personality_linux::clock::ClockCall, [u64; 2])>,
     retry_exec_stage: bool,
     stage_prefix: Option<alloc::boxed::Box<[u8]>>,
     service_wait: Option<carrick_core_abi::PortalOwnerWait>,
@@ -1403,6 +1404,17 @@ pub(super) enum NativeServiceDecision {
     Action(Action),
     /// Publish this request to the carrier.
     Begin(alloc::boxed::Box<NativeServiceBegin>),
+}
+
+/// The syscall number an owned native exit names, if it is one: only an SVC
+/// (ESR.EC 0x15) is. A data abort or an EL0 IRQ taken after a call returned
+/// still holds that call's number and arguments in `x8` and `x0`..; staging
+/// it from them would answer a syscall nobody made, overwrite `x0`, write
+/// through whatever `x1` holds and drop the fault or carrier work the exit
+/// carries (#2039).
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_svc_number(frame: &TrapFrame) -> Option<u64> {
+    ((frame.esr >> 26) & 0x3f == 0x15).then_some(frame.x[8])
 }
 
 /// Decide what an owned native exit publishes. `host_file` stages the
@@ -1425,6 +1437,7 @@ pub(super) fn native_service_decision(
 ) -> NativeServiceDecision {
     let child = || owner() == super::native_process_runtime::NativeThreadGroupOwner::ForkChild;
     let mut service_wait = wait;
+    let svc = native_svc_number(frame);
     let staged = match native_exec_stage(frame, task) {
         Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
         Some(NativeExecStage::Failed(errno)) => NativeServiceStage::Return(errno.guest_retval()),
@@ -1436,7 +1449,32 @@ pub(super) fn native_service_decision(
         // work first settles that work (CarrierWork) and is replayed;
         // staging it here would pre-empt the settlement forever.
         None if action != Action::Forward => NativeServiceStage::Operation,
-        None if frame.x[8] == 278 => {
+        // A fork child's clock reading is sampled on the run's clock domain.
+        // Planning is argument-only and matches the ring's own answer for
+        // everything that needs no sample, so only a reading is staged here.
+        None if child()
+            && let Some(call) = svc.and_then(|nr| {
+                carrick_personality_linux::clock::ClockCall::from_canonical(
+                    carrick_syscall_abi::CanonicalNr::new(nr),
+                )
+            })
+            && matches!(
+                carrick_personality_linux::clock::plan(call, [frame.x[0], frame.x[1]]),
+                carrick_personality_linux::clock::ClockPlan::Sample { .. }
+            ) =>
+        {
+            return NativeServiceDecision::Begin(alloc::boxed::Box::new(NativeServiceBegin {
+                operation: None,
+                exec_payload: None,
+                host_file: None,
+                entropy: None,
+                clock: Some((call, [frame.x[0], frame.x[1]])),
+                retry_exec_stage: false,
+                stage_prefix: None,
+                service_wait: None,
+            }));
+        }
+        None if svc == Some(278) => {
             let (address, capacity, flags, requested) = native_entropy_stage(frame);
             NativeServiceStage::Entropy {
                 address,
@@ -1583,6 +1621,7 @@ pub(super) fn native_service_decision(
         exec_payload,
         host_file,
         entropy,
+        clock: None,
         retry_exec_stage,
         stage_prefix,
         service_wait,
@@ -1622,6 +1661,7 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
         exec_payload,
         host_file,
         entropy,
+        clock,
         retry_exec_stage,
         stage_prefix,
         service_wait,
@@ -1651,6 +1691,12 @@ pub(super) fn begin_native_service<X: super::aarch64_process::ForkStockCrossing>
                     counters,
                 ),
             )
+        }
+    } else if let Some((call, args)) = clock {
+        if service_wait.is_some() {
+            Err(super::native_process_runtime::NativeProcessError::Quarantined)
+        } else {
+            process.begin_clock_service(call, args, carrick_guest_arch::NativeOrdinal::new(ordinal))
         }
     } else if let Some((address, capacity, flags, requested)) = entropy {
         process.begin_entropy_service(address, capacity, flags, requested)
@@ -3808,6 +3854,48 @@ impl<
             return DelegatedStep::NotDelegated;
         };
         let access = carrick_el1::substrate::sched::object_wait::space_access(zone.tables, slot);
+        if carrick_personality_linux::dispatch::AnonymousCall::from_canonical(
+            self.frame.canonical_ordinal(),
+        ) == Some(carrick_personality_linux::dispatch::AnonymousCall::Madvise)
+        {
+            if self
+                .process
+                .as_ref()
+                .is_none_or(|process| process.is_root_process())
+            {
+                return DelegatedStep::NotDelegated;
+            }
+            return match memory::serve_delegated_discard(
+                match self.frame.arm_frame() {
+                    Some(frame) => frame,
+                    None => {
+                        self.frame.record_isa_unsupported_forward();
+                        return DelegatedStep::NotDelegated;
+                    }
+                },
+                self.counters,
+                task,
+                access,
+                memory::reservations::shared_guest(),
+                &mut memory::HardwareAnonymousEditor,
+            ) {
+                memory::DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(cause),
+                memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
+                memory::DelegatedAnonymous::Served => {
+                    if carrick_core::wait::complete_anonymous_edit_replay(
+                        zone.tables,
+                        slot,
+                        task.mm.key.load(Ordering::Acquire),
+                    )
+                    .is_err()
+                    {
+                        invalid_completion(NativeInvariant::EntryBinding);
+                    }
+                    DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
+                }
+                memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
+            };
+        }
         // A private file mmap the host-file venue already retained a byte
         // source for: this is its exact retry.
         let take = self

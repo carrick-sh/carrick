@@ -195,6 +195,29 @@ impl X86AnonymousVenue<'_> {
     }
 }
 
+impl X86AnonymousVenue<'_> {
+    /// A parked edit's token outlives its wake; the replay that served the
+    /// edit owns it, whichever anonymous call (mapping or discard) it was.
+    fn settle_replay(&self, slot: carrick_el1_abi::SlotId) {
+        #[cfg(feature = "test-support")]
+        let refused = crate::test_support::take_replay_settlement_refusal();
+        #[cfg(not(feature = "test-support"))]
+        let refused = false;
+        if refused
+            || carrick_core::wait::complete_anonymous_edit_replay(
+                self.source.zone,
+                slot,
+                self.task.mm.key.load(Ordering::Acquire),
+            )
+            .is_err()
+        {
+            // The edit is already committed and the refusal is an
+            // ownership failure no errno repairs: fatal, as on ARM.
+            fatal_reservation();
+        }
+    }
+}
+
 impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     fn original_argument0(&self) -> u64 {
         self.frame.arguments()[0]
@@ -212,6 +235,33 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         };
         // SAFETY: this CPU's binding retains its initialized atomic counters.
         let counters = unsafe { &*(binding.counters_address as *const carrick_el1_abi::Counters) };
+        if carrick_personality_linux::dispatch::AnonymousCall::from_canonical(
+            carrick_syscall_abi::CanonicalNr::new(self.frame.canonical().raw()),
+        ) == Some(carrick_personality_linux::dispatch::AnonymousCall::Madvise)
+        {
+            return match carrick_el1::memory::serve_delegated_discard(
+                &mut self.frame,
+                counters,
+                self.task,
+                carrick_core::wait::space_access(zone, slot, crate::native_process::release),
+                shared_x86_cpl0_guest(),
+                &mut editor,
+            ) {
+                carrick_el1::memory::DelegatedAnonymous::Served => {
+                    self.settle_replay(slot);
+                    DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
+                }
+                carrick_el1::memory::DelegatedAnonymous::NotDelegated => {
+                    DelegatedStep::NotDelegated
+                }
+                carrick_el1::memory::DelegatedAnonymous::Contended(cause) => {
+                    #[cfg(feature = "test-support")]
+                    crate::test_support::arm_metadata_for_reprobe();
+                    DelegatedStep::Contended(cause)
+                }
+                carrick_el1::memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
+            };
+        }
         let file = match self.source(zone) {
             Ok(file) => file,
             Err(result) => return DelegatedStep::Served(result),
@@ -226,23 +276,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             file,
         ) {
             carrick_el1::memory::DelegatedAnonymous::Served => {
-                // A parked edit's token outlives its wake; the replay owns it.
-                #[cfg(feature = "test-support")]
-                let refused = crate::test_support::take_replay_settlement_refusal();
-                #[cfg(not(feature = "test-support"))]
-                let refused = false;
-                if refused
-                    || carrick_core::wait::complete_anonymous_edit_replay(
-                        self.source.zone,
-                        slot,
-                        self.task.mm.key.load(Ordering::Acquire),
-                    )
-                    .is_err()
-                {
-                    // The edit is already committed and the refusal is an
-                    // ownership failure no errno repairs: fatal, as on ARM.
-                    fatal_reservation();
-                }
+                self.settle_replay(slot);
                 DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
             carrick_el1::memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
@@ -311,31 +345,39 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                     }
                     Err(_) => return None,
                 };
-                match decide_reservation_syscall(frame, task, &mut root, None) {
-                    ReservationDisposition::Unavailable(
-                        carrick_el1::memory::reservations::Refusal::PreparedConflict,
-                    ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
-                    ReservationDisposition::Unavailable(
-                        carrick_el1::memory::reservations::Refusal::Busy,
-                    ) => return Some(Some(SpaceWaitCause::PendingEdit)),
-                    ReservationDisposition::Unavailable(
-                        carrick_el1::memory::reservations::Refusal::MetadataRequired,
-                    ) => {
-                        if root
-                            .provision_metadata(&carrick_el1::alloc::GLOBAL_ALLOCATOR)
-                            .is_err()
-                        {
-                            return None;
-                        }
-                        return Some(None);
+                if let Some(conflict) =
+                    carrick_el1::memory::probe_discard_root_conflict(frame, &mut root)
+                {
+                    if let Some(cause) = conflict {
+                        return Some(Some(cause));
                     }
-                    ReservationDisposition::Unavailable(_) => return None,
-                    ReservationDisposition::Work(pending) => {
-                        if pending.cancel(&mut root).is_err() {
-                            return None;
+                } else {
+                    match decide_reservation_syscall(frame, task, &mut root, None) {
+                        ReservationDisposition::Unavailable(
+                            carrick_el1::memory::reservations::Refusal::PreparedConflict,
+                        ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
+                        ReservationDisposition::Unavailable(
+                            carrick_el1::memory::reservations::Refusal::Busy,
+                        ) => return Some(Some(SpaceWaitCause::PendingEdit)),
+                        ReservationDisposition::Unavailable(
+                            carrick_el1::memory::reservations::Refusal::MetadataRequired,
+                        ) => {
+                            if root
+                                .provision_metadata(&carrick_el1::alloc::GLOBAL_ALLOCATOR)
+                                .is_err()
+                            {
+                                return None;
+                            }
+                            return Some(None);
                         }
+                        ReservationDisposition::Unavailable(_) => return None,
+                        ReservationDisposition::Work(pending) => {
+                            if pending.cancel(&mut root).is_err() {
+                                return None;
+                            }
+                        }
+                        ReservationDisposition::Return(_) | ReservationDisposition::Forward => {}
                     }
-                    ReservationDisposition::Return(_) | ReservationDisposition::Forward => {}
                 }
                 drop(root);
                 match zone
@@ -521,6 +563,16 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
                     executable: edit.executable,
                     user: edit.readable || edit.writable || edit.executable,
                 },
+                // An unreadable ceiling authorizes no widening.
+                ceiling: edit
+                    .root_ceiling
+                    .filter(|ceiling| ceiling.readable)
+                    .map(|ceiling| carrick_guest_arch::EditPermissions {
+                        readable: true,
+                        writable: ceiling.writable,
+                        executable: ceiling.executable,
+                        user: true,
+                    }),
             },
         )
         .map_err(|_| carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)
@@ -557,6 +609,39 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
             return Err(carrick_mmu_core::aarch64::GuestRetirementError::RollbackFailed);
         }
         Ok(())
+    }
+}
+impl carrick_el1::memory::AnonymousDiscardEditor for X86AnonymousEditor {
+    fn discard_and_scrub(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        steps: &[carrick_el1::memory::AnonymousDiscardStep],
+    ) -> Result<(), carrick_el1::memory::AnonymousDiscardError> {
+        use carrick_el1::memory::AnonymousDiscardError;
+        use carrick_el1_abi::AnonymousLeave as Leave;
+        let context = self
+            .words
+            .context
+            .ok_or(AnonymousDiscardError::Refused(Leave::BackingMalformed))?;
+        let register = RootGpa::page_aligned(FrameGpa::new(root.raw()))
+            .ok_or(AnonymousDiscardError::Refused(Leave::BackingMalformed))?;
+        if context.root != register {
+            return Err(AnonymousDiscardError::Refused(Leave::BackingMalformed));
+        }
+        match carrick_el1::memory::discard_x86_anonymous_steps(
+            &self.words,
+            context.root,
+            steps,
+            |alias_va, _| {
+                // SAFETY: `with_cow_write_alias` mapped `alias_va` as an exclusive
+                // CPL0-only RW NX 4 KiB page and invalidated any stale TLB entry.
+                unsafe { core::ptr::write_bytes(alias_va as *mut u8, 0, 4096) };
+            },
+        ) {
+            Ok(()) => Ok(()),
+            Err(AnonymousDiscardError::Indeterminate) => fatal_reservation(),
+            Err(error) => Err(error),
+        }
     }
 }
 

@@ -1250,8 +1250,21 @@ pub struct ProductionWorkerParts<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
 pub type NativeEntropyService =
     fn(&mut [u8]) -> Result<(), carrick_core_abi::service::entropy::InvalidEntropyRecord>;
 
+/// Runtime-supplied container clock handler: answers one staged
+/// `carrick_core_abi::clock` record in place against the run's `ClockDomain`.
+/// One x86 carrier serves one container, so the record's capability selects
+/// no other domain; the VMM retains transport only.
+pub type NativeClockService = Arc<
+    dyn Fn(
+            &mut [u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES],
+        ) -> Result<(), carrick_core_abi::clock::ClockRecordError>
+        + Send
+        + Sync,
+>;
+
 pub struct ProductionCpuFactory<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
     native_entropy: NativeEntropyService,
+    native_clock: NativeClockService,
     cpus: std::sync::Mutex<[Option<CarrierCpu<M>>; 2]>,
     custody: Arc<std::sync::Mutex<Cpl0HostCustody<Mem>>>,
     debug_cpus: [Arc<CarrierCpuDebug>; 2],
@@ -1266,6 +1279,7 @@ pub struct ProductionPhysicalCapture {
 
 pub struct ProductionCpuLease<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
     native_entropy: NativeEntropyService,
+    native_clock: NativeClockService,
     cpu: CarrierCpu<M>,
     _custody: Arc<std::sync::Mutex<Cpl0HostCustody<Mem>>>,
 }
@@ -1633,6 +1647,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
         let native_entropy = self.native_entropy;
+        let native_clock = Arc::clone(&self.native_clock);
         let mut work_flags = None;
         let mut pending_file = None;
         let (exit, register_child, unregister_child) = self.cpu.with_idle_peer_io(|io| {
@@ -1687,7 +1702,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 }
                 NATIVE_SERVICE_PORT => {
                     if let anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) =
-                        custody.service_native_notice(&lease, file, native_entropy)?
+                        custody.service_native_notice(&lease, file, native_entropy, &native_clock)?
                     {
                         pending_file = Some(pending);
                     }
@@ -2000,6 +2015,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
         let native_entropy = self.native_entropy;
+        let native_clock = Arc::clone(&self.native_clock);
         let mut work_flags = None;
         let mut pending_file = None;
         let (exit, register_child, unregister_child) = self.cpu.with_stopped_io(task, |io| {
@@ -2048,7 +2064,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                 }
                 Some(ProductionPort::NativeService) => {
                     if let anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) =
-                        custody.service_native_notice(&lease, file, native_entropy)? {
+                        custody.service_native_notice(&lease, file, native_entropy, &native_clock)? {
                         pending_file = Some(pending);
                     }
                     Ok((None, None, None))
@@ -2680,6 +2696,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         }
         Ok(ProductionCpuLease {
             native_entropy: self.native_entropy,
+            native_clock: Arc::clone(&self.native_clock),
             cpu,
             _custody: Arc::clone(&self.custody),
         })
@@ -2708,6 +2725,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionWorkerParts<M, Mem> {
     pub fn into_factory(
         self,
         native_entropy: NativeEntropyService,
+        native_clock: NativeClockService,
     ) -> (
         carrick_x86::arch_context::X86ArchContext,
         ProductionCpuFactory<M, Mem>,
@@ -2723,6 +2741,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionWorkerParts<M, Mem> {
             root_state,
             ProductionCpuFactory {
                 native_entropy,
+                native_clock,
                 cpus: std::sync::Mutex::new(cpus.map(Some)),
                 custody: Arc::new(std::sync::Mutex::new(custody)),
                 debug_cpus,

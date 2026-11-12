@@ -120,6 +120,64 @@ where
     Ok(result)
 }
 
+/// Validate the two preallocated, idle kernel-only leaves at `base` without
+/// publishing any descriptor.
+pub fn validate_cow_copy_window<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: SubstrateGpa,
+    base: u64,
+) -> Result<(), DescriptorRefusal> {
+    if base.checked_add(2 * PAGE).is_none() || !base.is_multiple_of(PAGE) {
+        return Err(DescriptorRefusal::WrongBacking);
+    }
+    for index in 0..2 {
+        let va = base + index * PAGE;
+        let (_, before) = leaf(words, root, va)?;
+        if before & 1 != 0 || before & AP != 0 || before & MASK != va {
+            return Err(DescriptorRefusal::WrongBacking);
+        }
+    }
+    Ok(())
+}
+
+/// Map the destination slot (`base + 4096`) of an idle copy-window pair as a
+/// kernel-only RW NX leaf while the caller owns the exact-MM editor, invoke
+/// `write` with that alias VA, then restore and invalidate before returning.
+pub fn with_cow_write_alias<W, R>(
+    words: &W,
+    root: SubstrateGpa,
+    base: u64,
+    destination: SubstrateGpa,
+    write: impl FnOnce(u64) -> R,
+) -> Result<R, DescriptorOutcome>
+where
+    W: LiveDescriptorWords + ?Sized,
+{
+    let refused = DescriptorOutcome::Refused;
+    if destination.raw() == 0 || destination.raw() & !MASK != 0 {
+        return Err(refused(DescriptorRefusal::WrongBacking));
+    }
+    validate_cow_copy_window(words, root, base).map_err(refused)?;
+    let va = base + PAGE;
+    let (address, before) = leaf(words, root, va).map_err(refused)?;
+    if before & 1 != 0 || before & AP != 0 || before & MASK != va {
+        return Err(refused(DescriptorRefusal::WrongBacking));
+    }
+    let after = destination.raw() | 3 | (1 << 10) | (3 << 8) | (1 << 11) | (1 << 53) | (1 << 54);
+    if words.compare_exchange(address, before, after) != Ok(true) {
+        return Err(refused(DescriptorRefusal::Contended));
+    }
+    words.publish_barrier();
+    words.invalidate_range(base, 2 * PAGE);
+    let result = write(va);
+    if !restore(words, base, &[(address, before, after)]) {
+        return Err(DescriptorOutcome::Indeterminate(
+            DescriptorRefusal::Contended,
+        ));
+    }
+    Ok(result)
+}
+
 fn restore<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     base: u64,
@@ -314,6 +372,36 @@ mod tests {
             words.load(FIRST + 8).unwrap(),
             (BASE + PAGE) | 2,
             "still revoke the other alias"
+        );
+    }
+
+    #[test]
+    fn cow_write_alias_maps_destination_slot_only_and_restores_before_completion() {
+        let words = Words::new();
+        assert_eq!(
+            with_cow_write_alias(&words, ROOT, BASE, SubstrateGpa(0x8000), |dest| {
+                assert_eq!(dest, BASE + PAGE);
+                assert_eq!(words.load(FIRST).unwrap(), BASE | 2);
+                assert_eq!(words.load(FIRST + 8).unwrap() & (MASK | AP | 3), 0x8000 | 3);
+                assert_eq!(
+                    words.load(FIRST + 8).unwrap() & ((1 << 53) | (1 << 54) | (1 << 11)),
+                    (1 << 53) | (1 << 54) | (1 << 11)
+                );
+                29
+            }),
+            Ok(29)
+        );
+        assert_eq!(words.load(FIRST).unwrap(), BASE | 2);
+        assert_eq!(words.load(FIRST + 8).unwrap(), (BASE + PAGE) | 2);
+        assert_eq!(words.invalidations.get(), 2);
+
+        let busy = Words::new();
+        busy.words[FIRST as usize / 8].set(0x8003);
+        assert!(
+            with_cow_write_alias(&busy, ROOT, BASE, SubstrateGpa(0x9000), |_| {
+                panic!("busy source slot must refuse write alias")
+            })
+            .is_err()
         );
     }
 }

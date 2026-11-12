@@ -66,7 +66,7 @@ impl carrick_el1::fault::PreparedPageResolver for NoInheritedSupply<'_> {
     }
 }
 
-fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
+pub(super) fn leaf(words: &(impl LiveDescriptorWords + ?Sized), root: u64, va: u64) -> u64 {
     let mut table = root & AARCH64_ROOT_ADDRESS_MASK;
     for (level, index) in carrick_mmu_core::aarch64::indices(va)
         .into_iter()
@@ -81,9 +81,9 @@ fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
     }
     unreachable!()
 }
-struct FixtureMapping<'a> {
-    words: &'a dyn LiveDescriptorWords,
-    residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+pub(super) struct FixtureMapping<'a> {
+    pub(super) words: &'a dyn LiveDescriptorWords,
+    pub(super) residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
 }
 impl carrick_el1::memory::AnonymousBackingProbe for FixtureMapping<'_> {
     fn backing(
@@ -157,7 +157,26 @@ impl carrick_el1::memory::AnonymousRetirementEditor for FixtureMapping<'_> {
         Ok(())
     }
 }
-
+impl carrick_el1::memory::AnonymousDiscardEditor for FixtureMapping<'_> {
+    fn discard_and_scrub(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        steps: &[carrick_el1::memory::AnonymousDiscardStep],
+    ) -> Result<(), carrick_el1::memory::AnonymousDiscardError> {
+        carrick_el1::memory::discard_aarch64_anonymous_steps(
+            self.words,
+            carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
+            carrick_el1_abi::EL1_COW_COPY_BASE,
+            steps,
+            |alias_va, _| {
+                let to = leaf(self.words, root.raw(), alias_va);
+                assert_eq!(to & 3, 3);
+                assert_eq!(to & (3 << 6), 0);
+                assert_ne!(to & ((1 << 54) | (1 << 53)), 0);
+            },
+        )
+    }
+}
 struct FaultResolver<'a> {
     tables: &'a crate::mm_portal::test_support::Tables,
     memory: &'a FaultMemory,
@@ -233,6 +252,13 @@ fn native_fork_child_clone_storm_recycles_exited_pinned_controls() {
     child_thread_admission(7, 32, ChildStockCase::Pinned);
 }
 
+/// #2039: B is a same-mm sibling (the child's ring-born worker).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn venue_copyout_repark_leaves_the_slot_before_a_same_mm_sibling_runs() {
+    child_thread_admission(1, 1, ChildStockCase::VenueNotice);
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_claimed_sibling_birth_parks_until_settlement() {
@@ -274,6 +300,9 @@ enum GroupExitCaller {
 #[derive(Clone, Copy, PartialEq)]
 enum ChildStockCase {
     FirstBirth,
+    /// #2039: the child leader's venue copyout parks behind a notice while
+    /// its ring-born worker (same mm) is queued on the slot.
+    VenueNotice,
     Reuse,
     Pinned,
     Claimed,
@@ -291,7 +320,10 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
     crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
-    if case != ChildStockCase::FirstBirth {
+    if !matches!(
+        case,
+        ChildStockCase::FirstBirth | ChildStockCase::VenueNotice
+    ) {
         let mut physical = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
         physical.metadata_in_el1_window = true;
         physical.bind_lane(
@@ -460,6 +492,16 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             tids.push(frame.x[0] as u32);
         }
         if case == ChildStockCase::FirstBirth {
+            return;
+        }
+        if case == ChildStockCase::VenueNotice {
+            super::native_venue_notice_tests::same_mm_worker_stays_queued(
+                fixture,
+                &mut frame,
+                &mut cpu,
+                &mut service,
+                &counters,
+            );
             return;
         }
         if let ChildStockCase::GroupExit(caller) = case {
@@ -1056,7 +1098,7 @@ impl crate::thread_setup::LifecycleVenue for LoanLifecycle {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn loan_call(
+pub(super) fn loan_call(
     fixture: &'static Fixture,
     frame: &mut carrick_el1_abi::TrapFrame,
     cpu: &mut crate::sched::FakeCpu,

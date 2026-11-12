@@ -80,7 +80,6 @@ pub mod nr {
     pub const MLOCK: CanonicalNr = CanonicalNr(228);
     pub const MUNLOCK: CanonicalNr = CanonicalNr(229);
     pub const MINCORE: CanonicalNr = CanonicalNr(232);
-    pub const MADVISE: CanonicalNr = CanonicalNr(233);
     pub const SYNCFS: CanonicalNr = CanonicalNr(267);
     pub const RENAMEAT2: CanonicalNr = CanonicalNr(276);
     pub const MLOCK2: CanonicalNr = CanonicalNr(284);
@@ -257,7 +256,6 @@ host_crossings! {
     Mlock = nr::MLOCK, false, Temporary;
     Munlock = nr::MUNLOCK, false, Temporary;
     Mincore = nr::MINCORE, false, Temporary;
-    Madvise = nr::MADVISE, false, Temporary;
     Syncfs = nr::SYNCFS, false, Permanent;
     Renameat2 = nr::RENAMEAT2, false, Permanent;
     Mlock2 = nr::MLOCK2, false, Temporary;
@@ -505,7 +503,7 @@ mod tests {
 
     #[test]
     fn ring_first_census_guest_fd_and_memory_rows_are_temporary() {
-        for ordinal in [72, 75, 76, 77, 199, 228, 229, 232, 233, 284] {
+        for ordinal in [72, 75, 76, 77, 199, 228, 229, 232, 284] {
             assert_eq!(
                 AllowedHostCrossing::from_canonical_aarch64(CanonicalNr::new(ordinal))
                     .and_then(AllowedHostCrossing::kind),
@@ -614,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 119);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 118);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
@@ -648,6 +646,7 @@ mod tests {
             CanonicalNr(220), // clone
             CanonicalNr(222), // mmap
             CanonicalNr(226), // mprotect
+            CanonicalNr(233), // madvise
             CanonicalNr(260), // wait4
         ] {
             assert!(

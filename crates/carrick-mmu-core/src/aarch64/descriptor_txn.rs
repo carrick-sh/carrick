@@ -209,8 +209,10 @@ pub enum DescriptorOp {
         access: LeafAccess,
     },
     /// Change permissions on prepared and/or resident private leaves. On
-    /// non-COW leaves the software write/execute bits bound the result; on
-    /// COW-armed resident leaves `edit.cow_ceiling` bounds the result in place
+    /// non-COW leaves the software write/execute bits bound the result, or
+    /// `edit.root_ceiling` when the root authorizes a widening (the widened
+    /// ceiling is then recorded); on
+    /// COW-armed resident leaves `edit.root_ceiling` bounds the result in place
     /// (keeping `SW_EL1_COW` armed, never granting `AP_RW`, and recording new
     /// write intent in `SW_EL1_MAY_WRITE`), or `CowArmed` is refused when no
     /// ceiling is supplied. Prepared leaves stay invalid.
@@ -604,7 +606,7 @@ impl DescriptorOp {
                 bool_word(edit.readable, 0)
                     | bool_word(edit.writable, 1)
                     | bool_word(edit.executable, 2),
-                edit.cow_ceiling.map_or(0, |ceiling| {
+                edit.root_ceiling.map_or(0, |ceiling| {
                     1 | bool_word(ceiling.readable, 1)
                         | bool_word(ceiling.writable, 2)
                         | bool_word(ceiling.executable, 3)
@@ -674,7 +676,7 @@ impl DescriptorOp {
                     readable: payload[2] & 1 != 0,
                     writable: payload[2] & 2 != 0,
                     executable: payload[2] & 4 != 0,
-                    cow_ceiling: match payload[3] {
+                    root_ceiling: match payload[3] {
                         0 => None,
                         w => Some(GuestPermissionCeiling {
                             readable: w & 2 != 0,
@@ -2289,7 +2291,7 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 }
                 let any_el0 = edit.readable || edit.writable || edit.executable;
                 if el1_cow(descriptor) {
-                    let Some(ceiling) = edit.cow_ceiling else {
+                    let Some(ceiling) = edit.root_ceiling else {
                         return Err(DescriptorRefusal::CowArmed);
                     };
                     if (any_el0 && !ceiling.readable)
@@ -2310,11 +2312,19 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                         | uxn
                         | may_write);
                 }
-                if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
-                    || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
+                // A recorded ceiling, or the root's, admits each access.
+                let root = edit.root_ceiling;
+                if (edit.writable
+                    && descriptor & SW_EL1_MAY_WRITE == 0
+                    && !root.is_some_and(|ceiling| ceiling.writable))
+                    || (edit.executable
+                        && descriptor & SW_EL1_MAY_EXEC == 0
+                        && !root.is_some_and(|ceiling| ceiling.executable))
                 {
                     return Err(DescriptorRefusal::PermissionWidening);
                 }
+                let widened = if edit.writable { SW_EL1_MAY_WRITE } else { 0 }
+                    | if edit.executable { SW_EL1_MAY_EXEC } else { 0 };
                 let (ap, uxn) = if !any_el0 {
                     (AP_PRIV_RO, UXN)
                 } else if edit.writable {
@@ -2326,7 +2336,7 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 // its later Publish arms COW whatever AP this records.
                 Ok(settle_deferred_fork_cow(
                     descriptor,
-                    (descriptor & !AP_MASK & !UXN) | ap | uxn,
+                    (descriptor & !AP_MASK & !UXN) | ap | uxn | widened,
                 ))
             }
             DescriptorOp::Retire(_) => match state {
@@ -2971,7 +2981,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: true,
-                cow_ceiling: None,
+                root_ceiling: None,
             }),
             DescriptorOp::Protect(GuestPermissionEdit {
                 va: 0x6000,
@@ -2979,7 +2989,7 @@ mod tests {
                 readable: true,
                 writable: true,
                 executable: false,
-                cow_ceiling: Some(GuestPermissionCeiling {
+                root_ceiling: Some(GuestPermissionCeiling {
                     readable: true,
                     writable: true,
                     executable: false,
@@ -3556,7 +3566,7 @@ mod tests {
                     readable,
                     writable,
                     executable: false,
-                    cow_ceiling: None,
+                    root_ceiling: None,
                 })
             };
             let setup = |writable: bool| {
@@ -3812,6 +3822,78 @@ mod tests {
             assert!(words.live_cas().is_empty());
         }
 
+        /// V8's code range in a native child: pages first touched while RW
+        /// record no execute ceiling. The root's `VM_MAYEXEC` admits RX on
+        /// both prepared and resident leaves, which then record it; a ceiling
+        /// without execute still refuses.
+        #[test]
+        fn protect_widens_non_cow_leaves_within_root_ceiling() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(2, PageSpan::new(VA, PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            let rx = GuestPermissionEdit {
+                va: VA,
+                len: 2 * PT_PAGE,
+                readable: true,
+                writable: false,
+                executable: true,
+                root_ceiling: Some(GuestPermissionCeiling {
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                }),
+            };
+            let before = words.image();
+            assert_eq!(
+                run(&words, DescriptorOp::Protect(rx), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+            );
+            assert_eq!(words.image(), before);
+            let rwx = Some(GuestPermissionCeiling {
+                readable: true,
+                writable: true,
+                executable: true,
+            });
+            applied(run(
+                &words,
+                DescriptorOp::Protect(GuestPermissionEdit {
+                    root_ceiling: rwx,
+                    ..rx
+                }),
+                &TableGrants::NONE,
+            ));
+            for n in 0..2 {
+                let d = words.get(leaf_pa(VA + n * PT_PAGE));
+                assert_eq!(d & AP_MASK, AP_RO, "page {n}");
+                assert_eq!(d & UXN, 0, "page {n}");
+                assert_ne!(d & SW_EL1_MAY_EXEC, 0, "page {n} records execute");
+                assert_ne!(d & SW_EL1_MAY_WRITE, 0, "page {n} keeps its write ceiling");
+                assert_eq!(d & VALID != 0, n == 0, "protection never changes residency");
+            }
+            // Recorded, RW and RX return without any root ceiling.
+            for edit in [
+                GuestPermissionEdit {
+                    writable: true,
+                    executable: false,
+                    root_ceiling: None,
+                    ..rx
+                },
+                GuestPermissionEdit {
+                    root_ceiling: None,
+                    ..rx
+                },
+            ] {
+                applied(run(&words, DescriptorOp::Protect(edit), &TableGrants::NONE));
+            }
+            assert!(terminal_descriptor_permits_el0(
+                words.get(leaf_pa(VA)),
+                LeafAccess::Execute
+            ));
+        }
+
         #[test]
         fn protect_serves_mixed_prepared_and_resident_ranges() {
             let words = fixture(3);
@@ -3826,7 +3908,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                root_ceiling: None,
             };
             applied(run(
                 &words,
@@ -3961,7 +4043,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: rwx_ceiling,
+                    root_ceiling: rwx_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
@@ -3986,7 +4068,7 @@ mod tests {
                     readable: false,
                     writable: false,
                     executable: false,
-                    cow_ceiling: rwx_ceiling,
+                    root_ceiling: rwx_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4013,7 +4095,7 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: false,
-                        cow_ceiling: none_ceiling,
+                        root_ceiling: none_ceiling,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4030,7 +4112,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: ro_ceiling,
+                    root_ceiling: ro_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4052,7 +4134,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: ro_ceiling,
+                        root_ceiling: ro_ceiling,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4070,7 +4152,7 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: true,
-                        cow_ceiling: Some(GuestPermissionCeiling {
+                        root_ceiling: Some(GuestPermissionCeiling {
                             readable: true,
                             writable: true,
                             executable: false,
@@ -4089,7 +4171,7 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: true,
-                        cow_ceiling: rwx_ceiling,
+                        root_ceiling: rwx_ceiling,
                     }),
                     &TableGrants::NONE,
                 ),
@@ -4106,7 +4188,7 @@ mod tests {
                     readable: true,
                     writable: true,
                     executable: false,
-                    cow_ceiling: rwx_ceiling,
+                    root_ceiling: rwx_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4119,7 +4201,7 @@ mod tests {
                     readable: true,
                     writable: true,
                     executable: true,
-                    cow_ceiling: rwx_ceiling,
+                    root_ceiling: rwx_ceiling,
                 }),
                 &TableGrants::NONE,
             ));
@@ -4204,7 +4286,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                root_ceiling: None,
             };
             assert_eq!(
                 run(&words, DescriptorOp::Protect(edit), &TableGrants::NONE),
@@ -4321,7 +4403,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                root_ceiling: None,
             };
             let outcome = run(&words, DescriptorOp::Protect(edit), &grants(&[8]));
             assert_eq!(
@@ -4517,7 +4599,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
-                    cow_ceiling: None,
+                    root_ceiling: None,
                 }),
                 &TableGrants::NONE,
             ));
@@ -5002,7 +5084,7 @@ mod tests {
                             readable,
                             writable: false,
                             executable: false,
-                            cow_ceiling: None,
+                            root_ceiling: None,
                         }),
                         &TableGrants::NONE,
                     ));
@@ -5063,7 +5145,7 @@ mod tests {
                             readable: true,
                             writable: true,
                             executable: false,
-                            cow_ceiling: None,
+                            root_ceiling: None,
                         }),
                         &TableGrants::NONE,
                     ));
@@ -5262,7 +5344,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
-                            cow_ceiling: None,
+                            root_ceiling: None,
                         },
                     )
                 },
@@ -5731,7 +5813,7 @@ mod carrick_owned_window_tests {
                 readable: true,
                 writable: false,
                 executable: false,
-                cow_ceiling: None,
+                root_ceiling: None,
             }),
             DescriptorOp::Retire(span),
             DescriptorOp::CowRepoint {

@@ -834,9 +834,14 @@ pub(crate) enum GuestIdleExit {
     /// a queued thread that needs this executor. The proof says the slot
     /// holds no switched record, so the executor may park or load on it.
     Idle(SettledIdleSlot),
-    /// A parked native continuation; physical backing custody survives the lane.
+    /// A parked native continuation; physical backing custody survives the
+    /// lane. The proof says EL1 left the slot vacated before the host took
+    /// the notice ([`admit_idle_service_exit`]).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    Service(Box<carrick_vmm_hvf::metadata_grant::NativeService>),
+    Service(
+        Box<carrick_vmm_hvf::metadata_grant::NativeService>,
+        SettledIdleSlot,
+    ),
     /// The in-ring process owner crossed its authenticated root exit on this
     /// vCPU while no host task was loaded. The process terminal is owed to a
     /// host member of the exiting process; this executor holds none.
@@ -987,6 +992,74 @@ impl SettledIdleSlot {
     }
 }
 
+/// The exit on which an idle lane's vCPU also carried a native service
+/// notice ([`admit_idle_service_exit`]).
+#[derive(Debug)]
+pub(crate) enum IdleServiceExit<'a> {
+    /// EL1 left for the host on its own.
+    Halt,
+    /// The in-ring owner's authenticated root exit crossing.
+    NativeRootExit,
+    /// Any other exit, as the backend reported it.
+    Other(&'a dyn core::fmt::Debug),
+}
+
+/// The record switched in on `slot`, for refusal diagnostics.
+fn slot_occupant(
+    zone: &carrick_el1_abi::ZoneTables,
+    slot: carrick_el1_abi::SlotId,
+) -> Option<(
+    carrick_el1_abi::RecordRef,
+    carrick_sched_core::Claim,
+    bool,
+    carrick_el1_abi::ThreadIdentity,
+)> {
+    zone.slot(slot).current().map(|record| {
+        let rec = zone.record(record);
+        (
+            zone.record_ref(record),
+            rec.claim(),
+            rec.is_native_owned(),
+            rec.identity(),
+        )
+    })
+}
+
+/// Admit a native service notice an idle lane's vCPU left with. A lane
+/// that publishes a notice must leave for the host at once with its slot
+/// vacated (`carrick_el1::sched::Sched::load`): only an EL1 `Halt` on a
+/// settled slot carries one. Any other exit, or a root-exit crossing,
+/// means a record ran at EL0 with the notice pending; refuse it here, named
+/// by exit, record and installed space, rather than accept it and fail
+/// later, unattributed, when the executor leaves the slot (#2039).
+pub(crate) fn admit_idle_service_exit(
+    zone: Option<&carrick_el1_abi::ZoneTables>,
+    slot: carrick_el1_abi::SlotId,
+    exit: IdleServiceExit<'_>,
+) -> Result<SettledIdleSlot, TrapError> {
+    let kind: &dyn core::fmt::Debug = match &exit {
+        IdleServiceExit::Halt => &"Halt",
+        IdleServiceExit::NativeRootExit => &"NativeRootExit",
+        IdleServiceExit::Other(other) => other,
+    };
+    let refused = |reason: &dyn core::fmt::Display| {
+        let (installed, held) = zone.map_or((0, None), |zone| {
+            (zone.installed_space(slot), slot_occupant(zone, slot))
+        });
+        TrapError::Hypervisor(format!(
+            "a vCPU waiting in the guest left with a native service notice on {kind:?} ({reason}): \
+             slot={slot:?} installed_mm={installed} current=(reference, claim, native, identity) {held:?}"
+        ))
+    };
+    match exit {
+        IdleServiceExit::Halt => SettledIdleSlot::admit_in(zone, Some(slot))
+            .map_err(|unsettled| refused(&format_args!("{unsettled:?}"))),
+        IdleServiceExit::NativeRootExit | IdleServiceExit::Other(_) => {
+            Err(refused(&"EL1 must leave on the notice alone"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod settled_idle_tests {
     use super::{SettledIdleSlot, UnsettledIdleSlot};
@@ -1053,6 +1126,84 @@ mod settled_idle_tests {
         assert!(SettledIdleSlot::admit_in(Some(&zone), None).is_ok());
         assert!(SettledIdleSlot::admit_in(None, Some(slot)).is_ok());
     }
+
+    /// A threadless slot driven by an idle lane, with address space 4
+    /// published and open.
+    fn idle_lane() -> (Box<ZoneTables>, SlotId) {
+        let zone = zone();
+        let slot = SlotId::from_index(1).unwrap();
+        zone.drive(slot, 2);
+        zone.publish_slot(slot, 0, None, 0);
+        zone.spaces.set_idle_ttbr(0x30000);
+        let space = zone.spaces.publish_closed(4, 0x10000, 0x10000).unwrap();
+        zone.spaces.open(space);
+        (zone, slot)
+    }
+
+    fn refusal(error: crate::trap::TrapError) -> String {
+        match error {
+            crate::trap::TrapError::Hypervisor(message) => message,
+            other => panic!("unexpected refusal {other:?}"),
+        }
+    }
+
+    /// #2039: a notice taken on a Halt whose slot word still names a space
+    /// is refused, naming the exit and the installed space: EL1 admitted
+    /// work after publishing it.
+    #[test]
+    fn service_notice_on_an_installed_slot_is_refused() {
+        let (zone, slot) = idle_lane();
+        zone.install_space(slot, 4).unwrap();
+        let message = refusal(
+            super::admit_idle_service_exit(Some(&zone), slot, super::IdleServiceExit::Halt)
+                .unwrap_err(),
+        );
+        assert!(message.contains("Halt"), "{message}");
+        assert!(message.contains("installed_mm=4"), "{message}");
+        assert!(message.contains("InstalledSpace"), "{message}");
+    }
+
+    /// #2039: a root-exit crossing (or any other EL0 exit) that arrives with
+    /// a notice is refused even on a settled slot: a record ran at EL0 with
+    /// the notice pending.
+    #[test]
+    fn service_notice_on_a_root_exit_is_refused() {
+        let (zone, slot) = idle_lane();
+        let message = refusal(
+            super::admit_idle_service_exit(
+                Some(&zone),
+                slot,
+                super::IdleServiceExit::NativeRootExit,
+            )
+            .unwrap_err(),
+        );
+        assert!(message.contains("NativeRootExit"), "{message}");
+        assert!(message.contains("installed_mm=0"), "{message}");
+        let message = refusal(
+            super::admit_idle_service_exit(
+                Some(&zone),
+                slot,
+                super::IdleServiceExit::Other(&"Syscall"),
+            )
+            .unwrap_err(),
+        );
+        assert!(message.contains("Syscall"), "{message}");
+    }
+
+    /// A notice on an EL1 Halt from a vacated slot is the protocol: admitted.
+    #[test]
+    fn service_notice_on_a_settled_halt_is_admitted() {
+        let (zone, slot) = idle_lane();
+        assert!(
+            super::admit_idle_service_exit(Some(&zone), slot, super::IdleServiceExit::Halt).is_ok()
+        );
+        // The same slot after EL1 left the space: still admitted.
+        zone.install_space(slot, 4).unwrap();
+        zone.release_space(slot);
+        assert!(
+            super::admit_idle_service_exit(Some(&zone), slot, super::IdleServiceExit::Halt).is_ok()
+        );
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1082,6 +1233,11 @@ pub(super) fn finish_native_service(
         carrick_core_abi::service::ServiceOperation::HostFile { .. }
     ) {
         service.serve_host_file()?
+    } else if matches!(
+        service.request().operation,
+        carrick_core_abi::service::ServiceOperation::Clock { .. }
+    ) {
+        service.serve_clock()?
     } else if matches!(
         service.request().operation,
         carrick_core_abi::service::ServiceOperation::Entropy { .. }
@@ -2016,8 +2172,19 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         if let Some(service) =
             carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(lifecycle, slot)?
         {
-            exit?;
-            return Ok(GuestIdleExit::Service(Box::new(service)));
+            let exit = exit?;
+            let settled = admit_idle_service_exit(
+                Some(zone),
+                slot,
+                match &exit {
+                    carrick_aarch64::Aarch64Exit::Halt => IdleServiceExit::Halt,
+                    carrick_aarch64::Aarch64Exit::NativeRootExit { .. } => {
+                        IdleServiceExit::NativeRootExit
+                    }
+                    other => IdleServiceExit::Other(other),
+                },
+            )?;
+            return Ok(GuestIdleExit::Service(Box::new(service), settled));
         }
         match exit? {
             carrick_aarch64::Aarch64Exit::Halt => {
@@ -2035,15 +2202,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 })?),
             ),
             other => {
-                let held = zone.slot(slot).current().map(|record| {
-                    let rec = zone.record(record);
-                    (
-                        zone.record_ref(record),
-                        rec.claim(),
-                        rec.is_native_owned(),
-                        rec.identity(),
-                    )
-                });
+                let held = slot_occupant(zone, slot);
                 Err(TrapError::Hypervisor(format!(
                     "a vCPU waiting in the guest left at EL0 ({other:?}) with no host task loaded: \
                      slot={slot:?} installed_mm={} current=(reference, claim, native, identity) {held:?}",
@@ -2234,12 +2393,26 @@ pub(crate) fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) -> Res
 /// The calling executor stops driving any slot: it parks with no guest CPU,
 /// or its loop ends. Whatever waits on its slot goes elsewhere.
 pub(crate) fn leave_driven_zone_slot() {
+    leave_driven_zone_slot_after(None);
+}
+
+/// [`leave_driven_zone_slot`] for an executor whose loop ended with
+/// `failure`. A refused leave then names that failure: the slot an executor
+/// dies on is usually unsettled because of the very exit that killed it, and
+/// a fatal naming only the slot hid the cause (#2039).
+pub(crate) fn leave_driven_zone_slot_after(failure: Option<&str>) {
     if let Some((slot, driver)) = DRIVEN_ZONE_SLOT.with(std::cell::Cell::get) {
         match carrick_kernel::el1_zone::leave_slot(slot, driver, None) {
             Ok(()) => DRIVEN_ZONE_SLOT.with(|cell| cell.set(None)),
-            Err(refused) => fail_zone_slot(format_args!(
-                "EL1 zone driver {driver} tried to park off-guest: {refused}"
-            )),
+            Err(refused) => match failure {
+                None => fail_zone_slot(format_args!(
+                    "EL1 zone driver {driver} tried to park off-guest: {refused}"
+                )),
+                Some(failure) => fail_zone_slot(format_args!(
+                    "EL1 zone driver {driver} tried to park off-guest: {refused}; \
+                     its executor stopped on: {failure}"
+                )),
+            },
         }
     }
 }

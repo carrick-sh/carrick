@@ -661,9 +661,22 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// `NeedsHost`: EL1 may not install that address space now (a pause of it is
     /// raised, or it is unpublished or retiring); the thread went back to
     /// the head of the run queue and the vCPU must leave for its executor
-    /// ([`Self::service_exit`]), which loads it.
+    /// ([`Self::service_exit`]), which loads it. Also `NeedsHost`: its owner
+    /// parked it behind a native service notice the host takes at this
+    /// vCPU's exit; nothing is installed.
     fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) -> LoadResult {
         let (zone, slot) = (self.zone, self.slot);
+        // A native service notice published on this lane is consumed only at
+        // this vCPU's next exit (ARM's doorbell is a no-op). Every admission
+        // (`run_ready`, `idle`, `preempt_record`, `steal`) loads through
+        // here, so this is the one place no record is admitted ahead of it:
+        // running one would hand the host the notice on an exit naming that
+        // record's address space (#2039). Requeue it and leave vacated.
+        if self.notice_pending() {
+            zone.unswitch(slot, switched.record);
+            self.leave_space();
+            return LoadResult::NeedsHost;
+        }
         let rec = zone.record(switched.record);
         // Paired with the affinity writer's claim inspection: no admission
         // may miss both the narrowed mask and the exact running-slot prompt.
@@ -704,7 +717,16 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             ResumeAction::RetrySavedSyscall | ResumeAction::RetrySyscall => None,
             ResumeAction::Left => {
                 self.leave_space();
-                return LoadResult::Left;
+                // A resumed owner can park its record again behind a fresh
+                // notice (a copyout that could not finish here). With no
+                // other record queued the caller would go idle, and WFI
+                // never shows the host that notice: leave now, as the check
+                // at the top of this function would for the next record.
+                return if self.notice_pending() {
+                    LoadResult::NeedsHost
+                } else {
+                    LoadResult::Left
+                };
             }
         };
         self.cpu.load(frame, ctx);
@@ -802,6 +824,12 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// page table a retiring address space frees.
     fn leave_space(&mut self) {
         let _vacated = leave_space(self.zone, self.slot, self.cpu);
+    }
+
+    /// This lane published a native service notice the host has not yet
+    /// taken: nothing may run here until the vCPU exits ([`Self::load`]).
+    fn notice_pending(&self) -> bool {
+        self.task.service_notice.is_published()
     }
 
     /// Nothing is runnable on this vCPU: poll, then park in WFI, until a

@@ -351,7 +351,8 @@ fn guest_protect_refuses_host_map_leaf() {
                     writable: false,
                     executable: false,
                     user: true
-                }
+                },
+                ceiling: None,
             },
             &[]
         ),
@@ -389,11 +390,126 @@ fn guest_protect_refuses_write_and_execute_widening_past_grant() {
         },
     ] {
         assert_eq!(
-            apply(&words, DescriptorOp::Protect { span, permissions }, &[]),
+            apply(
+                &words,
+                DescriptorOp::Protect {
+                    span,
+                    permissions,
+                    ceiling: None
+                },
+                &[]
+            ),
             DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
         );
         assert_eq!(*words.words.borrow(), before);
     }
+}
+
+/// A root that authorizes the edit (its `VM_MAY*` ceiling) lets a leaf
+/// published read-only gain execute past its recorded ceiling, and records
+/// it; the root's ceiling still bounds the edit. Write never widens: fork
+/// shares a read-only leaf without arming COW.
+#[test]
+fn guest_protect_widens_only_within_root_ceiling_and_records_it() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let readonly = Permissions {
+        writable: false,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, readonly),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let rx = Permissions {
+        executable: true,
+        ..readonly
+    };
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: rx,
+                ceiling: Some(Permissions {
+                    writable: true,
+                    ..readonly
+                }),
+            },
+            &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    let rwx = Permissions {
+        writable: true,
+        executable: true,
+        user: true,
+    };
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: rwx,
+                ceiling: Some(rwx),
+            },
+            &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: rx,
+                ceiling: Some(rwx),
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let (leaf, _) = read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va)).unwrap();
+    assert_eq!(leaf & (NX | WRITE), 0);
+    assert_ne!(
+        leaf & MAY_EXEC,
+        0,
+        "the widened execute ceiling is recorded"
+    );
+    assert_eq!(leaf & MAY_WRITE, 0);
+    // Recorded, it needs no root ceiling to return: read-only, then RX.
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: readonly,
+                ceiling: None,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: rx,
+                ceiling: None,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
 }
 
 #[test]
@@ -422,7 +538,8 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
             &words,
             DescriptorOp::Protect {
                 span,
-                permissions: readonly
+                permissions: readonly,
+                ceiling: None,
             },
             &[]
         ),
@@ -437,7 +554,8 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
             &words,
             DescriptorOp::Protect {
                 span,
-                permissions: writable
+                permissions: writable,
+                ceiling: None,
             },
             &[]
         ),
@@ -994,7 +1112,8 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                     writable: true,
                     executable: false,
                     user: true
-                }
+                },
+                ceiling: None,
             },
             &[]
         ),
@@ -1049,6 +1168,7 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                 executable: true,
                 user: true,
             },
+            ceiling: None,
         },
         &[],
     );
@@ -1127,7 +1247,15 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
             user: true,
         };
         assert!(matches!(
-            apply(&words, DescriptorOp::Protect { span, permissions }, &grants),
+            apply(
+                &words,
+                DescriptorOp::Protect {
+                    span,
+                    permissions,
+                    ceiling: None
+                },
+                &grants
+            ),
             DescriptorOutcome::Applied { .. }
         ));
         assert_eq!(
@@ -1152,6 +1280,7 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
                     writable: true,
                     ..permissions
                 },
+                ceiling: None,
             },
             &[],
         );
@@ -1208,7 +1337,8 @@ fn failed_split_restores_all_512_children_and_parent() {
                         writable: false,
                         executable: false,
                         user: true
-                    }
+                    },
+                    ceiling: None,
                 },
                 &[root(0x4000)]
             ),
@@ -1285,6 +1415,7 @@ fn whole_block_protection_edits_one_terminal_without_split_grants() {
                 executable: false,
                 user: true,
             },
+            ceiling: None,
         },
         &[],
     );

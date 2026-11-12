@@ -166,7 +166,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         readable: bits != 0,
                         writable: false,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             }
@@ -230,7 +230,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         readable: true,
                         writable: true,
                         executable: false,
-                        cow_ceiling: None,
+                        root_ceiling: None,
                     },
                 )
             }
@@ -3022,12 +3022,13 @@ fn fork_child_write_preparation(prepare_first: bool) {
 pub(crate) mod anonymous_editor {
     use super::Tables;
     use carrick_el1::memory::{
-        AnonymousBackingProbe, AnonymousPermissionEditor, AnonymousRetirementEditor, Stage1Backing,
-        classify_stage1_range,
+        AnonymousBackingProbe, AnonymousDiscardEditor, AnonymousDiscardError,
+        AnonymousPermissionEditor, AnonymousRetirementEditor, Stage1Backing, classify_stage1_range,
+        discard_aarch64_anonymous_steps,
     };
-    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, TableWindow};
     use carrick_mmu_core::aarch64::{
-        GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
+        GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError, SubstrateGpa,
         protect_existing_el1_private_pages, retire_existing_el1_private_pages,
     };
     use core::sync::atomic::Ordering;
@@ -3114,6 +3115,29 @@ pub(crate) mod anonymous_editor {
                 )?;
             }
             Ok(())
+        }
+    }
+    impl AnonymousDiscardEditor for ForkAnonymousEditor<'_> {
+        fn discard_and_scrub(
+            &mut self,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
+            steps: &[carrick_el1::memory::AnonymousDiscardStep],
+        ) -> Result<(), AnonymousDiscardError> {
+            let root = ttbr0.raw() & Self::TTBR_BADDR_MASK;
+            let table = self
+                .table_for(ttbr0.raw())
+                .ok_or(AnonymousDiscardError::Refused(
+                    carrick_el1_abi::AnonymousLeave::BackingMalformed,
+                ))?;
+            let maintenance = CallerInvalidatesAsid;
+            let words = table.live(&maintenance);
+            discard_aarch64_anonymous_steps(
+                &words,
+                SubstrateGpa(root),
+                carrick_el1_abi::EL1_COW_COPY_BASE,
+                steps,
+                |_, _| {},
+            )
         }
     }
 }
@@ -3420,6 +3444,214 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
             );
         }
         assert_eq!(counters.forwarded[215].load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn anonymous_madvise_busy_parks_once_then_completes() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_discard};
+    use carrick_el1::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served, ThreadCpu};
+    use carrick_el1_abi::{AnonymousLeave, Counters, CurrentTask, El1TaskId, SlotId, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
+        execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa, indices};
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+
+    for cause in [
+        SpaceWaitCause::Reservations,
+        SpaceWaitCause::Editor,
+        SpaceWaitCause::PreparedOverlap,
+    ] {
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, 77, ROOT, 2, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &zone.spaces, &view)
+            .with_zone(zone)
+            .unwrap();
+        let slot = SlotId::from_index(0).unwrap();
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, mm.raw(), None, 0);
+        assert!(
+            zone.occupancy
+                .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, mm.raw())
+        );
+        zone.enter_guest(slot);
+        let task = CurrentTask::new();
+        task.set(
+            El1TaskId::from_linux_tid(101),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            5,
+        );
+        task.mm.key.store(mm.raw(), Ordering::Release);
+        task.mm.thread_generation.store(1101, Ordering::Release);
+        task.linux.mark_pending_host_work();
+        let counters = Counters::default();
+        let tables = Tables::new(ROOT, IPA, 0);
+        let window = carrick_el1_abi::EL1_COW_COPY_BASE;
+        let win_indices = indices(window);
+        let set = |address: u64, value| {
+            tables.words[((address - ROOT) / 8) as usize].store(value, Ordering::Relaxed)
+        };
+        set(
+            ROOT + 0x1000 + win_indices[1] as u64 * 8,
+            (ROOT + 0x4000) | 3,
+        );
+        set(
+            ROOT + 0x4000 + win_indices[2] as u64 * 8,
+            (ROOT + 0x5000) | 3,
+        );
+        for page in 0..2 {
+            let alias = window + page * 4096;
+            set(ROOT + 0x5000 + indices(alias)[3] as u64 * 8, alias);
+        }
+        let maintenance = CallerInvalidatesAsid;
+        let nz = |value| NonZeroU64::new(value).unwrap();
+        let published = execute_descriptor_op(
+            &tables.live(&maintenance),
+            SubstrateGpa(ROOT),
+            DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: VA,
+                    ipa: IPA,
+                    len: 4096,
+                    writable: true,
+                    executable: true,
+                },
+                resident: PageSpan::new(VA, 4096),
+                backing: BackingIdentity {
+                    frame_id: nz(1),
+                    mapping_id: nz(2),
+                    owner_generation: nz(3),
+                    inventory_revision: nz(4),
+                },
+            },
+            &TableGrants::NONE,
+            &mut InlineJournal::new(),
+        );
+        assert!(matches!(published, DescriptorOutcome::Applied(_)));
+        let prepared = (cause == SpaceWaitCause::PreparedOverlap).then(|| {
+            let transfer = portal
+                .begin(
+                    portal.admitted_handle(mm, 0).unwrap(),
+                    GuestVa::new(VA),
+                    4096,
+                    TransferIntent::UserWrite,
+                    0,
+                )
+                .unwrap();
+            let request = selected(select(&portal, &transfer, &tables))
+                .request(TransferIntent::UserWrite, retained())
+                .unwrap();
+            let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+                .unwrap()
+                .unwrap();
+            (permit, request)
+        });
+        let arenas = [&tables];
+        let mut editor = ForkAnonymousEditor {
+            arenas: &arenas,
+            pool: TableWindow {
+                words: tables.words.as_ptr().cast_mut(),
+                physical_base: tables.base,
+                byte_len: tables.words.len() * 8,
+            },
+        };
+        let mut frame = TrapFrame {
+            slot: 0,
+            elr: 0x1004,
+            ..TrapFrame::default()
+        };
+        frame.x[0] = VA;
+        frame.x[1] = 4096;
+        frame.x[2] = 4;
+        frame.x[8] = 233;
+        let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
+        let held_root =
+            (cause == SpaceWaitCause::Reservations).then(|| portal.root(mm, 1).unwrap());
+        let held_editor = (cause == SpaceWaitCause::Editor).then(|| {
+            access
+                .try_begin_edit(
+                    zone.spaces.find(mm.raw()).unwrap(),
+                    mm.raw(),
+                    NonZeroU64::new(2).unwrap(),
+                )
+                .unwrap()
+        });
+        assert_eq!(
+            serve_delegated_discard(
+                &mut frame,
+                &counters,
+                &task,
+                access,
+                region.table(),
+                &mut editor,
+            ),
+            DelegatedAnonymous::Contended(cause),
+        );
+        let mut cpu = FakeCpu::default();
+        let mut sched = Sched {
+            handoff: None,
+            zone,
+            slot,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: &counters,
+        };
+        if cause == SpaceWaitCause::PreparedOverlap {
+            let mut prep_frame = frame;
+            assert!(matches!(
+                park_prepared_edit(&mut sched, &mut prep_frame, region.table()),
+                Some(Served::Idle),
+            ));
+        } else {
+            assert!(matches!(
+                park_anonymous_edit(&mut sched, &mut frame, region.table(), cause),
+                Some(Served::Idle),
+            ));
+        }
+        let source = zone
+            .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+            .unwrap()
+            .live_notifications()
+            .unwrap();
+        let key = source.key(cause);
+        assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 1);
+        drop(held_root);
+        drop(held_editor);
+        if let Some((permit, request)) = prepared {
+            portal.cancel_prepared(permit, request, 0).unwrap();
+        }
+        assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+        let switched = zone.switch_in_full(slot).unwrap();
+        // SAFETY: switch_in_full assigned this exact record to the execution slot.
+        let context = unsafe { zone.record(switched.record).ctx_mut() };
+        assert_eq!(context.native.pc, 0x1000);
+        sched.cpu.load(&mut frame, context);
+        assert_eq!(
+            serve_delegated_discard(
+                &mut frame,
+                &counters,
+                &task,
+                access,
+                region.table(),
+                &mut editor,
+            ),
+            DelegatedAnonymous::Served,
+            "cause={cause:?}",
+        );
+        assert_eq!(frame.x[0], 0);
+        for leave in [AnonymousLeave::RootBusy, AnonymousLeave::EditorBusy] {
+            assert_eq!(
+                counters.anonymous_leaves[leave as usize].load(Ordering::Relaxed),
+                0
+            );
+        }
+        assert_eq!(counters.forwarded[233].load(Ordering::Relaxed), 0);
     }
 }
 

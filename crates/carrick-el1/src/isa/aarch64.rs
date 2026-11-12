@@ -48,6 +48,28 @@ pub fn hardware_live_ttbr() -> u64 {
     ttbr
 }
 
+/// Clean D-cache lines for one scrubbed 4 KiB alias page to PoU and invalidate
+/// inner-shareable I-caches so executable private-anonymous pages never retain
+/// stale instructions after `MADV_DONTNEED`.
+///
+/// # Safety
+/// `alias_va` must map a live 4 KiB page in the current EL1 address space.
+pub unsafe fn clean_executable_alias_page(alias_va: u64) {
+    let ctr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+        let dline = (4usize << ((ctr >> 16) & 0xf)).clamp(4, 4096);
+        for offset in (0..4096usize).step_by(dline) {
+            core::arch::asm!(
+                "dc cvau, {}",
+                in(reg) alias_va + offset as u64,
+                options(nostack),
+            );
+        }
+        core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack),);
+    }
+}
+
 pub fn yield_host_effect() {
     // SAFETY: the carrier resumes this exact EL1 stack after the HVC service.
     unsafe {

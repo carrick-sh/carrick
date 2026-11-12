@@ -142,7 +142,13 @@ pub(super) struct OwnedCopyout<'a> {
     pub offset: usize,
     pub result: SyscallResult,
     pub prefix_on_fault: bool,
+    /// A guest-address fault in this output is the call's `-EFAULT` result
+    /// (clock samples), not a run failure. Ownership errors still propagate.
+    pub efault_on_fault: bool,
     pub effect: Option<Box<dyn carrick_personality_linux::lifecycle::CopyoutEffect + 'a>>,
+    /// A second output written after this one completes, keeping its result
+    /// (`gettimeofday` writes `timeval` then `timezone`).
+    pub then: Option<Box<OwnedCopyout<'a>>>,
 }
 
 pub(super) enum CopyoutData {
@@ -201,7 +207,50 @@ struct EntropyPreparation {
 /// A sample and its exact-member output destination remain owned until ACK.
 struct PendingClockSample {
     record: Box<[u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES]>,
-    output: UserVa,
+    output: carrick_personality_linux::clock::ClockOutput,
+}
+
+/// The Linux record(s) one completed sample writes. `gettimeofday` writes its
+/// `timeval` and then its `timezone`; the first output present carries the
+/// call's result.
+fn clock_copyout<'a>(
+    output: carrick_personality_linux::clock::ClockOutput,
+    seconds: u64,
+    nanos: u32,
+) -> OwnedCopyout<'a> {
+    use carrick_personality_linux::clock::{
+        ClockOutput, TIMEZONE_BYTES, timespec_bytes, timeval_bytes,
+    };
+    let record = |address: UserVa, bytes: &[u8]| OwnedCopyout {
+        data: CopyoutData::Bytes {
+            address,
+            bytes: bytes.to_vec(),
+        },
+        offset: 0,
+        result: SyscallResult::new(0),
+        prefix_on_fault: false,
+        efault_on_fault: true,
+        effect: None,
+        then: None,
+    };
+    match output {
+        ClockOutput::Timespec(address) => {
+            record(address, &timespec_bytes(seconds, u64::from(nanos)))
+        }
+        ClockOutput::Timeval { timeval, timezone } => {
+            let timezone = timezone.map(|address| record(address, &TIMEZONE_BYTES));
+            match timeval {
+                Some(address) => {
+                    let mut first = record(address, &timeval_bytes(seconds, nanos));
+                    first.then = timezone.map(Box::new);
+                    first
+                }
+                // The call carried at least one output (planning returned
+                // `Done` otherwise).
+                None => timezone.unwrap_or_else(|| record(UserVa::new(0), &[])),
+            }
+        }
+    }
 }
 
 /// A staged host-file write's gathered prefix, written instead if the
@@ -696,119 +745,144 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     pub(super) fn finish_copyout(
         &mut self,
+        output: OwnedCopyout<'a>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let efault_on_fault = output.efault_on_fault;
+        match self.finish_copyout_pages(output) {
+            Err(NativeProcessError::Fault) if efault_on_fault => Ok(NativeResume::Returned(
+                SyscallResult::new(carrick_syscall_abi::LINUX_EFAULT.guest_retval()),
+            )),
+            result => result,
+        }
+    }
+
+    #[inline(never)]
+    fn finish_copyout_pages(
+        &mut self,
         mut output: OwnedCopyout<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
-        if !output.prefix_on_fault
-            && let CopyoutData::Bytes { address, bytes } = &output.data
-            && !carrick_guest_arch::lower_half_range(address.raw(), bytes.len() as u64)
-        {
-            return Err(NativeProcessError::Fault);
-        }
-        let mut prepared_offset = None;
-        while output.offset < output.data.len() {
-            let previous_prepared_offset = prepared_offset.take();
-            let (address, bytes) = output.data.unit(output.offset)?;
-            let count = bytes.len();
-            if matches!(output.data, CopyoutData::Poll(_))
-                && !carrick_guest_arch::lower_half_range(address.raw(), count as u64)
+        'chain: loop {
+            if !output.prefix_on_fault
+                && let CopyoutData::Bytes { address, bytes } = &output.data
+                && !carrick_guest_arch::lower_half_range(address.raw(), bytes.len() as u64)
             {
                 return Err(NativeProcessError::Fault);
             }
-            match self.copy_owner_frame(address, bytes) {
-                Ok(()) => output.offset += count,
-                Err(NativeProcessError::OwnerWait(wait)) => {
-                    return self.begin_service_inner(
-                        ServiceOperation::CarrierWork {
-                            entry: OwnerEntry::Syscall,
-                            demand: carrick_core_abi::service::CarrierDemand::Work,
-                        },
-                        None,
-                        Some(wait),
-                        ServicePayload::Copyout(output),
-                        ServiceCompletion::Inline,
-                    );
+            let mut prepared_offset = None;
+            while output.offset < output.data.len() {
+                let previous_prepared_offset = prepared_offset.take();
+                let (address, bytes) = output.data.unit(output.offset)?;
+                let count = bytes.len();
+                if matches!(output.data, CopyoutData::Poll(_))
+                    && !carrick_guest_arch::lower_half_range(address.raw(), count as u64)
+                {
+                    return Err(NativeProcessError::Fault);
                 }
-                Err(NativeProcessError::Busy) => {
-                    return self.begin_service_inner(
-                        ServiceOperation::CarrierWork {
-                            entry: OwnerEntry::Syscall,
-                            demand: carrick_core_abi::service::CarrierDemand::Work,
-                        },
-                        None,
-                        None,
-                        ServicePayload::Copyout(output),
-                        ServiceCompletion::Inline,
-                    );
-                }
-                Err(NativeProcessError::Unsupported) => {
-                    if previous_prepared_offset == Some(output.offset) {
-                        return Err(NativeProcessError::Unsupported);
+                match self.copy_owner_frame(address, bytes) {
+                    Ok(()) => output.offset += count,
+                    Err(NativeProcessError::OwnerWait(wait)) => {
+                        return self.begin_service_inner(
+                            ServiceOperation::CarrierWork {
+                                entry: OwnerEntry::Syscall,
+                                demand: carrick_core_abi::service::CarrierDemand::Work,
+                            },
+                            None,
+                            Some(wait),
+                            ServicePayload::Copyout(output),
+                            ServiceCompletion::Inline,
+                        );
                     }
-                    let preparation =
-                        self.prepare_owner_output(carrick_core::mm::transaction::CopyoutRequest {
-                            address,
-                            len: carrick_guest_arch::GuestLen::new(count as u64),
-                        });
-                    match preparation {
-                        Ok(()) => {
-                            prepared_offset = Some(output.offset);
-                            continue;
-                        }
-                        Err(NativeProcessError::OwnerWait(wait)) => {
-                            return self.begin_service_inner(
-                                ServiceOperation::CarrierWork {
-                                    entry: OwnerEntry::Syscall,
-                                    demand: carrick_core_abi::service::CarrierDemand::Work,
-                                },
-                                None,
-                                Some(wait),
-                                ServicePayload::Copyout(output),
-                                ServiceCompletion::Inline,
-                            );
-                        }
-                        Err(NativeProcessError::Busy) => {
-                            return self.begin_service_inner(
-                                ServiceOperation::CarrierWork {
-                                    entry: OwnerEntry::Syscall,
-                                    demand: carrick_core_abi::service::CarrierDemand::Work,
-                                },
-                                None,
-                                None,
-                                ServicePayload::Copyout(output),
-                                ServiceCompletion::Inline,
-                            );
-                        }
-                        Err(NativeProcessError::Unsupported) => {
-                            let (fault, sequence) = self
-                                .service
-                                .copyout_fault(address)
-                                .ok_or(NativeProcessError::Unsupported)?;
-                            return self.begin_service_inner(
-                                ServiceOperation::Fault(fault),
-                                Some(sequence),
-                                None,
-                                ServicePayload::Copyout(output),
-                                ServiceCompletion::RetrySyscall,
-                            );
-                        }
-                        Err(NativeProcessError::Fault) if output.prefix_on_fault => {
-                            return Ok(entropy_copy_fault(output.offset));
-                        }
-                        Err(error) => return Err(error),
+                    Err(NativeProcessError::Busy) => {
+                        return self.begin_service_inner(
+                            ServiceOperation::CarrierWork {
+                                entry: OwnerEntry::Syscall,
+                                demand: carrick_core_abi::service::CarrierDemand::Work,
+                            },
+                            None,
+                            None,
+                            ServicePayload::Copyout(output),
+                            ServiceCompletion::Inline,
+                        );
                     }
+                    Err(NativeProcessError::Unsupported) => {
+                        if previous_prepared_offset == Some(output.offset) {
+                            return Err(NativeProcessError::Unsupported);
+                        }
+                        let preparation = self.prepare_owner_output(
+                            carrick_core::mm::transaction::CopyoutRequest {
+                                address,
+                                len: carrick_guest_arch::GuestLen::new(count as u64),
+                            },
+                        );
+                        match preparation {
+                            Ok(()) => {
+                                prepared_offset = Some(output.offset);
+                                continue;
+                            }
+                            Err(NativeProcessError::OwnerWait(wait)) => {
+                                return self.begin_service_inner(
+                                    ServiceOperation::CarrierWork {
+                                        entry: OwnerEntry::Syscall,
+                                        demand: carrick_core_abi::service::CarrierDemand::Work,
+                                    },
+                                    None,
+                                    Some(wait),
+                                    ServicePayload::Copyout(output),
+                                    ServiceCompletion::Inline,
+                                );
+                            }
+                            Err(NativeProcessError::Busy) => {
+                                return self.begin_service_inner(
+                                    ServiceOperation::CarrierWork {
+                                        entry: OwnerEntry::Syscall,
+                                        demand: carrick_core_abi::service::CarrierDemand::Work,
+                                    },
+                                    None,
+                                    None,
+                                    ServicePayload::Copyout(output),
+                                    ServiceCompletion::Inline,
+                                );
+                            }
+                            Err(NativeProcessError::Unsupported) => {
+                                let (fault, sequence) = self
+                                    .service
+                                    .copyout_fault(address)
+                                    .ok_or(NativeProcessError::Unsupported)?;
+                                return self.begin_service_inner(
+                                    ServiceOperation::Fault(fault),
+                                    Some(sequence),
+                                    None,
+                                    ServicePayload::Copyout(output),
+                                    ServiceCompletion::RetrySyscall,
+                                );
+                            }
+                            Err(NativeProcessError::Fault) if output.prefix_on_fault => {
+                                return Ok(entropy_copy_fault(output.offset));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(NativeProcessError::Fault) if output.prefix_on_fault => {
+                        return Ok(entropy_copy_fault(output.offset));
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(NativeProcessError::Fault) if output.prefix_on_fault => {
-                    return Ok(entropy_copy_fault(output.offset));
-                }
-                Err(error) => return Err(error),
             }
+            if let Some(next) = output.then.take() {
+                let result = output.result;
+                output = *next;
+                output.result = result;
+                continue 'chain;
+            }
+            if let Some(effect) = output.effect.as_mut() {
+                effect.commit().unwrap_or_else(|_| {
+                    crate::dispatch::invalid_completion(
+                        crate::dispatch::NativeInvariant::PipeOutput,
+                    )
+                });
+            }
+            return Ok(NativeResume::Returned(output.result));
         }
-        if let Some(effect) = output.effect.as_mut() {
-            effect.commit().unwrap_or_else(|_| {
-                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::PipeOutput)
-            });
-        }
-        Ok(NativeResume::Returned(output.result))
     }
 
     /// Authenticate retained adapter custody while the caller holds the graph.
@@ -1268,7 +1342,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         capability: carrick_core_abi::clock::ClockCapabilityId,
         clock_id: u64,
-        output: UserVa,
+        output: carrick_personality_linux::clock::ClockOutput,
         ordinal: carrick_guest_arch::NativeOrdinal,
     ) -> Result<NativeResume, NativeProcessError> {
         let mut record = Box::new([0; carrick_core_abi::clock::CLOCK_RECORD_BYTES]);
@@ -1289,6 +1363,49 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServicePayload::ClockSample(PendingClockSample { record, output }),
             ServiceCompletion::Inline,
         )
+    }
+
+    /// Stage a routed clock call through the same owner on every ISA, then
+    /// settle its handoff (the x86 entry; ARM settles in its exit body).
+    pub fn begin_clock_call(
+        &mut self,
+        call: carrick_personality_linux::clock::ClockCall,
+        args: [u64; 2],
+        ordinal: carrick_guest_arch::NativeOrdinal,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let result = self.begin_clock_service(call, args, ordinal);
+        let result = self.drain_copyout(result);
+        self.finish_service_handoff(result)
+    }
+
+    /// Serve one routed clock call that needs the container's clock domain.
+    /// The ring plans the call from its arguments
+    /// ([`carrick_personality_linux::clock::plan`]); only a reading crosses,
+    /// as a bounded sample request retained with its exact-MM output.
+    pub fn begin_clock_service(
+        &mut self,
+        call: carrick_personality_linux::clock::ClockCall,
+        args: [u64; 2],
+        ordinal: carrick_guest_arch::NativeOrdinal,
+    ) -> Result<NativeResume, NativeProcessError> {
+        use carrick_personality_linux::clock::ClockPlan;
+        match carrick_personality_linux::clock::plan(call, args) {
+            ClockPlan::Sample { clock_id, output } => {
+                self.service_phase = NativeServicePhase::Capability;
+                let capability = self
+                    .runtime
+                    .exec_capability()
+                    .map(|id| carrick_core_abi::clock::ClockCapabilityId::new(id.raw()))
+                    .ok_or(NativeProcessError::Stale)?;
+                self.begin_clock_sample(capability, clock_id, output, ordinal)
+            }
+            // The dispatch owner answered every other plan in ring; staging
+            // one is a routing invariant, not a guest-visible case.
+            ClockPlan::Refused(_)
+            | ClockPlan::Done
+            | ClockPlan::Resolution { .. }
+            | ClockPlan::Unserved => Err(NativeProcessError::Invalid),
+        }
     }
 
     /// Stage one typed host-file crossing for the carrier venue. Fd-based
@@ -3411,7 +3528,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     value
                 }),
                 prefix_on_fault: true,
+                efault_on_fault: false,
                 effect: None,
+                then: None,
             }));
         }
         if pending.adapter {
@@ -3475,19 +3594,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .map_err(|_| NativeProcessError::Quarantined)?
                     {
                         carrick_core_abi::clock::ClockReply::Sample(Ok((seconds, nanos))) => {
-                            let mut bytes = Vec::with_capacity(16);
-                            bytes.extend_from_slice(&seconds.to_le_bytes());
-                            bytes.extend_from_slice(&u64::from(nanos).to_le_bytes());
-                            output = Some(Box::new(OwnedCopyout {
-                                data: CopyoutData::Bytes {
-                                    address: sample.output,
-                                    bytes,
-                                },
-                                offset: 0,
-                                result: SyscallResult::new(0),
-                                prefix_on_fault: false,
-                                effect: None,
-                            }));
+                            output = Some(Box::new(clock_copyout(sample.output, seconds, nanos)));
                             Ok(NativeResume::NoPending)
                         }
                         carrick_core_abi::clock::ClockReply::Sample(Err(errno)) => {
