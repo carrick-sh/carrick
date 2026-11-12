@@ -2971,7 +2971,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             drop(prepared_fds);
             let _ = self.release_service_claim(pending.claim);
             return Ok(self.exec_past_no_return());
-        };
+        }
         let predecessor = self.caller_address;
         let successor_address = successor.address;
         let (table_custody, releases) = carrick_fd_core::exec::commit(prepared_fds);
