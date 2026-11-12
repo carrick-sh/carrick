@@ -68,6 +68,9 @@ parent_script:
 #else
 root_script:
     MMAP_UNTOUCHED 40
+    /* Results land at the end of one never-touched page and spill into the
+     * next: both are made writable. */
+    add $4095, %r13
     mov $AT_FDCWD, %edi
     PATH %rsi, file
     mov $O_RDWR_CREAT, %edx

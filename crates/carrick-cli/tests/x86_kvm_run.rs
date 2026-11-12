@@ -2545,6 +2545,29 @@ fn mounted_static_x86_files_crossings_match_native() {
     compare_root_crossings_with_native("x86_b1_files.S");
 }
 
+/// A directory the root's staged `openat` holds is the ring's description:
+/// its number names nothing in the root's host task. An absolute path ignores
+/// it (the files witness above); a relative one needs it as the base, which
+/// the shared path staging does not serve yet, so it is the ring's counted
+/// ENOSYS and never resolved against whatever the host task has under the
+/// number (#2157 B1 P0-2). Under carrick only: native Linux resolves it.
+#[test]
+fn mounted_static_x86_ring_held_dirfd_relative_paths_are_a_counted_enosys() {
+    if skip_without_kvm() {
+        return;
+    }
+    let run = run_crossing_fixture("x86_b1_files.S", &["-DRING_DIRFD"], true);
+    assert_eq!(
+        run.stdout,
+        b"F\n",
+        "ring-held dirfd: exit {:?} (the first step whose result differed); stderr: {}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.status.code(), Some(7));
+    assert!(run.stderr.is_empty(), "{:?}", run.stderr);
+}
+
 #[test]
 fn mounted_static_x86_files_crossings_in_a_fork_child_refuse_in_ring() {
     forked_child_crossings_refuse_in_ring("x86_b1_files.S");
