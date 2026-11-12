@@ -26,7 +26,7 @@ use carrick_x86::cpl0_scheduler::{
 };
 use kvm_pool_fixture::{
     physical_inventory, run_instrumented_pool_fixture, run_pool_fixture,
-    try_run_instrumented_pool_fixture,
+    try_run_instrumented_pool_fixture, witness_exec_retarget,
 };
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -454,6 +454,31 @@ fn append_result_check(code: &mut Vec<u8>, failures: &mut Vec<usize>, expected: 
     code.extend_from_slice(&[0x48, 0x83, 0xf8, expected as u8, 0x0f, 0x85]);
     failures.push(code.len());
     code.extend_from_slice(&0_i32.to_le_bytes());
+}
+
+/// #2142: a root `execve` rebinds the run root on the real KVM executor
+/// that has it loaded. The production retarget moves the executor's loaded
+/// binding, every executor's root binding and the physical CPU custody to
+/// the successor; the real vCPU save then captures the successor's MM and
+/// ASID generation. A predecessor that still owns its terminal role, and a
+/// repeat retarget of the already-loaded successor, are both refused.
+#[test]
+fn production_root_exec_retargets_the_loaded_kvm_executor() {
+    // exit_group(0); the witness never enters the guest root.
+    let code = [0xbf, 0, 0, 0, 0, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05];
+    let witness = witness_exec_retarget(&production_probe_elf(&code));
+    assert!(
+        witness
+            .untransferred_refusal
+            .as_deref()
+            .is_some_and(|refusal| refusal.contains("transferred predecessor")),
+        "{witness:?}"
+    );
+    assert!(witness.loaded_follows_successor, "{witness:?}");
+    assert!(witness.root_follows_successor, "{witness:?}");
+    assert!(!witness.predecessor_resolves, "{witness:?}");
+    assert!(witness.repeat_refusal.is_some(), "{witness:?}");
+    assert_eq!(witness.saved_identity, witness.successor_identity);
 }
 
 #[test]

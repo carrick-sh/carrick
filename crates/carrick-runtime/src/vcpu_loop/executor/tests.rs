@@ -1814,6 +1814,12 @@ fn pre_fork_exec_hardware_and_shutdown_guards_are_fail_closed() {
         .nth(1)
         .and_then(|tail| tail.split("} else if let Err").next())
         .expect("worker-owned exec cutover");
+    assert!(exec_cutover.contains("retarget_exec_replacement("));
+    let exec_cutover = source
+        .split("pub(crate) fn retarget_exec_replacement<")
+        .nth(1)
+        .and_then(|tail| tail.split("fn run_executor_loop").next())
+        .expect("shared exec retarget");
     let validate = exec_cutover
         .find("validate_loaded_hardware_identity()")
         .expect("live vCPU/Mach preflight");
@@ -2448,10 +2454,13 @@ fn kvm_exec_replacement_rebinds_root_to_successor_and_retires_predecessor() {
                 ExecBindingTransition {
                     predecessor_thread: context.thread().key(),
                     predecessor_generation: old_generation,
-                    successor_thread: transition.successor_thread,
-                    successor_generation: new_generation,
-                    identity,
-                    replacement_mm: None,
+                    successor: super::ExecSuccessorRequest {
+                        thread: transition.successor_thread,
+                        generation: new_generation,
+                        identity,
+                        custody: Some(super::ExecSuccessorCustody::Cpl0(successor_arch)),
+                        context: transition.context().retain_exact(),
+                    },
                     authority: Some(predecessor_authority),
                 },
             )
@@ -2500,6 +2509,37 @@ fn kvm_exec_replacement_rebinds_root_to_successor_and_retires_predecessor() {
     assert!(
         old_binding.validate_task_state(&successor_state).is_err(),
         "stale predecessor binding refuses the successor image"
+    );
+    assert!(
+        directory
+            .replace_exec(
+                &scheduler,
+                ExecBindingTransition {
+                    predecessor_thread: context.thread().key(),
+                    predecessor_generation: old_generation,
+                    successor: super::ExecSuccessorRequest {
+                        thread: committed_context.thread().key(),
+                        generation: ExecutionGeneration::from_raw(new_generation.raw() + 1),
+                        identity,
+                        custody: Some(super::ExecSuccessorCustody::Cpl0(successor_arch)),
+                        context: committed_context.retain_exact(),
+                    },
+                    authority: None,
+                },
+            )
+            .is_err(),
+        "a retired predecessor cannot rebind a second successor"
+    );
+    old_binding
+        .validate_task_state(&state)
+        .expect("the predecessor still validates its own image before transfer");
+    old_binding
+        .mark_exec_transferred()
+        .expect("the predecessor gives its terminal role to the successor once");
+    assert!(old_binding.mark_exec_transferred().is_err());
+    assert!(
+        old_binding.validate_task_state(&state).is_err(),
+        "a transferred predecessor refuses even its own image"
     );
     scheduler.settle_exited(running).unwrap();
     scheduler.unregister_executor(&registration).unwrap();
@@ -4704,10 +4744,13 @@ fn exec_replacement_keeps_worker_identity_and_swaps_thread_mm_asid_binding() {
                 ExecBindingTransition {
                     predecessor_thread: context.thread().key(),
                     predecessor_generation: old_generation,
-                    successor_thread: transition.successor_thread,
-                    successor_generation: new_generation,
-                    identity,
-                    replacement_mm: None,
+                    successor: super::ExecSuccessorRequest {
+                        thread: transition.successor_thread,
+                        generation: new_generation,
+                        identity,
+                        custody: None,
+                        context: transition.context().retain_exact(),
+                    },
                     authority: Some(predecessor_authority),
                 },
             )

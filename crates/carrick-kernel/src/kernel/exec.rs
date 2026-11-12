@@ -171,6 +171,13 @@ pub struct CommittedExecSchedulerParts {
     pub(crate) publication_receipt: ExecPublicationReceipt,
 }
 
+impl CommittedExecSchedulerParts {
+    /// The exact committed successor context a retarget binds its task to.
+    pub fn context(&self) -> &KernelContext {
+        &self.context
+    }
+}
+
 impl PreparedExec {
     /// Exact currently published address-space identity captured by this
     /// preparation. Destructive backend retirement must be routed here.

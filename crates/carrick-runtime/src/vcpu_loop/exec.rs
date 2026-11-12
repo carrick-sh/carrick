@@ -2685,11 +2685,11 @@ where
         }
         if let Some(committed) = committed.committed_transition {
             let (transition, replacement_mm, retired_mm) = committed.into_parts();
-            let pending = super::executor::PendingExecReplacement {
+            let pending = super::executor::PendingExecReplacement::stage1(
                 transition,
                 replacement_mm,
                 retired_mm,
-            };
+            );
             let state = &mut *self.state;
             if state.pending_exec_replacement.replace(pending).is_some() {
                 carrick_fatal!(

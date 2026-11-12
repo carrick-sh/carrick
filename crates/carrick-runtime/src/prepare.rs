@@ -294,6 +294,242 @@ pub fn try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
     )
 }
 
+/// What a real KVM executor did when its loaded run root was retargeted to
+/// a committed `execve` successor (#2142).
+#[doc(hidden)]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
+#[derive(Debug)]
+pub struct KvmExecRetargetWitness {
+    /// Retargeting while the predecessor still owns its terminal role.
+    pub untransferred_refusal: Option<String>,
+    /// The executor's loaded binding is the directory's successor record.
+    pub loaded_follows_successor: bool,
+    /// Every executor's root binding is the successor.
+    pub root_follows_successor: bool,
+    /// The predecessor's (thread, generation) still resolves a binding.
+    pub predecessor_resolves: bool,
+    /// Retargeting the loaded successor again, as if it were a predecessor.
+    pub repeat_refusal: Option<String>,
+    /// The successor's issued (MM, ASID generation).
+    pub successor_identity: (u64, u64),
+    /// The (MM, ASID generation) the real vCPU save captured afterwards.
+    pub saved_identity: (u64, u64),
+}
+
+/// Load the issued root on a real KVM executor, commit a Kernel exec for it,
+/// and retarget the executor through the production
+/// `retarget_exec_replacement`. The successor keeps the predecessor's
+/// page-table root and CPU image under its new MM and ASID generation: the
+/// successor image build is #1093 S4c, not this binding transfer.
+#[doc(hidden)]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
+pub fn witness_kvm_exec_retarget(
+    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    root_context: carrick_kernel::kernel::KernelContext,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+) -> Result<KvmExecRetargetWitness, RuntimeError> {
+    use crate::vcpu_loop::executor::{
+        self, PersistentExecutor, PersistentExecutorFactory, PersistentTaskBinding,
+        TaskBindingResolver,
+    };
+    use carrick_hal::guest_arch_binding::{GuestArchBinding, core_arch};
+    use carrick_hal::threaded::{GuestCpuState, X86TaskCpuStateV1};
+    use carrick_kernel::kernel::objects::MigratableTaskState;
+    fn configuration(error: impl std::fmt::Display) -> RuntimeError {
+        RuntimeError::Configuration(error.to_string())
+    }
+    let KvmRootPool {
+        scheduler,
+        state,
+        generation,
+        binding,
+        directory,
+        dormant,
+        factory,
+        ..
+    } = assemble_kvm_root_pool(machine, &root_context, dispatcher, 16, None, None)?;
+    let kick = Arc::new(executor::WorkerKick::new(Arc::new(
+        executor::ReceiptLog::default(),
+    )));
+    let registration = scheduler
+        .register_executor_bound(
+            kick as Arc<dyn carrick_kernel::kernel::ExecutorKick>,
+            None,
+            false,
+        )
+        .map_err(configuration)?;
+    let mut backend = factory.create(&registration)?;
+    let start_gate = root_context
+        .thread()
+        .take_opened_start_gate(generation)
+        .ok_or_else(|| configuration("KVM root start gate absent"))?;
+    let proof = executor::TaskActivationProof::validate(
+        &root_context,
+        &state,
+        generation,
+        binding.load_identity(),
+        start_gate,
+    )?;
+    dormant.activate(&scheduler, Arc::clone(root_context.thread()), proof)?;
+    let mut running = scheduler.take(&registration).map_err(configuration)?;
+    let thread = running.thread_key();
+    let authority = directory.take_submission_authority(thread, generation);
+    let lease = running.take_lease();
+    backend.load(&executor::RunnableTask {
+        thread,
+        generation,
+        lease: &lease,
+        binding: Arc::clone(&binding),
+    })?;
+
+    let kernel = Arc::clone(root_context.kernel());
+    let prepared = kernel
+        .prepare_exec_with_registry_id(
+            &root_context,
+            carrick_hal::ThreadId::synthetic_for_tests(root_context.thread().key().tid.raw()),
+            None,
+        )
+        .map_err(configuration)?;
+    root_context
+        .thread()
+        .exit_from_executor(lease)
+        .map_err(|(error, _)| configuration(error))?;
+    let committed = kernel
+        .commit_exec_transition(prepared, None)
+        .map_err(configuration)?;
+    let successor_context = committed.context().retain_exact();
+    let successor_mm = successor_context.shared().mm().id();
+    let predecessor = binding.arch();
+    let successor_asid = predecessor.context().generation.raw().get() + 1;
+    let committed = committed
+        .attach_successor_asid_generation(successor_mm, successor_asid)
+        .map_err(configuration)?;
+    let GuestCpuState::X86_64V1(cpu) = &state.cpu else {
+        return Err(configuration("KVM root published a non-x86 image"));
+    };
+    let successor_cpu = X86TaskCpuStateV1::new(
+        *cpu.gprs(),
+        cpu.rip(),
+        cpu.rflags(),
+        cpu.rsp(),
+        cpu.cr0(),
+        cpu.cr3(),
+        cpu.cr4(),
+        cpu.efer(),
+        cpu.fs_base(),
+        cpu.gs_base(),
+        successor_mm.raw(),
+        successor_asid,
+        cpu.xsave().to_vec(),
+        cpu.resume_payload().to_vec(),
+    )?;
+    let successor_generation = successor_context
+        .thread()
+        .publish_initial_task_state(MigratableTaskState {
+            cpu: GuestCpuState::X86_64V1(Arc::new(successor_cpu)),
+            mm: successor_mm,
+            asid_generation: successor_asid,
+        })
+        .map_err(configuration)?;
+    let successor_lease = successor_context
+        .thread()
+        .claim_runnable(running.executor())
+        .map_err(configuration)?;
+    let nonzero = |raw| {
+        std::num::NonZeroU64::new(raw).ok_or_else(|| configuration("zero successor identity"))
+    };
+    let successor_arch = GuestArchBinding::x86(
+        core_arch::TaskIdentity {
+            execution: core_arch::ExecutionGeneration::new(nonzero(successor_generation.raw())?),
+            ..predecessor.task()
+        },
+        core_arch::AddressContext {
+            mm: core_arch::MmGeneration::new(successor_mm.nonzero()),
+            generation: core_arch::ContextGeneration::new(nonzero(successor_asid)?),
+            ..predecessor.context()
+        },
+    );
+
+    let untransferred_refusal = backend
+        .retarget_loaded_task(Arc::clone(&binding))
+        .err()
+        .map(|error| error.to_string());
+    let (replacement, _) = executor::retarget_exec_replacement(
+        &scheduler,
+        directory.as_ref(),
+        &mut backend,
+        &mut running,
+        executor::ExecRetargetPredecessor {
+            binding: &binding,
+            thread,
+            generation,
+        },
+        executor::PendingExecReplacement::cpl0(committed, successor_arch)?,
+        successor_lease,
+        authority,
+    );
+    let successor = replacement.binding;
+    if let Some(authority) = replacement.authority {
+        directory
+            .restore_submission_authority(authority)
+            .map_err(|_| configuration("successor authority restore refused"))?;
+    }
+    let loaded_follows_successor = backend
+        .loaded_binding()
+        .is_some_and(|loaded| Arc::ptr_eq(loaded, &successor));
+    let root_follows_successor = Arc::ptr_eq(&backend.root_binding()?, &successor);
+    let predecessor_resolves = directory.resolve(thread, generation).is_ok();
+    let repeat_refusal = backend
+        .retarget_loaded_task(Arc::clone(&successor))
+        .err()
+        .map(|error| error.to_string());
+    let lease = running.take_lease();
+    let saved = backend
+        .save(lease)
+        .map_err(|error| configuration(format!("successor save: {error:?}")))?
+        .into_lease();
+    let saved_state = saved
+        .task_state_for_restore(
+            carrick_abi::LinuxGuestAbi::X86_64,
+            1,
+            successor_mm,
+            successor_asid,
+        )
+        .map_err(configuration)?;
+    let GuestCpuState::X86_64V1(saved_cpu) = &saved_state.cpu else {
+        return Err(configuration("KVM save produced a non-x86 image"));
+    };
+    let saved_identity = (saved_cpu.mm_generation(), saved_cpu.asid_generation());
+    scheduler
+        .restore_saved_lease(&mut running, saved)
+        .map_err(|(error, _)| configuration(error))?;
+    let successor_thread = running.thread_key();
+    scheduler.settle_exited(running).map_err(configuration)?;
+    directory.retire(successor_thread, successor_generation);
+    backend.destroy()?;
+    scheduler
+        .unregister_executor(&registration)
+        .map_err(configuration)?;
+    scheduler.close();
+    Ok(KvmExecRetargetWitness {
+        untransferred_refusal,
+        loaded_follows_successor,
+        root_follows_successor,
+        predecessor_resolves,
+        repeat_refusal,
+        successor_identity: (successor_mm.raw(), successor_asid),
+        saved_identity,
+    })
+}
+
 #[doc(hidden)]
 #[cfg(all(
     feature = "platform-linux",
@@ -304,39 +540,52 @@ pub type KvmLoadedPreEntryHook =
     crate::vcpu_loop::executor::cpl0::LoadedPreEntryHook<carrick_vmm_kvm::KvmKickHandle>;
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-fn run_prepared_kvm_pool_with_debug(
+type KvmExecutorFactory = crate::vcpu_loop::executor::cpl0::Cpl0PersistentExecutorFactory<
+    carrick_vmm_kvm::carrier_cpu::KvmCpuIo,
+    carrick_vmm_kvm::KvmVm,
+>;
+
+/// The production KVM root, published dormant under its scheduler and
+/// binding directory, with the executor factory that will run it.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+struct KvmRootPool {
+    physical: Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>,
+    reporter: Arc<carrick_kernel::compat::CompatReporter>,
+    stats: Arc<crate::vcpu_loop::executor::cpl0::Cpl0ForwardStats>,
+    dispatcher: Arc<std::sync::Mutex<carrick_kernel::dispatch::SyscallDispatcher>>,
+    scheduler: Arc<carrick_kernel::kernel::Scheduler>,
+    state: carrick_kernel::kernel::objects::MigratableTaskState,
+    generation: carrick_kernel::kernel::objects::ExecutionGeneration,
+    binding: Arc<crate::vcpu_loop::executor::cpl0::Cpl0TaskBinding>,
+    directory: Arc<crate::vcpu_loop::executor::cpl0::Cpl0TaskBindingDirectory>,
+    dormant: crate::vcpu_loop::executor::PreparedTaskSubmission<
+        crate::vcpu_loop::executor::cpl0::Cpl0TaskBinding,
+    >,
+    factory: Arc<KvmExecutorFactory>,
+    completed:
+        std::sync::mpsc::Receiver<Result<carrick_vmm_kvm::cpl0_boot::InitialProcessExit, String>>,
+}
+
+/// Hand a booted carrier's CPUs to the executor factory and publish its
+/// issued root task dormant, ready for activation once executors exist.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn assemble_kvm_root_pool(
     machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
-    root_context: carrick_kernel::kernel::KernelContext,
+    root_context: &carrick_kernel::kernel::KernelContext,
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
-    debug_server: Option<PreparedKvmDebugServer>,
-    #[cfg(feature = "kvm-pool-test-control")] loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
     lane_exit_budgets: Option<(usize, usize)>,
-) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
-    use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
+    #[cfg(feature = "kvm-pool-test-control")] loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
+) -> Result<KvmRootPool, RuntimeError> {
+    use crate::vcpu_loop::executor;
     use carrick_hal::threaded::GuestCpuState;
     use carrick_kernel::kernel::objects::MigratableTaskState;
     use carrick_kernel::kernel::scheduler::{CpuAffinity, GuestCpuId, GuestCpuPolicy};
-    // Host IPC releases (exit drains) wake tasks parked in this carrier's
-    // zone, which lives in its guest RAM rather than a process-global table.
-    root_context
-        .kernel()
-        .ipc()
-        .map_err(|error| RuntimeError::Configuration(format!("x86 IPC authority: {error:?}")))?
-        .bind_carrier_zone(machine.carrier_zone_wake()?)
-        .map_err(|_| {
-            RuntimeError::Configuration("x86 IPC authority already bound a carrier zone".into())
-        })?;
     let parts = machine.into_worker_parts(max_traps)?;
     let (root_cpu, physical) = parts.into_factory(carrick_kernel::dispatch::serve_native_entropy);
     let physical = Arc::new(physical);
     let reporter = Arc::new(carrick_kernel::compat::CompatReporter::default());
     let stats = Arc::new(executor::cpl0::Cpl0ForwardStats::default());
-    if let Some((_, ref physical_debug)) = debug_server {
-        physical_debug.attach(&physical);
-    }
-    let _debug_server = debug_server;
-    let census_scope = dispatcher.container().launch().carrier_scope_id.clone();
     let dispatcher = Arc::new(std::sync::Mutex::new(dispatcher));
     root_context
         .thread()
@@ -354,7 +603,7 @@ fn run_prepared_kvm_pool_with_debug(
         .publish_initial_task_state_gated(root_context.thread(), state.clone())
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let binding = Arc::new(executor::cpl0::Cpl0TaskBinding::new(
-        &root_context,
+        root_context,
         &state,
         root_cpu.binding(),
         generation,
@@ -368,7 +617,7 @@ fn run_prepared_kvm_pool_with_debug(
         generation,
         Arc::clone(&binding),
     )?;
-    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let (completed_tx, completed) = std::sync::mpsc::channel();
     let (max_loaded_exits, max_idle_exits) = lane_exit_budgets.unwrap_or((max_traps, max_traps));
     let factory = Arc::new(executor::cpl0::Cpl0PersistentExecutorFactory::new(
         executor::cpl0::Cpl0PersistentExecutorConfig {
@@ -385,6 +634,70 @@ fn run_prepared_kvm_pool_with_debug(
             loaded_pre_entry_hook,
         },
     )?);
+    Ok(KvmRootPool {
+        physical,
+        reporter,
+        stats,
+        dispatcher,
+        scheduler,
+        state,
+        generation,
+        binding,
+        directory,
+        dormant,
+        factory,
+        completed,
+    })
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn run_prepared_kvm_pool_with_debug(
+    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    root_context: carrick_kernel::kernel::KernelContext,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    max_traps: usize,
+    debug_server: Option<PreparedKvmDebugServer>,
+    #[cfg(feature = "kvm-pool-test-control")] loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
+    lane_exit_budgets: Option<(usize, usize)>,
+) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
+    use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
+    // Host IPC releases (exit drains) wake tasks parked in this carrier's
+    // zone, which lives in its guest RAM rather than a process-global table.
+    root_context
+        .kernel()
+        .ipc()
+        .map_err(|error| RuntimeError::Configuration(format!("x86 IPC authority: {error:?}")))?
+        .bind_carrier_zone(machine.carrier_zone_wake()?)
+        .map_err(|_| {
+            RuntimeError::Configuration("x86 IPC authority already bound a carrier zone".into())
+        })?;
+    let census_scope = dispatcher.container().launch().carrier_scope_id.clone();
+    let KvmRootPool {
+        physical,
+        reporter,
+        stats,
+        dispatcher,
+        scheduler,
+        state,
+        generation,
+        binding,
+        directory,
+        dormant,
+        factory,
+        completed: completed_rx,
+    } = assemble_kvm_root_pool(
+        machine,
+        &root_context,
+        dispatcher,
+        max_traps,
+        lane_exit_budgets,
+        #[cfg(feature = "kvm-pool-test-control")]
+        loaded_pre_entry_hook,
+    )?;
+    if let Some((_, ref physical_debug)) = debug_server {
+        physical_debug.attach(&physical);
+    }
+    let _debug_server = debug_server;
     let pool = executor::ExecutorPool::start(
         executor::ExecutorPoolConfig {
             bound_workers: 2,
