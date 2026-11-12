@@ -18030,7 +18030,7 @@ fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
                     || Ok(u64::MAX),
                 )
                 .unwrap();
-                match dispatcher.serve_native_host_file(&mut record) {
+                match dispatcher.serve_native_host_file(&mut record, None) {
                     Ok(_) => {
                         let parsed = carrick_core_abi::host_file::reply(&record)
                             .expect("served host-file record must contain a valid reply");
