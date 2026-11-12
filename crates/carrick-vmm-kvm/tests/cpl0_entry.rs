@@ -722,6 +722,13 @@ fn production_thread_clone_probe(mode: CloneProbe) -> Vec<u8> {
     mov(&mut code, &[0x48, 0xba], 1);
     mov(&mut code, &[0x48, 0xb8], 202);
     code.extend_from_slice(&[0x0f, 0x05]);
+    if mode == CloneProbe::GlibcPthreadJoin {
+        // The handshake may not have parked yet: both 0 and 1 are legal.
+        // Check this synchronous return unconditionally, so a lost rax
+        // result cannot hide behind which side wins the later join race.
+        code.extend_from_slice(&[0x48, 0x83, 0xf8, 1]); // cmp rax,1
+        failures.push(branch(&mut code, 0x87)); // ja failure (also rejects errnos)
+    }
     if mode == CloneProbe::KillKicksEveryMember {
         // The parent stays in user mode, SIGUSR1 unblocked, making no
         // syscall (so no signal checkpoint of its own). Only a kick can pull
@@ -903,6 +910,68 @@ fn production_glibc_pthread_join_futex_is_served_in_ring() {
         0,
         "futex must be served in ring"
     );
+}
+
+/// Synchronous completions must replace __NR_futex in rax, including the
+/// already-cleared join word: no child scheduling can choose this result.
+#[test]
+fn production_futex_synchronous_results_replace_rax() {
+    fn mov(code: &mut Vec<u8>, register: &[u8], value: u64) {
+        code.extend_from_slice(register);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut code = Vec::new();
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x49, 0x89, 0xc4]); // mmap; r12 = zero word
+    let mut failures = Vec::new();
+    for (op, expected_word, mask, result, fault) in [
+        (265, 42, 0xffff_ffff, -11_i64, false),
+        (1, 1, 0, 0, false),
+        (265, 42, 0, -22, false),
+        (128, 42, 0, -14, true),
+    ] {
+        code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // rdi = r12
+        if fault {
+            mov(&mut code, &[0x48, 0xbf], 0);
+        }
+        mov(&mut code, &[0x48, 0xbe], op);
+        mov(&mut code, &[0x48, 0xba], expected_word);
+        mov(&mut code, &[0x49, 0xba], 0);
+        mov(&mut code, &[0x49, 0xb9], mask);
+        mov(&mut code, &[0x48, 0xb8], 202);
+        code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x3d]);
+        code.extend_from_slice(&(result as i32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x85]);
+        failures.push(code.len());
+        code.extend_from_slice(&0_i32.to_le_bytes());
+    }
+    mov(&mut code, &[0x48, 0xbf], 7);
+    mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failed = code.len();
+    for at in failures {
+        let delta = i32::try_from(failed).unwrap() - i32::try_from(at + 4).unwrap();
+        code[at..at + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+    mov(&mut code, &[0x48, 0xbf], 9);
+    mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "synchronous futex result was lost"
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
 }
 
 /// A sole native thread must resume a timed futex with Linux ETIMEDOUT;
