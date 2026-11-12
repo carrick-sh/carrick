@@ -2591,7 +2591,7 @@ mod tests {
         }
 
         #[test]
-        fn deferred_exception_completion_without_a_live_driver_is_stealable() {
+        fn deferred_exception_completion_without_a_driver_is_held_until_publication() {
             deferred_completion_reaches_idle_boundary(
                 carrick_el1_abi::LinuxTaskState::mark_pending_host_work,
                 |slot| {
@@ -2747,23 +2747,33 @@ mod tests {
                     ready.lock().unwrap().is_empty(),
                     "exception completion offered a host-ready continuation"
                 );
-                assert!(
-                    matches!(zone.record(record).claim(), Claim::Queued { .. }),
-                    "exception owner lost native queue custody"
-                );
-                let Claim::Queued { slot: owner, .. } = zone.record(record).claim() else {
-                    unreachable!()
-                };
-                assert_eq!(
-                    capacity_wakes.load(std::sync::atomic::Ordering::Relaxed),
-                    usize::from(!zone.slot(owner).is_live()),
-                    "unplaced native work owes one execution-capacity notification"
-                );
                 let slot = SlotId::new(SLOT as u8);
+                let owner = match zone.record(record).claim() {
+                    Claim::Queued { slot: owner, .. } => {
+                        assert_eq!(
+                            capacity_wakes.load(std::sync::atomic::Ordering::Relaxed),
+                            usize::from(!zone.slot(owner).is_live())
+                        );
+                        owner
+                    }
+                    Claim::Held { .. } => {
+                        assert_eq!(zone.slot(slot).driver(), None);
+                        assert_eq!(zone.slot(slot).queued(), 0);
+                        assert_eq!(capacity_wakes.load(std::sync::atomic::Ordering::Relaxed), 0);
+                        slot
+                    }
+                    claim => panic!("exception owner lost ring custody: {claim:?}"),
+                };
                 zone.step_back(slot, 11);
-                zone.drive(slot, 11);
-                // A returning idle driver has no host task to install the MM.
-                zone.publish_slot(slot, 0, Some(0), 0);
+                // Returning idle entry publishes the driver and probes Held.
+                zone.drive_and_publish(
+                    slot,
+                    11,
+                    0,
+                    Some(0),
+                    carrick_sched_core::AffinitySource::UNBOUND,
+                );
+                assert!(matches!(zone.record(record).claim(), Claim::Queued { .. }));
                 assert!(!zone.head_needs_host(owner));
                 let selected = zone
                     .switch_in_full(slot)
