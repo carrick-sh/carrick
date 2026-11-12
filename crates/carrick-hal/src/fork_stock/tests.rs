@@ -2702,3 +2702,85 @@ fn private_map_releases_keep_native_source_custody_steady() {
     assert!(host_file::reply(&recovered).is_none());
     assert_eq!(sources.len(), 1023);
 }
+
+fn pages(runs: &[(u64, u64)]) -> Vec<RootGpa> {
+    runs.iter()
+        .flat_map(|&(base, count)| (0..count).map(move |n| page(base + n * 4096)))
+        .collect()
+}
+
+#[test]
+fn successor_tables_larger_than_any_run_are_granted_across_runs() {
+    // Runs of 3, 5 and 2 pages; no single run holds 7.
+    let mut stock = pages(&[(0x40_0000, 3), (0x10_0000, 5), (0x80_0000, 2)]);
+    let taken = take_successor_table_runs(&mut stock, 7).unwrap();
+    assert_eq!(
+        taken,
+        pages(&[(0x10_0000, 5), (0x40_0000, 2)]),
+        "the longest runs first, the last one only as far as needed"
+    );
+    assert_eq!(stock, pages(&[(0x40_2000, 1), (0x80_0000, 2)]));
+    let frames: Vec<_> = taken.iter().map(|page| page.address()).collect();
+    assert_eq!(
+        carrick_core_abi::successor_image::frame_runs(&frames, 4096)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn successor_tables_that_fit_one_run_take_the_shortest_such_run() {
+    let mut stock = pages(&[(0x10_0000, 5), (0x40_0000, 3), (0x80_0000, 2)]);
+    let taken = take_successor_table_runs(&mut stock, 3).unwrap();
+    assert_eq!(
+        taken,
+        pages(&[(0x40_0000, 3)]),
+        "the 5-page run stays whole"
+    );
+    assert_eq!(stock, pages(&[(0x10_0000, 5), (0x80_0000, 2)]));
+}
+
+#[test]
+fn successor_tables_refuse_without_touching_the_stock() {
+    let original = pages(&[(0x10_0000, 2), (0x40_0000, 2)]);
+    let mut stock = original.clone();
+    assert_eq!(take_successor_table_runs(&mut stock, 5), None);
+    assert_eq!(take_successor_table_runs(&mut stock, 0), None);
+    assert_eq!(stock, original);
+    let mut repeated = pages(&[(0x10_0000, 2)]);
+    repeated.push(page(0x10_0000));
+    assert_eq!(take_successor_table_runs(&mut repeated, 1), None);
+}
+
+#[test]
+fn successor_table_reservation_is_busy_on_exhaustion_and_returns_whole() {
+    let mut stock: ForkStock<UntaggedRoots> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(pages(&[(0x20_0000, 4), (0x60_0000, 4)]), lifecycles(1))
+        .unwrap();
+    assert_eq!(
+        stock.reserve_successor_tables(9),
+        Err(ForkStockServiceError::SuccessorTableCapacity)
+    );
+    assert_eq!(stock.counters().successor_table_refusals, 1);
+    assert_eq!(stock.table_stock().len(), 8);
+
+    let tables = stock.reserve_successor_tables(6).unwrap();
+    assert_eq!(tables.pages().len(), 6);
+    assert_eq!(stock.table_stock().len(), 2);
+    // Busy once, then success after the stock returns.
+    assert_eq!(
+        stock.reserve_successor_tables(6),
+        Err(ForkStockServiceError::SuccessorTableCapacity)
+    );
+    stock.return_successor_tables(tables);
+    assert_eq!(stock.table_stock().len(), 8);
+    let again = stock.reserve_successor_tables(6).unwrap();
+    assert_eq!(again.pages().len(), 6);
+    stock.return_successor_tables(again);
+}
