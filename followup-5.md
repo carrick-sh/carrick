@@ -1,0 +1,3 @@
+# Follow-up 5: fchdir search permission is not re-checked on an in-memory upper (host task and venue alike)
+
+`FsView::fchdir_target` (moved verbatim from the host task's `fchdir` in PR #2214) checks search permission only through `overlay.real_stat`. Only a host upper (`--fs host`) answers that. On the default in-memory upper, a non-root caller can `fchdir` into a 0600 directory it has open, where Linux returns EACCES (LTP fchdir03). `chdir_target` uses `check_directory_search_access` (layered metadata, fsuid), so `chdir` and `fchdir` disagree. Witness: `native_child_mkdir_p_fchdirs_into_each_created_directory` asserts EACCES only for `Upper::Host` and points here. Fix it in the shared lookup, with an oracle check of euid vs fsuid for fchdir.
