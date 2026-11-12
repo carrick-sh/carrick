@@ -36,7 +36,7 @@ use carrick_mem::x86_initial_image::{X86InitialImage, X86InitialRegion, prepare_
 use std::collections::BTreeMap;
 
 /// One page-rounded PT_LOAD region holding its own initialized bytes.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct ExecRegion {
     start: u64,
     end: u64,
@@ -47,7 +47,7 @@ struct ExecRegion {
 
 /// A successor image the host has loaded and checked: what the CPL0 build
 /// maps, the strings its stack carries, where it enters, and what it costs.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct X86ExecImage {
     regions: Vec<ExecRegion>,
     executable_region_count: usize,
@@ -200,7 +200,7 @@ impl X86ExecImage {
 
 /// The owned operation of one exec preparation: the checked image and the
 /// closed successor the ring published for it.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct X86ExecRequest {
     pub image: Box<X86ExecImage>,
     pub successor: ReservationMm,
@@ -228,7 +228,7 @@ pub trait X86ExecFrames {
 
 /// A successor's reserved carrier resources, retained from before the arm
 /// until slice d's adoption consumes them or its cancellation returns them.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct X86ExecPreparation<D> {
     request: X86ExecRequest,
     /// In the order the build takes them; the first is the root.
@@ -306,7 +306,7 @@ impl<D: X86ExecData> X86ExecPreparations<D> {
 
 /// Not now: an exec whose tables a holder has. Owns the operation and the
 /// stock release it observed before the refused reservation.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 #[must_use]
 pub struct ParkedX86Exec {
     request: X86ExecRequest,
@@ -333,7 +333,7 @@ impl ParkedX86Exec {
 }
 
 /// The service's answer before the arm.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 #[must_use]
 pub enum X86ExecStage {
     /// Reserved, imported and retained; seal the manifest from
