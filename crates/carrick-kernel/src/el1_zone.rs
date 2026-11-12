@@ -254,7 +254,9 @@ fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
     let Some(handback) = zone.place_host_handback(record) else {
         return;
     };
-    let placement = handback.placement;
+    let carrick_sched_core::NativePlacement::Placed(placement) = handback.placement else {
+        return;
+    };
     if placement.resched {
         carrier.resched(placement.slot);
     }
@@ -1304,7 +1306,10 @@ fn route_native_handback_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
     if !rec.needs_native_handback() {
         return false;
     }
-    if let Some(placement) = zone.place_native_handback(record) {
+    let Some(outcome) = zone.place_native_handback(record) else {
+        return false;
+    };
+    if let carrick_sched_core::NativePlacement::Placed(placement) = outcome {
         deliver_placement(Some(placement));
         if !zone.slot(placement.slot).is_live() {
             deliver_handback_event(HandbackEvent::NativeQueued);
