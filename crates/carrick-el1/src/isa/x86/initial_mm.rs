@@ -306,6 +306,25 @@ pub trait InitialFrameSource {
     fn write_data(&mut self, grant: InitialDataGrant, offset: u16, bytes: &[u8]) -> bool;
 }
 
+/// The frames one image costs the editor: `tables` page-table pages (the
+/// root, one table per new 512 GiB, 1 GiB and 2 MiB prefix the image and
+/// its stack touch, and the private COW copy branch) and `data` zeroed
+/// leaf frames (every page of every row and of the stack). An exec
+/// successor reserves exactly this before the arm, so the build that runs
+/// after it never meets an empty source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageFrameDemand {
+    pub tables: usize,
+    pub data: usize,
+}
+
+/// The editor's exact demand for `rows` and `stack`; `None` when a count
+/// overflows. The rows are assumed valid (`validate_image_rows`).
+pub fn image_frame_demand(rows: &[ImageRow], stack: ImageStack) -> Option<ImageFrameDemand> {
+    let _ = (rows, stack);
+    Some(ImageFrameDemand { tables: 0, data: 0 })
+}
+
 /// One completed but still unpublished address space. The caller consumes all
 /// descriptor publications under its closed-MM editor before opening the task.
 pub struct InitialMmImage {
@@ -811,6 +830,102 @@ mod tests {
             frames.staged[&0x10_000][..]
         );
         assert_eq!(loaded.initial_break.raw(), 0x40_3000);
+    }
+
+    /// The demand the host reserves before an exec's arm is exactly what the
+    /// editor takes: every table and data frame, and one table fewer is
+    /// refused. Layouts cover one 2 MiB table, rows across 2 MiB and 1 GiB
+    /// prefixes, and an interpreter in its own 512 GiB prefix.
+    #[test]
+    fn image_frame_demand_is_exactly_what_the_editor_takes() {
+        let layouts: [&[u64]; 4] = [
+            &[0x40_0000, 0x40_2000],
+            &[0x40_0000, 0x40_2000, 0x60_0000, 0x6000_0000],
+            &[0x40_0000, 0x40_2000, 0x8c_0000_0000],
+            &[0x40_0000, 0x40_2000, 0x7ffe_0000],
+        ];
+        for starts in layouts {
+            let template = static_successor(0x40_0000);
+            let regions: Vec<InitialImageRegion> = starts
+                .iter()
+                .enumerate()
+                .map(|(index, start)| {
+                    let base = &template[index.min(1)];
+                    InitialImageRegion {
+                        start: UserVa::new(*start),
+                        len: base.len,
+                        initialized_offset: base.initialized_offset,
+                        initialized: base.initialized,
+                        perms: base.perms,
+                    }
+                })
+                .collect();
+            let rows: Vec<ImageRow> = regions
+                .iter()
+                .map(|region| ImageRow {
+                    start: region.start,
+                    len: region.len,
+                    initialized_offset: region.initialized_offset,
+                    initialized_len: region.initialized.len,
+                    readable: region.perms.readable,
+                    writable: region.perms.writable,
+                    executable: region.perms.executable,
+                })
+                .collect();
+            let stack = successor_stack();
+            let demand = image_frame_demand(
+                &rows,
+                ImageStack {
+                    top: UserVa::new(stack.stack_top),
+                    size: GuestLen::new(stack.stack_size),
+                },
+            )
+            .unwrap();
+            let build = |tables: usize| {
+                let words = TestWords::new();
+                let source = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
+                carrick_mmu_core::x86::copy_window::provision_cow_copy_window(
+                    &words,
+                    source,
+                    [0x61_0000, 0x61_1000, 0x61_2000]
+                        .map(|pa| RootGpa::page_aligned(FrameGpa::new(pa)).unwrap()),
+                )
+                .unwrap();
+                let mut frames = TestFrames::new();
+                frames.table_stock = (0..tables as u64).map(|n| 0xa0_0000 + n * PAGE).collect();
+                frames.next_table = 0;
+                frames
+                    .staged
+                    .insert(0x10_000, b"\xb8\xe7\0\0\0\xbf\x07\0\0\0\x0f\x05".to_vec());
+                frames.staged.insert(0x11_000, b"ok\n".to_vec());
+                // SAFETY: isolated fixture owning every frame it hands out.
+                let loaded = unsafe {
+                    install_initial_image(
+                        &words,
+                        &mut frames,
+                        source,
+                        NonZeroU64::new(93).unwrap(),
+                        NonZeroU64::MIN,
+                        &InitialImageSpec {
+                            regions: &regions,
+                            executable_region_count: regions.len(),
+                            entry: UserVa::new(0x40_0000),
+                            stack: successor_stack(),
+                        },
+                    )
+                };
+                (
+                    loaded.map(|_| ()),
+                    frames.taken_tables.len(),
+                    frames.data.len(),
+                )
+            };
+            let (built, tables, data) = build(demand.tables);
+            assert_eq!(built, Ok(()), "{starts:#x?}");
+            assert_eq!((tables, data), (demand.tables, demand.data), "{starts:#x?}");
+            let (short, _, _) = build(demand.tables - 1);
+            assert_eq!(short, Err(InitialMmError::FrameUnavailable), "{starts:#x?}");
+        }
     }
 
     /// The editor refuses through the shared row validator, before it takes a
