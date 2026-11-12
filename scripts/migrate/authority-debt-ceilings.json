@@ -11358,6 +11358,62 @@
     {
       "family": "host_backing",
       "operation": "std::fs::create_dir_all",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::create_dir_all",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::create_dir_all",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::create_dir_all",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::create_dir_all",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::create_dir_all",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::create_dir_all",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::create_dir_all",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::create_dir_all",
       "owner": "carrick_vfs::fs_backend::host::rename_scratch_to_trash",
       "lane": "freebsd_cli",
       "ceiling": 1
@@ -14229,6 +14285,118 @@
       "family": "host_backing",
       "operation": "std::fs::read_dir",
       "owner": "carrick_vfs::fs_backend::host::discover_orphans",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::read_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
       "lane": "netbsd_runtime",
       "ceiling": 1
     },
@@ -15369,6 +15537,62 @@
     {
       "family": "host_backing",
       "operation": "std::fs::remove_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_dir",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_dir",
       "owner": "carrick_vfs::vfs::bind::<BindVfs as Vfs>::rmdir",
       "lane": "freebsd_cli",
       "ceiling": 1
@@ -16765,6 +16989,62 @@
       "owner": "carrick_vfs::fs_backend::host::cleanup_tree_entries_with_budget",
       "lane": "netbsd_runtime",
       "ceiling": 2
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_file",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_file",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_file",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_file",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_file",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_file",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_file",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::remove_file",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
     },
     {
       "family": "host_backing",
@@ -17371,6 +17651,62 @@
     {
       "family": "host_backing",
       "operation": "std::fs::rename",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::rename",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::rename",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::rename",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::rename",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::rename",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::rename",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::rename",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::rename",
       "owner": "carrick_vfs::fs_backend::host::rename_scratch_to_trash",
       "lane": "freebsd_cli",
       "ceiling": 1
@@ -18373,6 +18709,62 @@
       "family": "host_backing",
       "operation": "std::fs::set_permissions",
       "owner": "carrick_vfs::fs_backend::host::cleanup_tree_entries_with_budget",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::set_permissions",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::set_permissions",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::set_permissions",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::set_permissions",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::set_permissions",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::set_permissions",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::set_permissions",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::set_permissions",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
       "lane": "netbsd_runtime",
       "ceiling": 1
     },
@@ -19017,6 +19409,174 @@
       "family": "host_backing",
       "operation": "std::fs::symlink_metadata",
       "owner": "carrick_vfs::fs_backend::host::cleanup_tree_entries_with_budget",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::list_retired_scratch",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::fs::symlink_metadata",
+      "owner": "carrick_vfs::fs_backend::host::remove_tree_making_writable",
       "lane": "netbsd_runtime",
       "ceiling": 1
     },
@@ -20951,6 +21511,62 @@
       "owner": "carrick_vfs::fs_backend::host::cleanup_tree_entries_with_budget",
       "lane": "netbsd_runtime",
       "ceiling": 2
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::process::id",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "freebsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::process::id",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "freebsd_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::process::id",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::process::id",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::process::id",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "macos_cli_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::process::id",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "macos_runtime_default",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::process::id",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "netbsd_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_backing",
+      "operation": "std::process::id",
+      "owner": "carrick_vfs::fs_backend::host::reclaim_retired_tree",
+      "lane": "netbsd_runtime",
+      "ceiling": 1
     },
     {
       "family": "host_backing",
