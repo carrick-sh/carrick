@@ -1833,10 +1833,11 @@ mod tests {
         use carrick_kernel::dispatch::executable_authority::ExecSource;
 
         let mut layer = tar::Builder::new(Vec::new());
-        let entries: [(&str, Vec<u8>); 4] = [
+        let entries: [(&str, Vec<u8>); 5] = [
             ("bin/successor", static_x86_successor()),
             ("bin/script", b"#!/bin/successor -x\n".to_vec()),
             ("bin/text", b"not an executable image".to_vec()),
+            ("bin/textscript", b"#!/bin/text\n".to_vec()),
             (
                 "bin/arm",
                 synthetic_exec(EM_AARCH64, [0x1f, 0x20, 0x03, 0xd5]),
@@ -1897,6 +1898,11 @@ mod tests {
         let tail = vec![b't'; near - 1];
         argv.push(&tail);
         assert_eq!(errno(load("/bin/script", &argv)), 7);
+        // The same expansion through an interpreter that is no ELF at all:
+        // Linux counts the strings before it looks at the image, so E2BIG,
+        // never the image's ENOEXEC.
+        assert_eq!(errno(load("/bin/textscript", &[b"textscript"])), 8);
+        assert_eq!(errno(load("/bin/textscript", &argv)), 7);
 
         // fexecve runs the descriptor's own object, here a host file.
         let directory = tempfile::tempdir().unwrap();
