@@ -54,9 +54,15 @@
 //! # }
 //! ```
 //!
-//! A borrowed handle to a lock is not an owner: the order cannot hold it
-//! exclusively, and a guard taken through it would outlive its phase. The
-//! preparations' lock guard cannot ride out into the stock phase:
+//! Both owners are `'static` types: the order borrows the owner itself,
+//! never a borrowed handle to it. A handle such as `&Mutex<_>` would leave
+//! the mutex reachable outside the order, and a guard taken through it
+//! borrows the mutex, not the phase, so it could ride out of its phase
+//! through `R` or a captured slot. Each phase's closure gets only a borrow
+//! scoped to that call, which neither `R` nor a capture can name. A
+//! `'static` handle (a global, an `Arc`) is reachable anywhere and is the
+//! caller's to keep out. The preparations' lock guard cannot ride out into
+//! the stock phase:
 //!
 //! ```compile_fail
 //! # use carrick_hal::exec_lock_order::ExecCrossingOrder;
@@ -94,6 +100,18 @@
 //! });
 //! ```
 //!
+//! and an owner's phase borrow cannot be parked in a captured slot:
+//!
+//! ```compile_fail
+//! # use carrick_hal::exec_lock_order::ExecCrossingOrder;
+//! # fn order(cpu: carrick_guest_arch::CpuId) {
+//! let (mut preparations, mut stock) = (0_u32, 0_u32);
+//! let mut slot = None;
+//! let (_released, ()) = ExecCrossingOrder::on_stopped(cpu, &mut preparations, &mut stock)
+//!     .preparations(|preparations| slot = Some(preparations));
+//! # }
+//! ```
+//!
 //! The x86 fork commit already follows this order with no preparations at
 //! all: physical custody, the stopped-CPU lease, then `ForkStock::settle`.
 use carrick_guest_arch::CpuId;
@@ -128,7 +146,7 @@ pub struct ZoneBound<'c, S> {
     stock: &'c mut S,
 }
 
-impl<'c, P, S> ExecCrossingOrder<'c, P, S> {
+impl<'c, P: 'static, S: 'static> ExecCrossingOrder<'c, P, S> {
     /// Begin on `cpu`, stopped under the caller's lease.
     pub fn on_stopped(cpu: CpuId, preparations: &'c mut P, stock: &'c mut S) -> Self {
         Self {
