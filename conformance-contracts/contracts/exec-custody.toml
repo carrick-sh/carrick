@@ -37,8 +37,8 @@
 # the fork stock, the data frames under boot's inventory transaction and the
 # image rows in the closed successor root, under the exec lock order whose
 # phases now see only their owner's state (#2192). A reservation the stock
-# cannot grant parks on the stock's release revision and reruns once, with no
-# errno. The ring does not route x86 exec to it yet and the crossings are
+# cannot grant parks with its wake enrolled on the stock's release revision;
+# the holder's table return wakes it and it reruns once, with no errno. The ring does not route x86 exec to it yet and the crossings are
 # unchanged (slice d), so no x86 exec is guest-reachable and this contract's
 # work budgets are unchanged; see docs/conformance-contracts/x86-exec-host-service.md.
 schema_version = 1
@@ -68,9 +68,9 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_exec_adoption_identity_is_the_sealed_asid_over_the_root (#1093 S4c b: ARM PrepareCross characterization through the production adopt path)",
   "carrick-x86-cpl0::exec_successor::tests::{the_successor_build_runs_before_the_consuming_crossing,a_busy_build_refuses_before_the_crossing_then_succeeds_on_rerun,a_build_of_another_root_is_refused_before_the_crossing} (#1093 S4c b: the x86 build runs before the consuming crossing; refusals leave the receipt unspent)",
   "carrick-hal::exec_lock_order::tests::the_phases_run_in_the_design_order_and_any_phase_may_stop, plus the module's compile_fail doctests (#1093 S4c b: phase sequencing and no phase-borrow escape; lock exclusion for independently reachable owners deferred to slice c, #2192)",
-  "carrick-x86-cpl0-host::cpl0_boot::exec_service::tests::{exec_service_stages_a_static_successor,exec_service_refuses_with_exact_execve_errnos,a_pending_fork_parks_the_exec_until_its_release_then_stages} (#1093 S4c c: the host Exec service reserves the editor's exact demand and imports the rows before the arm, refuses with execve(2)'s 7 and 8, and parks behind a pending fork loan with nothing reserved, then stages after its abort; Busy once, then success)",
+  "carrick-x86-cpl0-host::cpl0_boot::exec_service::tests::{exec_service_stages_a_static_successor,exec_service_refuses_with_exact_execve_errnos,a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages} (#1093 S4c c: the host Exec service reserves the editor's exact demand and imports the rows before the arm, refuses with execve(2)'s 7 and 8, and parks behind a pending fork loan with nothing reserved and its wake enrolled on the stock's release; the abort on another thread wakes it within 5 s, then it stages; Busy once, then success)",
   "carrick-runtime::runtime::exec::tests::native_child_x86_exec_loads_its_successor_through_the_shared_loader (#1093 S4c c: the x86 successor loads through the shared native exec parse and resolver by path, #! script and fexecve, with ENOENT, ENOEXEC and post-#! E2BIG)",
-  "carrick-hal::fork_stock::tests::{a_pending_fork_holds_the_stock_until_its_abort_releases_the_successor,only_returned_tables_advance_the_stock_release} (#1093 S4c c: the stock release revision is the holder's release notification)",
+  "carrick-hal::fork_stock::tests::{a_pending_fork_holds_the_stock_until_its_abort_releases_the_successor,only_returned_tables_advance_the_stock_release,an_enrolled_waiter_is_woken_once_by_the_holder_return} (#1093 S4c c: the stock release revision is the holder's release notification; an enrolled wake is delivered once by the next return, or at enrolment if one already landed)",
   "carrick-el1::isa::x86_initial_mm::tests::image_frame_demand_is_exactly_what_the_editor_takes (#1093 S4c c: the reserved demand is exactly what the build takes; one table fewer is refused)",
   "carrick-hal::exec_lock_order::tests::mutex_owners_are_locked_only_for_their_own_phase, plus the module's compile_fail doctests including the static-mutex counterexample (#2192: each phase sees only its owner's state, for that phase)",
   "carrick-el1-linux::native_process_runtime::host_test_support::{host_request_during_service_park_yields_then_reparks,host_request_during_owner_wait_park_yields_then_reparks} (#1467: entry_binding no longer turns an Occupied service or owner-wait park into NativeServiceQuarantined; the exact operation stays bound to its record across the host handback; VM-free only)",
@@ -78,7 +78,7 @@ vm_free = [
 ]
 
 embed = [
-  "KVM carrier fixture (not signed): carrick-vmm-kvm::cpl0_initial_mm::production_exec_service_stages_parks_and_reruns_a_successor (#1093 S4c c: on a booted production carrier the host Exec service reserves from the carrier's own fork stock, frame inventory and CPL0 tables, releases whole, parks behind a stock holder with nothing reserved and stages after its release; run under just lease gate with CARRICK_REQUIRE_KVM=1)",
+  "KVM carrier fixture (not signed): carrick-vmm-kvm::cpl0_initial_mm::production_exec_service_stages_parks_and_reruns_a_successor (#1093 S4c c: on a booted production carrier the host Exec service reserves from the carrier's own fork stock, frame inventory and CPL0 tables, releases whole, parks behind a stock holder with nothing reserved and its wake enrolled, is woken by the holder's return on another thread within 5 s and then stages; run under just lease gate with CARRICK_REQUIRE_KVM=1)",
 ]
 
 [bindings.unresolved]

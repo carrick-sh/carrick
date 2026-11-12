@@ -1031,6 +1031,9 @@ impl Extend<RootGpa> for TableStock {
         self.pages.extend(pages);
         if self.pages.len() != before {
             self.returns = self.returns.saturating_add(1);
+            for waiter in core::mem::take(&mut self.waiters) {
+                waiter.deliver();
+            }
         }
     }
 }
