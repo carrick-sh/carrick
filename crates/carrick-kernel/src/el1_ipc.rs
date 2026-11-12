@@ -1551,10 +1551,8 @@ mod tests {
             assert_eq!(*carrier.rescheds.lock(), [peer]);
         }
 
-        /// No guest CPU can take the woken reader (every one is stopped,
-        /// like the CPU serving the exit). The host never completes or
-        /// drops it: its readiness is retained on its owner's queue for
-        /// the stopped driver to take on entry.
+        /// No allowed slot has a driver yet. Held custody retains the woken
+        /// reader until CPU 1 publication places it exactly once.
         #[test]
         fn release_retains_reader_no_guest_cpu_can_take() {
             let carrier = carrier();
@@ -1565,7 +1563,21 @@ mod tests {
             let object = owner.create_pipe(65536).expect("pipe");
             let record = park_reader(&carrier, object);
             release_last_writer(&owner, object);
-            let slot = queued_on(&carrier, record).expect("retained on a queue");
+            assert!(matches!(
+                carrier.zone.record(record).claim(),
+                carrick_sched_core::Claim::Held { .. }
+            ));
+            assert!(queued_on(&carrier, record).is_none());
+            let slot = SlotId::new(1);
+            carrier.zone.drive_and_publish(
+                slot,
+                1,
+                MM,
+                Some(1),
+                carrick_sched_core::AffinitySource::UNBOUND,
+            );
+            assert_eq!(queued_on(&carrier, record), Some(slot));
+            carrier.zone.publish_slot(slot, MM, Some(1), 1 << 1);
             assert_eq!(carrier.zone.slot(slot).queued(), 1);
         }
 
@@ -1604,7 +1616,20 @@ mod tests {
                 .expect("holder took the lane");
             release_last_writer(&owner, object);
             holder.join().expect("holder");
-            assert!(queued_on(&carrier, record).is_some());
+            assert!(matches!(
+                carrier.zone.record(record).claim(),
+                carrick_sched_core::Claim::Held { .. }
+            ));
+            let slot = SlotId::new(1);
+            carrier.zone.drive_and_publish(
+                slot,
+                1,
+                MM,
+                Some(1),
+                carrick_sched_core::AffinitySource::UNBOUND,
+            );
+            assert_eq!(queued_on(&carrier, record), Some(slot));
+            assert_eq!(carrier.zone.slot(slot).queued(), 1);
         }
 
         /// A carrier binds its zone once; a second binding is refused.
