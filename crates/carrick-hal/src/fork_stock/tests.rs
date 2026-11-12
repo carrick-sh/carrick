@@ -2784,3 +2784,60 @@ fn successor_table_reservation_is_busy_on_exhaustion_and_returns_whole() {
     assert_eq!(again.pages().len(), 6);
     stock.return_successor_tables(again);
 }
+
+/// #1093 S4c slice c: a pending fork loan holds the stock an exec successor
+/// needs. The reservation is refused for capacity (not now), nothing moves,
+/// and the stock's release revision is the holder's release notification:
+/// the loan's abort advances it, the exec probes once and is granted.
+#[test]
+fn a_pending_fork_holds_the_stock_until_its_abort_releases_the_successor() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
+    assert_eq!(stock.table_stock().len(), 1);
+    let observed = stock.table_release();
+    assert_eq!(
+        stock.reserve_successor_tables(3),
+        Err(ForkStockServiceError::SuccessorTableCapacity)
+    );
+    assert!(
+        !stock.released_since(observed),
+        "a refusal releases nothing"
+    );
+    assert_eq!(stock.table_stock().len(), 1);
+
+    let mut abort = ForkStockSettlement::abort(granted);
+    stock
+        .settle(
+            &mut NoTableLedger,
+            parent(),
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert!(
+        stock.released_since(observed),
+        "the abort returned the loan"
+    );
+    let tables = stock.reserve_successor_tables(3).unwrap();
+    assert_eq!(tables.pages().len(), 3);
+    stock.return_successor_tables(tables);
+}
+
+/// Taking pages (a loan, a successor reservation) never advances the
+/// release; every return does, once per return.
+#[test]
+fn only_returned_tables_advance_the_stock_release() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let start = stock.table_release();
+    let tables = stock.reserve_successor_tables(2).unwrap();
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    assert_eq!(stock.table_release(), start);
+    stock.return_successor_tables(tables);
+    let returned = stock.table_release();
+    assert!(returned > start);
+    // A partly used loan returns its unused table at commit.
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    assert!(stock.released_since(returned));
+}
