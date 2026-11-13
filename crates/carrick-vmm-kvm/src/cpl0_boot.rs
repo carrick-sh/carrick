@@ -323,68 +323,49 @@ impl Drop for FixtureReadinessLaneHold {
     }
 }
 
-/// A host party releasing the editors a full owed-return table's drain held
-/// (#1482 P0-1), from [`Cpl0Carrier::fixture_hold_owed_return_holders`].
+/// The editors a full owed-return table's drain held (#1482 P0-1), from
+/// [`Cpl0Carrier::fixture_hold_owed_return_holders`]: the census of what
+/// the holds met and the release that gives them back.
 #[cfg(feature = "test-fixtures")]
 pub struct FixtureOwedReturnHolderHold {
-    hold: Arc<carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::OwedReturnHolderHold>,
-    thread: Option<std::thread::JoinHandle<Result<bool, TrapError>>>,
+    release: carrick_x86_cpl0_host::cpl0_boot::anonymous_owner::OwedReturnHolderRelease<KvmVm>,
 }
 
 #[cfg(feature = "test-fixtures")]
 impl FixtureOwedReturnHolderHold {
     /// The holders whose editors the drain held.
     pub fn held(&self) -> Vec<carrick_el1_abi::ReservationMm> {
-        self.hold.held()
+        self.release.hold().held()
     }
     /// Settlement doorbells answered while the editors were held.
     pub fn doorbells_while_held(&self) -> u64 {
-        self.hold.doorbells_while_held()
+        self.release.hold().doorbells_while_held()
     }
-    /// Join the releaser: `Ok(true)` when it released because the expected
-    /// waiters were parked on the held holders' releases, `Ok(false)` when
-    /// its bound expired first (it released then too).
-    pub fn finish(mut self) -> Result<bool, TrapError> {
-        self.thread
-            .take()
-            .map_or(Ok(false), |thread| thread.join().unwrap_or(Ok(false)))
+    /// Wait, at most `bound`, for the first full-table drain to hold the
+    /// editors.
+    pub fn wait_claimed(&self, bound: Duration) -> bool {
+        self.release.hold().wait_claimed(bound)
+    }
+    /// Records parked on the held holders' `Editor` releases.
+    pub fn enrolled(&self) -> Result<u32, TrapError> {
+        self.release.enrolled()
+    }
+    /// Give every held editor back and publish each holder's exact `Editor`
+    /// release. Returns how many were released.
+    pub fn release(&self) -> Result<usize, TrapError> {
+        self.release.release()
     }
 }
 
 impl Cpl0Carrier {
     /// At the first drain that finds the shared owed-return table full, the
     /// carrier holds every holder's real editor word, as active ring editors
-    /// would. A host thread releases them, publishing each holder's exact
-    /// `Editor` release, once `waiters` records are parked on those
-    /// releases, or at `bound`. The release retains the carrier RAM.
+    /// would, until [`FixtureOwedReturnHolderHold::release`]. The hold
+    /// retains the carrier RAM.
     #[cfg(feature = "test-fixtures")]
-    pub fn fixture_hold_owed_return_holders(
-        &mut self,
-        waiters: u32,
-        bound: Duration,
-    ) -> FixtureOwedReturnHolderHold {
-        let release = self.custody.fixture_hold_owed_return_holders();
-        let hold = Arc::clone(release.hold());
-        let thread = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + bound;
-            if !release.hold().wait_claimed(bound) {
-                return Ok(false);
-            }
-            loop {
-                if release.enrolled()? >= waiters {
-                    release.release()?;
-                    return Ok(true);
-                }
-                if std::time::Instant::now() >= deadline {
-                    release.release()?;
-                    return Ok(false);
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        });
+    pub fn fixture_hold_owed_return_holders(&mut self) -> FixtureOwedReturnHolderHold {
         FixtureOwedReturnHolderHold {
-            hold,
-            thread: Some(thread),
+            release: self.custody.fixture_hold_owed_return_holders(),
         }
     }
 
