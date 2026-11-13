@@ -351,3 +351,90 @@ fn doorbell_replies_name_the_release_a_refusal_waits_for() {
     let failed: Outcome = Err(ReturnSettlementError::Backend(3));
     assert_eq!(doorbell_reply(&failed), None);
 }
+
+/// #1482 item 1 ratchet: every exclusion of an MM's EL1 editor settles that
+/// MM's owed returns. The carrick-kernel exclusions run the installed
+/// settlement hook; the native (ring-owned) carriers call the primitive
+/// `try_exclude_editor` directly, and each such production file must settle
+/// after it. A new caller of the primitive fails here until it is routed
+/// through a settling exclusion (or listed as test-only).
+#[test]
+fn every_native_exclusion_site_settles_owed_returns() {
+    // (file, settlement it runs after the exclusion); `None`: the primitive
+    // itself or test-only callers.
+    const SITES: &[(&str, Option<&str>)] = &[
+        ("carrick-sched-core/src/spaces/notification.rs", None),
+        // This ratchet names the primitive it searches for.
+        ("carrick-hal/src/return_settlement/tests.rs", None),
+        (
+            "carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs",
+            None,
+        ),
+        (
+            "carrick-el1-linux/src/aarch64_process_tests/native_retirement_tests.rs",
+            None,
+        ),
+        (
+            "carrick-x86-cpl0-host/src/cpl0_return_settlement.rs",
+            Some("self.settle_excluded("),
+        ),
+        (
+            "carrick-vmm-hvf/src/metadata_grant.rs",
+            Some("settle_native_returns(custody, exclusion.proof())"),
+        ),
+        (
+            "carrick-vmm-hvf/src/metadata_grant/native_service.rs",
+            Some("settle_native_returns(&custody, exclusion.proof())"),
+        ),
+        (
+            "carrick-vmm-hvf/src/metadata_grant/return_settlement.rs",
+            Some("settle_native_returns(custody, exclusion.proof())"),
+        ),
+    ];
+    fn walk(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name != "target") {
+                    walk(&path, found);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && std::fs::read_to_string(&path)
+                    .is_ok_and(|source| source.contains("try_exclude_editor("))
+            {
+                found.push(path);
+            }
+        }
+    }
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let mut found = Vec::new();
+    walk(crates, &mut found);
+    let mut callers: Vec<String> = found
+        .iter()
+        .map(|path| {
+            path.strip_prefix(crates)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    callers.sort();
+    let mut expected: Vec<String> = SITES.iter().map(|(file, _)| (*file).to_owned()).collect();
+    expected.sort();
+    assert_eq!(
+        callers, expected,
+        "a new exclusion of an MM's editor must settle its owed returns"
+    );
+    for (file, settlement) in SITES {
+        if let Some(settlement) = settlement {
+            let source = std::fs::read_to_string(crates.join(file)).unwrap();
+            let exclusion = source.find("try_exclude_editor(").unwrap();
+            assert!(
+                source[exclusion..].contains(settlement),
+                "{file} excludes an editor without settling owed returns after it"
+            );
+        }
+    }
+}
