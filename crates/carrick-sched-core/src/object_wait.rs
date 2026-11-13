@@ -3466,6 +3466,66 @@ mod host_tests {
         assert_eq!(taken.kind(), OperationKind::FaultRetry);
     }
 
+    /// #2141 review P1: a signal interrupts a native member parked on a user
+    /// fault. Its handback places it back on the native owner, and it switches
+    /// in with no wake value as its result: the saved context is the faulting
+    /// instruction, which reruns (or takes the signal) as it is, never with
+    /// a syscall result written over RAX. The typed operation survives for
+    /// the resume checkpoint to consume.
+    #[test]
+    fn fault_retry_signal_handback_takes_no_wake_value() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::address_space(0, 17).unwrap();
+        zone.bind_object_wait(key, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
+        let record = allocate(&zone, 101);
+        assert!(zone.mark_native_owned(record));
+        let exact = zone.record_ref(record);
+        // SAFETY: the unpublished record is exclusively this fixture's.
+        unsafe { zone.record(record).ctx_mut().x[0] = 0x1122_3344_5566_7788 };
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+        queue
+            .park(
+                queue.snapshot(),
+                record,
+                OperationToken::fault_retry(key).unwrap(),
+            )
+            .unwrap();
+        drop(queue);
+        assert_eq!(
+            zone.claim_for_host(exact, None, Handback::Signal, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            HostClaim::Claimed
+        );
+        let rec = zone.record(record);
+        assert_eq!(rec.handback(), Some(Handback::Signal));
+        assert!(rec.needs_native_handback());
+        assert!(
+            !rec.needs_host(),
+            "a native fault retry never crosses to the host"
+        );
+        assert!(matches!(
+            zone.place_native_handback(exact),
+            Some(crate::NativePlacement::Placed(_))
+        ));
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(switched.record, record);
+        assert_eq!(switched.result, None, "no wake value replaces the context");
+        // SAFETY: the switched-in slot owns the record.
+        assert_eq!(unsafe { rec.ctx_mut() }.x[0], 0x1122_3344_5566_7788);
+        assert_eq!(rec.object_operation_kind(), Some(OperationKind::FaultRetry));
+        // SAFETY: the switched-in slot owns the record's operation.
+        let taken = unsafe { rec.take_object_operation() }.unwrap();
+        assert_eq!(taken.kind(), OperationKind::FaultRetry);
+    }
+
     #[test]
     fn cancellation_preserves_operation_token_domains() {
         use spaces::notification::SpaceWaitCause;
