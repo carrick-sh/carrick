@@ -284,20 +284,31 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
   dispatch queues beside a scheduled run instead of displacing it. Per-merge HVF attribution comes
   from each merge group's own Signed queue gate.
 - **Scoreboard-only branch dispatch (#2251):** to score an unlanded branch, the owner dispatches
-  **on main** and names the branch:
-  `gh workflow run kernel-runtime.yml --repo carrick-sh/carrick --ref main -f scoreboard_branch=<branch> [-f scoreboard_sha=<sha>]`.
-  The workflow file, and the runner-group pin and `admit-job` checks above, still come from main.
-  A hosted `scoreboard-target` job resolves `refs/heads/<branch>` in this repository (never
-  `refs/pull/*`) to its exact SHA. `hvf-kernel` checks that SHA out without persisted
-  credentials, signs a build, verifies the entitlement and `__dof_carrick`, and runs the goal
-  scoreboard. It skips fixtures, receipts, embed tests, the Rust cache save, the #231 post and
-  every other lane. The run's `head_sha` is main's tip, so a `receipt-*` or `signed-fixtures-*`
-  artifact from it would be trusted as main's. Output: the job summary, a
-  `scoreboard-branch-<sha>-<attempt>` artifact with `provenance.json`, and a comment on the
-  branch's open same-repository PR. A `--ref <branch>` dispatch is still refused before any step.
-  Trust: unlanded owner code now runs as `carrick-hvf`. Root-owned runner files, hooks and
-  policy are out of its reach, but its writable state (CARGO_HOME, sccache, the 0444 relay
-  token) is not. Dispatch only branches you would push to main.
+  **on main** and names the branch and the exact head SHA they reviewed:
+  `gh workflow run kernel-runtime.yml --repo carrick-sh/carrick --ref main -f scoreboard_branch=<branch> -f scoreboard_sha=<sha>`.
+  The workflow file, the runner-group pin and `admit-job` still come from main, unchanged. The flow:
+  - `scoreboard-target` (hosted) requires `refs/heads/<branch>` in this repository (never
+    `refs/pull/*`) to equal the SHA;
+  - `hvf-scoreboard` (this runner, `permissions: contents: read`) fetches main's tree and the pinned
+    tree with anonymous git. It uses no actions/checkout, no rust-cache, no upload and no other Node
+    action, and it never references a token. It installs `just` from main's composite action, builds
+    main's `carrick-xtask` as the instrument, then signs a build of the branch under `RUNNER_TEMP`
+    with a private `CARGO_HOME` and sccache off. It runs the scoreboard and returns the results as
+    job outputs;
+  - `scoreboard-publish` (hosted, no repository code) holds the only write token. It uploads
+    `scoreboard-branch-<sha>-<attempt>` with `provenance.json` and comments on the branch's open
+    same-repository PR.
+
+  Nothing here produces a `receipt-*`, `signed-fixtures-*` or `scoreboard-<main sha>` artifact, a
+  cache entry or a #231 post. The run's `head_sha` is main's tip, so main's gates would trust any of
+  them.
+
+  Residual: the pinned code runs as `carrick-hvf`. Root-owned runner files, hooks and policy are
+  out of its reach. Files that user owns are not: its default CARGO_HOME and sccache, the
+  persistent workspace, and the runner's own state. It can also read the download-only 0444 relay
+  token. Code running as the same user could in principle tamper with later main jobs, or read
+  credentials the runner holds for that user. The exact-SHA pin is the control: dispatch only a
+  commit you would push to main.
 - **Host-lease serialization (`/tmp/carrick-host-lease.lock`):**
   - `hvf-kernel` builds its checkout xtask under the **shared** `just lease carrick` (it no
     longer runs `just ci`; hosted CI covers it, #2057). Fixture restoration and `Signed embedded
