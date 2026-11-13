@@ -58,6 +58,7 @@ embed = [
   "carrick-vmm-kvm::cpl0_entry::production_anonymous_release_to_idle_peer_preserves_wake (real KVM pool, ordered remote synthetic holder release; one park, zero handbacks/forwards, exact exit 7)",
   "carrick-vmm-kvm::cpl0_initial_mm::production_brk_regrows_over_its_released_pages (#2217/#1482, real KVM pool, red on main with exit 3: a brk shrink then regrowth over the released pages is served with exactly one settlement doorbell and zero-filled pages)",
   "carrick-vmm-kvm::cpl0_initial_mm::production_exclusion_settles_owed_returns_before_the_doorbell_is_needed (#1482 item 1, real KVM pool: a first-touch backing grant's exclusion settles the shrink's owed return, so the regrowth needs no doorbell)",
+  "carrick-vmm-kvm::cpl0_initial_mm::production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell (#1482 P0-2: production x86 carrier, a merged GiB owed range, exactly one doorbell, maximum 512 pages per editor exclusion)",
 ]
 
 [bindings.unresolved]

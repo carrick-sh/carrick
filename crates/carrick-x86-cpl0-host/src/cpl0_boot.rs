@@ -2850,6 +2850,17 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody.fork_stock_counters())
     }
 
+    /// Settlement work observed through the production carrier.
+    pub fn return_settlement_counters(
+        &self,
+    ) -> Result<anonymous_owner::ReturnSettlementCounters, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.return_settlement_counters)
+    }
+
     pub fn claim(&self, slot: usize) -> Result<ProductionCpuLease<M, Mem>, TrapError> {
         let mut cpus = self.cpus.lock().map_err(|_| fail("CPU factory poisoned"))?;
         let cpu = cpus
