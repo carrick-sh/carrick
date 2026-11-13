@@ -536,7 +536,10 @@ struct HolderHoldState {
 impl OwedReturnHolderHold {
     pub(crate) fn armed() -> Arc<Self> {
         let hold = Self::default();
-        hold.state.lock().unwrap().armed = true;
+        hold.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .armed = true;
         Arc::new(hold)
     }
 
@@ -546,7 +549,10 @@ impl OwedReturnHolderHold {
         zone: &X86Cpl0Zone,
         holders: &[carrick_el1_abi::ReservationMm],
     ) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !std::mem::take(&mut state.armed) {
             return;
         }
@@ -565,7 +571,10 @@ impl OwedReturnHolderHold {
     /// The doorbell's hook, after its answer: count doorbells answered while
     /// the editors are held.
     pub(super) fn count_doorbell(&self) {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.held.is_empty() && !state.released {
             self.doorbells_while_held
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -574,7 +583,10 @@ impl OwedReturnHolderHold {
 
     /// The MMs whose editors the drain claimed.
     pub fn held(&self) -> Vec<carrick_el1_abi::ReservationMm> {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.held.iter().map(|&(_, mm)| mm).collect()
     }
 
@@ -586,11 +598,14 @@ impl OwedReturnHolderHold {
 
     /// Wait (bounded) until a drain claimed the holders' editors.
     pub fn wait_claimed(&self, bound: std::time::Duration) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (state, _) = self
             .claimed
             .wait_timeout_while(state, bound, |state| state.held.is_empty())
-            .unwrap();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         !state.held.is_empty()
     }
 }
@@ -617,7 +632,11 @@ impl<M: CarrierMemoryIo> OwedReturnHolderRelease<M> {
     /// Records parked on the held holders' `Editor` releases.
     pub fn enrolled(&self) -> Result<u32, TrapError> {
         let zone = retained_cow_zone(&self.ram)?;
-        let state = self.hold.state.lock().unwrap();
+        let state = self
+            .hold
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(state
             .held
             .iter()
@@ -639,7 +658,11 @@ impl<M: CarrierMemoryIo> OwedReturnHolderRelease<M> {
     pub fn release(&self) -> Result<usize, TrapError> {
         let zone = retained_cow_zone(&self.ram)?;
         let held = {
-            let mut state = self.hold.state.lock().unwrap();
+            let mut state = self
+                .hold
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.released = true;
             state.held.clone()
         };
