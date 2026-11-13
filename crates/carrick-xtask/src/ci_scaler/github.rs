@@ -558,6 +558,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ci_scaler_zero_runner_never_owns_unassigned_job() {
+        use super::super::mac::MacLedger;
+        let mut row = MacLedger::default()
+            .reserve(
+                JobKey {
+                    run: RunId(10),
+                    attempt: 1,
+                    job: JobId(11),
+                },
+                100,
+            )
+            .unwrap();
+        row.runner = Some(RunnerId(0));
+        let assignment = Github::assignment_inner(&mut row, |_, endpoint, _, _| {
+            Ok(if endpoint.contains("/actions/jobs/") {
+                json!({"id":11,"runner_id":0,"status":"queued"})
+            } else if endpoint.contains("/actions/runners?") {
+                json!([{"runners":[{"id":0,"busy":false}]}])
+            } else if endpoint.contains("/actions/runs?") {
+                json!([{"workflow_runs":[{"id":20,"run_attempt":1}]}])
+            } else {
+                json!([{"jobs":[{"id":21,"runner_id":0,"status":"queued"}]}])
+            })
+        })
+        .unwrap();
+        assert_eq!(assignment, Assignment::Unassigned);
+    }
+
+    #[test]
+    fn ci_scaler_non_running_rollup_still_owns_diverted_job() {
+        use super::super::mac::MacLedger;
+        for status in ["queued", "waiting"] {
+            for job_status in ["queued", "in_progress"] {
+                let mut row = MacLedger::default()
+                    .reserve(
+                        JobKey {
+                            run: RunId(10),
+                            attempt: 1,
+                            job: JobId(11),
+                        },
+                        100,
+                    )
+                    .unwrap();
+                row.runner = Some(RunnerId(7));
+                let assignment = Github::assignment_inner(&mut row, |_, endpoint, _, _| {
+                    Ok(if endpoint.contains("/actions/runs?") {
+                        if endpoint.contains("status=in_progress") {
+                            json!([{"workflow_runs":[]}])
+                        } else {
+                            json!([{"workflow_runs":[{"id":20,"run_attempt":1,"status":status}]}])
+                        }
+                    } else if endpoint.contains("/attempts/1/jobs?") {
+                        json!([{"jobs":[{"id":21,"runner_id":7,"status":job_status}]}])
+                    } else if endpoint.contains("/actions/jobs/") {
+                        json!({"id":11,"runner_id":0,"status":"queued"})
+                    } else {
+                        json!([{"runners":[{"id":7,"busy":false}]}])
+                    })
+                })
+                .unwrap();
+                assert_eq!(assignment, Assignment::Busy, "{status}/{job_status}");
+            }
+        }
+    }
+
+    #[test]
+    fn ci_scaler_assignment_request_budget_young_and_completed() {
+        use super::super::mac::MacLedger;
+        // Demand's documented budget is workflow-scoped (github.rs workflow_runs).
+        // Normal polling must use only the reserved job and registration: no N+1 scan.
+        for (young, completed, budget) in [(true, false, 2), (false, true, 1)] {
+            let mut row = MacLedger::default()
+                .reserve(
+                    JobKey {
+                        run: RunId(10),
+                        attempt: 1,
+                        job: JobId(11),
+                    },
+                    if young { now().unwrap() } else { 100 },
+                )
+                .unwrap();
+            row.runner = Some(RunnerId(7));
+            let mut calls = 0;
+            Github::assignment_inner(&mut row, |_, endpoint, _, _| {
+                calls += 1;
+                Ok(if endpoint.contains("/actions/jobs/") {
+                    json!({"id":11,"runner_id":if completed {7} else {0},
+                        "status":if completed {"completed"} else {"queued"}})
+                } else if endpoint.contains("/actions/runners?") {
+                    json!([{"runners":[{"id":7,"busy":false}]}])
+                } else {
+                    json!([{"workflow_runs":[]}])
+                })
+            })
+            .unwrap();
+            assert_eq!(calls, budget, "young={young} completed={completed}");
+        }
+    }
+
+    #[test]
     fn ci_scaler_reclaim_checks_actual_running_job_before_idle_registration() {
         use super::super::mac::{MacLedger, MacState, MacStep, mac_step};
         for busy in [true, false] {
