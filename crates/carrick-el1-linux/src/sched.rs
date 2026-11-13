@@ -221,7 +221,7 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
             wait.timeout_result.raw() as u64,
             |record| {
                 crate::aarch64_process::registry()
-                    .futex_signal_pending(zone, record)
+                    .futex_interrupt_pending(zone, record)
                     .then_some(carrick_guest_arch::NativeReturnWord(
                         carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
                     ))
