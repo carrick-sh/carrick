@@ -88,6 +88,10 @@ impl UserSlot {
         }
     }
 
+    pub(crate) const fn guest_address(self) -> GuestVa {
+        GuestVa::new(self.address)
+    }
+
     pub(crate) const fn capacity(self) -> usize {
         self.capacity
     }
@@ -232,11 +236,34 @@ enum Venue<'m, M: CurrentMmMemory> {
 /// Destination authority for up to `N` outputs, obtained before any side
 /// effect. It borrows the memory until it is committed or dropped; dropping it
 /// unused cancels the owner permit.
+pub(crate) type PreparedCopyout<'m, M, const N: usize> =
+    PreparedOutputs<'m, M, [Option<UserSlot>; N]>;
+pub(crate) type PreparedVectorCopyout<'m, M> = PreparedOutputs<'m, M, Vec<Option<UserSlot>>>;
+
 #[must_use = "a prepared copyout writes nothing until it is committed"]
-pub(crate) struct PreparedCopyout<'m, M: CurrentMmMemory, const N: usize> {
-    slots: [Option<UserSlot>; N],
+pub(crate) struct PreparedOutputs<'m, M: CurrentMmMemory, S> {
+    slots: S,
     venue: Venue<'m, M>,
     effect: Option<OwnerEffect>,
+}
+
+#[derive(Clone, Copy)]
+enum FaultPrefixPolicy {
+    FixedRecords,
+    Stream,
+}
+impl FaultPrefixPolicy {
+    fn smaller(self, prefix: usize) -> usize {
+        match self {
+            Self::FixedRecords => prefix - 1,
+            Self::Stream => prefix / 2,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum CommitScope {
+    AllOutputs,
+    SecuredPrefix,
 }
 
 /// Prepare every output of one syscall. `None` slots (a NULL optional
@@ -246,31 +273,78 @@ pub(crate) fn prepare<'m, M: CurrentMmMemory, const N: usize>(
     memory: &'m mut M,
     slots: [Option<UserSlot>; N],
 ) -> Result<PreparedCopyout<'m, M, N>, CopyoutRefusal> {
+    prepare_outputs(
+        context,
+        memory,
+        slots,
+        |empty, _| [empty; N],
+        FaultPrefixPolicy::FixedRecords,
+    )
+}
+
+/// Secure a stream's scattered output before taking its consuming source lock.
+/// A real fault selects a geometrically bounded valid prefix; valid ranges
+/// need one preparation, independent of vector population.
+pub(crate) fn prepare_vector<'m, M: CurrentMmMemory>(
+    context: &KernelContext,
+    memory: &'m mut M,
+    slots: Vec<Option<UserSlot>>,
+) -> Result<PreparedVectorCopyout<'m, M>, CopyoutRefusal> {
+    prepare_outputs(
+        context,
+        memory,
+        slots,
+        |empty, count| vec![empty; count],
+        FaultPrefixPolicy::Stream,
+    )
+}
+
+fn prepare_outputs<'m, M, S, R>(
+    context: &KernelContext,
+    memory: &'m mut M,
+    slots: S,
+    ranges: impl FnOnce(GuestWriteRange, usize) -> R,
+    fault_prefix: FaultPrefixPolicy,
+) -> Result<PreparedOutputs<'m, M, S>, CopyoutRefusal>
+where
+    M: CurrentMmMemory,
+    S: AsRef<[Option<UserSlot>]> + AsMut<[Option<UserSlot>]>,
+    R: AsMut<[GuestWriteRange]>,
+{
     let owner = memory.user_memory_venue() == UserMemoryVenue::Owner;
-    let mut output = prepare_memory(memory, slots)?;
+    let mut output = prepare_memory(memory, slots, ranges, fault_prefix)?;
     if owner {
         output.effect = Some(admit_effect(context)?);
     }
     Ok(output)
 }
 
-fn prepare_memory<M: CurrentMmMemory, const N: usize>(
+fn prepare_memory<M, S, R>(
     memory: &mut M,
-    slots: [Option<UserSlot>; N],
-) -> Result<PreparedCopyout<'_, M, N>, CopyoutRefusal> {
-    let slots = slots.map(|slot| slot.filter(|slot| slot.capacity > 0));
+    mut slots: S,
+    ranges: impl FnOnce(GuestWriteRange, usize) -> R,
+    fault_prefix: FaultPrefixPolicy,
+) -> Result<PreparedOutputs<'_, M, S>, CopyoutRefusal>
+where
+    M: CurrentMmMemory,
+    S: AsRef<[Option<UserSlot>]> + AsMut<[Option<UserSlot>]>,
+    R: AsMut<[GuestWriteRange]>,
+{
+    for slot in slots.as_mut() {
+        *slot = slot.filter(|slot| slot.capacity > 0);
+    }
     // The legacy venue has no permit and prepares nothing: a guest-sized
     // output commits exactly as the direct write it replaces and never meets
     // the owner bound below.
     if memory.user_memory_venue() == UserMemoryVenue::Legacy {
-        return Ok(PreparedCopyout {
+        return Ok(PreparedOutputs {
             slots,
             effect: None,
             venue: Venue::Legacy(memory),
         });
     }
     let Some(empty) = GuestWriteRange::new(GuestVa::new(0), 0) else {
-        return Ok(PreparedCopyout {
+        return Ok(PreparedOutputs {
             slots,
             effect: None,
             venue: Venue::Owner {
@@ -280,11 +354,12 @@ fn prepare_memory<M: CurrentMmMemory, const N: usize>(
             },
         });
     };
-    let mut ranges = [empty; N];
+    let mut ranges = ranges(empty, slots.as_ref().len());
+    let ranges = ranges.as_mut();
     let mut count = 0usize;
     let mut total = 0usize;
     let mut faulted = false;
-    for slot in slots.iter().flatten() {
+    for slot in slots.as_ref().iter().flatten() {
         let Some(next_total) = total.checked_add(slot.capacity) else {
             debug_assert!(false, "owner copyout overflows permit size");
             faulted = true;
@@ -311,7 +386,7 @@ fn prepare_memory<M: CurrentMmMemory, const N: usize>(
         total = next_total;
     }
     if count == 0 {
-        return Ok(PreparedCopyout {
+        return Ok(PreparedOutputs {
             slots,
             effect: None,
             venue: Venue::Owner {
@@ -325,7 +400,8 @@ fn prepare_memory<M: CurrentMmMemory, const N: usize>(
     // if preparing the full prefix faults (`EFAULT`), step back to the longest
     // valid prefix so earlier slots still commit before reporting `EFAULT`,
     // matching the legacy venue and Linux (`wait4`, `gettimeofday`, `sockaddr`,
-    // `getsockopt`). Any transient refusal returns immediately before effects.
+    // `getsockopt`). Stream windows reduce geometrically to bound fault work.
+    // Any transient refusal returns immediately before effects.
     let memory_ptr: *mut M = memory;
     let mut prefix = count;
     while prefix > 0 {
@@ -336,7 +412,7 @@ fn prepare_memory<M: CurrentMmMemory, const N: usize>(
         let attempt = unsafe { &mut *memory_ptr }.prepare_write(&ranges[..prefix]);
         match attempt {
             Ok(permit) => {
-                return Ok(PreparedCopyout {
+                return Ok(PreparedOutputs {
                     slots,
                     effect: None,
                     venue: Venue::Owner {
@@ -349,13 +425,13 @@ fn prepare_memory<M: CurrentMmMemory, const N: usize>(
             Err(error) => match crate::el1_delegation::owner_prepare_refusal(error) {
                 outcome if outcome == DispatchOutcome::errno(LINUX_EFAULT) => {
                     faulted = true;
-                    prefix -= 1;
+                    prefix = fault_prefix.smaller(prefix);
                 }
                 outcome => return Err(CopyoutRefusal(Box::new(outcome))),
             },
         }
     }
-    Ok(PreparedCopyout {
+    Ok(PreparedOutputs {
         slots,
         effect: None,
         venue: Venue::Owner {
@@ -366,10 +442,14 @@ fn prepare_memory<M: CurrentMmMemory, const N: usize>(
     })
 }
 
-impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
+impl<M: CurrentMmMemory, S: AsRef<[Option<UserSlot>]>> PreparedOutputs<'_, M, S> {
+    pub(crate) fn slot(&self, index: usize) -> Option<UserSlot> {
+        self.slots.as_ref().get(index).copied().flatten()
+    }
     /// The prepared capacity of output `index` (0 for an absent slot).
     pub(crate) fn capacity(&self, index: usize) -> usize {
         self.slots
+            .as_ref()
             .get(index)
             .copied()
             .flatten()
@@ -381,7 +461,7 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
     pub(crate) fn secured_capacity(&self, index: usize) -> usize {
         match &self.venue {
             Venue::Owner { valid_present, .. } => {
-                let present = self.slots.iter().take(index + 1).flatten().count();
+                let present = self.slots.as_ref().iter().take(index + 1).flatten().count();
                 if present > *valid_present {
                     0
                 } else {
@@ -397,7 +477,9 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
     pub(crate) fn cancel_retaining(mut self) -> Option<OwnerEffect> {
         self.effect.take()
     }
+}
 
+impl<M: CurrentMmMemory, const N: usize> PreparedOutputs<'_, M, [Option<UserSlot>; N]> {
     /// Keep effect custody through metadata publication following copyout.
     pub(crate) fn commit_retaining(
         mut self,
@@ -406,13 +488,47 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
         let effect = self.effect.take();
         (self.commit(outputs), effect)
     }
-
-    /// Write one prefix per slot; the output for an absent slot (a NULL
-    /// optional pointer) is ignored. On both venues the first invalid pointer
-    /// stops the commit with [`CopyoutFault`] after any earlier valid slots
-    /// were written.
     pub(crate) fn commit(self, outputs: [&[u8]; N]) -> Result<(), CopyoutFault> {
-        for (slot, output) in self.slots.iter().zip(outputs) {
+        let mut present = [&[] as &[u8]; N];
+        self.commit_outputs(&outputs, &mut present, CommitScope::AllOutputs)
+    }
+}
+
+impl<M: CurrentMmMemory> PreparedOutputs<'_, M, Vec<Option<UserSlot>>> {
+    /// A consuming stream supplies only bytes within secured capacities.
+    /// A later bad range cannot turn a delivered prefix into EFAULT.
+    pub(crate) fn commit_prefix_retaining(
+        mut self,
+        outputs: &[&[u8]],
+    ) -> (Result<(), CopyoutFault>, Option<OwnerEffect>) {
+        let effect = self.effect.take();
+        let mut present = vec![&[] as &[u8]; self.slots.len()];
+        (
+            self.commit_outputs(outputs, &mut present, CommitScope::SecuredPrefix),
+            effect,
+        )
+    }
+}
+
+impl<M: CurrentMmMemory, S: AsRef<[Option<UserSlot>]>> PreparedOutputs<'_, M, S> {
+    fn commit_outputs<'b>(
+        self,
+        outputs: &[&'b [u8]],
+        present: &mut [&'b [u8]],
+        scope: CommitScope,
+    ) -> Result<(), CopyoutFault> {
+        if outputs.len() != self.slots.as_ref().len() || present.len() < outputs.len() {
+            return Err(CopyoutFault);
+        }
+        if matches!(scope, CommitScope::SecuredPrefix)
+            && outputs
+                .iter()
+                .enumerate()
+                .any(|(index, output)| output.len() > self.secured_capacity(index))
+        {
+            return Err(CopyoutFault);
+        }
+        for (slot, output) in self.slots.as_ref().iter().zip(outputs.iter().copied()) {
             let Some(capacity) = slot.map(UserSlot::capacity) else {
                 continue;
             };
@@ -434,9 +550,8 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
                 faulted,
             } => {
                 if let Some(permit) = permit {
-                    let mut present: [&[u8]; N] = [&[]; N];
                     let mut count = 0;
-                    for (slot, output) in self.slots.iter().zip(outputs) {
+                    for (slot, output) in self.slots.as_ref().iter().zip(outputs.iter().copied()) {
                         if slot.is_some() {
                             if count == valid_present {
                                 break;
@@ -447,10 +562,14 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
                     }
                     permit.commit(&present[..count]);
                 }
-                if faulted { Err(CopyoutFault) } else { Ok(()) }
+                if faulted && matches!(scope, CommitScope::AllOutputs) {
+                    Err(CopyoutFault)
+                } else {
+                    Ok(())
+                }
             }
             Venue::Legacy(memory) => {
-                for (slot, output) in self.slots.iter().zip(outputs) {
+                for (slot, output) in self.slots.as_ref().iter().zip(outputs.iter().copied()) {
                     if let Some(slot) = slot
                         && !output.is_empty()
                     {

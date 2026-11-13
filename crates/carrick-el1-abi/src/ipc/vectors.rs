@@ -253,6 +253,20 @@ impl IpcRegion<'_> {
         })
     }
 
+    /// Visit a bounded logical output window using retained immutable headers.
+    pub fn visit_vector_output(
+        &self,
+        token: &IpcOpToken,
+        at: u64,
+        maximum: usize,
+        mut visit: impl FnMut(IpcUserVa, usize),
+    ) -> Result<usize, VectorInputInvariant> {
+        self.copy_vector_range(token, at, maximum, |_, address, len| {
+            visit(address, len);
+            len
+        })
+    }
+
     #[inline(never)]
     fn copy_vector_range(
         &self,

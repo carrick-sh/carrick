@@ -624,6 +624,11 @@ struct HostCopy<'m, M: carrick_guest_mem::CurrentMmMemory> {
 
 enum HostOutput<'m, M: carrick_guest_mem::CurrentMmMemory> {
     Legacy(&'m mut M),
+    VectorPrepared {
+        copyout: crate::dispatch::copyout::PreparedVectorCopyout<'m, M>,
+        outputs: Vec<Vec<u8>>,
+        slot: usize,
+    },
     Prepared {
         copyout: crate::dispatch::copyout::PreparedCopyout<'m, M, 1>,
         base: u64,
@@ -634,6 +639,7 @@ enum HostOutput<'m, M: carrick_guest_mem::CurrentMmMemory> {
 impl<M: carrick_guest_mem::CurrentMmMemory> UserCopy for HostCopy<'_, M> {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
         let writable = match &self.output {
+            HostOutput::VectorPrepared { .. } => return false,
             HostOutput::Legacy(memory) => memory.guest_range_is_writable(dst_va, src.len()),
             HostOutput::Prepared { base, capacity, .. } => dst_va
                 .checked_sub(*base)
@@ -667,6 +673,35 @@ impl<M: carrick_guest_mem::CurrentMmMemory> UserCopy for HostCopy<'_, M> {
 }
 
 impl<M: carrick_guest_mem::CurrentMmMemory> HostCopy<'_, M> {
+    fn copy_scatter_prefix(&mut self, address: u64, bytes: &[u8]) -> Option<usize> {
+        let HostOutput::VectorPrepared {
+            copyout,
+            outputs,
+            slot,
+        } = &mut self.output
+        else {
+            return None;
+        };
+        while let Some(current) = copyout.slot(*slot) {
+            let capacity = copyout.secured_capacity(*slot);
+            if capacity == 0 {
+                return Some(0);
+            }
+            let used = outputs[*slot].len();
+            if used == current.capacity() {
+                *slot += 1;
+                continue;
+            }
+            if current.guest_address().raw().checked_add(used as u64) != Some(address) {
+                return Some(0);
+            }
+            let delivered = bytes.len().min(capacity - used);
+            outputs[*slot].extend_from_slice(&bytes[..delivered]);
+            return Some(delivered);
+        }
+        Some(0)
+    }
+
     /// Imported vectors can end their readable prefix between logical page
     /// boundaries. Preserve that exact prefix rather than asking the boolean
     /// user-copy interface to accept an entire logical page.
@@ -705,6 +740,16 @@ impl<M: carrick_guest_mem::CurrentMmMemory> HostCopy<'_, M> {
 
     fn land(self) -> (bool, Option<crate::dispatch::copyout::OwnerEffect>) {
         match self.output {
+            HostOutput::VectorPrepared {
+                copyout, outputs, ..
+            } => {
+                if outputs.iter().all(Vec::is_empty) {
+                    return (true, copyout.cancel_retaining());
+                }
+                let outputs: Vec<_> = outputs.iter().map(Vec::as_slice).collect();
+                let (landed, effect) = copyout.commit_prefix_retaining(&outputs);
+                (landed.is_ok(), effect)
+            }
             HostOutput::Prepared { copyout, .. } => {
                 if self.pending.is_empty() {
                     return (true, copyout.cancel_retaining());
@@ -795,7 +840,35 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
         op.pin = pin.into_raw();
         flags.map_err(IpcError::Fd)?
     };
-    let output = if matches!(op.kind, IpcOpKind::PipeRead | IpcOpKind::EventFdRead)
+    let vectored = region.has_vectors(&token)?;
+    let owner_output = memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner;
+    let output = if vectored && op.kind == IpcOpKind::PipeRead && owner_output {
+        use crate::dispatch::copyout::{self, UserSlot};
+        let mut slots = Vec::new();
+        region
+            .visit_vector_output(
+                &token,
+                op.progress.written,
+                op.progress.remaining().min(copyout::COPYOUT_MAX_BYTES),
+                |address, len| slots.push(Some(UserSlot::new(address.0, len))),
+            )
+            .map_err(IpcError::from)?;
+        let count = slots.len();
+        let copyout = match copyout::prepare_vector(context, memory, slots) {
+            Ok(copyout) => copyout,
+            Err(refusal) => {
+                return Ok(IpcHostOutcome::OwnerMemory {
+                    token,
+                    outcome: Box::new(refusal.into_outcome()),
+                });
+            }
+        };
+        HostOutput::VectorPrepared {
+            copyout,
+            outputs: vec![Vec::new(); count],
+            slot: 0,
+        }
+    } else if matches!(op.kind, IpcOpKind::PipeRead | IpcOpKind::EventFdRead)
         && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
     {
         use crate::dispatch::copyout::{self, UserSlot};
@@ -839,10 +912,9 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
         prefetch: Vec::new(),
         pending: Vec::new(),
     };
-    let vector_input = region.has_vectors(&token)?;
     if op.kind == IpcOpKind::PipeWrite {
         let length = (op.progress.remaining() as u64).min(HOST_STEP_BYTES);
-        if vector_input {
+        if vectored {
             // Gather the imported source before acquiring the pipe lock. The
             // logical prefix is independent of descriptor reuse or mutation.
             let mut bytes = vec![0; length as usize];
@@ -862,21 +934,40 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
             user.prefetch(va, length);
         }
     }
+    let mut vector_error = None;
     let (status, published) = {
         let mut guard = region.lock(object, &HostIpcWait)?;
         let mut copy = PrefixCopy::new(&mut user);
-        let (status, wake_set) = if vector_input {
-            carrick_el1::substrate::ipc::transfer_with_input(
+        let (status, wake_set) = if vectored {
+            carrick_el1::substrate::ipc::transfer_with_io(
                 &mut guard,
                 &mut op,
                 &mut copy,
                 |copy, at, dst| copy.user.copy_prefetched_prefix(dst, at),
+                |copy, at, src| match region.copy_vector_output(
+                    &token,
+                    at,
+                    src,
+                    |address, bytes| match copy.user.copy_scatter_prefix(address.0, bytes) {
+                        Some(delivered) => delivered,
+                        None => copy.copy_out(address.0, bytes),
+                    },
+                ) {
+                    Ok(delivered) => delivered,
+                    Err(error) => {
+                        vector_error = Some(error);
+                        0
+                    }
+                },
             )?
         } else {
             transfer(&mut guard, &mut op, &mut copy)?
         };
         (status, guard.publish(wake_set))
     };
+    if let Some(error) = vector_error {
+        return Err(IpcError::from(error));
+    }
     let (landed, effect) = user.land();
     region.update_operation(&token, op)?;
     drop(effect);

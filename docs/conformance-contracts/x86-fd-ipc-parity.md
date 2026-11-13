@@ -58,3 +58,20 @@ The successful-exec CLOEXEC and exhausted-default-pool gaps are recorded in
 `followup-1.md` and `followup-2.md`. The failed-exec witness does not claim that
 x86 exec replacement is implemented. Signed ARM, Docker differential and
 artifact promotion are not established by these KVM or VM-free tests.
+
+The existing legacy host continuation also consumes retained vector metadata.
+It prepares all destination ranges in one bounded owner permit before locking
+the source, then scatters through the same range walker and pipe transaction.
+This preserves one consuming source lease across vectors, including aliases,
+without one guest syscall or one preparation per tiny vector. Fixed-record
+copyout keeps its stack arrays and existing prefix policy; stream-vector
+storage uses the same preparation and commit owner. A real destination fault
+selects a bounded secured prefix, and no bytes outside that prefix are consumed.
+The handback bindings cover retained progress, one owner refusal followed by
+success, metadata preservation, real faults, reclamation, and 1/64/1024 tiny
+vectors with exactly one valid preparation.
+The retained host consumer is
+`crates/carrick-kernel/src/kernel/continuation/ipc.rs:785` (`complete_handback`);
+its range preparation is the existing copyout owner, generalized for both
+array and vector storage at
+`crates/carrick-kernel/src/dispatch/copyout.rs:302` (`prepare_outputs`).
