@@ -571,6 +571,12 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         prepared: NativeForkPreparation<'a, Self::Mm, Self::PreparedMm, C>,
     );
     fn quarantine_born(&mut self, born: Self::Born);
+    /// Detach the executing CPU from its process translation before a member
+    /// receipt can permit another CPU to retire that process's root.
+    fn vacate_terminal_space(
+        &mut self,
+        source: BornInZoneSource<'a, C>,
+    ) -> Result<(), NativeProcessError>;
     fn retire_mm(&mut self, mm: Self::Mm);
     fn apply_fault_reply(
         &mut self,
@@ -2497,6 +2503,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 if control.native_signal_owner()
                     && control.zone_record() == Some(record)
                     && !control.forwarded_wait_mask_armed()
+                    && !control.host_exit_requested()
                 {
                     let pending = super::native_process_signals::pending_summary_word();
                     let blocked = control.blocked().0;
@@ -2532,6 +2539,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .pending_signal_deliveries
                 .contains_key(&record)
             || member.control.forwarded_wait_mask_armed()
+            || member.control.host_exit_requested()
         {
             return true;
         }
@@ -4949,7 +4957,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     /// Test pending native work before the ISA saves FP/SIMD for delivery.
     /// A suspended mask needs its restoration even if no signal is pending.
     pub fn signal_checkpoint_needed(&self) -> bool {
-        if self.control.forwarded_wait_mask_armed() {
+        if self.control.forwarded_wait_mask_armed() || self.control.host_exit_requested() {
             return true;
         }
         let graph = self.runtime.graph.lock();
@@ -6685,6 +6693,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.resume_pending_wait()
     }
 
+    /// A running member reaches the same terminal owner at its interrupted
+    /// user return as a queued member does at scheduler selection.
+    pub(crate) fn resume_terminal_user_return(&mut self) -> Option<LifecycleOutcome> {
+        (self.control.host_exit_requested() && self.pending_close_status().is_some())
+            .then(|| self.resume_pending_lifecycle())
+            .flatten()
+    }
+
     fn pending_close_status(&self) -> Option<carrick_sched_core::process::TerminationStatus> {
         self.runtime
             .graph
@@ -6794,6 +6810,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             Err(_) => return Err(NativeProcessError::Quarantined),
         };
+        self.service.vacate_terminal_space(self.source)?;
         let receipt = custody
             .retire_zone_current(
                 self.control,
@@ -6803,6 +6820,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.record.id,
             )
             .map_err(|_| NativeProcessError::Quarantined)?;
+        self.source.zone.release_space(self.source.slot);
         carrick_core::lifecycle::retire_cancelled_pool_member(
             page,
             entry,
@@ -7618,7 +7636,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // member. Use the same owned interrupt as signal arrival:
                 // cancel retained services, interrupt a plain futex park, or
                 // kick the CPU holding a running record. No signal is queued.
-                self.interrupt_member_record(record)?;
+                if record == self.record {
+                    self.runtime
+                        .cancel_service(record, self.source.slot, self.service)?;
+                } else {
+                    self.interrupt_member_record(record)?;
+                }
             }
             // Native exception owners must have their cancellation checkpoint
             // queued before the host can admit its one-shot terminal wake batch.
@@ -9028,9 +9051,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         if record != self.record || self.handoff.is_some() {
             return false;
         }
+        if let Err(error) = self.service.vacate_terminal_space(self.source) {
+            self.run_failure = Some(error.run_failure_reason());
+            return false;
+        }
         self.handoff = retirement
             .retire_current(self.binding, self.source, record.id)
             .ok();
+        if self.handoff.is_some() {
+            self.source.zone.release_space(self.source.slot);
+        }
         self.handoff.is_some()
     }
     fn binding(&self) -> ExecutionBinding {
@@ -17840,6 +17870,14 @@ mod tests {
     }
 
     impl<'a> NativeProcessService<'a, ParkedContextWords> for FaultyPhysical<'a> {
+        fn vacate_terminal_space(
+            &mut self,
+            source: BornInZoneSource<'a, ParkedContextWords>,
+        ) -> Result<(), NativeProcessError> {
+            let _ = source;
+            Ok(())
+        }
+
         type Mm = AddressContext<RootGpa>;
         type PreparedMm = AddressContext<RootGpa>;
         type Born = AddressContext<RootGpa>;

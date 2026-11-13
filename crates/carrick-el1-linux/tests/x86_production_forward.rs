@@ -357,6 +357,14 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
     }
 
     impl<'a> NativeProcessService<'a, ParkedContextWords> for StockReclaimingService<'a> {
+        fn vacate_terminal_space(
+            &mut self,
+            source: carrick_el1_abi::BornInZoneSource<'a, ParkedContextWords>,
+        ) -> Result<(), NativeProcessError> {
+            let _ = source;
+            Ok(())
+        }
+
         type Mm = AddressContext<RootGpa>;
         type PreparedMm = AddressContext<RootGpa>;
         type Born = AddressContext<RootGpa>;
@@ -1296,6 +1304,14 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     }
 
     impl<'a> NativeProcessService<'a, ParkedContextWords> for Cpl0TestService<'a> {
+        fn vacate_terminal_space(
+            &mut self,
+            source: carrick_el1_abi::BornInZoneSource<'a, ParkedContextWords>,
+        ) -> Result<(), NativeProcessError> {
+            let _ = source;
+            Ok(())
+        }
+
         type Mm = AddressContext<RootGpa>;
         type PreparedMm = AddressContext<RootGpa>;
         type Born = AddressContext<RootGpa>;
