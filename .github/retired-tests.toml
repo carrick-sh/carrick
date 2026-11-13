@@ -35,3 +35,9 @@ test = "cpl0_initial_mm::in_zone_child_pipe_write_without_ipc_execution_is_count
 reason = "#1671: an in-zone child's pipe write on x86 CPL0 is now served through the shared IPC owner instead of returning a counted ENOSYS, so the refusal witness became a witness that the write is served (9968c4138)."
 replaced_by = "cpl0_initial_mm::in_zone_child_pipe_write_uses_shared_ipc_execution"
 pr = 2153
+
+[[retired]]
+test = "carrick_el1_linux::aarch64_process_tests::arm_two_live_threads_robust_exit_routes_host_custody_without_abort"
+reason = "#2109: a registered robust list no longer sends a ring-born member to nonexistent host custody; the replacement witnesses retirement in ring while its live sibling continues."
+replaced_by = "carrick_el1_linux::aarch64_process_tests::arm_two_live_threads_robust_exit_retires_in_ring"
+pr = 2182

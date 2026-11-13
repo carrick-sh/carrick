@@ -162,6 +162,9 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::{arm_two_threads_blocking_wait4_reap_distinct_children,arm_two_threads_blocking_wait4_any_one_reaps_other_blocks_then_echild,arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release,arm_wait4_child_exits_between_two_waiters_parking_rescans_without_lost_wake,arm_msgrcv_and_sibling_wait4_do_not_block_each_other} (#2071: per-member child-wait and vfork continuations in PendingTable; concurrent blocking wait4/waitid, vfork suspension alongside a parked sibling waiter, inter-park child exit rescan, and SysV msgrcv independence)",
   "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::{arm_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation,arm_wait4_reaps_zombie_while_sibling_vfork_holds_birth_reservation} (#2095: a sibling on a second vCPU calls blocking wait4 for an exited child while the forking thread holds its birth reservation inside the stock loan crossing; the wait parks and reaps after the release, and a vfork caller stays suspended)",
   "carrick-el1-linux::native_process_runtime::host_test_support::{reap_refused_by_sibling_birth_parks_then_reaps,host_request_during_wait4_park_yields_then_reparks,host_request_during_vfork_park_yields_then_reparks} (#2095: Busy once, then success for the reap refused by a sibling birth and for a child-wait or vfork park refused by a host request)",
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_pinned_glibc_member_raw_exit_on_an_idle_executor_retires_in_ring",
+  "carrick-el1-linux::aarch64_process_tests::arm_two_live_threads_robust_exit_retires_in_ring",
+  "carrick-el1-linux::lifecycle::tests::exit_of_a_born_thread_with_a_robust_list_is_served_in_zone",
 ]
 
 [bindings.unresolved]
