@@ -305,6 +305,8 @@ impl HostFileCall {
     ///   route. `ftruncate` names a descriptor, so it follows the descriptor:
     ///   one the root's `openat` installed lives in the ring namespace and the
     ///   host task has nothing under its number (#2157 B1).
+    /// - `readlinkat` is not staged here: the root's keeps its host crossing,
+    ///   and a descendant's is the native file family's (#1862).
     pub fn admitted_for(self, origin: ServiceOrigin, delegated: impl FnOnce(i32) -> bool) -> bool {
         match self {
             Self::Chdir { .. } => origin != ServiceOrigin::Initial,
@@ -1035,6 +1037,26 @@ pub fn crossing_output_stage(
     (covered < length).then_some(HostFileStage::PrepareOutput {
         address: address.wrapping_add(covered),
     })
+}
+
+/// Decode and admit a call for `origin`'s CPL0 venue. `Err` keeps the call
+/// on its existing route, whether the venue does not know it or does not
+/// admit it for this origin: when that route is a host crossing in `set`,
+/// the answer is its [`crossing_output_stage`], so a declared output is
+/// writable before the crossing runs (a root's `readlinkat`, which the venue
+/// decodes but never admits, #2201).
+pub fn admit_or_cross(
+    set: crate::crossing::HostCrossingSet,
+    canonical: CanonicalNr,
+    args: &[u64; 6],
+    origin: ServiceOrigin,
+    delegated: impl FnOnce(i32) -> bool,
+    writable: impl FnOnce(u64, usize) -> usize,
+) -> Result<HostFileCall, Option<HostFileStage>> {
+    match HostFileCall::decode(canonical, args) {
+        Some(call) if call.admitted_for(origin, delegated) => Ok(call),
+        _ => Err(crossing_output_stage(set, canonical, args, writable)),
+    }
 }
 
 fn stage_call(

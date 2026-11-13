@@ -6,7 +6,7 @@ use carrick_el1_linux::file::MemoryValidator;
 use carrick_personality_linux::crossing::HostCrossingSet;
 use carrick_personality_linux::entry::CanonicalCall;
 use carrick_personality_linux::native_host_file::{
-    HostFileCall, HostFileStage, NativeDescriptor, NativeNamespace,
+    HostFileStage, NativeDescriptor, NativeNamespace, admit_or_cross,
 };
 
 /// Decode, admit and stage `call` against the caller's ring namespace.
@@ -25,17 +25,17 @@ where
     R: FnMut(i32) -> Option<NativeDescriptor>,
 {
     let canonical = carrick_syscall_abi::CanonicalNr::new(call.canonical.raw());
-    let Some(decoded) = HostFileCall::decode(canonical, &call.args) else {
-        return carrick_personality_linux::native_host_file::crossing_output_stage(
-            HostCrossingSet::X86,
-            canonical,
-            &call.args,
-            |address, len| validator.writable_bytes(address, len),
-        );
+    let decoded = match admit_or_cross(
+        HostCrossingSet::X86,
+        canonical,
+        &call.args,
+        origin,
+        delegated,
+        |address, len| validator.writable_bytes(address, len),
+    ) {
+        Ok(decoded) => decoded,
+        Err(existing_route) => return existing_route,
     };
-    if !decoded.admitted_for(origin, delegated) {
-        return None;
-    }
     // No published ring namespace (venue or table unavailable): keep the
     // existing route, as ARM's staging does, so an initial write keeps its
     // stdout route and a strict refusal stays the crossing table's.
@@ -394,6 +394,22 @@ mod tests {
             stage_output(&Untouched, 258, [!99u64, path, 0o755, 0, 0, 0]),
             None
         );
+    }
+
+    /// readlinkat (x86_64 267) decodes as the native file family's call,
+    /// which this venue never admits: the root's keeps its host crossing, so
+    /// its untouched output page is prepared first, then the same call
+    /// crosses (#2201 with #1862). Nothing here stages it as a host-file
+    /// request.
+    #[test]
+    fn a_root_readlinkat_prepares_its_output_then_crosses() {
+        let (path, out) = (0x7000_0000u64, 0x7000_1000u64);
+        let args = [!99u64, path, out, 64, 0, 0];
+        assert_eq!(
+            stage_output(&Untouched, 267, args),
+            Some(HostFileStage::PrepareOutput { address: out })
+        );
+        assert_eq!(stage_output(&Resident, 267, args), None);
     }
 
     #[test]
