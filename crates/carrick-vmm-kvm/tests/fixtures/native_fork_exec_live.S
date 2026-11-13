@@ -1,48 +1,47 @@
-/* Two live processes cross exec: successor signals its parent over an
- * inherited pipe, then waits for the parent's acknowledgement before exit.
- * The parent observes the successor, acknowledges it, and checks wait4. */
+/* Block both handshake signals before fork. The exec successor announces
+ * itself with SIGUSR1, waits for SIGUSR2, then exits. Only after observing
+ * the successor does the parent acknowledge it and collect wait4 status.
+ * Timed signal waits bound a broken replacement without polling. */
 .global _start
 .text
 _start:
-    lea ready(%rip), %rdi
-    xor %esi, %esi
-    mov $293, %eax
+    mov $14, %eax
+    xor %edi, %edi
+    lea blocked(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
     syscall
     test %eax, %eax
-    js failure
-    lea ack(%rip), %rdi
-    xor %esi, %esi
-    mov $293, %eax
-    syscall
-    test %eax, %eax
-    js failure
+    jnz failure
     mov $57, %eax
     syscall
     test %eax, %eax
     js failure
     jz child
     mov %eax, %r12d
-    mov ready+4(%rip), %edi
-    mov $3, %eax
+    xor %r13d, %r13d
+    lea ready(%rip), %rdi
+    xor %esi, %esi
+    lea bound(%rip), %rdx
+    mov $8, %r10d
+    mov $128, %eax
+    syscall
+    cmp $10, %eax
+    je received
+    mov %r12d, %edi
+    mov $9, %esi
+    mov $62, %eax
+    syscall
+    jmp reap
+received:
+    mov %r12d, %edi
+    mov $12, %esi
+    mov $62, %eax
     syscall
     test %eax, %eax
-    js failure
-    mov ready(%rip), %edi
-    lea byte(%rip), %rsi
-    mov $1, %edx
-    xor %eax, %eax
-    syscall
-    cmp $1, %eax
-    jne failure
-    cmpb $'X', byte(%rip)
-    jne failure
-    mov ack+4(%rip), %edi
-    lea acknowledgement(%rip), %rsi
-    mov $1, %edx
-    mov $1, %eax
-    syscall
-    cmp $1, %eax
-    jne failure
+    jnz failure
+    mov $1, %r13d
+reap:
     mov %r12d, %edi
     lea status(%rip), %rsi
     xor %edx, %edx
@@ -51,8 +50,13 @@ _start:
     syscall
     cmp %r12d, %eax
     jne failure
-    cmpl $0, status(%rip)
-    jne failure
+    mov status(%rip), %edi
+    test $127, %edi
+    jnz failure
+    shr $8, %edi
+    jnz exit
+    test %r13d, %r13d
+    jz failure
     mov $1, %edi
     lea marker(%rip), %rsi
     mov $13, %edx
@@ -63,18 +67,6 @@ _start:
     xor %edi, %edi
     jmp exit
 child:
-    mov ready+4(%rip), %edi
-    mov $9, %esi
-    mov $33, %eax
-    syscall
-    cmp $9, %eax
-    jne failure
-    mov ack(%rip), %edi
-    mov $8, %esi
-    mov $33, %eax
-    syscall
-    cmp $8, %eax
-    jne failure
     lea successor(%rip), %rdi
     lea argv(%rip), %rsi
     xor %edx, %edx
@@ -93,11 +85,10 @@ exit:
 successor: .asciz SUCCESSOR_PATH
 .balign 8
 argv: .quad successor, 0
-acknowledgement: .ascii "A"
+blocked: .quad (1 << 9) | (1 << 11)
+ready: .quad (1 << 9)
+bound: .quad 5, 0
 marker: .ascii "live-exec-ok\n"
 .section .bss
 .balign 4
-ready: .space 8
-ack: .space 8
 status: .space 4
-byte: .space 1
