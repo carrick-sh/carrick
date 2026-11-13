@@ -211,7 +211,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
             .runtime
             .registry
             .lock()
-            .is_some_and(|registry| registry.futex_signal_pending(zone, self.entry.record))
+            .is_some_and(|registry| registry.futex_interrupt_pending(zone, self.entry.record))
         {
             zone.withdraw_guest_park(&guard, record);
             return Some(returned(carrick_syscall_abi::LINUX_EINTR.guest_retval()));

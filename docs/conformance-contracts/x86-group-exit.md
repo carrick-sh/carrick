@@ -10,6 +10,9 @@ The missing progress edges were plain futex interruption and running-member
 retirement. A service cancellation alone does not wake a plain futex park.
 A running sibling does not own the closing caller's continuation, so its next
 syscall previously bypassed lifecycle resumption.
+Closing can also race a worker between futex enrollment and park publication.
+The existing bucket-held final interruption check now sees the terminal request,
+so this interval cannot lose the close wake.
 
 `NativeProcessEntry::begin_closing` now uses the same member interruption owner
 as signal arrival, without enqueueing a signal. That owner cancels a retained
