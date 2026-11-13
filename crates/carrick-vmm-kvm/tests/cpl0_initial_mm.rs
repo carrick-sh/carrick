@@ -484,7 +484,7 @@ fn native_fork_child_execs_static_successor() {
     assert!(outcome.run.stderr.is_empty());
 }
 
-/// #2235: the successor and parent exchange bytes while both are live,
+/// #2235: the successor and parent exchange blocked signals while both are live,
 /// before the parent collects the child's successful replacement status.
 #[test]
 fn native_fork_child_execs_while_parent_keeps_running() {
@@ -495,6 +495,13 @@ fn native_fork_child_execs_while_parent_keeps_running() {
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
     let elf = native_exit_fixture_with_flags("native_fork_exec_live.S", &[&define]);
     let outcome = run_exec_fixture(&elf);
+    let counters = outcome.physical.syscall_counters().expect("exec census");
+    let exec_calls = counters.served[59].load(std::sync::atomic::Ordering::Acquire)
+        + counters.refused[59].load(std::sync::atomic::Ordering::Acquire);
+    assert!(
+        exec_calls > 0,
+        "the two-live-process witness must reach execve"
+    );
     assert_eq!(outcome.run.exit_code, 0, "two-live-process exec failed");
     assert_eq!(outcome.run.stdout, b"live-exec-ok\n");
     assert!(outcome.run.stderr.is_empty());

@@ -1,23 +1,26 @@
-/* fd 9 signals that the replacement runs; fd 8 keeps the replacement alive
- * until its still-live parent acknowledges it. These are inherited pipe ends. */
+/* Signal masks survive exec. Announce replacement to the still-live parent,
+ * then require its acknowledgement before exiting. No handler or IPC binding
+ * is needed; both signal waits consume blocked signals through the owner. */
 .global _start
 .text
 _start:
-    mov $9, %edi
-    lea marker(%rip), %rsi
-    mov $1, %edx
-    mov $1, %eax
+    mov $110, %eax
     syscall
-    cmp $1, %eax
-    jne failure
-    mov $8, %edi
-    lea acknowledgement(%rip), %rsi
-    mov $1, %edx
-    xor %eax, %eax
+    test %eax, %eax
+    jle failure
+    mov %eax, %edi
+    mov $10, %esi
+    mov $62, %eax
     syscall
-    cmp $1, %eax
-    jne failure
-    cmpb $'A', acknowledgement(%rip)
+    test %eax, %eax
+    jnz failure
+    lea acknowledgement(%rip), %rdi
+    xor %esi, %esi
+    lea bound(%rip), %rdx
+    mov $8, %r10d
+    mov $128, %eax
+    syscall
+    cmp $12, %eax
     jne failure
     xor %edi, %edi
     jmp exit
@@ -28,6 +31,6 @@ exit:
     syscall
     ud2
 .section .rodata
-marker: .ascii "X"
-.section .bss
-acknowledgement: .space 1
+.balign 8
+acknowledgement: .quad (1 << 11)
+bound: .quad 5, 0
