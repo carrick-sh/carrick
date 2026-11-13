@@ -116,11 +116,19 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
             ));
         }
     }
+    // The nightly poster and the scoreboard-only publisher are the only
+    // jobs that may write issues; the job that builds and scores a branch
+    // head (`hvf-scoreboard`) never holds a write token.
+    jobs_with_issues_write.sort();
     assert_eq!(
         jobs_with_issues_write,
-        vec![("hvf-kernel".to_owned(), "write".to_owned())],
-        "`issues: write` must appear only in hvf-kernel's job permissions"
+        vec![
+            ("hvf-kernel".to_owned(), "write".to_owned()),
+            ("scoreboard-publish".to_owned(), "write".to_owned()),
+        ],
+        "`issues: write` must appear only in hvf-kernel's and scoreboard-publish's job permissions"
     );
+    assert_scoreboard_branch_jobs_isolate_the_token(jobs);
 
     let hvf = &workflow["jobs"]["hvf-kernel"];
     let hvf_perms = hvf["permissions"]
@@ -178,6 +186,18 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
             let mut strings = Vec::new();
             collect_yaml_strings(step, &mut strings);
             if strings.iter().any(|s| s.contains("scoreboard")) {
+                // The owner's branch scoreboard lives in its own three jobs,
+                // and the trusted-hardware aggregate requires their results.
+                if [
+                    "scoreboard-target",
+                    "hvf-scoreboard",
+                    "scoreboard-publish",
+                    "trusted-hardware-ok",
+                ]
+                .contains(&id)
+                {
+                    continue;
+                }
                 assert_eq!(id, "hvf-kernel", "unexpected scoreboard step in job {id}");
                 assert!(
                     [run_idx, upload_idx, post_idx].contains(&idx),
@@ -508,4 +528,38 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
         !fail_run.status.success(),
         "failing xtask must return non-zero from the tee pipeline"
     );
+}
+
+/// The branch scoreboard splits building from posting: `hvf-scoreboard`
+/// builds and scores an owner-named branch head with a read-only token,
+/// and only `scoreboard-publish`, which runs no branch code, may post.
+/// Both run only on the owner's `workflow_dispatch` on main.
+fn assert_scoreboard_branch_jobs_isolate_the_token(jobs: &yaml_rust2::yaml::Hash) {
+    let job = |id: &str| &jobs[&Yaml::from_str(id)];
+    for id in ["hvf-scoreboard", "scoreboard-publish"] {
+        let guard = squash_ws(job(id)["if"].as_str().unwrap_or(""));
+        assert!(
+            guard.contains("github.event_name == 'workflow_dispatch'")
+                && guard.contains("github.ref == 'refs/heads/main'")
+                && guard.contains("github.actor == 'tjfontaine'")
+                && guard.contains("github.triggering_actor == 'tjfontaine'"),
+            "{id}: `if` must restrict to the owner's workflow_dispatch on main: {guard}"
+        );
+        assert!(
+            !guard.contains("'push'")
+                && !guard.contains("pull_request")
+                && !guard.contains("'schedule'"),
+            "{id}: `if` must never allow push, pull_request or schedule: {guard}"
+        );
+    }
+    let scorer = job("hvf-scoreboard")["permissions"]
+        .as_hash()
+        .expect("hvf-scoreboard has explicit permissions");
+    for (scope, level) in scorer {
+        assert_ne!(
+            level.as_str(),
+            Some("write"),
+            "hvf-scoreboard runs branch code and must hold no write scope ({scope:?})"
+        );
+    }
 }
