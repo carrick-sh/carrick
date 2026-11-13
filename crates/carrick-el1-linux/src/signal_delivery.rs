@@ -59,6 +59,17 @@ where
     if !process.matches_signal_return(task, slot) {
         return None;
     }
+    if let Some(outcome) = process.resume_terminal_user_return() {
+        use carrick_personality_linux::lifecycle::LifecycleOutcome;
+        return Some(match outcome {
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            } => CompletionRoute::Suspended,
+            LifecycleOutcome::HostCustody => machine.group_exit_custody(task),
+            _ => CompletionRoute::InvalidCompletion,
+        });
+    }
     if !carrick_personality_linux::signal::signal_delivery_before_work(
         CompletionRoute::Served,
         &task.linux,

@@ -156,6 +156,14 @@ impl<C: ProcessContext> Drop for HostExecSlot<'_, C> {
     }
 }
 impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
+    fn vacate_terminal_space(
+        &mut self,
+        source: carrick_el1_abi::BornInZoneSource<'a, C>,
+    ) -> Result<(), NativeProcessError> {
+        let _ = source;
+        Ok(())
+    }
+
     type Mm = AddressContext<RootGpa>;
     type PreparedMm = AddressContext<RootGpa>;
     type Born = AddressContext<RootGpa>;

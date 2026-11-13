@@ -20,6 +20,14 @@ struct NoPhysicalCrossings {
     effects: Vec<carrick_sched_core::WakeEffects>,
 }
 impl<'a> NativeProcessService<'a, Words> for NoPhysicalCrossings {
+    fn vacate_terminal_space(
+        &mut self,
+        source: carrick_el1_abi::BornInZoneSource<'a, Words>,
+    ) -> Result<(), NativeProcessError> {
+        let _ = source;
+        Ok(())
+    }
+
     type Mm = Address;
     type PreparedMm = Address;
     type Born = Address;

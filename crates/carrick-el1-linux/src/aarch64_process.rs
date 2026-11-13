@@ -2544,6 +2544,24 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         ));
     }
 
+    fn vacate_terminal_space(
+        &mut self,
+        source: BornInZoneSource<'a, Aarch64ParkedContext>,
+    ) -> Result<(), NativeProcessError> {
+        if !core::ptr::eq(source.zone, self.zone) || source.slot != self.slot {
+            return Err(NativeProcessError::Stale);
+        }
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let idle = self.zone.spaces.idle_ttbr();
+            if idle == 0 {
+                return Err(NativeProcessError::Quarantined);
+            }
+            crate::sched::ThreadCpu::set_translation(&mut crate::sched::HardwareCpu, idle, idle);
+        }
+        Ok(())
+    }
+
     fn retire_mm(&mut self, mm: Self::Mm) {
         let binding = common_entry::execution_binding(self.task);
         let source = carrick_el1_abi::BornInZoneSource {
