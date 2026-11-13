@@ -2035,6 +2035,48 @@ fn production_brk_regrows_over_its_released_pages() {
     );
 }
 
+/// #1482 item 1: every exclusion settles owed returns. A brk shrink journals
+/// an owed return; a fresh page's first touch then crosses to the carrier for
+/// its backing, whose exclusion of the MM's editor settles that return. The
+/// regrowth over the released pages is served with no settlement doorbell.
+#[test]
+fn production_exclusion_settles_owed_returns_before_the_doorbell_is_needed() {
+    let elf = native_exit_fixture("native_brk_settle_at_exclusion.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_LOADED)
+        .expect("settle at exclusion run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_brk_settle_at_exclusion.S): {:?}",
+        outcome.run
+    );
+    let families = outcome
+        .run
+        .report
+        .execution_witness
+        .as_ref()
+        .expect("execution witness")
+        .physical_crossing_families
+        .iter()
+        .map(|row| (row.family.as_str(), row.count))
+        .collect::<Vec<_>>();
+    assert!(
+        !families
+            .iter()
+            .any(|(family, _)| *family == "return_settlement"),
+        "the backing grant's exclusion settled the shrink; no doorbell: {families:?}"
+    );
+}
+
 #[test]
 fn block_then_user_page_fault_terminates_with_sigsegv_in_ring() {
     let elf = block_then_fault_elf();
