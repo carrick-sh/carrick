@@ -3,11 +3,15 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod native_service;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod return_settlement;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use carrick_hal::native_exec::NativeExecRegistrationError;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use native_service::NativeService;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use native_service::settle_native_cow;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use return_settlement::settle_native_returns;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub type NativeExecParts = carrick_hal::native_exec::NativeExecParts<crate::trap::GuestMappingPlan>;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -268,6 +272,10 @@ fn service_terminal_operation(
             return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
         }
         pool.release_mm(exclusion.proof());
+    }
+    // Every exclusion settles COW, then owed returns (#1369 slice 3).
+    if settle_native_returns(custody, exclusion.proof()).is_err() {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     }
     drop(exclusion);
     // SAFETY: the synchronous crossing retains the caller's aligned wire record.
@@ -1925,6 +1933,21 @@ pub(crate) fn service_native_fork_stock(
         }
         None => return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]),
     };
+    // The settled loan no longer names the parent: a settlement doorbell
+    // refused `ForkLoanPending` waits for exactly this `PendingEdit` release
+    // (#1369 slice 3, L1). Published with the fork stock released.
+    if reply
+        && matches!(kind, Some(ForkStockKind::Commit | ForkStockKind::Abort))
+        && let (Some(execution), Some(zone)) = (execution, carrick_el1_abi::zone_tables())
+        && let Some(parent) = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
+    {
+        return_settlement::publish_space_release(
+            custody,
+            zone,
+            parent,
+            carrick_sched_core::spaces::notification::SpaceWaitCause::PendingEdit,
+        );
+    }
     Ok([
         if reply {
             METADATA_GRANT_SUCCESS
@@ -2450,6 +2473,17 @@ pub(crate) fn handle_metadata_grant_trap(
         } else {
             [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
         }
+    } else if op == carrick_el1_abi::GRANT_OP_RETURN_SETTLE {
+        let ttbr0 = vcpu
+            .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+            .map_err(|e| TrapError::Hypervisor(format!("read return settlement root: {e}")))?;
+        return_settlement::service_return_settlement(
+            custody,
+            generation,
+            cpu,
+            [arg1, arg2, arg3],
+            ttbr0,
+        )
     } else if op == carrick_el1_abi::GRANT_OP_COW_SUPPLY {
         let ttbr0 = vcpu
             .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
