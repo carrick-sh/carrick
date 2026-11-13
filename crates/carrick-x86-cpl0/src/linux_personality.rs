@@ -939,6 +939,10 @@ fn supply_user_fault(
                 }),
                 &mut cow,
             );
+            // The supplied COW replacement is the MM's, reserved for this
+            // exact source (#2141): the parked rerun, or any lane of the MM
+            // that breaks this COW first, claims and settles it on any CPU,
+            // and this CPU keeps no grant while the fault waits.
             if let OwnerFaultSupplyOutcome::Contended(cause) = supply.outcome()
                 && result != Action::Served
             {
@@ -982,12 +986,28 @@ fn supply_user_fault(
             let Some(index) = spaces.find(mm_key) else {
                 return UserFaultSupply::Unresolved(9);
             };
-            let Ok(mut root) =
-                roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot)
-            else {
-                return UserFaultSupply::Unresolved(9);
+            // MM contention between the supply and its application is "not
+            // now" (#2141): cross without applying, so the carrier withdraws
+            // the exact supplied submission and this CPU keeps no grant, then
+            // wait on the cause and rerun the access, which selects afresh.
+            let withdraw = |cause| {
+                cross_owner_grant(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                    fault.address,
+                );
+                UserFaultSupply::Contended(cause)
             };
-            let Ok(target) = carrick_core::mm::frames::grant_target_in(
+            let mut root =
+                match roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot) {
+                    Ok(root) => root,
+                    Err(carrick_el1::memory::reservations::Refusal::Busy) => {
+                        return withdraw(
+                            carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+                        );
+                    }
+                    Err(_) => return UserFaultSupply::Unresolved(9),
+                };
+            let target = match carrick_core::mm::frames::grant_target_in(
                 match portal.carrier() {
                     Some(carrier) => carrier,
                     None => return UserFaultSupply::Unresolved(9),
@@ -996,8 +1016,17 @@ fn supply_user_fault(
                 spaces,
                 binding.cpu_slot,
                 &mut root,
-            ) else {
-                return UserFaultSupply::Unresolved(9);
+            ) {
+                Ok(target) => target,
+                Err(carrick_core::mm::transaction::MmError::Busy) => {
+                    drop(root);
+                    return withdraw(if spaces.table().gate(index) != 0 {
+                        carrick_sched_core::spaces::notification::SpaceWaitCause::Gate
+                    } else {
+                        carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
+                    });
+                }
+                Err(_) => return UserFaultSupply::Unresolved(9),
             };
             let receipt = carrick_core::mm::frames::apply_grant::<
                 carrick_mmu_core::x86::owner_mmu::X86Mmu,

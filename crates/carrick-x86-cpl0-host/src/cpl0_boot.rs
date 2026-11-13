@@ -3044,7 +3044,12 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     anonymous_next_gpa: FrameGpa,
     /// Exec successors reserved before their arm (#1093 S4c slice c).
     exec_preparations: exec_service::X86ExecPreparations<exec_service::CarrierExecData>,
-    anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
+    anonymous_pending: [Option<anonymous_owner::PendingPrepare>; 2],
+    /// COW supplies by MM, whichever lane consumes them (#2141).
+    cow_pending: Vec<anonymous_owner::PendingCow>,
+    /// Prepare supplies withdrawn under MM contention, awaiting cancellation
+    /// under their MM's exclusion (#2141).
+    withdrawn_pending: Vec<anonymous_owner::PendingPrepare>,
     native_backing_pending:
         std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
     owner_grant_crossings: u64,
@@ -4458,6 +4463,8 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
             exec_preparations: exec_service::X86ExecPreparations::default(),
             anonymous_pending: [None, None],
+            cow_pending: Vec::new(),
+            withdrawn_pending: Vec::new(),
             native_backing_pending: std::collections::BTreeMap::new(),
             owner_grant_crossings: 0,
             root_exit_crossings: 0,

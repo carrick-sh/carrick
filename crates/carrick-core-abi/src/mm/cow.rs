@@ -93,8 +93,22 @@ pub const COW_DECLINE_REASONS: usize = 9;
 
 /// Borrowed access to the existing exact-identity COW pool. No pool state or
 /// custody is owned by this interface; the adapter retains the original owner.
+/// The exact COW source a guest write fault would replace: its faulting
+/// page and the frame its live leaf maps there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CowClaimSource {
+    pub va: u64,
+    pub old_ipa: u64,
+}
+
 pub trait CowGrantVenue {
     fn claim(&self, mm_key: u64) -> Option<CowGrant>;
+    /// Take a grant that may replace `source`: one reserved for exactly it,
+    /// or an unreserved one. A venue without reservations takes any.
+    fn claim_for(&self, mm_key: u64, source: CowClaimSource) -> Option<CowGrant> {
+        let _ = source;
+        self.claim(mm_key)
+    }
     fn abandon(&self, grant: &CowGrant) -> bool;
     fn complete(&self, completion: &CowGrantCompletion) -> bool;
     fn note_declined(&self, reason: CowDecline);
