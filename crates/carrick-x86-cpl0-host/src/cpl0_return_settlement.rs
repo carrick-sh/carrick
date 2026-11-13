@@ -54,6 +54,11 @@ pub struct ReturnSettlementCounters {
     pub editor_contended: u64,
     /// Other MMs a full owed-return table's drain settled.
     pub drained_holders: u64,
+    /// Doorbells answered with a foreign holder's wait authority: a full
+    /// table no holder could drain (#1482 P0-1).
+    pub holder_waits: u64,
+    /// Drains that found only retiring holders (no live source to wait on).
+    pub drain_retiring: u64,
 }
 
 /// One exclusion of an MM's EL1 editor that has settled the MM's owed
@@ -304,6 +309,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if reply == SettlementDoorbellReply::Editor {
             self.return_settlement_counters.editor_contended += 1;
         }
+        #[cfg(feature = "test-support")]
+        if let Some(hold) = &self.fixture_holder_hold {
+            hold.count_doorbell();
+        }
         record.answer(reply);
         // SAFETY: the record is a fully initialized array of six u64 words.
         let bytes = unsafe {
@@ -335,6 +344,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         let mut holders = Vec::new();
         table.owed_return_holders(caller, &mut |holder| holders.push(holder));
+        #[cfg(feature = "test-support")]
+        if let Some(hold) = self.fixture_holder_hold.clone() {
+            hold.claim_once(retained_cow_zone(&ram)?, &holders);
+        }
         for holder in holders {
             self.return_settlement_counters.drained_holders += 1;
             self.ring_settlement(holder)?;
@@ -437,5 +450,182 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         .publish(source.reserve(cause));
         wake.finish()
+    }
+}
+
+/// The editor owner a fixture holder claims with: no vCPU slot owner
+/// (`slot + 1`) reaches it.
+#[cfg(feature = "test-support")]
+const FIXTURE_HOLDER_EDITOR: NonZeroU64 = NonZeroU64::new(u64::MAX - 0x2250).unwrap();
+
+/// Test-support witness of a full owed-return table whose holders are all
+/// busy (#1482 P0-1): at the first drain that finds the table full, the
+/// carrier claims each holder's real editor word, as an active ring editor
+/// would, before the drain attempts it. [`OwedReturnHolderRelease`] gives
+/// the words back and publishes each holder's exact `Editor` release.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct OwedReturnHolderHold {
+    state: std::sync::Mutex<HolderHoldState>,
+    claimed: std::sync::Condvar,
+    doorbells_while_held: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+struct HolderHoldState {
+    armed: bool,
+    held: Vec<(
+        carrick_sched_core::spaces::SpaceIndex,
+        carrick_el1_abi::ReservationMm,
+    )>,
+    released: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl OwedReturnHolderHold {
+    pub(crate) fn armed() -> Arc<Self> {
+        let hold = Self::default();
+        hold.state.lock().unwrap().armed = true;
+        Arc::new(hold)
+    }
+
+    /// The drain's hook: claim every holder's editor once.
+    pub(super) fn claim_once(
+        &self,
+        zone: &X86Cpl0Zone,
+        holders: &[carrick_el1_abi::ReservationMm],
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if !std::mem::take(&mut state.armed) {
+            return;
+        }
+        for &mm in holders {
+            if let Some(index) = zone.spaces.find(mm.raw())
+                && zone
+                    .spaces
+                    .fixture_claim_editor(index, mm.raw(), FIXTURE_HOLDER_EDITOR)
+            {
+                state.held.push((index, mm));
+            }
+        }
+        self.claimed.notify_all();
+    }
+
+    /// The doorbell's hook, after its answer: count doorbells answered while
+    /// the editors are held.
+    pub(super) fn count_doorbell(&self) {
+        let state = self.state.lock().unwrap();
+        if !state.held.is_empty() && !state.released {
+            self.doorbells_while_held
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The MMs whose editors the drain claimed.
+    pub fn held(&self) -> Vec<carrick_el1_abi::ReservationMm> {
+        let state = self.state.lock().unwrap();
+        state.held.iter().map(|&(_, mm)| mm).collect()
+    }
+
+    /// Settlement doorbells rung while every holder's editor was held.
+    pub fn doorbells_while_held(&self) -> u64 {
+        self.doorbells_while_held
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wait (bounded) until a drain claimed the holders' editors.
+    pub fn wait_claimed(&self, bound: std::time::Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .claimed
+            .wait_timeout_while(state, bound, |state| state.held.is_empty())
+            .unwrap();
+        !state.held.is_empty()
+    }
+}
+
+/// The releasing side of an [`OwedReturnHolderHold`], for a host fixture
+/// thread: it reads the held holders' `Editor` queues and releases.
+#[cfg(feature = "test-support")]
+pub struct OwedReturnHolderRelease<M: CarrierMemoryIo> {
+    hold: Arc<OwedReturnHolderHold>,
+    ram: Arc<GuestRam>,
+    vm: Arc<M>,
+}
+
+#[cfg(feature = "test-support")]
+impl<M: CarrierMemoryIo> OwedReturnHolderRelease<M> {
+    pub(crate) fn new(hold: Arc<OwedReturnHolderHold>, ram: Arc<GuestRam>, vm: Arc<M>) -> Self {
+        Self { hold, ram, vm }
+    }
+
+    pub fn hold(&self) -> &Arc<OwedReturnHolderHold> {
+        &self.hold
+    }
+
+    /// Records parked on the held holders' `Editor` releases.
+    pub fn enrolled(&self) -> Result<u32, TrapError> {
+        let zone = retained_cow_zone(&self.ram)?;
+        let state = self.hold.state.lock().unwrap();
+        Ok(state
+            .held
+            .iter()
+            .filter_map(|&(_, mm)| {
+                let source = zone
+                    .space_entry(NonZeroU64::new(mm.raw())?)?
+                    .live_notifications()
+                    .ok()?;
+                zone.object_queue_census(source.key(SpaceWaitCause::Editor).index())
+            })
+            .map(|census| census.waiters)
+            .sum())
+    }
+
+    /// Give every held editor word back, then publish each holder's exact
+    /// `Editor` release through the carrier's host wake (unlock before the
+    /// revision advances, as a ring editor's release does). Returns how
+    /// many were released.
+    pub fn release(&self) -> Result<usize, TrapError> {
+        let zone = retained_cow_zone(&self.ram)?;
+        let held = {
+            let mut state = self.hold.state.lock().unwrap();
+            state.released = true;
+            state.held.clone()
+        };
+        for &(index, mm) in &held {
+            if !zone
+                .spaces
+                .fixture_release_editor(index, FIXTURE_HOLDER_EDITOR)
+            {
+                return Err(fail(format!(
+                    "fixture editor of MM {} was not held",
+                    mm.raw()
+                )));
+            }
+            let Some(source) = NonZeroU64::new(mm.raw())
+                .and_then(|mm| zone.space_entry(mm))
+                .and_then(|entry| entry.live_notifications().ok())
+            else {
+                continue;
+            };
+            let wake = HostCowWake::new(&self.ram, Arc::clone(&self.vm))?;
+            let delivery = |zone: &X86Cpl0Zone,
+                            waker: Waker,
+                            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_sched_core::ParkedContextWords,
+            >| wake.deliver(zone, waker, owned);
+            SpaceReleaseVenue {
+                zone,
+                waker: Waker::Host,
+                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                    &delivery,
+                ),
+            }
+            .publish(source.reserve(SpaceWaitCause::Editor));
+            wake.finish()?;
+        }
+        Ok(held.len())
     }
 }
