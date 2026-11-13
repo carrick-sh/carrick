@@ -1151,13 +1151,19 @@ fn x86_exec_routes_to_the_native_service_not_unported() {
     }
 }
 
-// The claim gate is neutral: only a fork child's exec is the native owner's.
+// The shared claim gate selects the root venue without changing child ownership.
 #[test]
-fn x86_exec_claim_is_a_fork_child_only() {
+fn exec_claim_follows_the_root_venue() {
     use carrick_el1_linux::native_process_runtime::NativeThreadGroupOwner as Owner;
-    assert!(dispatch::native_exec_claimed(|| Owner::ForkChild));
-    assert!(!dispatch::native_exec_claimed(|| Owner::Root));
-    assert!(!dispatch::native_exec_claimed(|| Owner::Unowned));
+    use dispatch::RootExecRoute;
+    for route in [RootExecRoute::Host, RootExecRoute::Ring] {
+        assert!(dispatch::native_exec_claimed(|| Owner::ForkChild, route));
+        assert!(!dispatch::native_exec_claimed(|| Owner::Unowned, route));
+        assert_eq!(
+            dispatch::native_exec_claimed(|| Owner::Root, route),
+            route == RootExecRoute::Ring,
+        );
+    }
 }
 
 // A claimed x86 child's execve/execveat is staged through the neutral body

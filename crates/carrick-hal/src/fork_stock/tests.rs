@@ -312,7 +312,11 @@ fn a_built_root_exec_successor_commits_its_linked_tables() {
     let reserved = stock.reserve_successor_tables(4).unwrap();
     let pages = reserved.pages().to_vec();
     let used = stock.take_built_successor_tables(reserved, 2).unwrap();
-    assert_eq!(stock.table_stock().len(), before - 2, "the unused two return");
+    assert_eq!(
+        stock.table_stock().len(),
+        before - 2,
+        "the unused two return"
+    );
 
     let predecessor_mm = mm(PARENT_MM);
     let predecessor = execution(1, 0, PARENT_MM, 0x80_0000);

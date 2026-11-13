@@ -11630,8 +11630,14 @@ fn x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root() {
             Owner::Root
         }
     };
-    assert!(native_exec_claimed(|| owner(child)));
-    assert!(!native_exec_claimed(|| owner(root)));
+    assert!(native_exec_claimed(
+        || owner(child),
+        crate::dispatch::RootExecRoute::Host
+    ));
+    assert!(!native_exec_claimed(
+        || owner(root),
+        crate::dispatch::RootExecRoute::Host
+    ));
 
     for (native, canonical) in [(59, 221), (322, 281)] {
         // The x86 route table hands this exec to the native service; without

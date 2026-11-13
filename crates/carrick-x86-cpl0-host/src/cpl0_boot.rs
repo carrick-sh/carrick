@@ -1826,7 +1826,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         }
         drop(custody);
         if let Some(pending) = pending_exec {
-            let loaded = exec(pending.ticket.request().identity.birth.origin, &pending.payload);
+            let loaded = exec(
+                pending.ticket.request().identity.birth.origin,
+                &pending.payload,
+            );
             let mut custody = self
                 ._custody
                 .lock()
@@ -2230,7 +2233,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         }
         drop(custody);
         if let Some(pending) = pending_exec {
-            let loaded = exec(pending.ticket.request().identity.birth.origin, &pending.payload);
+            let loaded = exec(
+                pending.ticket.request().identity.birth.origin,
+                &pending.payload,
+            );
             let mut custody = self
                 ._custody
                 .lock()

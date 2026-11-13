@@ -257,7 +257,8 @@ fn prepare_root_x86_exec(
         .collect();
     let files = dispatcher.capture_exec_files(&context)?;
     let loader = ExecLoaderCapabilities::capture(dispatcher);
-    let (image, source) = load_x86_exec_image_with_source(&loader, &files, &path, argv, env.clone())?;
+    let (image, source) =
+        load_x86_exec_image_with_source(&loader, &files, &path, argv, env.clone())?;
     Ok(image.with_root_identity(
         carrick_x86_cpl0_host::cpl0_boot::exec_service::X86RootExecIdentity::new(
             X86RootExecIdentity {
