@@ -149,6 +149,12 @@ pub mod x86_user_tables;
 #[path = "isa/x86/initial_mm.rs"]
 pub mod x86_initial_mm;
 
+// The x86 exec successor's staged build: one wire layout for the host's
+// encoder, the CPL0 adopter's build and the host's result check.
+#[cfg(any(target_arch = "x86_64", test))]
+#[path = "isa/x86/exec_build.rs"]
+pub mod x86_exec_build;
+
 /// Architectural user stack pointer for AArch64.
 ///
 /// When an EL0 guest takes a synchronous exception (SVC) into EL1, ARM hardware
