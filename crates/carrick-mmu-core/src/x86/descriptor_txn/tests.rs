@@ -1404,3 +1404,73 @@ fn hardware_walk_enforces_cr0_wp_cr4_smep_cr4_smap_and_nxe() {
     cfg.cr4_smap = false;
     assert!(hw(Access::Read, &cfg).is_ok());
 }
+
+/// #1482: an owed return's settlement observes exactly the retired private
+/// terminals of its range (holes skipped), refuses without visiting anything
+/// when a live terminal sits inside, and clears only from the observed words.
+#[test]
+fn owed_return_settlement_clears_only_its_retired_terminals() {
+    use carrick_guest_arch::{EditIntent, EditOperation, EditOwner, GuestLen, UserRange};
+    let words = Words::new();
+    let rw = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    let span = PageSpan::new(0x4000, 3 * PAGE);
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, rw),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    // Retire the first two pages; the third stays a live prepared leaf.
+    // SAFETY: the fixture holds the sole editor for this synthetic root.
+    let owner = unsafe { EditOwner::issue(root(0x1000), NonZeroU64::MIN, NonZeroU64::MIN) };
+    let range = UserRange::checked(UserVa::new(0x4000), GuestLen::new(2 * PAGE)).unwrap();
+    let intent = EditIntent::checked(owner, range, EditOperation::Unmap, &[]).unwrap();
+    let retirement = DescriptorTxn::from_intent(&intent).unwrap();
+    assert!(matches!(
+        execute_descriptor_txn(&words, &retirement, root(0x1000), &mut InlineJournal::new())
+            .outcome,
+        DescriptorOutcome::Applied { .. }
+    ));
+    let mut seen = Vec::new();
+    assert_eq!(
+        owed_retired_terminals(&words, root(0x1000), 0x4000, 3 * PAGE, &mut |t| seen
+            .push(t)),
+        Err(DescriptorRefusal::Occupied),
+        "a live terminal in an owed range is a broken invariant"
+    );
+    assert!(seen.is_empty(), "a refusal visits nothing");
+    // A hole beyond the mapping is skipped; the owed range may cover it.
+    assert_eq!(
+        owed_retired_terminals(&words, root(0x1000), 0x2000, 4 * PAGE, &mut |t| seen
+            .push(t)),
+        Ok(())
+    );
+    assert_eq!(
+        seen.iter()
+            .map(|t| (t.va, t.entry & ADDRESS))
+            .collect::<Vec<_>>(),
+        vec![(0x4000, 0x800000), (0x5000, 0x801000)]
+    );
+    assert_eq!(clear_retired_terminals(&words, &seen), Ok(()));
+    for va in [0x4000, 0x5000] {
+        assert_eq!(
+            read_terminal_descriptor(&words, root(0x1000), UserVa::new(va))
+                .unwrap()
+                .0,
+            0
+        );
+    }
+    let (live, _) = read_terminal_descriptor(&words, root(0x1000), UserVa::new(0x6000)).unwrap();
+    assert_eq!(live & ADDRESS, 0x802000, "the live neighbour is untouched");
+    assert_eq!(
+        clear_retired_terminals(&words, &seen),
+        Err(DescriptorRefusal::Occupied),
+        "only the exact observed word clears"
+    );
+}
