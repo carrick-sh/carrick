@@ -3493,8 +3493,16 @@ impl Counters {
         slot: u64,
         binding: Option<ExecutionBinding>,
     ) {
-        let wait = matches!(arguments[1] & 0x7f, 0 | 9);
-        if result == 0 || matches!(result, -4 | -11 | -110) || (result > 0 && !wait) {
+        let wait = matches!(
+            arguments[1] & carrick_syscall_abi::LINUX_FUTEX_CMD_MASK,
+            carrick_syscall_abi::LINUX_FUTEX_WAIT | carrick_syscall_abi::LINUX_FUTEX_WAIT_BITSET
+        );
+        if result == 0
+            || result == carrick_syscall_abi::LINUX_EINTR.guest_retval()
+            || result == carrick_syscall_abi::LINUX_EAGAIN.guest_retval()
+            || result == carrick_syscall_abi::LINUX_ETIMEDOUT.guest_retval()
+            || (result > 0 && !wait)
+        {
             return;
         }
         self.publish_syscall_frame([
