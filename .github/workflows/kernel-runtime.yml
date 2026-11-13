@@ -18,20 +18,20 @@ on:
     - cron: '0 9 * * *'
   workflow_dispatch:
     # Scoreboard-only mode (#2251): an owner dispatch ON MAIN that names a
-    # same-repository branch builds that branch's exact head, signed, on the
-    # HVF runner and scores it with the goal scoreboard. Everything else is
-    # skipped: no fixtures, receipts, receipt gates, KVM/EL1-native lanes or
-    # #231 post. The workflow file and its guards always come from main, so
-    # the runner group pin (`kernel-runtime.yml@refs/heads/main`) and the
-    # job-start `admit-job` hook admit it unchanged; never dispatch with
-    # `--ref <branch>` (that is refused before any step runs).
+    # same-repository branch and its exact head SHA builds that commit,
+    # signed, on the HVF runner and scores it with the goal scoreboard.
+    # Every other lane, receipt, fixture, baseline and the #231 post is
+    # skipped. The workflow file and its guards always come from main, so the
+    # runner group pin (`kernel-runtime.yml@refs/heads/main`) and the
+    # job-start `admit-job` hook admit it unchanged. A `--ref <branch>`
+    # dispatch is still refused before any step runs.
     inputs:
       scoreboard_branch:
         description: "Scoreboard only: same-repository branch to build and score (empty = full main dispatch)"
         type: string
         default: ''
       scoreboard_sha:
-        description: "Scoreboard only, optional: the exact 40-hex head SHA the branch must still point at"
+        description: "Scoreboard only (required with a branch): the exact 40-hex head SHA you reviewed"
         type: string
         default: ''
 
@@ -48,15 +48,14 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Scoreboard-only mode: resolve the named branch to its exact head SHA on a
-  # hosted runner, before anything reaches the Mac. Only an owner dispatch on
-  # main gets here. The branch must exist as `refs/heads/<name>` in this
-  # repository (a fork's commits live only under `refs/pull/*`, which this
-  # never reads), so only someone with push access to carrick-sh/carrick can
-  # have created it. The SHA output is what hvf-kernel checks out; a later
-  # push to the branch cannot change what this run builds.
+  # Scoreboard-only mode, step 1 (hosted): pin the target. Only an owner
+  # dispatch on main gets here. The branch must exist as `refs/heads/<name>`
+  # in this repository (fork commits live only under `refs/pull/*`, which this
+  # never reads), so only someone with push access can have created it, and
+  # its head must equal the SHA the owner named. Nothing later reads the
+  # branch again: the Mac builds exactly this SHA.
   scoreboard-target:
-    name: HVF · resolve owner scoreboard branch
+    name: HVF · pin owner scoreboard branch
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && inputs.scoreboard_branch != '' &&
           github.repository == 'carrick-sh/carrick' && github.ref == 'refs/heads/main' &&
@@ -69,7 +68,7 @@ jobs:
       branch: ${{ steps.resolve.outputs.branch }}
       sha: ${{ steps.resolve.outputs.sha }}
     steps:
-      - name: Resolve the same-repository branch head
+      - name: Resolve and pin the same-repository branch head
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -87,9 +86,7 @@ jobs:
             main) refuse "main is scored by the nightly and full dispatch, not scoreboard-only mode" ;;
             *..* | *//* | */ | *.lock | */.* | *.) refuse "malformed branch name" ;;
           esac
-          if [ -n "$EXPECTED_SHA" ] && [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            refuse "scoreboard_sha must be a full lowercase 40-hex SHA"
-          fi
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || refuse "scoreboard_sha is required: the full lowercase 40-hex head SHA you reviewed"
           # The singular git/ref endpoint matches exactly one ref, never a prefix.
           ref_json="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH")" || refuse "no branch refs/heads/$BRANCH in $GITHUB_REPOSITORY"
           ref="$(jq -r '.ref' <<<"$ref_json")"
@@ -97,15 +94,12 @@ jobs:
           sha="$(jq -r '.object.sha' <<<"$ref_json")"
           [ "$ref" = "refs/heads/$BRANCH" ] || refuse "API returned $ref, not refs/heads/$BRANCH"
           [ "$type" = commit ] || refuse "refs/heads/$BRANCH points at a $type, not a commit"
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || refuse "malformed head SHA"
-          if [ -n "$EXPECTED_SHA" ] && [ "$sha" != "$EXPECTED_SHA" ]; then
-            refuse "refs/heads/$BRANCH is at $sha, not the requested $EXPECTED_SHA"
-          fi
+          [ "$sha" = "$EXPECTED_SHA" ] || refuse "refs/heads/$BRANCH is at $sha, not the requested $EXPECTED_SHA"
           printf 'branch=%s\nsha=%s\n' "$BRANCH" "$sha" >> "$GITHUB_OUTPUT"
           {
             printf '## Scoreboard-only target\n\n'
             printf -- '- Branch: `%s` (carrick-sh/carrick)\n' "$BRANCH"
-            printf -- '- Head SHA: `%s`\n' "$sha"
+            printf -- '- Pinned head SHA: `%s`\n' "$sha"
             printf -- '- Workflow and guards from main at `%s`\n' "$GITHUB_SHA"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -195,25 +189,13 @@ jobs:
   # Job-level concurrency (`cancel-in-progress: false`, keyed by
   # `github.event_name`) keeps a running job intact and lets a dispatch queue
   # beside, not displace, a scheduled run.
-  #
-  # Scoreboard-only mode (owner dispatch on main with `scoreboard_branch`):
-  # the job checks out `scoreboard-target`'s exact SHA instead of main, signs a
-  # build of it and runs only the goal scoreboard. It skips every step that
-  # reads fixtures or produces an artifact a gate trusts by name or by run
-  # (`receipt-hvf-*`, `signed-fixtures-*`): this run's `head_sha` is main's
-  # tip, so such an artifact would be read as main's. It never saves the Rust
-  # cache (the run's cache scope is main) and never posts to #231; the
-  # scoreboard goes to the job summary, a `scoreboard-branch-<sha>-*`
-  # artifact and the branch's open same-repository PR.
   hvf-kernel:
     name: HVF · signed embed + cached probes
     if: >-
-      ${{ !cancelled() &&
-          ((github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.signed-fixtures.result == 'success') ||
-           (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' &&
-            ((inputs.scoreboard_branch == '' && needs.signed-fixtures.result == 'success') ||
-             (inputs.scoreboard_branch != '' && needs.scoreboard-target.result == 'success' && needs.scoreboard-target.outputs.sha != '')))) }}
-    needs: [signed-fixtures, scoreboard-target]
+      ${{ !cancelled() && needs.signed-fixtures.result == 'success' &&
+          ((github.event_name == 'schedule' && github.ref == 'refs/heads/main') ||
+           (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) }}
+    needs: [signed-fixtures]
     runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
     concurrency:
       group: hvf-kernel-${{ github.event_name }}
@@ -267,26 +249,7 @@ jobs:
           echo "disk admission passed: ${avail_gib} GiB free on $RUNNER_WORKSPACE (floor ${HVF_DISK_FLOOR_GIB} GiB)"
           DISK_ADMISSION
 
-      # An empty `ref` and `persist-credentials: true` are checkout's own
-      # defaults, so main runs check out exactly as before. A scoreboard-only
-      # run checks out the resolved branch SHA without leaving the job token
-      # in .git/config for the branch's build scripts.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.scoreboard-target.outputs.sha }}
-          persist-credentials: ${{ needs.scoreboard-target.outputs.sha == '' }}
-
-      - name: Verify the scoreboard-only checkout is the resolved SHA
-        if: ${{ needs.scoreboard-target.outputs.sha != '' }}
-        env:
-          SCORE_SHA: ${{ needs.scoreboard-target.outputs.sha }}
-        run: |
-          set -euo pipefail
-          head="$(git rev-parse HEAD)"
-          if [ "$head" != "$SCORE_SHA" ]; then
-            echo "::error title=Scoreboard checkout mismatch::HEAD is $head, expected $SCORE_SHA"
-            exit 1
-          fi
 
       - name: Verify Apple Silicon host
         run: |
@@ -328,15 +291,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: hvf-arm64-release
-          # A scoreboard-only run's cache scope is main: never save a branch
-          # build into it.
-          save-if: ${{ needs.scoreboard-target.outputs.sha == '' }}
 
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Download exact-SHA fixture bundle
         id: relay
-        if: ${{ needs.scoreboard-target.outputs.sha == '' }}
         continue-on-error: true
         env:
           BUNDLE_NAME: ${{ needs.signed-fixtures.outputs.bundle-name }}
@@ -345,14 +304,13 @@ jobs:
         run: scripts/ci/download-fixture-bundle.sh relay
 
       - name: Fall back to the GitHub fixture artifact
-        if: ${{ needs.scoreboard-target.outputs.sha == '' && steps.relay.outcome != 'success' }}
+        if: ${{ steps.relay.outcome != 'success' }}
         uses: actions/download-artifact@v4
         with:
           name: signed-fixtures-${{ github.sha }}
           path: target/fixtures/incoming
 
       - name: Verify fixture archive transport digest
-        if: ${{ needs.scoreboard-target.outputs.sha == '' }}
         env:
           BUNDLE_NAME: ${{ needs.signed-fixtures.outputs.bundle-name }}
           BUNDLE_SHA256: ${{ needs.signed-fixtures.outputs.bundle-sha256 }}
@@ -390,7 +348,7 @@ jobs:
       # a failed 60 GiB or 35 GiB disk check stops before the ~28 GiB build.
       - name: Signed acceptance receipt
         id: signed-receipt
-        if: ${{ !cancelled() && steps.signed-disk.outcome == 'success' && needs.scoreboard-target.outputs.sha == '' }}
+        if: ${{ !cancelled() && steps.signed-disk.outcome == 'success' }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -414,7 +372,7 @@ jobs:
       # base receipt, so a queued entry can never hold the runner its base
       # entry needs. The hosted `*-gate` jobs compare.
       - name: Upload per-SHA receipt
-        if: ${{ !cancelled() && needs.scoreboard-target.outputs.sha == '' && steps.signed-receipt.outcome == 'success' && hashFiles('target/ci-receipts/receipt.json') != '' }}
+        if: ${{ !cancelled() && steps.signed-receipt.outcome == 'success' && hashFiles('target/ci-receipts/receipt.json') != '' }}
         uses: actions/upload-artifact@v4
         with:
           # The attempt keeps a re-run from colliding with an earlier upload;
@@ -426,7 +384,6 @@ jobs:
       # After publishing the receipt, run the full signed coverage, reusing
       # target/release (including .dSYM bundles) from signed acceptance.
       - name: Signed embedded guest tests
-        if: ${{ needs.scoreboard-target.outputs.sha == '' }}
         run: |
           shopt -s nullglob
           bundles=(target/fixtures/incoming/*.tar.gz)
@@ -454,29 +411,9 @@ jobs:
             RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes
           ' signed-fixtures "${bundles[0]}"
 
-      # Scoreboard-only mode signs a build of the branch head here (the
-      # steps above that build on main are skipped), with the same identity
-      # checks as the embed step.
-      - name: Signed build (scoreboard-only branch head)
-        id: branch-build
-        if: ${{ !cancelled() && needs.scoreboard-target.outputs.sha != '' }}
-        run: |
-          set -euo pipefail
-          just build
-          mkdir -p target/scoreboard-identity
-          codesign -d --entitlements - target/release/carrick \
-            > target/scoreboard-identity/entitlements.txt 2>&1
-          grep -q com.apple.security.hypervisor target/scoreboard-identity/entitlements.txt
-          otool -l target/release/carrick > target/scoreboard-identity/load-commands.txt
-          grep -q __dof_carrick target/scoreboard-identity/load-commands.txt
-
-      # In scoreboard-only mode the scoreboard is the run's product, so its
-      # failure fails the job; on main it stays advisory as before.
       - name: Goal scoreboard (nightly)
-        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' && (needs.scoreboard-target.outputs.sha == '' || steps.branch-build.outcome == 'success') }}
-        continue-on-error: ${{ needs.scoreboard-target.outputs.sha == '' }}
-        env:
-          SCORE_SHA: ${{ needs.scoreboard-target.outputs.sha || github.sha }}
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
         run: |
           set -euo pipefail
           test -n "${CARRICK_XTASK_BIN:-}"
@@ -486,14 +423,14 @@ jobs:
           mkdir -p target/scoreboard
           export CARRICK_RUN_ID="scoreboard-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           just lease gate "$CARRICK_XTASK_BIN" scoreboard --carrick target/release/carrick \
-            --sha "$SCORE_SHA" \
+            --sha "$GITHUB_SHA" \
             --out target/scoreboard/receipt.json \
             | tee target/scoreboard/table.txt
           test -s target/scoreboard/receipt.json
           test -s target/scoreboard/table.txt
 
       - name: Upload scoreboard receipt
-        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' && needs.scoreboard-target.outputs.sha == '' }}
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -502,7 +439,7 @@ jobs:
           if-no-files-found: warn
 
       - name: "Post scoreboard to #231"
-        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' && needs.scoreboard-target.outputs.sha == '' }}
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -538,84 +475,8 @@ jobs:
           } > target/scoreboard/comment.md
           gh issue comment 231 --repo "$GITHUB_REPOSITORY" --body-file target/scoreboard/comment.md
 
-      # Scoreboard-only publication. The artifact name carries the scored
-      # branch SHA and a `branch` tag so nothing keyed on main SHAs (receipt
-      # gates, fixture lookup, the nightly scoreboard) can mistake it for main.
-      - name: Record scoreboard-only provenance
-        id: branch-provenance
-        if: ${{ !cancelled() && needs.scoreboard-target.outputs.sha != '' }}
-        env:
-          SCORE_BRANCH: ${{ needs.scoreboard-target.outputs.branch }}
-          SCORE_SHA: ${{ needs.scoreboard-target.outputs.sha }}
-        run: |
-          set -euo pipefail
-          mkdir -p target/scoreboard
-          python3 - <<'PYTHON'
-          import json, os
-          e = os.environ
-          with open("target/scoreboard/provenance.json", "w", encoding="utf-8") as f:
-              json.dump({
-                  "mode": "scoreboard-only",
-                  "repository": e["GITHUB_REPOSITORY"],
-                  "branch": e["SCORE_BRANCH"],
-                  "sha": e["SCORE_SHA"],
-                  "workflow_sha": e["GITHUB_SHA"],
-                  "run_id": e["GITHUB_RUN_ID"],
-                  "run_attempt": e["GITHUB_RUN_ATTEMPT"],
-                  "triggering_actor": e["GITHUB_TRIGGERING_ACTOR"],
-              }, f, indent=2)
-          PYTHON
-          if [ -d target/scoreboard-identity ]; then
-            cp target/scoreboard-identity/* target/scoreboard/
-          fi
-          if [ -f target/release/carrick ]; then
-            shasum -a 256 target/release/carrick > target/scoreboard/carrick.sha256
-          fi
-          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          {
-            printf '### Goal scoreboard (branch `%s`)\n\n' "$SCORE_BRANCH"
-            printf 'Scored commit: %s on branch `%s` ([workflow run](%s)). ' "$SCORE_SHA" "$SCORE_BRANCH" "$run_url"
-            printf 'Workflow from main at %s. Scoreboard-only owner dispatch: no receipts, receipt gates or baselines; the table'"'"'s `main` label names the scored commit.\n\n' "$GITHUB_SHA"
-            if [ -s target/scoreboard/table.txt ]; then
-              printf '```text\n'
-              cat target/scoreboard/table.txt
-              printf '```\n'
-            else
-              printf 'No scoreboard table was produced; see the workflow run.\n'
-            fi
-          } > target/scoreboard/comment.md
-          cat target/scoreboard/comment.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload scoreboard-only artifact
-        if: ${{ !cancelled() && needs.scoreboard-target.outputs.sha != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: scoreboard-branch-${{ needs.scoreboard-target.outputs.sha }}-${{ github.run_attempt }}
-          path: target/scoreboard/
-          if-no-files-found: error
-
-      # Only an open PR whose head is this same-repository branch, at any
-      # SHA (the comment names the scored one). Advisory: a failed post never
-      # changes the verdict.
-      - name: Post scoreboard to the branch's open PR
-        if: ${{ !cancelled() && needs.scoreboard-target.outputs.sha != '' && steps.branch-provenance.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SCORE_BRANCH: ${{ needs.scoreboard-target.outputs.branch }}
-        run: |
-          set -euo pipefail
-          pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SCORE_BRANCH" --state open \
-            --json number,isCrossRepository,headRefName \
-            --jq "[.[] | select(.isCrossRepository == false and .headRefName == env.SCORE_BRANCH)] | if length == 1 then .[0].number else empty end")"
-          if [ -z "$pr" ]; then
-            echo "no single open same-repository PR for $SCORE_BRANCH; summary and artifact only"
-            exit 0
-          fi
-          gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body-file target/scoreboard/comment.md
-
       - name: Upload signed failure evidence
-        if: ${{ needs.scoreboard-target.outputs.sha == '' && (failure() || steps.signed-receipt.outputs.failed == 'true') }}
+        if: ${{ failure() || steps.signed-receipt.outputs.failed == 'true' }}
         # Evidence upload must never change the job verdict: a transient
         # upload error would otherwise fail a job whose tests passed.
         continue-on-error: true
@@ -627,6 +488,271 @@ jobs:
             target/embed-post-mortem/**
             target/embed-logs/**
           if-no-files-found: warn
+
+  # Scoreboard-only mode, step 2 (cloudmac, `carrick-hvf`): build the pinned
+  # branch SHA, signed, and score it. This job runs unlanded (owner-pinned)
+  # code, so it is built so that code can reach nothing worth taking:
+  # - no token and no Node action after branch code starts: both trees are
+  #   fetched with anonymous git (the repository is public), there is no
+  #   actions/checkout (whose post step would run last, with the token), no
+  #   rust-cache and no artifact upload; results leave only as job outputs,
+  #   published by the hosted `scoreboard-publish` job, which runs no
+  #   repository code;
+  # - `permissions: contents: read`, and no relay, fixture or cache step;
+  # - composite actions and the scoreboard instrument (`carrick-xtask
+  #   scoreboard`) come from main's tree, built before branch code runs;
+  # - the branch builds under RUNNER_TEMP (cleared by the root-owned
+  #   job-completed hook) with a private CARGO_HOME and sccache off, so its
+  #   build never writes the runner's shared Cargo home, sccache or
+  #   persistent workspace target.
+  # Residual: the code still runs as the `carrick-hvf` user. Root-owned
+  # runner files, hooks and policy are out of its reach; files that user owns
+  # are not. The exact-SHA pin is the control: dispatch only a commit you
+  # would push to main.
+  hvf-scoreboard:
+    name: HVF · scoreboard-only branch head
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' && inputs.scoreboard_branch != '' &&
+          github.repository == 'carrick-sh/carrick' && github.ref == 'refs/heads/main' &&
+          github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' &&
+          needs.scoreboard-target.result == 'success' && needs.scoreboard-target.outputs.sha != '' }}
+    needs: [scoreboard-target]
+    runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
+    concurrency:
+      group: hvf-kernel-${{ github.event_name }}
+      cancel-in-progress: false
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      receipt: ${{ steps.score.outputs.receipt }}
+      table: ${{ steps.score.outputs.table }}
+      binary-sha256: ${{ steps.build.outputs.binary-sha256 }}
+      identity: ${{ steps.build.outputs.identity }}
+    env:
+      SCORE_SHA: ${{ needs.scoreboard-target.outputs.sha }}
+    steps:
+      - name: Verify installed host-lease supervisor
+        run: |
+          set -euo pipefail
+          xtask=/usr/local/bin/carrick-xtask
+          if [ ! -x "$xtask" ] || [ -L "$xtask" ] || [ "$(/usr/bin/stat -f %u "$xtask")" != 0 ]; then
+            echo "::error title=host-lease supervisor missing::$xtask is not an installed root-owned binary; install it per docs/ci/mac-hvf-runner.md, setup step 3 (Root-owned carrick-xtask)"
+            exit 1
+          fi
+          "$xtask" host-lease --help >/dev/null
+
+      - name: Disk admission
+        env:
+          HVF_DISK_FLOOR_GIB: "60"
+        run: |
+          /usr/local/bin/carrick-xtask host-lease --mode gate -- bash -s <<'DISK_ADMISSION'
+          set -euo pipefail
+          test -n "${RUNNER_TEMP:-}" && test -d "$RUNNER_TEMP"
+          avail_kib="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
+          case "$avail_kib" in
+            '' | *[!0-9]*) echo "::error title=HVF disk admission failed::unable to parse df -Pk for $RUNNER_TEMP"; exit 1 ;;
+          esac
+          if [ "$avail_kib" -lt "$(( HVF_DISK_FLOOR_GIB * 1048576 ))" ]; then
+            echo "::error title=HVF disk admission failed::only $(( avail_kib / 1048576 )) GiB free on $RUNNER_TEMP, below ${HVF_DISK_FLOOR_GIB} GiB"
+            exit 1
+          fi
+          DISK_ADMISSION
+
+      - name: Verify Apple Silicon host
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          command -v codesign
+          command -v otool
+
+      # Anonymous fetches: no credential helper, no global or system git
+      # config, no prompt. Each tree must land on exactly its SHA.
+      - name: Fetch main's tree and the pinned branch tree (no credentials)
+        run: |
+          set -euo pipefail
+          sb="$RUNNER_TEMP/scoreboard"
+          main_tree="$GITHUB_WORKSPACE/.scoreboard-main"
+          rm -rf "$sb" "$main_tree"
+          mkdir -p "$sb/cargo-home" "$sb/sccache" "$sb/out"
+          fetch() { # <dir> <sha>
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 bash -c '
+              set -euo pipefail
+              git init -q "$1"
+              git -C "$1" -c credential.helper= fetch -q --depth=1 --no-tags https://github.com/carrick-sh/carrick.git "$2"
+              git -C "$1" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+              test "$(git -C "$1" rev-parse HEAD)" = "$2"
+            ' fetch "$1" "$2"
+          }
+          fetch "$main_tree" "$GITHUB_SHA"
+          fetch "$sb/branch" "$SCORE_SHA"
+          {
+            echo "SB=$sb"
+            echo "SB_MAIN=$main_tree"
+            echo "CARGO_HOME=$sb/cargo-home"
+            echo "SCCACHE_DIR=$sb/sccache"
+            echo "SCCACHE_SERVER_UDS=$sb/sccache/server.sock"
+            echo "CARRICK_SCCACHE=0"
+            echo "RUSTC_WRAPPER="
+            echo "CARGO_BUILD_RUSTC_WRAPPER="
+            echo "RUSTUP_AUTO_INSTALL=0"
+          } >> "$GITHUB_ENV"
+
+      # From main's tree, before any branch code runs.
+      - name: Install just (main's composite action)
+        uses: ./.scoreboard-main/.github/actions/install-tools
+        with:
+          tools: just
+
+      - name: Verify the read-only toolchain
+        working-directory: ${{ runner.temp }}/scoreboard/branch
+        run: |
+          set -euo pipefail
+          test -n "$RUSTUP_HOME"
+          test ! -w "$RUSTUP_HOME"
+          rustup show active-toolchain
+
+      # The scoreboard instrument is main's, built before branch code runs.
+      - name: Build main's scoreboard xtask
+        working-directory: ${{ github.workspace }}/.scoreboard-main
+        run: |
+          /usr/local/bin/carrick-xtask host-lease --mode carrick -- \
+            cargo build --locked -p carrick-xtask --target-dir "$SB/main-target"
+          test -x "$SB/main-target/debug/carrick-xtask"
+
+      # First branch code: build.rs, just recipes and scripts of the pinned SHA.
+      - name: Signed build of the pinned branch head
+        id: build
+        working-directory: ${{ runner.temp }}/scoreboard/branch
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SCORE_SHA"
+          just build
+          codesign -d --entitlements - target/release/carrick > "$SB/out/entitlements.txt" 2>&1
+          grep -q com.apple.security.hypervisor "$SB/out/entitlements.txt"
+          otool -l target/release/carrick > "$SB/out/load-commands.txt"
+          grep -q __dof_carrick "$SB/out/load-commands.txt"
+          digest="$(shasum -a 256 target/release/carrick | awk '{ print $1 }')"
+          cdhash="$(codesign -dvvv target/release/carrick 2>&1 | awk -F= '/^CDHash=/ { print $2 }')"
+          uuid="$(otool -l target/release/carrick | awk '/LC_UUID/ { f = 1 } f && /uuid/ { print $2; exit }')"
+          printf 'binary-sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'identity=sha256=%s cdhash=%s lc_uuid=%s entitlement=com.apple.security.hypervisor dof=__dof_carrick\n' \
+            "$digest" "$cdhash" "$uuid" >> "$GITHUB_OUTPUT"
+
+      - name: Goal scoreboard (pinned branch head)
+        id: score
+        working-directory: ${{ github.workspace }}/.scoreboard-main
+        run: |
+          set -euo pipefail
+          export CARRICK_RUN_ID="scoreboard-branch-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          /usr/local/bin/carrick-xtask host-lease --mode gate -- \
+            "$SB/main-target/debug/carrick-xtask" scoreboard \
+            --carrick "$SB/branch/target/release/carrick" \
+            --sha "$SCORE_SHA" \
+            --reaper "$SB_MAIN/scripts/sudo/kill.sh" \
+            --out "$SB/out/receipt.json" > "$SB/out/table.txt"
+          test -s "$SB/out/receipt.json"
+          test -s "$SB/out/table.txt"
+          cat "$SB/out/table.txt"
+          printf 'receipt=%s\n' "$(base64 < "$SB/out/receipt.json" | tr -d '\n')" >> "$GITHUB_OUTPUT"
+          printf 'table=%s\n' "$(base64 < "$SB/out/table.txt" | tr -d '\n')" >> "$GITHUB_OUTPUT"
+
+      - name: Remove the scoreboard trees
+        if: ${{ always() }}
+        run: |
+          for d in "${SB:-}" "${SB_MAIN:-}"; do
+            if [ -n "$d" ] && [ -d "$d" ]; then
+              chmod -R u+w "$d" 2>/dev/null || true
+              rm -rf "$d"
+            fi
+          done
+
+  # Scoreboard-only mode, step 3 (hosted): publish. It runs no repository
+  # code and holds the only write-capable token of this mode. It reads the
+  # Mac job's outputs as data (never interpolated into a script), uploads
+  # `scoreboard-branch-<sha>-<attempt>` (never a `receipt-*`,
+  # `signed-fixtures-*` or `scoreboard-<main sha>` name that main's gates or
+  # nightly read) and comments on the branch's single open same-repository PR.
+  # It never posts to #231.
+  scoreboard-publish:
+    name: HVF · publish scoreboard-only result
+    if: >-
+      ${{ always() && github.event_name == 'workflow_dispatch' && inputs.scoreboard_branch != '' &&
+          github.ref == 'refs/heads/main' &&
+          github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' &&
+          needs.scoreboard-target.result == 'success' && needs.hvf-scoreboard.result != 'skipped' }}
+    needs: [scoreboard-target, hvf-scoreboard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Write provenance, summary and comment
+        env:
+          SCORE_BRANCH: ${{ needs.scoreboard-target.outputs.branch }}
+          SCORE_SHA: ${{ needs.scoreboard-target.outputs.sha }}
+          HVF_RESULT: ${{ needs.hvf-scoreboard.result }}
+          RECEIPT_B64: ${{ needs.hvf-scoreboard.outputs.receipt }}
+          TABLE_B64: ${{ needs.hvf-scoreboard.outputs.table }}
+          BINARY_SHA256: ${{ needs.hvf-scoreboard.outputs.binary-sha256 }}
+          IDENTITY: ${{ needs.hvf-scoreboard.outputs.identity }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/scoreboard-branch"
+          mkdir -p "$out"
+          if [ -n "$RECEIPT_B64" ]; then base64 -d <<<"$RECEIPT_B64" > "$out/receipt.json"; fi
+          if [ -n "$TABLE_B64" ]; then base64 -d <<<"$TABLE_B64" > "$out/table.txt"; fi
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" --arg branch "$SCORE_BRANCH" --arg sha "$SCORE_SHA" \
+            --arg workflow_sha "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg actor "$GITHUB_TRIGGERING_ACTOR" --arg hvf_result "$HVF_RESULT" \
+            --arg binary_sha256 "$BINARY_SHA256" --arg identity "$IDENTITY" \
+            '{mode: "scoreboard-only", repository: $repository, branch: $branch, sha: $sha,
+              workflow_sha: $workflow_sha, run_id: $run_id, run_attempt: $run_attempt,
+              triggering_actor: $actor, hvf_scoreboard_result: $hvf_result,
+              binary_sha256: $binary_sha256, identity: $identity}' > "$out/provenance.json"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            printf '### Goal scoreboard (branch `%s`)\n\n' "$SCORE_BRANCH"
+            printf 'Scored commit `%s` on branch `%s` ([workflow run](%s), HVF job: %s). ' \
+              "$SCORE_SHA" "$SCORE_BRANCH" "$run_url" "$HVF_RESULT"
+            printf 'Owner scoreboard-only dispatch with the workflow from main at `%s`: no receipts, gates or baselines. ' "$GITHUB_SHA"
+            printf 'The table'"'"'s `main` label names the scored commit.\n\n'
+            if [ -s "$out/table.txt" ]; then
+              printf '```text\n'
+              cat "$out/table.txt"
+              printf '```\n\n'
+            else
+              printf 'No scoreboard table was produced; see the workflow run.\n\n'
+            fi
+            printf '<details><summary>Binary identity</summary>\n\n```text\n%s\n```\n</details>\n' "${IDENTITY:-none}"
+          } > "$out/comment.md"
+          cat "$out/comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scoreboard-only artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoreboard-branch-${{ needs.scoreboard-target.outputs.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scoreboard-branch/
+          if-no-files-found: error
+
+      - name: Post to the branch's open same-repository PR
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCORE_BRANCH: ${{ needs.scoreboard-target.outputs.branch }}
+        run: |
+          set -euo pipefail
+          pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SCORE_BRANCH" --state open \
+            --json number,isCrossRepository,headRefName \
+            --jq '[.[] | select(.isCrossRepository == false and .headRefName == env.SCORE_BRANCH)] | if length == 1 then .[0].number else empty end')"
+          if [ -z "$pr" ]; then
+            echo "no single open same-repository PR for $SCORE_BRANCH; summary and artifact only"
+            exit 0
+          fi
+          gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/scoreboard-branch/comment.md"
 
   # The focused job above is not suite closure. This separate baseline-free
   # gate is intentionally expensive, trusted-event-only, and dormant until the
@@ -1106,7 +1232,7 @@ jobs:
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
-    needs: [scoreboard-target, signed-fixtures, hvf-kernel, hvf-closure, kvm-tests-willow, kvm-gate, el1-native-tests, el1-native-gate]
+    needs: [scoreboard-target, hvf-scoreboard, scoreboard-publish, signed-fixtures, hvf-kernel, hvf-closure, kvm-tests-willow, kvm-gate, el1-native-tests, el1-native-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -1115,8 +1241,10 @@ jobs:
     steps:
       - name: Require the lanes this event runs (and skip the rest)
         env:
-          SCOREBOARD_TARGET: ${{ needs.scoreboard-target.result }}
-          SCOREBOARD_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.scoreboard_branch != '' }}
+          SB_TARGET: ${{ needs.scoreboard-target.result }}
+          SB_HVF: ${{ needs.hvf-scoreboard.result }}
+          SB_PUBLISH: ${{ needs.scoreboard-publish.result }}
+          SB_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.scoreboard_branch != '' }}
           FIXTURES: ${{ needs.signed-fixtures.result }}
           HVF: ${{ needs.hvf-kernel.result }}
           HVF_CLOSURE: ${{ needs.hvf-closure.result }}
@@ -1134,20 +1262,23 @@ jobs:
             fi
           }
           failed=0
-          if [ "$SCOREBOARD_MODE" = true ]; then
-            # Scoreboard-only owner dispatch: the branch resolver and the HVF
-            # scoreboard job, nothing else (no fixtures, receipts or gates).
-            require scoreboard-target "$SCOREBOARD_TARGET" success
-            require hvf-kernel "$HVF" success
-            require signed-fixtures "$FIXTURES" skipped
-            require hvf-closure "$HVF_CLOSURE" skipped
-            require kvm-tests-willow "$KVM" skipped
-            require kvm-gate "$KVM_GATE" skipped
-            require el1-native-tests "$EL1N" skipped
-            require el1-native-gate "$EL1N_GATE" skipped
+          if [ "$SB_MODE" = true ]; then
+            # Scoreboard-only owner dispatch: pin, HVF scoreboard, publish;
+            # nothing else (no fixtures, receipts, gates or other lanes).
+            require scoreboard-target "$SB_TARGET" success
+            require hvf-scoreboard "$SB_HVF" success
+            require scoreboard-publish "$SB_PUBLISH" success
+            for pair in "signed-fixtures:$FIXTURES" "hvf-kernel:$HVF" "hvf-closure:$HVF_CLOSURE" \
+                        "kvm-tests-willow:$KVM" "kvm-gate:$KVM_GATE" \
+                        "el1-native-tests:$EL1N" "el1-native-gate:$EL1N_GATE"; do
+              require "${pair%%:*}" "${pair#*:}" skipped
+            done
             exit "$failed"
           fi
-          require scoreboard-target "$SCOREBOARD_TARGET" skipped
+          # Every other event never runs the scoreboard-only jobs.
+          require scoreboard-target "$SB_TARGET" skipped
+          require hvf-scoreboard "$SB_HVF" skipped
+          require scoreboard-publish "$SB_PUBLISH" skipped
           require signed-fixtures "$FIXTURES" success
           case "$EVENT" in
             push)
