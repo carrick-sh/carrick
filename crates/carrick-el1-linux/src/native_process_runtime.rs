@@ -5172,12 +5172,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     // their pending signals until their owner resumes; a single-entry futex
     // wait (`UserReturn`) wakes with `-EINTR` on deliverable signal arrival.
     fn interrupt_signal_record(&mut self, record: RecordRef) {
-        if let Err(error) = self
-            .runtime
-            .cancel_service(record, self.source.slot, self.service)
-        {
+        if let Err(error) = self.interrupt_member_record(record) {
             self.run_failure = Some(error.run_failure_reason());
         }
+    }
+
+    fn interrupt_member_record(&mut self, record: RecordRef) -> Result<(), NativeProcessError> {
+        self.runtime
+            .cancel_service(record, self.source.slot, self.service)?;
         if !self.runtime.graph.lock().has_member_wait(&record) {
             let mut effects = WakeEffects::default();
             if self.source.zone.interrupt_parked_futex(
@@ -5192,10 +5194,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 &mut effects,
             ) {
                 self.service.wake_effects(effects);
-                return;
+                return Ok(());
             }
         }
         request_signal_reschedule(self.source.zone, self.service, record);
+        Ok(())
     }
 
     /// See [`NativeProcessRuntime::give_fixture_root_a_cwd`].
@@ -7611,8 +7614,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .collect()
             };
             for record in service_records {
-                self.runtime
-                    .cancel_service(record, self.source.slot, self.service)?;
+                // The terminal request is already published for each exact
+                // member. Use the same owned interrupt as signal arrival:
+                // cancel retained services, interrupt a plain futex park, or
+                // kick the CPU holding a running record. No signal is queued.
+                self.interrupt_member_record(record)?;
             }
             // Native exception owners must have their cancellation checkpoint
             // queued before the host can admit its one-shot terminal wake batch.
@@ -8746,7 +8752,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         }
     }
     fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
-        core::mem::take(&mut self.owner_continuation)
+        (core::mem::take(&mut self.owner_continuation) || self.control.host_exit_requested())
             .then(|| self.resume_pending_lifecycle())
             .flatten()
     }
