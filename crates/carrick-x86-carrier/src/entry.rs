@@ -303,6 +303,13 @@ pub mod user_fault_gate {
     }
 }
 
+/// End this CPU's user #PF custody when the fault leaves for the scheduler
+/// instead of returning through its entry: its context is already saved in
+/// a parked record, which resumes through the scheduler, never this entry.
+pub fn leave_user_page_fault(binding: &CpuBinding) {
+    binding.fault_active.store(0, Ordering::Release);
+}
+
 pub fn cross_owner_grant(cpu: carrick_guest_arch::CpuId, address: UserVa) {
     // SAFETY: this CPU owns the retained selection/completion slot. The
     // host authenticates CPU, MM, root and selected address before grant.

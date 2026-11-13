@@ -336,6 +336,56 @@ pub fn space_access<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
 pub fn coordinate_anonymous_edit_wait<P, F, T, Context: carrick_core_abi::EntryContext>(
     source: &SpaceNotificationLease<'_, Context>,
     resumed: Option<OperationToken>,
+    probe: P,
+    park: F,
+) -> EditWaitOutcome<T>
+where
+    P: FnMut() -> Option<Option<SpaceWaitCause>>,
+    F: FnMut(
+        ObjectWaitKey,
+        carrick_sched_core::object_wait::ObjectStateSnapshot,
+        OperationToken,
+    ) -> Result<T, (ObjectWaitError, OperationToken)>,
+{
+    coordinate_space_cause_wait(
+        source,
+        |key| {
+            resumed
+                .as_ref()
+                .is_some_and(|token| !token.is_anonymous_edit_for(key))
+        },
+        OperationToken::anonymous_edit,
+        probe,
+        park,
+    )
+}
+
+/// Coordinate a user fault refused by contention on its exact live MM source
+/// (#2141): park on the refusing cause's release with a
+/// [`OperationKind::FaultRetry`](carrick_sched_core::object_wait::OperationKind::FaultRetry)
+/// token, so the wake reruns the faulting instruction. Same observe-then-probe
+/// order and custody rules as [`coordinate_anonymous_edit_wait`]; the fault
+/// has made no effects.
+pub fn coordinate_fault_retry_wait<P, F, T, Context: carrick_core_abi::EntryContext>(
+    source: &SpaceNotificationLease<'_, Context>,
+    probe: P,
+    park: F,
+) -> EditWaitOutcome<T>
+where
+    P: FnMut() -> Option<Option<SpaceWaitCause>>,
+    F: FnMut(
+        ObjectWaitKey,
+        carrick_sched_core::object_wait::ObjectStateSnapshot,
+        OperationToken,
+    ) -> Result<T, (ObjectWaitError, OperationToken)>,
+{
+    coordinate_space_cause_wait(source, |_| false, OperationToken::fault_retry, probe, park)
+}
+
+fn coordinate_space_cause_wait<P, F, T, Context: carrick_core_abi::EntryContext>(
+    source: &SpaceNotificationLease<'_, Context>,
+    stale: impl Fn(ObjectWaitKey) -> bool,
+    mint: fn(ObjectWaitKey) -> Option<OperationToken>,
     mut probe: P,
     mut park: F,
 ) -> EditWaitOutcome<T>
@@ -368,10 +418,7 @@ where
             return EditWaitOutcome::NoConflict;
         };
         let key = source.key(cause);
-        if resumed
-            .as_ref()
-            .is_some_and(|token| !token.is_anonymous_edit_for(key))
-        {
+        if stale(key) {
             return EditWaitOutcome::StaleToken;
         }
         let Some(snapshot) = CAUSES
@@ -381,7 +428,7 @@ where
         else {
             return EditWaitOutcome::Refused;
         };
-        let Some(token) = OperationToken::anonymous_edit(key) else {
+        let Some(token) = mint(key) else {
             return EditWaitOutcome::Refused;
         };
         // SAFETY: the source observation precedes the failed predicate probe;
