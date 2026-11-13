@@ -711,6 +711,20 @@ impl CarrierGuestCowSettlement {
         pool: &CowGrantPool,
         excluded: &ExcludedEditor<'_>,
     ) -> Result<(), TrapError> {
+        // COW completions first: a retired leaf may name a replacement
+        // frame whose completion is still unsettled. Then a native child's
+        // owed returns (#1369 slice 3); the host-served root's settle at its
+        // host venue.
+        self.settle_cow_in(custody, pool, excluded)?;
+        crate::metadata_grant::settle_native_returns(custody, excluded).map(|_| ())
+    }
+
+    fn settle_cow_in(
+        &self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        pool: &CowGrantPool,
+        excluded: &ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
         if !pool.any_completed() || pool.completions(excluded).next().is_none() {
             return Ok(());
         }
