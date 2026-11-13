@@ -1566,10 +1566,35 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let slot = self
             .physical_slot()
             .ok_or_else(|| fail("fault exit has no physical slot"))?;
+        self.finish_fault_record(slot, first, |cpu| Ok(cpu.run_loaded(task)?.exit))
+    }
+
+    /// The idle peer's fault entry streams the same record. The peer owns no
+    /// host task lease, so its words arrive on idle entries, not a loaded run.
+    pub fn capture_idle_peer_fault_record(
+        &mut self,
+        first: u32,
+    ) -> Result<carrick_x86::FaultDoorbellRecord, TrapError> {
+        self.cpu.audit_unloaded_peer()?;
+        self.finish_fault_record(carrick_guest_arch::CpuId::new(1), first, |cpu| {
+            cpu.run_idle_peer()
+        })
+    }
+
+    /// Read the rest of one fault record and admit only the guest's
+    /// policy-declined disposition; any other reason is a kernel refusal.
+    fn finish_fault_record(
+        &mut self,
+        slot: carrick_guest_arch::CpuId,
+        first: u32,
+        mut next: impl FnMut(
+            &mut crate::carrier_cpu::CarrierCpu<M>,
+        ) -> Result<crate::carrier_cpu::CarrierRunExit, TrapError>,
+    ) -> Result<carrick_x86::FaultDoorbellRecord, TrapError> {
         let mut words = vec![first];
         while words.len() < carrick_x86::X86_FAULT_RECORD_U32_WORDS {
-            let stopped = self.cpu.run_loaded(task)?;
-            let crate::carrier_cpu::CarrierRunExit::FaultDoorbellWord(word) = stopped.exit else {
+            let crate::carrier_cpu::CarrierRunExit::FaultDoorbellWord(word) = next(&mut self.cpu)?
+            else {
                 return Err(fail("fault record interrupted"));
             };
             words.push(word);
@@ -1584,7 +1609,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             != Some(carrick_el1_abi::X86FaultDisposition::PolicyDeclined)
         {
             return Err(fail(format!(
-                "kernel fault policy refused: reason {reason}, {record:?}"
+                "kernel fault policy refused on CPU {}: reason {reason}, {record:?}",
+                slot.raw()
             )));
         }
         Ok(record)
