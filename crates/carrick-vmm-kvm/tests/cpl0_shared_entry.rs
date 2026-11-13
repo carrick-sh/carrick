@@ -114,6 +114,7 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
             (PhysicalCrossingFamily::RootExit, 1),
             (PhysicalCrossingFamily::ChildRetire, 0),
             (PhysicalCrossingFamily::RunFailure, 0),
+            (PhysicalCrossingFamily::ReturnSettlement, 0),
         ]
     );
     assert_eq!(
