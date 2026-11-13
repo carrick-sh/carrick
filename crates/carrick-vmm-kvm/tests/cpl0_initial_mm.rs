@@ -4021,26 +4021,47 @@ fn production_full_owed_return_table_parks_on_its_busy_holder_until_release() {
         .output()
         .expect("run native oracle");
     assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
             .expect("ELF program");
-        let mut hold = None;
         let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
             &program,
             4096,
             ROOT_AFFINITY_LOADED,
             |carrier| {
-                hold = Some(
-                    carrier.fixture_hold_owed_return_holders(1, std::time::Duration::from_secs(20)),
-                );
+                let _ = held_tx.send(carrier.fixture_hold_owed_return_holders());
             },
             carrick_kernel::dispatch::SyscallDispatcher::default(),
         )
         .map_err(|failure| failure.error);
-        let _ = tx.send((outcome, hold));
+        let _ = tx.send(outcome);
     });
-    let (outcome, hold) = rx
+    let hold = held_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("holder fixture armed");
+    // The releasing party: once the first full-table drain holds the
+    // editors, give them back only when the root is parked on a held
+    // holder's release (the real queue census), or at the bound.
+    let bound = std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + bound;
+    let mut released_on_park = false;
+    if hold.wait_claimed(bound) {
+        loop {
+            if hold.enrolled().expect("holder release census") >= 1 {
+                released_on_park = true;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+    let while_held = hold.doorbells_while_held();
+    hold.release().expect("fixture release");
+    let outcome = rx
         .recv_timeout(std::time::Duration::from_secs(120))
         .expect("the full-table run must complete, not hang");
     // Before #1482 P0-1 the drain skipped the busy holders and answered
@@ -4048,10 +4069,7 @@ fn production_full_owed_return_table_parks_on_its_busy_holder_until_release() {
     // budget ran out.
     let outcome =
         outcome.expect("full owed-return table run (an exit budget overrun is a rerun loop)");
-    let hold = hold.expect("holder fixture armed");
     let held = hold.held();
-    let while_held = hold.doorbells_while_held();
-    let released_on_park = hold.finish().expect("fixture release");
     let counts = outcome
         .physical
         .return_settlement_counters()
