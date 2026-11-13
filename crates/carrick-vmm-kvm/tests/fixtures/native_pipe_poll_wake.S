@@ -4,6 +4,7 @@
  * return 1 with revents == POLLIN while its pollfd fd/events stay intact.
  * Exit 7 = success; every other code names the failed stage. The native
  * oracle (same source) runs under `timeout 10`. -DUSE_POLL selects poll(7).
+ * -DCHILD_POLLS reverses the peers: child polls/reads, parent writes/reaps.
  * -DWAKE_BY_CLOSE: the parent closes its write end and the child closes the
  * last one instead of writing, so the wake is writer-close POLLHUP.
  * -DZERO_TIMEOUT: poll/ppoll uses a zero timeout while the child sleeps 50ms
@@ -41,9 +42,16 @@ _start:
     mov $57, %eax                  /* fork */
     syscall
     test %eax, %eax
-    jz child
     js fail_fork
+#ifdef CHILD_POLLS
+    jz poller
     mov %eax, %r12d
+    jmp child
+poller:
+#else
+    jz child
+    mov %eax, %r12d
+#endif
 #ifdef WAKE_BY_CLOSE
     mov fds+4(%rip), %edi
     mov $3, %eax                   /* close(fds[1]) */
@@ -141,6 +149,20 @@ _start:
     cmp $-14, %rax                 /* input owner EFAULT, never rax=441 */
     jne fail_input
 #endif
+#ifdef CHILD_POLLS
+    mov fds(%rip), %edi
+    lea received(%rip), %rsi
+    mov $1, %edx
+    xor %eax, %eax
+    syscall
+    cmp $1, %rax
+    jne fail_result
+    cmpb $'x', received(%rip)
+    jne fail_revents
+    xor %edi, %edi
+    jmp exit
+#endif
+wait_for_child:
     /* wait4(child, &status, 0, NULL) */
     mov %r12d, %edi
     lea status(%rip), %rsi
@@ -176,8 +198,12 @@ child:
     cmp $1, %rax
     jne child_fail
 #endif
+#ifdef CHILD_POLLS
+    jmp wait_for_child
+#else
     xor %edi, %edi
     jmp exit
+#endif
 child_fail:
     mov $9, %edi
     jmp exit
@@ -223,6 +249,7 @@ fds: .space 8
 pfd: .space 8
 status: .space 8
 poll_result: .space 8
+received: .space 1
 
 .balign 16
 epoll_event: .space 12
