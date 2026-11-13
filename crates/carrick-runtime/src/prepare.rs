@@ -781,7 +781,12 @@ fn run_prepared_kvm_pool_with_debug(
             count,
         })
         .collect();
-    let physical_exits: u64 = physical_crossing_families.iter().map(|row| row.count).sum();
+    // A settlement doorbell rides the owner-grant port: already one exit there.
+    let physical_exits: u64 = physical_crossing_families
+        .iter()
+        .filter(|row| row.family != "return_settlement")
+        .map(|row| row.count)
+        .sum();
     let count_family = |families: std::collections::BTreeMap<&'static str, u64>| {
         families
             .into_iter()
