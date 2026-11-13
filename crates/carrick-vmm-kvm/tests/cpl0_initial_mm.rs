@@ -2978,7 +2978,7 @@ fn crossing_operand_duplicated_stdin_reads_through_its_binding() {
 
 
 fn cwd_run(mode: &[&str]) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("director-rebased known-answer conflict");
     let mut flags = mode.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     for (name, leaf) in [("BASE", "a"), ("PARENT", "b"), ("CHILD", "c")] {
         let path = dir.path().join(leaf);
