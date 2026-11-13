@@ -26,29 +26,7 @@ use carrick_hal::return_settlement::{
 use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
 use carrick_sched_core::spaces::notification::{ExclusionRefusal, SpaceWaitCause};
 
-/// What this carrier's settlements did, for witnesses (deterministic counts).
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::default::Default,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-pub struct ReturnSettlementCounters {
-    /// Settlement doorbells rung by ring threads.
-    pub doorbells: u64,
-    /// Exclusions that ran a settlement (doorbells included).
-    pub exclusions: u64,
-    /// Owed extents settled (slots freed or advanced).
-    pub extents: u64,
-    /// Settlements skipped for a pending fork loan.
-    pub fork_loan_skips: u64,
-    /// Doorbells refused because a ring editor of the MM was active.
-    pub editor_contended: u64,
-    /// Other MMs a full owed-return table's drain settled.
-    pub drained_holders: u64,
-}
+pub use carrick_hal::return_settlement::ReturnSettlementCounters;
 
 /// One exclusion of an MM's EL1 editor that has settled the MM's owed
 /// returns. Only [`Cpl0HostCustody::settled_pause`] builds one.
@@ -121,11 +99,14 @@ struct Cpl0OwedReturns<'a, M: CarrierMemoryIo> {
     mm: NonZeroU64,
     root: RootGpa,
     failed: Option<String>,
+    /// Owed pages the prepared batch walked: this exclusion's pause.
+    pages: u64,
 }
 impl<M: CarrierMemoryIo> OwedReturnRetirement for Cpl0OwedReturns<'_, M> {
     type Prepared = Vec<(PageSpan, Vec<RetiredTerminal>)>;
     type Error = String;
     fn prepare(&mut self, request: &ReturnSettlementRequest) -> Result<Self::Prepared, String> {
+        self.pages = request.iter().map(|owed| owed.range.len() / 4096).sum();
         let words = self.memory.words();
         request
             .iter()
@@ -212,7 +193,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             // No admitted root delegates this MM's memory: nothing is owed.
             return Ok(SettlementDoorbellReply::Settled);
         }
-        self.return_settlement_counters.exclusions += 1;
         let guard = self.return_settlement.lock(excluded);
         let loan_pending = self.fork_stock.loan_names(mm);
         let journal = RingRootJournal {
@@ -226,15 +206,19 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             mm: key,
             root: context.root,
             failed: None,
+            pages: 0,
         };
         let outcome =
             settle_ring_owned_returns(excluded, &guard, loan_pending, &journal, &mut backend);
+        self.return_settlement_counters.record_pause(backend.pages);
         if let Some(error) = backend.failed {
             return Err(fail(format!("owed return settlement apply: {error}")));
         }
         match &outcome {
             Ok(carrick_el1_abi::SettlementOutcome::Settled(receipt)) => {
                 self.return_settlement_counters.extents +=
+                    (receipt.freed + receipt.advanced) as u64;
+                self.return_settlement_counters.chunks +=
                     (receipt.freed + receipt.advanced) as u64;
             }
             Ok(carrick_el1_abi::SettlementOutcome::Skipped(_)) => {

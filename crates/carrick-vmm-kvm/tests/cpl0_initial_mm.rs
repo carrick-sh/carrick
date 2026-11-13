@@ -2217,6 +2217,61 @@ fn production_exclusion_settles_owed_returns_before_the_doorbell_is_needed() {
     );
 }
 
+/// The run's owed-return settlement counters by family (#1482).
+fn return_settlement_families(
+    outcome: &carrick_runtime::prepare::PreparedKvmPoolOutcome,
+) -> std::collections::BTreeMap<String, u64> {
+    outcome
+        .run
+        .report
+        .execution_witness
+        .as_ref()
+        .expect("execution witness")
+        .return_settlement_families
+        .iter()
+        .map(|row| (row.family.clone(), row.count))
+        .collect()
+}
+
+/// #1482 P0-2: a settlement holds the MM's editor exclusion for at most one
+/// 512-page chunk. 512 abutting single-page retirements merge into one owed
+/// extent covering 1 GiB; a MAP_FIXED page at its far end rings exactly one
+/// doorbell, whose carrier settles the GiB in 512 chunks within that one
+/// exit, lowering and re-raising the gate between them.
+#[test]
+fn production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell() {
+    let elf = native_exit_fixture_with_flags("native_owed_return_gib.S", &[std::env::var("GIBFLAG").as_deref().unwrap_or("-DX")]);
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .expect("GiB owed extent run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_owed_return_gib.S): {:?}",
+        outcome.run
+    );
+    let families = return_settlement_families(&outcome);
+    let count = |family: &str| families.get(family).copied().unwrap_or(0);
+    assert_eq!(count("doorbell"), 1, "one crossing settles the GiB: {families:?}");
+    assert!(
+        count("max_pause_pages") <= 512,
+        "no exclusion is held for more than one chunk: {families:?}"
+    );
+    assert_eq!(
+        count("chunk"),
+        512,
+        "the GiB settles as 512 acknowledged chunks: {families:?}"
+    );
+}
+
 #[test]
 fn block_then_user_page_fault_terminates_with_sigsegv_in_ring() {
     let elf = block_then_fault_elf();

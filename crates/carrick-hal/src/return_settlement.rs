@@ -76,6 +76,53 @@ impl SettlementGuard<'_> {
     }
 }
 
+/// What one carrier's owed-return settlements did, for run reports and
+/// witnesses (deterministic counts, one set per carrier).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReturnSettlementCounters {
+    /// Settlement doorbells rung by ring threads.
+    pub doorbells: u64,
+    /// Exclusions that ran a settlement (doorbells included).
+    pub exclusions: u64,
+    /// Owed extents settled (slots freed or advanced).
+    pub extents: u64,
+    /// Settlements skipped for a pending fork loan.
+    pub fork_loan_skips: u64,
+    /// Doorbells refused because a ring editor of the MM was active.
+    pub editor_contended: u64,
+    /// Other MMs a full owed-return table's drain settled.
+    pub drained_holders: u64,
+    /// Settled chunks: acknowledgements that freed or advanced a slot.
+    pub chunks: u64,
+    /// Most pages one exclusion's settlement walked: the longest pause.
+    pub max_pause_pages: u64,
+}
+
+impl ReturnSettlementCounters {
+    /// Record one exclusion's settlement that walked `pages` owed pages.
+    pub fn record_pause(&mut self, pages: u64) {
+        self.exclusions += 1;
+        self.max_pause_pages = self.max_pause_pages.max(pages);
+    }
+
+    /// Nonzero counters by stable family name, for run reports.
+    pub fn families(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("doorbell", self.doorbells),
+            ("exclusion", self.exclusions),
+            ("extent", self.extents),
+            ("fork_loan_skip", self.fork_loan_skips),
+            ("editor_contended", self.editor_contended),
+            ("drained_holder", self.drained_holders),
+            ("chunk", self.chunks),
+            ("max_pause_pages", self.max_pause_pages),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count != 0)
+        .collect()
+    }
+}
+
 /// A venue's access to one MM's journal: each call takes and drops the root
 /// guard around `step`, so no backend service ever runs under it.
 pub trait ReturnJournalAccess {

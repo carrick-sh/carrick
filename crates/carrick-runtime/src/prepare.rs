@@ -832,6 +832,15 @@ fn run_prepared_kvm_pool_with_debug(
                 count,
             })
             .collect(),
+           return_settlement_families: physical
+            .return_settlement_counters()?
+            .families()
+            .into_iter()
+            .map(|(family, count)| crate::compat::ExecutionFamilyCount {
+                family: family.to_owned(),
+                count,
+            })
+            .collect(),
     });
     let (exit_code, terminating_signal, traps, fault_record, run_failure) = match outcome {
         carrick_vmm_kvm::cpl0_boot::InitialProcessExit::OwnedExit { status, exits } => {

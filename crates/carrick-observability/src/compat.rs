@@ -558,6 +558,10 @@ pub struct ExecutionWitness {
     /// refusal reason, withdrawn lifecycle records, child retirement.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fork_stock_families: Vec<ExecutionFamilyCount>,
+    /// Owed-return settlement outcomes by family: doorbells, exclusions,
+    /// settled chunks, drained holders, waits and the longest pause.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub return_settlement_families: Vec<ExecutionFamilyCount>,
     /// Last refused fork admission, including quarantine at that boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_admission_refusal: Option<ForkAdmissionRefusal>,
