@@ -1369,16 +1369,6 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             CarrierRunExit::Kick => Ok(GuestIdleExit::Idle(SettledIdleSlot::admit(
                 self.zone_slot(),
             )?)),
-            // The peer's #PF entry streams its record word by word. A kernel
-            // refusal names its reason and record, as on the loaded lane. A
-            // declined fault the guest could not deliver belongs to a ring
-            // task, not to the run's root, so it is never this run's exit.
-            CarrierRunExit::FaultDoorbellWord(first) => {
-                let record = self.physical.capture_idle_peer_fault_record(first)?;
-                Err(TrapError::Hypervisor(format!(
-                    "idle CPL0 peer task fault has no host owner: {record:?}"
-                )))
-            }
             other => Err(TrapError::Hypervisor(format!(
                 "idle CPL0 peer needs a host task handback: {other:?}"
             ))),
