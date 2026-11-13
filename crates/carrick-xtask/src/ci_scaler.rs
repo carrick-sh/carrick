@@ -791,6 +791,7 @@ fn standing_event_ref(event: &str, branch: &str) -> bool {
     }
 }
 
+/// A launched runner that has received no job by then is drained.
 pub(super) const UNASSIGNED_DRAIN_SECS: u64 = 900;
 
 /// The GitHub runner registration a controller owns, shared by the Willow
