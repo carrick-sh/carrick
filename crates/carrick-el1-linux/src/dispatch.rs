@@ -3626,116 +3626,139 @@ impl<
         Some(self)
     }
     fn futex(&mut self) -> FamilyCompletion {
-        if !self.frame.arm_scheduler() {
-            let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
-                return FamilyCompletion::Forward;
-            };
-            let Some(process) = self.process.as_deref_mut() else {
+        let arguments = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
+        let binding = self
+            .current_tasks
+            .get(self.frame.task_index())
+            .map(crate::common_entry::execution_binding);
+        let pc = self.frame.arm_frame_ref().map_or(0, |frame| frame.elr);
+        let slot = self.frame.task_index() as u64;
+        let completion = (|| {
+            if !self.frame.arm_scheduler() {
+                let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+                    return FamilyCompletion::Forward;
+                };
+                let Some(process) = self.process.as_deref_mut() else {
+                    self.frame.record_isa_unsupported_forward();
+                    return FamilyCompletion::Forward;
+                };
+                if process.binding() != super::common_entry::execution_binding(task) {
+                    return FamilyCompletion::Forward;
+                }
+                let call = carrick_personality_linux::sched::FutexCall {
+                    args: core::array::from_fn(|index| self.frame.argument(index).unwrap_or(0)),
+                };
+                let mut copy = file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                };
+                let Some(outcome) = process.native_futex(call, &mut copy) else {
+                    return FamilyCompletion::Forward;
+                };
+                // The futex family publishes an immediate result in its frame,
+                // as ARM's `serve_futex_operation` writes x0: the shared
+                // completion installs none for it. Without this an x86
+                // FUTEX_WAKE returned its own syscall number (202).
+                if let lifecycle::LifecycleOutcome::Returned { result, .. } = &outcome {
+                    self.frame
+                        .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
+                }
+                return lifecycle::lifecycle_effect(&outcome);
+            }
+            let mut operation = self
+                .process
+                .as_deref_mut()
+                .and_then(|process| process.take_relative_futex_wait());
+            let Some(frame) = self.frame.arm_frame() else {
                 self.frame.record_isa_unsupported_forward();
                 return FamilyCompletion::Forward;
             };
-            if process.binding() != super::common_entry::execution_binding(task) {
-                return FamilyCompletion::Forward;
-            }
-            let call = carrick_personality_linux::sched::FutexCall {
-                args: core::array::from_fn(|index| self.frame.argument(index).unwrap_or(0)),
-            };
-            let mut copy = file::ValidatedCopy {
-                task,
-                validator: &file::HardwareValidator,
-            };
-            let Some(outcome) = process.native_futex(call, &mut copy) else {
-                return FamilyCompletion::Forward;
-            };
-            // The futex family publishes an immediate result in its frame,
-            // as ARM's `serve_futex_operation` writes x0: the shared
-            // completion installs none for it. Without this an x86
-            // FUTEX_WAKE returned its own syscall number (202).
-            if let lifecycle::LifecycleOutcome::Returned { result, .. } = &outcome {
-                self.frame
-                    .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
-            }
-            return lifecycle::lifecycle_effect(&outcome);
-        }
-        let mut operation = self
-            .process
-            .as_deref_mut()
-            .and_then(|process| process.take_relative_futex_wait());
-        let Some(frame) = self.frame.arm_frame() else {
-            self.frame.record_isa_unsupported_forward();
-            return FamilyCompletion::Forward;
-        };
-        let counters = self.counters;
-        let zone = &mut self.zone;
-        let current_tasks = self.current_tasks;
-        let slot = frame.slot as usize;
-        let cur_task = current_tasks.get(slot);
-        if let (Some(zone), Some(task), Some(zslot)) =
-            (zone.as_mut(), cur_task, SlotId::from_index(slot))
-        {
-            let orig_x0 = frame.x[0];
-            let served = {
-                // The admitted process owns the shared-private rule (#2124),
-                // as for x86's native entry: a shared word keys
-                // shared-private only on its MM's private anonymous memory.
-                let process = self.process.as_deref_mut().filter(|process| {
-                    process.binding() == super::common_entry::execution_binding(task)
-                });
-                let mut authenticate = process.map(|process| {
-                    move |address, retained| process.futex_shared_private(address, retained)
-                });
-                let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-                sched.serve_futex_operation(
-                    frame,
-                    &mut operation,
-                    authenticate
-                        .as_mut()
-                        .map(|authenticate| authenticate as &mut sched::SharedFutexMapping<'_>),
-                )
-            };
-            let disposition = match served {
-                Ok(served) => served.map_or(ipc::IpcServed::Forward, ipc::IpcServed::from),
-                Err(sched::FutexRefusal::Mapping(outcome)) => {
-                    return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
-                }
-                Err(sched::FutexRefusal::Copy(carrick_core::user_copy::CopyOutcome::Fault)) => {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    );
-                }
-                Err(sched::FutexRefusal::Copy(carrick_core::user_copy::CopyOutcome::NotYet(
-                    request,
-                ))) => {
-                    let Some(process) = self.process.as_deref_mut() else {
-                        return FamilyCompletion::Forward;
-                    };
-                    if let Some(operation) = operation {
-                        process.retain_relative_futex_wait(operation);
+            let counters = self.counters;
+            let zone = &mut self.zone;
+            let current_tasks = self.current_tasks;
+            let slot = frame.slot as usize;
+            let cur_task = current_tasks.get(slot);
+            if let (Some(zone), Some(task), Some(zslot)) =
+                (zone.as_mut(), cur_task, SlotId::from_index(slot))
+            {
+                let orig_x0 = frame.x[0];
+                let served = {
+                    // The admitted process owns the shared-private rule (#2124),
+                    // as for x86's native entry: a shared word keys
+                    // shared-private only on its MM's private anonymous memory.
+                    let process = self.process.as_deref_mut().filter(|process| {
+                        process.binding() == super::common_entry::execution_binding(task)
+                    });
+                    let mut authenticate = process.map(|process| {
+                        move |address, retained| process.futex_shared_private(address, retained)
+                    });
+                    let mut sched =
+                        native_scheduler(zone, task, counters, zslot, &mut self.handoff);
+                    sched.serve_futex_operation(
+                        frame,
+                        &mut operation,
+                        authenticate
+                            .as_mut()
+                            .map(|authenticate| authenticate as &mut sched::SharedFutexMapping<'_>),
+                    )
+                };
+                let disposition = match served {
+                    Ok(served) => served.map_or(ipc::IpcServed::Forward, ipc::IpcServed::from),
+                    Err(sched::FutexRefusal::Mapping(outcome)) => {
+                        return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
                     }
-                    let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
-                    if !matches!(
-                        outcome,
-                        lifecycle::LifecycleOutcome::Redispatch
-                            | lifecycle::LifecycleOutcome::Transferred { .. }
-                    ) && let Some(process) = self.process.as_deref_mut()
-                    {
-                        let _ = process.take_relative_futex_wait();
+                    Err(sched::FutexRefusal::Copy(carrick_core::user_copy::CopyOutcome::Fault)) => {
+                        return FamilyCompletion::Complete(
+                            carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                        );
                     }
-                    return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
-                }
-                Err(sched::FutexRefusal::Copy(carrick_core::user_copy::CopyOutcome::Done)) => {
-                    invalid_completion(NativeInvariant::EntryBinding)
-                }
-            };
-            return carrick_personality_linux::dispatch::transfer_effect(
-                &task.linux,
-                orig_x0,
-                frame.x[0] as i64,
-                disposition,
-            );
-        }
+                    Err(sched::FutexRefusal::Copy(
+                        carrick_core::user_copy::CopyOutcome::NotYet(request),
+                    )) => {
+                        let Some(process) = self.process.as_deref_mut() else {
+                            return FamilyCompletion::Forward;
+                        };
+                        if let Some(operation) = operation {
+                            process.retain_relative_futex_wait(operation);
+                        }
+                        let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+                        if !matches!(
+                            outcome,
+                            lifecycle::LifecycleOutcome::Redispatch
+                                | lifecycle::LifecycleOutcome::Transferred { .. }
+                        ) && let Some(process) = self.process.as_deref_mut()
+                        {
+                            let _ = process.take_relative_futex_wait();
+                        }
+                        return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+                    }
+                    Err(sched::FutexRefusal::Copy(carrick_core::user_copy::CopyOutcome::Done)) => {
+                        invalid_completion(NativeInvariant::EntryBinding)
+                    }
+                };
+                return carrick_personality_linux::dispatch::transfer_effect(
+                    &task.linux,
+                    orig_x0,
+                    frame.x[0] as i64,
+                    disposition,
+                );
+            }
 
-        FamilyCompletion::Forward
+            FamilyCompletion::Forward
+        })();
+        let result = match completion {
+            FamilyCompletion::Complete(result)
+            | FamilyCompletion::CompleteWithWork(result)
+            | FamilyCompletion::Switched(result)
+            | FamilyCompletion::SwitchedWithWork(result)
+            | FamilyCompletion::AccountedComplete(result) => Some(result),
+            _ => None,
+        };
+        if let (Some(result), Some(binding)) = (result, binding) {
+            self.counters
+                .record_futex_error(arguments, result, pc, slot, binding);
+        }
+        completion
     }
     #[cfg(feature = "allocator-test-control")]
     fn allocator_control(&mut self) -> FamilyCompletion {

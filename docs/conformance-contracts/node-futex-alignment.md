@@ -19,3 +19,13 @@ They report both output streams on failure. This alignment witness does not
 establish that Node supplied a misaligned word. Node's exact failing futex
 operation and errno still require signed attribution; the ecosystem tests
 remain required, and no Node pass is inferred from lower-layer alignment tests.
+
+
+Unexpected immediate ring futex errors are sampled into the existing bounded
+syscall-frame diagnostic buffer, preserving original operands, execution
+binding and numeric return. Expected wait results (0, errno 4, 11 and 110)
+consume no records. The 32-slot buffer retains a prefix; saturation or an empty
+sample is not proof of absence. Sampling changes neither completion nor wait
+ownership. The ABI known-answer test checks filtering, retention, snapshot and
+numeric formatting; the production ARM invalid-operand witness checks that the
+real family records op 393 / errno 22. Signed Node assertions include samples.
