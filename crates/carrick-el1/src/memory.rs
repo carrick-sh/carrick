@@ -1108,15 +1108,52 @@ pub fn busy_root_cause<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy:
     }
 }
 
+/// What one owed-return settlement doorbell left a parked call's reprobe
+/// (#1369 slice 3, #1482 P0-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlementProbe {
+    /// The MM settled and the table has room: rerun the call now.
+    Rerun,
+    /// The caller's own MM refused: park on its `cause`, observed before
+    /// the doorbell rang.
+    Park(SpaceWaitCause),
+    /// The shared table is full of other MMs' slots and no holder could free
+    /// one: wait on that holder's release
+    /// ([`carrick_core::wait::coordinate_holder_release_wait`]), never rerun.
+    Holder(carrick_el1_abi::HolderWait),
+    /// The MM is gone.
+    Stale,
+}
+
+impl SettlementProbe {
+    /// The probe answer of an anonymous-edit wait for this outcome. A
+    /// holder wait is not the caller's own cause: it is stored in `holder`
+    /// for the venue to park on after the own-source wait returns
+    /// `NoConflict`.
+    pub fn edit_probe(
+        self,
+        holder: &mut Option<carrick_el1_abi::HolderWait>,
+    ) -> Option<Option<SpaceWaitCause>> {
+        match self {
+            Self::Rerun => Some(None),
+            Self::Park(cause) => Some(Some(cause)),
+            Self::Holder(wait) => {
+                *holder = Some(wait);
+                Some(None)
+            }
+            Self::Stale => None,
+        }
+    }
+}
+
 /// Drive one owed-return settlement for the calling MM (#1369 slice 3), from
 /// inside a parked call's reprobe: the caller observed every wait cause
 /// before this probe, so a refusal parks at a revision that precedes the
 /// carrier's decision, and a release in between wakes it. Claims the
 /// single flight under the root guard, releases the guard, and `ring`s the
 /// ISA's doorbell with the record (the carrier settles at an exclusion of
-/// the MM, releases the claim in its epilogue and answers). The probe's
-/// answer: `Some(None)` rerun now; `Some(Some(cause))` park on `cause`;
-/// `None` the MM is gone (stale).
+/// the MM, releases the claim in its epilogue and answers). A full table the
+/// carrier could not drain answers the holder's wait authority (#1482 P0-1).
 pub fn drive_return_settlement<
     G: ReservationGeometry,
     C: Copy + Send + Sync + zerocopy::FromZeros,
@@ -1126,19 +1163,23 @@ pub fn drive_return_settlement<
     table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
     slot: u32,
     ring: impl FnOnce(&mut carrick_el1_abi::ReturnSettlementDoorbell),
-) -> Option<Option<SpaceWaitCause>> {
-    let (mm, index) = native_reservation_root(current, spaces, table)?;
+) -> SettlementProbe {
+    let Some((mm, index)) = native_reservation_root(current, spaces, table) else {
+        return SettlementProbe::Stale;
+    };
     let claim = {
         let mut root = match table.lock_in(spaces, index.index(), mm, slot) {
             Ok(root) => root,
-            Err(reservations::Refusal::Busy) => return Some(Some(SpaceWaitCause::Reservations)),
-            Err(_) => return None,
+            Err(reservations::Refusal::Busy) => {
+                return SettlementProbe::Park(SpaceWaitCause::Reservations);
+            }
+            Err(_) => return SettlementProbe::Stale,
         };
         match root.claim_return_settlement(slot) {
             Some(claim) => claim,
             // A sibling's doorbell is in flight; its epilogue publishes
             // Reservations.
-            None => return Some(Some(SpaceWaitCause::Reservations)),
+            None => return SettlementProbe::Park(SpaceWaitCause::Reservations),
         }
     };
     let mut record = carrick_el1_abi::ReturnSettlementDoorbell::request(
@@ -1147,10 +1188,15 @@ pub fn drive_return_settlement<
         current.execution.task.load(Ordering::Acquire),
     );
     ring(&mut record);
-    match record.reply() {
-        carrick_el1_abi::SettlementDoorbellReply::Settled => Some(None),
-        carrick_el1_abi::SettlementDoorbellReply::Stale => None,
-        refused => Some(refused.wait_cause()),
+    match record.outcome() {
+        carrick_el1_abi::SettlementDoorbellAnswer::Holder(wait) => SettlementProbe::Holder(wait),
+        carrick_el1_abi::SettlementDoorbellAnswer::Own(reply) => match reply {
+            carrick_el1_abi::SettlementDoorbellReply::Settled => SettlementProbe::Rerun,
+            carrick_el1_abi::SettlementDoorbellReply::Stale => SettlementProbe::Stale,
+            refused => refused
+                .wait_cause()
+                .map_or(SettlementProbe::Stale, SettlementProbe::Park),
+        },
     }
 }
 

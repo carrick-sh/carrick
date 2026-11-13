@@ -37,8 +37,9 @@
 //! inside the journal steps, never across backend service.
 
 use carrick_core_abi::{
-    ChunkAcknowledgement, OwedReturnRetirement, Refusal, ReturnJournal, ReturnSettlementRequest,
-    SettlementBound, SettlementDoorbellReply, SettlementOutcome, SkipReason,
+    ChunkAcknowledgement, HolderRefusal, HolderWait, OwedReturnRetirement, Refusal, ReservationMm,
+    ReturnJournal, ReturnSettlementRequest, SettlementBound, SettlementDoorbellReply,
+    SettlementOutcome, SkipReason,
 };
 
 /// One MM's settlement lock: serializes every settlement of the MM's owed
@@ -257,6 +258,100 @@ pub fn doorbell_reply<B>(
         Err(ReturnSettlementError::Journal(Refusal::Busy)) => SettlementDoorbellReply::Reservations,
         Err(ReturnSettlementError::Journal(_)) => SettlementDoorbellReply::Stale,
         Err(ReturnSettlementError::Backend(_)) => return None,
+    })
+}
+
+/// One holder's release revisions on its live notification source, read
+/// before the drain's attempt on it (#1482 P0-1): whichever release the
+/// attempt is refused at, the waiter enrols at the revision that preceded
+/// the refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HolderRevisions {
+    pub editor: u64,
+    pub reservations: u64,
+    pub pending_edit: u64,
+}
+
+impl HolderRevisions {
+    /// The revision of the release `refusal` waits for.
+    pub const fn of(self, refusal: HolderRefusal) -> u64 {
+        match refusal {
+            HolderRefusal::Editor => self.editor,
+            HolderRefusal::Reservations => self.reservations,
+            HolderRefusal::ForkLoanPending => self.pending_edit,
+        }
+    }
+}
+
+/// What a full owed-return table's drain left the caller (#1482 P0-1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainOutcome {
+    /// The table has a free slot (it had one, or the drain freed one), or a
+    /// holder settled: the caller reruns.
+    Room,
+    /// No holder could free a slot. The oldest holder that refused names
+    /// the release to wait for; the caller enrols on it, probes its fence
+    /// once and parks, releasing its execution capacity.
+    Wait(HolderWait),
+    /// Every holder left has no live source: retiring MMs, whose slots only
+    /// their release receipts free.
+    Retiring,
+}
+
+/// A carrier's venue for the one neutral drain ([`drain_owed_return_table`]):
+/// the shared table's state, each holder's source and the carrier's own
+/// bounded doorbell drive for one MM.
+pub trait OwedReturnDrain {
+    type Error;
+    /// Whether every slot of the shared owed-return table is taken.
+    fn table_full(&self) -> bool;
+    /// The holder's release revisions; `None`: it has no live source.
+    fn observe(&mut self, holder: ReservationMm) -> Option<HolderRevisions>;
+    /// Settle `holder` over bounded exclusions ([`settle_in_bounded_pauses`]),
+    /// one exclusion at a time, and answer what stopped it.
+    fn settle(&mut self, holder: ReservationMm) -> Result<SettlementDoorbellReply, Self::Error>;
+}
+
+/// The shared owed-return table is full of other MMs' slots, so the caller's
+/// settled journal still cannot take a retirement (#1369 slice 3, #1482
+/// P0-1). Settle the other `holders`, oldest slot first, one MM's exclusions
+/// at a time (never one MM's while raising another's), until a slot is free.
+/// A holder's refusal is not progress: its release revisions are read before
+/// the attempt, and when no slot could be freed the oldest refusing holder's
+/// wait authority is the answer, so the caller waits on the holder that
+/// prevents progress instead of ringing again. Never fatal and never an
+/// errno: a refusal is "not now".
+pub fn drain_owed_return_table<D: OwedReturnDrain>(
+    drain: &mut D,
+    holders: &[ReservationMm],
+) -> Result<DrainOutcome, D::Error> {
+    if !drain.table_full() {
+        return Ok(DrainOutcome::Room);
+    }
+    let mut wait = None;
+    let mut live = false;
+    for &holder in holders {
+        let revisions = drain.observe(holder);
+        let reply = drain.settle(holder)?;
+        if !drain.table_full() {
+            return Ok(DrainOutcome::Room);
+        }
+        match (HolderRefusal::from_reply(reply), revisions) {
+            (Some(refusal), Some(revisions)) => {
+                live = true;
+                wait.get_or_insert(HolderWait::new(holder, refusal, revisions.of(refusal)));
+            }
+            // Settled, yet the table is full again: other MMs journaled into
+            // the freed slots, which is their progress; the rerun drains anew.
+            (None, Some(_)) if reply == SettlementDoorbellReply::Settled => live = true,
+            // No live source, or a stale holder: it is retiring.
+            _ => {}
+        }
+    }
+    Ok(match wait {
+        Some(wait) => DrainOutcome::Wait(wait),
+        None if live => DrainOutcome::Room,
+        None => DrainOutcome::Retiring,
     })
 }
 

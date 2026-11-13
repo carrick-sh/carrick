@@ -3801,3 +3801,74 @@ fn production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell() {
         "one chunk per exclusion: {counts:?}"
     );
 }
+
+/// #1482 P0-1: a full owed-return table whose holder is busy. Eight holder
+/// processes fill the shared 64-slot table and block. The waiters (the
+/// root and, with two, a second live process) each retire a resident page,
+/// which needs a slot; the drain finds every holder's editor held (by the
+/// fixture, at the first full-table drain, as active ring editors hold it).
+/// Each waiter must ring exactly once and park on the oldest busy holder's
+/// release, releasing its execution lane: nothing reruns while the holder
+/// holds. The fixture releases only after the expected waiters are parked
+/// on that release; each waiter then reruns and its retirement is served.
+fn full_table_waits_on_the_busy_holder(waiters: u32, flags: &[&str]) {
+    let elf = native_exit_fixture_with_flags("native_owed_return_table_full.S", flags);
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
+        .expect("ELF program");
+    let hold = std::sync::Mutex::new(None);
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        4096,
+        ROOT_AFFINITY_LOADED,
+        |carrier| {
+            *hold.lock().unwrap() = Some(
+                carrier.fixture_hold_owed_return_holders(waiters, std::time::Duration::from_secs(20)),
+            );
+        },
+        carrick_kernel::dispatch::SyscallDispatcher::default(),
+    )
+    .map_err(|failure| failure.error)
+    .expect("full owed-return table run");
+    let hold = hold.lock().unwrap().take().expect("holder fixture armed");
+    let held = hold.held();
+    let while_held = hold.doorbells_while_held();
+    let released_on_park = hold.finish().expect("fixture release");
+    let counts = outcome
+        .physical
+        .return_settlement_counters()
+        .expect("settlement counts");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_owed_return_table_full.S): \
+         held {held:?}, doorbells while held {while_held}, released on park \
+         {released_on_park}, {counts:?}: {:?}",
+        outcome.run
+    );
+    assert_eq!(held.len(), 8, "the drain met eight busy holders: {held:?}");
+    assert!(
+        released_on_park,
+        "the holders were released at the fixture's bound, not because {waiters} \
+         waiter(s) parked on their release: doorbells while held {while_held}, {counts:?}"
+    );
+    assert_eq!(
+        while_held,
+        u64::from(waiters),
+        "each waiter rang once and parked; none reran while the holder held: {counts:?}"
+    );
+    assert_eq!(counts.holder_waits, u64::from(waiters), "{counts:?}");
+}
+
+#[test]
+fn production_full_owed_return_table_parks_on_its_busy_holder_until_release() {
+    full_table_waits_on_the_busy_holder(1, &[]);
+}
