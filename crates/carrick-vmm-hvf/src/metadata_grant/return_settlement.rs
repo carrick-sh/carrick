@@ -231,7 +231,12 @@ pub(super) fn service_return_settlement(
             0,
         ];
     }
-    let reply = settle_at_doorbell(custody, zone, mm);
+    let reply = settle_at_doorbell(custody, zone, mm).and_then(|reply| {
+        if reply == SettlementDoorbellReply::Settled {
+            drain_owed_return_table(custody, region, zone, mm)?;
+        }
+        Ok(reply)
+    });
     let released = release_settlement_claim(custody, region, zone, mm, claim);
     match (reply, released) {
         (Ok(reply), true) => [METADATA_GRANT_SUCCESS, reply as u64, 0, 0],
@@ -262,6 +267,36 @@ fn settle_at_doorbell(
         }
     })
     .unwrap_or(Ok(SettlementDoorbellReply::Stale))
+}
+
+/// The shared owed-return table is full of other MMs' slots: settle the
+/// other native holders, one exclusion at a time (never holding one MM's
+/// exclusion while raising another's), until a slot is free. A holder whose
+/// ring editor is active is skipped: its editor section never blocks, and
+/// the caller's rerun rings again if the table is still full. The
+/// host-served root's slots settle at its host venue; retired MMs' slots
+/// wait for their release receipts.
+fn drain_owed_return_table(
+    custody: &crate::trap::CarrierVmCustody,
+    region: RetainedAbiRegion<'_>,
+    zone: &Zone,
+    caller: carrick_el1_abi::ReservationMm,
+) -> Result<(), TrapError> {
+    let Some(table) = retained_reservations(region) else {
+        return Ok(());
+    };
+    if !table.owed_return_table_full() {
+        return Ok(());
+    }
+    let mut holders = Vec::new();
+    table.owed_return_holders(caller, &mut |holder| holders.push(holder));
+    for holder in holders {
+        settle_at_doorbell(custody, zone, holder)?;
+        if !table.owed_return_table_full() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// The doorbell's exit epilogue: release the claim from its exact word and

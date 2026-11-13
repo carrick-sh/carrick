@@ -762,7 +762,7 @@ pub enum OwedTerminalRefusal {
     Unreadable,
     /// A live, prepared or foreign terminal, or a retired one straddling the
     /// range, sits inside the owed range.
-    Occupied,
+    LiveTerminal,
 }
 
 /// The retired terminals of one owed return `[va, va + len)` in `root`, for
@@ -808,7 +808,7 @@ pub fn owed_retired_terminals<A: AnonymousDescriptorDecode>(
                     || base < va
                     || base + span > end
                 {
-                    return Err(OwedTerminalRefusal::Occupied);
+                    return Err(OwedTerminalRefusal::LiveTerminal);
                 }
                 if pass == 1 {
                     visit(RetiredTerminal {
@@ -910,7 +910,7 @@ mod owed_terminal_tests {
         fn check<A: AnonymousDescriptorDecode>(words: RefCell<BTreeMap<u64, u64>>) {
             assert_eq!(
                 settle::<A>(&words, 0x4000, 0x3000),
-                Err(OwedTerminalRefusal::Occupied),
+                Err(OwedTerminalRefusal::LiveTerminal),
                 "a live terminal in an owed range is a broken invariant"
             );
             // A hole below the mapping is skipped; the owed range may cover it.
