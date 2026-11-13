@@ -1525,7 +1525,8 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
     }
     /// Clear the retired terminals of one settled owed return of `mm` and
     /// drop the physical alias edges they kept (#1369 slice 3). `terminals`
-    /// came from [`owed_retired_terminals`] under the same editor exclusion.
+    /// came from `carrick_el1::memory::owed_retired_terminals` under the same
+    /// editor exclusion.
     /// The backing slots stay registered and admitted for `mm`: their frames
     /// return with the MM's own retirement, as on HVF. A word that changed
     /// under the exclusion quarantines the carrier (a broken invariant).
@@ -1534,18 +1535,22 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         mm: NonZeroU64,
         root: RootGpa,
         span: PageSpan,
-        terminals: &[RetiredTerminal],
+        terminals: &[carrick_el1::memory::RetiredTerminal],
     ) -> Result<(), MemoryError> {
         self.admit()?;
         let context = self
             .root(mm)
             .filter(|context| context.root == root)
             .ok_or_else(|| error("stale carrier MM/root for an owed return"))?;
-        if let Err(reason) = clear_retired_terminals(&self.words(), terminals) {
+        let words = self.words();
+        let cleared = carrick_el1::memory::clear_retired_terminals(
+            &|pa, current, new| words.compare_exchange(pa, current, new).ok(),
+            terminals,
+        );
+        words.publish_barrier();
+        if !cleared {
             self.quarantined = true;
-            return Err(error(format!(
-                "owed return terminal changed under exclusion: {reason:?}"
-            )));
+            return Err(error("owed return terminal changed under exclusion"));
         }
         self.remove_aliases(mm, span, context);
         if self.quarantined {
