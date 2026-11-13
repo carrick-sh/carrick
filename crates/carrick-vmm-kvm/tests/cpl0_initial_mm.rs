@@ -406,7 +406,7 @@ fn native_fork_child_execs_static_successor() {
     carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
     let elf = native_exit_fixture_with_flags("native_fork_exec.S", &[&define]);
-    let outcome = run_exec_fixture(&elf);
+    let outcome = run_exec_fixture(&elf, 32);
     assert_eq!(outcome.run.exit_code, 0, "child exec returned errno");
     assert_eq!(outcome.run.stdout, b"X\n");
     assert!(outcome.run.stderr.is_empty());
@@ -422,7 +422,7 @@ fn native_fork_child_execs_while_parent_keeps_running() {
     carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
     let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
     let elf = native_exit_fixture_with_flags("native_fork_exec_live.S", &[&define]);
-    let outcome = run_exec_fixture(&elf);
+    let outcome = run_exec_fixture(&elf, 128);
     let counters = outcome.physical.syscall_counters().expect("exec census");
     let exec_calls = counters.served[59].load(std::sync::atomic::Ordering::Acquire)
         + counters.refused[59].load(std::sync::atomic::Ordering::Acquire);
@@ -440,10 +440,13 @@ fn native_fork_child_execs_while_parent_keeps_running() {
 fn run_root_exec(path: &std::path::Path) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let define = format!("-DEXEC_PATH=\"{}\"", path.display());
     let elf = native_exit_fixture_with_flags("native_root_exec.S", &[&define]);
-    run_exec_fixture(&elf)
+    run_exec_fixture(&elf, 128)
 }
 
-fn run_exec_fixture(elf: &[u8]) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+fn run_exec_fixture(
+    elf: &[u8],
+    max_exits: usize,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("exec caller ELF");
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     dispatcher.set_fs_backend(Box::new(
@@ -452,7 +455,7 @@ fn run_exec_fixture(elf: &[u8]) -> carrick_runtime::prepare::PreparedKvmPoolOutc
     ));
     kvm_pool_fixture::try_run_program_with_dispatcher(
         &program,
-        128,
+        max_exits,
         ROOT_AFFINITY_LOADED,
         |_| {},
         dispatcher,
