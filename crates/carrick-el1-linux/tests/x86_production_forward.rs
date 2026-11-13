@@ -1248,15 +1248,6 @@ fn x86_child_exec_is_staged_then_counted_enosys() {
 
 #[test]
 fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
-    x86_native_child(false);
-}
-
-#[test]
-fn production_x86_misaligned_realtime_bitset_futex_is_einval() {
-    x86_native_child(true);
-}
-
-fn x86_native_child(futex_only: bool) {
     use carrick_abi::{
         LINUX_AT_EMPTY_PATH, LINUX_AT_FDCWD, LINUX_O_CREAT, LINUX_O_TRUNC, LINUX_O_WRONLY,
     };
@@ -2167,44 +2158,41 @@ fn x86_native_child(futex_only: bool) {
         }),
     };
 
-    if futex_only {
-        for offset in [1, 2, 3] {
-            for mask in [0, 0xffff_ffff] {
-                let (route, result) = call_x86(
-                    &env,
-                    &child,
-                    &mut service,
-                    202,
-                    [0x1000 + offset, 393, 1, 0, 0, mask],
-                );
-                assert_eq!(
-                    route,
-                    CompletionRoute::Served,
-                    "offset={offset} mask={mask}"
-                );
-                assert_eq!(
-                    result, -22,
-                    "op 393 must return errno 22, not errno 38; offset={offset} mask={mask}"
-                );
-                assert_eq!(
-                    loads.get(),
-                    0,
-                    "invalid operands require zero user-memory loads"
-                );
-            }
+    for offset in [1, 2, 3] {
+        for mask in [0, 0xffff_ffff] {
+            let (route, result) = call_x86(
+                &env,
+                &child,
+                &mut service,
+                202,
+                [0x1000 + offset, 393, 1, 0, 0, mask],
+            );
+            assert_eq!(
+                route,
+                CompletionRoute::Served,
+                "offset={offset} mask={mask}"
+            );
+            assert_eq!(
+                result, -22,
+                "op 393 must return errno 22, not errno 38; offset={offset} mask={mask}"
+            );
+            assert_eq!(
+                loads.get(),
+                0,
+                "invalid operands require zero user-memory loads"
+            );
         }
-        let mut diagnostic = String::new();
-        counters.write_futex_errors(&mut diagnostic).unwrap();
-        let samples: Vec<_> = diagnostic
-            .lines()
-            .filter(|line| line.contains("futex-error sample="))
-            .collect();
-        assert_eq!(samples.len(), 6, "{diagnostic}");
-        for sample in samples {
-            assert!(sample.contains("op=393"), "{sample}");
-            assert!(sample.contains("result=-22 errno=22"), "{sample}");
-        }
-        return;
+    }
+    let mut diagnostic = String::new();
+    counters.write_futex_errors(&mut diagnostic).unwrap();
+    let samples: Vec<_> = diagnostic
+        .lines()
+        .filter(|line| line.contains("futex-error sample="))
+        .collect();
+    assert_eq!(samples.len(), 6, "{diagnostic}");
+    for sample in samples {
+        assert!(sample.contains("op=393"), "{sample}");
+        assert!(sample.contains("result=-22 errno=22"), "{sample}");
     }
 
     // Child stats fd 1 (statx AT_EMPTY_PATH) and writes fd 1.
