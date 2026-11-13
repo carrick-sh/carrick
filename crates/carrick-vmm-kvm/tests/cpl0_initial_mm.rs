@@ -4099,3 +4099,25 @@ fn production_full_owed_return_table_parks_on_its_busy_holder_until_release() {
         "busy once, then success: one refused doorbell, one after the release: {counts:?}"
     );
 }
+
+/// #1482 P0-3: a sibling retires a COW replacement leaf while the COW's
+/// completion is outstanding. The fixture image holds the leader's user-fault
+/// COW after its guest copy and repoint completed, before its settlement
+/// crossing; the worker then unmaps the page (an owed return naming the
+/// replacement frame) and maps it again. Every exclusion must settle the
+/// outstanding COW completion before it settles owed returns: before the fix
+/// an exclusion cleared the retired replacement leaf first, so publishing the
+/// completion found no live descriptor and the carrier quarantined.
+#[test]
+fn production_exclusion_settles_an_outstanding_cow_before_its_retired_leaf() {
+    let elf = native_exit_fixture("native_cow_retire_race.S");
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+        .map_err(|failure| failure.error)
+        .expect("COW completion and sibling retirement run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "see native_cow_retire_race.S for the failed step: {:?}",
+        outcome.run
+    );
+}
