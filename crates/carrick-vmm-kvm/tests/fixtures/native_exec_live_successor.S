@@ -4,6 +4,26 @@
 .global _start
 .text
 _start:
+    /* Inspect and write the actual replacement stack, not just sealed RSP. */
+    test $15, %rsp
+    jnz failure
+    cmpq $1, (%rsp)
+    jne failure
+    mov 8(%rsp), %rax
+    test %rax, %rax
+    jz failure
+    cmpb $'/', (%rax)
+    jne failure
+    cmpq $0, 16(%rsp)
+    jne failure
+    cmpq $0, 24(%rsp)
+    jne failure
+    sub $16, %rsp
+    movabs $0x657865632d73746b, %rax
+    mov %rax, (%rsp)
+    cmp %rax, (%rsp)
+    jne failure
+    add $16, %rsp
     mov $110, %eax
     syscall
     test %eax, %eax
