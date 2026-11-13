@@ -43,6 +43,11 @@ fn serial_host_native_fork_exec_child_misaligned_futex_is_einval() {
     }
 }
 
+#[test]
+fn serial_host_native_fork_exec_child_futex_refusal_preserves_diagnostic_arguments() {
+    fork_exec_successor(Some(777));
+}
+
 fn fork_exec_successor(futex: Option<u64>) {
     fork_exec_successor_with_futex(futex, u32::MAX as u64);
 }
@@ -1867,6 +1872,7 @@ fn child_futex<'a>(
 ) {
     let (operation, bitset, timed, departure, misaligned) = futex;
     let invalid = misaligned || (operation == 393 && bitset == 0);
+    let unsupported = operation == 777;
     let counters = &carrick_el1_abi::Counters::new();
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
     use carrick_guest_arch::{Access, GuestLen};
@@ -2030,7 +2036,9 @@ fn child_futex<'a>(
                 "opcode refusal happens before UserCopy"
             );
         }
-        let expected_route = if invalid {
+        let expected_route = if unsupported {
+            CompletionRoute::Forward
+        } else if invalid {
             CompletionRoute::Served
         } else {
             CompletionRoute::Suspended
@@ -2043,6 +2051,15 @@ fn child_futex<'a>(
             frame.x[0] as i64
         );
         assert!(entry.take_run_failure().is_none());
+    }
+    if unsupported {
+        let mut diagnostic = String::new();
+        counters.write_syscall_frames(&mut diagnostic).unwrap();
+        assert!(diagnostic.contains("op=777"), "{diagnostic}");
+        assert!(diagnostic.contains("result=-38 errno=38"), "{diagnostic}");
+        assert_eq!(word.reads.get(), 0);
+        registry.unregister_root_for_test(runtime);
+        return;
     }
     if invalid {
         let mut diagnostic = String::new();

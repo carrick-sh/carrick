@@ -5339,10 +5339,19 @@ mod tests {
             thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(14),
         };
         let args = [0x1001, 393, 7, 0, 0, 0xffff_ffff];
-        for result in [0, 1, -4, -11, -110] {
+        for result in [0, -4, -11, -110] {
             counters.record_futex_error(args, result, 0x400004, 2, binding);
         }
+        let mut wake = args;
+        wake[1] = 129;
+        counters.record_futex_error(wake, 1, 0x400004, 2, binding);
         assert_eq!(counters.syscall_frame_slots.load(Ordering::Relaxed), 0);
+        counters.record_futex_error(args, 7, 0x400004, 2, binding);
+        assert_eq!(
+            counters.syscall_frame_slots.load(Ordering::Relaxed),
+            1,
+            "a positive wait return is a protocol error, not a wake count"
+        );
         for _ in 0..40 {
             counters.record_futex_error(args, -22, 0x400004, 2, binding);
         }
@@ -5352,6 +5361,7 @@ mod tests {
         snapshot.write_syscall_frames(&mut output).unwrap();
         assert_eq!(output.matches("futex-error sample=").count(), 32);
         assert!(output.contains("task=13 thread=14 address=0x1001 op=393 value=7 timeout=0x0 uaddr2=0x0 mask=0xffffffff result=-22 errno=22"));
+        assert!(output.contains("result=7 errno=0"));
         assert!(output.contains("samples=32/32 (bounded prefix; not a census)"));
     }
 
