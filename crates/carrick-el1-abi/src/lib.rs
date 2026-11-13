@@ -3148,6 +3148,7 @@ pub enum SyscallFrameSource {
     SchedulerOwnerReplay = 6,
     SchedulerSavedReplay = 7,
     HostIpcReplay = 8,
+    FutexErrorReturn = 9,
 }
 impl SyscallFrameSource {
     pub const fn label(self) -> &'static str {
@@ -3160,6 +3161,7 @@ impl SyscallFrameSource {
             Self::SchedulerOwnerReplay => "scheduler-owner-replay",
             Self::SchedulerSavedReplay => "scheduler-saved-replay",
             Self::HostIpcReplay => "host-ipc-replay",
+            Self::FutexErrorReturn => "futex-error-return",
         }
     }
     fn from_code(code: u64) -> Option<Self> {
@@ -3172,6 +3174,7 @@ impl SyscallFrameSource {
             6 => Self::SchedulerOwnerReplay,
             7 => Self::SchedulerSavedReplay,
             8 => Self::HostIpcReplay,
+            9 => Self::FutexErrorReturn,
             _ => return None,
         })
     }
@@ -3231,7 +3234,8 @@ pub struct Counters {
     /// Zero binding words denote an absent identity, never a matching owner.
     pub copy_refusals: [[AtomicU64; 23]; 16],
     pub copy_refusal_slots: AtomicU64,
-    /// First 32 ppoll frame-source samples, not a complete execution census.
+    /// First 32 ppoll frame-source or unexpected futex-error samples,
+    /// not a complete execution census.
     /// commit, source, ordinal, PC, slot, `binding[4]`, `arguments[6]`, syndrome.
     pub syscall_frames: [[AtomicU64; 16]; 32],
     pub syscall_frame_slots: AtomicU64,
@@ -3478,6 +3482,39 @@ impl Counters {
         ]);
     }
 
+    /// Retain unexpected in-ring futex errors in the existing bounded diagnostic
+    /// buffer. Normal wait outcomes do not consume samples. This is observation,
+    /// never syscall completion authority; a full prefix cannot prove absence.
+    pub fn record_futex_error(
+        &self,
+        arguments: [u64; 6],
+        result: i64,
+        pc: u64,
+        slot: u64,
+        binding: ExecutionBinding,
+    ) {
+        if result >= 0 || matches!(result, -4 | -11 | -110) {
+            return;
+        }
+        self.publish_syscall_frame([
+            SyscallFrameSource::FutexErrorReturn as u64,
+            carrick_syscall_abi::nr::FUTEX.raw(),
+            pc,
+            slot,
+            binding.mm.raw(),
+            binding.generation.raw(),
+            binding.task.raw(),
+            binding.thread_generation.raw(),
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            arguments[5],
+            result as u64,
+        ]);
+    }
+
     fn publish_syscall_frame(&self, words: [u64; 15]) {
         let Ok(slot) =
             self.syscall_frame_slots
@@ -3501,6 +3538,26 @@ impl Counters {
             }
             let word = |i: usize| row[i].load(Ordering::Relaxed);
             let source = SyscallFrameSource::from_code(word(1)).map_or("unknown", |s| s.label());
+            if word(1) == SyscallFrameSource::FutexErrorReturn as u64 {
+                writeln!(
+                    output,
+                    "futex-error sample={sample} pc={:#x} slot={} task={} thread={} address={:#x} op={} value={} timeout={:#x} uaddr2={:#x} mask={:#x} result={} errno={}",
+                    word(3),
+                    word(4),
+                    word(7),
+                    word(8),
+                    word(9),
+                    word(10),
+                    word(11),
+                    word(12),
+                    word(13),
+                    word(14),
+                    word(15) as i64,
+                    (word(15) as i64).unsigned_abs()
+                )?;
+                continue;
+            }
+
             writeln!(
                 output,
                 "syscall-frame sample={sample} source={source} nr={} pc={:#x} slot={} binding[mm={},generation={},task={},thread={}] args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] {}={:#x}",
@@ -5269,6 +5326,33 @@ mod tests {
         assert_eq!(Action::Served as u64, 0);
         assert_eq!(Action::Forward as u64, 1);
         assert_eq!(Action::ServedWithWork as u64, 2);
+    }
+
+    #[test]
+    fn futex_error_samples_keep_arguments_numeric_errno_and_snapshot() {
+        extern crate std;
+        let counters = Counters::new();
+        let binding = ExecutionBinding {
+            mm: carrick_core_abi::EntryMmKey::from_raw(11),
+            generation: carrick_core_abi::SnapshotGeneration::from_raw(12),
+            task: carrick_core_abi::EntryTaskKey::from_raw(13),
+            thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(14),
+        };
+        let args = [0x1001, 393, 7, 0, 0, 0xffff_ffff];
+        for result in [0, 1, -4, -11, -110] {
+            counters.record_futex_error(args, result, 0x400004, 2, binding);
+        }
+        assert_eq!(counters.syscall_frame_slots.load(Ordering::Relaxed), 0);
+        for _ in 0..40 {
+            counters.record_futex_error(args, -22, 0x400004, 2, binding);
+        }
+        assert_eq!(counters.syscall_frame_slots.load(Ordering::Relaxed), 32);
+        let snapshot = counters.copy_snapshot();
+        let mut output = std::string::String::new();
+        snapshot.write_syscall_frames(&mut output).unwrap();
+        assert_eq!(output.matches("futex-error sample=").count(), 32);
+        assert!(output.contains("task=13 thread=14 address=0x1001 op=393 value=7 timeout=0x0 uaddr2=0x0 mask=0xffffffff result=-22 errno=22"));
+        assert!(output.contains("samples=32/32 (bounded prefix; not a census)"));
     }
 
     #[test]

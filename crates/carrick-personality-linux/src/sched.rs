@@ -19,7 +19,7 @@ impl FutexFrequency {
         self.0
     }
 }
-pub const SYS_FUTEX: usize = 98;
+pub const SYS_FUTEX: usize = carrick_syscall_abi::nr::FUTEX.raw() as usize;
 pub const FUTEX_WAIT_PRIVATE: u64 = 128;
 pub const FUTEX_WAKE_PRIVATE: u64 = 129;
 pub const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;

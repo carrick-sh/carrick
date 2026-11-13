@@ -2045,6 +2045,10 @@ fn child_futex<'a>(
         assert!(entry.take_run_failure().is_none());
     }
     if invalid {
+        let mut diagnostic = String::new();
+        counters.write_syscall_frames(&mut diagnostic).unwrap();
+        assert!(diagnostic.contains("op=393"), "{diagnostic}");
+        assert!(diagnostic.contains("result=-22 errno=22"), "{diagnostic}");
         assert_eq!(
             word.reads.get(),
             0,

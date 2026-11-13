@@ -8,18 +8,26 @@ use carrick_image::PullPolicy;
 
 fn node(script: &str) -> String {
     let _guard = common::guest_lock();
+    carrick_embed::reset_el1_counters();
     let result = common::run_or_fail(
         ContainerBuilder::from_image("node:22-slim")
             .pull_policy(PullPolicy::Missing)
             .command(["node", "-e", script])
             .run_blocking(),
     );
+    let mut diagnostics = String::new();
+    if let Some(counters) = carrick_embed::read_el1_counters() {
+        counters
+            .write_syscall_frames(&mut diagnostics)
+            .expect("format diagnostics");
+    }
     assert!(
         result.success(),
-        "Node exit={} stdout={} stderr={}",
+        "Node exit={} stdout={} stderr={} ring diagnostics={}",
         result.exit_code,
         result.stdout_utf8(),
-        result.stderr_utf8()
+        result.stderr_utf8(),
+        diagnostics
     );
     result.stdout_utf8().trim().to_owned()
 }
