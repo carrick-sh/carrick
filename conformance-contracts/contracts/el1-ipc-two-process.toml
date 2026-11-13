@@ -15,6 +15,7 @@ id = "kernel.el1.ipc-two-process"
 title = "Two-process blocking pipe and eventfd IPC is served and parked in the guest"
 guest_surfaces = [
   "syscall:read",
+  "syscall:readv",
   "syscall:write",
   "syscall:writev",
   "syscall:eventfd2",
@@ -27,6 +28,7 @@ guest_surfaces = [
   "vmm:kvm",
 ]
 semantic_authority = [
+  "man 2 readv: scatter in vector order and return the delivered prefix; a later destination fault does not consume undelivered pipe bytes; retained imported headers are not reread after parking",
   "man 2 writev: vectors are consumed in order as one write; pipe atomicity applies to their aggregate length, and imported vector headers survive suspension",
   "man 2 pipe / man 7 pipe: a read on an empty pipe with a live writer blocks until data is written, and returns EOF after every writer closes; writes of at most PIPE_BUF bytes are atomic",
   "man 2 eventfd: a read blocks while the counter is zero and returns the counter value once it is nonzero",

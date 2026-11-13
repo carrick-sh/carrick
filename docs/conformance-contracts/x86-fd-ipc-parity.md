@@ -37,3 +37,24 @@ and go-version/hello, with exact next-stop stderr for failures.
 Do not edit the other lanes' fault, prepared-page or owed-return settlement
 functions (#2263, #2266, #2250). A successful IPC probe does not establish that
 these independent lifecycle/memory blockers have landed.
+
+## Implemented shared correction and evidence limits
+
+Legacy x86 wait normalization now discards the two non-arguments and retains
+native identity 232 while selecting the canonical pwait owner. Pipe readv now
+shares imported vector custody with writev; one range walker supplies gather
+and scatter, and the neutral transaction records only delivered bytes. A later
+scatter fault leaves undelivered pipe bytes intact. Vector calls never enter
+the scalar host-file fallback with an iovec address interpreted as a buffer.
+
+Real KVM passes all five family bindings: exact scalar child-to-parent byte,
+readv scatter, exec-failure report followed by EOF, root fd/status flags and
+redirect/restore, and legacy epoll wake with garbage non-argument registers.
+The pool root's fcntl already passed before this lane changed production code;
+it cannot demonstrate the reported CLI-root refusal. No crossing change is
+justified by that pool result alone.
+
+The successful-exec CLOEXEC and exhausted-default-pool gaps are recorded in
+`followup-1.md` and `followup-2.md`. The failed-exec witness does not claim that
+x86 exec replacement is implemented. Signed ARM, Docker differential and
+artifact promotion are not established by these KVM or VM-free tests.

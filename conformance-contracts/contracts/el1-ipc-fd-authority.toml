@@ -74,6 +74,11 @@ vm_free = [
   "carrick-el1-linux::ipc::tests::el1_ipc_io_first_write_supplies_shared_storage_or_returns_enomem",
 ]
 
+embed = [
+  "carrick-vmm-kvm::cpl0_initial_mm::root_fcntl_redirect_restore_preserves_one_description_owner",
+  "carrick-cli::x86_kvm_run::mounted_root_fcntl_redirect_restore_preserves_host_description_owner",
+]
+
 [bindings.unresolved]
 kvm = "Executing metadata-only x86 binding: carrick-vmm-kvm::cpl0_entry::production_pipe_metadata_stays_in_the_ring_namespace. Real KVM required; the contract evaluator has no registered KVM observation layer. Byte-moving x86 IPC remains #1756; signed ARM and CPython remain director-owned."
 embed_structural = "EL0 pair-copyout and actual mapped-file pin integration require a carrick-conformance-next binding after Phase B/memory integration; core pins alone do not prove those consumers."

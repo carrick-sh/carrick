@@ -2602,3 +2602,26 @@ fn mounted_static_x86_xattr_crossings_match_native() {
 fn mounted_static_x86_xattr_crossings_in_a_fork_child_refuse_in_ring() {
     forked_child_crossings_refuse_in_ring("x86_b1_xattr.S");
 }
+
+/// #2107: the mounted CLI root must share the host file authority, even
+/// though the production pool's synthetic root already owns ring stdio.
+#[test]
+fn mounted_root_fcntl_redirect_restore_preserves_host_description_owner() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("root-fcntl");
+    compile_assembly(
+        "../../../carrick-vmm-kvm/tests/fixtures/native_root_fcntl.S",
+        &elf,
+    );
+    let guest = run_mounted_binary(&elf, "root-fcntl", false);
+    assert_eq!(
+        guest.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert!(guest.stdout.is_empty(), "redirect must reach pipe");
+}
