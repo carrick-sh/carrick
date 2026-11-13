@@ -135,9 +135,23 @@ pub fn transfer_with_input<U: UserCopy>(
     guard: &mut IpcObjectGuard<'_>,
     op: &mut IpcOperation,
     copy: &mut PrefixCopy<'_, U>,
-    mut input: impl FnMut(&mut PrefixCopy<'_, U>, u64, &mut [u8]) -> usize,
+    input: impl FnMut(&mut PrefixCopy<'_, U>, u64, &mut [u8]) -> usize,
 ) -> Result<(StepStatus, WakeSet), IpcError> {
     let buf = op.buf.0;
+    transfer_with_io(guard, op, copy, input, |copy, at, src| {
+        copy.copy_out(buf.wrapping_add(at), src)
+    })
+}
+
+/// One transaction with retained logical input and output ranges. Object
+/// progress advances only by the delivered prefix in either direction.
+pub fn transfer_with_io<U: UserCopy>(
+    guard: &mut IpcObjectGuard<'_>,
+    op: &mut IpcOperation,
+    copy: &mut PrefixCopy<'_, U>,
+    mut input: impl FnMut(&mut PrefixCopy<'_, U>, u64, &mut [u8]) -> usize,
+    mut output: impl FnMut(&mut PrefixCopy<'_, U>, u64, &[u8]) -> usize,
+) -> Result<(StepStatus, WakeSet), IpcError> {
     let mut wake = WakeSet::default();
     let mut owe = |w: WakeSet| {
         wake.readers |= w.readers;
@@ -146,10 +160,10 @@ pub fn transfer_with_input<U: UserCopy>(
     let status = match op.kind {
         IpcOpKind::PipeRead => {
             let mut p = guard.pipe()?;
-            let base = buf.wrapping_add(op.progress.written);
+            let base = op.progress.written;
             let mut at = 0u64;
             let step = p.read_with(op.progress.remaining(), |chunk| {
-                let n = copy.copy_out(base.wrapping_add(at), chunk);
+                let n = output(copy, base.wrapping_add(at), chunk);
                 at += n as u64;
                 n
             });
@@ -183,7 +197,7 @@ pub fn transfer_with_input<U: UserCopy>(
             let e = guard.eventfd()?;
             let step = e.read_with(|value| {
                 let bytes = value.to_ne_bytes();
-                copy.copy_out(buf, &bytes) == bytes.len()
+                output(copy, 0, &bytes) == bytes.len()
             });
             owe(step.wake);
             match step.result {

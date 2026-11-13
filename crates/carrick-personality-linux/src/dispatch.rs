@@ -710,7 +710,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
     match ordinal {
         nr if nr == crate::crossing::nr::GETRANDOM.raw() => Family::NativeService,
         nr if nr == crate::crossing::nr::READLINKAT.raw() => Family::NativeHostFile,
-        63 => Family::Read,
+        63 | 65 => Family::Read,
         64 | 66 => Family::Write,
         20 | 21 => Family::Descriptor,
         22 | 441 => Family::EpollWait,
@@ -1683,7 +1683,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     // File fallback follows the IPC authority's explicit decline, never a
     // retained operation's handback or completion.
     result = match family {
-        Family::Read => pending.file_read().into(),
+        Family::Read if ordinal != crate::crossing::nr::READV.raw() => pending.file_read().into(),
         Family::Write if ordinal != crate::crossing::nr::WRITEV.raw() => {
             pending.file_write().into()
         }
