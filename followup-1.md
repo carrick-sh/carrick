@@ -19,6 +19,13 @@ The recovered root patch is unfinished and must not land or enable the
 crossing. It selects RootExecRoute::Ring and carries root image identity,
 but both doorbell handlers discard NativeExecCrossing::RootSettled. The
 runtime never commits the host Kernel transition or retargets the root.
+The continuation therefore restores caller_access before service publication:
+the root remains a counted ENOSYS until the full transaction can own it.
+The existing access-refusal witness failed on the recovered WIP (1001 pass,
+1 fail, 9 ignored); it is retained unchanged as the guard regression witness.
+Before restoring the guard, real KVM passed the ENOENT/ENOEXEC cases but
+failed successful root replacement with `unregistered forward CR3: root
+0x480c000, rip 0xffffffff80005102` (run 2235r3-root).
 
 The missing shared interface must retain the neutral transaction across
 Exec preparation, the consuming adopt crossing, and settlement. Today
