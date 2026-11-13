@@ -34,7 +34,8 @@
 //! forwarded and the host resolves it as before).
 
 pub use crate::{
-    COW_DECLINE_REASONS, COW_GRANT_SIZE, CowDecline, CowGrant, CowGrantCompletion, CowGrantPurpose,
+    COW_DECLINE_REASONS, COW_GRANT_SIZE, CowClaimSource, CowDecline, CowGrant, CowGrantCompletion,
+    CowGrantPurpose,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
 use carrick_sched_core::ExcludedEditor;
@@ -46,7 +47,7 @@ pub const COW_GRANT_POOL_SLOTS: usize = 1024;
 /// Probe chain length for one MM's records.
 pub const COW_GRANT_PROBES: usize = 64;
 /// Protocol revision, included in each image ABI layout identity.
-pub const COW_GRANT_PROTOCOL_VERSION: u64 = 2;
+pub const COW_GRANT_PROTOCOL_VERSION: u64 = 3;
 
 const EMPTY: u64 = 0;
 const WRITING: u64 = 1;
@@ -73,6 +74,11 @@ pub struct CowGrantRecord {
     old_ipa: AtomicU64,
     new_ipa: AtomicU64,
     purpose: AtomicU64,
+    /// A grant supplied for one exact COW source: its page, or 0 when any
+    /// COW fault of the MM may take it. Written before READY is published.
+    reserved_va: AtomicU64,
+    /// The source frame that reserved grant replaces (with `reserved_va`).
+    reserved_old_ipa: AtomicU64,
 }
 
 impl CowGrantRecord {
@@ -90,6 +96,20 @@ impl CowGrantRecord {
             old_ipa: AtomicU64::new(0),
             new_ipa: AtomicU64::new(0),
             purpose: AtomicU64::new(0),
+            reserved_va: AtomicU64::new(0),
+            reserved_old_ipa: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether a READY grant may replace `source`: an unreserved grant
+    /// replaces any source of its MM, a reserved one only its own.
+    fn admits(&self, source: Option<CowClaimSource>) -> bool {
+        match self.reserved_va.load(Ordering::Relaxed) {
+            0 => true,
+            page => source.is_some_and(|source| {
+                source.va & !0xfff == page
+                    && source.old_ipa == self.reserved_old_ipa.load(Ordering::Relaxed)
+            }),
         }
     }
 
@@ -156,6 +176,33 @@ impl CowGrantPool {
         physical_ipa: u64,
         backing: BackingIdentity,
     ) -> Option<CowGrant> {
+        self.publish_for(mm_key, None, physical_ipa, backing)
+    }
+
+    /// As [`Self::publish`], for one exact COW source: only a COW fault of
+    /// `source.va`'s page that still maps `source.old_ipa` may claim it
+    /// ([`Self::claim_for`]). The supply then outlives the lane that asked
+    /// for it: whichever lane of the MM next breaks that COW consumes it.
+    pub fn publish_reserved(
+        &self,
+        mm_key: u64,
+        source: CowClaimSource,
+        physical_ipa: u64,
+        backing: BackingIdentity,
+    ) -> Option<CowGrant> {
+        if source.va & !0xfff == 0 || source.old_ipa == 0 {
+            return None;
+        }
+        self.publish_for(mm_key, Some(source), physical_ipa, backing)
+    }
+
+    fn publish_for(
+        &self,
+        mm_key: u64,
+        source: Option<CowClaimSource>,
+        physical_ipa: u64,
+        backing: BackingIdentity,
+    ) -> Option<CowGrant> {
         if mm_key == 0 || physical_ipa == 0 || !physical_ipa.is_multiple_of(COW_GRANT_SIZE) {
             return None;
         }
@@ -199,6 +246,13 @@ impl CowGrantPool {
             ] {
                 cell.store(0, Ordering::Relaxed);
             }
+            record.reserved_va.store(
+                source.map_or(0, |source| source.va & !0xfff),
+                Ordering::Relaxed,
+            );
+            record
+                .reserved_old_ipa
+                .store(source.map_or(0, |source| source.old_ipa), Ordering::Relaxed);
             let ready = (writing & !STATE_MASK) | READY;
             record.state.store(ready, Ordering::Release);
             return Some(CowGrant {
@@ -212,8 +266,19 @@ impl CowGrantPool {
         None
     }
 
-    /// EL1, holding `mm_key`'s editor: take one ready grant of this MM.
+    /// EL1, holding `mm_key`'s editor: take one ready unreserved grant of
+    /// this MM. A grant reserved for one COW source is never taken here.
     pub fn claim(&self, mm_key: u64) -> Option<CowGrant> {
+        self.claim_matching(mm_key, None)
+    }
+
+    /// EL1, holding `mm_key`'s editor, to break the COW of `source`: take a
+    /// ready grant reserved for exactly that source, or an unreserved one.
+    pub fn claim_for(&self, mm_key: u64, source: CowClaimSource) -> Option<CowGrant> {
+        self.claim_matching(mm_key, Some(source))
+    }
+
+    fn claim_matching(&self, mm_key: u64, source: Option<CowClaimSource>) -> Option<CowGrant> {
         if mm_key == 0 {
             return None;
         }
@@ -221,7 +286,10 @@ impl CowGrantPool {
             let slot = Self::probe(mm_key, offset);
             let record = &self.records[slot];
             let word = record.state.load(Ordering::Acquire);
-            if word & STATE_MASK != READY || record.mm_key.load(Ordering::Relaxed) != mm_key {
+            if word & STATE_MASK != READY
+                || record.mm_key.load(Ordering::Relaxed) != mm_key
+                || !record.admits(source)
+            {
                 continue;
             }
             let Some(grant) = record.grant(slot, word) else {
@@ -502,6 +570,9 @@ impl crate::CowGrantVenue for CowGrantPool {
     fn claim(&self, mm_key: u64) -> Option<CowGrant> {
         self.claim(mm_key)
     }
+    fn claim_for(&self, mm_key: u64, source: CowClaimSource) -> Option<CowGrant> {
+        self.claim_for(mm_key, source)
+    }
     fn abandon(&self, grant: &CowGrant) -> bool {
         self.abandon(grant)
     }
@@ -593,6 +664,69 @@ mod tests {
         assert!(!pool.finish(&seven, &published), "settled exactly once");
         assert!(!pool.any_completed());
         assert_eq!(pool.resolved(), 1);
+    }
+
+    /// #2141: a grant supplied for one exact COW source is the MM's, not the
+    /// supplying lane's. Only a fault of that page that still maps that
+    /// source frame takes it, on any lane; an unreserved claim, another page
+    /// or a changed source never does, and the host can revoke it unused.
+    #[test]
+    fn a_reserved_grant_is_taken_only_for_its_exact_source() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let pool = CowGrantPool::new();
+        let source = CowClaimSource {
+            va: 0x4000_1000,
+            old_ipa: 0x9_0000_1000,
+        };
+        assert!(
+            pool.publish_reserved(
+                7,
+                CowClaimSource { va: 0, ..source },
+                0x8_0000_4000,
+                backing(1)
+            )
+            .is_none(),
+            "a reservation names a page"
+        );
+        let reserved = pool
+            .publish_reserved(7, source, 0x8_0000_4000, backing(10))
+            .unwrap();
+        assert_eq!(pool.ready(7).collect::<Vec<_>>(), vec![reserved]);
+        assert!(pool.claim(7).is_none(), "an unreserved claim skips it");
+        for other in [
+            CowClaimSource {
+                va: 0x4000_2000,
+                ..source
+            },
+            CowClaimSource {
+                old_ipa: 0x9_0000_2000,
+                ..source
+            },
+        ] {
+            assert!(pool.claim_for(7, other).is_none());
+        }
+        assert!(
+            pool.claim_for(8, source).is_none(),
+            "another MM never takes it"
+        );
+        // Any offset in the reserved page names the same source page.
+        let claimed = pool
+            .claim_for(
+                7,
+                CowClaimSource {
+                    va: source.va + 0x10,
+                    ..source
+                },
+            )
+            .unwrap();
+        assert_eq!(claimed, reserved);
+        assert!(pool.abandon(&claimed));
+        assert!(pool.revoke(&excluded(&spaces, 7), &reserved));
+        assert!(pool.claim_for(7, source).is_none());
+        // A freed record's next publication is unreserved again.
+        let open = pool.publish(7, 0x8_0000_8000, backing(20)).unwrap();
+        assert_eq!(open.slot, reserved.slot);
+        assert_eq!(pool.claim_for(7, source), Some(open));
     }
 
     #[test]
@@ -820,6 +954,8 @@ mod layout_manifest {
                      old_ipa: _,
                      new_ipa: _,
                      purpose: _,
+                     reserved_va: _,
+                     reserved_old_ipa: _,
                  }: CowGrantRecord| {};
         field!(CowGrantRecord, state, AtomicU64, 0, 8, 8);
         field!(CowGrantRecord, mm_key, AtomicU64, 8, 8, 8);
@@ -833,6 +969,8 @@ mod layout_manifest {
         field!(CowGrantRecord, old_ipa, AtomicU64, 72, 8, 8);
         field!(CowGrantRecord, new_ipa, AtomicU64, 80, 8, 8);
         field!(CowGrantRecord, purpose, AtomicU64, 88, 8, 8);
+        field!(CowGrantRecord, reserved_va, AtomicU64, 96, 8, 8);
+        field!(CowGrantRecord, reserved_old_ipa, AtomicU64, 104, 8, 8);
     }
 
     #[test]

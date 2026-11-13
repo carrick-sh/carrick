@@ -3063,10 +3063,11 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     anonymous_next_gpa: FrameGpa,
     /// Exec successors reserved before their arm (#1093 S4c slice c).
     exec_preparations: exec_service::X86ExecPreparations<exec_service::CarrierExecData>,
-    anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
-    /// Per CPU: a COW completion another exclusion published before the
-    /// faulting CPU's settlement crossing arrived (#1482 P0-3).
-    cow_published: [Option<carrick_hal::fork_stock::GrantExecution>; 2],
+    anonymous_pending: [Option<anonymous_owner::PendingPrepare>; 2],
+    /// Completed MM-owned COW supplies awaiting their settlement crossing.
+    cow_published: Vec<(carrick_hal::fork_stock::GrantExecution, u64)>,
+    cow_pending: Vec<anonymous_owner::PendingCow>,
+    withdrawn_pending: Vec<anonymous_owner::PendingPrepare>,
     native_backing_pending:
         std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
     owner_grant_crossings: u64,
@@ -4486,7 +4487,9 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
             exec_preparations: exec_service::X86ExecPreparations::default(),
             anonymous_pending: [None, None],
-            cow_published: [None, None],
+            cow_published: Vec::new(),
+            cow_pending: Vec::new(),
+            withdrawn_pending: Vec::new(),
             native_backing_pending: std::collections::BTreeMap::new(),
             owner_grant_crossings: 0,
             return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
