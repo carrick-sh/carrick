@@ -135,6 +135,14 @@ mod decode_tests {
     use super::*;
 
     #[test]
+    fn x86_legacy_epoll_wait_discards_non_arguments() {
+        let call = decode_x86_64(232, [7, 0x1000, 3, u64::MAX, 1, 0xdead], 0x8000);
+        assert_eq!(call.canonical, crate::crossing::nr::EPOLL_PWAIT);
+        assert_eq!(call.args, [7, 0x1000, 3, u64::MAX, 0, 0]);
+        assert_eq!(call.native.raw(), 232);
+    }
+
+    #[test]
     fn x86_fork_normalizes_to_the_shared_clone_shape() {
         let call = decode_x86_64(57, [91, 92, 93, 94, 95, 96], 0x8000);
         assert_eq!(call.canonical.raw(), crate::lifecycle::SYS_CLONE as u64);
