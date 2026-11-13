@@ -654,8 +654,13 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 if leaf_output(entry, level) != expected.raw() + offset {
                     return Err(DescriptorRefusal::WrongBacking);
                 }
+                // A fork-armed leaf with write intent satisfies a write
+                // publication: it becomes resident and still COW-armed, so
+                // the retried store takes the COW copy (ARM's deferred fork
+                // COW). It never becomes writable onto the shared frame.
+                let cow_write_intent = entry & (COW | MAY_WRITE) == COW | MAY_WRITE;
                 if entry & USER == 0
-                    || matches!(access, Access::Write) && entry & WRITE == 0
+                    || matches!(access, Access::Write) && entry & WRITE == 0 && !cow_write_intent
                     || matches!(access, Access::Execute) && entry & NX != 0
                 {
                     return Err(DescriptorRefusal::PermissionDenied);
@@ -1325,6 +1330,28 @@ pub fn translate_leaf<W: LiveDescriptorWords + ?Sized>(
 ) -> Result<TranslatedLeaf, FaultClass> {
     walk_leaf_inner(words, root, va, access, user, WalkMode::Ring)
         .map_err(HardwareFaultClass::to_fault_class)
+}
+
+/// Whether a leaf another publication already made resident satisfies this
+/// faulting access to `expected`. A fork-armed leaf with write intent
+/// satisfies a write: the retried store takes the COW copy, as on ARM.
+pub fn resident_satisfies_publication<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: RootGpa,
+    va: UserVa,
+    expected: FrameGpa,
+    access: Access,
+) -> bool {
+    let probe = match access {
+        Access::Write => Access::Read,
+        other => other,
+    };
+    translate_leaf(words, root, va, probe, true).is_ok_and(|leaf| {
+        leaf.output == expected
+            && (access != Access::Write
+                || leaf.effective_writable
+                || leaf.descriptor & (COW | MAY_WRITE) == COW | MAY_WRITE)
+    })
 }
 
 /// Hardware-mode 4-level page-table walk sharing the single walk loop of [`translate_leaf`].

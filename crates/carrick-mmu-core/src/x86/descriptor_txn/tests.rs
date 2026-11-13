@@ -1090,7 +1090,113 @@ fn prepared_readonly_leaf_refuses_write_publication_without_a_store() {
         DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied),
     );
     assert_eq!(*words.words.borrow(), before);
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Publish {
+                span,
+                expected: FrameGpa::new(0x800000),
+                access: Access::Read,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let resident = |access| {
+        resident_satisfies_publication(
+            &words,
+            root(0x1000),
+            UserVa::new(span.va),
+            FrameGpa::new(0x800000),
+            access,
+        )
+    };
+    assert!(resident(Access::Read));
+    assert!(!resident(Access::Write));
 }
+/// A fork arms a not-yet-present writable leaf for COW. The child's first
+/// write publishes it resident and still COW-armed, so the retried store
+/// takes the COW copy, as ARM's deferred fork COW does (#2226).
+#[test]
+fn fork_armed_prepared_leaf_publishes_for_write_and_stays_cow_armed() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let op = DescriptorOp::Map {
+        span,
+        output: FrameGpa::new(0x800000),
+        permissions: Permissions {
+            writable: true,
+            executable: false,
+            user: true,
+        },
+        size: LeafSize::Page,
+        resident: false,
+        backing: backing(),
+    };
+    assert!(matches!(
+        apply(&words, op, &[root(0x2000), root(0x3000), root(0x4000)]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(&words, DescriptorOp::ArmCow(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Publish {
+                span,
+                expected: FrameGpa::new(0x800000),
+                access: Access::Write,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let leaf = read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va))
+        .unwrap()
+        .0;
+    assert_eq!(leaf & (PRESENT | PREPARED | WRITE | COW), PRESENT | COW);
+    // A second CPU's racing write fault finds the leaf already resident:
+    // its publication is satisfied and its retry takes the COW copy.
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Publish {
+                span,
+                expected: FrameGpa::new(0x800000),
+                access: Access::Write,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared),
+    );
+    assert!(resident_satisfies_publication(
+        &words,
+        root(0x1000),
+        UserVa::new(span.va),
+        FrameGpa::new(0x800000),
+        Access::Write,
+    ));
+    let walk = |access| translate(&words, root(0x1000), UserVa::new(span.va), access, true);
+    assert_eq!(walk(Access::Read), Ok(FrameGpa::new(0x800000)));
+    assert_eq!(walk(Access::Write), Err(FaultClass::CowWrite));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::CowRepoint {
+                span,
+                old: FrameGpa::new(0x800000),
+                new: FrameGpa::new(0x900000),
+                backing: backing()
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(walk(Access::Write), Ok(FrameGpa::new(0x900000)));
+}
+
 #[test]
 fn split_and_coalesce_preserve_pat_output_and_neighbors() {
     for size in [LeafSize::Block2M, LeafSize::Block1G] {
