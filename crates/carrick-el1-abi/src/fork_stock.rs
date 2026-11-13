@@ -28,6 +28,13 @@ pub const NATIVE_PEER_READY_PORT: u16 = 0xd4;
 /// x86 synchronous I/O port for [`NativeChildRetire`], the twin of AArch64
 /// `HVC #6` with [`GRANT_OP_CHILD_RETIRE`].
 pub const NATIVE_CHILD_RETIRE_PORT: u16 = 0xd6;
+/// x86 synchronous I/O port for a native exec's consuming crossings, the
+/// twin of AArch64 `HVC #6` with [`GRANT_OP_EXEC_ADOPT`],
+/// [`GRANT_OP_EXEC_CANCEL`] and [`GRANT_OP_EXEC_SETTLE`]: RDI names the
+/// operation and RAX the operation's record on the stopped CPU's
+/// supervisor stack ([`NativeExecAdoption`], [`NativeExecCancellation`] or
+/// [`NativeExecSettlement`]).
+pub const NATIVE_EXEC_PORT: u16 = 0xda;
 
 /// One synchronous, consuming native-exec adoption request. The carrier
 /// authenticates the manifest against the retained service identity and the
@@ -204,6 +211,88 @@ impl NativeExecCancellation {
             _ => return None,
         };
         self.words[2] = Self::CONSUMED;
+        Some(result)
+    }
+}
+
+/// One synchronous settlement of an adopted exec's predecessor (the x86
+/// transport of [`GRANT_OP_EXEC_SETTLE`]; AArch64 passes the same two MMs
+/// in registers). The ring sends it once its slot has switched to the
+/// successor; the carrier then releases the predecessor's stock and
+/// physical custody, or defers that release to its next quarantine drain.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct NativeExecSettlement {
+    words: [u64; 8],
+}
+
+impl NativeExecSettlement {
+    const MAGIC: u64 = 0x4352_4558_5345_544c;
+    const PENDING: u64 = 0;
+    const ACCEPTED: u64 = 1;
+    const REFUSED: u64 = 2;
+    const CONSUMED: u64 = 3;
+
+    pub fn new(predecessor: ReservationMm, successor: ReservationMm) -> Self {
+        Self {
+            words: [
+                Self::MAGIC,
+                predecessor.raw(),
+                successor.raw(),
+                Self::PENDING,
+                0,
+                0,
+                0,
+                0,
+            ],
+        }
+    }
+
+    /// Carrier: the unanswered request's predecessor and successor MMs.
+    pub fn request(&self) -> Option<(ReservationMm, ReservationMm)> {
+        if self.words[0] != Self::MAGIC || self.words[3] != Self::PENDING {
+            return None;
+        }
+        Some((
+            ReservationMm::new(self.words[1])?,
+            ReservationMm::new(self.words[2])?,
+        ))
+    }
+
+    fn reply(&mut self, status: u64) -> bool {
+        if self.request().is_none() {
+            return false;
+        }
+        self.words[3] = status;
+        true
+    }
+
+    pub fn accept(&mut self) -> bool {
+        self.reply(Self::ACCEPTED)
+    }
+
+    pub fn refuse(&mut self) -> bool {
+        self.reply(Self::REFUSED)
+    }
+
+    /// Ring: consume the carrier's answer to exactly this request.
+    pub fn take(
+        &mut self,
+        predecessor: ReservationMm,
+        successor: ReservationMm,
+    ) -> Option<Result<(), ()>> {
+        if self.words[0] != Self::MAGIC
+            || self.words[1] != predecessor.raw()
+            || self.words[2] != successor.raw()
+        {
+            return None;
+        }
+        let result = match self.words[3] {
+            Self::ACCEPTED => Ok(()),
+            Self::REFUSED => Err(()),
+            _ => return None,
+        };
+        self.words[3] = Self::CONSUMED;
         Some(result)
     }
 }

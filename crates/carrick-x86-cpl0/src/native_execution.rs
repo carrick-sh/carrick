@@ -39,7 +39,7 @@ pub fn schedule(slot: SlotId) -> ! {
             let record = source.zone.record_ref(selected.record);
             let runtime = native_process::runtime_for_record(source.zone, record);
             // SAFETY: switch_in_full transferred this exact record to this slot.
-            let Some(state) = (unsafe { runtime.record_binding(record) }) else {
+            let Some(mut state) = (unsafe { runtime.record_binding(record) }) else {
                 source.zone.clear_current(slot);
                 continue;
             };
@@ -150,8 +150,26 @@ pub fn schedule(slot: SlotId) -> ! {
                         continue;
                     }
                     carrick_el1_linux::native_process_runtime::NativeResume::NoPending => {
-                        if let Some(result) = selected.result {
-                            words.set_syscall_return(result);
+                        // SAFETY: switch_in_full still gives this slot the
+                        // exact record; its exec commit rewrote the context.
+                        match unsafe { runtime.record_binding(record) } {
+                            // A committed exec replaced the record's image:
+                            // enter the successor's saved entry state on
+                            // its own address space. The predecessor's
+                            // syscall has no return word.
+                            Some(replaced) if replaced.address != state.address => {
+                                if x86::X86Backend.install_context(replaced.address).is_err() {
+                                    fatal_boot();
+                                }
+                                words = replaced.words;
+                                state = replaced;
+                            }
+                            Some(_) => {
+                                if let Some(result) = selected.result {
+                                    words.set_syscall_return(result);
+                                }
+                            }
+                            None => fatal_boot(),
                         }
                     }
                     // A typed saved retry already names its x86 syscall

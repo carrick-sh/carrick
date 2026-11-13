@@ -52,6 +52,8 @@ struct TestFrames {
     inventory: Arc<dyn PhysicalFrameInventory>,
     next: u64,
     released: usize,
+    written: std::collections::BTreeMap<u64, Vec<u8>>,
+    cleared: usize,
 }
 
 impl TestFrames {
@@ -63,6 +65,8 @@ impl TestFrames {
             inventory,
             next: DYNAMIC_GRANT_GPA,
             released: 0,
+            written: std::collections::BTreeMap::new(),
+            cleared: 0,
         }
     }
     fn mapped(&self) -> usize {
@@ -105,6 +109,20 @@ impl X86ExecFrames for TestFrames {
             .rollback()
             .map_err(|error| fail(error.to_string()))?;
         self.released += 1;
+        Ok(())
+    }
+    fn write(&mut self, data: &TestData, bytes: &[u8]) -> Result<(), TrapError> {
+        self.written
+            .insert(data.grants.first().unwrap().gpa, bytes.to_vec());
+        Ok(())
+    }
+    fn read(&self, data: &TestData, len: usize) -> Result<Vec<u8>, TrapError> {
+        let mut bytes = self.written[&data.grants.first().unwrap().gpa].clone();
+        bytes.resize(len, 0);
+        Ok(bytes)
+    }
+    fn clear_tables(&mut self, tables: &[RootGpa]) -> Result<(), TrapError> {
+        self.cleared += tables.len();
         Ok(())
     }
 }
@@ -185,6 +203,7 @@ impl Fixture {
             self.region.roots(),
             self.region.zone(),
             wake,
+            [9; 16],
         )
         .unwrap()
     }
@@ -317,7 +336,8 @@ fn exec_service_stages_a_static_successor() {
     .unwrap()
     .rsp;
 
-    let X86ExecStage::Staged(backing, entry) = fixture.stage(request(successor_image)) else {
+    let X86ExecStage::Staged(backing, entry, build) = fixture.stage(request(successor_image))
+    else {
         panic!("a static successor with stock to spare stages");
     };
     let successor = ReservationMm::new(SUCCESSOR).unwrap();
@@ -334,7 +354,16 @@ fn exec_service_stages_a_static_successor() {
     assert_eq!(entry.entry.raw(), ENTRY);
     assert_eq!(entry.stack_pointer.raw(), expected_sp);
     assert_eq!(preparation.data().grants().len(), 19);
-    assert_eq!(fixture.frames.mapped(), 19);
+    // #2235: the build extent the manifest seals is the preparation's own
+    // staged frames, encoded with the shared layout.
+    assert_eq!(build.base.raw(), preparation.build().grants()[0].gpa);
+    let pages = build.pages.get() as usize;
+    assert_eq!(preparation.build().grants().len(), pages);
+    assert_eq!(
+        fixture.frames.written[&build.base.raw()][..8],
+        carrick_el1::isa::x86_exec_build::X86_EXEC_BUILD_MAGIC.to_le_bytes()
+    );
+    assert_eq!(fixture.frames.mapped(), 19 + pages);
 
     // The image pages and the whole stack reservation are imported, not
     // admitted: the adopter finishes the import.
@@ -351,7 +380,7 @@ fn exec_service_stages_a_static_successor() {
     )
     .unwrap();
     assert_eq!(fixture.stock.table_stock().len(), 16);
-    assert_eq!(fixture.frames.released, 1);
+    assert_eq!(fixture.frames.released, 2, "data frames and build extent");
     assert_eq!(fixture.frames.mapped(), 0);
     assert_eq!(fixture.imported(), 0);
 
@@ -521,7 +550,7 @@ fn a_pending_fork_parks_the_exec_until_its_release_wakes_it_then_stages() {
     });
     assert_eq!(fixture.stock.release_waiters(), 0, "woken once");
     let rerun = parked.probe(&fixture.stock).unwrap();
-    let X86ExecStage::Staged(backing, _) = fixture.stage(rerun) else {
+    let X86ExecStage::Staged(backing, _, _) = fixture.stage(rerun) else {
         panic!("the released stock grants the rerun");
     };
     let successor = ReservationMm::new(SUCCESSOR).unwrap();
