@@ -1718,6 +1718,37 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             successor_tag,
             successor_physical,
             false,
+            Vec::new(),
+        )
+    }
+
+    /// Move one exact live fork child to an exec successor whose tables the
+    /// adopter built from this stock's reserved pages (x86). `tables` are the
+    /// pages the build linked; they become the successor's committed
+    /// tables, returned to the stock when it is reclaimed, exactly as a fork
+    /// child's arena is.
+    pub fn replace_child_for_exec_with_tables(
+        &mut self,
+        execution: GrantExecution,
+        successor: carrick_el1_abi::El1MmHandle,
+        successor_root: RootGpa,
+        successor_physical: C,
+        tables: Vec<RootGpa>,
+    ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
+        let Some(successor_tag) = self.tags.allocate() else {
+            return Err((
+                ForkStockServiceError::Asid(AsidError::Exhausted),
+                successor_physical,
+            ));
+        };
+        self.replace_for_exec_with_tag(
+            execution,
+            successor,
+            successor_root,
+            successor_tag,
+            successor_physical,
+            false,
+            tables,
         )
     }
 
@@ -1739,9 +1770,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             successor_tag,
             successor_physical,
             true,
+            Vec::new(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replace_for_exec_with_tag(
         &mut self,
         execution: GrantExecution,
@@ -1750,6 +1783,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         successor_tag: T::Tag,
         successor_physical: C,
         root_predecessor: bool,
+        successor_tables: Vec<RootGpa>,
     ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
         let refuse = |tags: &mut T, error, physical| {
             let released = tags.release_unpublished(successor_tag);
@@ -1792,6 +1826,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             || successor.carrier() != self.carrier
             || successor_mm == predecessor_mm
             || self.children.contains_key(&successor_key)
+            || self.committed_tables.contains_key(&successor_key)
             || self.quarantine.contains_key(&predecessor_key)
             || self.quarantine.contains_key(&successor_key)
             || self
@@ -1849,6 +1884,10 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         };
         let replaced = self.children.insert(successor_key, successor_child);
         debug_assert!(replaced.is_none());
+        if !successor_tables.is_empty() {
+            self.committed_tables
+                .insert(successor_key, successor_tables);
+        }
         let pending = ExecPredecessor {
             predecessor: predecessor_mm,
             successor: successor_mm,
@@ -2006,6 +2045,25 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// Return an unused successor reservation to the reusable stock.
     pub fn return_successor_tables(&mut self, tables: SuccessorTables) {
         self.tables.extend(tables.pages);
+    }
+
+    /// Split an adopted successor's reservation: its build took pages in
+    /// reservation order, so the first `used` are the pages it linked, and
+    /// the rest return to the reusable stock untouched (still zero). A
+    /// `used` past the reservation refuses, returning it whole.
+    pub fn take_built_successor_tables(
+        &mut self,
+        mut tables: SuccessorTables,
+        used: usize,
+    ) -> Result<Vec<RootGpa>, SuccessorTables> {
+        if used == 0 || used > tables.pages.len() {
+            return Err(tables);
+        }
+        let unused = tables.pages.split_off(used);
+        if !unused.is_empty() {
+            self.tables.extend(unused);
+        }
+        Ok(tables.pages)
     }
 
     /// Seed the bounded stock before any guest can request it. Pages and
