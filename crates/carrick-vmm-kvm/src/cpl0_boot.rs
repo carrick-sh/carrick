@@ -1718,7 +1718,7 @@ impl Cpl0Carrier {
         self.custody.fork_stock_counters()
     }
 
-    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 4] {
+    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 5] {
         self.custody.physical_crossing_counts()
     }
 

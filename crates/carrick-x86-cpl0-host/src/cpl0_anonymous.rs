@@ -444,39 +444,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }))
     }
 }
-struct CowPause<'a> {
-    exclusion: carrick_sched_core::spaces::notification::SpaceExclusion<
-        'a,
-        carrick_sched_core::ParkedContextWords,
-    >,
-}
-impl<'a> CowPause<'a> {
-    fn new(
-        access: SpaceAccess<'a, carrick_sched_core::ParkedContextWords>,
-        mm: u64,
-    ) -> Result<Self, TrapError> {
-        let mm = carrick_el1_abi::ReservationMm::new(mm).ok_or_else(|| fail("owner COW MM"))?;
-        Self::try_new(access, mm)
-            .map_err(|reason| fail(format!("owner COW editor exclusion refused: {reason:?}")))
-    }
-    fn try_new(
-        access: SpaceAccess<'a, carrick_sched_core::ParkedContextWords>,
-        mm: carrick_el1_abi::ReservationMm,
-    ) -> Result<Self, carrick_sched_core::spaces::notification::ExclusionRefusal> {
-        use carrick_sched_core::spaces::notification::ExclusionRefusal;
-        let index = access
-            .table()
-            .find(mm.raw())
-            .ok_or(ExclusionRefusal::Stale)?;
-        Ok(Self {
-            exclusion: access.try_exclude_editor(index, mm.raw())?,
-        })
-    }
-    fn proof(&self) -> &carrick_el1_abi::ExcludedEditor<'_> {
-        self.exclusion.proof()
-    }
-}
-
 fn retained_reservations(ram: &GuestRam) -> Result<&X86Cpl0Reservations, TrapError> {
     let ptr = ram
         .host_ptr(
@@ -1654,6 +1621,23 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         } else {
             None
         };
+        // The loan no longer names the parent (or its committed child): a
+        // settlement doorbell refused `ForkLoanPending` waits for exactly
+        // this `PendingEdit` release (#1369 slice 3, L1).
+        let parent = carrick_el1_abi::ReservationMm::new(execution.context.mm.raw().get())
+            .ok_or_else(|| fail("physical fork parent MM"))?;
+        self.publish_space_release(
+            parent,
+            carrick_sched_core::spaces::notification::SpaceWaitCause::PendingEdit,
+        )?;
+        if let Some(child) = committed_child
+            .and_then(|child| carrick_el1_abi::ReservationMm::new(child.mm.raw().get()))
+        {
+            self.publish_space_release(
+                child,
+                carrick_sched_core::spaces::notification::SpaceWaitCause::PendingEdit,
+            )?;
+        }
         Ok(child_binding)
     }
 
@@ -1695,21 +1679,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         let ram = Arc::clone(&self.ram);
         let zone = retained_cow_zone(&ram)?;
-        let wake = HostCowWake::new(&self.ram, self._vm.clone_vm())?;
+        let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
         let delivery = |zone: &X86Cpl0Zone,
                         waker: Waker,
                         owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
             '_,
             carrick_sched_core::ParkedContextWords,
         >| wake.deliver(zone, waker, owned);
-        let pause = CowPause::new(
-            SpaceAccess::notified(SpaceReleaseVenue {
+        let pause = self.settled_pause_or_fail(
+            SpaceReleaseVenue {
                 zone,
                 waker: Waker::Host,
                 deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
                     &delivery,
                 ),
-            }),
+            },
             mm.get(),
         )?;
         let run = carrick_mmu_core::x86::descriptor_txn::classify_guest_cow_write(
@@ -1831,21 +1815,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     ) -> Result<(), TrapError> {
         let ram = Arc::clone(&self.ram);
         let zone = retained_cow_zone(&ram)?;
-        let wake = HostCowWake::new(&self.ram, self._vm.clone_vm())?;
+        let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
         let delivery = |zone: &X86Cpl0Zone,
                         waker: Waker,
                         owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
             '_,
             carrick_sched_core::ParkedContextWords,
         >| wake.deliver(zone, waker, owned);
-        let pause = CowPause::new(
-            SpaceAccess::notified(SpaceReleaseVenue {
+        let pause = self.settled_pause_or_fail(
+            SpaceReleaseVenue {
                 zone,
                 waker: Waker::Host,
                 deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
                     &delivery,
                 ),
-            }),
+            },
             execution.context.mm.raw().get(),
         )?;
         let pending = match self.anonymous_pending[index].as_ref() {
@@ -2020,6 +2004,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         {
             return Err(fail("owner grant stale execution/root"));
         }
+        // The settlement op names no selected address; a CPU with a grant
+        // still pending never rings it (its syscall path holds none).
+        if lane.get_gpr(X86Reg::Rdi)? == OWNER_GRANT_SETTLE_RETURNS {
+            if self.anonymous_pending[index].is_some() {
+                return Err(fail("owed-return settlement with a grant pending"));
+            }
+            return self.service_return_settlement(lease, execution);
+        }
         if matches!(self.anonymous_pending[index], Some(PendingGrant::Cow(_))) {
             return self.settle_cow_grant(index, execution);
         }
@@ -2095,15 +2087,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             '_,
             carrick_sched_core::ParkedContextWords,
         >| wake.deliver(zone, waker, owned);
-        let access = SpaceAccess::notified(SpaceReleaseVenue {
+        let release = SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
             deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
                 &delivery,
             ),
-        });
-        let pause = match CowPause::try_new(access, owner.mm()) {
-            Ok(pause) => pause,
+        };
+        let pause = match self.settled_pause(release, owner.mm())? {
+            Ok((pause, _)) => pause,
             Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
                 // Refusal leaves the exact reply and physical journals owned.
                 // The caller observed Editor before this crossing, and parks
@@ -2229,13 +2221,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             '_,
             carrick_sched_core::ParkedContextWords,
         >| wake.deliver(zone, waker, owned);
-        let access = SpaceAccess::notified(SpaceReleaseVenue {
+        let release = SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
             deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
                 &delivery,
             ),
-        });
+        };
         let source = zone
             .space_entry(
                 NonZeroU64::new(window.operation.mm.raw())
@@ -2246,8 +2238,8 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .notifications(window.operation.incarnation)
             .map_err(|_| fail("native preparation source"))?
             .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor);
-        let pause = match CowPause::try_new(access, window.operation.mm) {
-            Ok(pause) => pause,
+        let pause = match self.settled_pause(release, window.operation.mm)? {
+            Ok((pause, _)) => pause,
             Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
                 let handle = unsafe {
                     // SAFETY: the ticket retains this exact admitted window;
@@ -2398,23 +2390,24 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             },
             tables: TableGrants::new(&tables).ok_or_else(|| fail("owner table grant encoding"))?,
         };
+        let ram = Arc::clone(&self.ram);
         let demand = (|| -> Result<usize, TrapError> {
-            let zone = retained_cow_zone(&self.ram)?;
-            let wake = HostCowWake::new(&self.ram, self._vm.clone_vm())?;
+            let zone = retained_cow_zone(&ram)?;
+            let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
             let delivery = |zone: &X86Cpl0Zone,
                             waker: Waker,
                             owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
                 '_,
                 carrick_sched_core::ParkedContextWords,
             >| wake.deliver(zone, waker, owned);
-            let pause = CowPause::new(
-                SpaceAccess::notified(SpaceReleaseVenue {
+            let pause = self.settled_pause_or_fail(
+                SpaceReleaseVenue {
                     zone,
                     waker: Waker::Host,
                     deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
                         &delivery,
                     ),
-                }),
+                },
                 mm.get(),
             )?;
             let planned = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
@@ -2640,7 +2633,7 @@ mod custody_tests {
         access.open(index);
         let editor = access.try_begin_edit(index, 77, NonZeroU64::MIN).unwrap();
         assert!(matches!(
-            CowPause::try_new(access, carrick_el1_abi::ReservationMm::new(77).unwrap()),
+            return_settlement::unsettled_pause_for_test(access, 77),
             Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy)
         ));
         assert_eq!(
@@ -2649,8 +2642,7 @@ mod custody_tests {
             "refusal must not close the editor's gate"
         );
         drop(editor);
-        let pause =
-            CowPause::try_new(access, carrick_el1_abi::ReservationMm::new(77).unwrap()).unwrap();
+        let pause = return_settlement::unsettled_pause_for_test(access, 77).unwrap();
         drop(pause);
         assert_eq!(zone.spaces.gate(index), 0);
     }
@@ -3178,13 +3170,13 @@ mod custody_tests {
         });
         access.open(index);
         let before = calls.get();
-        let pause = CowPause::new(access, 302).unwrap();
+        let pause = return_settlement::unsettled_pause_for_test(access, 302).unwrap();
         assert_eq!(zone.spaces.gate(index), 1);
         drop(pause);
         assert_eq!(zone.spaces.gate(index), 0);
         assert_eq!(calls.get(), before + 1);
         let editor = access.try_begin_edit(index, 302, NonZeroU64::MIN).unwrap();
-        assert!(CowPause::new(access, 302).is_err());
+        assert!(return_settlement::unsettled_pause_for_test(access, 302).is_err());
         assert_eq!(zone.spaces.gate(index), 0);
         drop(editor);
     }
@@ -3212,9 +3204,9 @@ mod custody_tests {
         let index = spaces.publish_closed(302, 0x7000, 0x7000).unwrap();
         spaces.open(index);
         let editor = spaces.try_begin_edit(index, 302, NonZeroU64::MIN).unwrap();
-        assert!(CowPause::new(access, 302).is_err());
+        assert!(return_settlement::unsettled_pause_for_test(access, 302).is_err());
         drop(editor);
-        let pause = CowPause::new(access, 302).unwrap();
+        let pause = return_settlement::unsettled_pause_for_test(access, 302).unwrap();
         assert_eq!(pause.proof().key(), 302);
         assert!(spaces.try_begin_edit(index, 302, NonZeroU64::MIN).is_none());
         drop(pause);
@@ -3323,3 +3315,8 @@ mod custody_tests {
 
 #[path = "cpl0_native_service.rs"]
 pub(super) mod native_service;
+
+#[path = "cpl0_return_settlement.rs"]
+mod return_settlement;
+use return_settlement::CowPause;
+pub use return_settlement::ReturnSettlementCounters;

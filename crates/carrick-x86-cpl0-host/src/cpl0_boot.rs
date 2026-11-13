@@ -351,6 +351,9 @@ pub enum PhysicalCrossingFamily {
     RootExit,
     ChildRetire,
     RunFailure,
+    /// Owed-return settlement doorbells (#1369 slice 3). They ride the
+    /// owner-grant port, so each is also one `OwnerGrant` crossing.
+    ReturnSettlement,
 }
 impl PhysicalCrossingFamily {
     pub const fn as_str(self) -> &'static str {
@@ -359,6 +362,7 @@ impl PhysicalCrossingFamily {
             Self::RootExit => "root_exit",
             Self::ChildRetire => "child_retire",
             Self::RunFailure => "run_failure",
+            Self::ReturnSettlement => "return_settlement",
         }
     }
 }
@@ -2715,7 +2719,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
 
     pub fn physical_crossing_counts(
         &self,
-    ) -> Result<[(PhysicalCrossingFamily, u64); 4], TrapError> {
+    ) -> Result<[(PhysicalCrossingFamily, u64); 5], TrapError> {
         let custody = self
             .custody
             .lock()
@@ -2736,6 +2740,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             (
                 PhysicalCrossingFamily::RunFailure,
                 custody.run_failure_crossings,
+            ),
+            (
+                PhysicalCrossingFamily::ReturnSettlement,
+                custody.return_settlement_counters.doorbells,
             ),
         ])
     }
@@ -2964,6 +2972,9 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     native_backing_pending:
         std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
     owner_grant_crossings: u64,
+    /// Serializes every settlement of an MM's owed returns (#1369 slice 3).
+    return_settlement: carrick_hal::return_settlement::SettlementLock,
+    return_settlement_counters: anonymous_owner::ReturnSettlementCounters,
     root_exit_crossings: u64,
     child_retire_crossings: u64,
     run_failure_crossings: u64,
@@ -4375,6 +4386,8 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             anonymous_pending: [None, None],
             native_backing_pending: std::collections::BTreeMap::new(),
             owner_grant_crossings: 0,
+            return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
+            return_settlement_counters: Default::default(),
             root_exit_crossings: 0,
             child_retire_crossings: 0,
             run_failure_crossings: 0,
@@ -4550,7 +4563,11 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     pub fn record_work_exit(&mut self) {
         self.0.work_exits += 1;
     }
-    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 4] {
+    /// What this carrier's owed-return settlements did (#1369 slice 3).
+    pub fn return_settlement_counters(&self) -> anonymous_owner::ReturnSettlementCounters {
+        self.0.return_settlement_counters
+    }
+    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 5] {
         [
             (
                 PhysicalCrossingFamily::OwnerGrant,
@@ -4564,6 +4581,10 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             (
                 PhysicalCrossingFamily::RunFailure,
                 self.0.run_failure_crossings,
+            ),
+            (
+                PhysicalCrossingFamily::ReturnSettlement,
+                self.0.return_settlement_counters.doorbells,
             ),
         ]
     }

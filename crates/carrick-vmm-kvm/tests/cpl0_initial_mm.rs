@@ -1987,13 +1987,13 @@ fn production_initial_stack_grows_below_the_built_pages() {
     );
 }
 
-/// #2217: a brk shrink retires its resident pages as an owed return, and
-/// nothing on x86 settles it, so regrowing the break over those pages is
-/// refused `Busy`, forwarded and answered ENOSYS. glibc stores that errno as
-/// its break and the next allocation faults: CPython's compiler exits 139.
-/// The settlement owner is #1369's slice 3 (#1482).
+/// #2217: a brk shrink retires its resident pages as an owed return. Before
+/// #1482 nothing on x86 settled it, so regrowing the break over those pages
+/// was refused `Busy`, forwarded and answered ENOSYS; glibc stored that errno
+/// as its break and the next allocation faulted (CPython's compiler exited
+/// 139). The regrowth now rings the owed-return settlement doorbell, which
+/// settles the shrink's return, and is then served in the ring.
 #[test]
-#[ignore = "#1482: x86 has no owner that settles a brk shrink's owed return"]
 fn production_brk_regrows_over_its_released_pages() {
     let elf = native_exit_fixture("native_brk_regrow.S");
     let dir = tempfile::tempdir().expect("oracle directory");
@@ -2017,6 +2017,21 @@ fn production_brk_regrows_over_its_released_pages() {
         (0, None),
         "first step that differs from Linux (see native_brk_regrow.S): {:?}",
         outcome.run
+    );
+    // One shrink, one regrowth over it: exactly one settlement doorbell.
+    let families = outcome
+        .run
+        .report
+        .execution_witness
+        .as_ref()
+        .expect("execution witness")
+        .physical_crossing_families
+        .iter()
+        .map(|row| (row.family.as_str(), row.count))
+        .collect::<Vec<_>>();
+    assert!(
+        families.contains(&("return_settlement", 1)),
+        "settlement doorbells: {families:?}"
     );
 }
 
