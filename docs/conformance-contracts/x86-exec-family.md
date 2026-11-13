@@ -38,6 +38,7 @@ Exec request in `crates/carrick-x86-cpl0-host/src/cpl0_native_service.rs`, and
 ## Witnesses
 
 The static-child and three root cases reuse closed drafts #2149 and #2146.
+The child retains its original 32-exit budget; the root cases retain 128.
 The new `native_fork_child_execs_while_parent_keeps_running` blocks SIGUSR1
 and SIGUSR2 before fork. After replacement, the successor signals SIGUSR1 to
 its parent and consumes the parent's SIGUSR2 acknowledgement with
