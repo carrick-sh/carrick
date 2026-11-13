@@ -3087,6 +3087,7 @@ fn serial_host_child_of_an_execed_root_execs_through_the_installed_capability() 
         on_copy_complete: None,
         native_ipc: None,
         refuse_copy: false,
+        waker_slot: fixture.slot,
         on_signal_clock: None,
     };
     // The driver's relative spelling of the executable it wrote to /tmp.
