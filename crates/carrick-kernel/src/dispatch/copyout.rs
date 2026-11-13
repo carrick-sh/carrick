@@ -243,6 +243,7 @@ pub(crate) type PreparedVectorCopyout<'m, M> = PreparedOutputs<'m, M, Vec<Option
 #[must_use = "a prepared copyout writes nothing until it is committed"]
 pub(crate) struct PreparedOutputs<'m, M: CurrentMmMemory, S> {
     slots: S,
+    secured_until: usize,
     venue: Venue<'m, M>,
     effect: Option<OwnerEffect>,
 }
@@ -339,6 +340,7 @@ where
     if memory.user_memory_venue() == UserMemoryVenue::Legacy {
         return Ok(PreparedOutputs {
             slots,
+            secured_until: 0,
             effect: None,
             venue: Venue::Legacy(memory),
         });
@@ -346,6 +348,7 @@ where
     let Some(empty) = GuestWriteRange::new(GuestVa::new(0), 0) else {
         return Ok(PreparedOutputs {
             slots,
+            secured_until: 0,
             effect: None,
             venue: Venue::Owner {
                 permit: None,
@@ -388,6 +391,7 @@ where
     if count == 0 {
         return Ok(PreparedOutputs {
             slots,
+            secured_until: 0,
             effect: None,
             venue: Venue::Owner {
                 permit: None,
@@ -413,6 +417,15 @@ where
         match attempt {
             Ok(permit) => {
                 return Ok(PreparedOutputs {
+                    secured_until: slots
+                        .as_ref()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, slot)| slot.is_some())
+                        .take(prefix)
+                        .map(|(index, _)| index + 1)
+                        .last()
+                        .unwrap_or(0),
                     slots,
                     effect: None,
                     venue: Venue::Owner {
@@ -433,6 +446,7 @@ where
     }
     Ok(PreparedOutputs {
         slots,
+        secured_until: 0,
         effect: None,
         venue: Venue::Owner {
             permit: None,
@@ -460,9 +474,8 @@ impl<M: CurrentMmMemory, S: AsRef<[Option<UserSlot>]>> PreparedOutputs<'_, M, S>
     /// slot accepts no bytes: the source must not consume on a failed copy.
     pub(crate) fn secured_capacity(&self, index: usize) -> usize {
         match &self.venue {
-            Venue::Owner { valid_present, .. } => {
-                let present = self.slots.as_ref().iter().take(index + 1).flatten().count();
-                if present > *valid_present {
+            Venue::Owner { .. } => {
+                if index >= self.secured_until {
                     0
                 } else {
                     self.capacity(index)
