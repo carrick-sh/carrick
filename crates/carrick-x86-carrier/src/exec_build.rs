@@ -7,7 +7,7 @@
 use crate::entry::InitialWords;
 use carrick_core_abi::service::ExecBuildSource;
 use carrick_el1::isa::x86::initial_mm::{InitialMmError, InitialMmImage};
-use carrick_el1::isa::x86_exec_build::{ExecBuildPlan, ExecBuildWindow};
+use carrick_el1::isa::x86_exec_build::{ExecBuildPlan, ExecBuildWindow, WindowRefused};
 use carrick_guest_arch::{FrameGpa, RootGpa};
 use carrick_mmu_core::x86::copy_window::with_copy_window_frames;
 use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
@@ -28,10 +28,10 @@ impl CopyWindow<'_> {
         source: Option<FrameGpa>,
         destination: Option<FrameGpa>,
         effect: impl FnOnce(u64, u64) -> R,
-    ) -> Option<R> {
+    ) -> Result<R, WindowRefused> {
         match with_copy_window_frames(self.words, self.root, source, destination, effect) {
-            Ok(result) => Some(result),
-            Err(DescriptorOutcome::Refused(_)) => None,
+            Ok(result) => Ok(result),
+            Err(DescriptorOutcome::Refused(_)) => Err(WindowRefused),
             // A leaf the window could not restore names a frame no owner
             // tracks: stop the carrier, as boot does for its editor.
             Err(_) => carrick_el1::isa::x86::fatal_entry_binding(),
@@ -40,9 +40,9 @@ impl CopyWindow<'_> {
 }
 
 impl ExecBuildWindow for CopyWindow<'_> {
-    fn read(&mut self, page: FrameGpa, offset: usize, out: &mut [u8]) -> bool {
+    fn read(&mut self, page: FrameGpa, offset: usize, out: &mut [u8]) -> Result<(), WindowRefused> {
         if offset.checked_add(out.len()).is_none_or(|end| end > PAGE) {
-            return false;
+            return Err(WindowRefused);
         }
         self.map(Some(page), None, |source, _| {
             // SAFETY: the read-only leaf maps exactly `page` until restored
@@ -55,12 +55,11 @@ impl ExecBuildWindow for CopyWindow<'_> {
                 );
             }
         })
-        .is_some()
     }
 
-    fn write(&mut self, page: FrameGpa, offset: usize, bytes: &[u8]) -> bool {
+    fn write(&mut self, page: FrameGpa, offset: usize, bytes: &[u8]) -> Result<(), WindowRefused> {
         if offset.checked_add(bytes.len()).is_none_or(|end| end > PAGE) {
-            return false;
+            return Err(WindowRefused);
         }
         self.map(None, Some(page), |_, destination| {
             // SAFETY: the writable leaf maps exactly `page`, a frame no
@@ -73,7 +72,6 @@ impl ExecBuildWindow for CopyWindow<'_> {
                 );
             }
         })
-        .is_some()
     }
 
     fn copy(
@@ -83,14 +81,14 @@ impl ExecBuildWindow for CopyWindow<'_> {
         destination: FrameGpa,
         destination_offset: usize,
         len: usize,
-    ) -> bool {
+    ) -> Result<(), WindowRefused> {
         if source == destination
             || source_offset.checked_add(len).is_none_or(|end| end > PAGE)
             || destination_offset
                 .checked_add(len)
                 .is_none_or(|end| end > PAGE)
         {
-            return false;
+            return Err(WindowRefused);
         }
         self.map(Some(source), Some(destination), |from, to| {
             // SAFETY: both leaves map exactly their frames until restored;
@@ -103,7 +101,6 @@ impl ExecBuildWindow for CopyWindow<'_> {
                 );
             }
         })
-        .is_some()
     }
 }
 
@@ -122,15 +119,16 @@ pub unsafe fn build_exec_successor(
     mm: NonZeroU64,
     generation: NonZeroU64,
 ) -> Result<InitialMmImage, InitialMmError> {
-    let predecessor = carrick_el1::isa::x86::hardware_live_root()
-        .map_err(|_| InitialMmError::DescriptorRefused)?;
+    // `live_words` admits only the context authenticated against this
+    // CPU's live root; that root is the predecessor's.
     let words =
         crate::table_span::live_words(predecessor_mm).ok_or(InitialMmError::DescriptorRefused)?;
+    let predecessor = words.context.ok_or(InitialMmError::DescriptorRefused)?.root;
     let mut window = CopyWindow {
         words: &words,
         root: predecessor,
     };
-    let plan = ExecBuildPlan::read(&mut window, source, mm, generation)?;
+    let plan = ExecBuildPlan::decode(&mut window, source, mm, generation)?;
     plan.build(&mut window, |frames, spec| {
         // SAFETY: forwarded from this function's contract; `predecessor` is
         // the authenticated live root `live_words` admitted.

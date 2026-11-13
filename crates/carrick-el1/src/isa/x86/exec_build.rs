@@ -38,14 +38,18 @@ const PAGE: u64 = 4096;
 /// [`carrick_core_abi::X86_INITIAL_BOOT_MAGIC`] instead.
 pub const X86_EXEC_BUILD_MAGIC: u64 = u64::from_le_bytes(*b"CXEXEC01");
 
+/// A window access the guest could not map, or a span past its page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowRefused;
+
 /// Page access to one build extent. Every call names one page and a span
 /// inside it; the guest maps that page alone, for that call alone.
 pub trait ExecBuildWindow {
     /// Read `out.len()` bytes at `offset` of the extent page `page`.
-    fn read(&mut self, page: FrameGpa, offset: usize, out: &mut [u8]) -> bool;
+    fn read(&mut self, page: FrameGpa, offset: usize, out: &mut [u8]) -> Result<(), WindowRefused>;
     /// Write `bytes` at `offset` of the page `page` (an extent page or an
     /// unpublished data grant).
-    fn write(&mut self, page: FrameGpa, offset: usize, bytes: &[u8]) -> bool;
+    fn write(&mut self, page: FrameGpa, offset: usize, bytes: &[u8]) -> Result<(), WindowRefused>;
     /// Copy `len` bytes from `source_offset` of the extent page `source`
     /// to `destination_offset` of the unpublished data grant `destination`.
     fn copy(
@@ -55,7 +59,7 @@ pub trait ExecBuildWindow {
         destination: FrameGpa,
         destination_offset: usize,
         len: usize,
-    ) -> bool;
+    ) -> Result<(), WindowRefused>;
 }
 
 fn split_pages(gpa: u64, len: usize) -> impl Iterator<Item = (FrameGpa, usize, usize, usize)> {
@@ -77,12 +81,12 @@ fn split_pages(gpa: u64, len: usize) -> impl Iterator<Item = (FrameGpa, usize, u
 fn read_span(window: &mut impl ExecBuildWindow, gpa: u64, out: &mut [u8]) -> bool {
     let len = out.len();
     split_pages(gpa, len)
-        .all(|(page, offset, at, take)| window.read(page, offset, &mut out[at..at + take]))
+        .all(|(page, offset, at, take)| window.read(page, offset, &mut out[at..at + take]).is_ok())
 }
 
 fn write_span(window: &mut impl ExecBuildWindow, gpa: u64, bytes: &[u8]) -> bool {
     split_pages(gpa, bytes.len())
-        .all(|(page, offset, at, take)| window.write(page, offset, &bytes[at..at + take]))
+        .all(|(page, offset, at, take)| window.write(page, offset, &bytes[at..at + take]).is_ok())
 }
 
 fn as_bytes<T: Copy>(records: &[T]) -> &[u8] {
@@ -391,7 +395,7 @@ impl ExecBuildPlan {
     /// Read and check the extent `source` names for successor `mm` at
     /// `generation`. Every span is checked to lie in its own area of the
     /// extent before anything is used.
-    pub fn read(
+    pub fn decode(
         window: &mut impl ExecBuildWindow,
         source: ExecBuildSource,
         mm: NonZeroU64,
@@ -661,13 +665,15 @@ impl<W: ExecBuildWindow> InitialFrameSource for ExecBuildFrames<'_, W> {
         {
             return false;
         }
-        self.window.copy(
-            FrameGpa::new(start & !(PAGE - 1)),
-            (start & (PAGE - 1)) as usize,
-            grant.frame,
-            usize::from(offset),
-            usize::from(len),
-        )
+        self.window
+            .copy(
+                FrameGpa::new(start & !(PAGE - 1)),
+                (start & (PAGE - 1)) as usize,
+                grant.frame,
+                usize::from(offset),
+                usize::from(len),
+            )
+            .is_ok()
     }
 
     fn write_data(&mut self, grant: InitialDataGrant, offset: u16, bytes: &[u8]) -> bool {
@@ -678,7 +684,9 @@ impl<W: ExecBuildWindow> InitialFrameSource for ExecBuildFrames<'_, W> {
         {
             return false;
         }
-        self.window.write(grant.frame, usize::from(offset), bytes)
+        self.window
+            .write(grant.frame, usize::from(offset), bytes)
+            .is_ok()
     }
 }
 
@@ -786,15 +794,25 @@ mod tests {
         }
     }
     impl ExecBuildWindow for Ram {
-        fn read(&mut self, page: FrameGpa, offset: usize, out: &mut [u8]) -> bool {
+        fn read(
+            &mut self,
+            page: FrameGpa,
+            offset: usize,
+            out: &mut [u8],
+        ) -> Result<(), WindowRefused> {
             self.accesses += 1;
             out.copy_from_slice(&self.page(page)[offset..offset + out.len()]);
-            true
+            Ok(())
         }
-        fn write(&mut self, page: FrameGpa, offset: usize, bytes: &[u8]) -> bool {
+        fn write(
+            &mut self,
+            page: FrameGpa,
+            offset: usize,
+            bytes: &[u8],
+        ) -> Result<(), WindowRefused> {
             self.accesses += 1;
             self.page(page)[offset..offset + bytes.len()].copy_from_slice(bytes);
-            true
+            Ok(())
         }
         fn copy(
             &mut self,
@@ -803,12 +821,12 @@ mod tests {
             destination: FrameGpa,
             destination_offset: usize,
             len: usize,
-        ) -> bool {
+        ) -> Result<(), WindowRefused> {
             self.accesses += 1;
             let bytes = self.page(source)[source_offset..source_offset + len].to_vec();
             self.page(destination)[destination_offset..destination_offset + len]
                 .copy_from_slice(&bytes);
-            true
+            Ok(())
         }
     }
 
@@ -915,7 +933,7 @@ mod tests {
         ram.load(BASE, &encoded.bytes);
         let mm = NonZeroU64::new(91).unwrap();
         let generation = NonZeroU64::new(3).unwrap();
-        let plan = ExecBuildPlan::read(&mut ram, encoded.source, mm, generation).unwrap();
+        let plan = ExecBuildPlan::decode(&mut ram, encoded.source, mm, generation).unwrap();
         assert_eq!(plan.root(), Some(tables[0]));
         let image = plan
             .build(&mut ram, |frames, spec| {
@@ -1014,7 +1032,7 @@ mod tests {
         let mut ram = Ram::default();
         ram.load(BASE, &encoded.bytes);
         assert!(
-            ExecBuildPlan::read(
+            ExecBuildPlan::decode(
                 &mut ram,
                 encoded.source,
                 NonZeroU64::new(92).unwrap(),
@@ -1022,18 +1040,18 @@ mod tests {
             )
             .is_err()
         );
-        assert!(ExecBuildPlan::read(&mut ram, encoded.source, mm, NonZeroU64::MIN).is_err());
+        assert!(ExecBuildPlan::decode(&mut ram, encoded.source, mm, NonZeroU64::MIN).is_err());
         let mut moved = encoded.bytes.clone();
         // grants_gpa
         let offset = core::mem::offset_of!(X86InitialBootRequest, grants_gpa);
         moved[offset] ^= 8;
         let mut ram = Ram::default();
         ram.load(BASE, &moved);
-        assert!(ExecBuildPlan::read(&mut ram, encoded.source, mm, generation).is_err());
+        assert!(ExecBuildPlan::decode(&mut ram, encoded.source, mm, generation).is_err());
         let inside = grants(7, BASE);
         let encoded = encode(&[b"/bin/successor".to_vec()], &tables, &inside);
         let mut ram = Ram::default();
         ram.load(BASE, &encoded.bytes);
-        assert!(ExecBuildPlan::read(&mut ram, encoded.source, mm, generation).is_err());
+        assert!(ExecBuildPlan::decode(&mut ram, encoded.source, mm, generation).is_err());
     }
 }
