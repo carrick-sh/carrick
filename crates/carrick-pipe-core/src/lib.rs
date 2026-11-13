@@ -943,3 +943,5 @@ impl EventFd {
         Step::changed((), self.value != 0, false)
     }
 }
+
+compile_error!("director-rebased known-answer: deliberate compile break (agy-director#30)");
