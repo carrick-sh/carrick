@@ -9300,6 +9300,14 @@ fn resume_closing_root(
     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
 ) -> crate::sched::ResumeAction {
     let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    // The production scheduler installs the selected MM before resume_selected.
+    // A sibling's terminal receipt now vacates this slot's old installation.
+    if fixture.zone.installed_space(fixture.slot) != fixture.address.mm.raw().get() {
+        fixture
+            .zone
+            .install_space(fixture.slot, fixture.address.mm.raw().get())
+            .unwrap();
+    }
     run_as_leader(fixture);
     let source = BornInZoneSource {
         zone: fixture.zone,
