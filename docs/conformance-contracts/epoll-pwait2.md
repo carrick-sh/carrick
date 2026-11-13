@@ -37,3 +37,11 @@ forwarding. A pre-fix KVM replay, signal-mask and exhaustive member-kind
 witnesses remain required. No crossing
 allowlist change is included. Signed Node validation, blocked-pool capacity,
 EINTR, Docker differential and signed artifact promotion remain required.
+
+The native adapter also uses the existing ARM input-completion rule: a
+returned input-owner errno is installed in the syscall frame before lowering
+the completion. The production CPL0 witness was red with `(Served, 441)`
+instead of `-EFAULT`; the real KVM bad-timeout variant failed at exit 18.
+The host-only witness injects the guarded instruction refusal (the host
+fixture has no EL1 exception fixup), while KVM uses an actual unmapped guest
+timeout pointer. Both drive production dispatch and the native input owner.
