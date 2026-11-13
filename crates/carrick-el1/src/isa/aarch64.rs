@@ -189,6 +189,34 @@ pub fn cross_hvc_wait_channel_wake(mm: u64, address: u64, cpu: u64) -> Result<()
     }
 }
 
+/// Ring the owed-return settlement doorbell for `record` (#1369 slice 3):
+/// the carrier settles the MM at an exclusion, releases the record's claim
+/// in its epilogue and answers in x1, recorded in the record. An answer the
+/// record cannot hold leaves it unanswered (stale).
+pub fn cross_hvc_return_settlement(record: &mut carrick_el1_abi::ReturnSettlementDoorbell) {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status = carrick_el1_abi::GRANT_OP_RETURN_SETTLE;
+        let mut reply = record.words[1];
+        // SAFETY: synchronous stopped-CPU crossing; the carrier authenticates
+        // the stopped execution's MM against x1 and the claim in x2/x3.
+        unsafe {
+            core::arch::asm!("hvc #6", inout("x0") status,
+                inout("x1") reply, inlateout("x2") record.words[2] => _,
+                inlateout("x3") record.words[3] => _, options(nostack));
+        }
+        if status == carrick_el1_abi::METADATA_GRANT_SUCCESS
+            && let Some(reply) = carrick_el1_abi::SettlementDoorbellReply::from_raw(reply)
+        {
+            record.answer(reply);
+        }
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = record;
+    }
+}
+
 /// Apply the shared physical retirement owner after leaving the child's root.
 #[allow(clippy::result_unit_err)]
 pub fn cross_hvc_child_reclaim(mm: u64, cpu: u64) -> Result<(), ()> {

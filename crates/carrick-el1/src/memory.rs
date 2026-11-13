@@ -874,6 +874,90 @@ pub enum DelegatedAnonymous {
     /// The host venue runs the same root for the unchanged syscall. Any
     /// proposal was refused first, so the root is exactly as before.
     Forward,
+    /// Only a settlement of owed returns lets this call proceed: it overlaps
+    /// an owed extent, retires over one, or found the owed-return journal
+    /// full. No effect occurred and every guard is released; the venue rings
+    /// the settlement doorbell (a ring-owned MM) or forwards (a host-served
+    /// one, whose host venue settles first), then reruns the call.
+    Settle(SettlementNeed),
+}
+
+/// A delegated call that needs its MM's owed returns settled first
+/// (#1369 slice 3). Built only from the root and editor guards it consumes,
+/// so the doorbell is never rung while the caller holds either: the
+/// carrier's exclusion of this MM would otherwise wait on the caller itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlementNeed {
+    _released: (),
+}
+impl SettlementNeed {
+    fn after_release<R, E>(root: R, editor: E) -> Self {
+        drop(editor);
+        drop(root);
+        Self { _released: () }
+    }
+}
+
+/// How a parked anonymous call's reprobe reads a `Busy` root: a pending edit
+/// or fork waits for `PendingEdit`; an owed overlap waits for the in-flight
+/// settlement's `Reservations` release, or, with no settlement in flight,
+/// `None`: the call reruns and drives one itself.
+pub fn busy_root_cause<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    root: &ReservationModel<'_, G, C>,
+) -> Option<SpaceWaitCause> {
+    if root.pending().is_some() || root.fork_pending() || !root.owes_returns() {
+        Some(SpaceWaitCause::PendingEdit)
+    } else if root.return_settlement_claimed() {
+        Some(SpaceWaitCause::Reservations)
+    } else {
+        None
+    }
+}
+
+/// Drive one owed-return settlement for the calling MM (#1369 slice 3), from
+/// inside a parked call's reprobe: the caller observed every wait cause
+/// before this probe, so a refusal parks at a revision that precedes the
+/// carrier's decision, and a release in between wakes it. Claims the
+/// single flight under the root guard, releases the guard, and `ring`s the
+/// ISA's doorbell with the record (the carrier settles at an exclusion of
+/// the MM, releases the claim in its epilogue and answers). The probe's
+/// answer: `Some(None)` rerun now; `Some(Some(cause))` park on `cause`;
+/// `None` the MM is gone (stale).
+pub fn drive_return_settlement<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    slot: u32,
+    ring: impl FnOnce(&mut carrick_el1_abi::ReturnSettlementDoorbell),
+) -> Option<Option<SpaceWaitCause>> {
+    let (mm, index) = native_reservation_root(current, spaces, table)?;
+    let claim = {
+        let mut root = match table.lock_in(spaces, index.index(), mm, slot) {
+            Ok(root) => root,
+            Err(reservations::Refusal::Busy) => return Some(Some(SpaceWaitCause::Reservations)),
+            Err(_) => return None,
+        };
+        match root.claim_return_settlement(slot) {
+            Some(claim) => claim,
+            // A sibling's doorbell is in flight; its epilogue publishes
+            // Reservations.
+            None => return Some(Some(SpaceWaitCause::Reservations)),
+        }
+    };
+    let mut record = carrick_el1_abi::ReturnSettlementDoorbell::request(
+        mm,
+        claim,
+        current.execution.task.load(Ordering::Acquire),
+    );
+    ring(&mut record);
+    match record.reply() {
+        carrick_el1_abi::SettlementDoorbellReply::Settled => Some(None),
+        carrick_el1_abi::SettlementDoorbellReply::Stale => None,
+        refused => Some(refused.wait_cause()),
+    }
 }
 
 /// brk/mmap/munmap/mprotect for an MM whose shared reservation root is
@@ -1084,6 +1168,10 @@ pub fn serve_delegated_anonymous<
                 {
                     DelegatedAnonymous::Contended(SpaceWaitCause::PendingEdit)
                 }
+                // An owed overlap clears only by settling those returns.
+                reservations::Refusal::Busy if model.owes_returns() => {
+                    DelegatedAnonymous::Settle(SettlementNeed::after_release(model, ()))
+                }
                 reservations::Refusal::Busy => forward(Leave::RootUnavailableBusy),
                 reservations::Refusal::MetadataRequired => {
                     forward(Leave::RootUnavailableMetadataRequired)
@@ -1176,8 +1264,11 @@ pub fn serve_delegated_anonymous<
         // bytes: keep it invalid and publish only the fresh lazy reservation.
         // First touch obtains new zero backing under the new incarnation.
         (Prepare, RangeBacking::Retired, None) => None,
+        // Retiring over an owed extent (a munmap or brk shrink Linux
+        // allows): settle it first, then rerun.
         (_, RangeBacking::Retired, _) => {
-            return refuse(pending, &mut model, Leave::BackingRetired);
+            let _ = pending.cancel(&mut model);
+            return DelegatedAnonymous::Settle(SettlementNeed::after_release(model, _editor_guard));
         }
         (_, RangeBacking::Empty, _) | (_, _, None) => None,
         // The permission editor is the descriptor step of an mprotect and
@@ -1226,7 +1317,13 @@ pub fn serve_delegated_anonymous<
             // must not fail for lack of room. The whole range is owed; its
             // pages without a terminal have nothing to return.
             let Ok(slot) = model.reserve_return(request.range) else {
-                return refuse(pending, &mut model, Leave::JournalFull);
+                // This root's share or the shared table is full: settling
+                // (and, for a full table, draining its holders) makes room.
+                let _ = pending.cancel(&mut model);
+                return DelegatedAnonymous::Settle(SettlementNeed::after_release(
+                    model,
+                    _editor_guard,
+                ));
             };
             match editor.retire_and_invalidate(
                 mm,
@@ -3074,8 +3171,16 @@ mod tests {
             ];
             let generation = root(&spaces, &table, &task).generation();
             for (mut editor, nr, args) in cases {
+                let retired = editor.backing == RangeBacking::Retired;
                 let (route, _) = syscall(&task, &spaces, &table, &counters, &mut editor, nr, args);
-                assert_eq!(route, DelegatedAnonymous::Forward, "syscall {nr}");
+                // An edit over a retired (owed) range needs its settlement
+                // first (#1482); the rest forward.
+                let expected = if retired {
+                    DelegatedAnonymous::Settle(SettlementNeed { _released: () })
+                } else {
+                    DelegatedAnonymous::Forward
+                };
+                assert_eq!(route, expected, "syscall {nr}");
                 assert!(
                     !editor
                         .calls
@@ -3094,9 +3199,10 @@ mod tests {
                 counters.forwarded[SYS_MUNMAP as usize].load(Ordering::Relaxed),
                 1
             );
+            // The retired-range mprotect settles; it is not forwarded.
             assert_eq!(
                 counters.forwarded[SYS_MPROTECT as usize].load(Ordering::Relaxed),
-                2
+                1
             );
             assert_eq!(
                 counters.forwarded[SYS_MMAP as usize].load(Ordering::Relaxed),
@@ -3147,7 +3253,7 @@ mod tests {
             );
             assert_eq!(route, DelegatedAnonymous::Served);
             // The VA holding the unreconciled frames is not handed out again,
-            // not even as fresh lazy memory, by either venue.
+            // not even as fresh lazy memory: the call needs its settlement.
             let (route, _) = syscall(
                 &task,
                 &spaces,
@@ -3157,7 +3263,7 @@ mod tests {
                 SYS_MMAP,
                 mmap_fixed(ARENA + 0x1000, 0x1000),
             );
-            assert_eq!(route, DelegatedAnonymous::Forward);
+            assert_eq!(route, DelegatedAnonymous::Settle(SettlementNeed { _released: () }));
             let owed = {
                 let mut model = root(&spaces, &table, &task);
                 assert_eq!(
@@ -3230,7 +3336,7 @@ mod tests {
         }
 
         #[test]
-        fn delegated_owed_return_forwards_until_ack_then_completes() {
+        fn delegated_owed_return_needs_settlement_until_ack_then_completes() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
             let task = mm(&spaces, &table, 17, true);
             let mut lazy = Editor::over(RangeBacking::Empty);
@@ -3273,7 +3379,10 @@ mod tests {
                 SYS_MMAP,
                 mmap_fixed(ARENA + 0x1000, 0x1000),
             );
-            assert_eq!(before_ack, DelegatedAnonymous::Forward);
+            assert_eq!(
+                before_ack,
+                DelegatedAnonymous::Settle(SettlementNeed { _released: () })
+            );
 
             let mut model = root(&spaces, &table, &task);
             let chunks = settled(&model);
@@ -3305,7 +3414,7 @@ mod tests {
         }
 
         #[test]
-        fn delegated_full_return_journal_forwards_the_next_resident_retirement() {
+        fn delegated_full_return_journal_settles_before_the_next_resident_retirement() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
             let task = mm(&spaces, &table, 17, true);
             let mut lazy = Editor::over(RangeBacking::Empty);
@@ -3334,7 +3443,7 @@ mod tests {
                 let expected = if extent < DEFERRED_RETURNS as u64 {
                     DelegatedAnonymous::Served
                 } else {
-                    DelegatedAnonymous::Forward
+                    DelegatedAnonymous::Settle(SettlementNeed { _released: () })
                 };
                 assert_eq!(route, expected, "extent {extent}");
             }
