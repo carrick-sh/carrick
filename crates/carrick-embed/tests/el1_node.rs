@@ -19,7 +19,7 @@ fn node(script: &str) -> String {
     let mut diagnostics = String::new();
     if let Some(counters) = carrick_embed::read_el1_counters() {
         counters
-            .write_syscall_frames(&mut diagnostics)
+            .write_futex_errors(&mut diagnostics)
             .expect("format diagnostics");
     }
     assert!(

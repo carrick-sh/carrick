@@ -29,3 +29,16 @@ sample is not proof of absence. Sampling changes neither completion nor wait
 ownership. The ABI known-answer test checks filtering, retention, snapshot and
 numeric formatting; the production ARM invalid-operand witness checks that the
 real family records op 393 / errno 22. Signed Node assertions include samples.
+
+
+The first signed Node job (`20261113190017-f988c5`, pre-epoll rebase) still
+aborted after printing its version, with no futex error samples and only one
+of 32 slots used. That disproves buffer saturation as the explanation.
+Sampling now also observes common-owner result installation and the ARM
+native unclaimed-call refusal, preserving operands before overwriting arg0.
+Native refusals have unavailable binding fields (zero), never fabricated
+identity. Positive WAIT/WAIT_BITSET returns are recorded as protocol errors
+with errno zero; positive wake counts remain valid and do not consume records.
+The signed test prints a futex-only view. Red-first known-answer witnesses cover
+positive wait returns, the real ARM fork/exec refusal and production x86 strict
+crossing refusal. No Node error is attributed until a signed row provides it.
