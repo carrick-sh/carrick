@@ -3320,3 +3320,5 @@ pub(super) mod native_service;
 mod return_settlement;
 use return_settlement::CowPause;
 pub use return_settlement::ReturnSettlementCounters;
+#[cfg(feature = "test-support")]
+pub use return_settlement::{OwedReturnHolderHold, OwedReturnHolderRelease};

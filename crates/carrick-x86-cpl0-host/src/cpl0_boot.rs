@@ -3070,6 +3070,9 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     /// Serializes every settlement of an MM's owed returns (#1369 slice 3).
     return_settlement: carrick_hal::return_settlement::SettlementLock,
     return_settlement_counters: anonymous_owner::ReturnSettlementCounters,
+    /// Fixture-held editors of a full owed-return table's holders (#1482).
+    #[cfg(feature = "test-support")]
+    fixture_holder_hold: Option<Arc<anonymous_owner::OwedReturnHolderHold>>,
     root_exit_crossings: u64,
     child_retire_crossings: u64,
     run_failure_crossings: u64,
@@ -4484,6 +4487,8 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             owner_grant_crossings: 0,
             return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
             return_settlement_counters: Default::default(),
+            #[cfg(feature = "test-support")]
+            fixture_holder_hold: None,
             root_exit_crossings: 0,
             child_retire_crossings: 0,
             run_failure_crossings: 0,
@@ -4502,6 +4507,20 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     }
     pub fn memory_mut(&mut self) -> &mut CarrierMemory<M> {
         &mut self.0._vm
+    }
+    /// Hold every holder's editor at the first full owed-return table drain
+    /// and hand back the venue that releases them (#1482 P0-1 witness).
+    #[cfg(feature = "test-support")]
+    pub fn fixture_hold_owed_return_holders(
+        &mut self,
+    ) -> anonymous_owner::OwedReturnHolderRelease<M> {
+        let hold = anonymous_owner::OwedReturnHolderHold::armed();
+        self.0.fixture_holder_hold = Some(Arc::clone(&hold));
+        anonymous_owner::OwedReturnHolderRelease::new(
+            hold,
+            Arc::clone(&self.0.ram),
+            self.0._vm.clone_vm(),
+        )
     }
     pub fn ram(&self) -> &Arc<GuestRam> {
         &self.0.ram
