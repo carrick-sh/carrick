@@ -222,6 +222,16 @@ fn production_x86_family_absences_obey_crossings_without_user_memory() {
                 if allowed { 0xfeed } else { -38 },
                 "{family}"
             );
+            if native == 202 {
+                let mut diagnostic = String::new();
+                counters.write_syscall_frames(&mut diagnostic).unwrap();
+                assert!(diagnostic.contains("futex-error"), "{diagnostic}");
+                assert!(diagnostic.contains("result=-38 errno=38"), "{diagnostic}");
+                assert!(
+                    diagnostic.contains("address=0x3 op=18446744073709547520"),
+                    "{diagnostic}"
+                );
+            }
             assert_eq!(
                 counters.refused[bucket].load(Ordering::Relaxed) - before_refused,
                 u64::from(!allowed),
