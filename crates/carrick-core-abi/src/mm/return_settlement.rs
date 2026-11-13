@@ -16,6 +16,13 @@
 //! pages that really are unsettled, so an acknowledgement that raced it is
 //! stale and has no effect.
 //!
+//! The cursor is also what bounds an exclusion (#1482): a ring-owned
+//! settlement covers at most [`SETTLEMENT_CHUNK_PAGES`] owed pages under one
+//! exclusion of the MM's editor ([`SettlementBound::Chunk`]), acknowledges
+//! exactly that chunk, and the next exclusion observes the journal again and
+//! continues from the advanced `start`: never a restart from the extent's
+//! original front.
+//!
 //! Freeing a slot takes settlement authority, never a bare (slot, epoch):
 //! - an acknowledgement consumes a [`SettledChunk`], which only
 //!   [`ReturnSettlementRequest::retire_and_apply`] mints, under an exclusion
@@ -196,26 +203,87 @@ pub trait OwedReturnRetirement {
     fn apply(&mut self, prepared: Self::Prepared);
 }
 
+/// The most owed pages one settlement covers while it holds one exclusion of
+/// the MM's editor (#1482): the span of one last-level table (2 MiB). A
+/// larger owed extent settles over several exclusions; its slot's `start`,
+/// the settlement cursor, carries the progress from one to the next.
+pub const SETTLEMENT_CHUNK_PAGES: u64 = 512;
+const SETTLEMENT_CHUNK_BYTES: u64 = SETTLEMENT_CHUNK_PAGES * 4096;
+
+/// How much of an observed request one exclusion settles.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum SettlementBound {
+    /// At most [`SETTLEMENT_CHUNK_PAGES`] owed pages, from the front of
+    /// the observed extents in slot order: every ring-owned settlement. An
+    /// extent cut short ends on a chunk-aligned (2 MiB) address, so no
+    /// block terminal straddles the cut, and the first extent always
+    /// advances.
+    Chunk,
+    /// Every observed extent in one transaction: only the host venue's
+    /// boundary reconciliation, whose callers (fork planning) need the
+    /// whole journal settled at once, and which #1393 deletes.
+    WholeRequest,
+}
+
 impl ReturnSettlementRequest {
+    /// The part of this request one exclusion settles under `bound`, and
+    /// whether any observed owed page was left out of it (it stays owed in
+    /// its slot, from the cursor this chunk's acknowledgement leaves).
+    pub fn bounded(self, bound: SettlementBound) -> (Self, bool) {
+        if bound == SettlementBound::WholeRequest {
+            return (self, false);
+        }
+        let mut chunk = Self::new(self.mm);
+        let mut budget = SETTLEMENT_CHUNK_BYTES;
+        let mut rest_owed = false;
+        for (entry, observed) in chunk.owed.iter_mut().zip(self.owed) {
+            let Some(observed) = observed else { continue };
+            let (start, end) = (observed.range.start(), observed.range.end());
+            let cut = if end - start <= budget {
+                end
+            } else {
+                // `start + budget < end`: no overflow.
+                (start + budget) & !(SETTLEMENT_CHUNK_BYTES - 1)
+            };
+            rest_owed |= cut < end;
+            // `None`: no aligned piece of this extent fits what is left.
+            if let Some(range) = ReservationRange::new(start, cut) {
+                budget -= cut - start;
+                *entry = Some(DeferredReturn { range, ..observed });
+            }
+        }
+        (chunk, rest_owed)
+    }
+
     /// The settlement step that mints acknowledgement authority: under an
-    /// exclusion of exactly this request's MM, run the venue's fallible
-    /// steps, then its one infallible apply, and only then hand back one
-    /// [`SettledChunk`] per observed extent. `Ok(None)`: the exclusion names
-    /// another MM, so nothing ran (stale). `Err`: a fallible step failed;
-    /// nothing applied and nothing may be acknowledged.
+    /// exclusion of exactly this request's MM, take the part `bound`
+    /// allows ([`Self::bounded`]), run the venue's fallible steps over it,
+    /// then its one infallible apply, and only then hand back one
+    /// [`SettledChunk`] per extent it covered, each acknowledging exactly
+    /// the pages settled. `Ok(None)`: the exclusion names another MM, so
+    /// nothing ran (stale). `Err`: a fallible step failed; nothing applied
+    /// and nothing may be acknowledged.
     pub fn retire_and_apply<B: OwedReturnRetirement + ?Sized>(
         self,
         excluded: &ExcludedEditor<'_>,
+        bound: SettlementBound,
         backend: &mut B,
     ) -> Result<Option<SettledReturns>, B::Error> {
         if self.mm.raw() != excluded.key() {
             return Ok(None);
         }
-        let prepared = backend.prepare(&self)?;
+        let (chunk, rest_owed) = self.bounded(bound);
+        let prepared = backend.prepare(&chunk)?;
         backend.apply(prepared);
         Ok(Some(SettledReturns {
-            mm: self.mm,
-            chunks: self.owed.map(|owed| {
+            mm: chunk.mm,
+            chunks: chunk.owed.map(|owed| {
                 owed.map(|owed| SettledChunk {
                     slot: owed.slot,
                     epoch: owed.epoch,
@@ -223,6 +291,7 @@ impl ReturnSettlementRequest {
                     new_start: owed.range.end(),
                 })
             }),
+            rest_owed,
         }))
     }
 }
@@ -264,11 +333,17 @@ impl SettledChunk {
 pub struct SettledReturns {
     mm: ReservationMm,
     chunks: [Option<SettledChunk>; OWED_RETURNS_PER_MM],
+    rest_owed: bool,
 }
 impl SettledReturns {
     /// The root whose journal the settled request observed.
     pub const fn mm(&self) -> ReservationMm {
         self.mm
+    }
+    /// Whether the settlement's bound left observed owed pages for a later
+    /// exclusion.
+    pub const fn rest_owed(&self) -> bool {
+        self.rest_owed
     }
     pub fn is_empty(&self) -> bool {
         self.chunks.iter().all(Option::is_none)
@@ -486,5 +561,95 @@ impl ReturnSettlementDoorbell {
     /// The carrier's answer; an unanswered record is `Stale`.
     pub fn reply(&self) -> SettlementDoorbellReply {
         SettlementDoorbellReply::from_raw(self.words[5]).unwrap_or(SettlementDoorbellReply::Stale)
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    const MIB2: u64 = SETTLEMENT_CHUNK_BYTES;
+
+    fn request(extents: &[(u64, u64)]) -> ReturnSettlementRequest {
+        let mut request = ReturnSettlementRequest::new(ReservationMm::new(9).unwrap());
+        for (slot, &(start, end)) in extents.iter().enumerate() {
+            request
+                .push(DeferredReturn {
+                    range: ReservationRange::new(start, end).unwrap(),
+                    sequence: ReservationSequence::new(1).unwrap(),
+                    slot: OwedSlot::new(slot).unwrap(),
+                    epoch: OwedSlotEpoch::new(3),
+                })
+                .unwrap();
+        }
+        request
+    }
+
+    fn ranges(request: &ReturnSettlementRequest) -> alloc::vec::Vec<(u64, u64)> {
+        request
+            .iter()
+            .map(|owed| (owed.range.start(), owed.range.end()))
+            .collect()
+    }
+
+    fn pages(request: &ReturnSettlementRequest) -> u64 {
+        request.iter().map(|owed| owed.range.len() / 4096).sum()
+    }
+
+    /// #1482 P0-2: a GiB extent's chunk is its first 2 MiB, and the rest
+    /// stays owed.
+    #[test]
+    fn a_gib_extent_bounds_to_its_first_chunk() {
+        let base = 0x1_4000_0000;
+        let (chunk, rest) = request(&[(base, base + (1 << 30))]).bounded(SettlementBound::Chunk);
+        assert_eq!(ranges(&chunk), [(base, base + MIB2)]);
+        assert_eq!(pages(&chunk), SETTLEMENT_CHUNK_PAGES);
+        assert!(rest);
+    }
+
+    /// An unaligned front cuts on the 2 MiB grid, so the chunk is shorter
+    /// than the budget but never cuts a block terminal, and still advances.
+    #[test]
+    fn an_unaligned_front_cuts_on_the_chunk_grid() {
+        let start = 0x40_0000 + 0x3000;
+        let (chunk, rest) = request(&[(start, start + 8 * MIB2)]).bounded(SettlementBound::Chunk);
+        assert_eq!(ranges(&chunk), [(start, 0x60_0000)]);
+        assert!(rest);
+    }
+
+    /// The budget is shared by every extent of the request: small extents
+    /// settle whole, the extent that overruns is cut, later ones wait.
+    #[test]
+    fn the_budget_spans_every_extent_of_one_exclusion() {
+        let (chunk, rest) = request(&[
+            (0x10_0000, 0x10_4000),
+            (0x40_0000, 0x40_0000 + 3 * MIB2),
+            (0x200_0000, 0x200_1000),
+        ])
+        .bounded(SettlementBound::Chunk);
+        // 4 pages leave 508: the second extent's aligned cut falls on its
+        // own start, so it waits for the next exclusion's full budget.
+        assert_eq!(
+            ranges(&chunk),
+            [(0x10_0000, 0x10_4000), (0x200_0000, 0x200_1000)]
+        );
+        assert!(pages(&chunk) <= SETTLEMENT_CHUNK_PAGES);
+        assert!(rest);
+        let (all, rest) = request(&[(0x10_0000, 0x10_4000), (0x200_0000, 0x200_1000)])
+            .bounded(SettlementBound::Chunk);
+        assert_eq!(
+            ranges(&all),
+            [(0x10_0000, 0x10_4000), (0x200_0000, 0x200_1000)]
+        );
+        assert!(!rest, "everything owed fits one chunk");
+    }
+
+    /// The host venue's whole-request bound is the observed request.
+    #[test]
+    fn the_whole_request_bound_keeps_every_extent() {
+        let observed = request(&[(0x1_0000_0000, 0x1_4000_0000)]);
+        let (whole, rest) = observed.clone().bounded(SettlementBound::WholeRequest);
+        assert_eq!(whole, observed);
+        assert!(!rest);
     }
 }

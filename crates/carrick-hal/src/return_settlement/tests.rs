@@ -151,7 +151,7 @@ fn settle(
 ) -> Result<SettlementOutcome<ReturnSettlementReceipt>, ReturnSettlementError<Refusal, u64>> {
     let excluded = spaces.unpublished(mm).unwrap();
     let guard = lock.lock(&excluded);
-    settle_owed_returns(&excluded, &guard, journal, backend)
+    settle_owed_returns(&excluded, &guard, SettlementBound::Chunk, journal, backend)
 }
 
 const EXTENTS: [(u64, u64); 3] = [(0x10000, 0x12000), (0x20000, 0x21000), (0x30000, 0x34000)];
@@ -185,6 +185,7 @@ fn a_failed_extent_acknowledges_nothing_and_the_retry_is_idempotent() {
             freed: 3,
             advanced: 0,
             stale: 0,
+            owed_remains: false,
         }))
     );
     assert_eq!(
@@ -223,6 +224,7 @@ fn settlement_applies_once_after_every_fallible_step_then_acknowledges() {
     let outcome = settle_owed_returns(
         &excluded,
         &guard,
+        SettlementBound::Chunk,
         &journal,
         &mut Ordered { journal: &journal },
     );
@@ -292,6 +294,7 @@ fn a_reused_slot_keeps_its_successor_owed() {
         settle_owed_returns(
             &excluded,
             &guard,
+            SettlementBound::Chunk,
             &journal,
             &mut Racing { journal: &journal }
         ),
@@ -299,6 +302,7 @@ fn a_reused_slot_keeps_its_successor_owed() {
             freed: 0,
             advanced: 0,
             stale: 1,
+            owed_remains: false,
         }))
     );
     assert_eq!(journal.owed(), vec![(0x50000, 0x51000)]);
@@ -350,6 +354,144 @@ fn doorbell_replies_name_the_release_a_refusal_waits_for() {
     assert_eq!(doorbell_reply(&stale), Some(SettlementDoorbellReply::Stale));
     let failed: Outcome = Err(ReturnSettlementError::Backend(3));
     assert_eq!(doorbell_reply(&failed), None);
+}
+
+/// Records every chunk one exclusion's settlement covered.
+#[derive(Default)]
+struct Chunks {
+    spans: Vec<(u64, u64)>,
+    max_pages: u64,
+}
+
+impl OwedReturnRetirement for Chunks {
+    type Prepared = ();
+    type Error = u64;
+    fn prepare(&mut self, request: &ReturnSettlementRequest) -> Result<(), u64> {
+        let pages = request.iter().map(|owed| owed.range.len() / 4096).sum();
+        self.max_pages = self.max_pages.max(pages);
+        self.spans.extend(
+            request
+                .iter()
+                .map(|owed| (owed.range.start(), owed.range.end())),
+        );
+        Ok(())
+    }
+    fn apply(&mut self, (): ()) {}
+}
+
+const GIB_BASE: u64 = 0x1_4000_0000;
+const GIB: u64 = 1 << 30;
+const CHUNK: u64 = carrick_core_abi::SETTLEMENT_CHUNK_PAGES * 4096;
+
+/// One exclusion: raise it, settle one ring-owned chunk, lower it.
+fn one_pause(
+    spaces: &carrick_sched_core::AddressSpaces,
+    lock: &SettlementLock,
+    journal: &Journal,
+    backend: &mut Chunks,
+) -> PauseSettlement {
+    let excluded = spaces.unpublished(MM).unwrap();
+    let guard = lock.lock(&excluded);
+    let outcome = settle_ring_owned_returns(&excluded, &guard, false, journal, backend);
+    pause_settlement(&outcome).unwrap()
+}
+
+/// #1482 P0-2: one exclusion settles one chunk of a GiB owed extent and
+/// acknowledges exactly that chunk: the slot's cursor moves to the chunk's
+/// end and the rest stays owed.
+#[test]
+fn one_exclusion_settles_and_acknowledges_only_its_chunk() {
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let lock = SettlementLock::new();
+    let journal = Journal::owing(MM, &[(GIB_BASE, GIB_BASE + GIB)]);
+    let mut backend = Chunks::default();
+    let excluded = spaces.unpublished(MM).unwrap();
+    let guard = lock.lock(&excluded);
+    assert_eq!(
+        settle_ring_owned_returns(&excluded, &guard, false, &journal, &mut backend),
+        Ok(SettlementOutcome::Settled(ReturnSettlementReceipt {
+            freed: 0,
+            advanced: 1,
+            stale: 0,
+            owed_remains: true,
+        }))
+    );
+    assert_eq!(backend.spans, [(GIB_BASE, GIB_BASE + CHUNK)]);
+    assert_eq!(journal.owed(), [(GIB_BASE + CHUNK, GIB_BASE + GIB)]);
+}
+
+/// #1482 P0-2: a doorbell's drive settles a GiB owed extent in 512 bounded
+/// exclusions, each of at most 512 pages, each continuing from the cursor
+/// the previous one acknowledged (never from the extent's original front),
+/// and frees the slot.
+#[test]
+fn a_gib_extent_settles_one_chunk_per_exclusion_in_one_drive() {
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let lock = SettlementLock::new();
+    let journal = Journal::owing(MM, &[(GIB_BASE, GIB_BASE + GIB)]);
+    let mut backend = Chunks::default();
+    let mut pauses = 0u64;
+    let reply = settle_in_bounded_pauses::<()>(|| {
+        pauses += 1;
+        Ok(one_pause(&spaces, &lock, &journal, &mut backend))
+    });
+    assert_eq!(reply, Ok(SettlementDoorbellReply::Settled));
+    assert_eq!(pauses, GIB / CHUNK);
+    assert_eq!(backend.max_pages, carrick_core_abi::SETTLEMENT_CHUNK_PAGES);
+    let expected: Vec<(u64, u64)> = (0..GIB / CHUNK)
+        .map(|chunk| (GIB_BASE + chunk * CHUNK, GIB_BASE + (chunk + 1) * CHUNK))
+        .collect();
+    assert_eq!(backend.spans, expected, "contiguous chunks from the cursor");
+    assert!(journal.owed().is_empty(), "the GiB settled");
+}
+
+/// A refused re-raise between chunks ends the drive with that refusal; the
+/// chunks already settled stay settled, and the next drive continues from
+/// their cursor.
+#[test]
+fn a_refused_reraise_keeps_the_settled_cursor_for_the_next_drive() {
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let lock = SettlementLock::new();
+    let journal = Journal::owing(MM, &[(GIB_BASE, GIB_BASE + GIB)]);
+    let mut backend = Chunks::default();
+    let mut pauses = 0;
+    let reply = settle_in_bounded_pauses::<()>(|| {
+        pauses += 1;
+        if pauses == 3 {
+            // A ring editor of the MM took the editor between chunks.
+            return Ok(PauseSettlement::answer(SettlementDoorbellReply::Editor));
+        }
+        Ok(one_pause(&spaces, &lock, &journal, &mut backend))
+    });
+    assert_eq!(reply, Ok(SettlementDoorbellReply::Editor));
+    assert_eq!(journal.owed(), [(GIB_BASE + 2 * CHUNK, GIB_BASE + GIB)]);
+    backend.spans.clear();
+    assert_eq!(
+        one_pause(&spaces, &lock, &journal, &mut backend),
+        PauseSettlement {
+            reply: SettlementDoorbellReply::Settled,
+            owed_remains: true,
+        }
+    );
+    assert_eq!(
+        backend.spans,
+        [(GIB_BASE + 2 * CHUNK, GIB_BASE + 3 * CHUNK)],
+        "the next drive resumes from the cursor"
+    );
+}
+
+/// A pending fork loan ends the drive at once with its own answer.
+#[test]
+fn a_skipped_settlement_ends_the_drive() {
+    let mut pauses = 0;
+    let reply = settle_in_bounded_pauses::<()>(|| {
+        pauses += 1;
+        Ok(PauseSettlement::answer(
+            SettlementDoorbellReply::ForkLoanPending,
+        ))
+    });
+    assert_eq!(reply, Ok(SettlementDoorbellReply::ForkLoanPending));
+    assert_eq!(pauses, 1);
 }
 
 /// #1482 item 1 ratchet: every exclusion of an MM's EL1 editor settles that

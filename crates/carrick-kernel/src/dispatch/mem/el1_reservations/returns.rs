@@ -27,7 +27,7 @@
 
 use super::*;
 use carrick_el1_abi::{
-    OwedReturnRetirement, ReservationSequence, ReturnJournal, SettlementOutcome,
+    OwedReturnRetirement, ReservationSequence, ReturnJournal, SettlementBound, SettlementOutcome,
 };
 use carrick_hal::return_settlement::{
     ReturnJournalAccess, ReturnSettlementError, settle_owed_returns,
@@ -152,7 +152,15 @@ impl MemView<'_> {
                     stock_spans: Vec::new(),
                     stock: Vec::new(),
                 };
-                match settle_owed_returns(excluded, &guard, &root, &mut retirement) {
+                // The host venue settles its whole journal at the boundary:
+                // fork planning seeds a child from settled memory only.
+                match settle_owed_returns(
+                    excluded,
+                    &guard,
+                    SettlementBound::WholeRequest,
+                    &root,
+                    &mut retirement,
+                ) {
                     Ok(SettlementOutcome::Settled(receipt)) => Ok(receipt.freed),
                     // The permit's MM is the excluded MM's, and the host
                     // venue never defers its own returns.

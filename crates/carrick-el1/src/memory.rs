@@ -2713,7 +2713,11 @@ mod tests {
             let venue = Box::new(AddressSpaces::new());
             let request = carrick_el1_abi::ReturnJournal::owed_returns(model).unwrap();
             let excluded = venue.unpublished(request.mm().raw()).unwrap();
-            match request.retire_and_apply(&excluded, &mut NoBacking) {
+            match request.retire_and_apply(
+                &excluded,
+                carrick_el1_abi::SettlementBound::WholeRequest,
+                &mut NoBacking,
+            ) {
                 Ok(settled) => settled.unwrap().into_chunks().collect(),
                 Err(never) => match never {},
             }

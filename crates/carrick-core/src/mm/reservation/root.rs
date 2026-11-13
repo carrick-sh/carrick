@@ -7421,7 +7421,11 @@ pub(crate) fn settled_for_test<
     let spaces = alloc::boxed::Box::new(carrick_sched_core::AddressSpaces::new());
     let request = ReturnJournal::owed_returns(root).unwrap();
     let excluded = spaces.unpublished(request.mm().raw()).unwrap();
-    match request.retire_and_apply(&excluded, &mut NoBackingForTest) {
+    match request.retire_and_apply(
+        &excluded,
+        carrick_core_abi::SettlementBound::WholeRequest,
+        &mut NoBackingForTest,
+    ) {
         Ok(settled) => settled.expect("the exclusion names the request's MM"),
         Err(never) => match never {},
     }

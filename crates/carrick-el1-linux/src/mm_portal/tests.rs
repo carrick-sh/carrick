@@ -4508,7 +4508,11 @@ fn owner_fork_preserves_parent_owed_return_and_omits_retired_child_leaf() {
     let excluded = venue.unpublished(parent.raw()).unwrap();
     let settle = || {
         let request = carrick_el1_abi::ReturnJournal::owed_returns(&parent_root).unwrap();
-        match request.retire_and_apply(&excluded, &mut NoBacking) {
+        match request.retire_and_apply(
+            &excluded,
+            carrick_el1_abi::SettlementBound::WholeRequest,
+            &mut NoBacking,
+        ) {
             Ok(settled) => settled.unwrap(),
             Err(never) => match never {},
         }
