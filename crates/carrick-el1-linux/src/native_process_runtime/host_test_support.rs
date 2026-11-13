@@ -11799,13 +11799,13 @@ impl crate::file::MemoryValidator for ResidentUser {
 
 /// The x86 CPL0 `NativeService` completion arm's production body, driven with
 /// an admitted native fork child and the registered root: a child's
-/// `execve`/`execveat` takes native-service staging and settles with a counted
-/// ENOSYS, a root's takes the fallback counted refusal, and neither is
-/// forwarded to the host.
+/// `execve`/`execveat` is the native exec service's (#2235) and never settles
+/// here, a root's takes the counted refusal, and neither is forwarded.
 #[test]
 #[cfg(test)]
-fn x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root() {
-    use crate::dispatch::{NativeServiceSettlement, settle_unwired_native_service};
+fn x86_native_exec_completion_claims_the_fork_child_and_refuses_the_root() {
+    use crate::dispatch::{native_exec_claimed, settle_unwired_native_service};
+    use crate::native_process_runtime::NativeThreadGroupOwner as Owner;
     use carrick_guest_arch::NativeOrdinal;
     let capacity = NativeServiceCapacityFixture::new(1);
     let (child, _, _) = capacity.select().unwrap();
@@ -11813,21 +11813,17 @@ fn x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root() {
     let root = fixture.record;
     assert!(fixture.registry.record_is_fork_child(fixture.zone, child));
     assert!(!fixture.registry.record_is_fork_child(fixture.zone, root));
+    let owner = |record| {
+        if fixture.registry.record_is_fork_child(fixture.zone, record) {
+            Owner::ForkChild
+        } else {
+            Owner::Root
+        }
+    };
+    assert!(native_exec_claimed(|| owner(child)));
+    assert!(!native_exec_claimed(|| owner(root)));
 
-    let path = b"/bin/static\0";
-    let arg = b"static\0";
-    let env = b"A=B\0";
-    let argv: [u64; 2] = [arg.as_ptr() as u64, 0];
-    let envp: [u64; 2] = [env.as_ptr() as u64, 0];
-    let (path, argv, envp) = (
-        path.as_ptr() as u64,
-        argv.as_ptr() as u64,
-        envp.as_ptr() as u64,
-    );
-    for (native, canonical, args) in [
-        (59, 221, [path, argv, envp, 0, 0, 0]),
-        (322, 281, [(-100i64) as u64, path, argv, envp, 0, 0]),
-    ] {
+    for (native, canonical) in [(59, 221), (322, 281)] {
         // The x86 route table hands this exec to the native service; without
         // that arm the call is refused before any completion runs.
         assert_eq!(
@@ -11835,37 +11831,17 @@ fn x86_native_exec_completion_stages_the_fork_child_and_refuses_the_root() {
             carrick_personality_linux::dispatch::Family::NativeService,
             "native {native}: x86 routes exec to the native service"
         );
-        let ordinal = NativeOrdinal::new(native);
         let bucket = native as usize;
-        let settle = |record, counters: &carrick_el1_abi::Counters| {
+        let counters = carrick_el1_abi::Counters::new();
+        assert_eq!(
             settle_unwired_native_service(
                 fixture.registry,
                 fixture.zone,
-                Some(record),
-                canonical,
-                args,
-                ordinal,
-                fixture.task,
-                &ResidentUser,
-                counters,
-            )
-        };
-
-        let counters = carrick_el1_abi::Counters::new();
-        assert_eq!(
-            settle(child, &counters),
-            NativeServiceSettlement::ExecStaged(-38),
-            "native {native}: a fork child's exec stages and settles"
-        );
-        assert_eq!(counters.refused[bucket].load(Ordering::Relaxed), 1);
-        assert_eq!(counters.refused_child[bucket].load(Ordering::Relaxed), 1);
-        assert_eq!(counters.forwarded[bucket].load(Ordering::Relaxed), 0);
-        assert_eq!(counters.venue_refused[bucket].load(Ordering::Relaxed), 0);
-
-        let counters = carrick_el1_abi::Counters::new();
-        assert_eq!(
-            settle(root, &counters),
-            NativeServiceSettlement::Refused(-38),
+                Some(root),
+                NativeOrdinal::new(native),
+                &counters,
+            ),
+            -38,
             "native {native}: a root's exec keeps the counted refusal"
         );
         assert_eq!(counters.refused[bucket].load(Ordering::Relaxed), 1);
