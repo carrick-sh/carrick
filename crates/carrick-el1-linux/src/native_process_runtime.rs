@@ -7020,6 +7020,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 {
                     Ok(syscall_retry)
                 }
+                // A user fault parked on its MM's release (#2141): its saved
+                // context is the faulting instruction, which reruns as is.
+                NativeResume::NoPending
+                    if self
+                        .source
+                        .zone
+                        .record(self.record.id)
+                        .object_operation_kind()
+                        == Some(carrick_sched_core::object_wait::OperationKind::FaultRetry) =>
+                {
+                    // The receipt owns no pin: consuming it completes it.
+                    let receipt = carrick_core::wait::take_object_operation(
+                        self.source.zone,
+                        self.source.slot,
+                        self.source.zone.record(self.record.id).identity(),
+                    )
+                    .map_err(|_| NativeProcessError::Stale.run_failure_reason())?;
+                    match receipt.map(|token| token.kind()) {
+                        Some(carrick_sched_core::object_wait::OperationKind::FaultRetry) => {
+                            Ok(NativeResume::NoPending)
+                        }
+                        _ => Err(NativeProcessError::Stale.run_failure_reason()),
+                    }
+                }
                 resumed => Ok(resumed),
             },
             Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),

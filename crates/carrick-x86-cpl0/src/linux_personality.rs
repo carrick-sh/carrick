@@ -718,7 +718,55 @@ pub fn handle_user_page_fault_prepared(
             code,
             address,
         } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
+        UserFaultSupply::Contended(_) => park_contended_user_fault(prep, frame, fpstate),
         UserFaultSupply::Unresolved(reason) => reason,
+    }
+}
+
+/// A user #PF that met MM contention is "not now" (#2141): save the faulting
+/// context, park on the cause's release and leave for the scheduler; the wake
+/// reruns the access. A contention that ended first reruns it at once.
+fn park_contended_user_fault(
+    prep: &carrick_x86_carrier::entry::PreparedUserPageFault<'_>,
+    frame: &PageFaultStack,
+    fpstate: &XsaveArea,
+) -> u64 {
+    use carrick_el1::isa::x86::context;
+    if !native_process::is_admitted() {
+        return 9;
+    }
+    let Some(address) =
+        carrick_el1_abi::ReservationMm::new(prep.task.mm.key.load(Ordering::Acquire))
+            .and_then(anonymous::live_words)
+            .and_then(|words| words.context)
+    else {
+        return 9;
+    };
+    // The #PF entry pushes the same GPR order as the IRQ entry's frame.
+    let native = rust_alloc::boxed::Box::new(context::scheduler::NativeContext {
+        frame: context::scheduler::InterruptFrame {
+            gpr: frame.saved_gprs,
+            rip: frame.rip,
+            cs: frame.cs,
+            flags: frame.rflags,
+            rsp: frame.rsp,
+            ss: frame.ss,
+        },
+        address,
+        fs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0100),
+        gs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0102),
+        xsave: fpstate.clone(),
+    });
+    let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(&native));
+    drop(native);
+    match anonymous::park_contended_fault(prep.task, prep.slot, &saved) {
+        anonymous::ContendedFault::Parked => {
+            drop(saved);
+            carrick_x86_carrier::entry::leave_user_page_fault(prep.binding);
+            native_execution::schedule(prep.slot)
+        }
+        anonymous::ContendedFault::Rerun => 0,
+        anonymous::ContendedFault::Refused => 9,
     }
 }
 
@@ -733,6 +781,9 @@ pub enum UserFaultSupply {
         code: i32,
         address: UserVa,
     },
+    /// Another owner holds this MM's editor, root or gate: not now. The
+    /// access reruns after that cause's release, never a refusal.
+    Contended(carrick_sched_core::spaces::notification::SpaceWaitCause),
     /// No owner could supply the access: the #PF entry reports this reason.
     Unresolved(u64),
 }
@@ -856,6 +907,7 @@ fn supply_user_fault(
         },
         // This lane has no native-service birth handle, so it cannot mint
         // an owner wait. Refuse any such mismatched outcome at the boundary.
+        OwnerFaultSupplyOutcome::Contended(cause) => UserFaultSupply::Contended(cause),
         OwnerFaultSupplyOutcome::Wait(_) | OwnerFaultSupplyOutcome::Unavailable => {
             UserFaultSupply::Unresolved(9)
         }
@@ -886,6 +938,11 @@ fn supply_user_fault(
                 }),
                 &mut cow,
             );
+            if let OwnerFaultSupplyOutcome::Contended(cause) = supply.outcome()
+                && result != Action::Served
+            {
+                return UserFaultSupply::Contended(cause);
+            }
             if result != Action::Served || cow.completion.is_none() {
                 return UserFaultSupply::Unresolved(9);
             }
@@ -1317,9 +1374,11 @@ impl Personality for LinuxPersonality {
                             // The owner refused or could not supply the
                             // access (no reservation names it): never a
                             // carrier abort.
-                            UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
-                                Some(stage.refused())
-                            }
+                            // A contended staged copy keeps this refusal
+                            // until the stage can park and replay its call.
+                            UserFaultSupply::Signal { .. }
+                            | UserFaultSupply::Contended(_)
+                            | UserFaultSupply::Unresolved(_) => Some(stage.refused()),
                         }
                     }
                     None => Some(stage),
