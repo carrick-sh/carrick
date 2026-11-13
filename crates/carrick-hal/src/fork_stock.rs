@@ -1252,6 +1252,24 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         self.controls.is_empty() && self.unused_control.is_none()
     }
 
+    /// Whether a pending fork loan names `mm`: its forking execution runs
+    /// `mm`, or its admitted custody names `mm` as parent or child. Owed
+    /// returns of such an MM are not settled meanwhile
+    /// ([`carrick_el1_abi::SkipReason::ForkLoanPending`]): the loan's child
+    /// may still arm from the parent's leaves.
+    pub fn loan_names(&self, mm: ReservationMm) -> bool {
+        let Some(key) = MmKey::of(mm) else {
+            return false;
+        };
+        self.pending.iter().flatten().any(|loan| {
+            loan.execution.context.mm.raw() == key.0
+                || loan
+                    .admitted
+                    .as_ref()
+                    .is_some_and(|custody| custody.parent_key == key || custody.child_key == key)
+        })
+    }
+
     pub fn pending(&self, cpu: CpuId) -> Option<&PendingForkLoan<T::Tag, C>> {
         self.pending.get(cpu_index(cpu)?)?.as_ref()
     }
