@@ -79,8 +79,6 @@ pub const SYS_EPOLL_PWAIT2: usize = 441;
 const BATCH: usize = 32;
 /// `struct epoll_event` on AArch64: u32 events, 4 bytes padding, u64 data.
 const EVENT_BYTES: usize = 16;
-/// Largest `maxevents` Linux accepts (`EP_MAX_EVENTS`).
-const EP_MAX_EVENTS: i64 = i32::MAX as i64 / EVENT_BYTES as i64;
 /// The kernel `sigset_t` `epoll_pwait` takes (`sigsetsize` must equal it).
 const SIGSET_BYTES: usize = 8;
 
@@ -197,8 +195,14 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
         }
         Some(u64::from_le_bytes(bytes))
     };
+    let event_bytes = if frame.arm_scheduler() {
+        EVENT_BYTES
+    } else {
+        12
+    };
+    let data_offset = event_bytes - 8;
     let maxevents = i64::from(argument_word(frame, 2) as i32);
-    if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
+    if maxevents <= 0 || maxevents > i32::MAX as i64 / event_bytes as i64 {
         return returned(frame, linux::EINVAL);
     }
     let wait = match wait {
@@ -294,13 +298,13 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
         if harvest.reported > 0 {
             let mut bytes = [0u8; BATCH * EVENT_BYTES];
             for (event, report) in bytes
-                .chunks_exact_mut(EVENT_BYTES)
+                .chunks_exact_mut(event_bytes)
                 .zip(&reports[..harvest.reported])
             {
                 event[..4].copy_from_slice(&report.events.to_ne_bytes());
-                event[8..].copy_from_slice(&report.data.to_ne_bytes());
+                event[data_offset..].copy_from_slice(&report.data.to_ne_bytes());
             }
-            if !user.copy_out(buf, &bytes[..harvest.reported * EVENT_BYTES]) {
+            if !user.copy_out(buf, &bytes[..harvest.reported * event_bytes]) {
                 // Not delivered: queue the items again, so a later harvest
                 // reports them exactly once (Linux re-queues on a failed copy).
                 let _ = region.epoll_restore(object, taken, &Finish);
