@@ -32,7 +32,7 @@
 
 use carrick_core_abi::{
     ChunkAcknowledgement, OwedReturnRetirement, Refusal, ReturnJournal, ReturnSettlementRequest,
-    SettlementOutcome,
+    SettlementDoorbellReply, SettlementOutcome, SkipReason,
 };
 
 /// One MM's settlement lock: serializes every settlement of the MM's owed
@@ -145,6 +145,46 @@ pub fn settle_owed_returns<J: ReturnJournalAccess, B: OwedReturnRetirement>(
         })
         .map(SettlementOutcome::Settled)
         .map_err(ReturnSettlementError::Journal)
+}
+
+/// The settlement every exclusion of a ring-owned MM runs (#1369 slice 3),
+/// under that exclusion and the MM's settlement lock. A fork loan naming the
+/// MM (`loan_pending`, read under the fork-stock lock, which follows the
+/// settlement lock) skips it: nothing is acknowledged and the returns stay
+/// owed for a later exclusion. Otherwise it is [`settle_owed_returns`].
+pub fn settle_ring_owned_returns<J: ReturnJournalAccess, B: OwedReturnRetirement>(
+    excluded: &carrick_sched_core::ExcludedEditor<'_>,
+    guard: &SettlementGuard<'_>,
+    loan_pending: bool,
+    journal: &J,
+    backend: &mut B,
+) -> Result<SettlementOutcome<ReturnSettlementReceipt>, ReturnSettlementError<J::Error, B::Error>> {
+    if guard.mm() != excluded.key() {
+        return Ok(SettlementOutcome::Stale);
+    }
+    if loan_pending {
+        return Ok(SettlementOutcome::Skipped(SkipReason::ForkLoanPending));
+    }
+    settle_owed_returns(excluded, guard, journal, backend)
+}
+
+/// A settlement doorbell's answer for one ring-owned settlement. `Busy` from
+/// the journal means another holder had the MM's root: the ring waits for
+/// its `Reservations` release. `None`: a backend step failed, which the
+/// carrier treats as its own fault (quarantine), never a guest answer.
+pub fn doorbell_reply<B>(
+    outcome: &Result<SettlementOutcome<ReturnSettlementReceipt>, ReturnSettlementError<Refusal, B>>,
+) -> Option<SettlementDoorbellReply> {
+    Some(match outcome {
+        Ok(SettlementOutcome::Settled(_)) => SettlementDoorbellReply::Settled,
+        Ok(SettlementOutcome::Skipped(SkipReason::ForkLoanPending)) => {
+            SettlementDoorbellReply::ForkLoanPending
+        }
+        Ok(SettlementOutcome::Stale) => SettlementDoorbellReply::Stale,
+        Err(ReturnSettlementError::Journal(Refusal::Busy)) => SettlementDoorbellReply::Reservations,
+        Err(ReturnSettlementError::Journal(_)) => SettlementDoorbellReply::Stale,
+        Err(ReturnSettlementError::Backend(_)) => return None,
+    })
 }
 
 #[cfg(test)]
