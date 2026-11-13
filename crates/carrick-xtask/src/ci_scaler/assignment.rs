@@ -345,10 +345,21 @@ pub(super) fn parse_request(bytes: &[u8]) -> Result<Option<JobContext>, ScalerEr
 /// A job can request an identity; it cannot write approval or choose paths.
 pub fn pending_assignment(state: &Path) -> Result<Option<JobContext>, ScalerError> {
     let _lock = admission_lock(state)?;
-    let file = OpenOptions::new()
+    pending_assignment_locked(state)
+}
+
+/// Caller holds admission.lock; draining and request publication share it.
+pub(super) fn pending_assignment_locked(state: &Path) -> Result<Option<JobContext>, ScalerError> {
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(state.join("assignment.json"))?;
+        .open(state.join("assignment.json"))
+    {
+        Ok(file) => file,
+        // Older pilot state has no controller rendezvous.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     let mut bytes = Vec::new();
     file.take(REQUEST_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)?;

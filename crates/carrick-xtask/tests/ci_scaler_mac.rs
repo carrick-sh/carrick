@@ -1078,7 +1078,22 @@ fn assignment_without_approval_or_during_drain_fails_closed() {
         run_attempt: 1,
     };
     assert!(admit_assigned(&state, &context, uid, std::time::Duration::ZERO).is_err());
-    assert_eq!(quiesce_guest(&state).unwrap(), Assignment::Unassigned);
-    assert!(publish_assignment(&state, &JobPolicy::Bound(binding())).is_err());
-    assert!(admit_assigned(&state, &context, uid, std::time::Duration::ZERO).is_err());
+    // The request remains evidence of assigned work, even if approval timed
+    // out. A controller must not drain underneath the waiting hook.
+    assert_eq!(quiesce_guest(&state).unwrap(), Assignment::Busy);
+    assert!(!state.join("draining").exists());
+
+    // A separate, genuinely idle runner still drains and refuses admission.
+    let idle = prepare_run_once(
+        "carrick-hvf-10-1-1-101",
+        &exe,
+        &root.path().join("run"),
+        &binding(),
+        uid,
+        uid,
+    )
+    .unwrap();
+    assert_eq!(quiesce_guest(&idle).unwrap(), Assignment::Unassigned);
+    assert!(publish_assignment(&idle, &JobPolicy::Bound(binding())).is_err());
+    assert!(admit_assigned(&idle, &context, uid, std::time::Duration::ZERO).is_err());
 }

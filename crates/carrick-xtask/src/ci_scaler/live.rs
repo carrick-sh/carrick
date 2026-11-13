@@ -5101,6 +5101,7 @@ case "$*" in
   *actions/runs/1*) printf '{"id":1,"run_attempt":1,"event":"push","head_branch":"main","head_sha":"%s","path":".github/workflows/kernel-runtime.yml","repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"}}\n' "$sha" ;;
   *actions/runs/2*) printf '{"id":2,"run_attempt":1,"event":"push","head_branch":"main","head_sha":"%s","path":".github/workflows/kernel-runtime.yml","repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"}}\n' "$sha" ;;
   *generate-jitconfig*) printf '{"runner":{"id":99},"encoded_jit_config":"jit-fixture"}\n' ;;
+  *actions/runs\?*) printf '[{"workflow_runs":[]}]\n' ;;
   *actions/runners*) printf '[{"runners":[]}]\n' ;;
   *) exit 94 ;;
 esac

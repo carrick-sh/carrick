@@ -1072,7 +1072,9 @@ pub fn quiesce_guest(dir: &Path) -> Result<Assignment, ScalerError> {
     let mut lock = admission_lock(dir)?;
     let mut marker = String::new();
     lock.read_to_string(&mut marker)?;
-    if !marker.is_empty() {
+    // A hook waiting for re-vetting already owns work, even before it can
+    // write job-started. Never drain underneath its assignment rendezvous.
+    if !marker.is_empty() || assignment::pending_assignment_locked(dir)?.is_some() {
         return Ok(Assignment::Busy);
     }
     let drain = OpenOptions::new()
