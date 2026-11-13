@@ -61,6 +61,8 @@ use core::sync::atomic::Ordering;
 mod linux {
     pub const SYS_READ: usize = 63;
     pub const SYS_WRITE: usize = 64;
+    pub const SYS_READV: usize = carrick_personality_linux::crossing::nr::READV.raw() as usize;
+    pub const SYS_WRITEV: usize = carrick_personality_linux::crossing::nr::WRITEV.raw() as usize;
     pub const EBADF: i64 = -9;
     pub const EAGAIN: i64 = -11;
     pub const EINVAL: i64 = -22;
@@ -454,7 +456,8 @@ pub fn serve_ipc_with_signals<E: IpcExecution, M: UserCopy>(
     let nr = ordinal(frame);
     if nr != SYS_READ
         && nr != SYS_WRITE
-        && nr != 66
+        && nr != linux::SYS_READV
+        && nr != linux::SYS_WRITEV
         && !matches!(nr, SYS_EPOLL_PWAIT | SYS_EPOLL_PWAIT2)
     {
         return (IpcServed::Forward, false);
@@ -1038,7 +1041,7 @@ fn admit<E: IpcExecution, M: UserCopy>(
     };
     let table = TableId::from_raw(table);
     let fd = Fd(argument_word(frame, 0) as i32);
-    let reading = ordinal(frame) == SYS_READ;
+    let reading = matches!(ordinal(frame), SYS_READ | linux::SYS_READV);
     let fda = region.fd(EL1_WAIT);
     // A snapshot first (no retention): host-backed descriptions are never
     // pinned in EL1, so EL1 never holds a hold it could not release.
@@ -1096,8 +1099,8 @@ fn admit<E: IpcExecution, M: UserCopy>(
         AccessMode::WriteOnly => !reading,
         AccessMode::Path => false,
     };
-    let vectored = ordinal(frame) == 66;
-    if vectored && kind != IpcOpKind::PipeWrite {
+    let vectored = matches!(ordinal(frame), linux::SYS_READV | linux::SYS_WRITEV);
+    if vectored && !matches!(kind, IpcOpKind::PipeRead | IpcOpKind::PipeWrite) {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Forward;
     }
@@ -1322,16 +1325,16 @@ fn run<E: IpcExecution, M: UserCopy>(
                 );
             }
         };
-        let vector_input = venue.region.has_vectors(&token).unwrap_or_else(|_| {
+        let vectored_io = venue.region.has_vectors(&token).unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
         });
         let buf = op.buf.0;
-        let transferred = carrick_el1::substrate::ipc::transfer_with_input(
+        let transferred = carrick_el1::substrate::ipc::transfer_with_io(
             &mut guard,
             &mut op,
             &mut copy,
             |copy, at, dst| {
-                if vector_input {
+                if vectored_io {
                     match venue
                         .region
                         .copy_vector_input(&token, at, dst, |bytes, address| {
@@ -1348,6 +1351,22 @@ fn run<E: IpcExecution, M: UserCopy>(
                     }
                 } else {
                     copy.copy_in(dst, buf.wrapping_add(at))
+                }
+            },
+            |copy, at, src| {
+                if vectored_io {
+                    venue
+                        .region
+                        .copy_vector_output(&token, at, src, |address, bytes| {
+                            copy.copy_out(address.0, bytes)
+                        })
+                        .unwrap_or_else(|_| {
+                            crate::dispatch::invalid_completion(
+                                crate::dispatch::NativeInvariant::EntryBinding,
+                            )
+                        })
+                } else {
+                    copy.copy_out(buf.wrapping_add(at), src)
                 }
             },
         );
@@ -4278,6 +4297,32 @@ mod tests {
         // Above PIPE_BUF a nonblocking write may be partial.
         let mut f = syscall(SYS_WRITE, wfd, 0x100000, 10000, A_SVC);
         assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4096));
+        assert_eq!(host_calls(&w), 0);
+    }
+
+    #[test]
+    fn el1_ipc_readv_scatter_fault_preserves_undelivered_pipe_bytes() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (reader, writer, _) = w.pipe(t, NONBLOCK);
+        w.mem.write(MM, 0x100000, b"abcd");
+        let mut f = syscall(SYS_WRITE, writer, 0x100000, 4, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4));
+        w.mem.map(MM, 0x200000, PAGE);
+        let headers = [0x200000u64, 1, u64::MAX, 0, 0x200080, 1, 0x300000, 2]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x100000, &headers);
+        let baseline = w.region.descriptor_allocations();
+        let mut f = syscall(65, reader, 0x100000, 4, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 2));
+        assert_eq!(w.mem.read(MM, 0x200000, 1), b"a");
+        assert_eq!(w.mem.read(MM, 0x200080, 1), b"b");
+        assert_eq!(w.region.descriptor_allocations(), baseline);
+        let mut f = syscall(SYS_READ, reader, 0x200100, 4, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 2));
+        assert_eq!(w.mem.read(MM, 0x200100, 2), b"cd");
         assert_eq!(host_calls(&w), 0);
     }
 

@@ -235,6 +235,32 @@ impl IpcRegion<'_> {
         dst: &mut [u8],
         mut copy: impl FnMut(&mut [u8], IpcUserVa) -> usize,
     ) -> Result<usize, VectorInputInvariant> {
+        self.copy_vector_range(token, at, dst.len(), |done, address, len| {
+            copy(&mut dst[done..done + len], address)
+        })
+    }
+
+    /// Scatter a delivered prefix through the same retained vector headers.
+    pub fn copy_vector_output(
+        &self,
+        token: &IpcOpToken,
+        at: u64,
+        src: &[u8],
+        mut copy: impl FnMut(IpcUserVa, &[u8]) -> usize,
+    ) -> Result<usize, VectorInputInvariant> {
+        self.copy_vector_range(token, at, src.len(), |done, address, len| {
+            copy(address, &src[done..done + len])
+        })
+    }
+
+    #[inline(never)]
+    fn copy_vector_range(
+        &self,
+        token: &IpcOpToken,
+        at: u64,
+        len: usize,
+        mut copy: impl FnMut(usize, IpcUserVa, usize) -> usize,
+    ) -> Result<usize, VectorInputInvariant> {
         let slot = self.op_slot(token).map_err(VectorInputInvariant::Token)?;
         // SAFETY: the token retains the allocation, fully initialized before
         // transfer. Import failures are finished without attempting transfer.
@@ -255,7 +281,7 @@ impl IpcRegion<'_> {
                 <= at
         });
         let mut done = 0;
-        while done < dst.len() {
+        while done < len {
             let Some(vector) = vectors.get(index) else {
                 break;
             };
@@ -263,7 +289,7 @@ impl IpcRegion<'_> {
                 .checked_sub(vector.prefix.load(Ordering::Relaxed))
                 .ok_or(VectorInputInvariant::CorruptRange)?;
             let len = (vector.len.load(Ordering::Relaxed).saturating_sub(offset))
-                .min((dst.len() - done) as u64) as usize;
+                .min((len - done) as u64) as usize;
             if len == 0 {
                 index += 1;
                 continue;
@@ -271,7 +297,7 @@ impl IpcRegion<'_> {
             let Some(address) = vector.base.load(Ordering::Relaxed).checked_add(offset) else {
                 break;
             };
-            let copied = copy(&mut dst[done..done + len], IpcUserVa(address)).min(len);
+            let copied = copy(done, IpcUserVa(address), len).min(len);
             done += copied;
             if copied != len {
                 break;
