@@ -87,7 +87,7 @@ use carrick_sched_core::spaces::notification::{
     ROOT_NOTIFICATION_REQUIRED, ResourceUnlocked, SpaceNotificationLease, SpaceWaitCause,
 };
 use notification::RootAuthority;
-pub use notification::RootReleaseVenue;
+pub use notification::{RootReleaseVenue, RootReturns};
 #[cfg(feature = "test-support")]
 pub use notification::{inject_root_busy_once, release_injected_root_busy};
 
@@ -144,7 +144,7 @@ const NODE_OWNED: u64 = 1 << 63;
 const NODE_CUSTODY_BITS: u64 = 3 << 62;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
-const VERSION: u64 = 10;
+const VERSION: u64 = 11;
 /// Nodes each root keeps for its host venue: enough for the net growth of
 /// any one host syscall's mirror (at most two straddler splits per edit
 /// boundary pair, demotion and placeholder included).
@@ -156,6 +156,8 @@ pub const DEFERRED_RETURNS: usize = OWED_RETURNS_PER_MM;
 /// Table-wide journal slots shared by every root (at most
 /// [`DEFERRED_RETURNS`] each). Per-root state has no room to grow.
 const DEFERRED_SLOTS: usize = 64;
+/// Claimant vCPU slots the settlement single flight covers.
+const SETTLEMENT_CLAIM_SLOTS: usize = 256;
 
 /// One root's journal slot, reserved by [`Reservations::reserve_return`]
 /// before a retirement's descriptor step and consumed by its commit or
@@ -488,6 +490,11 @@ pub struct SharedReservations<Policy: ReservationPolicy, Geometry: ReservationGe
     /// whose own `admitted` stays the authority.
     admitted: [AtomicU64; ROOTS / 64],
     deferred: [DeferredSlot; DEFERRED_SLOTS],
+    /// The owed-return settlement single flight, one word per claimant vCPU
+    /// slot ([`SettlementClaim`]): a claimant rings from inside one exit, so
+    /// a slot holds at most one claim, and per-root words would not fit the
+    /// region. Taken under the root guard, released by compare-and-swap.
+    settlement_claims: [AtomicU64; SETTLEMENT_CLAIM_SLOTS],
     allocated: AtomicU32,
     free: AtomicU64,
     nodes: [Node; NODES],
@@ -512,6 +519,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             core::mem::offset_of!(SharedReservations<Policy, Geometry>, admitted) as u64,
             core::mem::offset_of!(SharedReservations<Policy, Geometry>, deferred) as u64,
             core::mem::size_of::<DeferredSlot>() as u64,
+            core::mem::offset_of!(SharedReservations<Policy, Geometry>, settlement_claims) as u64,
             core::mem::offset_of!(SharedReservations<Policy, Geometry>, nodes) as u64,
             core::mem::offset_of!(SharedReservations<Policy, Geometry>, storage) as u64,
             core::mem::offset_of!(Root, state) as u64,
@@ -530,6 +538,25 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
 
     pub fn initialized(&self) -> bool {
         self.layout_hash.load(Ordering::Acquire) == Self::LAYOUT_HASH
+    }
+
+    /// The carrier's exit epilogue for a settlement doorbell: release the
+    /// claim from the exact word it names ([`Reservations::claim_return_settlement`]).
+    /// `false`: that claim is no longer held (a duplicate or stale epilogue),
+    /// and nothing changed. The caller then publishes the MM's `Reservations`
+    /// release, so a refuser that enrolled on the held claim reruns.
+    pub fn release_return_settlement(&self, claim: SettlementClaim) -> bool {
+        self.settlement_claims
+            .get(claim.slot() as usize)
+            .is_some_and(|word| {
+                word.compare_exchange(
+                    claim.word(),
+                    SettlementClaim::released(claim.word()),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            })
     }
 }
 
@@ -2868,6 +2895,35 @@ impl<
                 })
             })
     }
+    /// Whether this root owes any return: a `Busy` proposal with no pending
+    /// edit or fork is then an owed overlap, which only settlement clears.
+    pub fn owes_returns(&self) -> bool {
+        self.deferred().next().is_some()
+    }
+    /// Whether a settlement doorbell for this root is in flight: a claim
+    /// held under this root's index.
+    pub fn return_settlement_claimed(&self) -> bool {
+        let index = self.index();
+        self.table
+            .settlement_claims
+            .iter()
+            .any(|word| SettlementClaim::held_for(word.load(Ordering::Acquire), index))
+    }
+    /// Claim the single flight of this root's owed-return settlement doorbell
+    /// for the ring thread on vCPU `slot` (#1369 slice 3), under this guard,
+    /// so two claimants of one MM serialize. `None`: a claim is in flight
+    /// (enrol on `Reservations` and probe once), or `slot` is out of range.
+    pub fn claim_return_settlement(&mut self, slot: u32) -> Option<SettlementClaim> {
+        if self.return_settlement_claimed() {
+            return None;
+        }
+        let word = self.table.settlement_claims.get(slot as usize)?;
+        let current = word.load(Ordering::Acquire);
+        let claim = SettlementClaim::claim(slot, current, self.index())?;
+        word.compare_exchange(current, claim.word(), Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(claim)
+    }
     fn return_owed_within(&self, range: ReservationRange) -> bool {
         self.deferred()
             .any(|owed| owed.range.start() < range.end() && range.start() < owed.range.end())
@@ -4089,6 +4145,58 @@ mod tests {
             Ok(ChunkAcknowledgement::Stale)
         );
         assert_eq!(owed_rows(&successor), vec![reused]);
+    }
+    /// #1482: the settlement doorbell is single flight per root. One claim
+    /// at a time per root, taken under its guard; only the exact held word
+    /// releases it, and every claim and release advances its epoch, so a
+    /// stale epilogue never releases a newer claim; a second root's claim is
+    /// independent.
+    #[test]
+    fn settlement_claim_is_single_flight_and_released_only_by_its_epoch() {
+        let table = table();
+        let (a, b) = (
+            ReservationMm::new(1482).unwrap(),
+            ReservationMm::new(1483).unwrap(),
+        );
+        for (slot, mm) in [(0, a), (1, b)] {
+            table.publish(slot, mm, layout()).unwrap();
+            table.lock(slot, mm).unwrap().finish_import().unwrap();
+        }
+        let first = table
+            .lock(0, a)
+            .unwrap()
+            .claim_return_settlement(3)
+            .unwrap();
+        assert!(table.lock(0, a).unwrap().return_settlement_claimed());
+        assert_eq!(
+            table.lock(0, a).unwrap().claim_return_settlement(4),
+            None,
+            "one claim per root"
+        );
+        let other = table
+            .lock(1, b)
+            .unwrap()
+            .claim_return_settlement(4)
+            .unwrap();
+        assert!(table.release_return_settlement(first));
+        assert!(!table.lock(0, a).unwrap().return_settlement_claimed());
+        assert!(
+            !table.release_return_settlement(first),
+            "a duplicate epilogue releases nothing"
+        );
+        let second = table
+            .lock(0, a)
+            .unwrap()
+            .claim_return_settlement(3)
+            .unwrap();
+        assert_ne!(second, first);
+        assert!(
+            !table.release_return_settlement(first),
+            "a stale epilogue never releases the newer claim"
+        );
+        assert!(table.lock(0, a).unwrap().return_settlement_claimed());
+        assert!(table.release_return_settlement(second));
+        assert!(table.release_return_settlement(other));
     }
     /// #1480 P0-2: final retirement is no settlement. A retired MM's owed
     /// slots stay owed under its key until its release receipt, so another

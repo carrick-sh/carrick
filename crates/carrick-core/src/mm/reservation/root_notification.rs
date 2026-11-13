@@ -155,6 +155,29 @@ impl<
             RootAuthority::Bound(self),
         )
     }
+    /// A host thread's one-attempt hold of `mm`'s root for its owed-return
+    /// journal alone (settlement observe and acknowledge). It reaches no
+    /// reservation node, so it needs no metadata banks. `Busy`: another
+    /// holder has the root; the settlement leaves its returns owed.
+    pub fn lock_returns(
+        self,
+        index: usize,
+        mm: ReservationMm,
+    ) -> Result<RootReturns<'a, Policy, Geometry, C>, Refusal> {
+        self.table
+            .lock_using(
+                index,
+                mm,
+                RootStorageAccess {
+                    banks: None,
+                    identity: true,
+                },
+                &NoRootWait,
+                RootHolder::Host.word(),
+                RootAuthority::Bound(self),
+            )
+            .map(RootReturns)
+    }
     pub fn lock_el1(
         self,
         index: usize,
@@ -332,5 +355,28 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Clone
 {
     fn clone(&self) -> Self {
         *self
+    }
+}
+
+/// One root's owed-return journal, held by a host thread
+/// ([`RootReleaseVenue::lock_returns`]). Only the journal is reachable; its
+/// drop releases the root and publishes `Reservations` like any guard.
+pub struct RootReturns<
+    'a,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx,
+>(Reservations<'a, Policy, Geometry, C>);
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> ReturnJournal for RootReturns<'_, Policy, Geometry, C>
+{
+    fn owed_returns(&self) -> Result<ReturnSettlementRequest, Refusal> {
+        self.0.owed_returns()
+    }
+    fn acknowledge_chunk(&mut self, chunk: SettledChunk) -> Result<ChunkAcknowledgement, Refusal> {
+        self.0.acknowledge_chunk(chunk)
     }
 }
