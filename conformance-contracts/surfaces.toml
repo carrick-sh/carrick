@@ -1392,6 +1392,8 @@ surfaces = [
   { path = "crates/carrick-vmm-kvm/tests/fixtures/native_root_fcntl.S", contract = "kernel.el1.ipc-fd-authority" },
   { path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs", contract = "x86.run-elf.poll" },
   { path = "crates/carrick-vmm-nvmm/src/nvmm_x86_engine.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_group_exit.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-vmm-kvm/tests/fixtures/native_group_exit.S", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-x86-carrier/src/entry.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-x86-carrier/src/entry.rs", contract = "kernel.native.entropy" },
   { path = "crates/carrick-x86-carrier/src/lib.rs", contract = "core.entry.completion" },
