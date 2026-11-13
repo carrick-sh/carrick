@@ -566,6 +566,60 @@ mod tests {
         assert_eq!(exec.machine.retired_context.get(), Some(predecessor));
     }
 
+    /// #2235: pre-admission exec import and post-admission boot insertion
+    /// both leave the carrier-built stack opaque through the real adopter.
+    #[test]
+    fn exec_import_and_boot_insertion_preserve_the_same_opaque_stack() {
+        use carrick_core_abi::{ReservationNodeFlags, ReservationProtection};
+        let stack = ReservationRange::new(0x7ffe_0000, 0x8000_0000).unwrap();
+        let flags = ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::GROWSDOWN);
+        for imported in [true, false] {
+            let fixture = Fixture::new();
+            let exec = fixture.exec(fixture.machine(true));
+            let mm = ReservationMm::new(SUCCESSOR).unwrap();
+            let slot = exec.prepare_slot(mm).unwrap();
+            let portal: MmPortal<'_, NoPin, _, _, TestVenue, X86Mmu, ParkedContextWords> =
+                MmPortal::for_zone(NonZeroU64::MIN, fixture.roots(), fixture.zone())
+                    .with_mmu(X86Mmu);
+            if imported {
+                portal
+                    .root_any(mm, 0)
+                    .unwrap()
+                    .import_with(stack, ReservationProtection::READ_WRITE, flags)
+                    .unwrap();
+            }
+            slot.prepare_adoption().unwrap();
+            if !imported {
+                portal
+                    .root_any(mm, 0)
+                    .unwrap()
+                    .insert_opaque(
+                        stack,
+                        ReservationProtection::READ_WRITE,
+                        flags.union(ReservationNodeFlags::ANONYMOUS),
+                    )
+                    .unwrap();
+            }
+            let manifest = sealed(slot.root_generation());
+            let adopted = exec.adopt(identity(), receipt(), &manifest, None).unwrap();
+            let mapping = portal
+                .root_any(mm, 0)
+                .unwrap()
+                .mapping(adopted.words.user_rsp())
+                .unwrap();
+            assert_eq!(mapping.range, stack);
+            assert_eq!(mapping.protection, ReservationProtection::READ_WRITE);
+            assert_eq!(mapping.flags, flags);
+            assert!(!mapping.flags.contains(ReservationNodeFlags::ANONYMOUS));
+            assert!(!mapping.anonymous);
+            fixture.predecessor_intact();
+            // Keep rollback armed: fixture cleanup also exercises retirement
+            // of the admitted but never-installed successor in both cases.
+            drop(slot);
+            assert!(fixture.zone().spaces.find(SUCCESSOR).is_none());
+        }
+    }
+
     #[test]
     fn refuses_every_asid_but_the_untagged_one_before_the_crossing() {
         for (asid, asid_generation) in [
