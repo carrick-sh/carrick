@@ -86,6 +86,7 @@ vm_free = [
 # The VM-free bounds are zero host calls and reclamation to the exact
 # pre-import allocation count after completion or failure.
 embed = [
+  "carrick-vmm-kvm::cpl0_initial_mm::zone_pipe_child_poll_wakes_on_parent_write_within_five_seconds",
   "carrick-vmm-kvm::cpl0_initial_mm::zone_pipe_child_write_parent_read_moves_exact_byte",
   "carrick-vmm-kvm::cpl0_initial_mm::zone_pipe_readv_scatters_child_bytes_through_shared_owner",
   "carrick-vmm-kvm::cpl0_initial_mm::zone_exec_status_pipe_reports_child_exec_failure_then_eof (failed exec only; successful exec CLOEXEC settlement remains #1093)",
