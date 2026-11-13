@@ -266,19 +266,27 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }?;
         self.return_settlement_counters.doorbells += 1;
         let reply = match record.decode() {
-            Some((mm, claim)) if mm.raw() == execution.context.mm.raw().get() => {
-                let settled = self.ring_settlement(mm).and_then(|reply| {
-                    if reply == SettlementDoorbellReply::Settled {
-                        self.drain_owed_return_table(mm)?;
-                    }
-                    Ok(reply)
-                });
+            Some((mm, claim)) => {
+                let settled = if mm.raw() == execution.context.mm.raw().get() {
+                    self.ring_settlement(mm).and_then(|reply| {
+                        if reply == SettlementDoorbellReply::Settled {
+                            self.drain_owed_return_table(mm)?;
+                        }
+                        Ok(reply)
+                    })
+                } else {
+                    // Not the stopped execution's MM: no effect.
+                    Ok(SettlementDoorbellReply::Stale)
+                };
+                // The epilogue releases the claim the record names whatever
+                // happened: an exact-word compare-and-swap, so a stale word
+                // never releases a newer claim.
                 let released = self.release_settlement_claim(mm, claim);
                 let reply = settled?;
                 released?;
                 reply
             }
-            _ => SettlementDoorbellReply::Stale,
+            None => SettlementDoorbellReply::Stale,
         };
         if reply == SettlementDoorbellReply::Editor {
             self.return_settlement_counters.editor_contended += 1;
