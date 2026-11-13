@@ -556,6 +556,15 @@ fn mounted_static_x86_two_live_mms_have_private_anonymous_leaves() {
     );
 }
 
+/// Two live processes each take the first write to a page that was prepared
+/// but untouched when the parent forked: the child on the idle peer, the
+/// parent on its loaded lane. Before #2226 the fork-armed leaf refused its
+/// write publication and the idle peer's fault doorbell killed the carrier.
+#[test]
+fn mounted_static_x86_fork_first_write_to_prepared_page_stays_private() {
+    compare_mounted_assembly_with_native("x86_fork_prepared_cow_write.S", b"C\nP\n");
+}
+
 /// Sequential fork/exit rounds beyond the eight x86 fork lifecycle records:
 /// each round past eight needs a retired child's stock reclaimed (its CR3
 /// registration, inventory rows and private memslots released) and its

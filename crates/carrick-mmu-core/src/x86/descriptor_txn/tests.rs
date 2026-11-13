@@ -1091,6 +1091,68 @@ fn prepared_readonly_leaf_refuses_write_publication_without_a_store() {
     );
     assert_eq!(*words.words.borrow(), before);
 }
+/// A fork arms a not-yet-present writable leaf for COW. The child's first
+/// write publishes it resident and still COW-armed, so the retried store
+/// takes the COW copy, as ARM's deferred fork COW does (#2226).
+#[test]
+fn fork_armed_prepared_leaf_publishes_for_write_and_stays_cow_armed() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let op = DescriptorOp::Map {
+        span,
+        output: FrameGpa::new(0x800000),
+        permissions: Permissions {
+            writable: true,
+            executable: false,
+            user: true,
+        },
+        size: LeafSize::Page,
+        resident: false,
+        backing: backing(),
+    };
+    assert!(matches!(
+        apply(&words, op, &[root(0x2000), root(0x3000), root(0x4000)]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(&words, DescriptorOp::ArmCow(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Publish {
+                span,
+                expected: FrameGpa::new(0x800000),
+                access: Access::Write,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let leaf = read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va))
+        .unwrap()
+        .0;
+    assert_eq!(leaf & (PRESENT | PREPARED | WRITE | COW), PRESENT | COW);
+    let walk = |access| translate(&words, root(0x1000), UserVa::new(span.va), access, true);
+    assert_eq!(walk(Access::Read), Ok(FrameGpa::new(0x800000)));
+    assert_eq!(walk(Access::Write), Err(FaultClass::CowWrite));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::CowRepoint {
+                span,
+                old: FrameGpa::new(0x800000),
+                new: FrameGpa::new(0x900000),
+                backing: backing()
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(walk(Access::Write), Ok(FrameGpa::new(0x900000)));
+}
+
 #[test]
 fn split_and_coalesce_preserve_pat_output_and_neighbors() {
     for size in [LeafSize::Block2M, LeafSize::Block1G] {
