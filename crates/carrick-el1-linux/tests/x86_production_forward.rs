@@ -1248,6 +1248,15 @@ fn x86_child_exec_is_staged_then_counted_enosys() {
 
 #[test]
 fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
+    x86_native_child(false);
+}
+
+#[test]
+fn production_x86_misaligned_realtime_bitset_futex_is_einval() {
+    x86_native_child(true);
+}
+
+fn x86_native_child(futex_only: bool) {
     use carrick_abi::{
         LINUX_AT_EMPTY_PATH, LINUX_AT_FDCWD, LINUX_O_CREAT, LINUX_O_TRUNC, LINUX_O_WRONLY,
     };
@@ -1850,7 +1859,91 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         words: &'c ParkedContextWords,
     }
 
+    // Observe the real dispatcher's copy adapter without replacing the native
+    // process implementation or its admission/completion path.
+    struct ObserveFutex<'p, 'c> {
+        inner: &'p mut dyn carrick_el1_linux::lifecycle::ProcessNative<'static, ParkedContextWords>,
+        loads: &'c core::cell::Cell<usize>,
+    }
+    impl carrick_el1_linux::lifecycle::ProcessNative<'static, ParkedContextWords>
+        for ObserveFutex<'_, '_>
+    {
+        fn binding(&self) -> carrick_core_abi::ExecutionBinding {
+            self.inner.binding()
+        }
+        fn is_root_process(&self) -> bool {
+            self.inner.is_root_process()
+        }
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::user_copy::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("unexpected copy wait")
+        }
+        fn fork(
+            &mut self,
+            _: carrick_personality_linux::lifecycle::ProcessForkChildTid,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("futex observer only")
+        }
+        fn wait4(
+            &mut self,
+            _: carrick_personality_linux::lifecycle::ProcessWaitPid,
+            _: UserVa,
+            _: carrick_personality_linux::lifecycle::LinuxWaitOptions,
+            _: UserVa,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("futex observer only")
+        }
+        fn exit_group(&mut self, _: u8) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("futex observer only")
+        }
+        fn native_futex(
+            &mut self,
+            call: carrick_personality_linux::sched::FutexCall,
+            copy: &mut dyn carrick_core::user_copy::UserCopy,
+        ) -> Option<carrick_personality_linux::lifecycle::LifecycleOutcome> {
+            struct CountCopy<'a, 'b> {
+                inner: &'a mut dyn carrick_core::user_copy::UserCopy,
+                loads: &'b core::cell::Cell<usize>,
+            }
+            impl carrick_core::user_copy::UserCopy for CountCopy<'_, '_> {
+                fn copy_in(
+                    &mut self,
+                    dst: &mut [u8],
+                    src: UserVa,
+                ) -> carrick_core::user_copy::CopyOutcome {
+                    self.loads.set(self.loads.get() + 1);
+                    self.inner.copy_in(dst, src)
+                }
+                fn copy_out(
+                    &mut self,
+                    _: UserVa,
+                    _: &[u8],
+                ) -> carrick_core::user_copy::CopyOutcome {
+                    panic!("futex wait cannot write user memory")
+                }
+                fn atomic_load_u32(
+                    &mut self,
+                    address: UserVa,
+                    value: &mut u32,
+                ) -> carrick_core::user_copy::CopyOutcome {
+                    self.loads.set(self.loads.get() + 1);
+                    self.inner.atomic_load_u32(address, value)
+                }
+            }
+            self.inner.native_futex(
+                call,
+                &mut CountCopy {
+                    inner: copy,
+                    loads: self.loads,
+                },
+            )
+        }
+    }
+
     struct X86Env<'e> {
+        loads: &'e core::cell::Cell<usize>,
         counters: &'e Counters,
         tasks: &'e [CurrentTask],
         names: &'e InotifyNameCache,
@@ -1894,9 +1987,17 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             origin: caller.origin,
             staged: None,
         };
+        let mut observer;
         let process: Option<
             &mut dyn carrick_el1_linux::lifecycle::ProcessNative<'static, ParkedContextWords>,
         > = match &mut entry {
+            Some(entry) if native_nr == 202 => {
+                observer = ObserveFutex {
+                    inner: &mut **entry,
+                    loads: env.loads,
+                };
+                Some(&mut observer)
+            }
             Some(entry) => Some(&mut **entry),
             None => None,
         };
@@ -1927,7 +2028,9 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         }
     }
 
+    let loads = core::cell::Cell::new(0);
     let env = X86Env {
+        loads: &loads,
         counters: &counters,
         tasks,
         names: &names,
@@ -2063,6 +2166,46 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
             words: &state.words,
         }),
     };
+
+    if futex_only {
+        for offset in [1, 2, 3] {
+            for mask in [0, 0xffff_ffff] {
+                let (route, result) = call_x86(
+                    &env,
+                    &child,
+                    &mut service,
+                    202,
+                    [0x1000 + offset, 393, 1, 0, 0, mask],
+                );
+                assert_eq!(
+                    route,
+                    CompletionRoute::Served,
+                    "offset={offset} mask={mask}"
+                );
+                assert_eq!(
+                    result, -22,
+                    "op 393 must return errno 22, not errno 38; offset={offset} mask={mask}"
+                );
+                assert_eq!(
+                    loads.get(),
+                    0,
+                    "invalid operands require zero user-memory loads"
+                );
+            }
+        }
+        let mut diagnostic = String::new();
+        counters.write_futex_errors(&mut diagnostic).unwrap();
+        let samples: Vec<_> = diagnostic
+            .lines()
+            .filter(|line| line.contains("futex-error sample="))
+            .collect();
+        assert_eq!(samples.len(), 6, "{diagnostic}");
+        for sample in samples {
+            assert!(sample.contains("op=393"), "{sample}");
+            assert!(sample.contains("result=-22 errno=22"), "{sample}");
+        }
+        return;
+    }
 
     // Child stats fd 1 (statx AT_EMPTY_PATH) and writes fd 1.
     let empty = GuestUserBuffer::from_bytes(b"\0");
