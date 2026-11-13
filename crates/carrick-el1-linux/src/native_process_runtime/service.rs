@@ -2726,7 +2726,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Stale)?;
         if keys.as_slice() != [old_key]
             || self.control.visible_tid() != Some(self.calling_tid)
-            || self.source.zone.record(self.record.id).identity().tid != self.calling_tid as u64
+            // The record names its task key, the entry's own binding task;
+            // the calling tid is the namespace view, another domain.
+            || self.source.zone.record(self.record.id).identity().tid != self.binding.task.raw()
         {
             return Err(NativeProcessError::Busy);
         }
