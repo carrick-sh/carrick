@@ -594,15 +594,15 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
     use carrick_mmu_core::x86::descriptor_txn::{Access, translate_leaf};
     use std::{boxed::Box, collections::BTreeMap, sync::Mutex};
 
-    struct TestWords(Mutex<BTreeMap<u64, u64>>);
+    pub(crate) struct TestWords(Mutex<BTreeMap<u64, u64>>);
     impl TestWords {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let mut words = BTreeMap::new();
             words.insert(0x60_0000 + 511 * 8, 0x20_0003);
             Self(Mutex::new(words))

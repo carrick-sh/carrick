@@ -4043,8 +4043,10 @@ impl Cpl0Carrier {
             .ok()
             .filter(|cpu| (*cpu as usize) < self.cpus.len())
             .ok_or_else(|| fail("exec service CPU"))?;
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|error| fail(format!("exec random: {error}")))?;
         self.custody
-            .stage_native_exec(carrick_guest_arch::CpuId::new(cpu), request, wake)
+            .stage_native_exec(carrick_guest_arch::CpuId::new(cpu), request, wake, random)
     }
 
     /// Probe a woken parked exec once against this carrier's fork stock.

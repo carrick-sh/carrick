@@ -687,7 +687,11 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             // Exit work can be published after the last child has left its
             // process root. Only the boot-published maintenance root may
             // serve that work; it is never a task snapshot or a child MM.
-            if *port == carrick_x86::cpl0_entry::WORK_PORT
+            // An exec settlement crosses after its CPU left the predecessor
+            // and before it loads the successor; the service authenticates
+            // the settling task and its successor's root.
+            if (*port == carrick_x86::cpl0_entry::WORK_PORT
+                || *port == carrick_el1_abi::NATIVE_EXEC_PORT)
                 && self
                     .maintenance_root
                     .is_some_and(|root| root.address().raw() == image.cr3)

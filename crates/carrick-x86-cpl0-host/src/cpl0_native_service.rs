@@ -8,6 +8,10 @@ pub(in crate::cpl0_boot) struct Cpl0ServicePin {
     cell: core::ptr::NonNull<ServiceCell>,
     _ram: Arc<crate::guest_ram::GuestRam>,
 }
+// SAFETY: the pin names one aligned atomic service cell inside RAM this pin
+// retains; a parked exec's ticket moves between stopped-host services only
+// inside exclusive carrier custody, and the cell itself is shared state.
+unsafe impl Send for Cpl0ServicePin {}
 impl core::ops::Deref for Cpl0ServicePin {
     type Target = ServiceCell;
     fn deref(&self) -> &ServiceCell {
@@ -23,9 +27,23 @@ pub(in crate::cpl0_boot) struct PendingNativeHostFile {
     address: KernelVa,
     pub(in crate::cpl0_boot) record: Vec<u8>,
 }
+/// A fork child's exec request, claimed and authenticated: the carrier's
+/// loader runs on its staged payload with custody released, then
+/// [`Cpl0HostCustody::finish_native_exec`] stages and seals the successor.
+pub(in crate::cpl0_boot) struct PendingNativeExec {
+    pub(in crate::cpl0_boot) ticket: ServiceTicket<Cpl0ServicePin>,
+    pub(in crate::cpl0_boot) execution: GrantExecution,
+    pub(in crate::cpl0_boot) key: ObjectWaitKey,
+    /// The ring's proposed manifest, authenticated in retained storage.
+    pub(in crate::cpl0_boot) manifest: KernelVa,
+    pub(in crate::cpl0_boot) successor: carrick_el1_abi::ReservationMm,
+    pub(in crate::cpl0_boot) root_generation: core::num::NonZeroU64,
+    pub(in crate::cpl0_boot) payload: Vec<u8>,
+}
 pub(in crate::cpl0_boot) enum NativeNoticeStep {
     Settled,
     HostFile(Box<PendingNativeHostFile>),
+    Exec(Box<PendingNativeExec>),
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
@@ -242,6 +260,45 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         record,
                     },
                 )));
+            }
+            ServiceOperation::Exec { payload, .. } => {
+                let pointer = self.native_service_pointer(
+                    execution.context,
+                    KernelVa::new(payload.address().raw()),
+                    payload.length().raw() as usize,
+                    1,
+                )?;
+                // SAFETY: the outstanding ticket retains the ring's staged
+                // exec payload until its acknowledgment.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(pointer, payload.length().raw() as usize) }
+                        .to_vec();
+                let manifest = ticket
+                    .reply_address()
+                    .ok_or_else(|| fail("native exec without a manifest reply"))?;
+                let reply = self.native_service_pointer(
+                    execution.context,
+                    manifest,
+                    size_of::<carrick_core_abi::service::ExecSuccessorManifest>(),
+                    align_of::<carrick_core_abi::service::ExecSuccessorManifest>(),
+                )?;
+                // SAFETY: the ticket retains the ring's aligned proposal box;
+                // the ring writes it before publication and only reads it
+                // again after this ticket's acknowledgment.
+                let proposed =
+                    unsafe { *reply.cast::<carrick_core_abi::service::ExecSuccessorManifest>() };
+                let (successor, root_generation) = proposed
+                    .proposal(ticket.request().identity)
+                    .ok_or_else(|| fail("native exec manifest proposal"))?;
+                return Ok(NativeNoticeStep::Exec(Box::new(PendingNativeExec {
+                    ticket,
+                    execution,
+                    key,
+                    manifest,
+                    successor,
+                    root_generation,
+                    payload: bytes,
+                })));
             }
             ServiceOperation::Entropy { payload } => {
                 let pointer = self.native_service_pointer(

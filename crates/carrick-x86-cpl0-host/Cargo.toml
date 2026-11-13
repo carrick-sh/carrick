@@ -26,6 +26,7 @@ carrick-mem = { path = "../carrick-mem" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-x86 = { path = "../carrick-x86" }
+getrandom.workspace = true
 libc.workspace = true
 static_assertions = "1"
 

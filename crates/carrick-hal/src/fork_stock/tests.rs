@@ -3021,3 +3021,63 @@ fn settlement_exclusion_reclaims_all_64_slots_held_by_exited_fork_children() {
     assert!(!stock.has_quarantine());
     assert_eq!(stock.counters().returned_children, 8);
 }
+
+/// #2235: an x86 exec successor's tables come from this stock. Adoption
+/// keeps the pages its build linked as the successor's committed tables,
+/// returns the untouched rest at once, and the successor's reclaim returns
+/// the linked pages once more, as a fork child's arena returns.
+#[test]
+fn a_built_exec_successor_commits_its_linked_tables_and_returns_the_rest() {
+    let mut stock = stock(UntaggedRoots, 12, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    let before = stock.table_stock().len();
+    let reserved = stock.reserve_successor_tables(5).unwrap();
+    let pages = reserved.pages().to_vec();
+    assert_eq!(stock.table_stock().len(), before - 5);
+    let reserved = match stock.take_built_successor_tables(reserved, 6) {
+        Err(whole) => whole,
+        Ok(_) => panic!("a build cannot use more than its reservation"),
+    };
+    let used = stock.take_built_successor_tables(reserved, 3).unwrap();
+    assert_eq!(used, pages[..3]);
+    assert_eq!(
+        stock.table_stock().len(),
+        before - 3,
+        "the unused two return"
+    );
+
+    let successor_mm = mm(303);
+    // SAFETY: this fixture owns the closed successor incarnation.
+    let successor = unsafe {
+        El1MmHandle::from_admitted_owner(CARRIER, successor_mm, NonZeroU64::new(9).unwrap())
+    };
+    let child = child_of(granted, 43);
+    let receipt = stock
+        .replace_child_for_exec_with_tables(child, successor, pages[0], (), used.clone())
+        .unwrap();
+    assert_eq!(stock.child_root(successor_mm), Some(pages[0]));
+    let cleared = RefCell::new(Vec::new());
+    stock
+        .settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            absent(granted.request.child_mm).unwrap(),
+            |tables| {
+                cleared.borrow_mut().extend_from_slice(tables);
+                true
+            },
+            |_, _| true,
+        )
+        .unwrap();
+    assert_eq!(cleared.borrow().len(), 1, "the predecessor's one table");
+    retire(&mut stock, execution(43, 1, 303, pages[0].address().raw())).unwrap();
+    let reclaimed = RefCell::new(Vec::new());
+    assert_eq!(reclaim(&mut stock, |_| true, &reclaimed), 1);
+    assert_eq!(
+        *reclaimed.borrow(),
+        used,
+        "the successor's linked tables return"
+    );
+    assert_eq!(stock.table_stock().len(), before + 1);
+}

@@ -198,7 +198,7 @@ impl<M: CarrierMemoryIo> ExclusionSettlement for Cpl0Exclusion<'_, '_, M> {
     ) -> Result<(), TrapError> {
         let active = carrick_el1_abi::ReservationMm::new(excluded.key())
             .ok_or_else(|| fail("settlement quarantine active MM"))?;
-        self.custody.drain_fork_quarantine(active)
+        self.custody.drain_fork_quarantine_in(active)
     }
     fn settle_owed_returns(
         &mut self,

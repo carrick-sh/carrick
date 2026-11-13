@@ -6,6 +6,8 @@ extern crate alloc as rust_alloc;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod entry;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod exec_build;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod initial_boot;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod native_execution;

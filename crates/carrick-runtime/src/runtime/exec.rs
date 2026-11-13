@@ -164,6 +164,23 @@ pub(crate) fn prepare_native_x86_exec_image(
     )
 }
 
+/// The KVM CPL0 carrier's exec loader for a fork child's staged payload
+/// (#2235): the run's exec capability and descriptor sources, through
+/// [`prepare_native_x86_exec_image`].
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub(crate) fn load_native_x86_exec(
+    dispatcher: &std::sync::Mutex<SyscallDispatcher>,
+    payload: &[u8],
+) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
+    let dispatcher = dispatcher
+        .lock()
+        .map_err(|_| crate::linux_abi::LINUX_ENOSYS)?;
+    let capability = capture_native_exec_capability(&dispatcher)?;
+    prepare_native_x86_exec_image(&capability, payload, |table, fd| {
+        dispatcher.native_descriptor_exec_source(table, fd)
+    })
+}
+
 /// Parse a native child's staged exec request under the caller's sealed
 /// access, and hand what it names to `load`.
 fn prepare_native_exec<R>(

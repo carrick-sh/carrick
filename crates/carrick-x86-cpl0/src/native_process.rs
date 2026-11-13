@@ -213,25 +213,46 @@ pub(super) fn admit_root(
     Ok(())
 }
 
-/// The machine effects of exec on this CPU. The three consuming crossings
-/// have no x86 transport yet (#1093 S4c), so they refuse: native exec stays
-/// an observable, counted refusal end to end until the transport lands.
+/// The machine effects of exec on this CPU: the three consuming crossings
+/// are synchronous stops on [`carrick_el1_abi::NATIVE_EXEC_PORT`], each
+/// naming its record on this CPU's supervisor stack.
 struct ServiceExecMachine {
     slot: SlotId,
 }
-impl X86ExecMachine for ServiceExecMachine {
-    fn cross_adopt(&self, _record: u64) -> Result<(), NativeProcessError> {
-        Err(NativeProcessError::Unsupported)
+impl ServiceExecMachine {
+    fn cross(operation: u64, record: u64) {
+        // SAFETY: the aligned record stays on this CPU's supervisor stack
+        // through the stopped host crossing, which authenticates it against
+        // the stopped execution and writes its typed reply into it.
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") carrick_el1_abi::NATIVE_EXEC_PORT,
+                in("rax") record, in("rdi") operation, options(nostack));
+        }
     }
-    fn cross_cancel(&self, _record: u64) -> Result<(), NativeProcessError> {
-        Err(NativeProcessError::Unsupported)
+}
+impl X86ExecMachine for ServiceExecMachine {
+    fn cross_adopt(&self, record: u64) -> Result<(), NativeProcessError> {
+        Self::cross(carrick_el1_abi::GRANT_OP_EXEC_ADOPT, record);
+        Ok(())
+    }
+    fn cross_cancel(&self, record: u64) -> Result<(), NativeProcessError> {
+        Self::cross(carrick_el1_abi::GRANT_OP_EXEC_CANCEL, record);
+        Ok(())
     }
     fn cross_settle(
         &self,
-        _predecessor: ReservationMm,
-        _successor: ReservationMm,
+        predecessor: ReservationMm,
+        successor: ReservationMm,
     ) -> Result<(), NativeProcessError> {
-        Err(NativeProcessError::Unsupported)
+        let mut settlement = carrick_el1_abi::NativeExecSettlement::new(predecessor, successor);
+        Self::cross(
+            carrick_el1_abi::GRANT_OP_EXEC_SETTLE,
+            &raw mut settlement as u64,
+        );
+        match settlement.take(predecessor, successor) {
+            Some(Ok(())) => Ok(()),
+            _ => Err(NativeProcessError::Quarantined),
+        }
     }
     fn park_on_maintenance_root(&self) -> bool {
         carrick_x86_carrier::native_execution::park_on_maintenance_root(
@@ -243,6 +264,42 @@ impl X86ExecMachine for ServiceExecMachine {
     }
     fn retire_context(&self, address: Mm) -> bool {
         anonymous::retire_context(address)
+    }
+}
+
+/// The CPL0 build of a sealed successor, run by the adopter before the
+/// consuming crossing over the extent the manifest names.
+struct ServiceExecBuild {
+    predecessor: ReservationMm,
+}
+impl crate::exec_successor::X86SuccessorBuild for ServiceExecBuild {
+    fn build(
+        &mut self,
+        successor: &carrick_core_abi::service::ExecSuccessorManifestView,
+    ) -> Result<RootGpa, NativeProcessError> {
+        use carrick_el1::isa::x86::initial_mm::InitialMmError;
+        let source = successor.build.ok_or(NativeProcessError::Stale)?;
+        let mm = NonZeroU64::new(successor.successor_mm.raw()).ok_or(NativeProcessError::Stale)?;
+        // SAFETY: the adopter owns the closed successor, sealed for this
+        // exact service and receipt; the carrier retains its reserved
+        // tables, data grants and extent until adoption or cancellation.
+        let image = unsafe {
+            carrick_x86_carrier::exec_build::build_exec_successor(
+                self.predecessor,
+                source,
+                mm,
+                successor.root_generation,
+            )
+        }
+        .map_err(|error| match error {
+            InitialMmError::DescriptorIndeterminate => fatal(),
+            InitialMmError::FrameUnavailable => NativeProcessError::Exhausted,
+            _ => NativeProcessError::Stale,
+        })?;
+        if image.stack_pointer != successor.stack_pointer.raw() {
+            return Err(NativeProcessError::Stale);
+        }
+        Ok(image.address.root)
     }
 }
 
@@ -570,9 +627,12 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         manifest: &carrick_core_abi::service::ExecSuccessorManifest,
     ) -> Result<NativeExecSuccessor<Mm, ParkedContextWords>, NativeProcessError> {
-        // The host builds no x86 successor yet (#1093 S4c slices c and d).
+        let mut build = ServiceExecBuild {
+            predecessor: ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))
+                .ok_or(NativeProcessError::Stale)?,
+        };
         self.exec_successor()?
-            .adopt(identity, receipt, manifest, None)
+            .adopt(identity, receipt, manifest, Some(&mut build))
     }
     fn cancel_exec_successor(
         &self,
