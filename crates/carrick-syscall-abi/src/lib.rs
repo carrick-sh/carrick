@@ -19,6 +19,15 @@ pub use stat::{
 };
 pub mod syscall_x86_64;
 
+/// futex(2) command and option domains, shared by decoding and observation.
+pub const LINUX_FUTEX_WAIT: u64 = 0;
+pub const LINUX_FUTEX_WAKE: u64 = 1;
+pub const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
+pub const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
+pub const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
+pub const LINUX_FUTEX_CLOCK_REALTIME: u64 = 256;
+pub const LINUX_FUTEX_CMD_MASK: u64 = !(LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME);
+
 /// Linux directory descriptor selecting the calling task's working directory.
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 /// `unlinkat` removes a directory rather than a non-directory entry.

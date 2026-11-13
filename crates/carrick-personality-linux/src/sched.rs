@@ -20,11 +20,16 @@ impl FutexFrequency {
     }
 }
 pub const SYS_FUTEX: usize = carrick_syscall_abi::nr::FUTEX.raw() as usize;
-pub const FUTEX_WAIT_PRIVATE: u64 = 128;
-pub const FUTEX_WAKE_PRIVATE: u64 = 129;
-pub const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
-pub const FUTEX_WAKE_BITSET_PRIVATE: u64 = 128 | 10;
-pub const FUTEX_WAIT_BITSET_PRIVATE_REALTIME: u64 = 128 | 256 | 9;
+pub const FUTEX_WAIT_PRIVATE: u64 =
+    carrick_syscall_abi::LINUX_FUTEX_WAIT | carrick_syscall_abi::LINUX_FUTEX_PRIVATE_FLAG;
+pub const FUTEX_WAKE_PRIVATE: u64 =
+    carrick_syscall_abi::LINUX_FUTEX_WAKE | carrick_syscall_abi::LINUX_FUTEX_PRIVATE_FLAG;
+pub const FUTEX_WAIT_BITSET_PRIVATE: u64 =
+    carrick_syscall_abi::LINUX_FUTEX_WAIT_BITSET | carrick_syscall_abi::LINUX_FUTEX_PRIVATE_FLAG;
+pub const FUTEX_WAKE_BITSET_PRIVATE: u64 =
+    carrick_syscall_abi::LINUX_FUTEX_WAKE_BITSET | carrick_syscall_abi::LINUX_FUTEX_PRIVATE_FLAG;
+pub const FUTEX_WAIT_BITSET_PRIVATE_REALTIME: u64 =
+    FUTEX_WAIT_BITSET_PRIVATE | carrick_syscall_abi::LINUX_FUTEX_CLOCK_REALTIME;
 pub const EAGAIN: i64 = -11;
 pub const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
 
