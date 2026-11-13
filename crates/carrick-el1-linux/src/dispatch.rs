@@ -5361,10 +5361,14 @@ impl<
         }
     }
 
-    /// Name why an `epoll_pwait` left the ring before the IPC owner ran
-    /// (read and write have their own host-backed routing, not counted).
+    /// Name why an `epoll_pwait` or `epoll_pwait2` left the ring before the
+    /// IPC owner ran (read and write have their own host-backed routing, not
+    /// counted).
     fn note_epoll_leave(&self, ordinal: u64, why: carrick_el1_abi::IpcLeave) {
-        if ordinal == ipc::SYS_EPOLL_PWAIT as u64 {
+        if matches!(
+            ordinal as usize,
+            ipc::SYS_EPOLL_PWAIT | ipc::SYS_EPOLL_PWAIT2
+        ) {
             self.counters.ipc_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
         }
     }

@@ -2921,7 +2921,8 @@ pub enum IpcLeave {
     PinRefused,
     /// No operation record was free (or one could not be taken back).
     NoOperationRecord,
-    /// An eventfd write's value could not be copied in.
+    /// An eventfd write's value, or an `epoll_pwait2` timeout, could not be
+    /// copied in.
     CopyInFault,
     /// A resumed operation's token or record did not resolve.
     StaleOperation,
