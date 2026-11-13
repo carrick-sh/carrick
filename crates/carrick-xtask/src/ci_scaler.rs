@@ -791,9 +791,12 @@ fn standing_event_ref(event: &str, branch: &str) -> bool {
     }
 }
 
+pub(super) const UNASSIGNED_DRAIN_SECS: u64 = 900;
+
 /// The GitHub runner registration a controller owns, shared by the Willow
 /// clone ledger and the cloudmac ledger for assignment and removal.
 pub trait RunnerRegistration {
+    fn created(&self) -> u64;
     fn key(&self) -> JobKey;
     fn name(&self) -> &str;
     fn runner(&self) -> Option<RunnerId>;
@@ -802,6 +805,9 @@ pub trait RunnerRegistration {
     fn set_assigned(&mut self, job: JobId);
 }
 impl RunnerRegistration for Record {
+    fn created(&self) -> u64 {
+        self.created
+    }
     fn key(&self) -> JobKey {
         self.key
     }
@@ -915,7 +921,7 @@ pub fn recovery_decision(row: &Record, present: bool, task: TaskState, now: u64)
         || row.state == State::Reaping
         || (row.state == State::Reserved
             && task == TaskState::Absent
-            && now.saturating_sub(row.created) >= 900)
+            && now.saturating_sub(row.created) >= UNASSIGNED_DRAIN_SECS)
     {
         Recovery::FinishAbsent
     } else {
@@ -1074,7 +1080,7 @@ pub fn quiesce_guest(dir: &Path) -> Result<Assignment, ScalerError> {
     lock.read_to_string(&mut marker)?;
     // A hook waiting for re-vetting already owns work, even before it can
     // write job-started. Never drain underneath its assignment rendezvous.
-    if !marker.is_empty() || assignment::pending_assignment_locked(dir)?.is_some() {
+    if !marker.is_empty() || assignment::waiting_assignment_locked(dir)? {
         return Ok(Assignment::Busy);
     }
     let drain = OpenOptions::new()
@@ -1103,7 +1109,7 @@ pub fn reap_decision(row: &Record, now: u64, assignment: Assignment) -> Reap {
     match assignment {
         Assignment::Completed => Reap::Destroy,
         Assignment::Unassigned
-            if now.saturating_sub(row.created) >= 900
+            if now.saturating_sub(row.created) >= UNASSIGNED_DRAIN_SECS
                 || (matches!(row.state, State::Cloning | State::Booting)
                     && row.busy_retries >= MAX_BUSY_RETRIES) =>
         {
@@ -1308,7 +1314,6 @@ pub fn admit_job_context(
     }
     if controller {
         admit_assigned(state_dir, context, owner, assignment::APPROVAL_LIMIT)?;
-        mark_job_started(state_dir)?;
     } else {
         match read_policy(policy_file, Some(owner))? {
             JobPolicy::Pilot { sha } => {

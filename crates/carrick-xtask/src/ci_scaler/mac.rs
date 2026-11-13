@@ -52,7 +52,7 @@ const SCHEDULER_DENY: [&str; 2] = ["/usr/lib/cron/cron.deny", "/usr/lib/cron/at.
 /// excluded from the manifest.
 const RUNNER_WRITABLE: [&str; 2] = ["_work", "_diag"];
 /// A launched runner that has received no job by then is drained.
-const UNASSIGNED_DRAIN_SECS: u64 = 900;
+
 /// Upper bound for one SSH-held runner lifecycle (hvf-kernel times out at 180m).
 const LAUNCH_LIMIT: Duration = Duration::from_secs(5 * 3600);
 
@@ -83,6 +83,9 @@ pub struct MacRecord {
     pub approved: bool,
 }
 impl RunnerRegistration for MacRecord {
+    fn created(&self) -> u64 {
+        self.created
+    }
     fn key(&self) -> JobKey {
         self.key
     }

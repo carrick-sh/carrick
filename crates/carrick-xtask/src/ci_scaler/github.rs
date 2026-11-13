@@ -392,7 +392,7 @@ impl Github {
                 None,
                 false,
             )?;
-            if job["runner_id"].as_u64() == Some(runner.0) {
+            if runner.0 != 0 && job["runner_id"].as_u64() == Some(runner.0) {
                 row.set_assigned(JobId(
                     job["id"]
                         .as_u64()
@@ -426,44 +426,48 @@ impl Github {
             // process is gone before destroying anything.
             Ok(Assignment::Unknown)
         })()?;
-        if assignment == Assignment::Busy {
+        if matches!(assignment, Assignment::Busy | Assignment::Completed)
+            || now()?.saturating_sub(row.created()) < UNASSIGNED_DRAIN_SECS
+        {
             return Ok(assignment);
         }
         // Only pay for repository-wide evidence when the cheap checks would
         // permit reclamation; known busy runners need no additional queries.
         // A reservation is demand provenance, not an assignment. Check all
-        // running repository workflows: shared labels can send this runner B
+        // active repository workflows: shared labels can send this runner B
         // while its reserved A remains queued, and registration busy may lag.
         // Failure to obtain this evidence defers reclamation via the caller.
-        let runs = request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runs?status=in_progress&per_page=100"),
-            None,
-            true,
-        )?;
-        for run in pages(&runs, "workflow_runs")? {
-            let id = run["id"].as_u64().ok_or(ScalerError::External("run id"))?;
-            let attempt = run["run_attempt"]
-                .as_u64()
-                .ok_or(ScalerError::External("run attempt"))?;
-            let jobs = request(
+        for status in ["in_progress", "queued", "waiting"] {
+            let runs = request(
                 "GET",
-                &format!(
-                    "repos/{REPOSITORY}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100"
-                ),
+                &format!("repos/{REPOSITORY}/actions/runs?status={status}&per_page=100"),
                 None,
                 true,
             )?;
-            for job in pages(&jobs, "jobs")? {
-                if job["status"] != "completed"
-                    && (job["runner_name"].as_str() == Some(row.name())
-                        || row
-                            .runner()
-                            .is_some_and(|runner| job["runner_id"].as_u64() == Some(runner.0)))
-                {
-                    // Only the assignment service may authenticate and persist
-                    // B's policy. This observation only withholds reclamation.
-                    return Ok(Assignment::Busy);
+            for run in pages(&runs, "workflow_runs")? {
+                let id = run["id"].as_u64().ok_or(ScalerError::External("run id"))?;
+                let attempt = run["run_attempt"]
+                    .as_u64()
+                    .ok_or(ScalerError::External("run attempt"))?;
+                let jobs = request(
+                    "GET",
+                    &format!(
+                        "repos/{REPOSITORY}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100"
+                    ),
+                    None,
+                    true,
+                )?;
+                for job in pages(&jobs, "jobs")? {
+                    if job["status"] != "completed"
+                        && (job["runner_name"].as_str() == Some(row.name())
+                            || row.runner().is_some_and(|runner| {
+                                runner.0 != 0 && job["runner_id"].as_u64() == Some(runner.0)
+                            }))
+                    {
+                        // Only the assignment service may authenticate and persist
+                        // B's policy. This observation only withholds reclamation.
+                        return Ok(Assignment::Busy);
+                    }
                 }
             }
         }
