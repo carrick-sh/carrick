@@ -3757,3 +3757,47 @@ fn serial_host_two_live_processes_keep_distinct_cwds() {
         cwd_run(&["-DCHILD", "-DCONCURRENT"])
     });
 }
+
+/// #1482 P0-2: a merged GiB must settle in one crossing with bounded pauses.
+#[test]
+fn production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell() {
+    // Load above the low initial stack so the production mmap arena has
+    // room for a complete GiB instead of being clipped by that stack.
+    let elf = native_exit_fixture_with_flags(
+        "native_owed_return_gib.S",
+        &["-Wl,-Ttext-segment=0x100000000"],
+    );
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .expect("GiB owed extent run");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "{:?}",
+        outcome.run
+    );
+    let counts = outcome
+        .physical
+        .return_settlement_counters()
+        .expect("settlement counts");
+    assert_eq!(
+        counts.doorbells, 1,
+        "one crossing settles the GiB: {counts:?}"
+    );
+    assert!(
+        counts.max_pause_pages > 0,
+        "settlement was measured: {counts:?}"
+    );
+    assert!(
+        counts.max_pause_pages <= 512,
+        "one chunk per exclusion: {counts:?}"
+    );
+}

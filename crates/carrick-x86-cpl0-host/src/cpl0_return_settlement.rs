@@ -38,6 +38,8 @@ use carrick_sched_core::spaces::notification::{ExclusionRefusal, SpaceWaitCause}
 pub struct ReturnSettlementCounters {
     /// Settlement doorbells rung by ring threads.
     pub doorbells: u64,
+    /// Maximum owed pages walked while one editor exclusion stayed raised.
+    pub max_pause_pages: u64,
     /// Exclusions that ran a settlement (doorbells included).
     pub exclusions: u64,
     /// Owed extents settled (slots freed or advanced).
@@ -121,11 +123,13 @@ struct Cpl0OwedReturns<'a, M: CarrierMemoryIo> {
     mm: NonZeroU64,
     root: RootGpa,
     failed: Option<String>,
+    pages: u64,
 }
 impl<M: CarrierMemoryIo> OwedReturnRetirement for Cpl0OwedReturns<'_, M> {
     type Prepared = Vec<(PageSpan, Vec<RetiredTerminal>)>;
     type Error = String;
     fn prepare(&mut self, request: &ReturnSettlementRequest) -> Result<Self::Prepared, String> {
+        self.pages = request.iter().map(|owed| owed.range.len() / 4096).sum();
         let words = self.memory.words();
         request
             .iter()
@@ -226,9 +230,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             mm: key,
             root: context.root,
             failed: None,
+            pages: 0,
         };
         let outcome =
             settle_ring_owned_returns(excluded, &guard, loan_pending, &journal, &mut backend);
+        self.return_settlement_counters.max_pause_pages = self
+            .return_settlement_counters
+            .max_pause_pages
+            .max(backend.pages);
         if let Some(error) = backend.failed {
             return Err(fail(format!("owed return settlement apply: {error}")));
         }
