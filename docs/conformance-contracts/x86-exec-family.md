@@ -45,7 +45,9 @@ its parent and consumes the parent's SIGUSR2 acknowledgement with
 rt_sigtimedwait. The parent receives the successor's signal, acknowledges it,
 and only then collects wait4 status and prints `live-exec-ok`. Both signal
 waits have a five-second bound; a returned child errno is propagated by the
-parent. The syscall census requires that the fixture actually reached exec.
+parent. The syscall census requires that the fixture actually reached exec. The
+successor checks initial stack alignment, argc, argv and the empty environment,
+then writes and reads its stack before announcing replacement.
 
 This uses signal-owner operations rather than in-zone pipes: the separate
 `in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring`
