@@ -3802,3 +3802,17 @@ fn zone_pipe_readv_scatters_child_bytes_through_shared_owner() {
         .unwrap_or_else(|failure| panic!("child write parent readv: {}", failure.error));
     assert_eq!(outcome.run.exit_code, 0, "readv exact scatter stage");
 }
+
+#[test]
+fn zone_exec_status_pipe_reports_child_exec_failure_then_eof() {
+    let elf = native_exit_fixture_with_flags(
+        "native_pipe_child_write.S",
+        &["-DREAD_CHILD", "-DEXEC_STATUS"],
+    );
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| panic!("exec-status pipe: {}", failure.error));
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "exec failure report and EOF stage"
+    );
+}
