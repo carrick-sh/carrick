@@ -77,8 +77,11 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::{post_arm_exec_adoption_failure_is_sigsegv,refused_exec_preparation_is_cancelled_exactly_once,lost_exec_race_keeps_winner_signal_instead_of_sigsegv,exit_group_wins_over_an_in_progress_native_exec_drain,sigkill_wins_over_an_in_progress_native_exec_drain}, carrick-kernel::kernel::exec_transaction::tests::staged_vma_revision_failure_kills_past_no_return_with_sigsegv and carrick-signal-core::policy::tests::exec_past_no_return_verdict_is_terminal_sigsegv (#1093 S4c slice a: post-no-return exec failures terminate with ExecPastNoReturn::SIGNAL / SIGSEGV across native-child owners on both ISAs and RootExecVenue::fail_past_no_return while concurrent exit_group and SIGKILL winners keep their own status; see docs/conformance-contracts/exec-past-no-return-sigsegv.md)",
 ]
 
+# #2235/#2142: red-first production bindings; no successful x86 replacement
+# or signed-ARM promotion is claimed until these run green with the server.
 embed = [
   "KVM carrier fixture (not signed): carrick-vmm-kvm::cpl0_initial_mm::production_exec_service_stages_parks_and_reruns_a_successor (#1093 S4c c: on a booted production carrier the host Exec service reserves from the carrier's own fork stock, frame inventory and CPL0 tables, releases whole, parks behind a stock holder with nothing reserved and its wake enrolled, is woken by the holder's return on another thread within 5 s and then stages; run under just lease gate with CARRICK_REQUIRE_KVM=1)",
+  "KVM production (red until #2235/#2142): carrick-vmm-kvm::cpl0_initial_mm::{native_fork_child_execs_static_successor,native_fork_child_execs_while_parent_keeps_running,production_root_exec_replaces_image_and_runs_static_successor,production_root_exec_of_a_missing_path_is_enoent,production_root_exec_of_a_non_elf_file_is_enoexec}; see docs/conformance-contracts/x86-exec-family.md",
 ]
 
 [bindings.unresolved]
