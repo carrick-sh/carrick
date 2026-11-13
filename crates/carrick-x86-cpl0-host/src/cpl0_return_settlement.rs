@@ -5,7 +5,12 @@
 //! settle it. Settlement runs at every exclusion of an MM's editor
 //! ([`Cpl0HostCustody::settled_pause`] is the only way to obtain one), and a
 //! ring thread that cannot proceed without it rings the owner-grant port's
-//! settlement op ([`Cpl0HostCustody::service_return_settlement`]).
+//! settlement op ([`Cpl0HostCustody::service_return_settlement`]). Every
+//! such exclusion settles the MM's outstanding COW completions first and its
+//! owed returns second, through the one neutral sequence
+//! ([`carrick_hal::return_settlement::settle_cow_then_returns`], #1482 P0-3):
+//! a sibling may have retired a replacement leaf whose completion is still
+//! outstanding.
 //!
 //! The physical step: under the exclusion, observe each owed extent's retired
 //! terminals from the MM's exact root, then clear them and drop the carrier's
@@ -24,8 +29,9 @@ use carrick_el1_abi::{
     ReturnSettlementRequest, SettlementDoorbellAnswer, SettlementDoorbellReply,
 };
 use carrick_hal::return_settlement::{
-    DrainOutcome, HolderRevisions, OwedReturnDrain, PauseSettlement, ReturnJournalAccess,
-    drain_owed_return_table, pause_settlement, settle_in_bounded_pauses, settle_ring_owned_returns,
+    CowSettled, DrainOutcome, ExclusionSettlement, HolderRevisions, OwedReturnDrain,
+    PauseSettlement, ReturnJournalAccess, drain_owed_return_table, pause_settlement,
+    settle_cow_then_returns, settle_in_bounded_pauses, settle_ring_owned_returns,
 };
 use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
 use carrick_sched_core::spaces::notification::{ExclusionRefusal, SpaceWaitCause};
@@ -171,6 +177,31 @@ impl<M: CarrierMemoryIo> OwedReturnRetirement for Cpl0OwedReturns<'_, M> {
     }
 }
 
+/// The CPL0 venue of the one exclusion sequence: the excluded MM's COW
+/// completions, then its owed returns, under one exclusion.
+struct Cpl0Exclusion<'v, 'a, M: CarrierMemoryIo> {
+    custody: &'v mut Cpl0HostCustody<M>,
+    release: SpaceReleaseVenue<'a, carrick_sched_core::ParkedContextWords>,
+}
+impl<M: CarrierMemoryIo> ExclusionSettlement for Cpl0Exclusion<'_, '_, M> {
+    type Error = TrapError;
+    type Returns = PauseSettlement;
+    fn settle_cow_completions(
+        &mut self,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        self.custody.settle_cow_completions(excluded)
+    }
+    fn settle_owed_returns(
+        &mut self,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+        cow: &CowSettled<'_>,
+    ) -> Result<PauseSettlement, TrapError> {
+        self.custody
+            .settle_owed_returns(self.release, excluded, cow)
+    }
+}
+
 /// The CPL0 venue of the one neutral drain: the shared table, each holder's
 /// live source in the zone, and the carrier's bounded doorbell drive.
 struct Cpl0Drain<'a, M: CarrierMemoryIo> {
@@ -237,10 +268,26 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|reason| fail(format!("owner COW editor exclusion refused: {reason:?}")))
     }
 
+    /// Every exclusion's settlement: COW completions, then owed returns.
     fn settle_excluded(
         &mut self,
         release: SpaceReleaseVenue<'_, carrick_sched_core::ParkedContextWords>,
         excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+    ) -> Result<PauseSettlement, TrapError> {
+        settle_cow_then_returns(
+            &mut Cpl0Exclusion {
+                custody: self,
+                release,
+            },
+            excluded,
+        )
+    }
+
+    fn settle_owed_returns(
+        &mut self,
+        release: SpaceReleaseVenue<'_, carrick_sched_core::ParkedContextWords>,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+        cow: &CowSettled<'_>,
     ) -> Result<PauseSettlement, TrapError> {
         let (Some(mm), Some(key)) = (
             carrick_el1_abi::ReservationMm::new(excluded.key()),
@@ -275,7 +322,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             pages: 0,
         };
         let outcome =
-            settle_ring_owned_returns(excluded, &guard, loan_pending, &journal, &mut backend);
+            settle_ring_owned_returns(excluded, cow, &guard, loan_pending, &journal, &mut backend);
         self.return_settlement_counters.max_pause_pages = self
             .return_settlement_counters
             .max_pause_pages

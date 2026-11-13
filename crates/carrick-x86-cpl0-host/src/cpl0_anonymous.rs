@@ -1808,6 +1808,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         wake.finish()
     }
 
+    /// The faulting CPU's settlement crossing for its COW grant. Its
+    /// exclusion settles every completed COW of the MM before any owed
+    /// return (#1482 P0-3), this CPU's own included
+    /// ([`Self::settle_cow_completions`]), so the crossing only checks that
+    /// its completion was published, by this exclusion or an earlier one.
     fn settle_cow_grant(
         &mut self,
         index: usize,
@@ -1832,10 +1837,68 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             },
             execution.context.mm.raw().get(),
         )?;
-        let pending = match self.anonymous_pending[index].as_ref() {
-            Some(PendingGrant::Cow(pending)) if pending.execution.matches(execution) => pending,
-            _ => return Err(fail("owner COW pending identity")),
+        drop(pause);
+        wake.finish()?;
+        self.take_published_cow(index, execution)
+    }
+
+    /// The faulting CPU's record that its COW completion was published:
+    /// consumed by its settlement crossing.
+    fn take_published_cow(
+        &mut self,
+        index: usize,
+        execution: GrantExecution,
+    ) -> Result<(), TrapError> {
+        if self.cow_published[index]
+            .take()
+            .is_some_and(|published| published.matches(execution))
+        {
+            Ok(())
+        } else {
+            Err(fail("owner COW exact completed receipt absent"))
+        }
+    }
+
+    /// The CPL0 venue's COW step of every exclusion (#1482 P0-3): publish
+    /// each pending COW grant of the excluded MM whose guest completion is in
+    /// the pool, on whichever CPU it is pending. A sibling may already have
+    /// retired its replacement leaf; that retirement is an owed return the
+    /// same exclusion settles only after this. A grant whose guest copy has
+    /// not completed stays pending.
+    pub(super) fn settle_cow_completions(
+        &mut self,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        for index in 0..self.anonymous_pending.len() {
+            let Some(PendingGrant::Cow(pending)) = &self.anonymous_pending[index] else {
+                continue;
+            };
+            if pending.execution.context.mm.raw().get() != excluded.key() {
+                continue;
+            }
+            let grant = pending.grant;
+            let Some(receipt) = self
+                .cow_pool()?
+                .completions(excluded)
+                .find(|receipt| receipt.grant == grant)
+            else {
+                continue;
+            };
+            self.publish_cow_completion(index, excluded, receipt)?;
+        }
+        Ok(())
+    }
+
+    fn publish_cow_completion(
+        &mut self,
+        index: usize,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+        receipt: carrick_el1_abi::CowGrantCompletion,
+    ) -> Result<(), TrapError> {
+        let Some(PendingGrant::Cow(pending)) = self.anonymous_pending[index].as_ref() else {
+            return Err(fail("owner COW pending identity"));
         };
+        let execution = pending.execution;
         if self
             ._vm
             .frame_identity(execution.context.mm.raw(), pending.source)
@@ -1844,34 +1907,55 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         {
             return Err(fail("owner COW source identity changed"));
         }
-        let receipt = self
-            .cow_pool()?
-            .completions(pause.proof())
-            .find(|receipt| receipt.grant == pending.grant)
-            .filter(|receipt| {
-                exact_cow_receipt(
-                    pending.grant,
-                    pending.window.fault_page,
-                    pending.source,
-                    receipt,
-                )
-            })
-            .ok_or_else(|| fail("owner COW exact completed receipt absent"))?;
-        let resident = self
+        if !exact_cow_receipt(
+            pending.grant,
+            pending.window.fault_page,
+            pending.source,
+            &receipt,
+        ) {
+            return Err(fail("owner COW exact completed receipt absent"));
+        }
+        match self
             .cow_residency()?
             .lookup(receipt.grant.mm_key, receipt.span_va)
-            .ok_or_else(|| fail("owner COW replacement residency absent"))?;
-        if resident.expected_ipa != receipt.new_ipa
-            || resident.identity.frame_id != receipt.grant.backing.frame_id.get()
-            || resident.identity.mapping_id != receipt.grant.backing.mapping_id.get()
-            || resident.identity.owner_generation != receipt.grant.backing.owner_generation.get()
-            || resident.identity.inventory_revision
-                != receipt.grant.backing.inventory_revision.get()
-            || !self
-                .cow_residency()?
-                .is_guest_committed(receipt.grant.mm_key, receipt.span_va)
         {
-            return Err(fail("owner COW replacement residency identity"));
+            Some(resident) => {
+                if resident.expected_ipa != receipt.new_ipa
+                    || resident.identity.frame_id != receipt.grant.backing.frame_id.get()
+                    || resident.identity.mapping_id != receipt.grant.backing.mapping_id.get()
+                    || resident.identity.owner_generation
+                        != receipt.grant.backing.owner_generation.get()
+                    || resident.identity.inventory_revision
+                        != receipt.grant.backing.inventory_revision.get()
+                    || !self
+                        .cow_residency()?
+                        .is_guest_committed(receipt.grant.mm_key, receipt.span_va)
+                {
+                    return Err(fail("owner COW replacement residency identity"));
+                }
+            }
+            None => {
+                // A sibling unmapped the page while this completion was
+                // outstanding: its retirement took the residency row and
+                // left the replacement leaf retired in place, still naming
+                // the replacement frame. Publication accepts exactly that
+                // leaf; the owed return settles after it.
+                use carrick_mmu_core::x86::descriptor_txn::{
+                    ADDRESS, PREPARED, PRESENT, RETIRED, read_terminal_descriptor,
+                };
+                let retired = read_terminal_descriptor(
+                    &self._vm.words(),
+                    execution.context.root,
+                    UserVa::new(receipt.span_va),
+                )
+                .is_ok_and(|(entry, _)| {
+                    entry & (PRESENT | PREPARED | RETIRED) == RETIRED
+                        && entry & ADDRESS == receipt.new_ipa & ADDRESS
+                });
+                if !retired {
+                    return Err(fail("owner COW replacement residency absent"));
+                }
+            }
         }
         let txn = DescriptorTxn {
             id: DescriptorTxnId {
@@ -1897,12 +1981,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .publish(&txn, publication, &mut pending.inventory)
             .map_err(|error| fail(error.to_string()))?;
         pending.inventory.finish()?;
-        if !self.cow_pool()?.finish(pause.proof(), &pending.grant) {
+        if !self.cow_pool()?.finish(excluded, &pending.grant) {
             return Err(fail("owner COW completion changed after settlement"));
         }
         let _retained = pending.handle;
-        drop(pause);
-        wake.finish()
+        self.cow_published[index] = Some(execution);
+        Ok(())
     }
 
     pub(super) fn grant_portal(&self) -> Result<&MmPortalSlots, TrapError> {
@@ -2003,6 +2087,24 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             && !pending.execution().matches(execution)
         {
             return Err(fail("owner grant stale execution/root"));
+        }
+        // Another exclusion published this CPU's COW completion before its
+        // settlement crossing arrived (#1482 P0-3): the crossing that names
+        // no new selection is that settlement, and finds it settled. Any
+        // other crossing drops the record.
+        if self.cow_published[index].is_some() && self.anonymous_pending[index].is_none() {
+            let far = lane.get_gpr(X86Reg::Rdi)?;
+            let slot = self
+                .grant_portal()?
+                .grant(index)
+                .ok_or_else(|| fail("owner grant slot"))?;
+            let settlement = far != OWNER_GRANT_SETTLE_RETURNS
+                && slot.pending_cow_fault_selection(mm.get(), far).is_none()
+                && slot.pending_fault_selection(mm.get(), far).is_none();
+            if settlement {
+                return self.take_published_cow(index, execution);
+            }
+            self.cow_published[index] = None;
         }
         // The settlement op names no selected address; a CPU with a grant
         // still pending never rings it (its syscall path holds none).
