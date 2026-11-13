@@ -1085,7 +1085,8 @@ pub fn tree_test_inventory(tree_root: &Path) -> Result<Vec<CrateTestInventory>, 
             ..Default::default()
         };
         let mut files = Vec::new();
-        collect_rs_files(&crate_dir, &mut files)?;
+        let explicit_targets = explicit_target_paths(&manifest);
+        collect_rs_files(&crate_dir, &explicit_targets, &crate_dir, &mut files)?;
         let scanned: BTreeSet<PathBuf> =
             files.iter().filter_map(|f| f.canonicalize().ok()).collect();
         let mut scans = BTreeMap::new();
