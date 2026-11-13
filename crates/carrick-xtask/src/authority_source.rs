@@ -2645,14 +2645,17 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             let owner = self.owner(&item.ident.unraw().to_string(), item.span());
             for variant in &item.variants {
                 let name = variant.ident.unraw().to_string();
-                // The anonymous dispatch result carries the scheduler's typed
-                // space cause directly into its park binding. It does not
-                // create a new, owner-defined contention vocabulary.
+                // The anonymous dispatch result, and a handle-less user fault's
+                // owner outcome (#2141), carry the scheduler's typed space
+                // cause directly into its park binding. They do not create a
+                // new, owner-defined contention vocabulary.
                 let anonymous_space_wait = name == "Contended"
                     && matches!(
                         owner.as_str(),
                         "carrick_el1::memory::DelegatedAnonymous"
                             | "carrick_personality_linux::pending_anonymous::DelegatedStep"
+                            | "carrick_el1::fault::OwnerFaultSupplyOutcome"
+                            | "carrick_x86_cpl0::linux_personality::UserFaultSupply"
                     )
                     && matches!(
                         &variant.fields,
