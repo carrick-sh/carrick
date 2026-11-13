@@ -1026,6 +1026,19 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         core::mem::forget(p);
         fatal();
     }
+    fn vacate_terminal_space(
+        &mut self,
+        source: BornInZoneSource<'static, ParkedContextWords>,
+    ) -> Result<(), NativeProcessError> {
+        if source.slot != self.slot {
+            return Err(NativeProcessError::Stale);
+        }
+        if !carrick_x86_carrier::native_execution::park_on_maintenance_root(source) {
+            return Err(NativeProcessError::Quarantined);
+        }
+        Ok(())
+    }
+
     fn retire_mm(&mut self, mm: Mm) {
         // The runtime calls this only for a fork-born process's final exit.
         let source = carrick_x86_carrier::native_execution::source(self.slot);
