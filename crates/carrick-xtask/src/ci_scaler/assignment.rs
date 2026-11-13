@@ -988,6 +988,27 @@ mod tests {
     }
 
     #[test]
+    fn ci_scaler_pending_diverted_assignment_prevents_local_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("admission.lock"), "").unwrap();
+        std::fs::write(
+            dir.path().join("assignment.json"),
+            serde_json::to_vec(&run_b()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::quiesce_guest(dir.path()).unwrap(),
+            Assignment::Busy
+        );
+        assert!(!dir.path().join("draining").exists());
+        std::fs::write(dir.path().join("assignment.json"), "").unwrap();
+        assert_eq!(
+            super::super::quiesce_guest(dir.path()).unwrap(),
+            Assignment::Unassigned
+        );
+    }
+
+    #[test]
     fn ci_scaler_assignment_publication_work_scales_with_ledger_population() {
         for population in [64_usize, 512, 4096] {
             let comparisons = std::rc::Rc::new(std::cell::Cell::new(0));

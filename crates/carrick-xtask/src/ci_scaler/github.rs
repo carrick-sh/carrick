@@ -359,8 +359,16 @@ impl Github {
         &self,
         row: &mut impl RunnerRegistration,
     ) -> Result<Assignment, ScalerError> {
+        Self::assignment_inner(row, |method, endpoint, body, paginate| {
+            self.request(method, endpoint, body, paginate)
+        })
+    }
+    fn assignment_inner(
+        row: &mut impl RunnerRegistration,
+        mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+    ) -> Result<Assignment, ScalerError> {
         if row.runner().is_none() {
-            let data = self.request(
+            let data = request(
                 "GET",
                 &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
                 None,
@@ -374,7 +382,15 @@ impl Github {
         };
         // Only the reserved job is examined: the hook binds the runner to
         // its vetted run, so any other assignment is killed before a step.
-        let job = self.job(row.assigned().unwrap_or(row.key().job))?;
+        let job = request(
+            "GET",
+            &format!(
+                "repos/{REPOSITORY}/actions/jobs/{}",
+                row.assigned().unwrap_or(row.key().job).0
+            ),
+            None,
+            false,
+        )?;
         if job["runner_id"].as_u64() == Some(runner.0) {
             row.set_assigned(JobId(
                 job["id"]
@@ -387,7 +403,7 @@ impl Github {
                 Assignment::Busy
             });
         }
-        let runners = self.request(
+        let runners = request(
             "GET",
             &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
             None,
@@ -494,6 +510,46 @@ fn pages(data: &Value, field: &str) -> Result<Vec<Value>, ScalerError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn ci_scaler_reclaim_checks_actual_running_job_before_idle_registration() {
+        use super::super::mac::{MacLedger, MacState, MacStep, mac_step};
+        for busy in [true, false] {
+            let mut row = MacLedger::default()
+                .reserve(
+                    JobKey {
+                        run: RunId(10),
+                        attempt: 1,
+                        job: JobId(11),
+                    },
+                    100,
+                )
+                .unwrap();
+            row.runner = Some(RunnerId(7));
+            row.state = MacState::Launched;
+            let name = row.name.clone();
+            let assignment = Github::assignment_inner(&mut row, |_, endpoint, _, _| {
+                Ok(if endpoint.contains("/actions/runs?") {
+                    json!([{"workflow_runs":[{"id":20,"run_attempt":1}]}])
+                } else if endpoint.contains("/attempts/1/jobs?") {
+                    json!([{"jobs":[{"id":21,"runner_name":name,"runner_id":7,
+                        "status":if busy {"in_progress"} else {"completed"}}]}])
+                } else if endpoint.contains("/actions/jobs/") {
+                    json!({"id":11,"runner_id":0,"status":"queued"})
+                } else if endpoint.contains("/actions/runners?") {
+                    // Registration may lag the job assignment.
+                    json!([{"runners":[{"id":7,"name":name,"busy":false}]}])
+                } else {
+                    panic!("unexpected endpoint: {endpoint}")
+                })
+            })
+            .unwrap();
+            assert_eq!(
+                mac_step(&row, assignment, false, 2000),
+                if busy { MacStep::Wait } else { MacStep::Drain }
+            );
+        }
+    }
 
     #[test]
     fn reservations_and_assignments_accept_main_push_and_dispatch_only() {
