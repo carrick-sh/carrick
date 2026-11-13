@@ -965,6 +965,7 @@ fn admitted_a_serves_re_vetted_b_but_refuses_untrusted_assignment() {
         );
         std::thread::yield_now();
     }
+    assert_eq!(quiesce_guest(&state).unwrap(), Assignment::Busy);
     publish_assignment(&state, &approved).unwrap();
     hook.join().unwrap().unwrap();
     publish_assignment(&state, &approved).unwrap(); // restart is idempotent
@@ -1078,10 +1079,19 @@ fn assignment_without_approval_or_during_drain_fails_closed() {
         run_attempt: 1,
     };
     assert!(admit_assigned(&state, &context, uid, std::time::Duration::ZERO).is_err());
-    // The request remains evidence of assigned work, even if approval timed
-    // out. A controller must not drain underneath the waiting hook.
-    assert_eq!(quiesce_guest(&state).unwrap(), Assignment::Busy);
-    assert!(!state.join("draining").exists());
+    // Approval has timed out and the hook is gone: stale requests must drain.
+    assert_eq!(quiesce_guest(&state).unwrap(), Assignment::Unassigned);
+    for bytes in [b"{".as_slice(), vec![b'x'; 100_000].as_slice()] {
+        std::fs::write(state.join("assignment.json"), bytes).unwrap();
+        assert_eq!(quiesce_guest(&state).unwrap(), Assignment::Unassigned);
+    }
+    std::fs::write(state.join("runner.exit"), "exited").unwrap();
+    std::fs::write(
+        state.join("assignment.json"),
+        serde_json::to_vec(&context).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(quiesce_guest(&state).unwrap(), Assignment::Unassigned);
 
     // A separate, genuinely idle runner still drains and refuses admission.
     let idle = prepare_run_once(
