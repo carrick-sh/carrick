@@ -12,6 +12,7 @@ fn node(script: &str) -> String {
     let result = common::run_or_fail(
         ContainerBuilder::from_image("node:22-slim")
             .pull_policy(PullPolicy::Missing)
+            .workdir("/tmp")
             .command(["node", "-e", script])
             .run_blocking(),
     );
