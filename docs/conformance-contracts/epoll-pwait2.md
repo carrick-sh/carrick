@@ -17,8 +17,11 @@ change the resumed result. Existing epoll_pwait readiness checks remain.
 This slice does not establish the director's Node blocking-wait attribution.
 The following forwarding paths still need retained owner work:
 
-- `ipc/epoll.rs`: sigmask input, table/pin contention, object harvest failure,
-  mixed host items, output preparation, timer-slot refusal and park refusal.
+- `ipc/epoll.rs`: sigmask or timespec input the ring cannot read, table/pin
+  contention, object harvest failure, mixed host items, an events buffer with
+  no native owner (#2178 prepares a native caller's buffer in ring),
+  timer-slot refusal and park refusal. Each is counted under one named
+  `IpcLeave` (#2166); a refused pwait2 timespec counts `CopyInFault`.
 - `dispatch.rs::serve_owned_ipc_descriptor`: a host-backed epoll member and
   the shared epoll core's HostHalf refusal.
 - `dispatch.rs::ipc_transfer`: absence of an execution venue (ARM scheduler
@@ -33,7 +36,9 @@ TestEl1Region storage in the production metadata address window, retaining the
 exact identity check including the live affinity source. The KVM binding adds
 USE_EPOLL to the existing pipe-wake guest: epoll_create1, ADD, parent pwait(-1),
 child write and packed readiness cookie, with no ring refusals or epoll
-forwarding. A pre-fix KVM replay, signal-mask and exhaustive member-kind
+forwarding. With x86 epoll_pwait reaching the ring owner, #2178's KVM
+copy-out witness (an untouched events page prepared by the native owner) is
+no longer ignored. A pre-fix KVM replay, signal-mask and exhaustive member-kind
 witnesses remain required. No crossing
 allowlist change is included. Signed Node validation, blocked-pool capacity,
 EINTR, Docker differential and signed artifact promotion remain required.
