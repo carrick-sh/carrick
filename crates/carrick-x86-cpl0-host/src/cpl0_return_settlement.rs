@@ -16,7 +16,6 @@
 //! steps.
 use super::*;
 use carrick_el1::memory::{RetiredTerminal, X86AnonymousDecode, owed_retired_terminals};
-use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
 use carrick_el1_abi::{
     OwedReturnRetirement, Refusal, ReturnJournal, ReturnSettlementDoorbell,
     ReturnSettlementRequest, SettlementDoorbellReply,
@@ -24,10 +23,18 @@ use carrick_el1_abi::{
 use carrick_hal::return_settlement::{
     ReturnJournalAccess, doorbell_reply, settle_ring_owned_returns,
 };
+use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
 use carrick_sched_core::spaces::notification::{ExclusionRefusal, SpaceWaitCause};
 
 /// What this carrier's settlements did, for witnesses (deterministic counts).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ReturnSettlementCounters {
     /// Settlement doorbells rung by ring threads.
     pub doorbells: u64,
@@ -39,6 +46,8 @@ pub struct ReturnSettlementCounters {
     pub fork_loan_skips: u64,
     /// Doorbells refused because a ring editor of the MM was active.
     pub editor_contended: u64,
+    /// Other MMs a full owed-return table's drain settled.
+    pub drained_holders: u64,
 }
 
 /// One exclusion of an MM's EL1 editor that has settled the MM's owed
@@ -258,7 +267,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         self.return_settlement_counters.doorbells += 1;
         let reply = match record.decode() {
             Some((mm, claim)) if mm.raw() == execution.context.mm.raw().get() => {
-                let settled = self.ring_settlement(mm);
+                let settled = self.ring_settlement(mm).and_then(|reply| {
+                    if reply == SettlementDoorbellReply::Settled {
+                        self.drain_owed_return_table(mm)?;
+                    }
+                    Ok(reply)
+                });
                 let released = self.release_settlement_claim(mm, claim);
                 let reply = settled?;
                 released?;
@@ -280,6 +294,34 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         self._vm
             .write(physical, bytes)
             .map_err(|e| fail(e.to_string()))
+    }
+
+    /// The shared owed-return table is full of other MMs' slots, so the
+    /// caller's settled journal still cannot take a retirement: settle the
+    /// other holders, one exclusion at a time (never holding one MM's
+    /// exclusion while raising another's), until a slot is free. A holder
+    /// whose ring editor is active is skipped: its editor section never
+    /// blocks, and the caller's rerun rings again if the table is still
+    /// full. Retired MMs' slots wait for their release receipts.
+    fn drain_owed_return_table(
+        &mut self,
+        caller: carrick_el1_abi::ReservationMm,
+    ) -> Result<(), TrapError> {
+        let ram = Arc::clone(&self.ram);
+        let table = retained_reservations(&ram)?;
+        if !table.owed_return_table_full() {
+            return Ok(());
+        }
+        let mut holders = Vec::new();
+        table.owed_return_holders(caller, &mut |holder| holders.push(holder));
+        for holder in holders {
+            self.return_settlement_counters.drained_holders += 1;
+            self.ring_settlement(holder)?;
+            if !table.owed_return_table_full() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn ring_settlement(
