@@ -1747,11 +1747,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, child_binding, None))
                 }
                 carrick_el1_abi::NATIVE_EXEC_PORT => {
-                    if let exec_service::NativeExecCrossing::Settled { successor, predecessor } =
-                        custody.service_native_exec(&lease)?
-                    {
-                        exec_rebind = Some((successor, predecessor));
-                    }
+                    exec_rebind = custody.service_native_exec(&lease)?.child_rebind()?;
                     Ok((None, None, None))
                 }
                 carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => {
@@ -2154,11 +2150,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     Ok((None, child_binding, None))
                 }
                 Some(ProductionPort::NativeExec) => {
-                    if let exec_service::NativeExecCrossing::Settled { successor, predecessor } =
-                        custody.service_native_exec(&lease)?
-                    {
-                        exec_rebind = Some((successor, predecessor));
-                    }
+                    exec_rebind = custody.service_native_exec(&lease)?.child_rebind()?;
                     Ok((None, None, None))
                 }
                 Some(ProductionPort::ChildRetire) => {

@@ -1063,6 +1063,27 @@ pub(in crate::cpl0_boot) enum NativeExecCrossing {
     RootSettled(Box<X86RootExecSettlement>),
 }
 
+impl NativeExecCrossing {
+    /// Only child bindings can be applied by the carrier's current doorbell
+    /// handlers. Root admission stays closed until the runtime can consume
+    /// its Kernel transition; losing that settlement must never resume it.
+    pub(in crate::cpl0_boot) fn child_rebind(
+        self,
+    ) -> Result<Option<(GuestArchBinding, Option<RootGpa>)>, TrapError> {
+        match self {
+            Self::Answered => Ok(None),
+            Self::Settled {
+                successor,
+                predecessor,
+            } => Ok(Some((successor, predecessor))),
+            Self::RootSettled(settlement) => Err(fail(format!(
+                "root exec settlement has no Kernel transition for MM {}",
+                settlement.successor.context().mm.raw()
+            ))),
+        }
+    }
+}
+
 /// A run root's settled exec, for the runtime to commit the host Kernel's
 /// half of (#2142): the successor's carrier binding in the ring's domain
 /// (its MM, root, address generation and execution generation), and what

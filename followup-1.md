@@ -17,8 +17,11 @@ Existing mechanisms, ARM first:
 
 The recovered root patch is unfinished and must not land or enable the
 crossing. It selects RootExecRoute::Ring and carries root image identity,
-but both doorbell handlers discard NativeExecCrossing::RootSettled. The
-runtime never commits the host Kernel transition or retargets the root.
+but the runtime never commits the host Kernel transition or retargets
+the root. Initially both doorbell handlers silently discarded RootSettled;
+the continuation makes that unexpected settlement an explicit invariant
+error through one exhaustive child_rebind handler. This is not a root
+transaction implementation.
 The continuation therefore restores caller_access before service publication:
 the root remains a counted ENOSYS until the full transaction can own it.
 The existing access-refusal witness failed on the recovered WIP (1001 pass,
