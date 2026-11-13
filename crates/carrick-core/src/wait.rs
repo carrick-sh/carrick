@@ -216,13 +216,20 @@ pub fn complete_anonymous_edit_replay<C: carrick_core_abi::EntryContext>(
     let Some(notifications) = notifications else {
         return Ok(false);
     };
-    let anonymous = SpaceWaitCause::ALL.into_iter().any(|cause| {
+    let own = SpaceWaitCause::ALL.into_iter().any(|cause| {
         let key = notifications.key(cause);
         OperationToken::anonymous_edit(key).is_some_and(|token| {
             token.index() == census.operation && token.generation() == census.operation_generation
         })
     });
-    if !anonymous {
+    // A full owed-return table parks the edit on a foreign holder's release
+    // (#1482 P0-1, [`coordinate_holder_release_wait`]): its token names that
+    // holder's queue, which may have retired by now. Only an anonymous-edit
+    // token can name a space queue, so no adapter operation matches.
+    let holder = !own
+        && retained.object_operation_kind()
+            == Some(carrick_sched_core::object_wait::OperationKind::AnonymousEdit);
+    if !own && !holder {
         return Ok(false);
     }
     take_object_operation(zone, slot, retained.identity())?
@@ -465,5 +472,83 @@ where
             Err((ObjectWaitError::Changed, _)) => continue,
             Err(_) => return EditWaitOutcome::Refused,
         }
+    }
+}
+
+/// Whether a refusing holder's fence is still raised: the one probe a
+/// waiter makes after it enrols and before it parks (#1482 P0-1). A held
+/// editor is read from the holder's exact editor word. A root guard or a
+/// fork loan is owned by its holder or the carrier, whose release advances
+/// the cause's revision, so for those the fence is the revision itself.
+pub fn holder_fence_raised<C: Copy + Send + Sync + zerocopy::FromZeros>(
+    zone: &ZoneTables<C>,
+    holder: core::num::NonZeroU64,
+    cause: SpaceWaitCause,
+) -> bool {
+    let Some(entry) = zone.space_entry(holder) else {
+        return false;
+    };
+    match cause {
+        SpaceWaitCause::Editor => zone.spaces.active_editor(entry.index()).is_some(),
+        _ => true,
+    }
+}
+
+/// Park an anonymous edit on the release of the foreign holder that keeps a
+/// full owed-return table full (#1482 P0-1): the carrier's drain freed no
+/// slot and answered `holder`, the oldest holder that refused it, with the
+/// revision of that holder's release read before the refused attempt.
+///
+/// Enrol, probe once, park: observe the holder's exact live source; a
+/// revision other than the carrier's means the release already happened,
+/// and so does a fence ([`holder_fence_raised`]) no longer raised: rerun
+/// (`NoConflict`). Otherwise park on that release, rechecked under the
+/// queue guard (`still_blocked`), releasing the caller's execution capacity:
+/// the wake reruns the unchanged call. A holder with no live source is
+/// retiring, which is its release: rerun. The caller's own root and editor
+/// are released before this runs (a [`EditWaitOutcome`] probe's custody
+/// rule); nothing is fatal and nothing is an errno.
+pub fn coordinate_holder_release_wait<F, T, C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
+    holder: carrick_core_abi::HolderWait,
+    mut park: F,
+) -> EditWaitOutcome<T>
+where
+    F: FnMut(
+        ObjectWaitKey,
+        carrick_sched_core::object_wait::ObjectStateSnapshot,
+        OperationToken,
+        &dyn Fn() -> bool,
+    ) -> Result<T, (ObjectWaitError, OperationToken)>,
+{
+    let Some(mm) = core::num::NonZeroU64::new(holder.mm().raw()) else {
+        return EditWaitOutcome::Refused;
+    };
+    let Some(source) = zone
+        .space_entry(mm)
+        .and_then(|entry| entry.live_notifications().ok())
+    else {
+        return EditWaitOutcome::NoConflict;
+    };
+    let cause = holder.cause();
+    let observed = source.observe(cause);
+    if observed.revision() != holder.revision() || !holder_fence_raised(zone, mm, cause) {
+        return EditWaitOutcome::NoConflict;
+    }
+    let key = source.key(cause);
+    let Some(token) = OperationToken::anonymous_edit(key) else {
+        return EditWaitOutcome::Refused;
+    };
+    // SAFETY: the holder's revision was read (by the carrier, and again
+    // here) before the fence probe above; park revalidates it before
+    // enrollment and the recheck closes publication.
+    let snapshot = unsafe {
+        carrick_sched_core::object_wait::ObjectStateSnapshot::before_object_probe(observed)
+    };
+    let still_blocked = || source.is_live() && source.observe(cause) == observed;
+    match park(key, snapshot, token, &still_blocked) {
+        Ok(parked) => EditWaitOutcome::Parked(parked),
+        Err((ObjectWaitError::Changed, _)) => EditWaitOutcome::NoConflict,
+        Err(_) => EditWaitOutcome::Refused,
     }
 }

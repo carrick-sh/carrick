@@ -580,3 +580,140 @@ fn every_native_exclusion_site_settles_owed_returns() {
         }
     }
 }
+
+/// A recording drain venue for [`drain_owed_return_table`]: a shared table of
+/// `capacity` slots, each holder's slot count, and each holder's editor (a
+/// held editor refuses the holder's settlement, as `try_exclude_editor`
+/// does, and its release advances the holder's `Editor` revision).
+struct TableDrain {
+    capacity: usize,
+    slots: Vec<(ReservationMm, usize)>,
+    held: Vec<ReservationMm>,
+    editor_revision: std::collections::BTreeMap<u64, u64>,
+    attempts: Vec<ReservationMm>,
+}
+
+impl TableDrain {
+    fn full(holders: &[u64]) -> Self {
+        Self {
+            capacity: holders.len() * 2,
+            slots: holders
+                .iter()
+                .map(|&mm| (ReservationMm::new(mm).unwrap(), 2))
+                .collect(),
+            held: Vec::new(),
+            editor_revision: holders.iter().map(|&mm| (mm, 10 + mm)).collect(),
+            attempts: Vec::new(),
+        }
+    }
+    fn hold(&mut self, mm: u64) {
+        self.held.push(ReservationMm::new(mm).unwrap());
+    }
+    /// The holder's editor leaves: its exact `Editor` release.
+    fn release(&mut self, mm: u64) {
+        self.held.retain(|held| held.raw() != mm);
+        *self.editor_revision.get_mut(&mm).unwrap() += 1;
+    }
+    fn holders(&self) -> Vec<ReservationMm> {
+        self.slots.iter().map(|&(mm, _)| mm).collect()
+    }
+}
+
+impl OwedReturnDrain for TableDrain {
+    type Error = ();
+    fn table_full(&self) -> bool {
+        self.slots.iter().map(|&(_, n)| n).sum::<usize>() >= self.capacity
+    }
+    fn observe(&mut self, holder: ReservationMm) -> Option<HolderRevisions> {
+        let editor = *self.editor_revision.get(&holder.raw())?;
+        Some(HolderRevisions {
+            editor,
+            reservations: 0,
+            pending_edit: 0,
+        })
+    }
+    fn settle(&mut self, holder: ReservationMm) -> Result<SettlementDoorbellReply, ()> {
+        self.attempts.push(holder);
+        if self.held.contains(&holder) {
+            return Ok(SettlementDoorbellReply::Editor);
+        }
+        if let Some(entry) = self.slots.iter_mut().find(|(mm, _)| *mm == holder) {
+            entry.1 = 0;
+        }
+        Ok(SettlementDoorbellReply::Settled)
+    }
+}
+
+/// #1482 P0-1, Busy once, then success: a full table whose every holder's
+/// editor is held answers the oldest holder's wait authority (its exact MM,
+/// release and the revision before the refused attempt), not a rerun. After
+/// that holder's release the same drain frees a slot.
+#[test]
+fn a_full_table_waits_on_its_oldest_busy_holder_then_drains_after_its_release() {
+    let mut drain = TableDrain::full(&[5, 3, 9]);
+    for mm in [5, 3, 9] {
+        drain.hold(mm);
+    }
+    let holders = drain.holders();
+    let refused = drain_owed_return_table(&mut drain, &holders).unwrap();
+    let DrainOutcome::Wait(wait) = refused else {
+        panic!("every holder busy: wait on one, never rerun ({refused:?})");
+    };
+    assert_eq!(wait.mm().raw(), 5, "the oldest holder, in the order given");
+    assert_eq!(wait.refusal(), carrick_core_abi::HolderRefusal::Editor);
+    assert_eq!(wait.revision(), 15, "the revision read before the attempt");
+    assert!(drain.table_full(), "nothing was freed");
+    assert_eq!(drain.attempts.len(), 3, "every holder was tried once");
+
+    // The holder's release advances exactly the revision the waiter holds.
+    drain.release(5);
+    assert_ne!(
+        drain.observe(wait.mm()).unwrap().of(wait.refusal()),
+        wait.revision()
+    );
+    drain.attempts.clear();
+    assert_eq!(
+        drain_owed_return_table(&mut drain, &holders).unwrap(),
+        DrainOutcome::Room
+    );
+    assert_eq!(
+        drain.attempts,
+        [ReservationMm::new(5).unwrap()],
+        "one holder freed room"
+    );
+    assert!(!drain.table_full());
+}
+
+/// A busy holder is skipped, not waited on, when a younger holder frees a
+/// slot; a table with room is never drained.
+#[test]
+fn a_drain_waits_only_when_no_holder_frees_a_slot() {
+    let mut drain = TableDrain::full(&[5, 3]);
+    drain.hold(5);
+    let holders = drain.holders();
+    assert_eq!(
+        drain_owed_return_table(&mut drain, &holders).unwrap(),
+        DrainOutcome::Room
+    );
+    assert_eq!(drain.attempts.len(), 2);
+    drain.attempts.clear();
+    assert_eq!(
+        drain_owed_return_table(&mut drain, &holders).unwrap(),
+        DrainOutcome::Room
+    );
+    assert!(drain.attempts.is_empty(), "room: no holder is touched");
+}
+
+/// Holders with no live source are retiring: no wait authority exists, and
+/// the drain says so instead of naming a source.
+#[test]
+fn a_table_of_retiring_holders_has_no_wait_authority() {
+    let mut drain = TableDrain::full(&[5]);
+    drain.editor_revision.clear();
+    drain.hold(5);
+    let holders = drain.holders();
+    assert_eq!(
+        drain_owed_return_table(&mut drain, &holders).unwrap(),
+        DrainOutcome::Retiring
+    );
+}

@@ -1584,3 +1584,264 @@ mod member_release {
         assert!(member.authority.reserve_reset().is_ok());
     }
 }
+
+fn deliver_holder_release(
+    _: &ZoneTables,
+    _: carrick_sched_core::Waker,
+    effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+) {
+    let _ = effects.deliver_handbacks(&mut |_| {});
+}
+
+/// #1482 P0-1, Busy once, then success, on the ring's production entry: a
+/// full owed-return table's waiter enrols on the busy holder's exact
+/// `Editor` release (never its own MM's queue), probes the holder's editor
+/// word once and parks; only that holder's release wakes it. Once the
+/// release has happened, the same wait authority reruns at once (its
+/// revision is stale), and a holder whose fence dropped never parks anyone.
+#[test]
+fn full_table_waiter_parks_on_the_busy_holders_release_until_it_comes() {
+    use carrick_core::wait::coordinate_holder_release_wait;
+    use carrick_core_abi::{HolderRefusal, HolderWait, ReservationMm};
+    let zone = zone();
+    let slot = SlotId::new(0);
+    let (waiter, holder) = (77u64, 78u64);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, waiter, None, 0);
+    let here = ExecutionSlot::zone(slot);
+    zone.occupancy.vacate_any(here);
+    assert!(zone.occupancy.replace(here, 0, waiter));
+    zone.enter_guest(slot);
+    let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+        let _ = effects.deliver_handbacks(&mut |_| {});
+    };
+    for mm in [waiter, holder] {
+        let space = zone.spaces.publish_closed(mm, 0x7000, 0x7000).unwrap();
+        zone.spaces.open(space);
+        zone.space_entry(std::num::NonZeroU64::new(mm).unwrap())
+            .unwrap()
+            .admit_notifications(
+                std::num::NonZeroU64::MIN,
+                &carrick_sched_core::BoundedSpin(0),
+                &complete,
+            )
+            .unwrap();
+    }
+    let own = zone
+        .space_entry(std::num::NonZeroU64::new(waiter).unwrap())
+        .unwrap()
+        .live_notifications()
+        .unwrap();
+    let entry = zone
+        .space_entry(std::num::NonZeroU64::new(holder).unwrap())
+        .unwrap();
+    let source = entry.live_notifications().unwrap();
+    let venue = carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+        zone: &zone,
+        waker: carrick_sched_core::Waker::Host,
+        deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+            deliver_holder_release,
+        ),
+    };
+    let identity = ThreadIdentity {
+        tid: 41,
+        serial: 101,
+        mm: waiter,
+        file_table: 5,
+        generation: 1,
+        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+        affinity: 0,
+        lifecycle_page: 0,
+        control_slot: 0,
+    };
+    let record = zone.current_or_new(slot, identity).unwrap();
+    let holder_mm = ReservationMm::new(holder).unwrap();
+    let editor_key = source.key(SpaceWaitCause::Editor);
+
+    // A holder whose editor already left never parks anyone.
+    let idle = HolderWait::new(
+        holder_mm,
+        HolderRefusal::Editor,
+        source.observe(SpaceWaitCause::Editor).revision(),
+    );
+    let unparked: EditWaitOutcome<()> =
+        coordinate_holder_release_wait(&zone, idle, |_, _, _, _| panic!("no fence, no park"));
+    assert_eq!(unparked, EditWaitOutcome::NoConflict);
+
+    // Busy: the holder's ring editor is active when the carrier refuses.
+    let editor = zone
+        .spaces
+        .try_begin_edit_cause(
+            entry.index(),
+            holder,
+            std::num::NonZeroU64::new(9).unwrap(),
+            Some(venue),
+        )
+        .unwrap();
+    let busy = HolderWait::new(
+        holder_mm,
+        HolderRefusal::Editor,
+        source.observe(SpaceWaitCause::Editor).revision(),
+    );
+    let mut enrolled = Vec::new();
+    let outcome = coordinate_holder_release_wait(&zone, busy, |key, snapshot, token, still| {
+        enrolled.push(key);
+        let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
+        park_object_record_rechecked(
+            &zone,
+            slot,
+            request,
+            &complete,
+            || Ok((record, false)),
+            still,
+        )
+    });
+    let EditWaitOutcome::Parked(_parked) = outcome else {
+        panic!("a busy holder parks the waiter");
+    };
+    assert_eq!(enrolled, [editor_key], "the holder's queue, exactly once");
+    assert_ne!(editor_key, own.key(SpaceWaitCause::Editor));
+    assert_eq!(
+        zone.object_queue_census(editor_key.index())
+            .unwrap()
+            .waiters,
+        1
+    );
+    assert!(matches!(
+        zone.record(record).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+
+    // The holder's release, and only it, wakes the waiter.
+    drop(editor);
+    assert_eq!(
+        zone.object_queue_census(editor_key.index())
+            .unwrap()
+            .waiters,
+        0
+    );
+    assert!(!matches!(
+        zone.record(record).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+
+    // The same authority after the release: rerun, no second park.
+    let rerun: EditWaitOutcome<()> =
+        coordinate_holder_release_wait(&zone, busy, |_, _, _, _| panic!("released: rerun"));
+    assert_eq!(rerun, EditWaitOutcome::NoConflict);
+}
+
+/// #1482 P0-1: two live processes at a full owed-return table. Each waiter
+/// (its own MM, on its own slot) parks on the same busy holder's `Editor`
+/// release; the holder's one release wakes both, and neither had a second
+/// enrollment while it held.
+#[test]
+fn two_processes_at_a_full_table_both_park_on_the_holder_and_both_wake() {
+    use carrick_core::wait::coordinate_holder_release_wait;
+    use carrick_core_abi::{HolderRefusal, HolderWait, ReservationMm};
+    let zone = zone();
+    let holder = 78u64;
+    let waiters = [
+        (SlotId::new(0), 77u64, 41u64),
+        (SlotId::new(1), 79u64, 42u64),
+    ];
+    let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+        let _ = effects.deliver_handbacks(&mut |_| {});
+    };
+    for (slot, mm, _) in waiters {
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, mm, None, 0);
+        let here = ExecutionSlot::zone(slot);
+        zone.occupancy.vacate_any(here);
+        assert!(zone.occupancy.replace(here, 0, mm));
+        zone.enter_guest(slot);
+    }
+    for mm in [77, 79, holder] {
+        let space = zone.spaces.publish_closed(mm, 0x7000, 0x7000).unwrap();
+        zone.spaces.open(space);
+        zone.space_entry(std::num::NonZeroU64::new(mm).unwrap())
+            .unwrap()
+            .admit_notifications(
+                std::num::NonZeroU64::MIN,
+                &carrick_sched_core::BoundedSpin(0),
+                &complete,
+            )
+            .unwrap();
+    }
+    let entry = zone
+        .space_entry(std::num::NonZeroU64::new(holder).unwrap())
+        .unwrap();
+    let source = entry.live_notifications().unwrap();
+    let editor = zone
+        .spaces
+        .try_begin_edit_cause(
+            entry.index(),
+            holder,
+            std::num::NonZeroU64::new(9).unwrap(),
+            Some(
+                carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+                    zone: &zone,
+                    waker: carrick_sched_core::Waker::Host,
+                    deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                        deliver_holder_release,
+                    ),
+                },
+            ),
+        )
+        .unwrap();
+    let key = source.key(SpaceWaitCause::Editor);
+    let mut records = Vec::new();
+    let mut parks = Vec::new();
+    for (slot, mm, tid) in waiters {
+        let record = zone
+            .current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid,
+                    serial: 100 + tid,
+                    mm,
+                    file_table: 5,
+                    generation: 1,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                },
+            )
+            .unwrap();
+        // Each waiter's carrier answer read the holder's revision first.
+        let wait = HolderWait::new(
+            ReservationMm::new(holder).unwrap(),
+            HolderRefusal::Editor,
+            source.observe(SpaceWaitCause::Editor).revision(),
+        );
+        let mut enrollments = 0;
+        let outcome = coordinate_holder_release_wait(&zone, wait, |key, snapshot, token, still| {
+            enrollments += 1;
+            let request = ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
+            park_object_record_rechecked(
+                &zone,
+                slot,
+                request,
+                &complete,
+                || Ok((record, false)),
+                still,
+            )
+        });
+        let EditWaitOutcome::Parked(parked) = outcome else {
+            panic!("waiter {tid} parks on the busy holder");
+        };
+        assert_eq!(enrollments, 1);
+        records.push(record);
+        parks.push(parked);
+    }
+    assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 2);
+    drop(editor);
+    assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+    for record in records {
+        assert!(!matches!(
+            zone.record(record).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+    }
+}
