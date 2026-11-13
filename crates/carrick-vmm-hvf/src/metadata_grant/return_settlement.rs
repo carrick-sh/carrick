@@ -6,9 +6,12 @@
 //! exists for a native MM), so settling an extent here is: observe its
 //! retired terminals from the child's exact root (fallible, no effect), then
 //! clear them, and acknowledge. It runs at every exclusion of a native
-//! child's editor ([`settle_native_returns`]: the carrier's COW settlement
+//! child's editor ([`settle_native_exclusion`]: the carrier's COW settlement
 //! hook, the native COW supply and the child retire) and on the
-//! `GRANT_OP_RETURN_SETTLE` doorbell ([`service_return_settlement`]).
+//! `GRANT_OP_RETURN_SETTLE` doorbell ([`service_return_settlement`]), each
+//! time after the MM's outstanding COW completions (#1482 P0-3), through the
+//! one neutral sequence
+//! ([`carrick_hal::return_settlement::settle_cow_then_returns`]).
 //! One exclusion settles at most one chunk
 //! ([`carrick_el1_abi::SETTLEMENT_CHUNK_PAGES`] owed pages, #1482); the
 //! doorbell lowers and re-raises it between chunks within its one crossing.
@@ -26,8 +29,9 @@ use carrick_el1_abi::{
     SettlementDoorbellAnswer, SettlementDoorbellReply,
 };
 use carrick_hal::return_settlement::{
-    DrainOutcome, HolderRevisions, OwedReturnDrain, PauseSettlement, ReturnJournalAccess,
-    pause_settlement, settle_in_bounded_pauses, settle_ring_owned_returns,
+    CowSettled, DrainOutcome, ExclusionSettlement, HolderRevisions, OwedReturnDrain,
+    PauseSettlement, ReturnJournalAccess, pause_settlement, settle_cow_then_returns,
+    settle_in_bounded_pauses, settle_ring_owned_returns,
 };
 use carrick_sched_core::spaces::notification::{
     ExclusionRefusal, SpaceAccess, SpaceReleaseVenue, SpaceWaitCause, SpaceWakeDelivery,
@@ -130,13 +134,61 @@ fn with_release<R>(
     }))
 }
 
-/// Settle a native child's owed returns under an exclusion of its editor.
+/// The carrier's venue of the one exclusion sequence: the excluded MM's
+/// COW completions through `pool`, then a native child's owed returns.
+struct NativeExclusion<'a> {
+    custody: &'a std::sync::Arc<crate::trap::CarrierVmCustody>,
+    pool: Option<&'a carrick_el1_abi::CowGrantPool>,
+}
+impl ExclusionSettlement for NativeExclusion<'_> {
+    type Error = TrapError;
+    type Returns = Option<PauseSettlement>;
+    fn settle_cow_completions(
+        &mut self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        // No retained pool: nothing was ever granted, so nothing completed.
+        self.pool.map_or(Ok(()), |pool| {
+            crate::trap::settle_cow_completions(self.custody, pool, excluded)
+        })
+    }
+    fn settle_owed_returns(
+        &mut self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        cow: &CowSettled<'_>,
+    ) -> Result<Option<PauseSettlement>, TrapError> {
+        settle_native_returns(self.custody, excluded, cow)
+    }
+}
+
+/// Every exclusion of an MM's editor obtained for settlement (#1482 P0-3):
+/// its outstanding COW completions, then a native child's owed returns.
 /// `Ok(None)`: the MM is not a live native child (the host-served root's
-/// host venue settles its own). A skipped or contended settlement leaves the
-/// returns owed for a later exclusion and is never the caller's failure.
-pub(crate) fn settle_native_returns(
+/// host venue settles its returns).
+pub(crate) fn settle_native_exclusion(
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+    excluded: &carrick_sched_core::ExcludedEditor<'_>,
+) -> Result<Option<PauseSettlement>, TrapError> {
+    settle_native_exclusion_in(custody, carrick_el1_abi::cow_grant_pool_host(), excluded)
+}
+
+/// [`settle_native_exclusion`] through the carrier's own COW pool.
+pub(crate) fn settle_native_exclusion_in(
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+    pool: Option<&carrick_el1_abi::CowGrantPool>,
+    excluded: &carrick_sched_core::ExcludedEditor<'_>,
+) -> Result<Option<PauseSettlement>, TrapError> {
+    settle_cow_then_returns(&mut NativeExclusion { custody, pool }, excluded)
+}
+
+/// Settle a native child's owed returns under an exclusion of its editor,
+/// after its COW completions. `Ok(None)`: the MM is not a live native
+/// child. A skipped or contended settlement leaves the returns owed for a
+/// later exclusion and is never the caller's failure.
+fn settle_native_returns(
     custody: &crate::trap::CarrierVmCustody,
     excluded: &carrick_sched_core::ExcludedEditor<'_>,
+    cow: &CowSettled<'_>,
 ) -> Result<Option<PauseSettlement>, TrapError> {
     let Some(mm) = carrick_el1_abi::ReservationMm::new(excluded.key()) else {
         return Ok(None);
@@ -175,7 +227,7 @@ pub(crate) fn settle_native_returns(
             failed: false,
         };
         let outcome =
-            settle_ring_owned_returns(excluded, &guard, loan_pending, &journal, &mut backend);
+            settle_ring_owned_returns(excluded, cow, &guard, loan_pending, &journal, &mut backend);
         if backend.failed {
             return Err(TrapError::Hypervisor(format!(
                 "native owed return of MM {} changed under exclusion",
@@ -197,7 +249,7 @@ pub(crate) fn settle_native_returns(
 /// Exclude, settle, then, whatever happened, release the claim and publish
 /// `Reservations` (the exit epilogue), and answer in x1 to x3.
 pub(super) fn service_return_settlement(
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
     args: [u64; 3],
@@ -250,7 +302,7 @@ pub(super) fn service_return_settlement(
 }
 
 fn settle_at_doorbell(
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     zone: &Zone,
     mm: carrick_el1_abi::ReservationMm,
 ) -> Result<SettlementDoorbellReply, TrapError> {
@@ -265,7 +317,7 @@ fn settle_at_doorbell(
         settle_in_bounded_pauses::<TrapError>(|| {
             match SpaceAccess::notified(release).try_exclude_editor(index, mm.raw()) {
                 Ok(exclusion) => {
-                    let settled = settle_native_returns(custody, exclusion.proof())?;
+                    let settled = settle_native_exclusion(custody, exclusion.proof())?;
                     drop(exclusion);
                     Ok(settled.unwrap_or(PauseSettlement::answer(SettlementDoorbellReply::Stale)))
                 }
@@ -285,7 +337,7 @@ fn settle_at_doorbell(
 /// holder's live source in the zone, and the carrier's bounded doorbell
 /// drive.
 struct NativeDrain<'a> {
-    custody: &'a crate::trap::CarrierVmCustody,
+    custody: &'a std::sync::Arc<crate::trap::CarrierVmCustody>,
     table: &'a carrick_el1::memory::reservations::SharedReservations,
     zone: &'a Zone,
 }
@@ -323,7 +375,7 @@ impl OwedReturnDrain for NativeDrain<'_> {
 /// venue (it answers stale here); retired MMs' slots wait for their release
 /// receipts.
 fn drain_owed_return_table(
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     region: RetainedAbiRegion<'_>,
     zone: &Zone,
     caller: carrick_el1_abi::ReservationMm,

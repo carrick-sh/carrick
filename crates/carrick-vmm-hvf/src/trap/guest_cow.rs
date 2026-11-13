@@ -711,39 +711,41 @@ impl CarrierGuestCowSettlement {
         pool: &CowGrantPool,
         excluded: &ExcludedEditor<'_>,
     ) -> Result<(), TrapError> {
-        // COW completions first: a retired leaf may name a replacement
-        // frame whose completion is still unsettled. Then a native child's
-        // owed returns (#1369 slice 3); the host-served root's settle at its
-        // host venue.
-        self.settle_cow_in(custody, pool, excluded)?;
-        crate::metadata_grant::settle_native_returns(custody, excluded).map(|_| ())
+        // The one sequence (#1482 P0-3): COW completions, then a native
+        // child's owed returns; the host-served root's settle at its host
+        // venue.
+        crate::metadata_grant::settle_native_exclusion_in(custody, Some(pool), excluded).map(|_| ())
     }
+}
 
-    fn settle_cow_in(
-        &self,
-        custody: &std::sync::Arc<CarrierVmCustody>,
-        pool: &CowGrantPool,
-        excluded: &ExcludedEditor<'_>,
-    ) -> Result<(), TrapError> {
-        if !pool.any_completed() || pool.completions(excluded).next().is_none() {
+/// The carrier's COW step of every exclusion (#1482 P0-3): settle the
+/// excluded MM's outstanding completions, a native child's through its
+/// supplied grants and any other MM's through its guest COW state. A retired
+/// leaf may name a replacement frame whose completion is still unsettled, so
+/// this runs before any owed return is settled.
+pub(crate) fn settle_cow_completions(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    pool: &CowGrantPool,
+    excluded: &ExcludedEditor<'_>,
+) -> Result<(), TrapError> {
+    if !pool.any_completed() || pool.completions(excluded).next().is_none() {
+        return Ok(());
+    }
+    crate::metadata_grant::settle_native_cow(custody, pool, excluded).and_then(|settled| {
+        if settled.is_some() {
             return Ok(());
         }
-        crate::metadata_grant::settle_native_cow(custody, pool, excluded).and_then(|settled| {
-            if settled.is_some() {
-                return Ok(());
-            }
-            let state = custody.guest_cow_state(excluded.key()).map_err(|()| {
-                TrapError::Hypervisor(format!(
-                    "EL1 COW completions for MM {} whose COW runtime was never bound",
-                    excluded.key()
-                ))
-            })?;
-            if let Some(state) = state {
-                settle_guest_cow_completions(&state, custody, pool, excluded);
-            }
-            // A retired MM settles its inventory and releases its records
-            // through publication retirement, without another live state.
-            Ok(())
-        })
-    }
+        let state = custody.guest_cow_state(excluded.key()).map_err(|()| {
+            TrapError::Hypervisor(format!(
+                "EL1 COW completions for MM {} whose COW runtime was never bound",
+                excluded.key()
+            ))
+        })?;
+        if let Some(state) = state {
+            settle_guest_cow_completions(&state, custody, pool, excluded);
+        }
+        // A retired MM settles its inventory and releases its records
+        // through publication retirement, without another live state.
+        Ok(())
+    })
 }

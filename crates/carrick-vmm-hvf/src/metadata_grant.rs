@@ -11,7 +11,7 @@ pub use native_service::NativeService;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use native_service::settle_native_cow;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use return_settlement::settle_native_returns;
+pub(crate) use return_settlement::{settle_native_exclusion, settle_native_exclusion_in};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub type NativeExecParts = carrick_hal::native_exec::NativeExecParts<crate::trap::GuestMappingPlan>;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -125,7 +125,7 @@ fn terminal_child_binding(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn service_terminal_operation(
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
     op: u64,
@@ -267,15 +267,13 @@ fn service_terminal_operation(
     let Ok(exclusion) = access.try_exclude_editor(index, binding.mm.raw()) else {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     };
-    if let Some(pool) = carrick_el1_abi::cow_grant_pool_host() {
-        if settle_native_cow(custody, pool, exclusion.proof()).is_err() {
-            return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
-        }
-        pool.release_mm(exclusion.proof());
-    }
-    // Every exclusion settles COW, then owed returns (#1369 slice 3).
-    if settle_native_returns(custody, exclusion.proof()).is_err() {
+    // Every exclusion settles COW, then owed returns, through the one
+    // sequence (#1482 P0-3); unused pool records are released after.
+    if settle_native_exclusion(custody, exclusion.proof()).is_err() {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    }
+    if let Some(pool) = carrick_el1_abi::cow_grant_pool_host() {
+        pool.release_mm(exclusion.proof());
     }
     drop(exclusion);
     // SAFETY: the synchronous crossing retains the caller's aligned wire record.
