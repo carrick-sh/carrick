@@ -303,3 +303,51 @@ fn a_reused_slot_keeps_its_successor_owed() {
     );
     assert_eq!(journal.owed(), vec![(0x50000, 0x51000)]);
 }
+
+/// #1482 L1: a pending fork loan naming the MM skips its settlement: no
+/// retirement, no acknowledgement, the returns stay owed, and the doorbell
+/// answers `ForkLoanPending` (the ring waits for the loan's PendingEdit
+/// release). Once the loan settles the same settlement frees every slot.
+#[test]
+fn a_pending_fork_loan_skips_ring_owned_settlement_until_it_settles() {
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let lock = SettlementLock::new();
+    let journal = Journal::owing(MM, &EXTENTS);
+    let mut backend = Backend::default();
+    let excluded = spaces.unpublished(MM).unwrap();
+    let guard = lock.lock(&excluded);
+    let skipped = settle_ring_owned_returns(&excluded, &guard, true, &journal, &mut backend);
+    assert_eq!(
+        skipped,
+        Ok(SettlementOutcome::Skipped(SkipReason::ForkLoanPending))
+    );
+    assert_eq!(
+        doorbell_reply(&skipped),
+        Some(SettlementDoorbellReply::ForkLoanPending)
+    );
+    assert!(backend.retirements.is_empty() && journal.log.borrow().is_empty());
+    assert_eq!(journal.owed(), EXTENTS.to_vec());
+    let settled = settle_ring_owned_returns(&excluded, &guard, false, &journal, &mut backend);
+    assert_eq!(
+        doorbell_reply(&settled),
+        Some(SettlementDoorbellReply::Settled)
+    );
+    assert!(journal.owed().is_empty());
+}
+
+/// A busy root answers `Reservations`; a failed backend step answers
+/// nothing (the carrier's own fault, never a guest reply).
+#[test]
+fn doorbell_replies_name_the_release_a_refusal_waits_for() {
+    type Outcome =
+        Result<SettlementOutcome<ReturnSettlementReceipt>, ReturnSettlementError<Refusal, u64>>;
+    let busy: Outcome = Err(ReturnSettlementError::Journal(Refusal::Busy));
+    assert_eq!(
+        doorbell_reply(&busy),
+        Some(SettlementDoorbellReply::Reservations)
+    );
+    let stale: Outcome = Err(ReturnSettlementError::Journal(Refusal::Stale));
+    assert_eq!(doorbell_reply(&stale), Some(SettlementDoorbellReply::Stale));
+    let failed: Outcome = Err(ReturnSettlementError::Backend(3));
+    assert_eq!(doorbell_reply(&failed), None);
+}
