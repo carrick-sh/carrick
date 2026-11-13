@@ -1508,3 +1508,53 @@ fn readlink_validates_only_the_bytes_returned_by_the_link() {
         3
     );
 }
+
+#[test]
+fn a_decoded_call_the_venue_does_not_admit_keeps_its_crossing_output_stage() {
+    use crate::crossing::HostCrossingSet;
+    // The venue decodes readlinkat (the native file family serves it) but
+    // never admits it, so the root's keeps its x86 host crossing. That
+    // crossing still needs its untouched output page prepared first (#2201).
+    let (path, out) = (0x7000_0000u64, 0x7000_1000u64);
+    let args = [LINUX_AT_FDCWD as u64, path, out, 64, 0, 0];
+    assert!(HostFileCall::decode(crate::crossing::nr::READLINKAT, &args).is_some());
+    for origin in [ServiceOrigin::Initial, ServiceOrigin::Descendant] {
+        assert_eq!(
+            admit_or_cross(
+                HostCrossingSet::X86,
+                crate::crossing::nr::READLINKAT,
+                &args,
+                origin,
+                |_| false,
+                |_, _| 0,
+            ),
+            Err(Some(HostFileStage::PrepareOutput { address: out })),
+            "{origin:?}"
+        );
+    }
+    // Once the page is writable the crossing runs as it is.
+    assert_eq!(
+        admit_or_cross(
+            HostCrossingSet::X86,
+            crate::crossing::nr::READLINKAT,
+            &args,
+            ServiceOrigin::Initial,
+            |_| false,
+            |_, len| len,
+        ),
+        Err(None)
+    );
+    // An admitted call is the venue's to stage; nothing is prepared for it.
+    let openat = [LINUX_AT_FDCWD as u64, path, 0, 0, 0, 0];
+    assert!(matches!(
+        admit_or_cross(
+            HostCrossingSet::X86,
+            crate::crossing::nr::OPENAT,
+            &openat,
+            ServiceOrigin::Initial,
+            |_| false,
+            |_, _| 0,
+        ),
+        Ok(HostFileCall::Openat { .. })
+    ));
+}
