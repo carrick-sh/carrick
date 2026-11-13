@@ -312,6 +312,23 @@ pub fn cross_owner_grant(cpu: carrick_guest_arch::CpuId, address: UserVa) {
     }
 }
 
+/// Ring the owed-return settlement doorbell on the owner-grant port: the
+/// carrier settles the stopped execution's MM at an exclusion, releases the
+/// record's claim in its epilogue and writes its answer into `record`.
+pub fn cross_return_settlement(
+    cpu: carrick_guest_arch::CpuId,
+    record: &mut carrick_core_abi::ReturnSettlementDoorbell,
+) {
+    // SAFETY: this CPU owns the retained selection slot and the record on
+    // its stack until the synchronous exit returns; the host authenticates
+    // CPU, MM and root before it writes the answer.
+    unsafe {
+        core::arch::asm!("out dx, eax", in("dx") OWNER_GRANT_PORT,
+            in("eax") cpu.raw(), in("rdi") carrick_el1::isa::x86::context::native::OWNER_GRANT_SETTLE_RETURNS,
+            in("rsi") core::ptr::from_mut(record) as u64, options(nostack));
+    }
+}
+
 #[repr(C)]
 pub struct PageFaultStack {
     pub saved_gprs: [u64; 15],

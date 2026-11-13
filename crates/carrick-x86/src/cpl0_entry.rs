@@ -192,6 +192,10 @@ pub const YIELD_PORT: u16 = 0xd0;
 /// EAX names the CPU slot; RDI carries the exact selected user address, also
 /// for kernel-owned user copies whose target need not equal hardware CR2.
 pub const OWNER_GRANT_PORT: u16 = 0xd1;
+/// The owner-grant port's settlement op (#1369 slice 3): RDI carries this
+/// non-user address instead of a selected one, and RSI the ring-owned
+/// `ReturnSettlementDoorbell` record the carrier answers.
+pub const OWNER_GRANT_SETTLE_RETURNS: u64 = 0x8000_0000_0000_5e77;
 /// Fixture observation only, outside Linux semantic serving.
 pub const OBSERVE_NATIVE: u64 = u64::MAX;
 /// Fixture observation of the shared kernel's active MMU root.
