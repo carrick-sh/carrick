@@ -47,7 +47,8 @@ and only then collects wait4 status and prints `live-exec-ok`. Both signal
 waits have a five-second bound; a returned child errno is propagated by the
 parent. The syscall census requires that the fixture actually reached exec. The
 successor checks initial stack alignment, argc, argv and the empty environment,
-then writes and reads its stack before announcing replacement.
+then writes and reads its stack before announcing replacement. The parent
+checks that its own stack canary survived before sending the acknowledgement.
 
 This uses signal-owner operations rather than in-zone pipes: the separate
 `in_zone_child_pipe_write_without_ipc_execution_is_counted_enosys_in_ring`
