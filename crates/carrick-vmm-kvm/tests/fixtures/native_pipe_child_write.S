@@ -7,7 +7,11 @@
 .text
 _start:
     lea fds(%rip), %rdi
+#ifdef EXEC_STATUS
+    mov $0x80000, %esi
+#else
     xor %esi, %esi
+#endif
     mov $293, %eax                 /* pipe2(fds, 0) */
     syscall
     test %rax, %rax
@@ -19,6 +23,13 @@ _start:
     jz child
 #ifdef READ_CHILD
     mov %eax, %r12d
+#ifdef EXEC_STATUS
+    mov fds+4(%rip), %edi
+    mov $3, %eax
+    syscall
+    test %rax, %rax
+    jnz fail_read
+#endif
     mov fds(%rip), %edi
 #ifdef READV_CHILD
     lea vectors(%rip), %rsi
@@ -41,6 +52,15 @@ _start:
 #endif
     cmpb $'P', received(%rip)
     jne fail_read
+#ifdef EXEC_STATUS
+    mov fds(%rip), %edi
+    lea received(%rip), %rsi
+    mov $1, %edx
+    xor %eax, %eax
+    syscall
+    test %rax, %rax                /* last-writer exit supplies EOF */
+    jnz fail_read
+#endif
     mov %r12d, %eax
 #endif
     mov %eax, %edi                 /* wait4(child, &status, 0, NULL) */
@@ -54,6 +74,15 @@ _start:
     movzbl status+1(%rip), %edi    /* WEXITSTATUS */
     jmp exit
 child:
+#ifdef EXEC_STATUS
+    lea missing_path(%rip), %rdi
+    lea argv(%rip), %rsi
+    xor %edx, %edx
+    mov $59, %eax                  /* execve failure reports over CLOEXEC pipe */
+    syscall
+    test %rax, %rax
+    jns fail_read
+#endif
     mov fds+4(%rip), %edi          /* write(fds[1], "P", 1) */
     lea message(%rip), %rsi
 #ifdef READV_CHILD
@@ -96,3 +125,7 @@ message: .ascii "PQ"
 received_second: .byte 0
 .balign 8
 vectors: .quad received, 1, received_second, 1
+
+missing_path: .asciz "/carrick-missing-exec-status-target"
+.balign 8
+argv: .quad missing_path, 0
