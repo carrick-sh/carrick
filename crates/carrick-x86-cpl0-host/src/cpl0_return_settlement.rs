@@ -15,6 +15,8 @@
 //! lock the caller holds), then the root guard, held only inside the journal
 //! steps.
 use super::*;
+use carrick_el1::memory::{RetiredTerminal, X86AnonymousDecode, owed_retired_terminals};
+use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
 use carrick_el1_abi::{
     OwedReturnRetirement, Refusal, ReturnJournal, ReturnSettlementDoorbell,
     ReturnSettlementRequest, SettlementDoorbellReply,
@@ -22,7 +24,6 @@ use carrick_el1_abi::{
 use carrick_hal::return_settlement::{
     ReturnJournalAccess, doorbell_reply, settle_ring_owned_returns,
 };
-use carrick_mmu_core::x86::descriptor_txn::{RetiredTerminal, owed_retired_terminals};
 use carrick_sched_core::spaces::notification::{ExclusionRefusal, SpaceWaitCause};
 
 /// What this carrier's settlements did, for witnesses (deterministic counts).
@@ -122,9 +123,13 @@ impl<M: CarrierMemoryIo> OwedReturnRetirement for Cpl0OwedReturns<'_, M> {
             .map(|owed| {
                 let (start, len) = (owed.range.start(), owed.range.len());
                 let mut terminals = Vec::new();
-                owed_retired_terminals(&words, self.root, start, len, &mut |terminal| {
-                    terminals.push(terminal)
-                })
+                owed_retired_terminals::<X86AnonymousDecode>(
+                    &|pa| words.load(pa).ok(),
+                    self.root.address().raw(),
+                    start,
+                    len,
+                    &mut |terminal| terminals.push(terminal),
+                )
                 .map_err(|reason| {
                     format!("owed return [{start:#x}, +{len:#x}) holds a live terminal: {reason:?}")
                 })?;

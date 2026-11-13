@@ -742,6 +742,200 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
     backing
 }
 
+/// One retired private terminal inside an owed return: its descriptor word's
+/// physical address, its value, and the VA span it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredTerminal {
+    pub slot: u64,
+    pub descriptor: u64,
+    pub va: u64,
+    pub span: u64,
+}
+
+/// Why an owed return's terminals could not be observed: a broken
+/// invariant, since its root refused every reuse while it was owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwedTerminalRefusal {
+    /// The range is not page-aligned or overflows.
+    BadRange,
+    /// A word could not be read.
+    Unreadable,
+    /// A live, prepared or foreign terminal, or a retired one straddling the
+    /// range, sits inside the owed range.
+    Occupied,
+}
+
+/// The retired terminals of one owed return `[va, va + len)` in `root`, for
+/// either ISA: the observation half of its settlement at an exclusion of the
+/// MM (#1369 slice 3), shared by every carrier. An owed range holds only
+/// retired private terminals (their retirement left them invalid, with
+/// their output kept) and holes. Anything else refuses before anything is
+/// visited.
+pub fn owed_retired_terminals<A: AnonymousDescriptorDecode>(
+    read: &dyn Fn(u64) -> Option<u64>,
+    root: u64,
+    va: u64,
+    len: u64,
+    visit: &mut dyn FnMut(RetiredTerminal),
+) -> Result<(), OwedTerminalRefusal> {
+    use carrick_mmu_core::aarch64::El1PrivateLeafState;
+    const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
+    let end = va.checked_add(len).ok_or(OwedTerminalRefusal::BadRange)?;
+    if !va.is_multiple_of(PAGE_SIZE) || !len.is_multiple_of(PAGE_SIZE) {
+        return Err(OwedTerminalRefusal::BadRange);
+    }
+    // Two passes, so a refusal visits nothing.
+    for pass in 0..2 {
+        let mut cursor = va;
+        while cursor < end {
+            let index = A::indices(UserVa::new(cursor));
+            let mut table = root;
+            let mut level = 0;
+            let (slot, descriptor) = loop {
+                let slot = table + index[level] as u64 * 8;
+                let descriptor = read(slot).ok_or(OwedTerminalRefusal::Unreadable)?;
+                if let Some(next_table) = A::next_table(descriptor, level) {
+                    table = next_table.raw();
+                    level += 1;
+                    continue;
+                }
+                break (slot, descriptor);
+            };
+            let span = SPANS[level];
+            let base = cursor & !(span - 1);
+            if descriptor != 0 {
+                if A::private_state(descriptor) != El1PrivateLeafState::Retired
+                    || base < va
+                    || base + span > end
+                {
+                    return Err(OwedTerminalRefusal::Occupied);
+                }
+                if pass == 1 {
+                    visit(RetiredTerminal {
+                        slot,
+                        descriptor,
+                        va: base,
+                        span,
+                    });
+                }
+            }
+            cursor = base
+                .checked_add(span)
+                .ok_or(OwedTerminalRefusal::BadRange)?;
+        }
+    }
+    Ok(())
+}
+
+/// The edit half of an owed return's settlement: clear each observed retired
+/// terminal ([`owed_retired_terminals`]) by compare-and-swap from its exact
+/// retired word. The caller holds the MM's editor exclusion, so no ring
+/// editor races it, and a retired terminal is invalid, so no hardware walker
+/// writes it or caches it. `false`: a word changed under that exclusion, a
+/// broken invariant; the terminals cleared before it stay cleared (each was
+/// already invalid).
+pub fn clear_retired_terminals(
+    compare_exchange: &dyn Fn(u64, u64, u64) -> Option<bool>,
+    terminals: &[RetiredTerminal],
+) -> bool {
+    terminals
+        .iter()
+        .all(|terminal| compare_exchange(terminal.slot, terminal.descriptor, 0) == Some(true))
+}
+
+#[cfg(test)]
+mod owed_terminal_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    /// A four-level graph rooted at 0x1000 with one L3 table at 0x4000
+    /// covering VA 0..2 MiB, and the words `leaf(page)` at pages 4..7.
+    fn graph(table: u64, leaf: &dyn Fn(u64) -> u64) -> RefCell<BTreeMap<u64, u64>> {
+        let mut words = BTreeMap::new();
+        words.insert(0x1000, 0x2000 | table);
+        words.insert(0x2000, 0x3000 | table);
+        words.insert(0x3000, 0x4000 | table);
+        for page in 4..8 {
+            words.insert(0x4000 + page * 8, leaf(page));
+        }
+        RefCell::new(words)
+    }
+
+    fn settle<A: AnonymousDescriptorDecode>(
+        words: &RefCell<BTreeMap<u64, u64>>,
+        va: u64,
+        len: u64,
+    ) -> Result<Vec<RetiredTerminal>, OwedTerminalRefusal> {
+        let read = |pa: u64| Some(words.borrow().get(&pa).copied().unwrap_or(0));
+        let mut seen = Vec::new();
+        owed_retired_terminals::<A>(&read, 0x1000, va, len, &mut |t| seen.push(t))?;
+        Ok(seen)
+    }
+
+    fn cas(words: &RefCell<BTreeMap<u64, u64>>) -> impl Fn(u64, u64, u64) -> Option<bool> + '_ {
+        move |pa, current, new| {
+            let mut words = words.borrow_mut();
+            let word = words.entry(pa).or_insert(0);
+            Some(
+                *word == current && {
+                    *word = new;
+                    true
+                },
+            )
+        }
+    }
+
+    /// #1482, both ISAs through the one shared walker: an owed return's
+    /// settlement observes exactly its retired private terminals (holes
+    /// skipped), refuses without visiting anything when a live terminal sits
+    /// inside, and clears only from the exact observed words.
+    #[test]
+    fn owed_return_settlement_clears_only_its_retired_terminals() {
+        use carrick_mmu_core::x86::descriptor_txn as x86;
+        const ARM_RETIRED: u64 = (1 << 55) | (1 << 56);
+        const ARM_RESIDENT: u64 = (1 << 56) | 0b11;
+        let x86_leaf = |page: u64| {
+            let output = 0x80_0000 + page * 0x1000;
+            if page < 6 {
+                output | x86::RETIRED | x86::PRIVATE | x86::USER
+            } else {
+                output | x86::PRESENT | x86::PRIVATE | x86::USER
+            }
+        };
+        let arm_leaf = |page: u64| {
+            let output = 0x80_0000 + page * 0x1000;
+            output | if page < 6 { ARM_RETIRED } else { ARM_RESIDENT }
+        };
+        fn check<A: AnonymousDescriptorDecode>(words: RefCell<BTreeMap<u64, u64>>) {
+            assert_eq!(
+                settle::<A>(&words, 0x4000, 0x3000),
+                Err(OwedTerminalRefusal::Occupied),
+                "a live terminal in an owed range is a broken invariant"
+            );
+            // A hole below the mapping is skipped; the owed range may cover it.
+            let seen = settle::<A>(&words, 0x2000, 0x4000).unwrap();
+            assert_eq!(
+                seen.iter().map(|t| (t.va, t.span)).collect::<Vec<_>>(),
+                vec![(0x4000, 0x1000), (0x5000, 0x1000)]
+            );
+            assert!(clear_retired_terminals(&cas(&words), &seen));
+            assert_eq!(settle::<A>(&words, 0x2000, 0x4000), Ok(Vec::new()));
+            assert_ne!(
+                words.borrow()[&(0x4000 + 6 * 8)],
+                0,
+                "the live neighbour is untouched"
+            );
+            assert!(
+                !clear_retired_terminals(&cas(&words), &seen),
+                "only the exact observed word clears"
+            );
+        }
+        check::<X86AnonymousDecode>(graph(x86::PRESENT | x86::WRITE | x86::USER, &x86_leaf));
+        check::<ArmAnonymousDecode>(graph(0b11, &arm_leaf));
+    }
+}
+
 /// Exact-MM read of the live stage-1 graph behind the syscall policy.
 ///
 /// A raw integer is not an authenticated root register or a user range.
@@ -3263,7 +3457,10 @@ mod tests {
                 SYS_MMAP,
                 mmap_fixed(ARENA + 0x1000, 0x1000),
             );
-            assert_eq!(route, DelegatedAnonymous::Settle(SettlementNeed { _released: () }));
+            assert_eq!(
+                route,
+                DelegatedAnonymous::Settle(SettlementNeed { _released: () })
+            );
             let owed = {
                 let mut model = root(&spaces, &table, &task);
                 assert_eq!(
