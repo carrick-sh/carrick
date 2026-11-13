@@ -2679,6 +2679,31 @@ fn zone_epoll_pwait_blocks_until_child_pipe_write() {
 }
 
 #[test]
+fn zone_pipe_child_write_parent_read_moves_exact_byte() {
+    let elf = native_exit_fixture_with_flags("native_pipe_child_write.S", &["-DREAD_CHILD"]);
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| panic!("child write parent read: {}", failure.error));
+    assert_eq!(outcome.run.exit_code, 0, "child write/parent read stage");
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    assert_eq!(
+        counters.forwarded[63].load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(
+        counters.forwarded[64].load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+}
+
+#[test]
+fn zone_epoll_legacy_wait_blocks_until_child_pipe_write() {
+    assert_zone_epoll_pipe_wake(&["-DUSE_EPOLL", "-DUSE_LEGACY_EPOLL"]);
+}
+
+#[test]
 fn zone_epoll_pwait2_bad_timeout_returns_input_owner_fault() {
     assert_zone_epoll_pipe_wake(&["-DUSE_EPOLL", "-DEPOLL_INPUT_FAULT"]);
 }
@@ -3684,4 +3709,24 @@ fn serial_host_two_live_processes_keep_distinct_cwds() {
     bounded_witness("serial_host_two_live_processes_keep_distinct_cwds", || {
         cwd_run(&["-DCHILD", "-DCONCURRENT"])
     });
+}
+
+#[test]
+fn root_fcntl_redirect_restore_preserves_one_description_owner() {
+    let elf = native_exit_fixture("native_root_fcntl.S");
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| panic!("root fcntl: {}", failure.error));
+    assert_eq!(outcome.run.exit_code, 7, "root fcntl stage");
+    assert!(outcome.run.stdout.is_empty(), "redirect must reach pipe");
+}
+
+#[test]
+fn zone_pipe_readv_scatters_child_bytes_through_shared_owner() {
+    let elf = native_exit_fixture_with_flags(
+        "native_pipe_child_write.S",
+        &["-DREAD_CHILD", "-DREADV_CHILD"],
+    );
+    let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .unwrap_or_else(|failure| panic!("child write parent readv: {}", failure.error));
+    assert_eq!(outcome.run.exit_code, 0, "readv exact scatter stage");
 }

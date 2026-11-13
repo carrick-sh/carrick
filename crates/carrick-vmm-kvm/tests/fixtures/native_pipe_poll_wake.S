@@ -65,7 +65,14 @@ _start:
     mov $-1, %r10d                 /* epoll_pwait(ep, events, 1, -1, NULL, 8) */
     xor %r8d, %r8d
     mov $8, %r9d
+#ifdef USE_LEGACY_EPOLL
+    /* epoll_wait has four args: ignored registers must not become a mask. */
+    mov $1, %r8d
+    mov $0xdead, %r9d
+    mov $232, %eax
+#else
     mov $281, %eax
+#endif
 #elif defined(USE_POLL)
 #ifdef ZERO_TIMEOUT
     xor %edx, %edx                 /* poll(pfd, 1, 0) */
