@@ -9,6 +9,9 @@
 //! child's editor ([`settle_native_returns`]: the carrier's COW settlement
 //! hook, the native COW supply and the child retire) and on the
 //! `GRANT_OP_RETURN_SETTLE` doorbell ([`service_return_settlement`]).
+//! One exclusion settles at most one chunk
+//! ([`carrick_el1_abi::SETTLEMENT_CHUNK_PAGES`] owed pages, #1482); the
+//! doorbell lowers and re-raises it between chunks within its one crossing.
 //!
 //! The host-served root is not settled here: its host venue settles at its
 //! boundaries (`reconcile_el1_deferred_returns`), and its ring never rings.
@@ -22,7 +25,8 @@ use carrick_el1_abi::{
     OwedReturnRetirement, Refusal, ReturnJournal, ReturnSettlementRequest, SettlementDoorbellReply,
 };
 use carrick_hal::return_settlement::{
-    ReturnJournalAccess, doorbell_reply, settle_ring_owned_returns,
+    PauseSettlement, ReturnJournalAccess, pause_settlement, settle_in_bounded_pauses,
+    settle_ring_owned_returns,
 };
 use carrick_sched_core::spaces::notification::{
     ExclusionRefusal, SpaceAccess, SpaceReleaseVenue, SpaceWaitCause, SpaceWakeDelivery,
@@ -132,7 +136,7 @@ fn with_release<R>(
 pub(crate) fn settle_native_returns(
     custody: &crate::trap::CarrierVmCustody,
     excluded: &carrick_sched_core::ExcludedEditor<'_>,
-) -> Result<Option<SettlementDoorbellReply>, TrapError> {
+) -> Result<Option<PauseSettlement>, TrapError> {
     let Some(mm) = carrick_el1_abi::ReservationMm::new(excluded.key()) else {
         return Ok(None);
     };
@@ -177,7 +181,7 @@ pub(crate) fn settle_native_returns(
                 mm.raw()
             )));
         }
-        doorbell_reply(&outcome).map(Some).ok_or_else(|| {
+        pause_settlement(&outcome).map(Some).ok_or_else(|| {
             TrapError::Hypervisor(format!(
                 "native owed return of MM {} holds a live terminal: {outcome:?}",
                 mm.raw()
@@ -251,16 +255,23 @@ fn settle_at_doorbell(
     with_release(custody, zone, |release| {
         // A live ring editor of the MM: the ring observed `Editor` before it
         // rang, so it parks at that revision and reruns on the release. No
-        // exit spins on it.
-        match SpaceAccess::notified(release).try_exclude_editor(index, mm.raw()) {
-            Ok(exclusion) => {
-                let reply = settle_native_returns(custody, exclusion.proof())?;
-                drop(exclusion);
-                Ok(reply.unwrap_or(SettlementDoorbellReply::Stale))
+        // exit spins on it. Each chunk takes its own exclusion, lowered
+        // before the next is raised (#1482).
+        settle_in_bounded_pauses::<TrapError>(|| {
+            match SpaceAccess::notified(release).try_exclude_editor(index, mm.raw()) {
+                Ok(exclusion) => {
+                    let settled = settle_native_returns(custody, exclusion.proof())?;
+                    drop(exclusion);
+                    Ok(settled.unwrap_or(PauseSettlement::answer(SettlementDoorbellReply::Stale)))
+                }
+                Err(ExclusionRefusal::Busy) => {
+                    Ok(PauseSettlement::answer(SettlementDoorbellReply::Editor))
+                }
+                Err(ExclusionRefusal::Stale) => {
+                    Ok(PauseSettlement::answer(SettlementDoorbellReply::Stale))
+                }
             }
-            Err(ExclusionRefusal::Busy) => Ok(SettlementDoorbellReply::Editor),
-            Err(ExclusionRefusal::Stale) => Ok(SettlementDoorbellReply::Stale),
-        }
+        })
     })
     .unwrap_or(Ok(SettlementDoorbellReply::Stale))
 }

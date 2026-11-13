@@ -9,8 +9,11 @@
 //!
 //! The physical step: under the exclusion, observe each owed extent's retired
 //! terminals from the MM's exact root, then clear them and drop the carrier's
-//! alias edges for the span. Frames stay in their backing slots, admitted for
-//! the MM, and return with its retirement, as on HVF. Lock order: exclusion,
+//! alias edges for the span. One exclusion covers at most one chunk
+//! ([`carrick_el1_abi::SETTLEMENT_CHUNK_PAGES`] owed pages, #1482); the
+//! doorbell lowers and re-raises it between chunks. Frames stay in their
+//! backing slots, admitted for the MM, and return with its retirement, as on
+//! HVF. Lock order: exclusion,
 //! then the settlement lock, then the fork stock (read under the custody
 //! lock the caller holds), then the root guard, held only inside the journal
 //! steps.
@@ -21,7 +24,8 @@ use carrick_el1_abi::{
     ReturnSettlementRequest, SettlementDoorbellReply,
 };
 use carrick_hal::return_settlement::{
-    ReturnJournalAccess, doorbell_reply, settle_ring_owned_returns,
+    PauseSettlement, ReturnJournalAccess, pause_settlement, settle_in_bounded_pauses,
+    settle_ring_owned_returns,
 };
 use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
 use carrick_sched_core::spaces::notification::{ExclusionRefusal, SpaceWaitCause};
@@ -173,7 +177,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         &mut self,
         release: SpaceReleaseVenue<'a, carrick_sched_core::ParkedContextWords>,
         mm: carrick_el1_abi::ReservationMm,
-    ) -> Result<Result<(CowPause<'a>, SettlementDoorbellReply), ExclusionRefusal>, TrapError> {
+    ) -> Result<Result<(CowPause<'a>, PauseSettlement), ExclusionRefusal>, TrapError> {
         let pause = match exclude(SpaceAccess::notified(release), mm) {
             Ok(pause) => pause,
             Err(refusal) => return Ok(Err(refusal)),
@@ -199,22 +203,22 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         &mut self,
         release: SpaceReleaseVenue<'_, carrick_sched_core::ParkedContextWords>,
         excluded: &carrick_el1_abi::ExcludedEditor<'_>,
-    ) -> Result<SettlementDoorbellReply, TrapError> {
+    ) -> Result<PauseSettlement, TrapError> {
         let (Some(mm), Some(key)) = (
             carrick_el1_abi::ReservationMm::new(excluded.key()),
             NonZeroU64::new(excluded.key()),
         ) else {
-            return Ok(SettlementDoorbellReply::Stale);
+            return Ok(PauseSettlement::answer(SettlementDoorbellReply::Stale));
         };
         let ram = Arc::clone(&self.ram);
         let table = retained_reservations(&ram)?;
         let (Some(index), Some(context)) = (release.zone.spaces.find(mm.raw()), self._vm.root(key))
         else {
-            return Ok(SettlementDoorbellReply::Stale);
+            return Ok(PauseSettlement::answer(SettlementDoorbellReply::Stale));
         };
         if !table.admitted(index.index(), mm) {
             // No admitted root delegates this MM's memory: nothing is owed.
-            return Ok(SettlementDoorbellReply::Settled);
+            return Ok(PauseSettlement::answer(SettlementDoorbellReply::Settled));
         }
         self.return_settlement_counters.exclusions += 1;
         let guard = self.return_settlement.lock(excluded);
@@ -251,7 +255,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             }
             _ => {}
         }
-        doorbell_reply(&outcome).ok_or_else(|| match outcome {
+        pause_settlement(&outcome).ok_or_else(|| match outcome {
             Err(carrick_hal::return_settlement::ReturnSettlementError::Backend(error)) => {
                 fail(format!("owed return settlement: {error}"))
             }
@@ -363,16 +367,25 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         // A live ring editor of the MM: the ring observed `Editor` before it
         // rang, so it parks at that revision and reruns on the release. No
-        // exit spins on it.
-        let reply = match self.settled_pause(release, mm)? {
-            Ok((pause, reply)) => {
-                drop(pause);
-                reply
-            }
-            Err(ExclusionRefusal::Busy) => SettlementDoorbellReply::Editor,
-            Err(ExclusionRefusal::Stale) => SettlementDoorbellReply::Stale,
-        };
-        wake.finish()?;
+        // exit spins on it. Each chunk takes its own exclusion, lowered
+        // before the next is raised (#1482).
+        let reply = settle_in_bounded_pauses::<TrapError>(|| {
+            Ok(match self.settled_pause(release, mm)? {
+                Ok((pause, settled)) => {
+                    drop(pause);
+                    settled
+                }
+                Err(ExclusionRefusal::Busy) => {
+                    PauseSettlement::answer(SettlementDoorbellReply::Editor)
+                }
+                Err(ExclusionRefusal::Stale) => {
+                    PauseSettlement::answer(SettlementDoorbellReply::Stale)
+                }
+            })
+        });
+        let finished = wake.finish();
+        let reply = reply?;
+        finished?;
         Ok(reply)
     }
 
