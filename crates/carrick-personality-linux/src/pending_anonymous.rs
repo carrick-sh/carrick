@@ -8,6 +8,9 @@ pub enum DelegatedStep {
     Contended(SpaceWaitCause),
     Served(SyscallResult),
     Forward,
+    /// Only a settlement of the MM's owed returns lets the unchanged call
+    /// proceed (#1369 slice 3); no effect occurred.
+    Settle,
 }
 pub enum PermissionStep {
     Forward,
@@ -31,6 +34,12 @@ pub trait PendingAnonymousVenue {
         } else {
             None
         }
+    }
+    /// Drive the MM's owed-return settlement and park or rerun the call.
+    /// `None`: this venue has no settlement doorbell (a host-served MM,
+    /// whose host venue settles before serving), so the call forwards.
+    fn park_settlement(&mut self) -> Option<FamilyCompletion> {
+        None
     }
     fn permission(&mut self) -> PermissionStep;
     fn retirement(&mut self) -> RetirementStep;
@@ -60,6 +69,9 @@ pub fn serve(
             return FamilyCompletion::Complete(result.raw());
         }
         DelegatedStep::Forward => return FamilyCompletion::Forward,
+        DelegatedStep::Settle => {
+            return venue.park_settlement().unwrap_or(FamilyCompletion::Forward);
+        }
         DelegatedStep::NotDelegated => {}
     }
     match call {
