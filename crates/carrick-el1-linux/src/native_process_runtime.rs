@@ -2465,7 +2465,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     /// The caller holds the wait bucket. Signal senders release graph custody
     /// before acquiring that bucket; selection retains the canonical signal
     /// queue lock, so a sender cannot miss enrollment and this pending probe.
-    pub(crate) fn futex_signal_pending(&self, zone: &ZoneTables<C>, record: RecordRef) -> bool {
+    pub(crate) fn futex_interrupt_pending(&self, zone: &ZoneTables<C>, record: RecordRef) -> bool {
         let state = self.state.lock();
         let Some(member) = state
             .records
@@ -2474,6 +2474,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         else {
             return false;
         };
+        // Closing may race the interval after enrollment but before park
+        // publication. The member interrupt cannot claim that record yet;
+        // reject the park under the same bucket-held final check.
+        if member.control.host_exit_requested() {
+            return true;
+        }
         let graph = member.runtime.graph.lock();
         let Ok(row) = graph.owner.task(member.process) else {
             return false;
