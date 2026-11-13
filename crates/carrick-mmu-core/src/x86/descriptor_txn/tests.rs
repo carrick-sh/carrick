@@ -1090,6 +1090,29 @@ fn prepared_readonly_leaf_refuses_write_publication_without_a_store() {
         DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied),
     );
     assert_eq!(*words.words.borrow(), before);
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Publish {
+                span,
+                expected: FrameGpa::new(0x800000),
+                access: Access::Read,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let resident = |access| {
+        resident_satisfies_publication(
+            &words,
+            root(0x1000),
+            UserVa::new(span.va),
+            FrameGpa::new(0x800000),
+            access,
+        )
+    };
+    assert!(resident(Access::Read));
+    assert!(!resident(Access::Write));
 }
 /// A fork arms a not-yet-present writable leaf for COW. The child's first
 /// write publishes it resident and still COW-armed, so the retried store
@@ -1134,6 +1157,27 @@ fn fork_armed_prepared_leaf_publishes_for_write_and_stays_cow_armed() {
         .unwrap()
         .0;
     assert_eq!(leaf & (PRESENT | PREPARED | WRITE | COW), PRESENT | COW);
+    // A second CPU's racing write fault finds the leaf already resident:
+    // its publication is satisfied and its retry takes the COW copy.
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Publish {
+                span,
+                expected: FrameGpa::new(0x800000),
+                access: Access::Write,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared),
+    );
+    assert!(resident_satisfies_publication(
+        &words,
+        root(0x1000),
+        UserVa::new(span.va),
+        FrameGpa::new(0x800000),
+        Access::Write,
+    ));
     let walk = |access| translate(&words, root(0x1000), UserVa::new(span.va), access, true);
     assert_eq!(walk(Access::Read), Ok(FrameGpa::new(0x800000)));
     assert_eq!(walk(Access::Write), Err(FaultClass::CowWrite));
