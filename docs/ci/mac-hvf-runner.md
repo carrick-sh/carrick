@@ -283,6 +283,21 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
   `concurrency: { group: hvf-kernel-${{ github.event_name }}, cancel-in-progress: false }`, so a
   dispatch queues beside a scheduled run instead of displacing it. Per-merge HVF attribution comes
   from each merge group's own Signed queue gate.
+- **Scoreboard-only branch dispatch (#2251):** to score an unlanded branch, the owner dispatches
+  **on main** and names the branch:
+  `gh workflow run kernel-runtime.yml --repo carrick-sh/carrick --ref main -f scoreboard_branch=<branch> [-f scoreboard_sha=<sha>]`.
+  The workflow file, and the runner-group pin and `admit-job` checks above, still come from main.
+  A hosted `scoreboard-target` job resolves `refs/heads/<branch>` in this repository (never
+  `refs/pull/*`) to its exact SHA. `hvf-kernel` checks that SHA out without persisted
+  credentials, signs a build, verifies the entitlement and `__dof_carrick`, and runs the goal
+  scoreboard. It skips fixtures, receipts, embed tests, the Rust cache save, the #231 post and
+  every other lane. The run's `head_sha` is main's tip, so a `receipt-*` or `signed-fixtures-*`
+  artifact from it would be trusted as main's. Output: the job summary, a
+  `scoreboard-branch-<sha>-<attempt>` artifact with `provenance.json`, and a comment on the
+  branch's open same-repository PR. A `--ref <branch>` dispatch is still refused before any step.
+  Trust: unlanded owner code now runs as `carrick-hvf`. Root-owned runner files, hooks and
+  policy are out of its reach, but its writable state (CARGO_HOME, sccache, the 0444 relay
+  token) is not. Dispatch only branches you would push to main.
 - **Host-lease serialization (`/tmp/carrick-host-lease.lock`):**
   - `hvf-kernel` builds its checkout xtask under the **shared** `just lease carrick` (it no
     longer runs `just ci`; hosted CI covers it, #2057). Fixture restoration and `Signed embedded
