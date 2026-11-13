@@ -8,32 +8,91 @@ No retries, widened budgets or host-side descriptor/stack editor are permitted.
 
 ## Existing mechanisms
 
-ARM's root exec owner comes first: `HvpatchExecVenue` implements the shared
-`RootExecVenue` in `crates/carrick-runtime/src/vcpu_loop/exec.rs:1800`; the
-transaction driver is `crates/carrick-kernel/src/kernel/exec_transaction.rs:133`.
-The neutral native-child owner is `begin_exec_service` in
-`crates/carrick-el1-linux/src/native_process_runtime/service.rs:1188`.
+ARM's exec owners come first. The run root execs through the host:
+`HvpatchExecVenue` implements the shared `RootExecVenue`
+(`crates/carrick-runtime/src/vcpu_loop/exec.rs:1800`), driven by
+`drive_root_exec` (`crates/carrick-kernel/src/kernel/exec_transaction.rs:244`).
+A native fork child execs through the neutral ring owner:
+`begin_exec_service` (`crates/carrick-el1-linux/src/native_process_runtime/service.rs:1188`)
+proposes the successor, `complete_exec_prepared` (`:2872`) adopts it and
+`commit_exec_successor` (`:2503`) rebinds the record. The closed successor
+slot, adoption and cancellation are `crates/carrick-el1-linux/src/exec_successor.rs:152,241,287`.
+ARM's carrier answers the request in `NativeService::prepare_exec`
+(`crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs:334`) and the
+crossings in `service_native_exec_{adopt,cancel,settle}`
+(`crates/carrick-vmm-hvf/src/metadata_grant.rs:2064,2194,2235`). The shared
+fork stock moves a child to its successor and settles the predecessor
+(`crates/carrick-hal/src/fork_stock.rs` `replace_child_for_exec`,
+`settle_exec_predecessor`).
 
-The x86 loader already uses the shared exec parser and resolver:
-`prepare_native_x86_exec_image`, `crates/carrick-runtime/src/runtime/exec.rs:146`.
-`stage_native_exec`, `crates/carrick-x86-cpl0-host/src/cpl0_exec.rs:680`, reserves
-successor tables/data and imports the closed root. `ParkedX86Exec` retains the
-exact request and stock-release revision. `build_x86_successor`,
-`crates/carrick-x86-carrier/src/initial_boot.rs:391`, runs boot's existing editor
-in CPL0 over the reserved table order, without repeating boot's admission.
+x86 reuses all of these. Before this change it had the loader
+(`prepare_native_x86_exec_image`, `crates/carrick-runtime/src/runtime/exec.rs:146`),
+the stager (`stage_x86_exec`, `crates/carrick-x86-cpl0-host/src/cpl0_exec.rs`),
+the adopter (`X86ExecSuccessor`, `crates/carrick-x86-cpl0/src/exec_successor.rs`)
+and boot's editor as a successor build (`build_x86_successor`,
+`crates/carrick-x86-carrier/src/initial_boot.rs:391`). The exact-MM alias it
+now reads and writes through is the COW copy window
+(`crates/carrick-mmu-core/src/x86/copy_window.rs`), which boot already
+provisions in every root.
 
-Root rebinding is already implemented: `Cpl0RootBinding::replace_exec`,
-`crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs:120`, and
-`ProductionCpuLease::retarget_root_exec`,
-`crates/carrick-x86-cpl0-host/src/cpl0_boot.rs:1451`. Pending replacement is
-venue-typed in `crates/carrick-runtime/src/vcpu_loop/executor/binding.rs`.
-These mechanisms must be reused, not rebuilt from the older #2146 inventory.
+Root rebinding for the KVM executor is on main: `Cpl0RootBinding::replace_exec`
+and `retarget_loaded_task` (`crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs:120,1465`),
+`ProductionCpuLease::retarget_root_exec`
+(`crates/carrick-x86-cpl0-host/src/cpl0_boot.rs:1451`), the venue-typed
+`PendingExecReplacement::cpl0` (`crates/carrick-runtime/src/vcpu_loop/executor/binding.rs:400`)
+and `Cpl0TaskBindingDirectory::replace_exec` (`cpl0.rs:1901`). No x86
+`RootExecVenue` publishes it yet.
 
-The remaining production refusals are x86 `CompletionRoute::NativeService`
-settlement in `crates/carrick-x86-cpl0/src/linux_personality.rs`, the unmatched
-Exec request in `crates/carrick-x86-cpl0-host/src/cpl0_native_service.rs`, and
-`ServiceExecMachine`'s three Unsupported crossings in
-`crates/carrick-x86-cpl0/src/native_process.rs:222`.
+## The fork-child path (#2235, implemented)
+
+1. Ring entry: a claimed fork child's execve/execveat stages its payload
+   (`native_exec_stage_request`) and begins the shared service through
+   `begin_exec_call` (`service.rs:1245`), the inline-settling twin of the
+   host-file call (`native_exec_call`,
+   `crates/carrick-x86-cpl0/src/linux_personality.rs:745`). A staging fault
+   is supplied through the owner fault path and the syscall re-entered; a
+   refused supply is EFAULT. The ring census records the call as served once
+   the owner takes it. A root's exec keeps the counted ENOSYS
+   (`settle_unwired_native_service`, which no longer stages anything).
+2. Host Exec arm: `service_native_notice` authenticates the payload and the
+   ring's proposed manifest and hands them, with custody released, to the
+   runtime's loader (`load_native_x86_exec`). `finish_native_exec`
+   (`cpl0_exec.rs:1038`) returns a loader errno as the exec's errno, or
+   stages the successor and one build extent, seals the manifest with a
+   fresh receipt and the extent (`ExecSuccessorManifest::seal_with_build`)
+   and publishes it on the exact ticket. A ring that cancelled meanwhile gets
+   no manifest and the preparation is released. A stock refusal parks the
+   request with its ticket outstanding; every crossing that can return
+   tables probes woken parked requests once (`probe_parked_execs`).
+3. Build extent: one wire layout, `crates/carrick-el1/src/isa/x86/exec_build.rs`,
+   owned by neither side. The host encodes a header (boot's request record
+   with its own magic), the rows, strings, grants (tables first, the first
+   being the sealed root), a publication area and the initialized file
+   bytes, each region's on its own pages at its user page offset.
+4. Guest build: before the consuming crossing, `X86PrepareCross` runs
+   `ServiceExecBuild` (`crates/carrick-x86-cpl0/src/native_process.rs:272`):
+   `build_exec_successor` (`crates/carrick-x86-carrier/src/exec_build.rs:119`)
+   reads the extent and writes the unpublished frames one page at a time
+   through the predecessor's copy window (`with_copy_window_frames`), runs
+   boot's editor, checks the sealed root and stack pointer, and writes its
+   publications and results back. The host never writes a descriptor or the
+   stack.
+5. Crossings on `NATIVE_EXEC_PORT` (RDI names the operation, RAX the stack
+   record). Adopt (`adopt_prepared`, `cpl0_exec.rs:1301`) authenticates the
+   receipt, its sealed identity against the stopped predecessor, the
+   manifest and the build's results (`read_exec_build_results`: every byte
+   the host wrote unchanged), binds the closed space's root, replays every
+   publication into the carrier's descriptor model and commits the data
+   frames as boot does, releases the extent, and moves fork-stock custody
+   keeping the linked tables as the successor's
+   (`replace_child_for_exec_with_tables`). Cancel zeroes and returns the
+   reservation; the ring's slot retires the root. Settle runs from the
+   maintenance root (the carrier admits only this port and the work port
+   there): it moves the task's registered CR3 to the successor and releases
+   the predecessor like a reclaimed child, or defers that release to the
+   next quarantine drain.
+6. Resume: after the owner commits, the scheduler enters the record's new
+   context on the successor's root (`native_execution.rs`).
 
 ## Witnesses
 
@@ -62,9 +121,12 @@ Every caller gets an explicit host filesystem backend so the temporary ELF
 can actually resolve once exec transport is wired. The production CPL0 image
 and scheduler pool remain the entry point; no test helper performs replacement.
 
-These witnesses are deliberately red until the entire server is present.
-The crossing allowlist must flip in a separately labelled commit with its
-server and director review. No early errno-only flip is allowed.
+The two child witnesses and
+`native_fork_child_exec_refusals_return_their_errno_to_the_old_image`
+(ENOENT and ENOEXEC from the child's old image) are green with the child
+server. The three root witnesses stay red until root exec lands. The crossing
+allowlist must flip in a separately labelled commit with its server and
+director review. No early errno-only flip is allowed.
 
 ## Stack adoption
 
@@ -78,8 +140,8 @@ opaque stack, not a demand-zero anonymous stack. The VM-free characterization
 `exec_import_and_boot_insertion_preserve_the_same_opaque_stack` drives the
 production slot admission and adopter in both orders, checks the entry stack
 row remains opaque with identical range/protection/flags, then drops the
-rollback token and checks the space was retired. A live successor stack
-access witness still needs the completed physical transport.
+rollback token and checks the space was retired. The live-parent witness's
+successor now writes and reads its initial stack on the production carrier.
 
 ## Overlap
 
@@ -93,36 +155,25 @@ No production function from those diffs is changed by the witness commit.
 Signed ARM execution, native-arm64 Docker comparison, the x86 scoreboard A/B,
 and the full final-head gates remain required before accepting the exec fix.
 
-## Remaining build handoff design
+## Root exec (#2142): what remains
 
-The director confirmed that no existing transport is known and accepted a
-neutral typed retained build descriptor tied to the exact preparation,
-including a manifest extension if that is the cleanest handoff. This document
-records a proposed integration, not implemented production behavior.
+The root's exec is not the child's. The x86 run root is a ring-native
+process whose filesystem authority, descriptor table, credentials and
+`/proc/self/exe` identity the host Kernel retains (`host_root_retains_filesystem`,
+`encode_caller_access` refuses it ENOSYS). Its exec must therefore commit
+the host Kernel's exec transition (close-on-exec on the host table, the exe
+identity and binfmt argv, the `/proc` generation, the signal reset, the
+ptrace stop) and publish `PendingExecReplacement::cpl0` so the executor
+retargets its loaded root. That is `drive_root_exec`, whose typestate runs
+synchronously in one host call, while the x86 successor is built by the
+ring adopter between the arm and the consuming crossing. Two designs need a
+director ruling before code: an x86 `RootExecVenue` whose `install_image`
+drives a host-entered CPL0 build (boot's pattern, mid-forward), or the
+child's ring path for the root with the driver's neutral steps split across
+the Exec arm, adopt and settle crossings. Until then the root keeps its
+counted ENOSYS and `Execve`/`Execveat` stay `x86 = false` (no early flip).
 
-The descriptor must retain immutable image/string records, ordered table and
-data grants, and publication storage under the same service identity, receipt,
-successor MM and root generation as the sealed manifest. The first table is
-the sealed root and the editor's final stack pointer must equal the sealed RSP.
-The host stages bytes and custody; the guest runs the existing image editor.
-No host descriptor or stack writes are allowed.
-
-The existing exact-MM alias mechanism is
-`carrick-mmu-core/src/x86/copy_window.rs::with_cow_copy_aliases`: it maps a
-retained source/destination pair, invokes the copy, restores both leaves and
-drains them. `initial_mm.rs::install_initial_image` already provisions a
-private copy branch for each new root. These are the mechanisms to investigate
-for the guest build's staged-byte reads and data writes, rather than inventing
-a global physical-memory alias. Currently `InitialWords` authenticates table
-access and the boot source's direct aliases cover only the initial extent;
-`CarrierExecData` uses dynamic GPAs outside those aliases. The build transport
-must close that gap with exact preparation custody and a guest-owned editor.
-
-Any temporary closed-root load must preserve supervisor entry/stack mappings,
-keep interrupts and live-context authentication coherent, restore the caller
-before a physical crossing, and drain on cleanup. Indeterminate descriptor
-cleanup quarantines the preparation. Adoption transfers tables, inventory and
-executable backing once; cancellation releases only never-published resources;
-settlement retires the predecessor after translation switch. A stock refusal
-retains its per-ticket operation and enrolled release revision, then probes
-once after the holder's settlement. No polling or errno conversion is allowed.
+#1903: a native child's `/proc/self/exe` is not served on x86 at all today;
+#2084 owns that readlink. The successor's image is loaded by the shared
+resolver, so #2084's executable object is where the identity belongs; this
+change adds no path snapshot.

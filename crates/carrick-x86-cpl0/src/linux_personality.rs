@@ -1554,8 +1554,8 @@ impl Personality for LinuxPersonality {
             // Entropy has been staged above. Any other unwired native service
             // fails closed with a counted refusal.
             CompletionRoute::NativeService => {
-                // A fork child's exec stages (no x86 successor hooks until
-                // #1093 S3/S4); everything else is the counted refusal.
+                // A fork child's exec was handed to the native exec service
+                // above; everything else is the counted refusal.
                 frame.rax = carrick_el1_linux::dispatch::settle_unwired_native_service(
                     native_process::registry(),
                     source.zone,
@@ -1564,14 +1564,9 @@ impl Personality for LinuxPersonality {
                         .slot(slot)
                         .current()
                         .map(|r| source.zone.record_ref(r)),
-                    call.canonical.raw(),
-                    call.args,
                     carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
-                    task,
-                    &carrick_el1_linux::file::HardwareValidator,
                     counters,
-                )
-                .retval() as u64;
+                ) as u64;
                 ControlFlow::Return(())
             }
             CompletionRoute::Forward | CompletionRoute::HostCustody => {
