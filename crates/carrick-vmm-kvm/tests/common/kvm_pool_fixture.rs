@@ -30,11 +30,25 @@ pub fn try_run_instrumented_pool_fixture(
     carrick_runtime::prepare::PreparedKvmPoolOutcome,
     carrick_runtime::prepare::PreparedKvmPoolFailure,
 > {
+    try_run_instrumented_pool_fixture_with_root_affinity(elf, max_exits, ROOT_AFFINITY_ANY)
+}
+
+/// As [`try_run_instrumented_pool_fixture`], with the root (and so every
+/// member it forks or clones) placed by `affinity`.
+#[allow(dead_code)]
+pub fn try_run_instrumented_pool_fixture_with_root_affinity(
+    elf: &[u8],
+    max_exits: usize,
+    affinity: u64,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_runtime::prepare::PreparedKvmPoolFailure,
+> {
     let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
     try_run_program_with_dispatcher_image(
         &program,
         max_exits,
-        ROOT_AFFINITY_ANY,
+        affinity,
         |_| {},
         carrick_kernel::dispatch::SyscallDispatcher::default(),
         Some(include_bytes!(env!("CARRICK_X86_CPL0_TEST_IMAGE"))),

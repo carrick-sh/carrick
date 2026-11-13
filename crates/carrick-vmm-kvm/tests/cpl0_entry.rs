@@ -1203,6 +1203,113 @@ fn production_user_fault_editor_busy_once_parks_and_reruns() {
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
 
+/// The root and every member it forks or clones may run only on CPU 0.
+const ROOT_AFFINITY_CPU0: u64 = 1;
+
+/// #2141 review: an owner fault that meets MM contention after its physical
+/// supply crossing returned, before the guest applied the supplied grant.
+/// `native_post_supply_busy.S` documents each variant; every one exits 7.
+/// Bounded in a child test process: a lost wake must fail, never hang CI.
+fn post_supply_busy_witness(test: &str, flag: &str, affinity: u64) {
+    const CHILD: &str = "CARRICK_POST_SUPPLY_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "60"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
+            .output()
+            .expect("bounded post-supply witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture("native_post_supply_busy.S", &[flag]);
+    let outcome =
+        kvm_pool_fixture::try_run_instrumented_pool_fixture_with_root_affinity(&elf, 128, affinity)
+            .map_err(|failure| failure.to_string())
+            .expect("a post-supply Busy was a carrier fault");
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "exit 92 is a clobbered RAX canary, 93 a Busy that missed its supply, \
+         100 + n a child's exit n: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// P0 1: the root's COW write is Busy after its COW supply, on two vCPUs
+/// with a second live member (its fork child, which takes its own COW
+/// grant). The parked write reruns, wherever it is rescheduled, and keeps
+/// RAX and its byte.
+#[test]
+fn production_cow_busy_after_supply_parks_and_reruns() {
+    post_supply_busy_witness(
+        "production_cow_busy_after_supply_parks_and_reruns",
+        "-DPOST_SUPPLY_COW",
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+    );
+}
+
+/// P0 1: as above with every member on CPU 0, so the fork child runs on the
+/// parked root's CPU and needs its own COW grant there while the root's
+/// supplied grant is unapplied. A grant held by the CPU, not by its fault,
+/// refuses the child (`owner grant stale execution/root`).
+#[test]
+fn production_cow_parked_after_supply_frees_its_cpu_for_another_grant() {
+    post_supply_busy_witness(
+        "production_cow_parked_after_supply_frees_its_cpu_for_another_grant",
+        "-DPOST_SUPPLY_COW",
+        ROOT_AFFINITY_CPU0,
+    );
+}
+
+/// P0 1: a fork child's worker thread parks after its COW supply and the
+/// child's main thread calls `exit_group` with that worker parked. The root
+/// then needs a COW grant on the same CPU. Ignored: on x86 CPL0 a fork
+/// child's `exit_group` with any second live member (a runnable yielder, or
+/// one blocked in `futex`, on main too) never completes cleanly (#418 class).
+#[test]
+#[ignore = "x86 CPL0 exit_group with a second live member fails on main (followup-4)"]
+fn production_cow_parked_after_supply_survives_exit_group() {
+    post_supply_busy_witness(
+        "production_cow_parked_after_supply_survives_exit_group",
+        "-DPOST_SUPPLY_EXIT_GROUP",
+        ROOT_AFFINITY_CPU0,
+    );
+}
+
+/// P0 1: as above, but the main thread raw-exits (a non-last exit) while the
+/// worker is parked; the worker reruns its store and ends the child.
+#[test]
+fn production_cow_parked_after_supply_survives_a_non_last_raw_exit() {
+    post_supply_busy_witness(
+        "production_cow_parked_after_supply_survives_a_non_last_raw_exit",
+        "-DPOST_SUPPLY_RAW_EXIT",
+        ROOT_AFFINITY_CPU0,
+    );
+}
+
+/// P0 2: the root's first touch of fresh anonymous memory is Busy after its
+/// Prepare supply, on two vCPUs with a second live member touching its own
+/// copy. The access waits and reruns; it is never carrier reason 9.
+#[test]
+fn production_prepare_busy_after_supply_parks_and_reruns() {
+    post_supply_busy_witness(
+        "production_prepare_busy_after_supply_parks_and_reruns",
+        "-DPOST_SUPPLY_PREPARE",
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+    );
+}
+
 /// A real munmap reaches the shared editor admission, parks on one injected
 /// owner, and replays without falling out to the host or refusal accounting.
 #[test]
