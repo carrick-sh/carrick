@@ -1239,6 +1239,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceCompletion::Inline,
         )
     }
+    /// Begin a staged exec through the same owner on every ISA, for an entry
+    /// whose service settles inline (x86): the copyout drain and handoff
+    /// receipt are this call's, as for [`Self::begin_host_file_call`].
+    pub fn begin_exec_call(
+        &mut self,
+        payload: Box<[u8]>,
+        table: Option<[u64; 3]>,
+        call: NativeServiceCall<'_>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let result = self.begin_exec_service(payload, table, call);
+        let result = self.drain_copyout(result);
+        self.finish_service_handoff(result)
+    }
     /// Keep a carrier-retained private-mapping source for this record:
     /// `key` names the exact `mmap` retry that consumes it.
     fn stash_map_source(

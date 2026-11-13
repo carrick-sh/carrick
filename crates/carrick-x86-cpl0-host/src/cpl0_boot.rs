@@ -1685,9 +1685,12 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         exit: &CarrierRunExit,
         on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
-        self.service_idle_peer_doorbell_with_host_file(exit, on_work, &mut |_, _| {
-            Err(carrick_hal::fork_stock::NativeHostFileRefused)
-        })
+        self.service_idle_peer_doorbell_with_host_file(
+            exit,
+            on_work,
+            &mut |_, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+            &mut refuse_native_exec,
+        )
     }
 
     pub fn service_idle_peer_doorbell_with_host_file(
@@ -1695,6 +1698,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         exit: &CarrierRunExit,
         on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
         host_file: &mut NativeHostFileService<'_>,
+        exec: &mut NativeExecLoadService<'_>,
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("idle peer service requires physical doorbell"));
@@ -1717,6 +1721,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let native_entropy = self.native_entropy;
         let mut work_flags = None;
         let mut pending_file = None;
+        let mut pending_exec = None;
+        let mut exec_rebind = None;
         let (exit, register_child, unregister_child) = self.cpu.with_idle_peer_io(|io| {
             let lease = StoppedCpuLease {
                 cpu: carrick_guest_arch::CpuId::new(1),
@@ -1737,7 +1743,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     let child_binding = custody.service_fork_stock(&lease)?;
+                    custody.probe_parked_execs(lease.cpu)?;
                     Ok((None, child_binding, None))
+                }
+                carrick_el1_abi::NATIVE_EXEC_PORT => {
+                    if let exec_service::NativeExecCrossing::Settled { successor, predecessor } =
+                        custody.service_native_exec(&lease)?
+                    {
+                        exec_rebind = Some((successor, predecessor));
+                    }
+                    Ok((None, None, None))
                 }
                 carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => {
                     custody.child_retire_crossings = custody
@@ -1768,10 +1783,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         .map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
                 }
                 NATIVE_SERVICE_PORT => {
-                    if let anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) =
-                        custody.service_native_notice(&lease, file, native_entropy)?
-                    {
-                        pending_file = Some(pending);
+                    match custody.service_native_notice(&lease, file, native_entropy)? {
+                        anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) => {
+                            pending_file = Some(pending);
+                        }
+                        anonymous_owner::native_service::NativeNoticeStep::Exec(pending) => {
+                            pending_exec = Some(pending);
+                        }
+                        anonymous_owner::native_service::NativeNoticeStep::Settled => {}
                     }
                     Ok((None, None, None))
                 }
@@ -1796,10 +1815,30 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             self.cpu.unregister_child_binding(live_root)?;
             retire_result?;
         }
+        if let Some((successor, predecessor)) = exec_rebind {
+            self.cpu.register_child_binding(successor)?;
+            if let Some(root) = predecessor {
+                self.cpu.unregister_child_binding(root)?;
+            }
+        }
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
+        if let Some(pending) = pending_exec {
+            let loaded = exec(&pending.payload);
+            let mut custody = self
+                ._custody
+                .lock()
+                .map_err(|_| fail("physical custody poisoned"))?;
+            self.cpu.with_idle_peer_io(|io| {
+                let lease = StoppedCpuLease {
+                    cpu: carrick_guest_arch::CpuId::new(1),
+                    io,
+                };
+                custody.finish_native_exec(&lease, pending, loaded)
+            })?;
+        }
         if let Some(mut pending) = pending_file {
             let served = host_file(
                 pending.ticket.request().identity.birth.origin,
@@ -2047,9 +2086,13 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         exit: &CarrierRunExit,
         on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
-        self.service_physical_doorbell_with_host_file(task, exit, on_work, &mut |_, _| {
-            Err(carrick_hal::fork_stock::NativeHostFileRefused)
-        })
+        self.service_physical_doorbell_with_host_file(
+            task,
+            exit,
+            on_work,
+            &mut |_, _| Err(carrick_hal::fork_stock::NativeHostFileRefused),
+            &mut refuse_native_exec,
+        )
     }
 
     pub fn service_physical_doorbell_with_host_file(
@@ -2058,6 +2101,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         exit: &CarrierRunExit,
         on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
         host_file: &mut NativeHostFileService<'_>,
+        exec: &mut NativeExecLoadService<'_>,
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("physical service requires a doorbell exit"));
@@ -2084,6 +2128,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let native_entropy = self.native_entropy;
         let mut work_flags = None;
         let mut pending_file = None;
+        let mut pending_exec = None;
+        let mut exec_rebind = None;
         let (exit, register_child, unregister_child) = self.cpu.with_stopped_io(task, |io| {
             let lease = StoppedCpuLease { cpu: slot, io };
             match production_port(*port) {
@@ -2101,7 +2147,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     let child_binding = custody.service_fork_stock(&lease)?;
+                    custody.probe_parked_execs(lease.cpu)?;
                     Ok((None, child_binding, None))
+                }
+                Some(ProductionPort::NativeExec) => {
+                    if let exec_service::NativeExecCrossing::Settled { successor, predecessor } =
+                        custody.service_native_exec(&lease)?
+                    {
+                        exec_rebind = Some((successor, predecessor));
+                    }
+                    Ok((None, None, None))
                 }
                 Some(ProductionPort::ChildRetire) => {
                     custody.child_retire_crossings = custody
@@ -2129,9 +2184,14 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                     custody.service_root_exit(&lease).map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
                 }
                 Some(ProductionPort::NativeService) => {
-                    if let anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) =
-                        custody.service_native_notice(&lease, file, native_entropy)? {
-                        pending_file = Some(pending);
+                    match custody.service_native_notice(&lease, file, native_entropy)? {
+                        anonymous_owner::native_service::NativeNoticeStep::HostFile(pending) => {
+                            pending_file = Some(pending);
+                        }
+                        anonymous_owner::native_service::NativeNoticeStep::Exec(pending) => {
+                            pending_exec = Some(pending);
+                        }
+                        anonymous_owner::native_service::NativeNoticeStep::Settled => {}
                     }
                     Ok((None, None, None))
                 }
@@ -2159,10 +2219,27 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             self.cpu.unregister_child_binding(live_root)?;
             retire_result?;
         }
+        if let Some((successor, predecessor)) = exec_rebind {
+            self.cpu.register_child_binding(successor)?;
+            if let Some(root) = predecessor {
+                self.cpu.unregister_child_binding(root)?;
+            }
+        }
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
+        if let Some(pending) = pending_exec {
+            let loaded = exec(&pending.payload);
+            let mut custody = self
+                ._custody
+                .lock()
+                .map_err(|_| fail("physical custody poisoned"))?;
+            self.cpu.with_stopped_io(task, |io| {
+                let lease = StoppedCpuLease { cpu: slot, io };
+                custody.finish_native_exec(&lease, pending, loaded)
+            })?;
+        }
         if let Some(mut pending) = pending_file {
             let served = host_file(
                 pending.ticket.request().identity.birth.origin,
@@ -2184,6 +2261,18 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     }
 }
 
+/// The carrier's exec loader for a fork child's staged payload (#2235),
+/// invoked with physical custody and CPU-I/O borrows released: the shared
+/// request parse, resolver and x86 image checks, or the exec's errno.
+pub type NativeExecLoadService<'a> =
+    dyn FnMut(&[u8]) -> Result<exec_service::X86ExecImage, carrick_abi::LinuxErrno> + 'a;
+
+/// A carrier with no exec capability leaves the exec unrouted: the
+/// carrier's counted ENOSYS.
+fn refuse_native_exec(_: &[u8]) -> Result<exec_service::X86ExecImage, carrick_abi::LinuxErrno> {
+    Err(carrick_abi::LINUX_ENOSYS)
+}
+
 /// Host-file handler invoked with physical custody and CPU-I/O borrows released.
 pub type NativeHostFileService<'a> = dyn FnMut(
         carrick_core_abi::service::ServiceOrigin,
@@ -2196,6 +2285,7 @@ pub type NativeHostFileService<'a> = dyn FnMut(
 enum ProductionPort {
     OwnerGrant,
     ForkStock,
+    NativeExec,
     ChildRetire,
     RunFailure,
     RootExit,
@@ -2207,6 +2297,7 @@ fn production_port(port: u16) -> Option<ProductionPort> {
     match port {
         OWNER_GRANT_PORT => Some(ProductionPort::OwnerGrant),
         carrick_el1_abi::FORK_STOCK_PORT => Some(ProductionPort::ForkStock),
+        carrick_el1_abi::NATIVE_EXEC_PORT => Some(ProductionPort::NativeExec),
         carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => Some(ProductionPort::ChildRetire),
         carrick_core_abi::NATIVE_RUN_FAILURE_PORT => Some(ProductionPort::RunFailure),
         carrick_core_abi::NATIVE_ROOT_EXIT_PORT => Some(ProductionPort::RootExit),
@@ -3044,6 +3135,12 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     anonymous_next_gpa: FrameGpa,
     /// Exec successors reserved before their arm (#1093 S4c slice c).
     exec_preparations: exec_service::X86ExecPreparations<exec_service::CarrierExecData>,
+    /// Exec requests parked on the fork stock's release, tickets outstanding.
+    parked_execs: Vec<exec_service::ParkedNativeExec>,
+    /// The last exec adoption receipt this carrier issued.
+    exec_receipts: u64,
+    /// Adopted execs whose predecessor custody awaits its settlement.
+    exec_predecessors: Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<()>>,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     native_backing_pending:
         std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
@@ -4457,6 +4554,9 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             maintenance_root: None,
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
             exec_preparations: exec_service::X86ExecPreparations::default(),
+            parked_execs: Vec::new(),
+            exec_receipts: 0,
+            exec_predecessors: Vec::new(),
             anonymous_pending: [None, None],
             native_backing_pending: std::collections::BTreeMap::new(),
             owner_grant_crossings: 0,

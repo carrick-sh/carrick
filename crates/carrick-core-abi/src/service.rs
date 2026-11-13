@@ -1039,6 +1039,8 @@ pub struct ExecSuccessorManifest {
     entry: u64,
     stack_pointer: u64,
     receipt: u64,
+    build_source: u64,
+    build_pages: u64,
     digest: u64,
 }
 
@@ -1051,6 +1053,39 @@ pub struct ExecSuccessorManifestView {
     pub asid_generation: NonZeroU64,
     pub entry: carrick_guest_arch::UserVa,
     pub stack_pointer: carrick_guest_arch::UserVa,
+    /// Where the successor's build reads its staged inputs, when the
+    /// adopter builds the successor's tables itself (x86). `None` when the
+    /// carrier built them before sealing (AArch64).
+    pub build: Option<ExecBuildSource>,
+}
+
+/// The carrier-retained, page-aligned staging extent an exec successor's
+/// in-guest build reads (its image records, strings, frame grants and
+/// initialized file bytes) and writes its descriptor publications back to.
+/// It is tied to the exact preparation the manifest seals: the same service
+/// identity, receipt, successor MM and root generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecBuildSource {
+    pub base: carrick_guest_arch::FrameGpa,
+    pub pages: core::num::NonZeroU32,
+}
+
+impl ExecBuildSource {
+    pub fn checked(base: carrick_guest_arch::FrameGpa, pages: u32) -> Option<Self> {
+        let pages = core::num::NonZeroU32::new(pages)?;
+        (base.raw() != 0
+            && base.raw().is_multiple_of(4096)
+            && base
+                .raw()
+                .checked_add(u64::from(pages.get()) * 4096)
+                .is_some())
+        .then_some(Self { base, pages })
+    }
+
+    /// One past the extent's last byte.
+    pub fn end(self) -> u64 {
+        self.base.raw() + u64::from(self.pages.get()) * 4096
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1085,7 +1120,7 @@ impl ServiceIdentity {
 }
 
 impl ExecSuccessorManifest {
-    fn words(&self) -> [u64; 21] {
+    fn words(&self) -> [u64; 23] {
         [
             self.revision,
             self.phase,
@@ -1107,6 +1142,8 @@ impl ExecSuccessorManifest {
             self.entry,
             self.stack_pointer,
             self.receipt,
+            self.build_source,
+            self.build_pages,
             0,
         ]
     }
@@ -1132,6 +1169,8 @@ impl ExecSuccessorManifest {
             entry: 0,
             stack_pointer: 0,
             receipt: 0,
+            build_source: 0,
+            build_pages: 0,
             digest: 0,
         };
         manifest.digest = crate::integrity_digest(&manifest.words());
@@ -1149,6 +1188,8 @@ impl ExecSuccessorManifest {
             && self.entry == 0
             && self.stack_pointer == 0
             && self.receipt == 0
+            && self.build_source == 0
+            && self.build_pages == 0
             && self.has_valid_digest())
         .then(|| {
             Some((
@@ -1159,13 +1200,30 @@ impl ExecSuccessorManifest {
     }
 
     pub fn seal(
-        mut self,
+        self,
         identity: ServiceIdentity,
         receipt: ExecAdoptionReceipt,
         backing: ExecSuccessorBacking,
         image: ExecSuccessorEntry,
     ) -> Option<Self> {
+        self.seal_with_build(identity, receipt, backing, image, None)
+    }
+
+    /// Seal a successor whose adopter builds its tables from `build`, the
+    /// staging extent the carrier retains for this exact preparation.
+    pub fn seal_with_build(
+        mut self,
+        identity: ServiceIdentity,
+        receipt: ExecAdoptionReceipt,
+        backing: ExecSuccessorBacking,
+        image: ExecSuccessorEntry,
+        build: Option<ExecBuildSource>,
+    ) -> Option<Self> {
         self.proposal(identity)?;
+        if let Some(build) = build {
+            self.build_source = build.base.raw();
+            self.build_pages = u64::from(build.pages.get());
+        }
         self.phase = EXEC_SUCCESSOR_SEALED;
         self.root = backing.root.address().raw();
         self.asid = u64::from(backing.asid.raw());
@@ -1202,6 +1260,13 @@ impl ExecSuccessorManifest {
             asid_generation: NonZeroU64::new(self.asid_generation)?,
             entry: carrick_guest_arch::UserVa::new(self.entry),
             stack_pointer: carrick_guest_arch::UserVa::new(self.stack_pointer),
+            build: match (self.build_source, self.build_pages) {
+                (0, 0) => None,
+                (base, pages) => Some(ExecBuildSource::checked(
+                    carrick_guest_arch::FrameGpa::new(base),
+                    u32::try_from(pages).ok()?,
+                )?),
+            },
         })
     }
 }
@@ -2551,6 +2616,7 @@ mod tests {
                 asid_generation,
                 entry,
                 stack_pointer,
+                build: None,
             })
         );
         let mut stale = identity;
@@ -2562,6 +2628,42 @@ mod tests {
         let mut torn = sealed;
         torn.root_generation = 67;
         assert_eq!(torn.open(identity, receipt), None);
+
+        // #2235: an adopter that builds the successor's tables itself is
+        // sealed the exact staging extent, inside the digest.
+        let build =
+            ExecBuildSource::checked(carrick_guest_arch::FrameGpa::new(0x40_0000), 3).unwrap();
+        let built = proposal
+            .seal_with_build(
+                identity,
+                receipt,
+                ExecSuccessorBacking {
+                    root,
+                    asid,
+                    asid_generation,
+                },
+                ExecSuccessorEntry {
+                    entry,
+                    stack_pointer,
+                },
+                Some(build),
+            )
+            .unwrap();
+        assert_eq!(built.open(identity, receipt).unwrap().build, Some(build));
+        let mut moved = built;
+        moved.build_source += 4096;
+        assert_eq!(moved.open(identity, receipt), None);
+        assert_eq!(
+            proposal.proposal(identity),
+            Some((successor, root_generation))
+        );
+        assert_eq!(built.proposal(identity), None);
+        assert!(
+            ExecBuildSource::checked(carrick_guest_arch::FrameGpa::new(0x40_0001), 3).is_none()
+        );
+        assert!(
+            ExecBuildSource::checked(carrick_guest_arch::FrameGpa::new(0x40_0000), 0).is_none()
+        );
     }
 
     #[test]

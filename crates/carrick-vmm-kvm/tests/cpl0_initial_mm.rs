@@ -667,7 +667,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     let stock = carrier.fork_table_stock();
     assert!(stock >= demand.tables, "boot left the stock {stock} tables");
 
-    let X86ExecStage::Staged(backing, entry) = carrier
+    let X86ExecStage::Staged(backing, entry, _) = carrier
         .stage_exec_successor(0, request(), StockReleaseWake::new(|| {}))
         .expect("service")
     else {
@@ -1003,7 +1003,8 @@ fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
                         .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
                     marker = true;
                     Ok(served.retained_source)
-                }
+                },
+                &mut |_| Err(carrick_abi::LINUX_ENOSYS),
             )
             .expect("thread birth service")
             .is_none()
@@ -1736,6 +1737,7 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
                     served_marker = true;
                     Ok(served.retained_source)
                 },
+                &mut |_| Err(carrick_abi::LINUX_ENOSYS),
             )
             .expect("peer authenticated host-file completion")
             .is_none()
