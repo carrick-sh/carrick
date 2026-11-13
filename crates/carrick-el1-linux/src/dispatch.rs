@@ -3942,7 +3942,38 @@ impl<
                 ))
             }
             memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
+            memory::DelegatedAnonymous::Settle(_) => DelegatedStep::Settle,
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    fn park_settlement(&mut self) -> Option<FamilyCompletion> {
+        // Only a ring-owned fork child rings the doorbell. The host-served
+        // root forwards: its host venue settles before serving (unchanged).
+        if self
+            .process
+            .as_deref()
+            .is_none_or(|process| process.is_root_process())
+        {
+            return None;
+        }
+        let slot = self.frame.slot()?;
+        let task = self.current_tasks.get(self.frame.task_index())?;
+        let zone = self.zone.as_mut()?;
+        let served = {
+            let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
+            super::mm_portal::park_settling_anonymous_edit(
+                &mut sched,
+                self.frame.arm_frame()?,
+                memory::reservations::shared_guest(),
+                &carrick_el1::isa::aarch64::cross_hvc_return_settlement,
+            )?
+        };
+        Some(
+            carrick_personality_linux::dispatch::accounted_scheduler_effect(
+                served,
+                self.frame.result().0 as i64,
+            ),
+        )
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> {
         let slot = self.frame.slot()?;
