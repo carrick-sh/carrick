@@ -32,6 +32,14 @@
 //! already succeeded as no-ops. A journal that no longer names the MM is
 //! [`SettlementOutcome::Stale`]: no effect, and nothing is quarantined.
 //!
+//! COW first (#1482 P0-3): a sibling may retire a leaf that names a COW
+//! replacement frame whose completion is still outstanding. Clearing that
+//! retired leaf and its alias before the completion is published leaves the
+//! publication no live descriptor, so every exclusion obtained for
+//! settlement runs [`settle_cow_then_returns`]: the venue's COW completions,
+//! then its owed returns. A ring-owned settlement takes the [`CowSettled`]
+//! proof only that sequence mints.
+//!
 //! Lock order: the MM's EL1 editor exclusion, then its [`SettlementLock`],
 //! then the fork-stock lock, then the root guard. The root guard is held only
 //! inside the journal steps, never across backend service.
@@ -165,8 +173,70 @@ pub fn settle_owed_returns<J: ReturnJournalAccess, B: OwedReturnRetirement>(
         .map_err(ReturnSettlementError::Journal)
 }
 
+/// Proof that the excluded MM's outstanding COW completions were settled
+/// under the current exclusion (#1482 P0-3). Only [`settle_cow_then_returns`]
+/// mints one, after its venue's COW step succeeded, so no ring-owned owed
+/// return is settled ahead of a completion that may name its leaf.
+#[must_use]
+#[derive(Debug)]
+pub struct CowSettled<'a> {
+    mm: u64,
+    _exclusion: core::marker::PhantomData<&'a ()>,
+}
+
+impl CowSettled<'_> {
+    /// The MM whose COW completions were settled.
+    pub fn mm(&self) -> u64 {
+        self.mm
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(excluded: &carrick_sched_core::ExcludedEditor<'_>) -> Self {
+        Self {
+            mm: excluded.key(),
+            _exclusion: core::marker::PhantomData,
+        }
+    }
+}
+
+/// A venue's two settlements under one exclusion of an MM's editor.
+pub trait ExclusionSettlement {
+    type Error;
+    /// What the venue's owed-return step answered.
+    type Returns;
+    /// Settle every outstanding COW completion of the excluded MM: a retired
+    /// leaf may name a replacement frame whose completion is not yet
+    /// published. A completion the guest has not finished stays outstanding.
+    fn settle_cow_completions(
+        &mut self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+    ) -> Result<(), Self::Error>;
+    /// Settle the excluded MM's owed returns, after its COW completions.
+    fn settle_owed_returns(
+        &mut self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        cow: &CowSettled<'_>,
+    ) -> Result<Self::Returns, Self::Error>;
+}
+
+/// The one sequence every exclusion obtained for settlement runs, on every
+/// venue (#1482 P0-3): the excluded MM's outstanding COW completions, then
+/// its owed returns. A failed COW step settles no return.
+pub fn settle_cow_then_returns<V: ExclusionSettlement>(
+    venue: &mut V,
+    excluded: &carrick_sched_core::ExcludedEditor<'_>,
+) -> Result<V::Returns, V::Error> {
+    venue.settle_cow_completions(excluded)?;
+    let cow = CowSettled {
+        mm: excluded.key(),
+        _exclusion: core::marker::PhantomData,
+    };
+    venue.settle_owed_returns(excluded, &cow)
+}
+
 /// The settlement every exclusion of a ring-owned MM runs (#1369 slice 3),
-/// under that exclusion and the MM's settlement lock: at most one
+/// under that exclusion and the MM's settlement lock, after its COW
+/// completions ([`CowSettled`]): at most one
 /// [`SettlementBound::Chunk`] (#1482), so no exclusion walks more than
 /// [`carrick_core_abi::SETTLEMENT_CHUNK_PAGES`] owed pages. A fork loan
 /// naming the MM (`loan_pending`, read under the fork-stock lock, which
@@ -175,12 +245,13 @@ pub fn settle_owed_returns<J: ReturnJournalAccess, B: OwedReturnRetirement>(
 /// [`settle_owed_returns`].
 pub fn settle_ring_owned_returns<J: ReturnJournalAccess, B: OwedReturnRetirement>(
     excluded: &carrick_sched_core::ExcludedEditor<'_>,
+    cow: &CowSettled<'_>,
     guard: &SettlementGuard<'_>,
     loan_pending: bool,
     journal: &J,
     backend: &mut B,
 ) -> Result<SettlementOutcome<ReturnSettlementReceipt>, ReturnSettlementError<J::Error, B::Error>> {
-    if guard.mm() != excluded.key() {
+    if guard.mm() != excluded.key() || cow.mm() != excluded.key() {
         return Ok(SettlementOutcome::Stale);
     }
     if loan_pending {

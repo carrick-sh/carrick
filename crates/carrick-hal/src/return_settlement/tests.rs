@@ -320,7 +320,14 @@ fn a_pending_fork_loan_skips_ring_owned_settlement_until_it_settles() {
     let mut backend = Backend::default();
     let excluded = spaces.unpublished(MM).unwrap();
     let guard = lock.lock(&excluded);
-    let skipped = settle_ring_owned_returns(&excluded, &guard, true, &journal, &mut backend);
+    let skipped = settle_ring_owned_returns(
+        &excluded,
+        &CowSettled::for_test(&excluded),
+        &guard,
+        true,
+        &journal,
+        &mut backend,
+    );
     assert_eq!(
         skipped,
         Ok(SettlementOutcome::Skipped(SkipReason::ForkLoanPending))
@@ -331,7 +338,14 @@ fn a_pending_fork_loan_skips_ring_owned_settlement_until_it_settles() {
     );
     assert!(backend.retirements.is_empty() && journal.log.borrow().is_empty());
     assert_eq!(journal.owed(), EXTENTS.to_vec());
-    let settled = settle_ring_owned_returns(&excluded, &guard, false, &journal, &mut backend);
+    let settled = settle_ring_owned_returns(
+        &excluded,
+        &CowSettled::for_test(&excluded),
+        &guard,
+        false,
+        &journal,
+        &mut backend,
+    );
     assert_eq!(
         doorbell_reply(&settled),
         Some(SettlementDoorbellReply::Settled)
@@ -392,7 +406,14 @@ fn one_pause(
 ) -> PauseSettlement {
     let excluded = spaces.unpublished(MM).unwrap();
     let guard = lock.lock(&excluded);
-    let outcome = settle_ring_owned_returns(&excluded, &guard, false, journal, backend);
+    let outcome = settle_ring_owned_returns(
+        &excluded,
+        &CowSettled::for_test(&excluded),
+        &guard,
+        false,
+        journal,
+        backend,
+    );
     pause_settlement(&outcome).unwrap()
 }
 
@@ -408,7 +429,14 @@ fn one_exclusion_settles_and_acknowledges_only_its_chunk() {
     let excluded = spaces.unpublished(MM).unwrap();
     let guard = lock.lock(&excluded);
     assert_eq!(
-        settle_ring_owned_returns(&excluded, &guard, false, &journal, &mut backend),
+        settle_ring_owned_returns(
+            &excluded,
+            &CowSettled::for_test(&excluded),
+            &guard,
+            false,
+            &journal,
+            &mut backend
+        ),
         Ok(SettlementOutcome::Settled(ReturnSettlementReceipt {
             freed: 0,
             advanced: 1,
@@ -522,15 +550,15 @@ fn every_native_exclusion_site_settles_owed_returns() {
         ),
         (
             "carrick-vmm-hvf/src/metadata_grant.rs",
-            Some("settle_native_returns(custody, exclusion.proof())"),
+            Some("settle_native_exclusion(custody, exclusion.proof())"),
         ),
         (
             "carrick-vmm-hvf/src/metadata_grant/native_service.rs",
-            Some("settle_native_returns(&custody, exclusion.proof())"),
+            Some("settle_native_exclusion(&custody, exclusion.proof())"),
         ),
         (
             "carrick-vmm-hvf/src/metadata_grant/return_settlement.rs",
-            Some("settle_native_returns(custody, exclusion.proof())"),
+            Some("settle_native_exclusion(custody, exclusion.proof())"),
         ),
     ];
     fn walk(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
@@ -716,4 +744,73 @@ fn a_table_of_retiring_holders_has_no_wait_authority() {
         drain_owed_return_table(&mut drain, &holders).unwrap(),
         DrainOutcome::Retiring
     );
+}
+
+/// A venue recording the order of its two settlements.
+#[derive(Default)]
+struct Ordered {
+    steps: Vec<&'static str>,
+    cow_fails: bool,
+}
+
+impl ExclusionSettlement for Ordered {
+    type Error = &'static str;
+    type Returns = u64;
+    fn settle_cow_completions(
+        &mut self,
+        _: &carrick_sched_core::ExcludedEditor<'_>,
+    ) -> Result<(), &'static str> {
+        self.steps.push("cow");
+        if self.cow_fails {
+            return Err("cow");
+        }
+        Ok(())
+    }
+    fn settle_owed_returns(
+        &mut self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        cow: &CowSettled<'_>,
+    ) -> Result<u64, &'static str> {
+        self.steps.push("returns");
+        assert_eq!(cow.mm(), excluded.key());
+        Ok(cow.mm())
+    }
+}
+
+/// #1482 P0-3: the one sequence settles the excluded MM's COW completions
+/// before its owed returns, and a failed COW step settles no return.
+#[test]
+fn an_exclusion_settles_cow_completions_before_owed_returns() {
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let excluded = spaces.unpublished(MM).unwrap();
+    let mut venue = Ordered::default();
+    assert_eq!(settle_cow_then_returns(&mut venue, &excluded), Ok(MM));
+    assert_eq!(venue.steps, ["cow", "returns"]);
+    let mut failed = Ordered {
+        cow_fails: true,
+        ..Ordered::default()
+    };
+    assert_eq!(settle_cow_then_returns(&mut failed, &excluded), Err("cow"));
+    assert_eq!(failed.steps, ["cow"]);
+}
+
+/// #1482 P0-3: a COW proof minted under another MM's exclusion settles
+/// nothing: no retirement, no acknowledgement.
+#[test]
+fn a_cow_proof_for_another_mm_settles_no_return() {
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let lock = SettlementLock::new();
+    let journal = Journal::owing(MM, &EXTENTS);
+    let mut backend = Backend::default();
+    let other = spaces.unpublished(MM + 1).unwrap();
+    let cow = CowSettled::for_test(&other);
+    drop(other);
+    let excluded = spaces.unpublished(MM).unwrap();
+    let guard = lock.lock(&excluded);
+    assert_eq!(
+        settle_ring_owned_returns(&excluded, &cow, &guard, false, &journal, &mut backend),
+        Ok(SettlementOutcome::Stale)
+    );
+    assert!(backend.retirements.is_empty() && journal.log.borrow().is_empty());
+    assert_eq!(journal.owed(), EXTENTS.to_vec());
 }
