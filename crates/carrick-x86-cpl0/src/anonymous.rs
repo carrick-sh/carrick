@@ -78,6 +78,9 @@ pub(super) fn release_injected_edit_wait(
     source: BornInZoneSource<'static, ParkedContextWords>,
     task: &'static CurrentTask,
 ) {
+    if crate::test_support::post_supply_held() {
+        return;
+    }
     if crate::test_support::defer_release_to_peer(source.slot) {
         return;
     }
@@ -116,6 +119,33 @@ pub(super) fn release_injected_edit_wait(
         ),
     };
     venue.publish(notifications.reserve(cause));
+}
+
+/// Release a held synthetic editor holder of its own MM, once its waiter
+/// published its park: the Editor release a real holder's drop publishes.
+#[cfg(feature = "test-support")]
+pub(super) fn release_held_editor(source: BornInZoneSource<'static, ParkedContextWords>) -> bool {
+    let mm = carrick_sched_core::spaces::injected_editor_busy_key();
+    if !crate::test_support::take_edit_park()
+        || !carrick_sched_core::spaces::release_injected_editor_busy()
+    {
+        return false;
+    }
+    let Some(notifications) = NonZeroU64::new(mm)
+        .and_then(|mm| source.zone.space_entry(mm))
+        .and_then(|entry| entry.live_notifications().ok())
+    else {
+        return false;
+    };
+    let venue = carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+        zone: source.zone,
+        waker: carrick_sched_core::Waker::El1 { slot: source.slot },
+        deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+            crate::native_process::release,
+        ),
+    };
+    venue.publish(notifications.reserve(SpaceWaitCause::Editor));
+    true
 }
 
 impl X86AnonymousVenue<'_> {
