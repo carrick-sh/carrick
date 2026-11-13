@@ -44,6 +44,13 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
         // the same shape ARM libcs pass, preserving its native nr.
         args = [crate::lifecycle::VFORK_CLONE_FLAGS, 0, 0, 0, 0, 0];
         crate::lifecycle::SYS_CLONE as u64
+    } else if native == 232 {
+        // Legacy epoll_wait has only four arguments. The same epoll owner
+        // serves pwait without a signal-mask swap; unused registers carry no
+        // authority to read a mask or reject its size.
+        args[4] = 0;
+        args[5] = 0;
+        crate::crossing::nr::EPOLL_PWAIT.raw()
     } else {
         carrick_syscall_abi::syscall_x86_64::canonical_x86_64(carrick_syscall_abi::NativeNr(native))
             .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw)
