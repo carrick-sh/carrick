@@ -43,6 +43,7 @@ rationale = "Request/response IPC between forked processes (`pairs` concurrent p
 
 [bindings]
 vm_free = [
+  "carrick-kernel::kernel::continuation::ipc::tests::{el1_ipc_readv_handback_scatters_retained_headers_without_overwriting_them,el1_ipc_readv_handback_prepares_the_actual_vector_destination,el1_ipc_readv_handback_prepares_tiny_vectors_once_and_reads_them_atomically,el1_ipc_readv_handback_fault_preserves_only_the_secured_prefix}",
   "carrick-el1-linux::ipc::tests::el1_ipc_readv_scatter_fault_preserves_undelivered_pipe_bytes",
   "carrick-el1-abi::ipc::tests::el1_ipc_too_small_retained_ring_stays_owned_until_replacement (#1506: retained extent identity, no stock consumption on refusal, exactly one replacement transfer; constructor syscall remains unserved)",
   "carrick-el1-abi::ipc::tests::lock_release (shared object and descriptor guard entry points; exact per-slot release revisions; ReleaseTicket release-before-enrollment and two-live-thread release-after-park for ARM and x86 contexts; no executor-capacity or constructor-continuation claim)",

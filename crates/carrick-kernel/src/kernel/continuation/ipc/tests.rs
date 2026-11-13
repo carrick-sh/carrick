@@ -1810,60 +1810,188 @@ fn el1_ipc_readv_handback_scatters_retained_headers_without_overwriting_them() {
 #[test]
 fn el1_ipc_readv_handback_prepares_the_actual_vector_destination() {
     use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
-    let w = world();
-    let (reader, _writer, object) = w.pipe();
-    let token = w.operation(reader, IpcOpKind::PipeRead, 4, 65);
-    w.region
-        .import_vectors(&token, 2, |index, header| {
-            let base = BUF + 128 + index as u64 * 128;
-            header[..8].copy_from_slice(&base.to_ne_bytes());
-            header[8..].copy_from_slice(&2u64.to_ne_bytes());
-            true
-        })
-        .unwrap();
-    {
-        let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
-        guard.pipe().unwrap().try_write(b"abcd");
-    }
-    w.hand_back(&token, IpcHandback::Continue, 0, 0);
-    let mut memory = OwnerRefusingMemory::new(BUF, 4096, 0xa5);
-    memory.refuse_next();
-    let outcome = complete_handback(
-        &caller(),
-        w.region,
-        token,
-        MM,
-        &mut memory,
-        None,
-        &Wakes::default(),
-    )
-    .unwrap();
-    let IpcHostOutcome::OwnerMemory { token, .. } = outcome else {
-        panic!("retain before any pipe effect");
-    };
-    assert_eq!(w.unread(object), 4);
-    let outcome = complete_handback(
-        &caller(),
-        w.region,
-        token,
-        MM,
-        &mut memory,
-        None,
-        &Wakes::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        outcome,
-        IpcHostOutcome::Complete {
-            result: 2,
-            sigpipe: false
+    for prefix in [0usize, 1] {
+        let w = world();
+        let (reader, _writer, object) = w.pipe();
+        let token = w.operation(reader, IpcOpKind::PipeRead, 4, 65);
+        w.region
+            .import_vectors(&token, 2, |index, header| {
+                let base = BUF + 128 + index as u64 * 128;
+                header[..8].copy_from_slice(&base.to_ne_bytes());
+                header[8..].copy_from_slice(&2u64.to_ne_bytes());
+                true
+            })
+            .unwrap();
+        {
+            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            guard.pipe().unwrap().try_write(&b"abcd"[prefix..]);
         }
-    );
-    assert_eq!(memory.inner.read_bytes(BUF + 128, 2).unwrap(), b"ab");
-    assert_eq!(memory.inner.read_bytes(BUF, 4).unwrap(), [0xa5; 4]);
-    assert_eq!(
-        w.unread(object),
-        2,
-        "the secured vector/page prefix bounds consumption"
-    );
+        w.hand_back(&token, IpcHandback::Continue, prefix as u64, 0);
+        let mut memory = OwnerRefusingMemory::new(BUF, 4096, 0xa5);
+        if prefix != 0 {
+            memory.inner.write_bytes(BUF + 128, b"a").unwrap();
+        }
+        memory.refuse_next();
+        let outcome = complete_handback(
+            &caller(),
+            w.region,
+            token,
+            MM,
+            &mut memory,
+            None,
+            &Wakes::default(),
+        )
+        .unwrap();
+        let IpcHostOutcome::OwnerMemory { token, .. } = outcome else {
+            panic!("retain before any pipe effect");
+        };
+        assert_eq!(w.unread(object), 4 - prefix);
+        assert_eq!(
+            w.region.operation(&token).unwrap().progress.written,
+            prefix as u64
+        );
+        let outcome = complete_handback(
+            &caller(),
+            w.region,
+            token,
+            MM,
+            &mut memory,
+            None,
+            &Wakes::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            IpcHostOutcome::Complete {
+                result: 4,
+                sigpipe: false
+            }
+        );
+        assert_eq!(memory.inner.read_bytes(BUF + 128, 2).unwrap(), b"ab");
+        assert_eq!(memory.inner.read_bytes(BUF + 256, 2).unwrap(), b"cd");
+        assert_eq!(memory.inner.read_bytes(BUF, 4).unwrap(), [0xa5; 4]);
+        assert_eq!(w.unread(object), 0);
+        assert_eq!(
+            memory.prepares, 2,
+            "one refused prepare, then one permit for all remaining vectors"
+        );
+        assert_eq!(memory.commits.len(), 2, "no delivered prefix is replayed");
+    }
+}
+
+#[test]
+fn el1_ipc_readv_handback_prepares_tiny_vectors_once_and_reads_them_atomically() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    for count in [1usize, 64, 1024] {
+        let w = world();
+        let (reader, _writer, object) = w.pipe();
+        let token = w.operation(reader, IpcOpKind::PipeRead, count as u64, 65);
+        w.region
+            .import_vectors(&token, count, |index, header| {
+                let base = BUF + 128 + index as u64 * 8;
+                header[..8].copy_from_slice(&base.to_ne_bytes());
+                header[8..].copy_from_slice(&1u64.to_ne_bytes());
+                true
+            })
+            .unwrap();
+        let source: Vec<_> = (0..count).map(|n| (n % 251) as u8).collect();
+        {
+            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            assert_eq!(
+                guard.pipe().unwrap().try_write(&source).result.unwrap(),
+                count
+            );
+        }
+        w.hand_back(&token, IpcHandback::Continue, 0, 0);
+        let mut memory = OwnerRefusingMemory::new(BUF, 16384, 0xa5);
+        let outcome = complete_handback(
+            &caller(),
+            w.region,
+            token,
+            MM,
+            &mut memory,
+            None,
+            &Wakes::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            IpcHostOutcome::Complete {
+                result: count as i64,
+                sigpipe: false
+            }
+        );
+        assert_eq!(
+            memory.prepares, 1,
+            "one permit independent of vector population"
+        );
+        assert_eq!(memory.commits.len(), count);
+        for (index, byte) in source.iter().enumerate() {
+            assert_eq!(
+                memory
+                    .inner
+                    .read_bytes(BUF + 128 + index as u64 * 8, 1)
+                    .unwrap(),
+                [*byte]
+            );
+        }
+        assert_eq!(memory.inner.read_bytes(BUF, 4).unwrap(), [0xa5; 4]);
+        assert_eq!(w.unread(object), 0);
+    }
+}
+
+#[test]
+fn el1_ipc_readv_handback_fault_preserves_only_the_secured_prefix() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    for bad_first in [false, true] {
+        let w = world();
+        let (reader, _writer, object) = w.pipe();
+        let baseline = w.region.descriptor_allocations();
+        let token = w.operation(reader, IpcOpKind::PipeRead, 4, 65);
+        w.region
+            .import_vectors(&token, 2, |index, header| {
+                let bad = (index == 0) == bad_first;
+                let base = if bad { BUF + 4096 } else { BUF + 128 };
+                header[..8].copy_from_slice(&base.to_ne_bytes());
+                header[8..].copy_from_slice(&2u64.to_ne_bytes());
+                true
+            })
+            .unwrap();
+        {
+            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            guard.pipe().unwrap().try_write(b"abcd");
+        }
+        w.hand_back(&token, IpcHandback::Continue, 0, 0);
+        let mut memory = OwnerRefusingMemory::new(BUF, 8192, 0xa5);
+        memory.protect_readonly(BUF + 4096, 4096);
+        let outcome = complete_handback(
+            &caller(),
+            w.region,
+            token,
+            MM,
+            &mut memory,
+            None,
+            &Wakes::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            IpcHostOutcome::Complete {
+                result: if bad_first { -14 } else { 2 },
+                sigpipe: false
+            }
+        );
+        assert_eq!(
+            memory.inner.read_bytes(BUF + 128, 2).unwrap(),
+            if bad_first {
+                vec![0xa5; 2]
+            } else {
+                b"ab".to_vec()
+            }
+        );
+        assert_eq!(memory.inner.read_bytes(BUF, 4).unwrap(), [0xa5; 4]);
+        assert_eq!(w.unread(object), if bad_first { 4 } else { 2 });
+        assert_eq!(memory.prepares, 2, "fault prefix selection is bounded");
+        assert_eq!(w.region.descriptor_allocations(), baseline);
+    }
 }
