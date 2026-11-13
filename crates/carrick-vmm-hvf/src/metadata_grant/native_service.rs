@@ -594,6 +594,9 @@ impl NativeService {
                 Err(Refusal::Invariant(_)) => return Err(stale()),
                 Err(Refusal::Guest(())) => return self.refuse(),
             };
+        // Every exclusion settles the MM's owed returns first (#1369 slice
+        // 3); a skipped or contended settlement leaves them owed.
+        super::settle_native_returns(&custody, exclusion.proof())?;
         let pool = carrick_el1_abi::cow_grant_pool_host().ok_or_else(|| stale())?;
         let mut stock = custody.fork_stock.lock();
         if stock.owner.child_owner(handle.mm()) != Some(handle)
