@@ -1114,12 +1114,83 @@ fn trusted_hardware_aggregate_has_an_exact_expectation_per_event() {
             .env("KVM_GATE", r[4])
             .env("EL1N", r[5])
             .env("EL1N_GATE", r[6])
+            // Outside a scoreboard-only dispatch its three jobs never run.
+            .env("SB_MODE", "false")
+            .env("SB_TARGET", "skipped")
+            .env("SB_HVF", "skipped")
+            .env("SB_PUBLISH", "skipped")
             .output()
             .unwrap();
         assert_eq!(
             output.status.success(),
             expected,
             "{event}: fixtures/hvf/closure/kvm/kvm-gate/el1n/el1n-gate = {r:?}"
+        );
+    }
+    // A scoreboard job that runs outside scoreboard mode is never expected.
+    for (name, index) in [("SB_TARGET", 0), ("SB_HVF", 1), ("SB_PUBLISH", 2)] {
+        for result in ["success", "failure", "cancelled"] {
+            let mut sb = ["skipped"; 3];
+            sb[index] = result;
+            let output = std::process::Command::new("bash")
+                .args(["-e", "-c", script])
+                .env("EVENT", "push")
+                .env("FIXTURES", PUSH[0])
+                .env("HVF", PUSH[1])
+                .env("HVF_CLOSURE", PUSH[2])
+                .env("KVM", PUSH[3])
+                .env("KVM_GATE", PUSH[4])
+                .env("EL1N", PUSH[5])
+                .env("EL1N_GATE", PUSH[6])
+                .env("SB_MODE", "false")
+                .env("SB_TARGET", sb[0])
+                .env("SB_HVF", sb[1])
+                .env("SB_PUBLISH", sb[2])
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "push with {name}={result}");
+        }
+    }
+    // A scoreboard-only owner dispatch needs its three jobs green and every
+    // other lane skipped.
+    let sb_ok = ["success"; 3];
+    let lanes_skipped = ["skipped"; 7];
+    let mut sb_cases: Vec<([&str; 3], [&str; 7], bool)> = vec![(sb_ok, lanes_skipped, true)];
+    for index in 0..3 {
+        for result in ["failure", "cancelled", "skipped"] {
+            let mut sb = sb_ok;
+            sb[index] = result;
+            sb_cases.push((sb, lanes_skipped, false));
+        }
+    }
+    for index in 0..7 {
+        for result in ["success", "failure", "cancelled"] {
+            let mut lanes = lanes_skipped;
+            lanes[index] = result;
+            sb_cases.push((sb_ok, lanes, false));
+        }
+    }
+    for (sb, r, expected) in sb_cases {
+        let output = std::process::Command::new("bash")
+            .args(["-e", "-c", script])
+            .env("EVENT", "workflow_dispatch")
+            .env("FIXTURES", r[0])
+            .env("HVF", r[1])
+            .env("HVF_CLOSURE", r[2])
+            .env("KVM", r[3])
+            .env("KVM_GATE", r[4])
+            .env("EL1N", r[5])
+            .env("EL1N_GATE", r[6])
+            .env("SB_MODE", "true")
+            .env("SB_TARGET", sb[0])
+            .env("SB_HVF", sb[1])
+            .env("SB_PUBLISH", sb[2])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            expected,
+            "scoreboard dispatch: target/hvf/publish = {sb:?}, lanes = {r:?}"
         );
     }
 }
