@@ -3426,6 +3426,46 @@ mod host_tests {
         assert!(!zone.record(record).has_object_operation());
     }
 
+    /// #2141: a user fault parked on an MM cause keeps its typed kind through
+    /// the record and switches in with no wake value as its result.
+    #[test]
+    fn fault_retry_round_trips_and_takes_no_wake_value() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::address_space(0, 17).unwrap();
+        let operation = OperationToken::fault_retry(key).unwrap();
+        assert_eq!(operation.kind(), OperationKind::FaultRetry);
+        assert!(operation.kind().is_space_replay());
+        assert!(!operation.kind().replays_syscall());
+        assert!(!operation.is_anonymous_edit_for(key));
+        assert!(
+            OperationToken::fault_retry(ObjectWaitKey::metadata_request(17).unwrap()).is_none()
+        );
+        zone.bind_object_wait(key, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
+        let record = allocate(&zone, 101);
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+        queue.park(queue.snapshot(), record, operation).unwrap();
+        queue
+            .notify_object(SLOT, &mut WakeEffects::default())
+            .unwrap();
+        drop(queue);
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(switched.record, record);
+        assert_eq!(switched.result, None);
+        assert_eq!(
+            zone.record(record).object_operation_kind(),
+            Some(OperationKind::FaultRetry)
+        );
+        let taken = unsafe { zone.record(record).take_object_operation() }.unwrap();
+        assert_eq!(taken.kind(), OperationKind::FaultRetry);
+    }
+
     #[test]
     fn cancellation_preserves_operation_token_domains() {
         use spaces::notification::SpaceWaitCause;
@@ -3455,6 +3495,10 @@ mod host_tests {
                 },
                 cause != SpaceWaitCause::Metadata,
             ));
+            if let Some(operation) = OperationToken::fault_retry(key) {
+                // #2141: a parked user fault owns no pin, like an anonymous edit.
+                cases.push(("fault", key, operation, true));
+            }
         }
         for index in [
             1,
