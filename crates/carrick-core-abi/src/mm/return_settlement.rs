@@ -516,19 +516,171 @@ impl SettlementDoorbellReply {
     }
 }
 
+/// Why a foreign holder of the shared owed-return table refused the full
+/// table's drain (#1482 P0-1): the holder-side refusals a waiter can enrol
+/// on. Each names the release the holder's own source publishes.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum HolderRefusal {
+    /// A ring editor of the holder is active: its `Editor` release.
+    Editor,
+    /// Another holder has the holder's root: its `Reservations` release.
+    Reservations,
+    /// A fork loan naming the holder is pending: the `PendingEdit` release
+    /// the carrier publishes when the loan settles.
+    ForkLoanPending,
+}
+impl HolderRefusal {
+    /// The holder-side refusal one settlement answer names; `None` for a
+    /// final answer (`Settled`, `Stale`).
+    pub const fn from_reply(reply: SettlementDoorbellReply) -> Option<Self> {
+        match reply {
+            SettlementDoorbellReply::Editor => Some(Self::Editor),
+            SettlementDoorbellReply::Reservations => Some(Self::Reservations),
+            SettlementDoorbellReply::ForkLoanPending => Some(Self::ForkLoanPending),
+            SettlementDoorbellReply::Settled | SettlementDoorbellReply::Stale => None,
+        }
+    }
+    pub const fn reply(self) -> SettlementDoorbellReply {
+        match self {
+            Self::Editor => SettlementDoorbellReply::Editor,
+            Self::Reservations => SettlementDoorbellReply::Reservations,
+            Self::ForkLoanPending => SettlementDoorbellReply::ForkLoanPending,
+        }
+    }
+    /// The holder's release this refusal waits for.
+    pub const fn cause(self) -> carrick_sched_core::spaces::notification::SpaceWaitCause {
+        use carrick_sched_core::spaces::notification::SpaceWaitCause;
+        match self {
+            Self::Editor => SpaceWaitCause::Editor,
+            Self::Reservations => SpaceWaitCause::Reservations,
+            Self::ForkLoanPending => SpaceWaitCause::PendingEdit,
+        }
+    }
+}
+
+/// A foreign holder's wait authority (#1482 P0-1). A full owed-return
+/// table's drain freed no slot: `mm`, the oldest holder that refused it,
+/// keeps the slots until its `refusal` releases. `revision` is the revision
+/// of that release on `mm`'s live notification source, read before the
+/// carrier's refused attempt, so a release that followed the refusal is a
+/// changed revision to the waiter, never a lost wake.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub struct HolderWait {
+    mm: ReservationMm,
+    refusal: HolderRefusal,
+    revision: u64,
+}
+impl HolderWait {
+    pub const fn new(mm: ReservationMm, refusal: HolderRefusal, revision: u64) -> Self {
+        Self {
+            mm,
+            refusal,
+            revision,
+        }
+    }
+    /// The holder whose live notification source names the wait.
+    pub const fn mm(&self) -> ReservationMm {
+        self.mm
+    }
+    pub const fn refusal(&self) -> HolderRefusal {
+        self.refusal
+    }
+    /// The holder's release the waiter enrols on.
+    pub const fn cause(&self) -> carrick_sched_core::spaces::notification::SpaceWaitCause {
+        self.refusal.cause()
+    }
+    /// The release's revision before the carrier's refused attempt.
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+/// The carrier's whole answer to one settlement doorbell.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum SettlementDoorbellAnswer {
+    /// The caller's own MM: settled (rerun), refused at a cause the caller
+    /// observed before it rang, or stale.
+    Own(SettlementDoorbellReply),
+    /// The caller's MM settled, but the shared table is full of other MMs'
+    /// slots and no holder could free one: wait on that holder's release.
+    Holder(HolderWait),
+}
+impl From<SettlementDoorbellReply> for SettlementDoorbellAnswer {
+    fn from(reply: SettlementDoorbellReply) -> Self {
+        Self::Own(reply)
+    }
+}
+impl SettlementDoorbellAnswer {
+    /// Set in the answer word of a [`Self::Holder`] answer, above the
+    /// holder's [`HolderRefusal`] reply.
+    const HOLDER: u64 = 1 << 8;
+
+    /// The three reply words a carrier writes (the record's tail; HVC x1 to
+    /// x3): the answer word, then a holder's MM and revision.
+    pub const fn to_words(self) -> [u64; 3] {
+        match self {
+            Self::Own(reply) => [reply as u64, 0, 0],
+            Self::Holder(wait) => [
+                Self::HOLDER | wait.refusal.reply() as u64,
+                wait.mm.raw(),
+                wait.revision,
+            ],
+        }
+    }
+
+    /// Decode three reply words; `None` for words no carrier writes.
+    pub const fn from_words(words: [u64; 3]) -> Option<Self> {
+        if words[0] & Self::HOLDER == 0 {
+            return match SettlementDoorbellReply::from_raw(words[0]) {
+                Some(reply) => Some(Self::Own(reply)),
+                None => None,
+            };
+        }
+        let Some(reply) = SettlementDoorbellReply::from_raw(words[0] & !Self::HOLDER) else {
+            return None;
+        };
+        let Some(refusal) = HolderRefusal::from_reply(reply) else {
+            return None;
+        };
+        let Some(mm) = ReservationMm::new(words[1]) else {
+            return None;
+        };
+        Some(Self::Holder(HolderWait::new(mm, refusal, words[2])))
+    }
+}
+
 /// The physical-service record a ring thread hands its carrier when it rings
 /// the owed-return settlement doorbell (HVF: an HVC #6 grant op; x86 CPL0:
 /// an op on the owner-grant port). One neutral record for both ISAs: the
 /// carrier authenticates the stopped execution's MM against `mm`, settles at
 /// an exclusion of that MM, releases `claim` in its epilogue and writes the
-/// reply. It is a physical-service doorbell, never a syscall crossing.
+/// answer ([`SettlementDoorbellAnswer`]) into the last three words.
 #[repr(C)]
 #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct ReturnSettlementDoorbell {
-    pub words: [u64; 6],
+    pub words: [u64; 8],
 }
 impl ReturnSettlementDoorbell {
-    pub const MAGIC: u64 = 0x4f57_4544_5345_5431; // "OWEDSET1"
+    pub const MAGIC: u64 = 0x4f57_4544_5345_5432; // "OWEDSET2"
+    const ANSWER: usize = 5;
     pub const fn request(mm: ReservationMm, claim: SettlementClaim, task: u64) -> Self {
         Self {
             words: [
@@ -537,6 +689,8 @@ impl ReturnSettlementDoorbell {
                 claim.word(),
                 claim.slot() as u64,
                 task,
+                0,
+                0,
                 0,
             ],
         }
@@ -555,12 +709,73 @@ impl ReturnSettlementDoorbell {
     pub const fn task(&self) -> u64 {
         self.words[4]
     }
-    pub fn answer(&mut self, reply: SettlementDoorbellReply) {
-        self.words[5] = reply as u64;
+    /// Write the carrier's answer into the record's reply words.
+    pub fn answer(&mut self, answer: impl Into<SettlementDoorbellAnswer>) {
+        self.set_reply_words(answer.into().to_words());
     }
-    /// The carrier's answer; an unanswered record is `Stale`.
-    pub fn reply(&self) -> SettlementDoorbellReply {
-        SettlementDoorbellReply::from_raw(self.words[5]).unwrap_or(SettlementDoorbellReply::Stale)
+    /// Store reply words a transport carried (HVC x1 to x3).
+    pub fn set_reply_words(&mut self, words: [u64; 3]) {
+        self.words[Self::ANSWER..].copy_from_slice(&words);
+    }
+    /// The carrier's answer; an unanswered or malformed record is `Stale`.
+    pub fn outcome(&self) -> SettlementDoorbellAnswer {
+        let [answer, mm, revision] = [
+            self.words[Self::ANSWER],
+            self.words[Self::ANSWER + 1],
+            self.words[Self::ANSWER + 2],
+        ];
+        SettlementDoorbellAnswer::from_words([answer, mm, revision]).unwrap_or(
+            SettlementDoorbellAnswer::Own(SettlementDoorbellReply::Stale),
+        )
+    }
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::*;
+
+    /// #1482 P0-1: a holder's wait authority survives the reply words both
+    /// transports carry, and an own answer stays an own answer.
+    #[test]
+    fn holder_and_own_answers_round_trip_the_reply_words() {
+        let claim = SettlementClaim::claim(1, 0, 3).unwrap();
+        let mut record =
+            ReturnSettlementDoorbell::request(ReservationMm::new(7).unwrap(), claim, 9);
+        assert_eq!(
+            record.outcome(),
+            SettlementDoorbellAnswer::Own(SettlementDoorbellReply::Stale),
+            "an unanswered record is stale"
+        );
+        for reply in [
+            SettlementDoorbellReply::Settled,
+            SettlementDoorbellReply::Editor,
+            SettlementDoorbellReply::Stale,
+        ] {
+            record.answer(reply);
+            assert_eq!(record.outcome(), SettlementDoorbellAnswer::Own(reply));
+        }
+        for refusal in [
+            HolderRefusal::Editor,
+            HolderRefusal::Reservations,
+            HolderRefusal::ForkLoanPending,
+        ] {
+            let wait = HolderWait::new(ReservationMm::new(42).unwrap(), refusal, 0x55);
+            record.answer(SettlementDoorbellAnswer::Holder(wait));
+            assert_eq!(record.outcome(), SettlementDoorbellAnswer::Holder(wait));
+            let mut carried =
+                ReturnSettlementDoorbell::request(ReservationMm::new(7).unwrap(), claim, 9);
+            carried.set_reply_words(SettlementDoorbellAnswer::Holder(wait).to_words());
+            assert_eq!(carried.outcome(), SettlementDoorbellAnswer::Holder(wait));
+        }
+        // A holder answer naming no MM, or a final reply, is malformed.
+        assert_eq!(
+            SettlementDoorbellAnswer::from_words([(1 << 8) | 2, 0, 1]),
+            None
+        );
+        assert_eq!(
+            SettlementDoorbellAnswer::from_words([(1 << 8) | 1, 4, 1]),
+            None
+        );
     }
 }
 

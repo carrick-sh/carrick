@@ -170,6 +170,7 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
     AnonymousCall::from_canonical(CanonicalNr::new(frame.x[8]))?;
     let zone = sched.zone;
     let mut settle = settle;
+    let mut holder = None;
     let outcome = coordinate_anonymous_edit_wait(
         &source,
         resumed,
@@ -181,7 +182,8 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
                     table,
                     slot.index() as u32,
                     ring,
-                );
+                )
+                .edit_probe(&mut holder);
             }
             let mut root = match table.lock_in(access, index.index(), mm, slot.index() as u32) {
                 Ok(root) => root,
@@ -247,6 +249,20 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
             })
         },
     );
+    // A full owed-return table that no holder could drain: wait on the
+    // refusing holder's release instead of rerunning (#1482 P0-1).
+    let outcome = match (outcome, holder) {
+        (EditWaitOutcome::NoConflict, Some(wait)) => {
+            carrick_core::wait::coordinate_holder_release_wait(
+                zone,
+                wait,
+                |key, snapshot, token, still_blocked| {
+                    sched.park_object_rechecked(frame, key, snapshot, resume, token, still_blocked)
+                },
+            )
+        }
+        (outcome, _) => outcome,
+    };
     match outcome {
         EditWaitOutcome::Parked(parked) => {
             if sched.task.linux.has_pending_host_work() {

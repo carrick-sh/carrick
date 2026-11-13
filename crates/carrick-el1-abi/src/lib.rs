@@ -682,7 +682,8 @@ pub const GRANT_OP_EXEC_CANCEL: u64 = 13;
 pub const GRANT_OP_ROOT_FORK_SEED: u64 = 14;
 /// Ring a ring-owned MM's owed-return settlement doorbell (#1369 slice 3):
 /// x1 = MM, x2 = claim word, x3 = claimant slot of the
-/// [`carrick_core_abi::ReturnSettlementDoorbell`]; the reply returns in x1.
+/// [`carrick_core_abi::ReturnSettlementDoorbell`]; the answer returns in x1
+/// to x3 ([`carrick_core_abi::SettlementDoorbellAnswer::to_words`]).
 /// A physical-service doorbell, never a syscall crossing.
 pub const GRANT_OP_RETURN_SETTLE: u64 = 15;
 
