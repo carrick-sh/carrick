@@ -5384,6 +5384,46 @@ mod tests {
     }
 
     #[test]
+    fn futex_only_view_excludes_non_futex_frames() {
+        extern crate std;
+        let counters = Counters::new();
+        counters.publish_syscall_frame([
+            SyscallFrameSource::HostIpcReplay as u64,
+            22,
+            0x400004,
+            1,
+            0,
+            0,
+            0,
+            0,
+            9,
+            0x2000,
+            1024,
+            u64::MAX,
+            0,
+            8,
+            8,
+        ]);
+        counters.record_futex_error(
+            [0x1000, 393, 7, 0, 0, u32::MAX as u64],
+            -14,
+            0x400008,
+            2,
+            None,
+        );
+        let mut output = std::string::String::new();
+        counters
+            .copy_snapshot()
+            .write_futex_errors(&mut output)
+            .unwrap();
+        assert!(output.contains("address=0x1000 op=393"));
+        assert!(output.contains("result=-14 errno=14"));
+        assert!(output.contains("futex-error samples=1 shared-slots=2/32"));
+        assert!(!output.contains("host-ipc"));
+        assert!(!output.contains("nr=22"));
+    }
+
+    #[test]
     fn futex_error_samples_keep_arguments_numeric_errno_and_snapshot() {
         extern crate std;
         let counters = Counters::new();
