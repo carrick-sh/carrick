@@ -834,6 +834,8 @@ fn supply_user_fault(
     );
     if result == Action::Served {
         if cow.completion.is_some() {
+            #[cfg(feature = "test-support")]
+            crate::test_support::hold_armed_cow_settle();
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
@@ -887,6 +889,8 @@ fn supply_user_fault(
             if result != Action::Served || cow.completion.is_none() {
                 return UserFaultSupply::Unresolved(9);
             }
+            #[cfg(feature = "test-support")]
+            crate::test_support::hold_armed_cow_settle();
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,

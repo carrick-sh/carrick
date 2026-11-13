@@ -94,6 +94,55 @@ mod test_support {
     /// fails the run instead of hanging it.
     const BIRTH_HOLD_SPINS: u64 = 1 << 32;
     static BIRTH_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// Hold the next completed user-fault COW in the ring, after its guest
+    /// copy and repoint completed and before its settlement crossing, so a
+    /// sibling can retire the replacement leaf while the completion is
+    /// outstanding (#1482 P0-3).
+    pub const INJECT_HOLD_NEXT_COW_SETTLE: u64 = 0xffff_ffff_ffff_fe22;
+    /// 1 once the armed COW completion is held, else 0.
+    pub const INJECT_COW_SETTLE_HELD: u64 = 0xffff_ffff_ffff_fe23;
+    /// Release the held COW completion to its settlement crossing, or
+    /// disarm a hold that never engaged.
+    pub const INJECT_RELEASE_HELD_COW_SETTLE: u64 = 0xffff_ffff_ffff_fe24;
+    /// 1 if the hold reached its bound before the sibling released it.
+    pub const INJECT_COW_SETTLE_TIMED_OUT: u64 = 0xffff_ffff_ffff_fe25;
+    /// The calling member's CPU slot, so the fixture can keep the held
+    /// member off its poller's CPU.
+    pub const INJECT_CURRENT_CPU: u64 = 0xffff_ffff_ffff_fe26;
+    static COW_SETTLE_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    static COW_SETTLE_TIMED_OUT: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    /// About seconds of spinning before the hold gives up.
+    const COW_SETTLE_HOLD_SPINS: u64 = 1 << 28;
+
+    /// Called by the user-fault owner between a COW completion and its
+    /// settlement crossing, on the faulting member's CPU. While held it
+    /// acknowledges shootdowns, as a member away at its crossing does.
+    pub fn hold_armed_cow_settle() {
+        if COW_SETTLE_HOLD
+            .compare_exchange(BIRTH_ARMED, BIRTH_HELD, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let mut spins = 0_u64;
+        while COW_SETTLE_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
+            spins += 1;
+            if spins > COW_SETTLE_HOLD_SPINS {
+                // The sibling never released: let the crossing run and
+                // report the hold's bound to the fixture.
+                COW_SETTLE_TIMED_OUT.store(true, Ordering::Release);
+                break;
+            }
+            if carrick_el1::isa::x86::interrupt::sync_user_memory_generation().is_err() {
+                carrick_x86_carrier::entry::fatal_boot();
+            }
+            core::hint::spin_loop();
+        }
+        COW_SETTLE_HOLD.store(0, Ordering::Release);
+    }
+
     static BIRTH_WAITER: carrick_el1::lock::SpinLock<Option<carrick_sched_core::RecordRef>> =
         carrick_el1::lock::SpinLock::new(None);
 
@@ -364,6 +413,45 @@ mod test_support {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 );
+                Some(0)
+            }
+            INJECT_HOLD_NEXT_COW_SETTLE => COW_SETTLE_HOLD
+                .compare_exchange(0, BIRTH_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some(0),
+            INJECT_COW_SETTLE_HELD => {
+                if COW_SETTLE_HOLD.load(Ordering::Acquire) == BIRTH_HELD {
+                    return Some(1);
+                }
+                // Not held yet: kick the other CPU's scheduler, so a woken
+                // sibling queued behind this polling member is taken by the
+                // idle CPU instead of waiting for this one to yield.
+                let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
+                carrick_el1::isa::x86::interrupt::send_resched(peer)
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot());
+                Some(0)
+            }
+            INJECT_CURRENT_CPU => Some(u64::from(binding.cpu_slot)),
+            INJECT_COW_SETTLE_TIMED_OUT => {
+                Some(u64::from(COW_SETTLE_TIMED_OUT.load(Ordering::Acquire)))
+            }
+            INJECT_RELEASE_HELD_COW_SETTLE => {
+                // A hold not yet engaged is disarmed: no later COW waits.
+                let _ = COW_SETTLE_HOLD
+                    .compare_exchange(
+                        BIRTH_HELD,
+                        BIRTH_RELEASED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .or_else(|_| {
+                        COW_SETTLE_HOLD.compare_exchange(
+                            BIRTH_ARMED,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                    });
                 Some(0)
             }
             INJECT_OWNED_COPY_BUSY_ONCE => {
