@@ -340,7 +340,7 @@ impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPage
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
         use carrick_mmu_core::x86::descriptor_txn::{
             Access, DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn,
-            translate_leaf,
+            resident_satisfies_publication,
         };
         let root = self.admitted_root(root_pa)?;
         let range = UserRange::checked(UserVa::new(va), GuestLen::new(4096))
@@ -377,9 +377,13 @@ impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPage
         match receipt.outcome {
             DescriptorOutcome::Applied { .. } => Ok(GuestPreparedCommit::Committed),
             DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared) => {
-                if translate_leaf(self.words, root, UserVa::new(va), native_access, true)
-                    .is_ok_and(|leaf| leaf.output == expected)
-                {
+                if resident_satisfies_publication(
+                    self.words,
+                    root,
+                    UserVa::new(va),
+                    expected,
+                    native_access,
+                ) {
                     Ok(GuestPreparedCommit::AlreadyResident)
                 } else {
                     Err(GuestPreparedCommitError::NotPrepared)
