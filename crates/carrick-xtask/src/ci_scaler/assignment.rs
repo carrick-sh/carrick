@@ -297,19 +297,28 @@ pub fn admit_assigned(
     if context.run_id == 0 || context.run_attempt == 0 {
         return Err(ScalerError::Guard("invalid assigned run identity"));
     }
-    {
+    let _waiting_hook = {
+        use std::os::fd::AsRawFd;
         let _lock = admission_lock(state)?;
         if state.join("draining").exists() {
             return Err(ScalerError::Guard("runner is draining"));
         }
         let mut request = OpenOptions::new()
             .write(true)
-            .truncate(true)
+            .truncate(false)
             .custom_flags(libc::O_NOFOLLOW)
             .open(state.join("assignment.json"))?;
+        // The open-file lock is released on timeout, return or hook death.
+        // Publish under admission.lock so quiesce sees the request and its
+        // lifetime together; do not hold admission.lock while awaiting approval.
+        if unsafe { libc::flock(request.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(ScalerError::Guard("another hook owns the assignment"));
+        }
+        request.set_len(0)?;
         request.write_all(&serde_json::to_vec(context)?)?;
         request.sync_all()?;
-    }
+        request
+    };
     let deadline = Instant::now() + limit;
     loop {
         if state.join("approved-policy").exists() {
@@ -319,7 +328,10 @@ pub fn admit_assigned(
                     "controller rendezvous requires a run-bound policy",
                 ));
             }
-            return policy.authorize(context);
+            policy.authorize(context)?;
+            // Hand the waiting-hook protection to the durable started marker
+            // before releasing the request lock.
+            return mark_job_started(state);
         }
         if state.join("draining").exists() || Instant::now() >= deadline {
             return Err(ScalerError::Guard("assigned run approval unavailable"));
@@ -364,6 +376,43 @@ pub(super) fn pending_assignment_locked(state: &Path) -> Result<Option<JobContex
     file.take(REQUEST_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)?;
     parse_request(&bytes)
+}
+
+/// A valid request protects reclamation only while its publishing hook lives.
+/// Caller holds admission.lock, which orders publication against draining.
+pub(super) fn waiting_assignment_locked(state: &Path) -> Result<bool, ScalerError> {
+    use std::os::fd::AsRawFd;
+    if state.join("runner.exit").exists() {
+        return Ok(false);
+    }
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(state.join("assignment.json"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(false);
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(REQUEST_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if !matches!(parse_request(&bytes), Ok(Some(_))) {
+        return Ok(false);
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(true)
+    } else {
+        Err(error.into())
+    }
 }
 
 pub fn publish_assignment(state: &Path, policy: &JobPolicy) -> Result<(), ScalerError> {
@@ -1007,12 +1056,16 @@ mod tests {
             serde_json::to_vec(&run_b()).unwrap(),
         )
         .unwrap();
+        // Model the live waiting hook, including the lifetime lock it owns.
+        use std::os::fd::AsRawFd;
+        let hook = File::open(dir.path().join("assignment.json")).unwrap();
+        assert_eq!(unsafe { libc::flock(hook.as_raw_fd(), libc::LOCK_EX) }, 0);
         assert_eq!(
             super::super::quiesce_guest(dir.path()).unwrap(),
             Assignment::Busy
         );
         assert!(!dir.path().join("draining").exists());
-        std::fs::write(dir.path().join("assignment.json"), "").unwrap();
+        drop(hook); // exit/timeout releases protection even with the request present
         assert_eq!(
             super::super::quiesce_guest(dir.path()).unwrap(),
             Assignment::Unassigned
