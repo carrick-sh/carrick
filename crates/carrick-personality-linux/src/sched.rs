@@ -97,7 +97,10 @@ impl FutexCall {
     }
     pub fn admitted(self) -> bool {
         if self.args[0] & 3 != 0 {
-            return false;
+            // Admission includes invalid operands that policy can finish without
+            // touching memory. Declining this native-child call answers ENOSYS
+            // instead of Linux EINVAL (#1850).
+            return self.args[1] == FUTEX_WAIT_BITSET_PRIVATE_REALTIME && self.args[3] == 0;
         }
         match self.args[1] {
             FUTEX_WAIT_PRIVATE => true,
@@ -178,7 +181,7 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
     } else {
         mask as u32
     };
-    if op == FUTEX_WAIT_BITSET_PRIVATE_REALTIME && bitset == 0 {
+    if address.raw() & 3 != 0 || (op == FUTEX_WAIT_BITSET_PRIVATE_REALTIME && bitset == 0) {
         return venue.invalid(SyscallResult::new(LINUX_EINVAL.guest_retval()));
     }
     if matches!(op, FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE) {
