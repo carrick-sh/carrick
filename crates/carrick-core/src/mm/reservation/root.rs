@@ -540,6 +540,36 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.layout_hash.load(Ordering::Acquire) == Self::LAYOUT_HASH
     }
 
+    /// Whether every slot of the shared owed-return table is taken: a root
+    /// under its own share then still cannot journal, and a settlement
+    /// doorbell drains other holders ([`Self::owed_return_holders`]).
+    pub fn owed_return_table_full(&self) -> bool {
+        self.deferred
+            .iter()
+            .all(|slot| slot.mm.load(Ordering::Acquire) != 0)
+    }
+
+    /// Each MM holding a slot of the shared owed-return table, once, in
+    /// table order, except `except`: the holders a full table's drain
+    /// settles one at a time. Retired MMs' slots are listed too; only their
+    /// release receipt frees them, so a drain finds no live root for them.
+    pub fn owed_return_holders(&self, except: ReservationMm, visit: &mut dyn FnMut(ReservationMm)) {
+        for (index, slot) in self.deferred.iter().enumerate() {
+            let mm = slot.mm.load(Ordering::Acquire);
+            if mm == 0
+                || mm == except.raw()
+                || self.deferred[..index]
+                    .iter()
+                    .any(|earlier| earlier.mm.load(Ordering::Acquire) == mm)
+            {
+                continue;
+            }
+            if let Some(mm) = ReservationMm::new(mm) {
+                visit(mm);
+            }
+        }
+    }
+
     /// The carrier's exit epilogue for a settlement doorbell: release the
     /// claim from the exact word it names ([`Reservations::claim_return_settlement`]).
     /// `false`: that claim is no longer held (a duplicate or stale epilogue),
@@ -4197,6 +4227,34 @@ mod tests {
         assert!(table.lock(0, a).unwrap().return_settlement_claimed());
         assert!(table.release_return_settlement(second));
         assert!(table.release_return_settlement(other));
+    }
+    /// #1482: a full table's drain finds every other holder once, in table
+    /// order, and never the caller; the table is full only when no slot is
+    /// free.
+    #[test]
+    fn owed_return_holders_name_each_other_holder_once() {
+        let table = table();
+        let mms = [1490, 1491, 1492].map(|mm| ReservationMm::new(mm).unwrap());
+        for (slot, mm) in mms.into_iter().enumerate() {
+            table.publish(slot, mm, layout()).unwrap();
+            table.lock(slot, mm).unwrap().finish_import().unwrap();
+        }
+        let rw = ReservationProtection::READ_WRITE;
+        for (slot, mm) in mms.into_iter().enumerate().take(2) {
+            let mut root = table.lock(slot, mm).unwrap();
+            let mapped = root.mmap(Placement::Fixed(0x100000), 0x8000, rw).unwrap();
+            complete(&mut root, mapped);
+            // Two disjoint extents: two slots for this MM.
+            retire_owed(&mut root, range(0x100000, 0x101000));
+            retire_owed(&mut root, range(0x104000, 0x105000));
+        }
+        let mut holders = Vec::new();
+        table.owed_return_holders(mms[2], &mut |mm| holders.push(mm));
+        assert_eq!(holders, vec![mms[0], mms[1]]);
+        holders.clear();
+        table.owed_return_holders(mms[0], &mut |mm| holders.push(mm));
+        assert_eq!(holders, vec![mms[1]]);
+        assert!(!table.owed_return_table_full());
     }
     /// #1480 P0-2: final retirement is no settlement. A retired MM's owed
     /// slots stay owed under its key until its release receipt, so another

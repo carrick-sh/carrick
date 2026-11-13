@@ -25,7 +25,11 @@ rationale = "EL1 increment 2 anonymous reservation checkpoint (TASK 1). Under th
 vm_free = [
   "carrick-kernel::dispatch::mem::delegated_tests::delegated_occupied_pie_hint_relocates_to_owner_code_range (both ISA call views forward the occupied PIE hint; host relocation keeps the anonymous owner and subsequent whole-range protection is recognized by both ISAs; zero backing allocation)",
   "carrick-kernel::dispatch::mem::delegated_tests::delegated_el1_resident_munmap_reconciles_at_the_next_host_boundary (owed resident returns refuse fixed reuse with Busy, reconcile once at the host boundary, then permit reuse)",
-  "carrick-el1::memory::tests::delegated::delegated_owed_return_forwards_until_ack_then_completes (Busy without pending edit or fork reaches host acknowledgement rather than parking on PendingEdit)",
+  "carrick-el1::memory::tests::delegated::delegated_owed_return_needs_settlement_until_ack_then_completes (#1482, red against the forward: Busy from an owed overlap, with no pending edit or fork, asks for the owed-return settlement instead of forwarding or parking on PendingEdit, and completes once acknowledged)",
+  "carrick-el1::memory::tests::delegated::delegated_full_return_journal_settles_before_the_next_resident_retirement (#1482, red against the forward: a full journal asks for the settlement, which frees or drains it, then the retirement reruns)",
+  "carrick-el1::memory::owed_terminal_tests::owed_return_settlement_clears_only_its_retired_terminals (#1482, both ISAs through the one shared walker: only retired private terminals of the owed range are observed and cleared; a live terminal refuses before anything is visited)",
+  "carrick-core::mm::reservation::root::tests::{settlement_claim_is_single_flight_and_released_only_by_its_epoch,owed_return_holders_name_each_other_holder_once} (#1482 single flight per root, released only by its exact epoch word; a full table's drain names every other holder once)",
+  "carrick-hal::return_settlement::tests::{a_pending_fork_loan_skips_ring_owned_settlement_until_it_settles,doorbell_replies_name_the_release_a_refusal_waits_for,every_native_exclusion_site_settles_owed_returns} (#1482 fork-loan skip, doorbell replies, and the ratchet that every native exclusion settles owed returns)",
   "carrick-kernel::dispatch::mem::delegated_tests::delegated_outside_hint_keeps_owner_protection (production host dispatch, owner-admitted 256 MiB outside-arena hint and unhinted control; R/RW/RWX protection remains owner-published with zero backing allocation)",
   "carrick-kernel::dispatch::mem::delegated_tests::{delegated_outside_hint_go_arena_fixed_subranges_keep_owner_authority,delegated_outside_hint_host_demotion_strips_outside_layout_provenance} (Go 64 MiB outside-layout arena reserve + MAP_FIXED sub-range commit/decommit/mprotect/munmap stays owner-admitted across both ISAs and host dispatch; host-served demotions strip PLACED_OUTSIDE_LAYOUT/IMAGE while preserving unclipped owner pieces)",
   "carrick-core::mm::reservation::root::tests::outside_layout_fixed_prepare_retains_owner_provenance_and_admitted_opaque_rejects_it (Prepare within PLACED_OUTSIDE_LAYOUT retains provenance, straddling or IMAGE Prepare forwards, and admitted insert_opaque still refuses PLACED_OUTSIDE_LAYOUT/IMAGE with Invalid)",
@@ -52,6 +56,8 @@ vm_free = [
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",
   "carrick-vmm-kvm::cpl0_entry::production_anonymous_release_to_idle_peer_preserves_wake (real KVM pool, ordered remote synthetic holder release; one park, zero handbacks/forwards, exact exit 7)",
+  "carrick-vmm-kvm::cpl0_initial_mm::production_brk_regrows_over_its_released_pages (#2217/#1482, real KVM pool, red on main with exit 3: a brk shrink then regrowth over the released pages is served with exactly one settlement doorbell and zero-filled pages)",
+  "carrick-vmm-kvm::cpl0_initial_mm::production_exclusion_settles_owed_returns_before_the_doorbell_is_needed (#1482 item 1, real KVM pool: a first-touch backing grant's exclusion settles the shrink's owed return, so the regrowth needs no doorbell)",
 ]
 
 [bindings.unresolved]
