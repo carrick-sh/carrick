@@ -1,4 +1,6 @@
 //! Allocation-free pipe and event counter substrate. See README.md for the
+//!
+//! (director-rebased known-answer run, agy-director#29: throwaway, never merged.)
 //! semantic contract and the venue's synchronization/continuation obligations.
 //!
 //! One algorithm, two storage shapes: a [`Pipe`] either owns its
