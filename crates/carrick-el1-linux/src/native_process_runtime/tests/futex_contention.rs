@@ -170,6 +170,66 @@ impl UserCopy for Copy {
     }
 }
 
+#[test]
+fn native_misaligned_realtime_bitset_futex_x86_is_einval() {
+    let fixture =
+        Fixture::<ParkedContextWords>::new::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(words);
+    let zone = fixture.zone;
+    let mut service = Physical {
+        zone,
+        page: fixture.page,
+        controls: core::slice::from_ref(fixture.control),
+        copies: Vec::new(),
+        tid_words: BTreeMap::new(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
+        on_signal_clock: None,
+    };
+    let source = BornInZoneSource {
+        zone,
+        slot: fixture.slot,
+    };
+    let saved = words(fixture.address);
+    let mut copy = Copy {
+        refuse_word: false,
+        loads: 0,
+        word: 0,
+    };
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    for offset in [1, 2, 3] {
+        for mask in [0, 1, u32::MAX as u64] {
+            let outcome = entry.native_futex(
+                FutexCall {
+                    args: [0x1000 + offset, 393, 1, 0, 0, mask],
+                },
+                &mut copy,
+            );
+            assert!(
+                matches!(outcome, Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == -22),
+                "misaligned op 393 must return errno 22, not decline to errno 38"
+            );
+            assert_eq!(copy.loads, 0, "invalid operand requires no memory access");
+        }
+    }
+}
+
 fn episode<C: ProcessContext + 'static, B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
     make: impl Fn(AddressContext<RootGpa>) -> C,
     mapping: bool,

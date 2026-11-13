@@ -36,6 +36,13 @@ fn serial_host_native_fork_exec_child_realtime_bitset_zero_mask_is_einval() {
     fork_exec_successor_with_futex(Some(128 | 256 | 9), 0);
 }
 
+#[test]
+fn serial_host_native_fork_exec_child_misaligned_futex_is_einval() {
+    for mask in [0, 1, u32::MAX as u64] {
+        fork_exec_probe_alignment(Some(393), mask, false, None, None, true);
+    }
+}
+
 fn fork_exec_successor(futex: Option<u64>) {
     fork_exec_successor_with_futex(futex, u32::MAX as u64);
 }
@@ -398,6 +405,19 @@ fn fork_exec_probe_with_departure(
     );
 }
 
+fn fork_exec_probe_alignment(
+    futex: Option<u64>,
+    bitset: u64,
+    timed: bool,
+    metadata: Option<super::pipe_metadata_tests::Case>,
+    departure: Option<TimerDeparture>,
+    misaligned: bool,
+) {
+    fork_exec_probe_copy_alignment(
+        futex, bitset, timed, metadata, departure, false, None, false, misaligned,
+    );
+}
+
 // One knob per fixture variant; a struct would only rename these.
 #[allow(clippy::too_many_arguments)]
 fn fork_exec_probe_copy(
@@ -409,6 +429,23 @@ fn fork_exec_probe_copy(
     readlink: bool,
     copy_error: Option<NativeProcessError>,
     clock: bool,
+) {
+    fork_exec_probe_copy_alignment(
+        futex, bitset, timed, metadata, departure, readlink, copy_error, clock, false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fork_exec_probe_copy_alignment(
+    futex: Option<u64>,
+    bitset: u64,
+    timed: bool,
+    metadata: Option<super::pipe_metadata_tests::Case>,
+    departure: Option<TimerDeparture>,
+    readlink: bool,
+    copy_error: Option<NativeProcessError>,
+    clock: bool,
+    misaligned: bool,
 ) {
     let counters = carrick_el1_abi::Counters::new();
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -698,7 +735,7 @@ fn fork_exec_probe_copy(
             &mut service,
             parent,
             child,
-            (operation, bitset, timed, departure),
+            (operation, bitset, timed, departure, misaligned),
         );
         registry.unregister_root_for_test(&runtime);
         return;
@@ -1826,9 +1863,10 @@ fn child_futex<'a>(
     service: &mut Physical<'a, Aarch64ParkedContext>,
     parent: TaskKey,
     child: TaskKey,
-    futex: (u64, u64, bool, Option<TimerDeparture>),
+    futex: (u64, u64, bool, Option<TimerDeparture>, bool),
 ) {
-    let (operation, bitset, timed, departure) = futex;
+    let (operation, bitset, timed, departure, misaligned) = futex;
+    let invalid = misaligned || (operation == 393 && bitset == 0);
     let counters = &carrick_el1_abi::Counters::new();
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
     use carrick_guest_arch::{Access, GuestLen};
@@ -1911,7 +1949,7 @@ fn child_futex<'a>(
         ..Default::default()
     };
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
-    frame.x[0] = VA;
+    frame.x[0] = VA + u64::from(misaligned);
     frame.x[1] = operation;
     frame.x[5] = bitset;
     frame.x[2] = 1;
@@ -1956,8 +1994,8 @@ fn child_futex<'a>(
             None,
             |_| core::ptr::null_mut(),
         );
-        if operation == (128 | 256 | 9) && bitset == 0 {
-            assert_eq!(frame.x[0] as i64, -22, "native child receives EINVAL");
+        if invalid && route != CompletionRoute::Forward {
+            assert_eq!(frame.x[0] as i64, -22, "native child receives errno 22");
         }
         if route == CompletionRoute::Forward {
             // Complete the same unclaimed-syscall capture as the ARM vector.
@@ -1984,11 +2022,7 @@ fn child_futex<'a>(
                 ),
                 crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
             );
-            let expected = if operation == (128 | 256 | 9) && bitset == 0 {
-                -22
-            } else {
-                -38
-            };
+            let expected = if invalid { -22 } else { -38 };
             assert_eq!(frame.x[0] as i64, expected, "native child errno");
             assert_eq!(
                 word.reads.get(),
@@ -1996,7 +2030,7 @@ fn child_futex<'a>(
                 "opcode refusal happens before UserCopy"
             );
         }
-        let expected_route = if operation == (128 | 256 | 9) && bitset == 0 {
+        let expected_route = if invalid {
             CompletionRoute::Served
         } else {
             CompletionRoute::Suspended
@@ -2010,7 +2044,12 @@ fn child_futex<'a>(
         );
         assert!(entry.take_run_failure().is_none());
     }
-    if operation == (128 | 256 | 9) && bitset == 0 {
+    if invalid {
+        assert_eq!(
+            word.reads.get(),
+            0,
+            "invalid operand requires no memory access"
+        );
         registry.unregister_root_for_test(runtime);
         return;
     }
