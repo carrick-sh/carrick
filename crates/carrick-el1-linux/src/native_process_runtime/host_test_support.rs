@@ -4510,6 +4510,98 @@ fn sole_member_exec_closes_admission_before_adopting_successor() {
     assert!(fixture.page.cancel_host_birth_claim(host_birth).is_some());
 }
 
+/// #2235: a process's record names its task key; its threads see their
+/// namespace-visible tids. A carrier whose task keys are not namespace pids
+/// (the x86 KVM run issues host-scale keys, its children see pid 2, ...)
+/// still execs: the sole-member check compares the record against the
+/// entry's own task key, never against a visible tid in another domain.
+#[cfg(test)]
+#[test]
+fn exec_succeeds_when_task_keys_are_not_namespace_tids() {
+    let fixture = NativeSignalFixture::new_with_context::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        ExecutionBinding {
+            task: carrick_core_abi::EntryTaskKey::from_raw(198_057),
+            generation: carrick_core_abi::SnapshotGeneration::from_raw(11),
+            mm: carrick_core_abi::EntryMmKey::from_raw(1),
+            thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(101),
+        },
+        carrick_core_abi::EntryTaskKey::from_raw(198_057),
+        carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap()),
+        words,
+    );
+    // The namespace view: the process and its thread are pid 2.
+    fixture.task.publish_visible_pid(2);
+    // SAFETY: the fixture's sole member; nothing else reads its slot yet.
+    unsafe { fixture.control.promote_exec_identity_owned(2) };
+    {
+        let mut graph = fixture.runtime.graph.lock();
+        let key = graph.owner.tasks().values().next().unwrap().key();
+        let row = graph.owner.task_mut(key).unwrap();
+        row.metadata_mut().namespace_pid = 2;
+        for thread in &mut row.threads.threads {
+            thread.tid = 2;
+        }
+    }
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(
+                test_exec_payload(b"/bin/static"),
+                None,
+                NativeServiceCall::new(
+                    carrick_guest_arch::NativeOrdinal::new(221),
+                    &carrick_el1_abi::Counters::new()
+                )
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let successor_mm =
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 67, 0x9a_0000);
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::NoPending)
+    ));
+    assert!(entry.take_run_failure().is_none());
+    assert_eq!(
+        fixture.task.mm.key.load(Ordering::Acquire),
+        successor_mm.raw(),
+        "the exec committed its successor rather than killing the caller"
+    );
+}
+
 #[cfg(test)]
 fn exec_closes_over_predecessor_gate(gate: carrick_el1_abi::GateState) {
     let fixture = native_exec_fixture();
