@@ -586,6 +586,7 @@ surfaces = [
   { path = "crates/carrick-kernel-example/tests/stdio_inherited_backpressure.rs", contract = "kernel.scheduler.host-wait-handoff" },
   { path = "crates/carrick-kernel/src/clock_service.rs", contract = "kernel.time.native-routing" },
   { path = "crates/carrick-kernel/src/dispatch/copyout.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-kernel/src/dispatch/copyout.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-kernel/src/dispatch/copyout.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-kernel/src/dispatch/copyout_contention_tests.rs", contract = "kernel.copyout.owner-refusal" },
   { path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs", contract = "kernel.copyout.owner-refusal" },
