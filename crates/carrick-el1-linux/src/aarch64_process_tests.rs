@@ -13828,8 +13828,20 @@ fn native_descriptor_argument_witness(
         // epoll_pwait2 shares this ring-created object and must not cross.
         let zero_timeout = carrick_test_support::GuestUserBuffer::zeroed(16);
         assert_eq!(
-            completed(sys::EPOLL_PWAIT2.raw(), [epoll, events.arg(), 1, zero_timeout.arg()]),
+            completed(
+                sys::EPOLL_PWAIT2.raw(),
+                [epoll, events.arg(), 1, zero_timeout.arg()]
+            ),
             0
+        );
+        let invalid_timeout =
+            carrick_test_support::GuestUserBuffer::from_value([0i64, 1_000_000_000]);
+        assert_eq!(
+            completed(
+                sys::EPOLL_PWAIT2.raw(),
+                [epoll, events.arg(), 1, invalid_timeout.arg()]
+            ),
+            -22
         );
         let value = carrick_test_support::GuestUserBuffer::from_value(1u64);
         let counter = carrick_test_support::GuestUserBuffer::zeroed(8);
@@ -13849,18 +13861,6 @@ fn native_descriptor_argument_witness(
         assert_eq!(completed(sys::READ.raw(), [event, counter.arg(), 8, 0]), 8);
         assert_eq!(
             completed(sys::EPOLL_PWAIT.raw(), [epoll, events.arg(), 1, 0]),
-            0
-        );
-        // MOD rearms the same edge with a new data cookie. Fork the writer
-        // after construction so only real descriptor inheritance connects it
-        // to the child's private eventfd; the original parent stays live.
-        let cookie = cookie + 1;
-        member.as_mut_bytes()[8..].copy_from_slice(&cookie.to_ne_bytes());
-        assert_eq!(
-            completed(
-                sys::EPOLL_CTL.raw(),
-                [epoll, carrick_abi::LINUX_EPOLL_CTL_MOD, event, member.arg()]
-            ),
             0
         );
         let writer = {
@@ -13890,68 +13890,97 @@ fn native_descriptor_argument_witness(
                 .unwrap();
             runtime.task_binding(key).unwrap()
         };
-        // End this VM-free entry at its real park boundary instead of loading
-        // a peer's guest instructions on the fake CPU.
-        task.linux.mark_pending_host_work();
-        let (route, _) = run_binding(child, sys::EPOLL_PWAIT.raw(), [epoll, events.arg(), 1, 500]);
-        assert_eq!(
-            route,
-            CompletionRoute::Suspended,
-            "empty finite wait must really park in ring"
-        );
-        assert!(fixture.zone.slot(fixture.slot).current().is_none());
-        assert_eq!(
-            fixture.zone.record(child.record.id).deadline(),
-            Some(13_000_001)
-        );
-        let parked_operation = fixture
-            .zone
-            .record(child.record.id)
-            .object_wait_census()
-            .unwrap();
-        assert_ne!(parked_operation.operation, 0);
-        assert_ne!(parked_operation.queue, 0);
-        assert!(matches!(
-            fixture.zone.record(child.record.id).claim(),
-            carrick_sched_core::Claim::Parked { .. }
-                | carrick_sched_core::Claim::Transferring { .. }
-        ));
-        activate_target(source, &task, &writer);
-        let (route, result) = run_binding(&writer, sys::WRITE.raw(), [event, value.arg(), 8, 0]);
-        assert!(matches!(
-            route,
-            CompletionRoute::Served | CompletionRoute::WithWork
-        ));
-        assert_eq!(result, 8);
-        assert!(
-            fixture
+        for wait_call in [sys::EPOLL_PWAIT, sys::EPOLL_PWAIT2] {
+            // MOD rearms the same edge with a new data cookie. Fork the writer
+            // after construction so only real descriptor inheritance connects it
+            // to the child's private eventfd; the original parent stays live.
+            let cookie = cookie + wait_call.raw();
+            member.as_mut_bytes()[8..].copy_from_slice(&cookie.to_ne_bytes());
+            assert_eq!(
+                completed(
+                    sys::EPOLL_CTL.raw(),
+                    [epoll, carrick_abi::LINUX_EPOLL_CTL_MOD, event, member.arg()]
+                ),
+                0
+            );
+            // End this VM-free entry at its real park boundary instead of loading
+            // a peer's guest instructions on the fake CPU.
+            task.linux.mark_pending_host_work();
+            let mut timeout =
+                carrick_test_support::GuestUserBuffer::from_value([0i64, 500_000_000]);
+            let timeout_arg = if wait_call == sys::EPOLL_PWAIT2 {
+                timeout.arg()
+            } else {
+                500
+            };
+            let (route, _) = run_binding(
+                child,
+                wait_call.raw(),
+                [epoll, events.arg(), 1, timeout_arg],
+            );
+            assert_eq!(
+                route,
+                CompletionRoute::Suspended,
+                "empty finite wait must really park in ring"
+            );
+            assert!(fixture.zone.slot(fixture.slot).current().is_none());
+            assert_eq!(
+                fixture.zone.record(child.record.id).deadline(),
+                Some(13_000_001)
+            );
+            let parked_operation = fixture
                 .zone
-                .requeue_preempted(fixture.slot, writer.record.id)
-                .is_queued()
-        );
-        activate_target(source, &task, child);
-        assert!(fixture.zone.record(child.record.id).has_object_operation());
-        // SAFETY: activate_target holds this record OnCpu, and no guest CPU
-        // runs concurrently. Verify the arguments retained by the actual park
-        // before reconstructing its SVC entry through the helper.
-        let saved = unsafe { &*fixture.zone.record(child.record.id).ctx_mut() };
-        assert_eq!(&saved.native.x[..4], &[epoll, events.arg(), 1, 500]);
-        assert_eq!(saved.native.x[8], sys::EPOLL_PWAIT.raw());
-        assert_eq!(
-            completed(sys::EPOLL_PWAIT.raw(), [epoll, events.arg(), 1, 500]),
-            1
-        );
-        assert_eq!(fixture.zone.timer_deadline(fixture.slot), None);
-        assert!(!fixture.zone.record(child.record.id).has_object_operation());
-        assert_eq!(
-            u64::from_ne_bytes(events.as_bytes()[8..].try_into().unwrap()),
-            cookie
-        );
-        assert_eq!(completed(sys::READ.raw(), [event, counter.arg(), 8, 0]), 8);
-        assert_eq!(
-            u64::from_ne_bytes(counter.as_bytes().try_into().unwrap()),
-            1
-        );
+                .record(child.record.id)
+                .object_wait_census()
+                .unwrap();
+            assert_ne!(parked_operation.operation, 0);
+            assert_ne!(parked_operation.queue, 0);
+            assert!(matches!(
+                fixture.zone.record(child.record.id).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+                    | carrick_sched_core::Claim::Transferring { .. }
+            ));
+            activate_target(source, &task, &writer);
+            let (route, result) =
+                run_binding(&writer, sys::WRITE.raw(), [event, value.arg(), 8, 0]);
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
+            assert_eq!(result, 8);
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, writer.record.id)
+                    .is_queued()
+            );
+            activate_target(source, &task, child);
+            assert!(fixture.zone.record(child.record.id).has_object_operation());
+            // SAFETY: activate_target holds this record OnCpu, and no guest CPU
+            // runs concurrently. Verify the arguments retained by the actual park
+            // before reconstructing its SVC entry through the helper.
+            let saved = unsafe { &*fixture.zone.record(child.record.id).ctx_mut() };
+            assert_eq!(&saved.native.x[..4], &[epoll, events.arg(), 1, timeout_arg]);
+            assert_eq!(saved.native.x[8], wait_call.raw());
+            // A resumed wait uses the retained deadline, even if the caller's
+            // timespec has since become invalid.
+            timeout.as_mut_bytes().fill(0xff);
+            assert_eq!(
+                completed(wait_call.raw(), [epoll, events.arg(), 1, timeout_arg]),
+                1
+            );
+            assert_eq!(fixture.zone.timer_deadline(fixture.slot), None);
+            assert!(!fixture.zone.record(child.record.id).has_object_operation());
+            assert_eq!(
+                u64::from_ne_bytes(events.as_bytes()[8..].try_into().unwrap()),
+                cookie
+            );
+            assert_eq!(completed(sys::READ.raw(), [event, counter.arg(), 8, 0]), 8);
+            assert_eq!(
+                u64::from_ne_bytes(counter.as_bytes().try_into().unwrap()),
+                1
+            );
+        }
         assert_eq!(
             completed(
                 sys::EPOLL_CTL.raw(),
