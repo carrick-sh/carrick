@@ -5,6 +5,9 @@
 .global _start
 .text
 _start:
+    /* A replacement must not overwrite its still-live parent's stack. */
+    movabs $0x706172656e742d73, %rax
+    mov %rax, (%rsp)
     mov $14, %eax
     xor %edi, %edi
     lea blocked(%rip), %rsi
@@ -34,6 +37,9 @@ _start:
     syscall
     jmp reap
 received:
+    movabs $0x706172656e742d73, %rax
+    cmp %rax, (%rsp)
+    jne failure
     mov %r12d, %edi
     mov $12, %esi
     mov $62, %eax
