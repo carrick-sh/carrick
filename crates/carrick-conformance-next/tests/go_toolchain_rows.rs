@@ -90,8 +90,8 @@ fn run_go_row(args: &[&str]) -> (ContainerResult, String) {
     (result, digest)
 }
 
-/// Scoreboard row `go-version`: red on main `59a2b28ab` as a bare SIGSEGV
-/// (exit 139, no Go panic text) after #2247.
+/// Scoreboard row `go-version`: red on main `e2e10d32a` and `59a2b28ab` as a
+/// bare SIGSEGV (exit 139, no Go panic text, empty stdout) after #2247.
 #[test]
 fn go_version_with_telemetry_sidecar_exits_zero() {
     let _guard = common::guest_lock();
@@ -107,8 +107,31 @@ fn go_version_with_telemetry_sidecar_exits_zero() {
     assert!(result.stderr.is_empty(), "unexpected stderr\n{digest}");
 }
 
+/// Control for `go-version`: the same root `go version` with telemetry off
+/// (Go's mode file says `off`), so Go maps no counter file and starts no
+/// sidecar. The Docker oracle shows only thread clones, no vfork. Green here
+/// with the row above red places the stop in the sidecar start.
+#[test]
+fn go_version_with_telemetry_off_exits_zero() {
+    let _guard = common::guest_lock();
+    let (result, digest) = run_go_row(&[
+        "sh",
+        "-c",
+        "mkdir -p /root/.config/go/telemetry && echo off > /root/.config/go/telemetry/mode && exec go version",
+    ]);
+    assert_eq!(result.signal, None, "go version died of a signal\n{digest}");
+    assert_eq!(result.exit_code, 0, "go version failed\n{digest}");
+    assert!(
+        result.stdout_utf8().starts_with("go version go1.23."),
+        "unexpected go version output\n{digest}"
+    );
+}
+
 /// Scoreboard row `go-hello`: `go run` from a shell, which needs GOROOT from
 /// `/proc/self/exe` in an exec'd child (#2084) and then builds and runs.
+/// Red on main `59a2b28ab` (exit 134): the sidecar's vfork child fails with
+/// EFAULT (`fork/exec /usr/local/go/bin/go: bad address`), the compile
+/// spawn with EAGAIN, then an `entry_binding` `NativeServiceQuarantined` fatal.
 #[test]
 fn go_run_hello_from_shell_prints_go_ok() {
     let _guard = common::guest_lock();
