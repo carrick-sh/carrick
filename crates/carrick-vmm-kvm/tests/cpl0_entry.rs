@@ -1126,6 +1126,83 @@ fn production_anonymous_root_busy_once_parks_and_completes() {
     );
 }
 
+/// #2141: Go's heap shape (a `PROT_NONE` reserve, a `MAP_FIXED` read/write
+/// commit over it, then the first store) meets the MM editor held by another
+/// owner, as a sibling Go thread's fault or mmap on the other vCPU holds it.
+/// The user #PF parks on the editor's release once and reruns the store; it
+/// is never a carrier fault refusal (`kernel fault policy refused: reason 9`).
+#[test]
+fn production_user_fault_editor_busy_once_parks_and_reruns() {
+    const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    // mmap(NULL, two pages, PROT_NONE, PRIVATE|ANONYMOUS, -1, 0), retain in r12.
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x2000),
+        (&[0x48, 0xba], 0),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12,rax
+    // mmap(r12, one page, RW, FIXED|PRIVATE|ANONYMOUS, -1, 0) == r12.
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi,r12
+    for (register, value) in [
+        (&[0x48, 0xbe][..], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x32),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x4c, 0x39, 0xe0, 0x0f, 0x85]); // cmp rax,r12; jne
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_EDITOR_BUSY_ONCE);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    // The first store faults into the held editor, then reads back.
+    code.extend_from_slice(&[0x41, 0xc6, 0x04, 0x24, 0x5a]); // mov byte [r12],0x5a
+    code.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x04, 0x24]); // movzx eax,byte [r12]
+    append_result_check(&mut code, &mut failures, 0x5a);
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 1);
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let outcome = try_run_instrumented_pool_fixture(&production_probe_elf(&code), 32)
+        .unwrap_or_else(|failure| panic!("a held editor refused the user fault: {failure}"));
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "the store must rerun after one editor park: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
 /// A real munmap reaches the shared editor admission, parks on one injected
 /// owner, and replays without falling out to the host or refusal accounting.
 #[test]
