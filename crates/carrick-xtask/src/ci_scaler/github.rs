@@ -367,61 +367,107 @@ impl Github {
         row: &mut impl RunnerRegistration,
         mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
     ) -> Result<Assignment, ScalerError> {
-        if row.runner().is_none() {
-            let data = request(
+        let assignment = (|| -> Result<Assignment, ScalerError> {
+            if row.runner().is_none() {
+                let data = request(
+                    "GET",
+                    &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
+                    None,
+                    true,
+                )?;
+                let recovered = recover_registration(&*row, &pages(&data, "runners")?)?;
+                row.set_runner(recovered);
+            }
+            let Some(runner) = row.runner() else {
+                return Ok(Assignment::Unassigned);
+            };
+            // Completion of the reserved or recorded job is only a candidate
+            // for reclamation; actual running work is checked below.
+            let job = request(
+                "GET",
+                &format!(
+                    "repos/{REPOSITORY}/actions/jobs/{}",
+                    row.assigned().unwrap_or(row.key().job).0
+                ),
+                None,
+                false,
+            )?;
+            if job["runner_id"].as_u64() == Some(runner.0) {
+                row.set_assigned(JobId(
+                    job["id"]
+                        .as_u64()
+                        .ok_or(ScalerError::External("assigned id"))?,
+                ));
+                return Ok(if job["status"] == "completed" {
+                    Assignment::Completed
+                } else {
+                    Assignment::Busy
+                });
+            }
+            let runners = request(
                 "GET",
                 &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
                 None,
                 true,
             )?;
-            let recovered = recover_registration(&*row, &pages(&data, "runners")?)?;
-            row.set_runner(recovered);
+            for registered in pages(&runners, "runners")? {
+                if registered["id"].as_u64() == Some(runner.0) {
+                    return Ok(if registered["busy"] == true {
+                        Assignment::Busy
+                    } else if registered["busy"] == false {
+                        Assignment::Unassigned
+                    } else {
+                        Assignment::Unknown
+                    });
+                }
+            }
+            // Registration gone and the reserved job never ran on it: the runner
+            // ended (rejected, killed or exited). The caller confirms the runner
+            // process is gone before destroying anything.
+            Ok(Assignment::Unknown)
+        })()?;
+        if assignment == Assignment::Busy {
+            return Ok(assignment);
         }
-        let Some(runner) = row.runner() else {
-            return Ok(Assignment::Unassigned);
-        };
-        // Only the reserved job is examined: the hook binds the runner to
-        // its vetted run, so any other assignment is killed before a step.
-        let job = request(
+        // Only pay for repository-wide evidence when the cheap checks would
+        // permit reclamation; known busy runners need no additional queries.
+        // A reservation is demand provenance, not an assignment. Check all
+        // running repository workflows: shared labels can send this runner B
+        // while its reserved A remains queued, and registration busy may lag.
+        // Failure to obtain this evidence defers reclamation via the caller.
+        let runs = request(
             "GET",
-            &format!(
-                "repos/{REPOSITORY}/actions/jobs/{}",
-                row.assigned().unwrap_or(row.key().job).0
-            ),
-            None,
-            false,
-        )?;
-        if job["runner_id"].as_u64() == Some(runner.0) {
-            row.set_assigned(JobId(
-                job["id"]
-                    .as_u64()
-                    .ok_or(ScalerError::External("assigned id"))?,
-            ));
-            return Ok(if job["status"] == "completed" {
-                Assignment::Completed
-            } else {
-                Assignment::Busy
-            });
-        }
-        let runners = request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
+            &format!("repos/{REPOSITORY}/actions/runs?status=in_progress&per_page=100"),
             None,
             true,
         )?;
-        for registered in pages(&runners, "runners")? {
-            if registered["id"].as_u64() == Some(runner.0) {
-                return Ok(if registered["busy"] == true {
-                    Assignment::Busy
-                } else {
-                    Assignment::Unassigned
-                });
+        for run in pages(&runs, "workflow_runs")? {
+            let id = run["id"].as_u64().ok_or(ScalerError::External("run id"))?;
+            let attempt = run["run_attempt"]
+                .as_u64()
+                .ok_or(ScalerError::External("run attempt"))?;
+            let jobs = request(
+                "GET",
+                &format!(
+                    "repos/{REPOSITORY}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100"
+                ),
+                None,
+                true,
+            )?;
+            for job in pages(&jobs, "jobs")? {
+                if job["status"] != "completed"
+                    && (job["runner_name"].as_str() == Some(row.name())
+                        || row
+                            .runner()
+                            .is_some_and(|runner| job["runner_id"].as_u64() == Some(runner.0)))
+                {
+                    // Only the assignment service may authenticate and persist
+                    // B's policy. This observation only withholds reclamation.
+                    return Ok(Assignment::Busy);
+                }
             }
         }
-        // Registration gone and the reserved job never ran on it: the runner
-        // ended (rejected, killed or exited). The caller confirms the runner
-        // process is gone before destroying anything.
-        Ok(Assignment::Unknown)
+        Ok(assignment)
     }
     pub(super) fn registration_exists(&self, row: &Record) -> Result<bool, ScalerError> {
         let runners = self.request(
