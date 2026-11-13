@@ -1753,3 +1753,117 @@ fn ppoll_handback_only_revents_requires_write_permission() {
     );
     assert_eq!(memory.commits, vec![(address + 6, vec![1, 0])]);
 }
+
+#[test]
+fn el1_ipc_readv_handback_scatters_retained_headers_without_overwriting_them() {
+    for prefix in [0usize, 1] {
+        let w = world();
+        let (reader, _writer, object) = w.pipe();
+        let baseline = w.region.descriptor_allocations();
+        let token = w.operation(reader, IpcOpKind::PipeRead, 4, 65);
+        w.region
+            .import_vectors(&token, 2, |index, header| {
+                let base = BUF + 128 + index as u64 * 128;
+                header[..8].copy_from_slice(&base.to_ne_bytes());
+                header[8..].copy_from_slice(&2u64.to_ne_bytes());
+                true
+            })
+            .unwrap();
+        {
+            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            guard.pipe().unwrap().try_write(&b"abcd"[prefix..]);
+        }
+        w.hand_back(&token, IpcHandback::Continue, prefix as u64, 0);
+        let mut memory = memory(&[0xa5; 512]);
+        if prefix != 0 {
+            memory.write_bytes(BUF + 128, b"a").unwrap();
+        }
+        let outcome = complete_handback(
+            &caller(),
+            w.region,
+            token,
+            MM,
+            &mut memory,
+            None,
+            &Wakes::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            IpcHostOutcome::Complete {
+                result: 4,
+                sigpipe: false
+            }
+        );
+        assert_eq!(memory.read_bytes(BUF + 128, 2).unwrap(), b"ab");
+        assert_eq!(memory.read_bytes(BUF + 256, 2).unwrap(), b"cd");
+        assert_eq!(
+            memory.read_bytes(BUF, 4).unwrap(),
+            [0xa5; 4],
+            "iov header memory is not an output buffer"
+        );
+        assert_eq!(w.unread(object), 0);
+        assert_eq!(w.region.descriptor_allocations(), baseline);
+    }
+}
+
+#[test]
+fn el1_ipc_readv_handback_prepares_the_actual_vector_destination() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    let w = world();
+    let (reader, _writer, object) = w.pipe();
+    let token = w.operation(reader, IpcOpKind::PipeRead, 4, 65);
+    w.region
+        .import_vectors(&token, 2, |index, header| {
+            let base = BUF + 128 + index as u64 * 128;
+            header[..8].copy_from_slice(&base.to_ne_bytes());
+            header[8..].copy_from_slice(&2u64.to_ne_bytes());
+            true
+        })
+        .unwrap();
+    {
+        let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+        guard.pipe().unwrap().try_write(b"abcd");
+    }
+    w.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let mut memory = OwnerRefusingMemory::new(BUF, 4096, 0xa5);
+    memory.refuse_next();
+    let outcome = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut memory,
+        None,
+        &Wakes::default(),
+    )
+    .unwrap();
+    let IpcHostOutcome::OwnerMemory { token, .. } = outcome else {
+        panic!("retain before any pipe effect");
+    };
+    assert_eq!(w.unread(object), 4);
+    let outcome = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut memory,
+        None,
+        &Wakes::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        IpcHostOutcome::Complete {
+            result: 2,
+            sigpipe: false
+        }
+    );
+    assert_eq!(memory.inner.read_bytes(BUF + 128, 2).unwrap(), b"ab");
+    assert_eq!(memory.inner.read_bytes(BUF, 4).unwrap(), [0xa5; 4]);
+    assert_eq!(
+        w.unread(object),
+        2,
+        "the secured vector/page prefix bounds consumption"
+    );
+}
