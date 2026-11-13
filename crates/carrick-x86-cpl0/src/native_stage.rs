@@ -413,6 +413,36 @@ mod tests {
     }
 
     #[test]
+    fn a_child_readlinkat_prepares_untouched_output_then_keeps_the_family_route() {
+        let (path, out) = (0x7000_0000u64, 0x7000_1000u64);
+        let call = decode_x86_64(267, [!99u64, path, out, 64, 0, 0], 0x8000);
+        let task = CurrentTask::new();
+        fn stage(
+            validator: &impl MemoryValidator,
+            call: &CanonicalCall,
+            task: &CurrentTask,
+        ) -> Option<HostFileStage> {
+            stage_call(
+                call,
+                task,
+                validator,
+                CHILD,
+                |_| false,
+                || Some(([3, 4, 5], |_| None)),
+            )
+        }
+        assert_eq!(
+            stage(&Untouched, &call, &task),
+            Some(HostFileStage::PrepareOutput { address: out })
+        );
+        assert_eq!(stage(&Resident, &call, &task), None);
+        assert_eq!(
+            carrick_personality_linux::dispatch::route_x86(78, 0),
+            carrick_personality_linux::dispatch::Family::NativeHostFile,
+        );
+    }
+
+    #[test]
     fn ftruncate_follows_its_descriptor_for_the_root_too() {
         // The root's ring-held file has no host-task descriptor to truncate:
         // the ring venue stages it, as for a descendant. A descriptor the

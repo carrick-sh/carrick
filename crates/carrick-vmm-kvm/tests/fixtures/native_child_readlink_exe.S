@@ -28,8 +28,6 @@ _start:
     shr $8, %edi
     jmp exit
 child:
-    movq $0x5a5a5a5a5a5a5a5a, %rax
-    mov %rax, link_buffer(%rip)
     mov $-100, %rdi
     lea exe_path(%rip), %rsi
     lea link_buffer(%rip), %rdx
@@ -38,7 +36,7 @@ child:
     syscall
     cmp $-38, %rax
     jne failure
-    movq $0x5a5a5a5a5a5a5a5a, %rax
+    xor %eax, %eax
     cmp link_buffer(%rip), %rax
     jne written
     mov $218, %edi
