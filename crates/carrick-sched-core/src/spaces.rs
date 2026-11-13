@@ -42,20 +42,45 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "test-support")]
 static INJECT_EDITOR_BUSY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// The MM the injected holder edits, or 0 for whichever MM asks next.
+#[cfg(feature = "test-support")]
+static INJECT_EDITOR_BUSY_KEY: AtomicU64 = AtomicU64::new(0);
+
 /// Hold the next shared editor acquisition until its waiter enrolls.
 #[cfg(feature = "test-support")]
 pub fn inject_editor_busy_once() -> bool {
+    inject_editor_busy_once_for(0)
+}
+
+/// As [`inject_editor_busy_once`], holding only `key`'s editor: another
+/// MM's member (a fork child on the other vCPU) is never refused by it.
+#[cfg(feature = "test-support")]
+pub fn inject_editor_busy_once_for(key: u64) -> bool {
+    if INJECT_EDITOR_BUSY.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    INJECT_EDITOR_BUSY_KEY.store(key, Ordering::Release);
     INJECT_EDITOR_BUSY
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
 }
 
 #[cfg(feature = "test-support")]
-fn injected_editor_busy() -> bool {
+fn injected_editor_busy(key: u64) -> bool {
+    let held = INJECT_EDITOR_BUSY_KEY.load(Ordering::Acquire);
+    if held != 0 && held != key {
+        return false;
+    }
     match INJECT_EDITOR_BUSY.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) | Err(2) => true,
         Err(_) => false,
     }
+}
+
+/// The MM the injected holder edits, or 0 for any.
+#[cfg(feature = "test-support")]
+pub fn injected_editor_busy_key() -> u64 {
+    INJECT_EDITOR_BUSY_KEY.load(Ordering::Acquire)
 }
 
 /// Release the injected editor holder after the real wait record is published.
@@ -780,7 +805,7 @@ impl AddressSpaces {
         venue: Option<SpaceReleaseVenue<'a, C>>,
     ) -> Result<SpaceEditor<'a, C>, EditAdmissionRefusal> {
         #[cfg(feature = "test-support")]
-        if injected_editor_busy() {
+        if injected_editor_busy(key) {
             return Err(EditAdmissionRefusal::Editor);
         }
         self.try_begin_edit_mode(index, key, owner, venue, false)

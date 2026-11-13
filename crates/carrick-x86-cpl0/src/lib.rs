@@ -87,6 +87,44 @@ mod test_support {
     /// Release a held birth from its waiter's own call; 0 also when the
     /// waiter's park already released it.
     pub const INJECT_RELEASE_HELD_BIRTH: u64 = 0xffff_ffff_ffff_fe21;
+    /// The next owner fault's application step is Busy once (#2141): after
+    /// its physical supply crossing returns, before the guest applies it.
+    /// The synthetic editor holder releases once the faulting member parks.
+    pub const INJECT_POST_SUPPLY_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe22;
+    /// Post-supply Busies injected so far: COW supplies in the high 32 bits,
+    /// Prepare supplies in the low 32 bits.
+    pub const INJECT_POST_SUPPLY_CENSUS: u64 = 0xffff_ffff_ffff_fe23;
+    /// As [`INJECT_POST_SUPPLY_BUSY_ONCE`], but the synthetic holder stays
+    /// held after the faulting member parks, until another member's
+    /// [`INJECT_RELEASE_POST_SUPPLY_HOLD`].
+    pub const INJECT_POST_SUPPLY_BUSY_HELD: u64 = 0xffff_ffff_ffff_fe24;
+    /// Release a held post-supply holder from another member: publish the
+    /// held MM's Editor release once its waiter has parked. 1 if released.
+    pub const INJECT_RELEASE_POST_SUPPLY_HOLD: u64 = 0xffff_ffff_ffff_fe25;
+    static POST_SUPPLY_BUSY: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static POST_SUPPLY_HOLD: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// Whether a held post-supply holder must outlive its waiter's park.
+    pub fn post_supply_held() -> bool {
+        POST_SUPPLY_HOLD.load(Ordering::Acquire)
+    }
+    static POST_SUPPLY_CENSUS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// Called once an owner fault's supply crossing returned: hold this
+    /// MM's editor (only this MM's) for the application step that follows,
+    /// if armed.
+    pub fn hold_editor_after_supply(mm: u64, cow: bool) {
+        if !POST_SUPPLY_BUSY.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if !carrick_sched_core::spaces::inject_editor_busy_once_for(mm) {
+            carrick_x86_carrier::entry::fatal_boot();
+        }
+        POST_SUPPLY_CENSUS.fetch_add(if cow { 1 << 32 } else { 1 }, Ordering::AcqRel);
+    }
     const BIRTH_ARMED: u8 = 1;
     const BIRTH_HELD: u8 = 2;
     const BIRTH_RELEASED: u8 = 3;
@@ -365,6 +403,27 @@ mod test_support {
                     Ordering::Acquire,
                 );
                 Some(0)
+            }
+            INJECT_POST_SUPPLY_BUSY_ONCE => {
+                (!POST_SUPPLY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
+            }
+            INJECT_POST_SUPPLY_CENSUS => Some(POST_SUPPLY_CENSUS.load(Ordering::Acquire)),
+            INJECT_POST_SUPPLY_BUSY_HELD => {
+                if POST_SUPPLY_HOLD.swap(true, Ordering::AcqRel) {
+                    return None;
+                }
+                (!POST_SUPPLY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
+            }
+            INJECT_RELEASE_POST_SUPPLY_HOLD => {
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                if !POST_SUPPLY_HOLD.swap(false, Ordering::AcqRel) {
+                    return None;
+                }
+                Some(u64::from(crate::anonymous::release_held_editor(
+                    carrick_x86_carrier::native_execution::source(slot),
+                )))
             }
             INJECT_OWNED_COPY_BUSY_ONCE => {
                 (!OWNED_COPY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)
