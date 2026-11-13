@@ -297,6 +297,10 @@ struct DeferredSlot {
     end: AtomicU64,
     sequence: AtomicU64,
     epoch: AtomicU64,
+    /// When the slot's current extent was first journaled, on the table's
+    /// owed-return clock: a full table's drain settles holders oldest
+    /// first by this, never by physical slot order, which reuse scrambles.
+    admitted: AtomicU64,
 }
 impl DeferredSlot {
     /// Free the slot. Only a [`ReturnSettlement`] reaches here: a matched
@@ -305,12 +309,14 @@ impl DeferredSlot {
         self.start.store(0, Ordering::Relaxed);
         self.end.store(0, Ordering::Relaxed);
         self.sequence.store(0, Ordering::Relaxed);
+        self.admitted.store(0, Ordering::Relaxed);
         self.epoch.fetch_add(1, Ordering::Relaxed);
         self.mm.store(0, Ordering::Release);
     }
     /// Give back a claimed slot whose retirement never committed: it never
     /// held an extent, so no settlement is owed and its epoch is unchanged.
     fn abandon(&self) {
+        self.admitted.store(0, Ordering::Relaxed);
         self.mm.store(0, Ordering::Release);
     }
 }
@@ -490,6 +496,10 @@ pub struct SharedReservations<Policy: ReservationPolicy, Geometry: ReservationGe
     /// whose own `admitted` stays the authority.
     admitted: [AtomicU64; ROOTS / 64],
     deferred: [DeferredSlot; DEFERRED_SLOTS],
+    /// The owed-return clock: advanced once per slot a retirement claims,
+    /// stamped into the slot ([`DeferredSlot::admitted`]) so holders order
+    /// by age.
+    owed_return_clock: AtomicU64,
     /// The owed-return settlement single flight, one word per claimant vCPU
     /// slot ([`SettlementClaim`]): a claimant rings from inside one exit, so
     /// a slot holds at most one claim, and per-root words would not fit the
@@ -549,21 +559,34 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             .all(|slot| slot.mm.load(Ordering::Acquire) != 0)
     }
 
-    /// Each MM holding a slot of the shared owed-return table, once, in
-    /// table order, except `except`: the holders a full table's drain
-    /// settles one at a time. Retired MMs' slots are listed too; only their
-    /// release receipt frees them, so a drain finds no live root for them.
+    /// Each MM holding a slot of the shared owed-return table, once, oldest
+    /// first, except `except`: the holders a full table's drain settles one
+    /// at a time. An MM's age is its oldest slot's admission on the table's
+    /// owed-return clock, so a slot freed and reused by a younger MM sorts
+    /// after every older holder whatever its physical index (#1482 P0-1).
+    /// Retired MMs' slots are listed too; only their release receipt frees
+    /// them, so a drain finds no live root for them.
     pub fn owed_return_holders(&self, except: ReservationMm, visit: &mut dyn FnMut(ReservationMm)) {
+        // (age, first slot, MM) per holder: one entry per slot at most, no
+        // allocation. The first slot breaks ties (a stamp not yet stored).
+        let mut holders = [(0u64, 0usize, 0u64); DEFERRED_SLOTS];
+        let mut count = 0;
         for (index, slot) in self.deferred.iter().enumerate() {
             let mm = slot.mm.load(Ordering::Acquire);
-            if mm == 0
-                || mm == except.raw()
-                || self.deferred[..index]
-                    .iter()
-                    .any(|earlier| earlier.mm.load(Ordering::Acquire) == mm)
-            {
+            if mm == 0 || mm == except.raw() {
                 continue;
             }
+            let admitted = slot.admitted.load(Ordering::Relaxed);
+            match holders[..count].iter_mut().find(|(_, _, held)| *held == mm) {
+                Some((age, _, _)) => *age = (*age).min(admitted),
+                None => {
+                    holders[count] = (admitted, index, mm);
+                    count += 1;
+                }
+            }
+        }
+        holders[..count].sort_unstable_by_key(|&(age, index, _)| (age, index));
+        for &(_, _, mm) in &holders[..count] {
             if let Some(mm) = ReservationMm::new(mm) {
                 visit(mm);
             }
@@ -3002,6 +3025,14 @@ impl<
                     .compare_exchange(0, mm, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
+                if !merge {
+                    // A fresh slot joins the drain order behind every
+                    // older holder's slots.
+                    let admitted = self.table.owed_return_clock.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.table.deferred[index]
+                        .admitted
+                        .store(admitted, Ordering::Relaxed);
+                }
                 return Ok(ReturnSlot { index, merge });
             }
         }

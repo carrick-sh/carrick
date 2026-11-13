@@ -331,6 +331,7 @@ impl X86AnonymousVenue<'_> {
         let task = self.task;
         let frame = &self.frame;
         let mut settle = settle;
+        let mut holder = None;
         let outcome = coordinate_anonymous_edit_wait(
             &source,
             resumed,
@@ -347,7 +348,8 @@ impl X86AnonymousVenue<'_> {
                                 record,
                             )
                         },
-                    );
+                    )
+                    .edit_probe(&mut holder);
                 }
                 let mut root = match table.lock_in(access, index.index(), mm, slot.index() as u32) {
                     Ok(root) => root,
@@ -441,6 +443,20 @@ impl X86AnonymousVenue<'_> {
                 result
             },
         );
+        // A full owed-return table that no holder could drain: wait on the
+        // refusing holder's release instead of rerunning (#1482 P0-1).
+        let outcome = match (outcome, holder) {
+            (EditWaitOutcome::NoConflict, Some(wait)) => {
+                carrick_core::wait::coordinate_holder_release_wait(
+                    zone,
+                    wait,
+                    |key, snapshot, token, still_blocked| {
+                        park_saved_context(zone, slot, saved, key, snapshot, token, still_blocked)
+                    },
+                )
+            }
+            (outcome, _) => outcome,
+        };
         match outcome {
             EditWaitOutcome::Parked(mut parked) => {
                 #[cfg(feature = "test-support")]
@@ -464,6 +480,58 @@ impl X86AnonymousVenue<'_> {
 struct X86AnonymousEditor {
     words: InitialWords,
     sequence: Option<carrick_el1::memory::AnonymousEditGeneration>,
+}
+
+/// Park the executing record's unchanged syscall context on `key` until its
+/// release (a foreign holder's, #1482 P0-1). `still_blocked` rechecks the
+/// observed revision under the queue guard; a refused park restores the
+/// record's context.
+fn park_saved_context<'z>(
+    zone: &'z X86Cpl0Zone,
+    slot: carrick_sched_core::SlotId,
+    saved: ParkedContextWords,
+    key: carrick_sched_core::object_wait::ObjectWaitKey,
+    snapshot: carrick_sched_core::object_wait::ObjectStateSnapshot,
+    token: carrick_sched_core::object_wait::OperationToken,
+    still_blocked: &dyn Fn() -> bool,
+) -> Result<
+    carrick_core::wait::ObjectParked<'z, ParkedContextWords>,
+    (
+        ObjectWaitError,
+        carrick_sched_core::object_wait::OperationToken,
+    ),
+> {
+    let request =
+        carrick_core::wait::ObjectParkRequest::from_locked_snapshot(key, snapshot, token, None);
+    let mut replaced = None;
+    let result = carrick_core::wait::park_object_record_rechecked(
+        zone,
+        slot,
+        request,
+        &|effects| {
+            crate::native_process::release(zone, carrick_sched_core::Waker::El1 { slot }, effects)
+        },
+        || {
+            let record = zone
+                .slot(slot)
+                .current()
+                .or_else(|| zone.slot(slot).host_record())
+                .ok_or(ObjectWaitError::Stale)?;
+            // SAFETY: the executing slot owns its current record until the park publishes.
+            let context = unsafe { zone.record(record).ctx_mut() };
+            replaced = Some((record, *context));
+            *context = saved;
+            Ok((record, false))
+        },
+        still_blocked,
+    );
+    if result.is_err()
+        && let Some((record, previous)) = replaced
+    {
+        // SAFETY: a failed park leaves the same current slot owning this record.
+        *unsafe { zone.record(record).ctx_mut() } = previous;
+    }
+    result
 }
 impl X86AnonymousEditor {
     fn edit(

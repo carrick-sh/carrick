@@ -191,24 +191,28 @@ pub fn cross_hvc_wait_channel_wake(mm: u64, address: u64, cpu: u64) -> Result<()
 
 /// Ring the owed-return settlement doorbell for `record` (#1369 slice 3):
 /// the carrier settles the MM at an exclusion, releases the record's claim
-/// in its epilogue and answers in x1, recorded in the record. An answer the
-/// record cannot hold leaves it unanswered (stale).
+/// in its epilogue and answers in x1 to x3 (the answer word, then a full
+/// table's holder MM and revision, #1482 P0-1), recorded in the record. An
+/// answer the record cannot hold leaves it unanswered (stale).
 pub fn cross_hvc_return_settlement(record: &mut carrick_el1_abi::ReturnSettlementDoorbell) {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status = carrick_el1_abi::GRANT_OP_RETURN_SETTLE;
-        let mut reply = record.words[1];
+        let mut answer = record.words[1];
+        let mut holder = record.words[2];
+        let mut revision = record.words[3];
         // SAFETY: synchronous stopped-CPU crossing; the carrier authenticates
         // the stopped execution's MM against x1 and the claim in x2/x3.
         unsafe {
             core::arch::asm!("hvc #6", inout("x0") status,
-                inout("x1") reply, inlateout("x2") record.words[2] => _,
-                inlateout("x3") record.words[3] => _, options(nostack));
+                inout("x1") answer, inout("x2") holder,
+                inout("x3") revision, options(nostack));
         }
         if status == carrick_el1_abi::METADATA_GRANT_SUCCESS
-            && let Some(reply) = carrick_el1_abi::SettlementDoorbellReply::from_raw(reply)
+            && carrick_el1_abi::SettlementDoorbellAnswer::from_words([answer, holder, revision])
+                .is_some()
         {
-            record.answer(reply);
+            record.set_reply_words([answer, holder, revision]);
         }
     }
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]

@@ -22,11 +22,12 @@
 //! each journal step.
 use super::*;
 use carrick_el1_abi::{
-    OwedReturnRetirement, Refusal, ReturnJournal, ReturnSettlementRequest, SettlementDoorbellReply,
+    OwedReturnRetirement, Refusal, ReturnJournal, ReturnSettlementRequest,
+    SettlementDoorbellAnswer, SettlementDoorbellReply,
 };
 use carrick_hal::return_settlement::{
-    PauseSettlement, ReturnJournalAccess, pause_settlement, settle_in_bounded_pauses,
-    settle_ring_owned_returns,
+    DrainOutcome, HolderRevisions, OwedReturnDrain, PauseSettlement, ReturnJournalAccess,
+    pause_settlement, settle_in_bounded_pauses, settle_ring_owned_returns,
 };
 use carrick_sched_core::spaces::notification::{
     ExclusionRefusal, SpaceAccess, SpaceReleaseVenue, SpaceWaitCause, SpaceWakeDelivery,
@@ -194,7 +195,7 @@ pub(crate) fn settle_native_returns(
 /// `GRANT_OP_RETURN_SETTLE`: a ring thread of the stopped native child
 /// claimed the single flight and needs its MM's owed returns settled.
 /// Exclude, settle, then, whatever happened, release the claim and publish
-/// `Reservations` (the exit epilogue), and answer in x1.
+/// `Reservations` (the exit epilogue), and answer in x1 to x3.
 pub(super) fn service_return_settlement(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
@@ -223,23 +224,27 @@ pub(super) fn service_return_settlement(
         && child_root.is_some_and(|root| {
             root.address().raw() == ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
         });
-    let reply = if own {
+    let answer = if own {
         settle_at_doorbell(custody, zone, mm).and_then(|reply| {
             if reply == SettlementDoorbellReply::Settled {
-                drain_owed_return_table(custody, region, zone, mm)?;
+                drain_owed_return_table(custody, region, zone, mm)
+            } else {
+                Ok(reply.into())
             }
-            Ok(reply)
         })
     } else {
         // Not the stopped native child's own MM: no effect.
-        Ok(SettlementDoorbellReply::Stale)
+        Ok(SettlementDoorbellReply::Stale.into())
     };
     // The epilogue releases the claim the record names whatever happened:
     // an exact-word compare-and-swap, so a stale word never releases a
     // newer claim.
     let released = release_settlement_claim(custody, region, zone, mm, claim);
-    match (reply, released) {
-        (Ok(reply), true) => [METADATA_GRANT_SUCCESS, reply as u64, 0, 0],
+    match (answer, released) {
+        (Ok(answer), true) => {
+            let [word, holder, revision] = answer.to_words();
+            [METADATA_GRANT_SUCCESS, word, holder, revision]
+        }
         _ => [METADATA_GRANT_ERR_DENIED, 0, 0, 0],
     }
 }
@@ -276,34 +281,75 @@ fn settle_at_doorbell(
     .unwrap_or(Ok(SettlementDoorbellReply::Stale))
 }
 
-/// The shared owed-return table is full of other MMs' slots: settle the
-/// other native holders, one exclusion at a time (never holding one MM's
-/// exclusion while raising another's), until a slot is free. A holder whose
-/// ring editor is active is skipped: its editor section never blocks, and
-/// the caller's rerun rings again if the table is still full. The
-/// host-served root's slots settle at its host venue; retired MMs' slots
-/// wait for their release receipts.
+/// The HVF venue of the one neutral drain: the shared table, each native
+/// holder's live source in the zone, and the carrier's bounded doorbell
+/// drive.
+struct NativeDrain<'a> {
+    custody: &'a crate::trap::CarrierVmCustody,
+    table: &'a carrick_el1::memory::reservations::SharedReservations,
+    zone: &'a Zone,
+}
+impl OwedReturnDrain for NativeDrain<'_> {
+    type Error = TrapError;
+    fn table_full(&self) -> bool {
+        self.table.owed_return_table_full()
+    }
+    fn observe(&mut self, holder: carrick_el1_abi::ReservationMm) -> Option<HolderRevisions> {
+        let source = self
+            .zone
+            .space_entry(core::num::NonZeroU64::new(holder.raw())?)?
+            .live_notifications()
+            .ok()?;
+        Some(HolderRevisions {
+            editor: source.observe(SpaceWaitCause::Editor).revision(),
+            reservations: source.observe(SpaceWaitCause::Reservations).revision(),
+            pending_edit: source.observe(SpaceWaitCause::PendingEdit).revision(),
+        })
+    }
+    fn settle(
+        &mut self,
+        holder: carrick_el1_abi::ReservationMm,
+    ) -> Result<SettlementDoorbellReply, TrapError> {
+        settle_at_doorbell(self.custody, self.zone, holder)
+    }
+}
+
+/// The shared owed-return table is full of other MMs' slots: the one
+/// neutral drain ([`carrick_hal::return_settlement::drain_owed_return_table`])
+/// settles the other native holders, oldest first, one MM's exclusions at a
+/// time. When none could free a slot, the answer is the oldest refusing
+/// holder's wait authority, so the caller waits on the holder that prevents
+/// progress (#1482 P0-1). The host-served root's slots settle at its host
+/// venue (it answers stale here); retired MMs' slots wait for their release
+/// receipts.
 fn drain_owed_return_table(
     custody: &crate::trap::CarrierVmCustody,
     region: RetainedAbiRegion<'_>,
     zone: &Zone,
     caller: carrick_el1_abi::ReservationMm,
-) -> Result<(), TrapError> {
+) -> Result<SettlementDoorbellAnswer, TrapError> {
     let Some(table) = retained_reservations(region) else {
-        return Ok(());
+        return Ok(SettlementDoorbellReply::Settled.into());
     };
     if !table.owed_return_table_full() {
-        return Ok(());
+        return Ok(SettlementDoorbellReply::Settled.into());
     }
     let mut holders = Vec::new();
     table.owed_return_holders(caller, &mut |holder| holders.push(holder));
-    for holder in holders {
-        settle_at_doorbell(custody, zone, holder)?;
-        if !table.owed_return_table_full() {
-            break;
-        }
-    }
-    Ok(())
+    let outcome = carrick_hal::return_settlement::drain_owed_return_table(
+        &mut NativeDrain {
+            custody,
+            table,
+            zone,
+        },
+        &holders,
+    )?;
+    Ok(match outcome {
+        DrainOutcome::Wait(wait) => SettlementDoorbellAnswer::Holder(wait),
+        // Room, or only retiring holders whose release receipts free their
+        // slots: rerun.
+        DrainOutcome::Room | DrainOutcome::Retiring => SettlementDoorbellReply::Settled.into(),
+    })
 }
 
 /// The doorbell's exit epilogue: release the claim from its exact word and
