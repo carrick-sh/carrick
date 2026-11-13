@@ -3491,9 +3491,10 @@ impl Counters {
         result: i64,
         pc: u64,
         slot: u64,
-        binding: ExecutionBinding,
+        binding: Option<ExecutionBinding>,
     ) {
-        if result >= 0 || matches!(result, -4 | -11 | -110) {
+        let wait = matches!(arguments[1] & 0x7f, 0 | 9);
+        if result == 0 || matches!(result, -4 | -11 | -110) || (result > 0 && !wait) {
             return;
         }
         self.publish_syscall_frame([
@@ -3501,10 +3502,10 @@ impl Counters {
             carrick_syscall_abi::nr::FUTEX.raw(),
             pc,
             slot,
-            binding.mm.raw(),
-            binding.generation.raw(),
-            binding.task.raw(),
-            binding.thread_generation.raw(),
+            binding.map_or(0, |binding| binding.mm.raw()),
+            binding.map_or(0, |binding| binding.generation.raw()),
+            binding.map_or(0, |binding| binding.task.raw()),
+            binding.map_or(0, |binding| binding.thread_generation.raw()),
             arguments[0],
             arguments[1],
             arguments[2],
@@ -3513,6 +3514,20 @@ impl Counters {
             arguments[5],
             result as u64,
         ]);
+    }
+
+    /// The final ARM native refusal owns the actual errno 38 decision but has
+    /// no execution binding parameter. Zero identity fields mean unavailable.
+    pub fn record_futex_refusal(&self, frame: &TrapFrame) {
+        if frame.x[8] == carrick_syscall_abi::nr::FUTEX.raw() {
+            self.record_futex_error(
+                core::array::from_fn(|i| frame.x[i]),
+                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+                frame.elr,
+                frame.slot,
+                None,
+            );
+        }
     }
 
     fn publish_syscall_frame(&self, words: [u64; 15]) {
@@ -3539,22 +3554,7 @@ impl Counters {
             let word = |i: usize| row[i].load(Ordering::Relaxed);
             let source = SyscallFrameSource::from_code(word(1)).map_or("unknown", |s| s.label());
             if word(1) == SyscallFrameSource::FutexErrorReturn as u64 {
-                writeln!(
-                    output,
-                    "futex-error sample={sample} pc={:#x} slot={} task={} thread={} address={:#x} op={} value={} timeout={:#x} uaddr2={:#x} mask={:#x} result={} errno={}",
-                    word(3),
-                    word(4),
-                    word(7),
-                    word(8),
-                    word(9),
-                    word(10),
-                    word(11),
-                    word(12),
-                    word(13),
-                    word(14),
-                    word(15) as i64,
-                    (word(15) as i64).unsigned_abs()
-                )?;
+                Self::write_futex_error_sample(output, sample, row)?;
                 continue;
             }
 
@@ -3585,6 +3585,53 @@ impl Counters {
         writeln!(
             output,
             "syscall-frame samples={}/32 (bounded prefix; not a census)",
+            self.syscall_frame_slots.load(Ordering::Relaxed)
+        )
+    }
+
+    fn write_futex_error_sample(
+        output: &mut impl core::fmt::Write,
+        sample: usize,
+        row: &[AtomicU64; 16],
+    ) -> core::fmt::Result {
+        let word = |i: usize| row[i].load(Ordering::Relaxed);
+        writeln!(
+            output,
+            "futex-error sample={sample} pc={:#x} slot={} task={} thread={} address={:#x} op={} value={} timeout={:#x} uaddr2={:#x} mask={:#x} result={} errno={}",
+            word(3),
+            word(4),
+            word(7),
+            word(8),
+            word(9),
+            word(10),
+            word(11),
+            word(12),
+            word(13),
+            word(14),
+            word(15) as i64,
+            if (word(15) as i64) < 0 {
+                (word(15) as i64).unsigned_abs()
+            } else {
+                0
+            }
+        )?;
+        Ok(())
+    }
+
+    /// A futex-only view; ppoll frames cannot masquerade as futex evidence.
+    pub fn write_futex_errors(&self, output: &mut impl core::fmt::Write) -> core::fmt::Result {
+        let mut count = 0;
+        for (sample, row) in self.syscall_frames.iter().enumerate() {
+            if row[0].load(Ordering::Acquire) == 1
+                && row[1].load(Ordering::Relaxed) == SyscallFrameSource::FutexErrorReturn as u64
+            {
+                Self::write_futex_error_sample(output, sample, row)?;
+                count += 1;
+            }
+        }
+        writeln!(
+            output,
+            "futex-error samples={count} shared-slots={}/32 (bounded prefix; not a census)",
             self.syscall_frame_slots.load(Ordering::Relaxed)
         )
     }
@@ -5340,20 +5387,20 @@ mod tests {
         };
         let args = [0x1001, 393, 7, 0, 0, 0xffff_ffff];
         for result in [0, -4, -11, -110] {
-            counters.record_futex_error(args, result, 0x400004, 2, binding);
+            counters.record_futex_error(args, result, 0x400004, 2, Some(binding));
         }
         let mut wake = args;
         wake[1] = 129;
-        counters.record_futex_error(wake, 1, 0x400004, 2, binding);
+        counters.record_futex_error(wake, 1, 0x400004, 2, Some(binding));
         assert_eq!(counters.syscall_frame_slots.load(Ordering::Relaxed), 0);
-        counters.record_futex_error(args, 7, 0x400004, 2, binding);
+        counters.record_futex_error(args, 7, 0x400004, 2, Some(binding));
         assert_eq!(
             counters.syscall_frame_slots.load(Ordering::Relaxed),
             1,
             "a positive wait return is a protocol error, not a wake count"
         );
         for _ in 0..40 {
-            counters.record_futex_error(args, -22, 0x400004, 2, binding);
+            counters.record_futex_error(args, -22, 0x400004, 2, Some(binding));
         }
         assert_eq!(counters.syscall_frame_slots.load(Ordering::Relaxed), 32);
         let snapshot = counters.copy_snapshot();

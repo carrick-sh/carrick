@@ -826,6 +826,7 @@ pub fn count_unclaimed_native_refusal(
 /// Answer an unclaimed native syscall with a counted ENOSYS in ring.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
+    counters.record_futex_refusal(frame);
     frame.x[0] = count_unclaimed_native_refusal(
         carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
         counters,
@@ -3536,6 +3537,24 @@ impl<
                     == carrick_personality_linux::lifecycle::SYS_GETPID as u64)
     }
     fn install_result(&mut self, result: SyscallResult) {
+        // Continuation results and strict crossing refusals bypass the family.
+        // Observe before installing the result, while arg0 is still the operand.
+        if self.frame.canonical_ordinal().raw() == carrick_syscall_abi::nr::FUTEX.raw() {
+            let arguments = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
+            let binding = self
+                .current_tasks
+                .get(self.frame.task_index())
+                .map(crate::common_entry::execution_binding);
+            let pc = self.frame.arm_frame_ref().map_or(0, |frame| frame.elr);
+            self.counters.record_futex_error(
+                arguments,
+                result.raw(),
+                pc,
+                self.frame.task_index() as u64,
+                binding,
+            );
+        }
+
         self.frame
             .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
@@ -3756,7 +3775,7 @@ impl<
         };
         if let (Some(result), Some(binding)) = (result, binding) {
             self.counters
-                .record_futex_error(arguments, result, pc, slot, binding);
+                .record_futex_error(arguments, result, pc, slot, Some(binding));
         }
         completion
     }
