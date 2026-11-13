@@ -203,10 +203,8 @@ pub(super) fn service_return_settlement(
     else {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     };
-    let Some((task, _)) = stopped_records(region, cpu) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
-    };
-    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    let binding = stopped_records(region, cpu)
+        .map(|(task, _)| carrick_core::entry::binding(&task.execution, &task.mm));
     let (Some(mm), Some(claim)) = (
         carrick_el1_abi::ReservationMm::new(args[0]),
         u32::try_from(args[2])
@@ -216,27 +214,25 @@ pub(super) fn service_return_settlement(
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     };
     let child_root = custody.fork_stock.lock().owner.child_root(mm);
-    if !request_has_live_vm(custody, generation)
-        || binding.mm.raw() != mm.raw()
-        || child_root.is_none_or(|root| {
-            root.address().raw() != ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
+    let own = request_has_live_vm(custody, generation)
+        && binding.is_some_and(|binding| binding.mm.raw() == mm.raw())
+        && child_root.is_some_and(|root| {
+            root.address().raw() == ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
+        });
+    let reply = if own {
+        settle_at_doorbell(custody, zone, mm).and_then(|reply| {
+            if reply == SettlementDoorbellReply::Settled {
+                drain_owed_return_table(custody, region, zone, mm)?;
+            }
+            Ok(reply)
         })
-    {
-        // Not the stopped native child's own MM: no effect, and the claim
-        // stays with the epilogue of the doorbell that names it.
-        return [
-            METADATA_GRANT_SUCCESS,
-            SettlementDoorbellReply::Stale as u64,
-            0,
-            0,
-        ];
-    }
-    let reply = settle_at_doorbell(custody, zone, mm).and_then(|reply| {
-        if reply == SettlementDoorbellReply::Settled {
-            drain_owed_return_table(custody, region, zone, mm)?;
-        }
-        Ok(reply)
-    });
+    } else {
+        // Not the stopped native child's own MM: no effect.
+        Ok(SettlementDoorbellReply::Stale)
+    };
+    // The epilogue releases the claim the record names whatever happened:
+    // an exact-word compare-and-swap, so a stale word never releases a
+    // newer claim.
     let released = release_settlement_claim(custody, region, zone, mm, claim);
     match (reply, released) {
         (Ok(reply), true) => [METADATA_GRANT_SUCCESS, reply as u64, 0, 0],
