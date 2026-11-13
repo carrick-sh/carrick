@@ -3744,3 +3744,51 @@ fn zone_exec_status_pipe_reports_child_exec_failure_then_eof() {
         "exec failure report and EOF stage"
     );
 }
+
+/// Director follow-up: reverse the existing peers so a fork child owns the
+/// blocked poll and read, while its live parent produces the exact byte.
+#[test]
+fn zone_pipe_child_poll_wakes_on_parent_write_within_five_seconds() {
+    let elf =
+        native_exit_fixture_with_flags("native_pipe_poll_wake.S", &["-DUSE_POLL", "-DCHILD_POLLS"]);
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o700);
+    let native = std::process::Command::new("timeout")
+        .arg("5")
+        .arg(&oracle)
+        .status()
+        .expect("bounded native oracle");
+    assert_eq!(
+        native.code(),
+        Some(7),
+        "native child poll oracle: {native:?}"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(try_run_pool_fixture_with_root_affinity(
+            &elf,
+            256,
+            ROOT_AFFINITY_IDLE_PEER,
+        ));
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("fork child poll must wake within five seconds")
+        .expect("child poll run");
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "child poll/read and parent write/reap"
+    );
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    for ordinal in [63, 64, 73] {
+        assert_eq!(
+            counters.forwarded[ordinal].load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "zone pipe read/write/poll must stay in ring",
+        );
+    }
+}
