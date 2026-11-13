@@ -954,8 +954,19 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
                     },
                 ) {
                     Ok(delivered) => delivered,
-                    Err(error) => {
-                        vector_error = Some(error);
+                    Err(carrick_el1_abi::ipc::VectorInputInvariant::Token(error)) => {
+                        vector_error =
+                            Some(carrick_el1_abi::ipc::VectorInputInvariant::Token(error));
+                        0
+                    }
+                    Err(carrick_el1_abi::ipc::VectorInputInvariant::Custody(error)) => {
+                        vector_error =
+                            Some(carrick_el1_abi::ipc::VectorInputInvariant::Custody(error));
+                        0
+                    }
+                    Err(carrick_el1_abi::ipc::VectorInputInvariant::CorruptRange) => {
+                        vector_error =
+                            Some(carrick_el1_abi::ipc::VectorInputInvariant::CorruptRange);
                         0
                     }
                 },

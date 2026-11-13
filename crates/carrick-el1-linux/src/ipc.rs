@@ -1355,16 +1355,20 @@ fn run<E: IpcExecution, M: UserCopy>(
             },
             |copy, at, src| {
                 if vectored_io {
-                    venue
+                    match venue
                         .region
                         .copy_vector_output(&token, at, src, |address, bytes| {
                             copy.copy_out(address.0, bytes)
-                        })
-                        .unwrap_or_else(|_| {
-                            crate::dispatch::invalid_completion(
-                                crate::dispatch::NativeInvariant::EntryBinding,
-                            )
-                        })
+                        }) {
+                        Ok(delivered) => delivered,
+                        Err(
+                            carrick_el1_abi::ipc::VectorInputInvariant::Token(_)
+                            | carrick_el1_abi::ipc::VectorInputInvariant::Custody(_)
+                            | carrick_el1_abi::ipc::VectorInputInvariant::CorruptRange,
+                        ) => crate::dispatch::invalid_completion(
+                            crate::dispatch::NativeInvariant::EntryBinding,
+                        ),
+                    }
                 } else {
                     copy.copy_out(buf.wrapping_add(at), src)
                 }
