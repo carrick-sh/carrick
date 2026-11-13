@@ -40,3 +40,11 @@ fn fork_child_exit_group_retires_runnable_worker() {
         "fork_child_exit_group_retires_runnable_worker",
     );
 }
+
+#[test]
+fn fork_child_exit_group_retires_computing_worker() {
+    group_exit(
+        &["-DCOMPUTING_WORKER"],
+        "fork_child_exit_group_retires_computing_worker",
+    );
+}
