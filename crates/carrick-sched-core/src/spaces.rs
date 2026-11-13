@@ -1029,6 +1029,29 @@ impl AddressSpaces {
     pub fn active_editor(&self, index: SpaceIndex) -> Option<NonZeroU64> {
         NonZeroU64::new(self.entry(index).active_editor.load(Ordering::SeqCst))
     }
+
+    /// Host fixtures only: take `index`'s editor word as `owner` with no
+    /// guard, as an active ring editor holds it, so contention is real.
+    /// The holder must give it back with [`Self::fixture_release_editor`]
+    /// and then publish the space's exact `Editor` release itself.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn fixture_claim_editor(&self, index: SpaceIndex, key: u64, owner: NonZeroU64) -> bool {
+        let entry = self.entry(index);
+        entry.key.load(Ordering::SeqCst) == key
+            && entry
+                .active_editor
+                .compare_exchange(0, owner.get(), Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+
+    /// Give back an editor word [`Self::fixture_claim_editor`] took.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn fixture_release_editor(&self, index: SpaceIndex, owner: NonZeroU64) -> bool {
+        self.entry(index)
+            .active_editor
+            .compare_exchange(owner.get(), 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
 }
 
 #[cfg(test)]

@@ -3998,3 +3998,86 @@ fn production_gib_owed_extent_settles_one_chunk_per_pause_in_one_doorbell() {
         "one chunk per exclusion: {counts:?}"
     );
 }
+
+/// #1482 P0-1, Busy once, then success, on the production doorbell: a full
+/// owed-return table whose holders are busy. Eight holder processes fill
+/// the shared 64-slot table and sleep. The root retires a resident page,
+/// which needs a slot; the drain finds every holder's editor held (by the
+/// fixture, at the first full-table drain, as active ring editors hold it).
+/// The root must ring exactly once and park on the oldest busy holder's
+/// release, releasing its execution lane: nothing reruns while the holder
+/// holds. The fixture releases only once the root is parked on that
+/// release (or at its bound, which fails the witness); the root then reruns,
+/// its second doorbell drains a holder and its retirement is served.
+#[test]
+fn production_full_owed_return_table_parks_on_its_busy_holder_until_release() {
+    let elf = native_exit_fixture("native_owed_return_table_full.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("run native oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let program = carrick_mem::elf::ElfProgram::load(&elf, ELF_X86_64_MACHINE, &|_| None)
+            .expect("ELF program");
+        let mut hold = None;
+        let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+            &program,
+            4096,
+            ROOT_AFFINITY_LOADED,
+            |carrier| {
+                hold = Some(
+                    carrier.fixture_hold_owed_return_holders(1, std::time::Duration::from_secs(20)),
+                );
+            },
+            carrick_kernel::dispatch::SyscallDispatcher::default(),
+        )
+        .map_err(|failure| failure.error);
+        let _ = tx.send((outcome, hold));
+    });
+    let (outcome, hold) = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("the full-table run must complete, not hang");
+    // Before #1482 P0-1 the drain skipped the busy holders and answered
+    // `Settled`, so the root reran and rang again until the guest exit
+    // budget ran out.
+    let outcome =
+        outcome.expect("full owed-return table run (an exit budget overrun is a rerun loop)");
+    let hold = hold.expect("holder fixture armed");
+    let held = hold.held();
+    let while_held = hold.doorbells_while_held();
+    let released_on_park = hold.finish().expect("fixture release");
+    let counts = outcome
+        .physical
+        .return_settlement_counters()
+        .expect("settlement counts");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None),
+        "first step that differs from Linux (see native_owed_return_table_full.S): \
+         held {held:?}, doorbells while held {while_held}, released on park \
+         {released_on_park}, {counts:?}: {:?}",
+        outcome.run
+    );
+    assert_eq!(held.len(), 8, "the drain met eight busy holders: {held:?}");
+    assert!(
+        released_on_park,
+        "the holders were released at the fixture's bound, not because the root \
+         parked on their release: doorbells while held {while_held}, {counts:?}"
+    );
+    assert_eq!(
+        (while_held, counts.holder_waits),
+        (1, 1),
+        "the root rang once and parked on the holder; it never reran while the \
+         holder held: {counts:?}"
+    );
+    assert_eq!(
+        counts.doorbells, 2,
+        "busy once, then success: one refused doorbell, one after the release: {counts:?}"
+    );
+}

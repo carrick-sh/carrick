@@ -4256,6 +4256,52 @@ mod tests {
         assert_eq!(holders, vec![mms[1]]);
         assert!(!table.owed_return_table_full());
     }
+    /// #1482 P0-1: a full table's drain settles its oldest holder first. The
+    /// oldest MM's slot 0 is freed and a younger MM's retirement reuses it,
+    /// physically first: the holders still come oldest first (by the slots'
+    /// admission on the table's owed-return clock), not in slot order.
+    #[test]
+    fn owed_return_holders_come_oldest_first_after_slot_reuse() {
+        let table = table();
+        let mms = [1493, 1494, 1495, 1496].map(|mm| ReservationMm::new(mm).unwrap());
+        for (slot, mm) in mms.into_iter().enumerate() {
+            table.publish(slot, mm, layout()).unwrap();
+            table.lock(slot, mm).unwrap().finish_import().unwrap();
+        }
+        let rw = ReservationProtection::READ_WRITE;
+        // Admission order 0, 1, 2: each takes the lowest free slot.
+        for (slot, mm) in mms.into_iter().enumerate().take(3) {
+            let mut root = table.lock(slot, mm).unwrap();
+            let mapped = root.mmap(Placement::Fixed(0x100000), 0x8000, rw).unwrap();
+            complete(&mut root, mapped);
+            retire_owed(&mut root, range(0x100000, 0x101000));
+        }
+        // The oldest settles: slot 0 is free and the youngest reuses it.
+        settle_all(&mut table.lock(0, mms[0]).unwrap());
+        let mut youngest = table.lock(3, mms[3]).unwrap();
+        let mapped = youngest
+            .mmap(Placement::Fixed(0x100000), 0x8000, rw)
+            .unwrap();
+        complete(&mut youngest, mapped);
+        retire_owed(&mut youngest, range(0x100000, 0x101000));
+        drop(youngest);
+        assert_eq!(
+            table.deferred[0].mm.load(Ordering::Acquire),
+            mms[3].raw(),
+            "the youngest holder took physical slot 0"
+        );
+        let mut holders = Vec::new();
+        table.owed_return_holders(mms[0], &mut |mm| holders.push(mm));
+        assert_eq!(holders, vec![mms[1], mms[2], mms[3]], "oldest first");
+        // A holder's age is its oldest slot: a newer second slot of the
+        // oldest live holder does not make it younger.
+        let mut second = table.lock(1, mms[1]).unwrap();
+        retire_owed(&mut second, range(0x104000, 0x105000));
+        drop(second);
+        holders.clear();
+        table.owed_return_holders(mms[0], &mut |mm| holders.push(mm));
+        assert_eq!(holders, vec![mms[1], mms[2], mms[3]]);
+    }
     /// #1480 P0-2: final retirement is no settlement. A retired MM's owed
     /// slots stay owed under its key until its release receipt, so another
     /// MM's retirement never lands in them meanwhile. A failed release mints
