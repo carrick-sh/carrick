@@ -1234,6 +1234,7 @@ fn x86_child_exec_is_staged_then_counted_enosys() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     use carrick_abi::{
@@ -1612,11 +1613,47 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         AddressContext<RootGpa>,
         ParkedContextWords,
     >::new()));
-    let page: &'static ThreadLifecyclePage = Box::leak(Box::new(ThreadLifecyclePage::new()));
-    let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
-    let child_page: &'static ThreadLifecyclePage = Box::leak(Box::new(ThreadLifecyclePage::new()));
-    let child_controls: &'static [ThreadControlSlot; 9] =
-        Box::leak(Box::new(core::array::from_fn(|_| ThreadControlSlot::new())));
+    // CurrentTask authenticates lifecycle pointers in the metadata window.
+    // Keep these ABI records in a TestEl1Region mapped at that production
+    // address, rather than unrelated heap addresses that cannot be imported.
+    let metadata_len = core::mem::size_of::<TestEl1Region>();
+    let metadata_base = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE as *mut libc::c_void;
+    // SAFETY: request anonymous writable storage without replacing an existing
+    // mapping; the returned address is checked before constructing any view.
+    let mapped = unsafe {
+        libc::mmap(
+            metadata_base,
+            metadata_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    assert_eq!(mapped, metadata_base);
+    // SAFETY: the zeroed mapping is aligned and remains owned until this test
+    // process exits. No other test maps this fixture's metadata window.
+    let metadata = unsafe { &mut *mapped.cast::<TestEl1Region>() };
+    let page_bytes = core::mem::size_of::<ThreadLifecyclePage>().div_ceil(16384) * 16384;
+    let controls_offset = page_bytes * 2;
+    assert!(
+        controls_offset + core::mem::size_of::<ThreadControlSlot>() * 10
+            <= metadata_len.min(carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE as usize)
+    );
+    // SAFETY: these aligned, disjoint ABI ranges fit inside the mapped region.
+    // Each is initialized before reference publication and lives until exit.
+    let (page, child_page, control, child_controls) = unsafe {
+        let base = metadata.as_mut_ptr();
+        let page = base.cast::<ThreadLifecyclePage>();
+        let child = base.add(page_bytes).cast::<ThreadLifecyclePage>();
+        let control = base.add(controls_offset).cast::<ThreadControlSlot>();
+        let children = control.add(1).cast::<[ThreadControlSlot; 9]>();
+        page.write(ThreadLifecyclePage::new());
+        child.write(ThreadLifecyclePage::new());
+        control.write(ThreadControlSlot::new());
+        children.write(core::array::from_fn(|_| ThreadControlSlot::new()));
+        (&*page, &*child, &*control, &*children)
+    };
     let tasks: &'static [CurrentTask; 2] =
         Box::leak(Box::new([CurrentTask::new(), CurrentTask::new()]));
     let [task, peer_task] = tasks;
@@ -2052,6 +2089,11 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     assert_eq!(route, CompletionRoute::Served);
     assert!(epoll >= 0);
     let events = GuestUserBuffer::zeroed(12);
+    let live_identity = zone.record(child_record.id).identity();
+    assert_eq!(
+        live_identity,
+        carrick_el1_linux::sched::identity_of(peer_task, live_identity.affinity)
+    );
     let (route, result) = call_x86(
         &env,
         &child,
@@ -2059,7 +2101,79 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         281,
         [epoll as u64, events.arg(), 1, 0, 0, 0],
     );
-    assert_eq!((route, result), (CompletionRoute::Served, 0));
+    assert_eq!(
+        (route, result),
+        (CompletionRoute::Served, 0),
+        "canonical {:?}, ipc leaves {:?}",
+        decode_x86_64(281, [0; 6], 0).canonical,
+        counters
+            .ipc_leaves
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect::<Vec<_>>()
+    );
+
+    let (route, event) = call_x86(&env, &child, &mut service, 290, [0; 6]);
+    assert_eq!(route, CompletionRoute::Served);
+    assert!(event >= 0);
+    let mut interest = [0u8; 12];
+    interest[..4].copy_from_slice(&1u32.to_ne_bytes());
+    interest[4..].copy_from_slice(&0x1671u64.to_ne_bytes());
+    let interest = GuestUserBuffer::from_bytes(&interest);
+    assert_eq!(
+        call_x86(
+            &env,
+            &child,
+            &mut service,
+            233,
+            [epoll as u64, 1, event as u64, interest.arg(), 0, 0]
+        ),
+        (CompletionRoute::Served, 0)
+    );
+    let value = GuestUserBuffer::from_value(1u64);
+    assert_eq!(
+        call_x86(
+            &env,
+            &child,
+            &mut service,
+            1,
+            [event as u64, value.arg(), 8, 0, 0, 0]
+        ),
+        (CompletionRoute::Served, 8)
+    );
+    assert_eq!(
+        call_x86(
+            &env,
+            &child,
+            &mut service,
+            281,
+            [epoll as u64, events.arg(), 1, u64::MAX, 0, 0]
+        ),
+        (CompletionRoute::Served, 1)
+    );
+    assert_eq!(&events.as_bytes()[4..], &0x1671u64.to_ne_bytes());
+    let read_value = GuestUserBuffer::zeroed(8);
+    assert_eq!(
+        call_x86(
+            &env,
+            &child,
+            &mut service,
+            0,
+            [event as u64, read_value.arg(), 8, 0, 0, 0]
+        ),
+        (CompletionRoute::Served, 8)
+    );
+    let timeout = GuestUserBuffer::zeroed(16);
+    assert_eq!(
+        call_x86(
+            &env,
+            &child,
+            &mut service,
+            441,
+            [epoll as u64, events.arg(), 1, timeout.arg(), 0, 0]
+        ),
+        (CompletionRoute::Served, 0)
+    );
 
     // Two-live-process table isolation on x86 CPL0 while both root and child remain live:
     // Child closes fd 3; root's fd 3 stays open and root can dup(3) -> 4.
@@ -2082,6 +2196,16 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         child_dup_1, 3,
         "root close(1) must not close live child's fd 1"
     );
+    let (wait_route, _) = call_x86(
+        &env,
+        &child,
+        &mut service,
+        281,
+        [epoll as u64, events.arg(), 1, u64::MAX, 0, 0],
+    );
+    assert_eq!(wait_route, CompletionRoute::Suspended);
+    assert!(zone.slot(peer_slot).current().is_none());
+    assert!(zone.record(child_record.id).has_object_operation());
 }
 
 // #2160: every epoll_pwait the ring hands to the host names its cause in
