@@ -1774,6 +1774,36 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         )
     }
 
+    /// Move the authenticated carrier root to an exec successor whose tables
+    /// the adopter built from this stock's reserved pages (x86, #2142): the
+    /// root's form of [`Self::replace_child_for_exec_with_tables`]. The root
+    /// has no fork lifecycle/control row; its successor joins the child stock
+    /// exactly as an AArch64 root successor does.
+    pub fn replace_root_for_exec_with_tables(
+        &mut self,
+        execution: GrantExecution,
+        successor: carrick_el1_abi::El1MmHandle,
+        successor_root: RootGpa,
+        successor_physical: C,
+        tables: Vec<RootGpa>,
+    ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
+        let Some(successor_tag) = self.tags.allocate() else {
+            return Err((
+                ForkStockServiceError::Asid(AsidError::Exhausted),
+                successor_physical,
+            ));
+        };
+        self.replace_for_exec_with_tag(
+            execution,
+            successor,
+            successor_root,
+            successor_tag,
+            successor_physical,
+            true,
+            tables,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn replace_for_exec_with_tag(
         &mut self,

@@ -523,12 +523,31 @@ where
     )
 }
 
-/// Whether the native exec service owns this exec: only a ring-owned fork
-/// child's. A root or host-loaded task execs through the host, on either ISA.
+/// Where a run root's own exec is served.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootExecRoute {
+    /// The root's host vCPU loop drives the shared root exec transaction
+    /// (ARM HVPatch): the root's exec leaves the ring for its host task.
+    Host,
+    /// The run root is ring-native (x86 CPL0): no host loop executes it, so
+    /// its exec takes the native exec service exactly as a fork child's does,
+    /// and the carrier commits the host Kernel's half (#2142).
+    Ring,
+}
+
+/// Whether the native exec service owns this exec: a ring-owned fork
+/// child's always, and the run root's where its exec venue is the ring. A
+/// host-loaded task otherwise execs through the host.
 pub fn native_exec_claimed(
     owner: impl FnOnce() -> super::native_process_runtime::NativeThreadGroupOwner,
+    root: RootExecRoute,
 ) -> bool {
-    owner() == super::native_process_runtime::NativeThreadGroupOwner::ForkChild
+    use super::native_process_runtime::NativeThreadGroupOwner;
+    match owner() {
+        NativeThreadGroupOwner::ForkChild => true,
+        NativeThreadGroupOwner::Root => root == RootExecRoute::Ring,
+        NativeThreadGroupOwner::Unowned => false,
+    }
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -547,7 +566,7 @@ pub(super) fn arm_process_call_claimed(
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
         || match nr {
-            221 | 281 => native_exec_claimed(owner),
+            221 | 281 => native_exec_claimed(owner, RootExecRoute::Host),
             260 | 93 | 94 | 95 | 58 | 139 => owner() != NativeThreadGroupOwner::Unowned,
             _ => false,
         }

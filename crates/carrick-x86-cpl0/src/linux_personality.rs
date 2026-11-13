@@ -1354,12 +1354,16 @@ impl Personality for LinuxPersonality {
                     _ => fatal_boot(),
                 };
             }
-            // A fork child's execve/execveat is the native exec service's
-            // (#2235): stage its arguments exactly as ARM's owned entry
-            // does, then hand the payload to the shared owner, which parks
-            // until the carrier has prepared and sealed the successor.
+            // A fork child's and the ring-native root's execve/execveat are
+            // the native exec service's (#2235, #2142): stage the arguments
+            // exactly as ARM's owned entry does, then hand the payload to the
+            // shared owner, which parks until the carrier has prepared and
+            // sealed the successor.
             if route == CompletionRoute::NativeService
-                && carrick_el1_linux::dispatch::native_exec_claimed(|| process.thread_group_owner())
+                && carrick_el1_linux::dispatch::native_exec_claimed(
+                    || process.thread_group_owner(),
+                    carrick_el1_linux::dispatch::RootExecRoute::Ring,
+                )
                 && let Some(request) =
                     carrick_el1_linux::exec_stage::ExecStageRequest::from_canonical(
                         call.canonical.raw(),

@@ -1826,7 +1826,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         }
         drop(custody);
         if let Some(pending) = pending_exec {
-            let loaded = exec(&pending.payload);
+            let loaded = exec(pending.ticket.request().identity.birth.origin, &pending.payload);
             let mut custody = self
                 ._custody
                 .lock()
@@ -2230,7 +2230,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         }
         drop(custody);
         if let Some(pending) = pending_exec {
-            let loaded = exec(&pending.payload);
+            let loaded = exec(pending.ticket.request().identity.birth.origin, &pending.payload);
             let mut custody = self
                 ._custody
                 .lock()
@@ -2261,15 +2261,23 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     }
 }
 
-/// The carrier's exec loader for a fork child's staged payload (#2235),
-/// invoked with physical custody and CPU-I/O borrows released: the shared
-/// request parse, resolver and x86 image checks, or the exec's errno.
-pub type NativeExecLoadService<'a> =
-    dyn FnMut(&[u8]) -> Result<exec_service::X86ExecImage, carrick_abi::LinuxErrno> + 'a;
+/// The carrier's exec loader for a staged payload (#2235), invoked with
+/// physical custody and CPU-I/O borrows released: the shared request parse,
+/// resolver and x86 image checks, or the exec's errno. `origin` names whose
+/// authority resolves it: a fork child's sealed access, or the initial
+/// root's own host filesystem authority (#2142).
+pub type NativeExecLoadService<'a> = dyn FnMut(
+        carrick_core_abi::service::ServiceOrigin,
+        &[u8],
+    ) -> Result<exec_service::X86ExecImage, carrick_abi::LinuxErrno>
+    + 'a;
 
 /// A carrier with no exec capability leaves the exec unrouted: the
 /// carrier's counted ENOSYS.
-fn refuse_native_exec(_: &[u8]) -> Result<exec_service::X86ExecImage, carrick_abi::LinuxErrno> {
+fn refuse_native_exec(
+    _: carrick_core_abi::service::ServiceOrigin,
+    _: &[u8],
+) -> Result<exec_service::X86ExecImage, carrick_abi::LinuxErrno> {
     Err(carrick_abi::LINUX_ENOSYS)
 }
 
@@ -3141,6 +3149,12 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     exec_receipts: u64,
     /// Adopted execs whose predecessor custody awaits its settlement.
     exec_predecessors: Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<()>>,
+    /// Adopted run-root successors (#2142) and their loader identity, until
+    /// the settlement hands it to the runtime's Kernel exec commit.
+    exec_root_identities: Vec<(
+        carrick_el1_abi::ReservationMm,
+        exec_service::X86RootExecIdentity,
+    )>,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     native_backing_pending:
         std::collections::BTreeMap<carrick_guest_arch::KernelVa, anonymous_owner::PendingPrepare>,
@@ -4557,6 +4571,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             parked_execs: Vec::new(),
             exec_receipts: 0,
             exec_predecessors: Vec::new(),
+            exec_root_identities: Vec::new(),
             anonymous_pending: [None, None],
             native_backing_pending: std::collections::BTreeMap::new(),
             owner_grant_crossings: 0,

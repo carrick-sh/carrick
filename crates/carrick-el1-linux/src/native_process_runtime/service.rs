@@ -1201,14 +1201,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // the caller's own cwd and credentials, which the ring seals into
         // the payload from the caller's task row (#1392), and resolves a
         // descriptor `execveat` names in the caller's ring table (#1530).
-        let access = match self.caller_access(call) {
-            Ok(access) => access,
-            Err(failure) => return Ok(failure.into_resume()),
-        };
+        // The initial host root's filesystem authority, credentials and
+        // descriptor table stay in the carrier (#1714 option A), exactly as
+        // for its host-file calls: its payload crosses unsealed and the
+        // carrier resolves it with the root's own authority (#2142).
         let mut sealed = payload.into_vec();
-        if let Err(error) =
+        let sealing = if self.host_root_retains_filesystem() {
+            Ok(())
+        } else {
+            let access = match self.caller_access(call) {
+                Ok(access) => access,
+                Err(failure) => return Ok(failure.into_resume()),
+            };
             carrick_core_abi::service::seal_exec_payload_access(&mut sealed, &access, table)
-        {
+        };
+        if let Err(error) = sealing {
             return Ok(NativeResume::Returned(SyscallResult::from_errno(
                 match error {
                     carrick_core_abi::service::ExecPayloadError::TooLarge => {

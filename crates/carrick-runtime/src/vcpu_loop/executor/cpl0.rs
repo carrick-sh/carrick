@@ -1264,9 +1264,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                                 );
                             },
                             &mut host_file,
-                            &mut |payload| {
+                            &mut |origin, payload| {
                                 crate::runtime::exec::load_native_x86_exec(
                                     &self.dispatcher,
+                                    origin,
                                     payload,
                                 )
                             },
@@ -1332,9 +1333,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                                 );
                             },
                             &mut host_file,
-                            &mut |payload| {
+                            &mut |origin, payload| {
                                 crate::runtime::exec::load_native_x86_exec(
                                     &self.dispatcher,
+                                    origin,
                                     payload,
                                 )
                             },

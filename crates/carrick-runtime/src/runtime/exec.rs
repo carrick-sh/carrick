@@ -164,21 +164,111 @@ pub(crate) fn prepare_native_x86_exec_image(
     )
 }
 
-/// The KVM CPL0 carrier's exec loader for a fork child's staged payload
-/// (#2235): the run's exec capability and descriptor sources, through
-/// [`prepare_native_x86_exec_image`].
+/// The KVM CPL0 carrier's exec loader for a staged payload. A fork child's
+/// (#2235) resolves under the access its ring sealed, with the run's exec
+/// capability and descriptor sources, through
+/// [`prepare_native_x86_exec_image`]. The ring-native run root's (#2142)
+/// resolves with the root's own host filesystem authority, which the
+/// carrier retains (#1714 option A), through [`prepare_root_x86_exec`].
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 pub(crate) fn load_native_x86_exec(
     dispatcher: &std::sync::Mutex<SyscallDispatcher>,
+    origin: carrick_core_abi::service::ServiceOrigin,
     payload: &[u8],
 ) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
     let dispatcher = dispatcher
         .lock()
         .map_err(|_| crate::linux_abi::LINUX_ENOSYS)?;
-    let capability = capture_native_exec_capability(&dispatcher)?;
-    prepare_native_x86_exec_image(&capability, payload, |table, fd| {
-        dispatcher.native_descriptor_exec_source(table, fd)
-    })
+    match origin {
+        carrick_core_abi::service::ServiceOrigin::Descendant => {
+            let capability = capture_native_exec_capability(&dispatcher)?;
+            prepare_native_x86_exec_image(&capability, payload, |table, fd| {
+                dispatcher.native_descriptor_exec_source(table, fd)
+            })
+        }
+        carrick_core_abi::service::ServiceOrigin::Initial => {
+            prepare_root_x86_exec(&dispatcher, payload)
+        }
+    }
+}
+
+/// What a run root's exec says about its successor, published by the host
+/// Kernel's half of the exec once the ring has adopted the successor
+/// (`/proc/self/{exe,cmdline,environ}`), exactly as the HVF venue publishes
+/// it from `prepare_execve`.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub(crate) struct X86RootExecIdentity {
+    pub(crate) path: String,
+    pub(crate) argv: Vec<String>,
+    pub(crate) env: Vec<Vec<u8>>,
+    pub(crate) source: carrick_kernel::dispatch::executable_authority::ExecSource,
+    pub(crate) command_line: String,
+}
+
+/// Load the ring-native run root's exec successor (#2142). The root's cwd,
+/// credentials, `/proc/self` and descriptor table are the host task's, so
+/// the request resolves with exactly that authority, as the HVF root's
+/// `prepare_execve` does: observer verdicts, then the shared resolver and
+/// x86 image checks. The successor's identity rides with the image to the
+/// settlement that commits the Kernel's half.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn prepare_root_x86_exec(
+    dispatcher: &SyscallDispatcher,
+    payload: &[u8],
+) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
+    let view = carrick_core_abi::service::ExecPayloadView::parse(payload)
+        .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+    let path = core::str::from_utf8(view.path())
+        .map_err(|_| crate::linux_abi::LINUX_EINVAL)?
+        .to_owned();
+    if let carrick_core_abi::service::ExecCall::Execveat { dirfd, flags } = view.call() {
+        const VALID: u32 =
+            carrick_abi::LINUX_AT_EMPTY_PATH as u32 | carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW as u32;
+        if flags & !VALID != 0 {
+            return Err(crate::linux_abi::LINUX_EINVAL);
+        }
+        // Served exactly or left unrouted: a no-follow lookup, a descriptor
+        // the root's own table names (fexecve) and a path relative to one
+        // are counted ENOSYS until the root's exec resolves them.
+        if flags != 0 || !(path.starts_with('/') || dirfd == -100) {
+            return Err(crate::linux_abi::LINUX_ENOSYS);
+        }
+    }
+    let argv: Vec<Vec<u8>> = view.argv().map(<[u8]>::to_vec).collect();
+    let env: Vec<Vec<u8>> = view.envp().map(<[u8]>::to_vec).collect();
+    let context = dispatcher
+        .capture_one_task_context()
+        .map_err(|_| crate::linux_abi::LINUX_ESRCH)?;
+    if let Some(chain) = dispatcher.observers() {
+        let process = carrick_kernel::observe::ProcessInfo::new(&context);
+        let slices: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+        match chain.on_exec(&process, path.as_bytes(), &slices) {
+            carrick_kernel::observe::SyscallAction::Allow
+            | carrick_kernel::observe::SyscallAction::Short(_) => {}
+            carrick_kernel::observe::SyscallAction::Deny(errno) => return Err(errno),
+            carrick_kernel::observe::SyscallAction::Kill(_) => {
+                return Err(crate::linux_abi::LINUX_EACCES);
+            }
+        }
+    }
+    let proc_argv: Vec<String> = argv
+        .iter()
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect();
+    let files = dispatcher.capture_exec_files(&context)?;
+    let loader = ExecLoaderCapabilities::capture(dispatcher);
+    let (image, source) = load_x86_exec_image_with_source(&loader, &files, &path, argv, env.clone())?;
+    Ok(image.with_root_identity(
+        carrick_x86_cpl0_host::cpl0_boot::exec_service::X86RootExecIdentity::new(
+            X86RootExecIdentity {
+                command_line: proc_argv.join(" "),
+                path,
+                argv: proc_argv,
+                env,
+                source,
+            },
+        ),
+    ))
 }
 
 /// Parse a native child's staged exec request under the caller's sealed
@@ -856,6 +946,25 @@ pub(crate) fn load_x86_exec_image<'a>(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
 ) -> Result<carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage, LinuxErrno> {
+    load_x86_exec_image_with_source(loader, files, target, argv, env).map(|(image, _)| image)
+}
+
+/// [`load_x86_exec_image`], keeping the final image's source: the object
+/// `/proc/self/exe` names once a root's exec commits.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn load_x86_exec_image_with_source<'a>(
+    loader: &ExecLoaderCapabilities,
+    files: &carrick_kernel::dispatch::exec_files::ExecFiles,
+    target: impl Into<ExecTarget<'a>>,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+) -> Result<
+    (
+        carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage,
+        carrick_kernel::dispatch::executable_authority::ExecSource,
+    ),
+    LinuxErrno,
+> {
     use carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage;
     // No vDSO or trap policy reaches an image the CPL0 build maps.
     let _ = loader;
@@ -872,7 +981,7 @@ pub(crate) fn load_x86_exec_image<'a>(
             error,
         ))
     })?;
-    X86ExecImage::from_program(&program, argv, env)
+    Ok((X86ExecImage::from_program(&program, argv, env)?, source))
 }
 
 // Shebang resolution and the signal-death / stop helpers live in the

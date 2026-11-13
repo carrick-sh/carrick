@@ -70,9 +70,49 @@ pub struct X86ExecImage {
     env: Vec<Vec<u8>>,
     stack_pointer: u64,
     demand: ImageFrameDemand,
+    /// A run root's successor only: what the runtime's loader says about
+    /// it, carried to the settlement that commits the host Kernel's half.
+    root: Option<X86RootExecIdentity>,
+}
+
+/// What the runtime's loader says about a run root's exec successor
+/// (`/proc/self/exe` and its argv), opaque to the carrier. It rides with the
+/// image from the load through the adoption to the settlement, where the
+/// runtime commits the root's host Kernel exec transition (#2142).
+pub struct X86RootExecIdentity(Box<dyn core::any::Any + Send>);
+
+impl X86RootExecIdentity {
+    pub fn new(identity: impl core::any::Any + Send) -> Self {
+        Self(Box::new(identity))
+    }
+
+    pub fn into_inner(self) -> Box<dyn core::any::Any + Send> {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for X86RootExecIdentity {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("X86RootExecIdentity")
+    }
 }
 
 impl X86ExecImage {
+    /// Name this image a run root's successor, with the loader's identity.
+    pub fn with_root_identity(mut self, identity: X86RootExecIdentity) -> Self {
+        self.root = Some(identity);
+        self
+    }
+
+    /// Whether this image is a run root's successor.
+    pub fn is_root_successor(&self) -> bool {
+        self.root.is_some()
+    }
+
+    fn take_root_identity(&mut self) -> Option<X86RootExecIdentity> {
+        self.root.take()
+    }
+
     /// The execve(2) argument check, which Linux makes before it looks at
     /// the image: E2BIG (7) when argv and envp exceed the shared
     /// [`ExecArgumentCharge`]. The loader runs it again after a shebang
@@ -154,6 +194,7 @@ impl X86ExecImage {
             env,
             stack_pointer: stack.rsp,
             demand,
+            root: None,
         })
     }
 
@@ -1015,6 +1056,21 @@ pub(in crate::cpl0_boot) enum NativeExecCrossing {
         successor: GuestArchBinding,
         predecessor: Option<RootGpa>,
     },
+    /// The run root settled onto its successor (#2142). The root is not a
+    /// registered child: its binding moves through the runtime's Kernel
+    /// exec commit and the executor's retarget, which this settlement hands
+    /// the loader's identity.
+    RootSettled(Box<X86RootExecSettlement>),
+}
+
+/// A run root's settled exec, for the runtime to commit the host Kernel's
+/// half of (#2142): the successor's carrier binding in the ring's domain
+/// (its MM, root, address generation and execution generation), and what
+/// the loader said about the image.
+#[derive(::core::fmt::Debug)]
+pub struct X86RootExecSettlement {
+    pub successor: GuestArchBinding,
+    pub identity: X86RootExecIdentity,
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
@@ -1352,6 +1408,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         ) else {
             return Ok(false);
         };
+        // A root's successor replaces exactly the issued run root; a child's
+        // replaces a live fork child (the stock checks which).
+        if preparation.request().image.is_root_successor()
+            && self
+                .initial_task
+                .is_none_or(|root| root.mm != execution.context.mm)
+        {
+            return Ok(false);
+        }
         let zone = self.exec_zone()?;
         let Some(index) = zone.spaces.find(successor.raw()) else {
             return Ok(false);
@@ -1374,7 +1439,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .take(successor)
             .ok_or_else(|| fail("exec preparation vanished"))?;
         let X86ExecPreparation {
-            request,
+            mut request,
             tables,
             mut data,
             build,
@@ -1402,16 +1467,31 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 request.root_generation,
             )
         };
-        let replaced = self
-            .fork_stock
-            .replace_child_for_exec_with_tables(
+        // The run root's successor (#2142) joins the stock as the root's
+        // form; its identity waits for the settlement. The loader named it
+        // a root's from the request's authenticated origin, and only the
+        // issued root's MM may be its predecessor.
+        let root_identity = request.image.take_root_identity();
+        let replaced = match &root_identity {
+            Some(_) => self.fork_stock.replace_root_for_exec_with_tables(
                 execution,
                 handle,
                 backing.root,
                 carrick_hal::fork_stock::ForkHostBackingCustody::default(),
                 used,
-            )
-            .map_err(|(error, _)| fail(format!("exec successor stock custody: {error:?}")))?;
+            ),
+            None => self.fork_stock.replace_child_for_exec_with_tables(
+                execution,
+                handle,
+                backing.root,
+                carrick_hal::fork_stock::ForkHostBackingCustody::default(),
+                used,
+            ),
+        }
+        .map_err(|(error, _)| fail(format!("exec successor stock custody: {error:?}")))?;
+        if let Some(identity) = root_identity {
+            self.exec_root_identities.push((successor, identity));
+        }
         self.exec_predecessors.push(replaced);
         // The data extent is now the successor's: its frames are published.
         drop(data);
@@ -1631,15 +1711,42 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if !known {
             return Ok(NativeExecCrossing::Answered);
         }
+        let execution = ExecutionGeneration::new(
+            NonZeroU64::new(binding.generation.raw())
+                .ok_or_else(|| fail("exec settlement generation"))?,
+        );
+        if let Some(index) = self
+            .exec_root_identities
+            .iter()
+            .position(|(root_successor, _)| *root_successor == successor)
+        {
+            // The run root keeps its issued task serial; only the carrier
+            // root binding the runtime retargets may name it.
+            let (_, identity) = self.exec_root_identities.swap_remove(index);
+            let root = self
+                .initial_task
+                .ok_or_else(|| fail("root exec settlement has no issued root"))?;
+            let task = TaskIdentity {
+                carrier: carrick_guest_arch::CarrierGeneration::new(self._vm.identity().nonzero()),
+                task: TaskSerial::new(
+                    NonZeroU64::new(root.task.serial.raw())
+                        .ok_or_else(|| fail("root exec settlement task"))?,
+                ),
+                execution,
+            };
+            return Ok(NativeExecCrossing::RootSettled(Box::new(
+                X86RootExecSettlement {
+                    successor: GuestArchBinding::x86(task, context),
+                    identity,
+                },
+            )));
+        }
         let task = TaskIdentity {
             carrier: carrick_guest_arch::CarrierGeneration::new(self._vm.identity().nonzero()),
             task: TaskSerial::new(
                 NonZeroU64::new(binding.task.raw()).ok_or_else(|| fail("exec settlement task"))?,
             ),
-            execution: ExecutionGeneration::new(
-                NonZeroU64::new(binding.generation.raw())
-                    .ok_or_else(|| fail("exec settlement generation"))?,
-            ),
+            execution,
         };
         Ok(NativeExecCrossing::Settled {
             successor: GuestArchBinding::x86(task, context),

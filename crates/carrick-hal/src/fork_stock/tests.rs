@@ -299,6 +299,65 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
     assert_eq!(stock.child_owner(successor_mm), None);
 }
 
+/// #2142: the x86 run root's exec successor is built from this stock's
+/// reserved tables, like a fork child's. The root's adoption commits the
+/// linked pages as the successor's tables, moves the successor into the
+/// shared child stock without fork capacity, never releases the boot root's
+/// frames as fork-stock custody, and the successor's reclaim returns the
+/// linked pages.
+#[test]
+fn a_built_root_exec_successor_commits_its_linked_tables() {
+    let mut stock = stock(UntaggedRoots, 6, 0);
+    let before = stock.table_stock().len();
+    let reserved = stock.reserve_successor_tables(4).unwrap();
+    let pages = reserved.pages().to_vec();
+    let used = stock.take_built_successor_tables(reserved, 2).unwrap();
+    assert_eq!(stock.table_stock().len(), before - 2, "the unused two return");
+
+    let predecessor_mm = mm(PARENT_MM);
+    let predecessor = execution(1, 0, PARENT_MM, 0x80_0000);
+    let successor_mm = mm(303);
+    // SAFETY: this fixture owns the closed successor incarnation.
+    let successor = unsafe {
+        El1MmHandle::from_admitted_owner(CARRIER, successor_mm, NonZeroU64::new(9).unwrap())
+    };
+    assert!(
+        stock
+            .replace_child_for_exec_with_tables(predecessor, successor, pages[0], (), used.clone())
+            .is_err(),
+        "the root is not a fork child"
+    );
+    let receipt = stock
+        .replace_root_for_exec_with_tables(predecessor, successor, pages[0], (), used.clone())
+        .unwrap();
+    assert_eq!(stock.child_owner(successor_mm), Some(successor));
+    assert_eq!(stock.child_root(successor_mm), Some(pages[0]));
+    assert_eq!(stock.child_lifecycle(successor_mm), None);
+    let mut child_releases = 0;
+    stock
+        .settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            absent(predecessor_mm).unwrap(),
+            |tables| tables.is_empty(),
+            |_, _| {
+                child_releases += 1;
+                false
+            },
+        )
+        .unwrap();
+    assert_eq!(child_releases, 0, "root frames are not fork-stock custody");
+    retire(&mut stock, execution(1, 0, 303, pages[0].address().raw())).unwrap();
+    let reclaimed = RefCell::new(Vec::new());
+    assert_eq!(reclaim(&mut stock, |_| true, &reclaimed), 1);
+    assert_eq!(
+        *reclaimed.borrow(),
+        used,
+        "the successor's linked tables return"
+    );
+    assert_eq!(stock.table_stock().len(), before);
+}
+
 #[test]
 fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
     use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
