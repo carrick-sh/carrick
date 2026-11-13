@@ -3551,6 +3551,7 @@ fn anonymous_contention_then_metadata_provisions_without_park_serial_host() {
             region.table(),
             SpaceWaitCause::Reservations,
             &metadata,
+            None,
         ),
         Some(Served::Returned { switched: false })
     );

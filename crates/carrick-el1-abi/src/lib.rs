@@ -680,6 +680,11 @@ pub const GRANT_OP_EXEC_CANCEL: u64 = 13;
 /// forking ([`carrick_core_abi::service::RootForkSeed`], #1392). A
 /// #1393(a) `RootOnly` crossing: deleted when the root becomes a ring task.
 pub const GRANT_OP_ROOT_FORK_SEED: u64 = 14;
+/// Ring a ring-owned MM's owed-return settlement doorbell (#1369 slice 3):
+/// x1 = MM, x2 = claim word, x3 = claimant slot of the
+/// [`carrick_core_abi::ReturnSettlementDoorbell`]; the reply returns in x1.
+/// A physical-service doorbell, never a syscall crossing.
+pub const GRANT_OP_RETURN_SETTLE: u64 = 15;
 
 /// Bounded debug rendering of a typed refusal, retained on the stopped EL1 stack.
 #[repr(C, align(64))]

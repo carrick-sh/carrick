@@ -118,6 +118,28 @@ pub fn park_anonymous_edit<C: ThreadCpu, U: UserWord>(
         table,
         initial_cause,
         &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+        None,
+    )
+}
+
+/// A ring-owned MM's call that only a settlement of its owed returns lets
+/// proceed (#1369 slice 3): observe every release source, then ring the
+/// settlement doorbell as this park's first probe. A settled MM reruns the
+/// call; a refusal parks at the revision observed before the carrier
+/// decided. Later reprobes are the ordinary anonymous-edit reprobe.
+pub fn park_settling_anonymous_edit<C: ThreadCpu, U: UserWord>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut TrapFrame,
+    table: &SharedReservations,
+    ring: &dyn Fn(&mut carrick_el1_abi::ReturnSettlementDoorbell),
+) -> Option<Served> {
+    park_anonymous_edit_with_allocator(
+        sched,
+        frame,
+        table,
+        SpaceWaitCause::Reservations,
+        &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+        Some(ring),
     )
 }
 
@@ -127,6 +149,7 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
     table: &SharedReservations,
     _initial_cause: SpaceWaitCause,
     metadata: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
+    settle: Option<&dyn Fn(&mut carrick_el1_abi::ReturnSettlementDoorbell)>,
 ) -> Option<Served> {
     let mm = ReservationMm::new(sched.task.mm.key.load(Ordering::Acquire))?;
     let index = sched.zone.spaces.find(mm.raw())?;
@@ -146,10 +169,20 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
     let task = sched.task;
     AnonymousCall::from_canonical(CanonicalNr::new(frame.x[8]))?;
     let zone = sched.zone;
+    let mut settle = settle;
     let outcome = coordinate_anonymous_edit_wait(
         &source,
         resumed,
         || {
+            if let Some(ring) = settle.take() {
+                return carrick_el1::memory::drive_return_settlement(
+                    task,
+                    access,
+                    table,
+                    slot.index() as u32,
+                    ring,
+                );
+            }
             let mut root = match table.lock_in(access, index.index(), mm, slot.index() as u32) {
                 Ok(root) => root,
                 Err(carrick_el1::memory::reservations::Refusal::Busy) => {
@@ -165,7 +198,13 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
                 ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
                 ReservationDisposition::Unavailable(
                     carrick_el1::memory::reservations::Refusal::Busy,
-                ) => return Some(Some(SpaceWaitCause::PendingEdit)),
+                ) => {
+                    // An owed overlap with no settlement in flight reruns
+                    // (behind the editor probe) and drives one itself.
+                    if let Some(cause) = carrick_el1::memory::busy_root_cause(&root) {
+                        return Some(Some(cause));
+                    }
+                }
                 ReservationDisposition::Unavailable(
                     carrick_el1::memory::reservations::Refusal::MetadataRequired,
                 ) => {
