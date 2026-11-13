@@ -455,6 +455,7 @@ surfaces = [
   { path = "crates/carrick-embed/tests/el1_fork_exec.rs", contract = "kernel.fork.stage1-image" },
   { path = "crates/carrick-embed/tests/el1_gic.rs", contract = "kernel.el1.gic" },
   { path = "crates/carrick-embed/tests/el1_kick_served_loop.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-embed/tests/el1_node.rs", contract = "kernel.futex.contention" },
   { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.anonymous-first-touch" },
   { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.delegated-root-fork" },
