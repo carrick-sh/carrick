@@ -1179,9 +1179,10 @@ fn x86_exec_claim_is_a_fork_child_only() {
 }
 
 // A claimed x86 child's execve/execveat is staged through the neutral body
-// from the decoded x86 registers, then refused with a counted ring ENOSYS.
+// from the decoded x86 registers into the payload the native exec service
+// takes (#2235); an unreadable argument is a staging fault, never a refusal.
 #[test]
-fn x86_child_exec_is_staged_then_counted_enosys() {
+fn x86_child_exec_stages_its_payload_or_faults() {
     use carrick_el1_linux::exec_stage::ExecStageRequest;
     let path = b"/bin/static\0";
     let arg = b"static\0";
@@ -1216,21 +1217,15 @@ fn x86_child_exec_is_staged_then_counted_enosys() {
         let call = decode_x86_64(native, args, 0x7fff_0000);
         let request = ExecStageRequest::from_canonical(call.canonical.raw(), call.args)
             .expect("exec decodes to a stage request");
-        let counters = Counters::new();
-        let result = dispatch::settle_native_exec_without_successor(
-            &task,
-            &ResidentUser,
-            request,
-            call.native,
-            &counters,
+        assert!(
+            matches!(
+                dispatch::native_exec_stage_request(&task, &ResidentUser, request),
+                Some(dispatch::NativeExecStage::Payload(_))
+            ),
+            "native {native}: the readable request stages a payload"
         );
-        assert_eq!(result, -38, "native {native}");
-        assert_eq!(
-            counters.refused[native as usize].load(Ordering::Relaxed),
-            1,
-            "native {native}: counted once, on the native ordinal"
-        );
-        // An unreadable argument vector is EFAULT, never a host exit.
+        // An unreadable argument vector is a staging fault the entry
+        // supplies or answers with EFAULT, never a host exit.
         let bad = ExecStageRequest { argv: 0, ..request };
         struct Refuse;
         impl carrick_el1_linux::file::MemoryValidator for Refuse {
@@ -1241,16 +1236,13 @@ fn x86_child_exec_is_staged_then_counted_enosys() {
                 0
             }
         }
-        let counters = Counters::new();
-        let result = dispatch::settle_native_exec_without_successor(
-            &task,
-            &Refuse,
-            bad,
-            call.native,
-            &counters,
+        assert!(
+            matches!(
+                dispatch::native_exec_stage_request(&task, &Refuse, bad),
+                Some(dispatch::NativeExecStage::Fault(_))
+            ),
+            "native {native}: an unreadable argv is a staging fault"
         );
-        assert_eq!(result, -14, "native {native}");
-        assert_eq!(counters.refused[native as usize].load(Ordering::Relaxed), 0);
     }
 }
 

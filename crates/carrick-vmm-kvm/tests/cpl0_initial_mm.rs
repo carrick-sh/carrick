@@ -484,6 +484,28 @@ fn native_fork_child_execs_static_successor() {
     assert!(outcome.run.stderr.is_empty());
 }
 
+/// #2235: a child's exec refused before the arm returns execve(2)'s errno
+/// and the child's old image runs on: it exits with that errno, which the
+/// parent collects and propagates. Missing is ENOENT (2); a non-ELF file is
+/// ENOEXEC (8). Before the native exec service both were ENOSYS (38).
+#[test]
+fn native_fork_child_exec_refusals_return_their_errno_to_the_old_image() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let text = directory.path().join("text");
+    carrick_test_support::executable::write_executable_mode(&text, b"not an executable\n", 0o700);
+    for (path, errno) in [(directory.path().join("absent"), 2), (text, 8)] {
+        let define = format!("-DSUCCESSOR_PATH=\"{}\"", path.display());
+        let elf = native_exit_fixture_with_flags("native_fork_exec.S", &[&define]);
+        let outcome = run_exec_fixture(&elf, 32);
+        assert_eq!(
+            (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+            (errno, b"".as_slice()),
+            "{}: the child's exec returns {errno}; 38 is ENOSYS",
+            path.display()
+        );
+    }
+}
+
 /// #2235: the successor and parent exchange blocked signals while both are live,
 /// before the parent collects the child's successful replacement status.
 #[test]
