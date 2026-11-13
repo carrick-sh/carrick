@@ -579,6 +579,7 @@ pub(super) enum ContendedFault {
 pub(super) fn park_contended_fault(
     task: &CurrentTask,
     slot: carrick_sched_core::SlotId,
+    cause: SpaceWaitCause,
     context: &ParkedContextWords,
 ) -> ContendedFault {
     use carrick_core::wait::{
@@ -587,6 +588,14 @@ pub(super) fn park_contended_fault(
     };
     use carrick_sched_core::Waker;
     use carrick_sched_core::spaces::EditAdmissionRefusal;
+    // The fault owner contends only on its root, editor and gate. The probe
+    // below observes exactly these; any other cause would never re-probe.
+    if !matches!(
+        cause,
+        SpaceWaitCause::Reservations | SpaceWaitCause::Editor | SpaceWaitCause::Gate
+    ) {
+        return ContendedFault::Refused;
+    }
     let source = carrick_x86_carrier::native_execution::source(slot);
     let zone = source.zone;
     let Some(mm) = carrick_el1_abi::ReservationMm::new(task.mm.key.load(Ordering::Acquire)) else {

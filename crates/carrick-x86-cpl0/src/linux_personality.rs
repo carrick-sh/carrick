@@ -718,7 +718,7 @@ pub fn handle_user_page_fault_prepared(
             code,
             address,
         } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
-        UserFaultSupply::Contended(_) => park_contended_user_fault(prep, frame, fpstate),
+        UserFaultSupply::Contended(cause) => park_contended_user_fault(prep, frame, fpstate, cause),
         UserFaultSupply::Unresolved(reason) => reason,
     }
 }
@@ -730,6 +730,7 @@ fn park_contended_user_fault(
     prep: &carrick_x86_carrier::entry::PreparedUserPageFault<'_>,
     frame: &PageFaultStack,
     fpstate: &XsaveArea,
+    cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
 ) -> u64 {
     use carrick_el1::isa::x86::context;
     if !native_process::is_admitted() {
@@ -759,7 +760,7 @@ fn park_contended_user_fault(
     });
     let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(&native));
     drop(native);
-    match anonymous::park_contended_fault(prep.task, prep.slot, &saved) {
+    match anonymous::park_contended_fault(prep.task, prep.slot, cause, &saved) {
         anonymous::ContendedFault::Parked => {
             drop(saved);
             carrick_x86_carrier::entry::leave_user_page_fault(prep.binding);
@@ -1370,11 +1371,18 @@ impl Personality for LinuxPersonality {
                             // The owner refused or could not supply the
                             // access (no reservation names it): never a
                             // carrier abort.
-                            // A contended staged copy keeps this refusal
-                            // until the stage can park and replay its call.
-                            UserFaultSupply::Signal { .. }
-                            | UserFaultSupply::Contended(_)
-                            | UserFaultSupply::Unresolved(_) => Some(stage.refused()),
+                            // Cancelled with its reason: this stage cannot
+                            // park and replay its call yet, so a contended
+                            // staged copy keeps the refusal it had (#2141
+                            // follow-up).
+                            UserFaultSupply::Contended(cancelled) => {
+                                let _: carrick_sched_core::spaces::notification::SpaceWaitCause =
+                                    cancelled;
+                                Some(stage.refused())
+                            }
+                            UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
+                                Some(stage.refused())
+                            }
                         }
                     }
                     None => Some(stage),
