@@ -427,6 +427,9 @@ pub struct CarrierVmCustody {
     >,
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
     pub fork_stock: parking_lot::Mutex<crate::fork_stock::ForkStockHostCustody>,
+    /// Serializes every settlement of a native child's owed returns
+    /// (#1369 slice 3).
+    pub(crate) return_settlement: carrick_hal::return_settlement::SettlementLock,
     pub(crate) native_frame_backings: parking_lot::Mutex<
         std::collections::BTreeMap<
             (u64, u64),
@@ -778,6 +781,7 @@ impl CarrierVmCustody {
                 crate::metadata_grant::HostApertureState::new(),
             ),
             native_frame_backings: Default::default(),
+            return_settlement: carrick_hal::return_settlement::SettlementLock::new(),
             fork_stock: parking_lot::Mutex::new(
                 crate::fork_stock::ForkStockHostCustody::with_asids(
                     transfer_carrier,
