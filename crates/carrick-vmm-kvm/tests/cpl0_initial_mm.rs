@@ -819,7 +819,7 @@ fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
                 &mut |origin, record| {
                     assert_eq!(origin, carrick_core_abi::service::ServiceOrigin::Descendant);
                     let served = dispatcher
-                        .serve_native_host_file(record)
+                        .serve_native_host_file(record, None)
                         .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
                     marker = true;
                     Ok(served.retained_source)
