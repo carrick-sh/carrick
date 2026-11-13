@@ -254,13 +254,43 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             carrick_el1::memory::DelegatedAnonymous::Forward if file.is_some() => {
                 DelegatedStep::Served(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))
             }
-            _ => DelegatedStep::Forward,
+            carrick_el1::memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
+            carrick_el1::memory::DelegatedAnonymous::Settle(_) => DelegatedStep::Settle,
         }
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> {
         None
     }
     fn park_contended(&mut self, _: SpaceWaitCause) -> Option<FamilyCompletion> {
+        self.park_anonymous_edit(false)
+    }
+    fn park_settlement(&mut self) -> Option<FamilyCompletion> {
+        // Every x86 MM is ring-owned: its owed returns settle only through
+        // the carrier's doorbell.
+        self.park_anonymous_edit(true)
+    }
+    fn take_x86_handoff_receipt(
+        &mut self,
+    ) -> Option<carrick_core_abi::EntryHandoffReceipt<ParkedContextWords>> {
+        self.handoff.take()
+    }
+    fn permission(&mut self) -> PermissionStep {
+        crate::refuse_anonymous_permission(&crate::CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS)
+    }
+    fn retirement(&mut self) -> RetirementStep {
+        crate::refuse_anonymous_retirement(&crate::CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS)
+    }
+    fn install_result(&mut self, result: SyscallResult) {
+        self.frame
+            .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
+    }
+}
+
+impl X86AnonymousVenue<'_> {
+    /// Park the unchanged call on its exact MM's release sources, or rerun
+    /// it. With `settle`, the first probe rings the owed-return settlement
+    /// doorbell after every source was observed (#1369 slice 3).
+    fn park_anonymous_edit(&mut self, settle: bool) -> Option<FamilyCompletion> {
         use carrick_core::wait::{
             EditWaitOutcome, ObjectParkRequest, coordinate_anonymous_edit_wait,
             park_object_record_rechecked, space_access,
@@ -300,10 +330,25 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         let saved = self.saved;
         let task = self.task;
         let frame = &self.frame;
+        let mut settle = settle;
         let outcome = coordinate_anonymous_edit_wait(
             &source,
             resumed,
             || {
+                if core::mem::take(&mut settle) {
+                    return carrick_el1::memory::drive_return_settlement(
+                        task,
+                        access,
+                        table,
+                        slot.index() as u32,
+                        |record| {
+                            carrick_x86_carrier::entry::cross_return_settlement(
+                                carrick_guest_arch::CpuId::new(u32::from(slot.raw())),
+                                record,
+                            )
+                        },
+                    );
+                }
                 let mut root = match table.lock_in(access, index.index(), mm, slot.index() as u32) {
                     Ok(root) => root,
                     Err(carrick_el1::memory::reservations::Refusal::Busy) => {
@@ -317,7 +362,13 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                     ) => return Some(Some(SpaceWaitCause::PreparedOverlap)),
                     ReservationDisposition::Unavailable(
                         carrick_el1::memory::reservations::Refusal::Busy,
-                    ) => return Some(Some(SpaceWaitCause::PendingEdit)),
+                    ) => {
+                        // An owed overlap with no settlement in flight
+                        // reruns (behind the editor probe) and drives one.
+                        if let Some(cause) = carrick_el1::memory::busy_root_cause(&root) {
+                            return Some(Some(cause));
+                        }
+                    }
                     ReservationDisposition::Unavailable(
                         carrick_el1::memory::reservations::Refusal::MetadataRequired,
                     ) => {
@@ -407,21 +458,6 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
                 None
             }
         }
-    }
-    fn take_x86_handoff_receipt(
-        &mut self,
-    ) -> Option<carrick_core_abi::EntryHandoffReceipt<ParkedContextWords>> {
-        self.handoff.take()
-    }
-    fn permission(&mut self) -> PermissionStep {
-        crate::refuse_anonymous_permission(&crate::CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS)
-    }
-    fn retirement(&mut self) -> RetirementStep {
-        crate::refuse_anonymous_retirement(&crate::CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS)
-    }
-    fn install_result(&mut self, result: SyscallResult) {
-        self.frame
-            .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
 }
 

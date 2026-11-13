@@ -1523,6 +1523,36 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             }
         }
     }
+    /// Clear the retired terminals of one settled owed return of `mm` and
+    /// drop the physical alias edges they kept (#1369 slice 3). `terminals`
+    /// came from [`owed_retired_terminals`] under the same editor exclusion.
+    /// The backing slots stay registered and admitted for `mm`: their frames
+    /// return with the MM's own retirement, as on HVF. A word that changed
+    /// under the exclusion quarantines the carrier (a broken invariant).
+    pub fn clear_settled_return(
+        &mut self,
+        mm: NonZeroU64,
+        root: RootGpa,
+        span: PageSpan,
+        terminals: &[RetiredTerminal],
+    ) -> Result<(), MemoryError> {
+        self.admit()?;
+        let context = self
+            .root(mm)
+            .filter(|context| context.root == root)
+            .ok_or_else(|| error("stale carrier MM/root for an owed return"))?;
+        if let Err(reason) = clear_retired_terminals(&self.words(), terminals) {
+            self.quarantined = true;
+            return Err(error(format!(
+                "owed return terminal changed under exclusion: {reason:?}"
+            )));
+        }
+        self.remove_aliases(mm, span, context);
+        if self.quarantined {
+            return Err(error("owed return alias release became indeterminate"));
+        }
+        Ok(())
+    }
     /// Delete physical custody only after descriptor unlink and exact-context
     /// acknowledgements. Failure retains the old registration for a later drain;
     /// a failed deletion quarantines, rather than ignoring ioctl errors.
