@@ -2647,7 +2647,6 @@ fn zone_pipe_poll_wake_with_affinity(flags: &[&str], affinity: u64) {
 /// is EFAULT with the report kept queued for the next valid wait, and no
 /// call is forwarded to the host.
 #[test]
-#[ignore = "#2153: x86 epoll_pwait reaches the ring epoll owner only with its routing"]
 fn zone_epoll_pwait_copy_out_into_an_untouched_page_stays_in_ring() {
     let elf = native_exit_fixture("native_epoll_copyout.S");
     let outcome = try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_LOADED)
