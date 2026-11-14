@@ -640,6 +640,184 @@ fn arm_host_loaded_root_delivers_pending_signal_once_after_another_process_on_th
     host_loaded_root_returns_after_foreign_occupant(true);
 }
 
+/// #2276: Go's root `go` starts its telemetry sidecar with a zero-stack
+/// `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` (0x4111) from whichever thread
+/// runs the goroutine. Linux suspends that calling thread until the child
+/// execs or exits (clone(2)), so the child runs alone on the caller's stack
+/// page. A root thread the host cloned (its record is not native-owned) had
+/// its vfork downgraded by `NativeProcessEntry::fork`: the pid came back at
+/// once and caller and child ran together on that page.
+///
+/// Two live processes through the production ARM adapter: a host-issued
+/// thread of the root vforks and parks; the child writes the caller's stack
+/// page (`rt_sigprocmask` old set) while the caller stays parked, then
+/// exits; only that exit releases the caller.
+#[test]
+fn arm_host_issued_root_thread_vfork_stays_suspended_until_its_child_exits() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+        ]),
+    )
+    .with_words(words);
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    let task: &'static CurrentTask = &fixture.task;
+    // Admit the root, then adopt a sibling the host cloned through its first
+    // syscall (gettid).
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let caller = host_born_sibling(fixture, 42);
+    let mut first = carrick_el1_abi::TrapFrame::default();
+    first.x[8] = 178;
+    arm_call_with_cpu(fixture, caller, &mut service, &mut first, &mut cpu).unwrap();
+    assert_eq!(first.x[0], 42);
+    let caller_record = caller
+        .zone_record()
+        .expect("the sibling's admission recorded it in the zone")
+        .id;
+    assert!(
+        !fixture.zone.record(caller_record).is_native_owned(),
+        "a host-issued thread's record has no native execution owner"
+    );
+    // The page the caller's stack pointer names: a zero clone stack means
+    // the child runs on it too.
+    let mut stack = carrick_test_support::GuestUserBuffer::zeroed(4096);
+    stack.as_mut_bytes().fill(0xff);
+    let mask_va = stack.arg() + 2048 - 64;
+
+    let mut vfork = carrick_el1_abi::TrapFrame::default();
+    vfork.x[8] = 220;
+    vfork.x[0] = 0x4111;
+    vfork.x[1] = 0;
+    let route = arm_call_with_cpu(fixture, caller, &mut service, &mut vfork, &mut cpu)
+        .expect("the caller's vfork admits through its process owner");
+    assert!(
+        matches!(
+            fixture.zone.record(caller_record).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ),
+        "the vfork caller returned before its child ran: route {route:?}, x0 = {}, claim {:?}",
+        vfork.x[0] as i64,
+        fixture.zone.record(caller_record).claim(),
+    );
+    let child = match fixture.zone.slot(fixture.slot).current() {
+        Some(current) if current != caller_record => current,
+        _ => {
+            let child = fixture
+                .zone
+                .runnable_head(fixture.slot)
+                .expect("the vfork child is queued");
+            fixture.zone.clear_current(fixture.slot);
+            fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+            task.mm.key.store(0, Ordering::Release);
+            let mut frame = carrick_el1_abi::TrapFrame::default();
+            assert_eq!(
+                switch_in(fixture, task, &mut cpu, &mut frame),
+                carrick_el1_abi::Action::Served
+            );
+            child
+        }
+    };
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+    let child_identity = fixture.zone.record(child).identity();
+    // SAFETY: the child owner retains its lifecycle and control.
+    let child_page = unsafe { &*(child_identity.lifecycle_page as *const ThreadLifecyclePage) };
+    let child_control = unsafe { &*(child_identity.control_slot as *const ThreadControlSlot) };
+    // SAFETY: `child` is the slot's active record.
+    let child_ctx = unsafe { *fixture.zone.record(child).ctx_mut() };
+    cpu.ttbr.0 = child_ctx
+        .address_context()
+        .expect("child address context")
+        .root
+        .address()
+        .raw();
+
+    // The child writes the caller's stack page before it execs or exits.
+    service.task = task;
+    let mut mask = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    mask.x[8] = 135;
+    mask.x[..4].copy_from_slice(&[0, 0, mask_va, 8]);
+    loaded_call(
+        fixture,
+        task,
+        child_page,
+        child_control,
+        &mut service,
+        &mut mask,
+        &mut cpu,
+    )
+    .expect("the child's rt_sigprocmask admits through its owner");
+    assert_eq!(mask.x[0], 0, "rt_sigprocmask(SIG_BLOCK, NULL, old)");
+    assert_ne!(
+        stack.get::<u64>(2048 - 64),
+        u64::MAX,
+        "the child wrote its old mask into the caller's stack page"
+    );
+    assert!(
+        matches!(
+            fixture.zone.record(caller_record).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ),
+        "the caller stays suspended while its vfork child runs"
+    );
+
+    // The child exits: that releases the suspended caller.
+    if let Some(work) = task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    let _ = task.linux.take_served_boundary();
+    *service.crossing.zone.lock().unwrap() = Some(fixture.zone);
+    *service.crossing.child.lock().unwrap() = Some((
+        super::super::common_entry::execution_binding(task),
+        child_ctx.address_context().expect("child address context"),
+    ));
+    let mut exit = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    exit.x[8] = 94;
+    exit.x[0] = 5;
+    let _ = loaded_call(
+        fixture,
+        task,
+        child_page,
+        child_control,
+        &mut service,
+        &mut exit,
+        &mut cpu,
+    );
+    assert!(
+        !matches!(
+            fixture.zone.record(caller_record).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ),
+        "the child's exit releases the suspended caller: {:?}",
+        fixture.zone.record(caller_record).claim()
+    );
+}
+
 /// The signal checkpoint's refusal is returned, never served (#1958 review).
 /// A recorded host-loaded root has SIGUSR1 pending when its slot carries a
 /// foreign namespace PID: admission refuses the binding as `Stale`, and
