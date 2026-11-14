@@ -584,6 +584,40 @@ mod tests {
         }
     }
 
+    /// The ABI, not a second list of crossing ordinals, defines which user
+    /// pointers can be written. Report the entire missing population at once.
+    #[test]
+    fn all_crossings_declare_abi_output_arguments() {
+        use crate::dispatch::OutputOperand;
+        let mut missing = std::vec::Vec::new();
+        for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
+            let abi = carrick_abi::syscall::lookup_aarch64(crossing.canonical().raw())
+                .expect("crossing must have syscall metadata");
+            let Some(outputs) = abi.output_arguments else {
+                missing.push(std::format!("{}: ABI output arguments unaudited", abi.name));
+                continue;
+            };
+            let declared = match crossing.operand_spec().output_operand() {
+                OutputOperand::None => None,
+                OutputOperand::Record { ptr, .. } | OutputOperand::Buffer { ptr, .. } => Some(ptr),
+            };
+            for ptr in outputs {
+                if declared != Some(*ptr) {
+                    missing.push(std::format!(
+                        "{}: missing output argument {}",
+                        abi.name,
+                        ptr
+                    ));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "undeclared crossing outputs:\n{}",
+            missing.join("\n")
+        );
+    }
+
     /// A host crossing copies out through a venue that cannot supply a page,
     /// so every x86 crossing that writes guest memory declares its output
     /// (T3, #2157). Adding an x86 crossing that writes guest memory means

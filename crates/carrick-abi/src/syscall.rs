@@ -66,6 +66,10 @@ pub struct Syscall {
     pub support: SupportLevel,
     pub handler: SyscallHandler,
     pub authority: Authority,
+    /// Potentially written user-pointer arguments, including indirect and
+    /// command-dependent outputs. `None` means not yet audited, not output-free.
+    #[serde(skip_serializing)]
+    pub output_arguments: Option<&'static [u8]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compat_note: Option<&'static str>,
 }
@@ -99,7 +103,97 @@ const fn syscall(
         support,
         handler: handler_for_aarch64(number),
         authority: authority_for_aarch64(number),
+        output_arguments: output_arguments_for_aarch64(number),
         compat_note: compat_note_for_aarch64(number),
+    }
+}
+
+/// Linux syscall argument directions, audited for the host-crossing surface.
+///
+/// Argument indices are zero based. A pointer is listed even when output is
+/// optional (NULL), conditional on a command/error, or nested through an iovec,
+/// msghdr or socklen. This describes the Linux ABI, not a staging exemption.
+/// Authority: the corresponding Linux man-pages syscall signatures and RETURN
+/// VALUE / DESCRIPTION sections. Unlisted syscalls remain explicitly unaudited.
+pub const fn output_arguments_for_aarch64(number: u64) -> Option<&'static [u8]> {
+    match number {
+        // xattr value/name lists; cwd; filesystem and file records.
+        8..=10 => Some(&[2]),
+        11..=13 => Some(&[1]),
+        17 => Some(&[0]),
+        29 => Some(&[2]), // ioctl: request-dependent pointed-to record
+        25 => Some(&[2]), // fcntl: e.g. F_GETLK
+        43 | 44 | 61 | 80 => Some(&[1]),
+        78 | 79 => Some(&[2]),
+        291 => Some(&[4]), // statx
+        // Scalar, vector and indirect file I/O.
+        63 | 65 | 67 | 69 | 286 => Some(&[1]),
+        71 => Some(&[2]),          // sendfile updates off_t
+        72 => Some(&[1, 2, 3, 4]), // pselect6 includes remaining timeout
+        76 => Some(&[1, 3]),       // splice updates both offsets
+        285 => Some(&[1, 3]),      // copy_file_range updates both offsets
+        232 => Some(&[2]),         // mincore residency vector
+        // Socket results, lengths and in/out message headers.
+        199 => Some(&[3]),
+        202 | 204 | 205 | 242 => Some(&[1, 2]),
+        207 => Some(&[1, 4, 5]),
+        209 => Some(&[3, 4]),
+        212 | 269 => Some(&[1]),
+        243 => Some(&[1, 4]), // recvmmsg also updates the timeout
+        // Clocks, optional remainder records, entropy and event arrays.
+        101 => Some(&[1]),
+        113 | 114 | 87 => Some(&[1]),
+        115 | 86 => Some(&[3]),
+        153 | 278 => Some(&[0]),
+        169 => Some(&[0, 1]),
+        22 | 441 => Some(&[1]),
+        // Audited crossings whose Linux ABI has no user-memory output.
+        5..=7
+        | 14..=16
+        | 20
+        | 21
+        | 23
+        | 24
+        | 26..=28
+        | 32..=38
+        | 40
+        | 45..=57
+        | 62
+        | 64
+        | 66
+        | 68
+        | 70
+        | 74
+        | 75
+        | 77
+        | 81..=85
+        | 88
+        | 93
+        | 94
+        | 198
+        | 200
+        | 201
+        | 203
+        | 206
+        | 208
+        | 210
+        | 211
+        | 213..=216
+        | 221..=223
+        | 226..=231
+        | 233..=235
+        | 267
+        | 276
+        | 281
+        | 284
+        | 287
+        | 288
+        | 434
+        | 436
+        | 437
+        | 439
+        | 452 => Some(&[]),
+        _ => None,
     }
 }
 
