@@ -5173,12 +5173,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         });
         signals.enqueue_thread(record, signal, Some(info));
-        if signal == carrick_signal_core::policy::Signal::KILL {
-            self.current.linux.mark_native_signal_work();
-        }
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
             carrick_signal_core::SignalSet::from_bits(control.blocked().0),
         );
+        if signal == carrick_signal_core::policy::Signal::KILL
+            || signals.has_default_terminating_deliverable(record, blocked)
+        {
+            self.current.linux.mark_native_signal_work();
+        }
         let interrupt = signals.has_deliverable(record, blocked);
         let ipc_channel = if interrupt {
             match graph.pending.get(&target_key) {
@@ -6331,6 +6333,32 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .resources()
             .signals()
             .has_deliverable(self.record, blocked)
+    }
+
+    fn latch_default_terminating_exec_signal(&self) -> bool {
+        let graph = self.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(self.key) else {
+            return false;
+        };
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+        );
+        let fatal = row
+            .native()
+            .resources()
+            .signals()
+            .default_terminating_deliverable(self.record, blocked);
+        if let Some(signal) = fatal
+            && let Some(pending) = graph.service_wait(&self.record)
+        {
+            let _ = pending.exec_fatal_signal.compare_exchange(
+                0,
+                signal.number() as u8,
+                core::sync::atomic::Ordering::Release,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        fatal.is_some()
     }
 
     fn ipc_env(
@@ -11132,6 +11160,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
         let mut wake_channels = Vec::new();
         let mut interrupts = Vec::new();
+        let mut fatal_signal_work = signal == carrick_signal_core::policy::Signal::KILL;
         for (target_key, target_signals, _) in targets {
             let before = interrupts.len();
             // kill() is process-directed: the signal sits in the process inbox
@@ -11147,6 +11176,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         let mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                             carrick_signal_core::SignalSet::from_bits(control.blocked().0),
                         );
+                        fatal_signal_work |=
+                            target_signals.has_default_terminating_deliverable(record, mask);
                         if (preferred_member.is_none() || !mask.contains(signal))
                             && target_signals.has_deliverable(record, mask)
                         {
@@ -11170,7 +11201,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
         drop(graph);
-        if signal == carrick_signal_core::policy::Signal::KILL {
+        if fatal_signal_work {
             self.current.linux.mark_native_signal_work();
         }
         for record in interrupts {

@@ -468,6 +468,342 @@ fn native_exit_fixture(name: &str) -> Vec<u8> {
     native_exit_fixture_with_flags(name, &[])
 }
 
+/// #1093 S4c: exercise exec from a real ring-born child, with its parent
+/// alive in wait4. A returned exec errno is propagated as the run exit code.
+#[test]
+fn native_fork_child_execs_static_successor() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_marker.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec.S", &[&define]);
+    let outcome = run_exec_fixture(&elf, 32);
+    assert_eq!(outcome.run.exit_code, 0, "child exec returned errno");
+    assert_eq!(outcome.run.stdout, b"X\n");
+    assert!(outcome.run.stderr.is_empty());
+}
+
+/// #2235: a child's exec refused before the arm returns execve(2)'s errno
+/// and the child's old image runs on: it exits with that errno, which the
+/// parent collects and propagates. Missing is ENOENT (2); a non-ELF file is
+/// ENOEXEC (8). Before the native exec service both were ENOSYS (38).
+#[test]
+fn native_fork_child_exec_refusals_return_their_errno_to_the_old_image() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let text = directory.path().join("text");
+    carrick_test_support::executable::write_executable_mode(&text, b"not an executable\n", 0o700);
+    for (path, errno) in [(directory.path().join("absent"), 2), (text, 8)] {
+        let define = format!("-DSUCCESSOR_PATH=\"{}\"", path.display());
+        let elf = native_exit_fixture_with_flags("native_fork_exec.S", &[&define]);
+        let outcome = run_exec_fixture(&elf, 32);
+        assert_eq!(
+            (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+            (errno, b"".as_slice()),
+            "{}: the child's exec returns {errno}; 38 is ENOSYS",
+            path.display()
+        );
+    }
+}
+
+/// #2235: the successor and parent exchange blocked signals while both are live,
+/// before the parent collects the child's successful replacement status.
+#[test]
+fn native_fork_child_execs_while_parent_keeps_running() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_live_successor.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec_live.S", &[&define]);
+    let outcome = run_exec_fixture(&elf, 128);
+    let counters = outcome.physical.syscall_counters().expect("exec census");
+    let exec_calls = counters.served[59].load(std::sync::atomic::Ordering::Acquire)
+        + counters.refused[59].load(std::sync::atomic::Ordering::Acquire);
+    assert!(
+        exec_calls > 0,
+        "the two-live-process witness must reach execve"
+    );
+    assert_eq!(outcome.run.exit_code, 0, "two-live-process exec failed");
+    assert_eq!(outcome.run.stdout, b"live-exec-ok\n");
+    assert!(outcome.run.stderr.is_empty());
+}
+
+/// A second live child holds fork-stock tables while this child's production
+/// NATIVE_SERVICE_PORT exec parks. Retirement returns the tables and must
+/// resume the exact parked record through its scheduler object queue.
+#[test]
+fn native_fork_child_exec_wakes_after_stock_holder_retires() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_stock_successor.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define]);
+    let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "stock holder handshake must finish"
+    );
+    assert!(
+        outcome
+            .physical
+            .fork_stock_counters()
+            .expect("stock census")
+            .successor_table_refusals
+            > 0,
+        "the live exec must actually park for fork stock"
+    );
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "parked exec must wake after stock return"
+    );
+    assert_eq!(outcome.run.stdout, b"X\n");
+}
+
+/// SIGKILL must acknowledge a parked exec's service ticket even when its
+/// stock holder remains live. The parent's wait4 must collect the killed child.
+#[test]
+fn native_fork_child_exec_killed_while_parked_is_reaped() {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_stock_successor.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf =
+        native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define, "-DCANCEL_PARKED"]);
+    let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "stock holder handshake must finish"
+    );
+    assert!(
+        outcome
+            .physical
+            .fork_stock_counters()
+            .expect("stock census")
+            .successor_table_refusals
+            > 0,
+        "the killed exec must actually park for fork stock"
+    );
+    assert_eq!(outcome.run.exit_code, 0, "wait4 must reap the parked child");
+}
+
+/// A caught signal cannot cancel the outstanding exec service. Its old
+/// handler is reset by exec, so SIGUSR1 terminates the successor image.
+#[test]
+fn native_fork_child_exec_caught_signal_while_parked() {
+    parked_exec_signal_witness("-DCAUGHT_PARKED", b"X\n");
+}
+
+/// SIG_IGN survives exec: the successor must write its marker and exit zero.
+#[test]
+fn native_fork_child_exec_ignored_signal_while_parked() {
+    parked_exec_signal_witness("-DIGNORED_PARKED", b"X\n");
+}
+
+/// A default-terminate signal cancels the service and reaps the child even
+/// while its stock holder is still alive.
+#[test]
+fn native_fork_child_exec_default_terminate_while_parked() {
+    parked_exec_signal_witness("-DTERM_PARKED", b"");
+}
+
+/// A pending caught SIGUSR1 has a lower number than fatal SIGTERM. The
+/// cancelled exec must end the group without calling the old-image handler.
+#[test]
+fn native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked() {
+    native_parked_exec_linux_oracle(
+        "one",
+        "case=caught_then_fatal seccomp_exec_parked=1 threads=1 signaled=1 signal=15 old_image_bytes=0\n",
+    );
+    parked_exec_signal_witness("-DTWO_SIGNALS_PARKED", b"");
+}
+
+/// A real sibling can consume group-directed SIGTERM while the exec caller
+/// remains parked. Cancellation must retire the caller without RAX=59 even
+/// if the pending signal has already been dequeued by that sibling.
+#[test]
+fn native_fork_child_exec_sibling_fatal_signal_retires_parked_caller() {
+    native_parked_exec_linux_oracle(
+        "two",
+        "case=sibling_fatal seccomp_exec_parked=1 threads=2 signaled=1 signal=15 old_image_bytes=0\n",
+    );
+    parked_exec_signal_witness("-DTWO_THREAD_TERM_PARKED", b"S\n");
+}
+
+fn native_parked_exec_linux_oracle(case: &str, expected: &str) {
+    let dir = tempfile::tempdir().expect("native oracle directory");
+    let binary = dir.path().join("native_exec_signal_oracle");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/native_exec_signal_oracle.c");
+    let compile = std::process::Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-pthread"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("compile native Linux oracle");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let oracle = std::process::Command::new("timeout")
+        .args(["--kill-after=1", "10"])
+        .arg(&binary)
+        .arg(case)
+        .output()
+        .expect("run native Linux oracle");
+    assert!(
+        oracle.status.success(),
+        "{}",
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    assert_eq!(oracle.stdout, expected.as_bytes(), "native Linux oracle");
+}
+
+fn parked_exec_signal_witness(flag: &str, stdout: &[u8]) {
+    let directory = tempfile::tempdir().expect("successor directory");
+    let successor = directory.path().join("successor");
+    let marker = native_exit_fixture("native_exec_stock_successor.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &marker, 0o700);
+    let define = format!("-DSUCCESSOR_PATH=\"{}\"", successor.display());
+    let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define, flag]);
+    let outcome = run_exec_fixture_with_stock_pressure(&elf, &marker, 256);
+    assert!(
+        outcome
+            .physical
+            .fork_stock_counters()
+            .expect("stock census")
+            .successor_table_refusals
+            > 0,
+        "the signal must reach a parked exec: exit={}, stdout={:?}, stderr={:?}",
+        outcome.run.exit_code,
+        outcome.run.stdout,
+        outcome.run.stderr
+    );
+    assert_eq!(outcome.run.exit_code, 0, "parked signal/wait4 result");
+    assert_eq!(outcome.run.stdout, stdout, "successor execution marker");
+}
+
+/// Run the production CPL0 root, which execs `path` and exits with the
+/// refused errno (38 is ENOSYS) if `execve` returns.
+fn run_root_exec(path: &std::path::Path) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    let define = format!("-DEXEC_PATH=\"{}\"", path.display());
+    let elf = native_exit_fixture_with_flags("native_root_exec.S", &[&define]);
+    run_exec_fixture(&elf, 128)
+}
+
+fn run_exec_fixture(
+    elf: &[u8],
+    max_exits: usize,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("exec caller ELF");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        max_exits,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .map_err(|failure| failure.error)
+    .expect("production CPL0 root exec")
+}
+
+fn run_exec_fixture_with_stock_pressure(
+    elf: &[u8],
+    successor: &[u8],
+    max_exits: usize,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    use carrick_x86_cpl0_host::cpl0_boot::exec_service::X86ExecImage;
+    let program =
+        carrick_mem::elf::ElfProgram::load(successor, 62, &|_| None).expect("successor ELF");
+    let demand = X86ExecImage::from_program(&program, vec![b"/successor".to_vec()], vec![])
+        .expect("successor demand")
+        .demand();
+    let caller = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("exec caller ELF");
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    let held = std::sync::Mutex::new(None);
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &caller,
+        max_exits,
+        ROOT_AFFINITY_LOADED,
+        |carrier| {
+            // Leave capacity for the two fork children and one fewer table
+            // than their exec successor needs. The first child's retirement
+            // must return its own tables to satisfy that exec.
+            let left = demand.tables + 13;
+            *held.lock().expect("held stock slot") = Some(
+                carrier
+                    .fixture_hold_fork_stock(left)
+                    .expect("hold excess stock"),
+            );
+        },
+        dispatcher,
+    )
+    .map_err(|failure| failure.error)
+    .expect("stock-contended production exec");
+    drop(held);
+    outcome
+}
+
+/// #2142: root exec must replace the production CPL0 image, not return ENOSYS.
+#[test]
+#[ignore = "#2142 root exec: not served by #2273"]
+fn production_root_exec_replaces_image_and_runs_static_successor() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let successor = dir.path().join("successor");
+    let successor_elf = native_exit_fixture("native_root_exec_successor.S");
+    carrick_test_support::executable::write_executable_mode(&successor, &successor_elf, 0o700);
+    let outcome = run_root_exec(&successor);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (0, b"root-exec-ok\n".as_slice()),
+        "root exec must run the successor; 38 is ENOSYS"
+    );
+    assert!(outcome.run.stderr.is_empty());
+}
+
+/// #2142: execve(2) of a missing path fails with ENOENT and the caller keeps
+/// running its old image, which exits with that errno.
+#[test]
+#[ignore = "#2142 root exec: not served by #2273"]
+fn production_root_exec_of_a_missing_path_is_enoent() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let outcome = run_root_exec(&dir.path().join("absent"));
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (2, b"".as_slice()),
+        "a missing exec path is ENOENT (2); 38 is ENOSYS"
+    );
+}
+
+/// #2142: execve(2) of an executable file in no recognized format fails with
+/// ENOEXEC and the caller keeps running its old image.
+#[test]
+#[ignore = "#2142 root exec: not served by #2273"]
+fn production_root_exec_of_a_non_elf_file_is_enoexec() {
+    let dir = tempfile::tempdir().expect("exec fixture directory");
+    let text = dir.path().join("text");
+    carrick_test_support::executable::write_executable_mode(&text, b"not an executable\n", 0o700);
+    let outcome = run_root_exec(&text);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.stdout.as_slice()),
+        (8, b"".as_slice()),
+        "a non-ELF exec is ENOEXEC (8); 38 is ENOSYS"
+    );
+}
+
 fn native_exit_fixture_with_flags(name: &str, flags: &[&str]) -> Vec<u8> {
     kvm_pool_fixture::assemble_fixture(name, flags)
 }
@@ -627,7 +963,7 @@ fn production_exec_service_stages_parks_and_reruns_a_successor() {
     let stock = carrier.fork_table_stock();
     assert!(stock >= demand.tables, "boot left the stock {stock} tables");
 
-    let X86ExecStage::Staged(backing, entry) = carrier
+    let X86ExecStage::Staged(backing, entry, _) = carrier
         .stage_exec_successor(0, request(), StockReleaseWake::new(|| {}))
         .expect("service")
     else {
@@ -963,7 +1299,8 @@ fn native_child_futex_wake_to_a_busy_pinned_cpu_queues_the_waiter_there() {
                         .map_err(|_| carrick_hal::fork_stock::NativeHostFileRefused)?;
                     marker = true;
                     Ok(served.retained_source)
-                }
+                },
+                &mut |_| Err(carrick_abi::LINUX_ENOSYS),
             )
             .expect("thread birth service")
             .is_none()
@@ -1696,6 +2033,7 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
                     served_marker = true;
                     Ok(served.retained_source)
                 },
+                &mut |_| Err(carrick_abi::LINUX_ENOSYS),
             )
             .expect("peer authenticated host-file completion")
             .is_none()
