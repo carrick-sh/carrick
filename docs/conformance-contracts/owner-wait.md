@@ -284,3 +284,14 @@ on resume with the original ready count. No input bytes are published or
 completed output replayed. The native prepared-fork eventfd-input binding
 also requires forbidden input to complete with EFAULT without changing the
 counter; valid inherited input retains exact-MM read preparation.
+
+For wait4 rusage (#2306), the reap precedes output as required by Linux.
+The completed PID and accounting bytes enter the existing `OwnedCopyout`
+service, retaining the next unwritten byte on Busy or an authenticated owner
+wait. Resumption completes that answer without rescanning the child set.
+The production continuation binding
+`wait4_rusage_owner_wait_retains_reaped_answer_until_release` holds a real
+MM Gate after child exit, requires a transfer with no physical notice, then
+releases it and requires one rusage output and ECHILD on a subsequent wait.
+It was red on d5ab1fd1f at the transfer assertion. This does not establish the
+remaining generic converter audit or resolve the separate loaded birth stall.
