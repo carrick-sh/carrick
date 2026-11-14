@@ -16552,6 +16552,7 @@ fn futex_copy_not_yet_owner_fault_publishes_efault() {
     futex_owner_wait_episode(false, false, false, None, false, false, true);
 }
 
+#[cfg(test)]
 fn futex_owner_wait_episode(
     timed: bool,
     synchronous: bool,
