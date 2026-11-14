@@ -626,7 +626,7 @@ fn run_exec_fixture_with_stock_pressure(
             // Leave capacity for the two fork children and one fewer table
             // than their exec successor needs. The first child's retirement
             // must return its own tables to satisfy that exec.
-            let left = demand.tables + 7;
+            let left = demand.tables + 3;
             *held.lock().unwrap() = Some(
                 carrier.fixture_hold_fork_stock(left).expect("hold excess stock"),
             );
