@@ -40,3 +40,7 @@ node_modules/
 
 # scratch / local tooling (accidentally committed in phase-2; keep on disk, out of git)
 last_1000_commits.txt
+
+# Worker follow-up notes are drafts for issues, never repository content (four PRs
+# committed them at the root on 2026-11-13: #2250, #2271, #2272, #2277).
+/followup-*.md
