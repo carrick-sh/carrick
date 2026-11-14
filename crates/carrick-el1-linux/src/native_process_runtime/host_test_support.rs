@@ -10,6 +10,7 @@ std::thread_local! {
     static TERMINAL_VACATES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
 pub(super) fn take_terminal_vacates() -> usize {
     TERMINAL_VACATES.with(|count| count.replace(0))
 }
@@ -166,6 +167,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         source: carrick_el1_abi::BornInZoneSource<'a, C>,
     ) -> Result<(), NativeProcessError> {
         let _ = source;
+        #[cfg(test)]
         TERMINAL_VACATES.with(|count| count.set(count.get() + 1));
         Ok(())
     }
