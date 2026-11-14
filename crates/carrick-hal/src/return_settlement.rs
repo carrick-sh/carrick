@@ -247,6 +247,14 @@ pub trait ExclusionSettlement {
         &mut self,
         excluded: &carrick_sched_core::ExcludedEditor<'_>,
     ) -> Result<(), Self::Error>;
+    /// Reclaim retired fork holders through the venue's existing quarantine
+    /// drain. The excluded MM is never reclaimed. A child still published or
+    /// installed stays quarantined. A published holder's release source
+    /// remains the authority a full-table drain waits on.
+    fn reclaim_retired_holders(
+        &mut self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+    ) -> Result<(), Self::Error>;
     /// Settle the excluded MM's owed returns, after its COW completions.
     fn settle_owed_returns(
         &mut self,
@@ -263,6 +271,7 @@ pub fn settle_cow_then_returns<V: ExclusionSettlement>(
     excluded: &carrick_sched_core::ExcludedEditor<'_>,
 ) -> Result<V::Returns, V::Error> {
     venue.settle_cow_completions(excluded)?;
+    venue.reclaim_retired_holders(excluded)?;
     let cow = CowSettled {
         mm: excluded.key(),
         _exclusion: core::marker::PhantomData,
@@ -451,7 +460,18 @@ pub fn drain_owed_return_table<D: OwedReturnDrain>(
             // Settled, yet the table is full again: other MMs journaled into
             // the freed slots, which is their progress; the rerun drains anew.
             (None, Some(_)) if reply == SettlementDoorbellReply::Settled => live = true,
-            // No live source, or a stale holder: it is retiring.
+            // A native venue cannot settle the host-served root, and a
+            // closing holder may already have lost its native root. Its live
+            // source still owns release: Stale is no evidence of progress.
+            (None, Some(revisions)) => {
+                wait.get_or_insert(HolderWait::new(
+                    holder,
+                    HolderRefusal::Reservations,
+                    revisions.reservations,
+                ));
+            }
+            // No live source: retirement has detached it. The exclusion's
+            // quarantine drain reclaims retired holders through MM receipts.
             _ => {}
         }
     }

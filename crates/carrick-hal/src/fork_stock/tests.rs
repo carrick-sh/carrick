@@ -2915,3 +2915,109 @@ fn an_enrolled_waiter_is_woken_once_by_the_holder_return() {
     assert_eq!(late.load(Ordering::Acquire), 1);
     assert_eq!(stock.release_waiters(), 0);
 }
+
+/// Both carriers compose this exact sequence and ForkStock release protocol.
+/// The table models retired journals; only real whole-MM release receipts
+/// free its 64 slots. The additive HVF fixture uses real reservation journals.
+#[test]
+fn settlement_exclusion_reclaims_all_64_slots_held_by_exited_fork_children() {
+    use crate::return_settlement::{CowSettled, ExclusionSettlement, settle_cow_then_returns};
+    use carrick_core_abi::{MmReleaseReceipt, Refusal, RetiredReturns};
+    struct Table(RefCell<std::collections::BTreeMap<u64, usize>>);
+    impl Table {
+        fn occupied(&self) -> usize {
+            self.0.borrow().values().sum()
+        }
+    }
+    impl RetiredReturns for Table {
+        fn settle_whole_mm(&self, receipt: MmReleaseReceipt) -> Result<usize, Refusal> {
+            Ok(self.0.borrow_mut().remove(&receipt.mm().raw()).unwrap_or(0))
+        }
+    }
+    struct Venue<'a> {
+        stock: &'a mut ForkStock<UntaggedRoots>,
+        table: &'a Table,
+        spaces: &'a carrick_sched_core::AddressSpaces,
+        residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+    }
+    impl ExclusionSettlement for Venue<'_> {
+        type Error = ForkStockServiceError;
+        type Returns = usize;
+        fn settle_cow_completions(
+            &mut self,
+            _: &carrick_sched_core::ExcludedEditor<'_>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn reclaim_retired_holders(
+            &mut self,
+            excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        ) -> Result<(), Self::Error> {
+            self.stock
+                .reclaim(
+                    &mut NoTableLedger,
+                    mm(excluded.key()),
+                    |mm| self.spaces.unpublished(mm.raw()).and_then(|_| absent(mm)),
+                    |_| true,
+                    |_| true,
+                    |absence| {
+                        self.spaces
+                            .unpublished(absence.mm().raw())
+                            .is_some_and(|absent| {
+                                release_child_mm(
+                                    &DummyInventory,
+                                    self.residency,
+                                    self.table,
+                                    &absent,
+                                )
+                            })
+                    },
+                )
+                .map(|_| ())
+        }
+        fn settle_owed_returns(
+            &mut self,
+            _: &carrick_sched_core::ExcludedEditor<'_>,
+            _: &CowSettled<'_>,
+        ) -> Result<usize, Self::Error> {
+            Ok(self.table.occupied())
+        }
+    }
+    let mut stock = stock(UntaggedRoots, 16, 8);
+    let table = Table(RefCell::new(std::collections::BTreeMap::new()));
+    for index in 0..8 {
+        let child_mm = 302 + index;
+        let loan = loan(&mut stock, parent(), child_mm, 1, 1).unwrap();
+        commit(&mut stock, parent(), loan, 1, 0).unwrap();
+        table.0.borrow_mut().insert(child_mm, 8);
+        retire(&mut stock, child_of(loan, 42 + index)).unwrap();
+    }
+    assert_eq!(table.occupied(), 64);
+    assert!(stock.has_quarantine());
+    let region = carrick_test_support::TestEl1Region::zeroed();
+    // SAFETY: aligned zero-valid residency ABI record in retained owned storage.
+    let residency = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize)
+            .cast::<carrick_el1_abi::FrameGrantResidencyTable>()
+    };
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let excluded = spaces.unpublished(PARENT_MM).unwrap();
+    let occupied = settle_cow_then_returns(
+        &mut Venue {
+            stock: &mut stock,
+            table: &table,
+            spaces: &spaces,
+            residency,
+        },
+        &excluded,
+    )
+    .unwrap();
+    assert_eq!(
+        occupied, 0,
+        "retired holders are reclaimed before the caller's returns"
+    );
+    assert!(!stock.has_quarantine());
+    assert_eq!(stock.counters().returned_children, 8);
+}

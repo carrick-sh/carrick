@@ -1669,6 +1669,12 @@ fn fork_loan_outliving_finish_wakes_and_serves_the_original_mapping() {
         ) -> Result<(), ()> {
             Ok(()) // This schedule has no outstanding COW completion.
         }
+        fn reclaim_retired_holders(
+            &mut self,
+            _: &carrick_sched_core::ExcludedEditor<'_>,
+        ) -> Result<(), ()> {
+            Ok(()) // No retired fork holders in this schedule.
+        }
         fn settle_owed_returns(
             &mut self,
             excluded: &carrick_sched_core::ExcludedEditor<'_>,

@@ -685,6 +685,7 @@ dependencies = [
  "carrick-sched-core",
  "carrick-signal-core",
  "carrick-signal-linux",
+ "carrick-test-support",
  "carrick-timer-core",
  "libc",
  "parking_lot",

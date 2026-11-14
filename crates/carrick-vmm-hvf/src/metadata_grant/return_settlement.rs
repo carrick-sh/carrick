@@ -152,6 +152,30 @@ impl ExclusionSettlement for NativeExclusion<'_> {
             crate::trap::settle_cow_completions(self.custody, pool, excluded)
         })
     }
+    fn reclaim_retired_holders(
+        &mut self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        let (Some(region), Some(zone), Some(active)) = (
+            retained_abi_region(self.custody),
+            carrick_el1_abi::zone_tables(),
+            carrick_el1_abi::ReservationMm::new(excluded.key()),
+        ) else {
+            return Ok(());
+        };
+        let mut stock = self.custody.fork_stock.lock();
+        let mut ledger = crate::fork_stock::fork_table_accounting(self.custody);
+        reclaim_fork_stock(
+            self.custody,
+            &mut stock,
+            &mut ledger,
+            region,
+            zone,
+            active.into(),
+        )
+        .map(|_| ())
+        .map_err(|error| TrapError::Hypervisor(format!("settlement fork quarantine: {error:?}")))
+    }
     fn settle_owed_returns(
         &mut self,
         excluded: &carrick_sched_core::ExcludedEditor<'_>,
@@ -347,7 +371,12 @@ fn settle_at_doorbell(
                 Ok(exclusion) => {
                     let settled = settle_native_exclusion(custody, exclusion.proof())?;
                     drop(exclusion);
-                    Ok(settled.unwrap_or(PauseSettlement::answer(SettlementDoorbellReply::Stale)))
+                    // The host-served root (MM 1) has no native child root.
+                    // Its live Reservations source, not a Stale rerun, owns
+                    // the host-boundary release of any slots it holds.
+                    Ok(settled.unwrap_or(PauseSettlement::answer(
+                        SettlementDoorbellReply::Reservations,
+                    )))
                 }
                 Err(ExclusionRefusal::Busy) => {
                     Ok(PauseSettlement::answer(SettlementDoorbellReply::Editor))

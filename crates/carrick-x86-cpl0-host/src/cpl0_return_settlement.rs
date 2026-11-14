@@ -192,6 +192,14 @@ impl<M: CarrierMemoryIo> ExclusionSettlement for Cpl0Exclusion<'_, '_, M> {
     ) -> Result<(), TrapError> {
         self.custody.settle_cow_completions(excluded)
     }
+    fn reclaim_retired_holders(
+        &mut self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        let active = carrick_el1_abi::ReservationMm::new(excluded.key())
+            .ok_or_else(|| fail("settlement quarantine active MM"))?;
+        self.custody.drain_fork_quarantine(active)
+    }
     fn settle_owed_returns(
         &mut self,
         excluded: &carrick_el1_abi::ExcludedEditor<'_>,
@@ -328,8 +336,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return Ok(PauseSettlement::answer(SettlementDoorbellReply::Stale));
         };
         if !table.admitted(index.index(), mm) {
-            // No admitted root delegates this MM's memory: nothing is owed.
-            return Ok(PauseSettlement::answer(SettlementDoorbellReply::Settled));
+            // A root already retired can still hold shared-table slots until
+            // its fork-quarantine release. No native journal was settled.
+            return Ok(PauseSettlement::answer(SettlementDoorbellReply::Stale));
         }
         self.return_settlement_counters.exclusions += 1;
         let guard = self.return_settlement.lock(excluded);
