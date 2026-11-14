@@ -4211,3 +4211,76 @@ fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
     );
     assert_eq!(outcome.run.terminating_signal, None);
 }
+
+/// Exercise the real exclusion, then release its editor only after a real
+/// Editor wait is enrolled. Reuse #2250's editor hold/release fixture.
+fn owner_crossing_busy_witness(
+    crossing: carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing,
+) {
+    let elf = kvm_pool_fixture::assemble_fixture("native_concurrent_cow_faults.S", &[]);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = kvm_pool_fixture::try_run_pool_fixture_with(&elf, 512, |carrier| {
+            held_tx.send(carrier.fixture_hold_fault_editor(crossing)).unwrap();
+        }).map_err(|error| error.to_string());
+        tx.send(result).unwrap();
+    });
+    let bound = std::time::Duration::from_secs(20);
+    let hold = held_rx.recv_timeout(bound).expect("fault exclusion hold armed");
+    assert!(hold.wait_claimed(bound), "the selected exclusion must be reached");
+    assert_eq!(hold.held().len(), 1, "one exact MM editor is held");
+    let deadline = std::time::Instant::now() + bound;
+    let mut early_result = None;
+    let enrolled = loop {
+        if hold.enrolled().expect("Editor queue census") > 0 {
+            break true;
+        }
+        if let Ok(result) = rx.try_recv() {
+            early_result = Some(result);
+            break false;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+    assert_eq!(hold.release().expect("publish exact Editor release"), 1);
+    let result = early_result.unwrap_or_else(|| rx.recv_timeout(bound).expect("fault resumed"));
+    assert!(enrolled, "Busy must enroll before release: {:?}", result.as_ref().err());
+    let outcome = result.expect("Busy is not a fatal carrier fault");
+    assert_eq!(outcome.run.exit_code, 7, "{:?}", outcome.run);
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+#[test]
+fn production_cow_supply_exclusion_busy_once_then_success() {
+    owner_crossing_busy_witness(
+        carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::CowSupply,
+    );
+}
+
+#[test]
+fn production_cow_settlement_exclusion_busy_once_then_success() {
+    owner_crossing_busy_witness(
+        carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::CowSettlement,
+    );
+}
+
+#[test]
+fn production_prepare_planning_exclusion_busy_once_then_success() {
+    owner_crossing_busy_witness(
+        carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::PreparePlanning,
+    );
+}
+
+#[test]
+fn production_two_threads_of_forked_mm_fault_cow_concurrently() {
+    let elf = kvm_pool_fixture::assemble_fixture("native_concurrent_cow_faults.S", &[]);
+    let outcome = kvm_pool_fixture::try_run_pool_fixture_with(&elf, 512, |_| {})
+        .expect("concurrent faults retain their MM operations");
+    assert_eq!(outcome.run.exit_code, 7, "{:?}", outcome.run);
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
