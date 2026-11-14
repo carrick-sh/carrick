@@ -1564,13 +1564,28 @@ pub enum TerminalRefusal {
 /// produced gets `SW_EL1_PRIVATE` and the write (and execute) ceiling its
 /// current permission implies. Only a writable leaf qualifies: an
 /// already-restricted leaf carries no recoverable Linux write intent, so it
-/// stays with the host. Blocks stay with the host (EL1 never splits).
+/// stays with the host. Range rules leave blocks with the host; owner fork
+/// adopts a wholly private block with [`adopt_host_block_as_el1_private`].
 fn adopt_host_leaf_as_el1_private(desc: u64, level: usize) -> u64 {
-    if level != 3
-        || desc & (VALID | SW_EL1_PRIVATE) != VALID
-        || desc & TYPE_BITS != TYPE_TABLE_OR_PAGE
-        || desc & AP_MASK != AP_RW
-    {
+    if level != 3 || desc & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+        return desc;
+    }
+    adopt_writable_terminal(desc)
+}
+
+/// Owner fork's adoption of a wholly private L1/L2 block before it arms the
+/// block in place (#2276). The tags travel to every child of the block's
+/// later split, so its first COW write is EL1's and the split happens once,
+/// inside that repoint, with host-granted tables.
+pub(crate) fn adopt_host_block_as_el1_private(desc: u64, level: usize) -> u64 {
+    if !matches!(level, 1 | 2) || desc & TYPE_BITS != TYPE_BLOCK {
+        return desc;
+    }
+    adopt_writable_terminal(desc)
+}
+
+fn adopt_writable_terminal(desc: u64) -> u64 {
+    if desc & (VALID | SW_EL1_PRIVATE) != VALID || desc & AP_MASK != AP_RW {
         return desc;
     }
     desc | SW_EL1_PRIVATE | SW_EL1_MAY_WRITE | if desc & UXN == 0 { SW_EL1_MAY_EXEC } else { 0 }
