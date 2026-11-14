@@ -149,6 +149,16 @@ and lets only a deliverable default-terminate signal cancel it. Fatal signal
 work drives a host probe of the parked ticket. An error while probing preserves
 all unprocessed parked execs.
 
+The final cancellation boundary adds two production KVM witnesses under the
+same stock pressure. `native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked`
+queues caught SIGUSR1 before default-fatal SIGTERM and records any old-image
+handler write. On `c61e80c77`, the handler wrote `H\n` before the child died:
+`2273-red-a` failed with stdout `[72, 10]`. The real two-thread fork child in
+`native_fork_child_exec_sibling_fatal_signal_retires_parked_caller` has a
+sibling consume SIGTERM while the exec service is cancelled; it records `R\n`
+if the old image resumes. On the same head, `2273-red-b8` exited 197, the
+negation of saved syscall number 59, rather than being reaped as signaled.
+
 ## Stack adoption
 
 The staged successor imports a PRIVATE|GROWSDOWN stack before admission,
