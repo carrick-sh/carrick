@@ -1128,6 +1128,14 @@ pub fn evaluate_el1_step(
             parsed.unfinished_binaries.join(", ")
         ));
     }
+    // A test that never ran is never forgiven by the allowlist (#2355 review):
+    // a budget NOT-RUN or a missing developer registry fails the step.
+    if !parsed.not_run_tests.is_empty() {
+        reasons.push(format!(
+            "el1 not-run tests: {}",
+            parsed.not_run_tests.join(", ")
+        ));
+    }
     if exit_code != Some(0)
         && reasons.is_empty()
         && (parsed.failed_tests.is_empty() || parsed.finished_binaries.is_empty())

@@ -31,12 +31,10 @@ pub fn carrier_snapshot(
     carrier.snapshot()
 }
 
-/// The exit status a test process uses to say it needs a developer registry
-/// the host doesn't have (#1448). `scripts/lib/test-signed-run.sh` turns it,
-/// with [`DEV_REGISTRY_MARKER`], into a named `test-signed: NOT-RUN` row:
-/// counted and failing, never a silent pass.
-pub const DEV_REGISTRY_NOT_RUN_EXIT: i32 = 77;
-/// The stderr line [`require_dev_registry`] prints before that exit.
+/// The line [`require_dev_registry`] writes when a test needs a developer
+/// registry the host doesn't have (#1448). `scripts/lib/test-signed-run.sh`
+/// turns a test whose output carries it into a named `test-signed: NOT-RUN`
+/// row: counted and failing, never a silent pass.
 pub const DEV_REGISTRY_MARKER: &str = "test-signed: needs developer registry";
 
 /// The registry host of an image served by a developer registry on this
@@ -48,12 +46,19 @@ pub fn dev_registry_host(image: &str) -> Option<&str> {
 }
 
 /// For an image from a developer registry (`localhost:5005`, `:5050`), check
-/// the registry answers; when it doesn't, print [`DEV_REGISTRY_MARKER`] and
-/// exit [`DEV_REGISTRY_NOT_RUN_EXIT`], so the signed runner reports this test
-/// NOT-RUN by name (#1448: the signed runners have no such registry, and
-/// these tests failed in 0.2 s as product failures). Returns `image`.
+/// the registry answers; when it doesn't, the test stops here (#1448: the
+/// signed runners have no such registry, and these tests failed in 0.2 s as
+/// product failures). It writes [`DEV_REGISTRY_MARKER`] on its own line
+/// straight to the process's stderr (libtest's capture can't hold it back),
+/// then panics with the same line, so the test fails, its binary's other
+/// tests still run, and the signed runner reports it NOT-RUN by name.
+/// Returns `image`.
+// A test-only stop: failing the calling test is this helper's contract, like
+// an assertion (precedent: carrick-conformance-next's test helpers).
+#[allow(clippy::panic)]
 pub fn require_dev_registry(image: &str) -> &str {
     if let Some(host) = dev_registry_host(image) {
+        use std::io::Write;
         use std::net::ToSocketAddrs;
         let reachable = host.to_socket_addrs().is_ok_and(|mut addrs| {
             addrs.any(|addr| {
@@ -61,8 +66,9 @@ pub fn require_dev_registry(image: &str) -> &str {
             })
         });
         if !reachable {
-            eprintln!("{DEV_REGISTRY_MARKER} {host} ({image})");
-            std::process::exit(DEV_REGISTRY_NOT_RUN_EXIT);
+            let line = format!("{DEV_REGISTRY_MARKER} {host} ({image})");
+            let _ = writeln!(std::io::stderr().lock(), "\n{line}");
+            panic!("\n{line}");
         }
     }
     image
@@ -572,6 +578,42 @@ mod tests {
             compat: CompatReport::default(),
             terminal_reason: None,
         }
+    }
+
+    /// Run only as the child of the test below: the real helper, under
+    /// libtest's default output capture.
+    #[test]
+    #[ignore = "child of dev_registry_marker_reaches_the_output_under_capture"]
+    fn dev_registry_child() {
+        if std::env::var_os("CARRICK_DEV_REGISTRY_CHILD").is_some() {
+            // Port 1 on loopback refuses: the registry is "missing".
+            require_dev_registry("localhost:1/carrick-test-missing:1");
+        }
+    }
+
+    #[test]
+    fn dev_registry_marker_reaches_the_output_under_capture() {
+        // #2355 review: the marker must survive libtest's capture and sit on its own line.
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "testing::tests::dev_registry_child",
+                "--include-ignored",
+            ])
+            .env("CARRICK_DEV_REGISTRY_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "a missing registry must not pass");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            text.lines().any(|line| line
+                == "test-signed: needs developer registry localhost:1 (localhost:1/carrick-test-missing:1)"),
+            "{text}"
+        );
     }
 
     #[test]

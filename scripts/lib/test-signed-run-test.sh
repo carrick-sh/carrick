@@ -32,7 +32,7 @@ case "$name" in
     aborts) kill -9 $$ ;;
     hangs) exec sleep 30 ;;
     empty) echo 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out;' ;;
-    needsreg) echo 'test-signed: needs developer registry localhost:5050 (localhost:5050/ltp:arm64)' >&2; exit 77 ;;
+    needsreg) printf 'running 1 test\ntest needsreg ... \ntest-signed: needs developer registry localhost:5050 (localhost:5050/ltp:arm64)\n' >&2; exit 101 ;;
     exits77) exit 77 ;;
     *) printf 'running 1 test\ntest %s ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out;\n' "$name" ;;
 esac
@@ -101,8 +101,9 @@ for name in one two; do
     fi
 done
 
-# 3b. #1448: a test that needs a missing developer registry is a named NOT-RUN with
-#     its reason, failing the run; a bare exit 77 without the marker is a failure.
+# 3b. #1448: a test that needs a missing developer registry (its marker on its own
+#     line, after libtest's `test name ... ` prefix) is a named NOT-RUN with its
+#     reason, failing the run; an exit without the marker is a failure.
 test_deadline_secs=5 binary_deadline_secs=0
 run_case needsreg after exits77
 [ "$failed" = 1 ]
