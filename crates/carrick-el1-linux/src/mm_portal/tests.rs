@@ -2791,6 +2791,96 @@ fn owner_fork_racing_a_return_drain_waits_for_copy_and_cow_settlement() {
     fork_child_write_preparation_mode(false, true);
 }
 
+/// #2276: the production owner fork must split a wholly-private block before
+/// arming COW.  Otherwise the block is read-only but remains untagged, and a
+/// host copyout into any page in it is misclassified as EFAULT instead of
+/// selecting the existing COW supply owner.
+#[test]
+fn owner_fork_private_block_copyout_selects_cow_supply_instead_of_efault() {
+    use carrick_core::mm::transaction::SelectionVenues;
+    use carrick_el1::fault::{CowResolution, CowResolver};
+
+    struct NeedsCowSupply;
+    impl CowResolver for NeedsCowSupply {
+        fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
+            panic!("the owner must retain the typed COW supply result")
+        }
+
+        fn resolve_cow_outcome(&mut self, _: u64, _: u64, _: u64) -> CowResolution {
+            CowResolution::NeedsSupply
+        }
+    }
+
+    const BLOCK_PAGES: usize = 512;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, BLOCK_PAGES, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view);
+    let parent_tables = Tables::new(ROOT, IPA, BLOCK_PAGES);
+    let child = Tables::new(ROOT + 0x100000, 0, 0);
+    let supply = Tables::new(ROOT + 0x200000, 0, 0);
+    parent_tables.words[1024].store((IPA & !0x1f_ffff) | (RW & !2), Ordering::Release);
+    let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
+    let arenas = [&parent_tables, &child, &supply];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let plan = portal
+        .prepare_fork(
+            request,
+            ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
+            &words,
+            0,
+        )
+        .unwrap();
+    let completion = portal
+        .publish_fork(plan, &words, 0)
+        .unwrap()
+        .commit(&portal, 0)
+        .unwrap();
+    assert_ne!(
+        completion.parent_tables_used, 0,
+        "a private L2 block must become L3 leaves in the live parent"
+    );
+    assert_ne!(
+        completion.child_tables_used, 0,
+        "the child must inherit the same page-granular COW shape"
+    );
+
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(parent, 0).unwrap(),
+            GuestVa::new(VA + 0x2d_ed0),
+            16,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let mut cow = NeedsCowSupply;
+    let residency = residency();
+    let step = portal
+        .select(
+            &transfer,
+            &words,
+            SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut cow,
+                residency: &residency,
+                slot: 0,
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            step,
+            carrick_core::mm::transaction::TransferStep::CowSupply(_)
+        ),
+        "valid block-backed output must select COW supply, got {step:?}"
+    );
+}
+
 fn fork_child_write_preparation(prepare_first: bool) {
     fork_child_write_preparation_mode(prepare_first, false);
 }
