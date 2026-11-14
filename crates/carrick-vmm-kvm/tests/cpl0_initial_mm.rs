@@ -542,7 +542,7 @@ fn native_fork_child_exec_wakes_after_stock_holder_retires() {
     let elf = native_exit_fixture_with_flags("native_fork_exec_stock.S", &[&define]);
     let outcome = run_exec_fixture(&elf, 256);
     assert!(
-        outcome.physical.fork_stock_counters().successor_table_refusals > 0,
+        outcome.physical.fork_stock_counters().expect("stock census").successor_table_refusals > 0,
         "the live exec must actually park for fork stock"
     );
     assert_eq!(outcome.run.exit_code, 0, "parked exec must wake after stock return");
@@ -564,7 +564,7 @@ fn native_fork_child_exec_killed_while_parked_is_reaped() {
     );
     let outcome = run_exec_fixture(&elf, 256);
     assert!(
-        outcome.physical.fork_stock_counters().successor_table_refusals > 0,
+        outcome.physical.fork_stock_counters().expect("stock census").successor_table_refusals > 0,
         "the killed exec must actually park for fork stock"
     );
     assert_eq!(outcome.run.exit_code, 0, "wait4 must reap the parked child");
