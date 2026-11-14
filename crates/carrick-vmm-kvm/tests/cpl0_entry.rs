@@ -4070,8 +4070,18 @@ fn production_wait4_rusage_copy_busy_once_retains_the_reaped_answer() {
 }
 
 fn instrumented_wait4_output_witness(test: &str, flags: &[&str]) {
-    // Bounded in a child test process: a lost wake must fail, never hang CI.
-    const CHILD: &str = "CARRICK_WAIT4_OUTPUT_WITNESS_CHILD";
+    bounded_contention_witness(
+        test,
+        "native_wait4_output_contention.S",
+        flags,
+        "wait4 output contention",
+    );
+}
+
+/// Run one contention fixture in a bounded child test process: a lost wake
+/// must fail, never hang CI. Exit 7 is success; 100 + n is errno n.
+fn bounded_contention_witness(test: &str, fixture: &str, flags: &[&str], what: &str) {
+    const CHILD: &str = "CARRICK_CONTENTION_WITNESS_CHILD";
     if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
         let output = std::process::Command::new("timeout")
             .args(["--kill-after=1", "20"])
@@ -4079,7 +4089,7 @@ fn instrumented_wait4_output_witness(test: &str, flags: &[&str]) {
             .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(CHILD, test)
             .output()
-            .expect("bounded wait4 output witness");
+            .expect("bounded contention witness");
         // The child must have run exactly this witness, not filtered it out.
         assert!(
             output.status.success()
@@ -4091,13 +4101,54 @@ fn instrumented_wait4_output_witness(test: &str, flags: &[&str]) {
         );
         return;
     }
-    let elf = kvm_pool_fixture::assemble_fixture("native_wait4_output_contention.S", flags);
+    let elf = kvm_pool_fixture::assemble_fixture(fixture, flags);
     let outcome = run_instrumented_pool_fixture(&elf, 128);
     assert_eq!(
         outcome.run.exit_code, 7,
-        "wait4 output contention (100 + n is errno n; 90..94 a wrong answer): {:?}",
+        "{what} (100 + n is errno n; 90..96 a wrong answer): {:?}",
         outcome.run
     );
     assert_eq!(outcome.run.terminating_signal, None);
     assert!(outcome.run.stdout.is_empty());
+}
+
+/// #2306 on x86 CPL0: the parent's space editor is held once when a
+/// production fork prepares its child MM. The fork keeps its syscall and
+/// reruns after the carrier settles: the parent gets the child's pid and
+/// reaps it, never EAGAIN (111).
+#[test]
+fn production_fork_editor_busy_once_then_forks() {
+    bounded_contention_witness(
+        "production_fork_editor_busy_once_then_forks",
+        "native_not_now_contention.S",
+        &["-DFORK_EDITOR=1"],
+        "fork preparation contention",
+    );
+}
+
+/// #2306 on x86 CPL0: waitid(WNOHANG) with a live production fork child.
+/// Its empty siginfo copy is Busy once; nothing was consumed, so the call
+/// reruns and answers 0 with the zeroed siginfo, never EAGAIN (111).
+#[test]
+fn production_waitid_nohang_siginfo_busy_once_returns_zero() {
+    bounded_contention_witness(
+        "production_waitid_nohang_siginfo_busy_once_returns_zero",
+        "native_not_now_contention.S",
+        &["-DWAITID_BUSY=1"],
+        "waitid WNOHANG siginfo contention",
+    );
+}
+
+/// #2306 on x86 CPL0: a production fork with CLONE_CHILD_SETTID whose tid
+/// store in the child is Busy once before the child's first instruction.
+/// The store stays pending and the child finds its tid stored; it was
+/// silently dropped before.
+#[test]
+fn production_clone_settid_busy_once_then_stores() {
+    bounded_contention_witness(
+        "production_clone_settid_busy_once_then_stores",
+        "native_not_now_contention.S",
+        &["-DSETTID_BUSY=1"],
+        "CLONE_CHILD_SETTID contention",
+    );
 }

@@ -23,7 +23,7 @@ use carrick_el1_linux::exec_successor::{
     prepare_closed_exec_successor_slot,
 };
 use carrick_el1_linux::native_process_runtime::{
-    ExecSuccessorSlot, NativeExecSuccessor, NativeProcessError,
+    ExecSuccessorSlot, NativeExecSuccessor, NativeFailure, NativeProcessError,
 };
 use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces};
 use carrick_guest_arch::{AddressContext, RootGpa, SlotId};
@@ -158,7 +158,7 @@ where
         )
     }
 
-    pub(crate) fn cancel(&self, receipt: ExecAdoptionReceipt) -> Result<(), NativeProcessError> {
+    pub(crate) fn cancel(&self, receipt: ExecAdoptionReceipt) -> Result<(), NativeFailure> {
         cancel_prepared_exec(receipt, |record| self.machine.cross_cancel(record))
     }
 
@@ -766,10 +766,7 @@ mod tests {
 
         // A refused cancellation is reported, never swallowed.
         let exec = fixture.exec(fixture.machine(false));
-        assert!(matches!(
-            exec.cancel(receipt()),
-            Err(NativeProcessError::Stale)
-        ));
+        assert!(matches!(exec.cancel(receipt()), Err(NativeFailure::Stale)));
         fixture.predecessor_intact();
     }
 }

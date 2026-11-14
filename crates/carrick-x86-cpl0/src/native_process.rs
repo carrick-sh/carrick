@@ -20,8 +20,9 @@ use carrick_el1_abi::{
 use carrick_el1_linux::mm_portal::production::GuestMetadataPin;
 use carrick_el1_linux::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
 use carrick_el1_linux::native_process_runtime::{
-    ExecSuccessorSlot, NativeExecSuccessor, NativeForkPreparation, NativeLifecycleResources,
-    NativeProcessError, NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
+    ExecSuccessorSlot, NativeExecSuccessor, NativeFailure, NativeForkPreparation,
+    NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
+    NativeProcessService,
 };
 use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces};
 use carrick_guest_arch::{
@@ -284,7 +285,7 @@ type Portal = MmPortal<
     X86Mmu,
     ParkedContextWords,
 >;
-fn portal() -> Result<Portal, NativeProcessError> {
+fn portal() -> Result<Portal, NativeFailure> {
     let layout = carrick_el1::isa::x86_kernel_layout();
     // SAFETY: the boot owner retains the one compact native portal region.
     let slots = unsafe { &*(layout.portal.raw() as *const MmPortalSlots) };
@@ -292,7 +293,7 @@ fn portal() -> Result<Portal, NativeProcessError> {
         carrick_x86_carrier::native_execution::source(carrick_guest_arch::SlotId::new(0)).zone;
     Ok(Portal {
         backend: PhantomData,
-        carrier: slots.carrier().ok_or(NativeProcessError::Stale)?,
+        carrier: slots.carrier().ok_or(NativeFailure::Stale)?,
         roots: shared_x86_cpl0_guest(),
         spaces: &zone.spaces,
         nodes: None,
@@ -301,6 +302,18 @@ fn portal() -> Result<Portal, NativeProcessError> {
 }
 fn error(_: impl core::fmt::Debug) -> NativeProcessError {
     NativeProcessError::Fault
+}
+
+/// Owner contention at fork preparation is "not now" (#2306): an observed
+/// release to enrol on, or a bare Busy. Every other owner refusal keeps its
+/// fault answer.
+fn fork_owner_error(error: carrick_core::mm::transaction::MmError) -> NativeProcessError {
+    use carrick_core::mm::transaction::MmError;
+    match error {
+        MmError::Wait(wait) => NativeProcessError::OwnerWait(wait),
+        MmError::Busy => NativeProcessError::Busy,
+        _ => NativeProcessError::Fault,
+    }
 }
 
 pub(super) struct Prepared {
@@ -337,13 +350,11 @@ impl Service {
     /// Exec custody over this CPU's zone and reservations.
     fn exec_successor(
         &self,
-    ) -> Result<
-        X86ExecSuccessor<'static, GuestMetadataPin, Venue, ServiceExecMachine>,
-        NativeProcessError,
-    > {
+    ) -> Result<X86ExecSuccessor<'static, GuestMetadataPin, Venue, ServiceExecMachine>, NativeFailure>
+    {
         let owner = portal()?;
         Ok(X86ExecSuccessor {
-            zone: owner.zone.ok_or(NativeProcessError::Stale)?,
+            zone: owner.zone.ok_or(NativeFailure::Stale)?,
             roots: owner.roots,
             retired: &RETIRED_SPACES,
             carrier: owner.carrier,
@@ -577,7 +588,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn cancel_exec_successor(
         &self,
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         self.exec_successor()?.cancel(receipt)
     }
     fn finish_exec_successor(
@@ -752,16 +763,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             carrick_guest_arch::Access::Read,
         )
     }
-    fn service_mm_handle(
-        &self,
-        mm: &Mm,
-    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+    fn service_mm_handle(&self, mm: &Mm) -> Result<carrick_core_abi::El1MmHandle, NativeFailure> {
         portal()?
             .admitted_handle(
-                ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?,
+                ReservationMm::new(mm.mm.raw().get()).ok_or(NativeFailure::Stale)?,
                 self.worker(),
             )
-            .map_err(error)
+            .map_err(|_| NativeFailure::Fault)
     }
     fn prepare_mm(
         &mut self,
@@ -785,20 +793,15 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             .try_reserve_exact(capacity)
             .map_err(|_| NativeProcessError::Exhausted)?;
         let (operation, generation, count, layout) = {
-            let index = owner
-                .spaces
-                .find(mm.raw())
-                .ok_or(NativeProcessError::Stale)?;
-            let access = owner.space_access(self.worker()).map_err(error)?;
-            let _editor = access
-                .try_begin_edit(
-                    index,
-                    mm.raw(),
-                    NonZeroU64::new(u64::from(self.worker()) + 1)
-                        .ok_or(NativeProcessError::Stale)?,
-                )
-                .ok_or(NativeProcessError::Busy)?;
-            let mut root = owner.root(mm, self.worker()).map_err(error)?;
+            let handle = owner.admitted_handle(mm, self.worker()).map_err(error)?;
+            // A held editor or root is the holder's release to enrol on
+            // (`MmError::Wait`), never a bare retry (#2306).
+            let _editor = owner
+                .editor_for(handle, self.worker())
+                .map_err(fork_owner_error)?;
+            let mut root = owner
+                .root_for(handle, self.worker())
+                .map_err(fork_owner_error)?;
             if !root.fork_ready() {
                 return Err(NativeProcessError::Busy);
             }
@@ -929,8 +932,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         child_task: core::num::NonZeroU64,
         child_execution: core::num::NonZeroU64,
     ) -> Result<Box<Born>, (NativeProcessError, Prepared)> {
-        let result =
-            portal().and_then(|owner| p.child.commit(&owner, self.worker()).map_err(error));
+        let result = portal()
+            .map_err(NativeProcessError::from)
+            .and_then(|owner| p.child.commit(&owner, self.worker()).map_err(error));
         match result {
             Ok(_) => Ok(Box::new(Born {
                 prepared: p,
@@ -942,6 +946,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     }
     fn abort_mm(&mut self, mut p: Prepared) -> Result<(), (NativeProcessError, Prepared)> {
         let result = portal()
+            .map_err(NativeProcessError::from)
             .and_then(|owner| abort_child(&owner, self.worker(), &mut p.child, &p.words, &p.loan));
         match result {
             Ok(()) => Ok(()),
@@ -1002,14 +1007,14 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     }
     /// Test images can lag one read of the production counter.
     #[cfg(feature = "test-support")]
-    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
+    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeFailure> {
         use carrick_guest_arch::InterruptBackend;
         if crate::test_support::signal_clock_read_lags() {
             return Ok(carrick_guest_arch::CounterTick::new(0));
         }
         carrick_el1::isa::signal_clock()
             .counter()
-            .map_err(|_| NativeProcessError::Unsupported)
+            .map_err(|_| NativeFailure::Unsupported)
     }
     fn quarantine_prepared(&mut self, p: Prepared) {
         core::mem::forget(p);
@@ -1029,12 +1034,12 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn vacate_terminal_space(
         &mut self,
         source: BornInZoneSource<'static, ParkedContextWords>,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         if source.slot != self.slot {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeFailure::Stale);
         }
         if !carrick_x86_carrier::native_execution::park_on_maintenance_root(source) {
-            return Err(NativeProcessError::Quarantined);
+            return Err(NativeFailure::Quarantined);
         }
         Ok(())
     }
@@ -1252,7 +1257,7 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
     }
     let owner = match portal() {
         Ok(owner) => owner,
-        Err(error) => return Err((error, born)),
+        Err(error) => return Err((error.into(), born)),
     };
     let Some(index) = owner.spaces.find(p.address.mm.raw().get()) else {
         return Err((NativeProcessError::Stale, born));

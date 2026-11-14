@@ -4,8 +4,8 @@
 use super::*;
 use carrick_el1_abi::{BornInZoneSource, CurrentTask, Lifecycle};
 use carrick_el1_linux::native_process_runtime::{
-    NativeForkPreparation, NativeLifecycleResources, NativeProcessEntry, NativeProcessError,
-    NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
+    NativeFailure, NativeForkPreparation, NativeLifecycleResources, NativeProcessEntry,
+    NativeProcessError, NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
 };
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa, UserVa,
@@ -23,7 +23,7 @@ impl<'a> NativeProcessService<'a, Words> for NoPhysicalCrossings {
     fn vacate_terminal_space(
         &mut self,
         source: carrick_el1_abi::BornInZoneSource<'a, Words>,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         let _ = source;
         Ok(())
     }
@@ -34,8 +34,8 @@ impl<'a> NativeProcessService<'a, Words> for NoPhysicalCrossings {
     fn service_mm_handle(
         &self,
         _: &Address,
-    ) -> Result<carrick_el1_abi::El1MmHandle, NativeProcessError> {
-        Err(NativeProcessError::Unsupported)
+    ) -> Result<carrick_el1_abi::El1MmHandle, NativeFailure> {
+        Err(NativeFailure::Unsupported)
     }
     fn prepare_mm(
         &mut self,

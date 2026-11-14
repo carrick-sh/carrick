@@ -88,21 +88,21 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
         }
         Err(NativeProcessError::Exhausted)
     }
-    fn drain_closed(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeProcessError> {
+    fn drain_closed(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeFailure> {
         self.identities
             .drain_closed(page, self.controls)
-            .map_err(|_| NativeProcessError::Stale)
+            .map_err(|_| NativeFailure::Stale)
     }
-    fn settle(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeProcessError> {
+    fn settle(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeFailure> {
         self.identities
             .settle(page, self.controls)
-            .map_err(|_| NativeProcessError::Stale)
+            .map_err(|_| NativeFailure::Stale)
     }
 }
 
 pub(super) fn drain_closed<M, C: ProcessContext>(
     resources: &mut NativeResources<'_, M, C>,
-) -> Result<(), NativeProcessError> {
+) -> Result<(), NativeFailure> {
     if let Some(stock) = resources.thread_stock.as_mut() {
         stock.drain_closed(resources.page)?;
     }
@@ -113,19 +113,16 @@ pub(super) fn at_limit<M: Clone, C: ProcessContext>(
     graph: &Graph<'_, M, C>,
     key: TaskKey,
     caller: u32,
-) -> Result<bool, NativeProcessError> {
+) -> Result<bool, NativeFailure> {
     use carrick_personality_linux::identity::LinuxCapabilitySet;
-    let task = graph
-        .owner
-        .task(key)
-        .map_err(|_| NativeProcessError::Stale)?;
+    let task = graph.owner.task(key).map_err(|_| NativeFailure::Stale)?;
     let credentials = task
         .credentials_for(caller)
-        .map_err(|_| NativeProcessError::Stale)?;
+        .map_err(|_| NativeFailure::Stale)?;
     let limit = task
         .rlimits
         .get(carrick_abi::LinuxResource::Nproc.index())
-        .ok_or(NativeProcessError::Invalid)?
+        .ok_or(NativeFailure::Invalid)?
         .rlim_cur;
     if credentials.ruid.is_root()
         || limit == u64::MAX
@@ -155,17 +152,17 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
     graph: &mut Graph<'a, M, C>,
     key: TaskKey,
     caller: u32,
-) -> Result<(), NativeProcessError> {
+) -> Result<(), NativeFailure> {
     let limit = at_limit(graph, key, caller)?;
     let namespace = graph.namespace;
     let visible_namespace = graph.visible_namespace;
     let task = graph
         .owner
         .task_mut(key)
-        .map_err(|_| NativeProcessError::Stale)?;
+        .map_err(|_| NativeFailure::Stale)?;
     let uid = task
         .credentials_for(caller)
-        .map_err(|_| NativeProcessError::Stale)?
+        .map_err(|_| NativeFailure::Stale)?
         .ruid;
     let resources = task.native_mut().resources_mut();
     let Some(stock) = resources.thread_stock.as_mut() else {
@@ -296,8 +293,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 {
     pub(super) fn prepare_native_thread_birth(
         &mut self,
-    ) -> Result<carrick_personality_linux::lifecycle::ThreadBirthAdmission, NativeProcessError>
-    {
+    ) -> Result<carrick_personality_linux::lifecycle::ThreadBirthAdmission, NativeFailure> {
         use carrick_personality_linux::lifecycle::ThreadBirthAdmission;
         use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
         let release = {
@@ -305,7 +301,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let resources = graph
                 .owner
                 .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
+                .map_err(|_| NativeFailure::Stale)?
                 .native()
                 .resources();
             let Some(stock) = resources.thread_stock.as_ref() else {
@@ -319,7 +315,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         loop {
             let mut limit = false;
             let token = OperationToken::new(u64::from(key.index()), key.generation())
-                .ok_or(NativeProcessError::Stale)?;
+                .ok_or(NativeFailure::Stale)?;
             let parked = carrick_core::wait::park_object_record(
                 zone,
                 self.source.slot,
@@ -419,13 +415,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     let resources = graph
                         .owner
                         .task(self.key)
-                        .map_err(|_| NativeProcessError::Stale)?
+                        .map_err(|_| NativeFailure::Stale)?
                         .native()
                         .resources();
                     if resources
                         .thread_stock
                         .as_ref()
-                        .ok_or(NativeProcessError::Stale)?
+                        .ok_or(NativeFailure::Stale)?
                         .identities
                         .standing(resources.page)
                         != 0
@@ -435,7 +431,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 Err(_) => {
                     self.clear_thread_stock_wait();
-                    return Err(NativeProcessError::Stale);
+                    return Err(NativeFailure::Stale);
                 }
             }
         }
@@ -533,15 +529,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
         self.take_thread_stock_wait()
             .map(|resumed| resumed.unwrap_or(NativeResume::NoPending))
-            .map_err(NativeProcessError::run_failure_reason)
+            .map_err(NativeFailure::run_failure_reason)
     }
-    fn take_thread_stock_wait(&mut self) -> Result<Option<NativeResume>, NativeProcessError> {
+    fn take_thread_stock_wait(&mut self) -> Result<Option<NativeResume>, NativeFailure> {
         let key = {
             let graph = self.runtime.graph.lock();
             let task = graph
                 .owner
                 .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?;
+                .map_err(|_| NativeFailure::Stale)?;
             let Some(stock) = task.native().resources().thread_stock.as_ref() else {
                 return Ok(None);
             };
@@ -555,10 +551,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.source.slot,
             self.source.zone.record(self.record.id).identity(),
         )
-        .map_err(|_| NativeProcessError::Stale)?
-        .ok_or(NativeProcessError::Stale)?;
+        .map_err(|_| NativeFailure::Stale)?
+        .ok_or(NativeFailure::Stale)?;
         if token.index() != u64::from(key.index()) || token.generation() != key.generation() {
-            return Err(NativeProcessError::Stale);
+            return Err(NativeFailure::Stale);
         }
         self.clear_thread_stock_wait();
         // SAFETY: the selected record owns this exact Syscall continuation;

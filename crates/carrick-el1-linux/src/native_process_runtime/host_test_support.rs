@@ -38,6 +38,21 @@ std::thread_local! {
     };
 }
 
+// One-shot fork MM preparation refusals, as a carrier lease or the parent's
+// space editor refuses `prepare_mm` (#2306).
+#[cfg(test)]
+std::thread_local! {
+    static PREPARE_MM_ERRORS: std::cell::RefCell<std::collections::VecDeque<NativeProcessError>> = const {
+        std::cell::RefCell::new(std::collections::VecDeque::new())
+    };
+}
+
+/// Refuse the next Physical fork preparations, in order.
+#[cfg(test)]
+pub(crate) fn fail_prepare_mm(errors: &[NativeProcessError]) {
+    PREPARE_MM_ERRORS.with(|queue| *queue.borrow_mut() = errors.iter().copied().collect());
+}
+
 #[cfg(test)]
 type ServicePublishedHook = Option<(usize, Box<dyn FnOnce()>)>;
 
@@ -173,7 +188,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn vacate_terminal_space(
         &mut self,
         source: carrick_el1_abi::BornInZoneSource<'a, C>,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         let _ = source;
         #[cfg(test)]
         TERMINAL_VACATES.with(|count| count.set(count.get() + 1));
@@ -206,7 +221,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn cancel_exec_successor(
         &self,
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), NativeFailure> {
         EXEC_CANCELLATIONS.with(|receipts| receipts.borrow_mut().push(receipt.raw().get()));
         Ok(())
     }
@@ -349,17 +364,17 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn service_mm_handle(
         &self,
         mm: &Self::Mm,
-    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+    ) -> Result<carrick_core_abi::El1MmHandle, NativeFailure> {
         self.zone
             .spaces
             .find(mm.mm.raw().get())
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(NativeFailure::Stale)?;
         // SAFETY: this test venue owns these never-reused synthetic MM roots.
         Ok(unsafe {
             carrick_core_abi::El1MmHandle::from_admitted_owner(
                 NonZeroU64::MIN,
                 carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
-                    .ok_or(NativeProcessError::Stale)?,
+                    .ok_or(NativeFailure::Stale)?,
                 NonZeroU64::MIN,
             )
         })
@@ -381,6 +396,10 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         _: &C,
         child: MmGeneration,
     ) -> Result<Self::PreparedMm, NativeProcessError> {
+        #[cfg(test)]
+        if let Some(error) = PREPARE_MM_ERRORS.with(|errors| errors.borrow_mut().pop_front()) {
+            return Err(error);
+        }
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x2000)).unwrap(),
             mm: child,
@@ -451,6 +470,16 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             hook(address);
         }
         Ok(())
+    }
+    /// The production venues write the canonical siginfo wire image through
+    /// their signal byte copy; so does this one.
+    fn copy_siginfo(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        info: &carrick_syscall_abi::LinuxSiginfo,
+    ) -> Result<(), NativeProcessError> {
+        self.copy_signal_bytes(mm, address, zerocopy::IntoBytes::as_bytes(info))
     }
     fn copy_signal_bytes(
         &mut self,
@@ -597,23 +626,18 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn signal_deadline(
         &mut self,
         nanos: u64,
-    ) -> Result<carrick_guest_arch::Deadline, NativeProcessError> {
+    ) -> Result<carrick_guest_arch::Deadline, NativeFailure> {
         Ok(carrick_guest_arch::Deadline(
             carrick_guest_arch::CounterTick::new(1000 + nanos),
         ))
     }
     /// One tick per nanosecond, matching `signal_deadline` above.
-    fn signal_frequency(
-        &mut self,
-    ) -> Result<carrick_guest_arch::CounterFrequency, NativeProcessError> {
+    fn signal_frequency(&mut self) -> Result<carrick_guest_arch::CounterFrequency, NativeFailure> {
         Ok(carrick_guest_arch::CounterFrequency::new(
-            NonZeroU64::new(1_000_000_000).ok_or(NativeProcessError::Invalid)?,
+            NonZeroU64::new(1_000_000_000).ok_or(NativeFailure::Invalid)?,
         ))
     }
-    fn arm_signal_timer(
-        &mut self,
-        _: carrick_guest_arch::Deadline,
-    ) -> Result<(), NativeProcessError> {
+    fn arm_signal_timer(&mut self, _: carrick_guest_arch::Deadline) -> Result<(), NativeFailure> {
         Ok(())
     }
     fn counter_frequency(
@@ -623,7 +647,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             1000,
         ))
     }
-    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
+    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeFailure> {
         if let Some(mut hook) = self.on_signal_clock.take() {
             hook();
         }
@@ -11314,6 +11338,10 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
 mod futex_contention;
 
 #[cfg(test)]
+#[path = "tests/contention_not_now.rs"]
+mod contention_not_now;
+
+#[cfg(test)]
 #[path = "tests/x86_switch_in_binding.rs"]
 mod x86_switch_in_binding;
 
@@ -12634,4 +12662,54 @@ fn wait4_blocking_status_owner_released_before_enrolment_rescans() {
 #[test]
 fn wait4_exited_zombie_status_owner_released_before_enrolment_rescans() {
     wait4_status_owner_released_before_enrolment(true);
+}
+
+/// Play the carrier for one exact member's retained `CarrierWork`: claim
+/// its published notice, complete it as supplied and wake its service queue,
+/// as the host does once the work that refused the member has settled.
+#[cfg(test)]
+pub(crate) fn complete_carrier_work<C: ProcessContext>(
+    zone: &ZoneTables<C>,
+    task: &CurrentTask,
+    slot: SlotId,
+    record: RecordRef,
+) -> carrick_core_abi::service::ServiceOperation {
+    let notice = task.service_notice.take().unwrap().unwrap();
+    let identity = zone.record(record.id).identity();
+    let queue = zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        )
+        .unwrap();
+    // SAFETY: the fixture retains this exact member's control allocation;
+    // its service queue authenticates the notice and excludes cancellation.
+    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &control.service,
+            notice,
+            NonZeroU64::MIN,
+            identity,
+        )
+    }
+    .unwrap();
+    let operation = ticket.request().operation;
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(slot, &mut WakeEffects::default())
+        .unwrap();
+    operation
+}
+
+/// A comparable name for a lifecycle outcome in test assertions.
+#[cfg(test)]
+pub(crate) fn outcome_kind(outcome: &LifecycleOutcome) -> std::string::String {
+    match outcome {
+        LifecycleOutcome::Redispatch => "Redispatch".into(),
+        LifecycleOutcome::HostCustody => "HostCustody".into(),
+        LifecycleOutcome::Returned { result, .. } => std::format!("Returned({})", result.raw()),
+        LifecycleOutcome::Transferred { .. } => "Transferred".into(),
+    }
 }

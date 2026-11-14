@@ -329,8 +329,8 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         ThreadIdentity, ThreadLifecyclePage,
     };
     use carrick_el1_linux::native_process_runtime::{
-        NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
-        NativeProcessRuntime, NativeProcessService,
+        NativeFailure, NativeForkPreparation, NativeLifecycleResources, NativeProcessError,
+        NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
     };
     use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
     use carrick_hal::birth_serial::test_support::OwnedBirthZone;
@@ -360,7 +360,7 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         fn vacate_terminal_space(
             &mut self,
             source: carrick_el1_abi::BornInZoneSource<'a, ParkedContextWords>,
-        ) -> Result<(), NativeProcessError> {
+        ) -> Result<(), NativeFailure> {
             let _ = source;
             Ok(())
         }
@@ -371,17 +371,17 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         fn service_mm_handle(
             &self,
             mm: &Self::Mm,
-        ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+        ) -> Result<carrick_core_abi::El1MmHandle, NativeFailure> {
             self.zone
                 .spaces
                 .find(mm.mm.raw().get())
-                .ok_or(NativeProcessError::Stale)?;
+                .ok_or(NativeFailure::Stale)?;
             // SAFETY: this test venue owns these never-reused synthetic MM roots.
             Ok(unsafe {
                 carrick_core_abi::El1MmHandle::from_admitted_owner(
                     NonZeroU64::MIN,
                     carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
-                        .ok_or(NativeProcessError::Stale)?,
+                        .ok_or(NativeFailure::Stale)?,
                     NonZeroU64::MIN,
                 )
             })
@@ -1267,8 +1267,8 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     use carrick_el1_linux::file_table::admit_stdio;
     use carrick_el1_linux::ipc::{IpcVenue, MapTables};
     use carrick_el1_linux::native_process_runtime::{
-        NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
-        NativeProcessRuntime, NativeProcessService,
+        NativeFailure, NativeForkPreparation, NativeLifecycleResources, NativeProcessError,
+        NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
     };
     use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
     use carrick_hal::birth_serial::test_support::OwnedBirthZone;
@@ -1307,7 +1307,7 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         fn vacate_terminal_space(
             &mut self,
             source: carrick_el1_abi::BornInZoneSource<'a, ParkedContextWords>,
-        ) -> Result<(), NativeProcessError> {
+        ) -> Result<(), NativeFailure> {
             let _ = source;
             Ok(())
         }
@@ -1319,16 +1319,16 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
         fn service_mm_handle(
             &self,
             mm: &Self::Mm,
-        ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+        ) -> Result<carrick_core_abi::El1MmHandle, NativeFailure> {
             self.zone
                 .spaces
                 .find(mm.mm.raw().get())
-                .ok_or(NativeProcessError::Stale)?;
+                .ok_or(NativeFailure::Stale)?;
             Ok(unsafe {
                 carrick_core_abi::El1MmHandle::from_admitted_owner(
                     NonZeroU64::MIN,
                     carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
-                        .ok_or(NativeProcessError::Stale)?,
+                        .ok_or(NativeFailure::Stale)?,
                     NonZeroU64::MIN,
                 )
             })
