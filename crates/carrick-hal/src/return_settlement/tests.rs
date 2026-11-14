@@ -537,6 +537,7 @@ fn every_native_exclusion_site_settles_owed_returns() {
         // This ratchet names the primitive it searches for.
         ("carrick-hal/src/return_settlement/tests.rs", None),
         ("carrick-core/tests/entry_completion.rs", None),
+        ("carrick-el1-linux/src/mm_portal/tests.rs", None),
         (
             "carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs",
             None,

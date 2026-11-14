@@ -2786,7 +2786,16 @@ fn owner_fork_prepares_copyout_without_publishing_bytes() {
     fork_child_write_preparation(true);
 }
 
+#[test]
+fn owner_fork_racing_a_return_drain_waits_for_copy_and_cow_settlement() {
+    fork_child_write_preparation_mode(false, true);
+}
+
 fn fork_child_write_preparation(prepare_first: bool) {
+    fork_child_write_preparation_mode(prepare_first, false);
+}
+
+fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
     use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
     let region = Region::new();
     let spaces = AddressSpaces::new();
@@ -3010,6 +3019,304 @@ fn fork_child_write_preparation(prepare_first: bool) {
             "{outcome:?}"
         );
         replacement.borrow_mut()[..4].copy_from_slice(b"fork");
+    }
+    if race_drain {
+        use carrick_el1::memory::{DelegatedAnonymous, RetiredTerminal, serve_delegated_anonymous};
+        use carrick_el1_abi::{CurrentTask, ReturnJournal, ReturnSettlementRequest, TrapFrame};
+        use carrick_hal::return_settlement::{
+            CowSettled, ExclusionSettlement, ReturnJournalAccess, SettlementLock,
+            settle_cow_then_returns, settle_ring_owned_returns,
+        };
+        use carrick_sched_core::spaces::notification::{ExclusionRefusal, SpaceAccess};
+
+        assert!(
+            pool.has_completions_for(78),
+            "the real COW completion is outstanding"
+        );
+        let task = CurrentTask::new();
+        task.execution.task.store(101, Ordering::Relaxed);
+        task.mm.thread_generation.store(1, Ordering::Relaxed);
+        task.mm.key.store(78, Ordering::Relaxed);
+        let mut frame = TrapFrame {
+            slot: 0,
+            elr: 0x40004,
+            ..TrapFrame::default()
+        };
+        frame.x[0] = VA + 4096;
+        frame.x[1] = 4096;
+        frame.x[8] = 215;
+        let mut editor = ForkAnonymousEditor {
+            arenas: &arenas,
+            pool: carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
+                words: child.words.as_ptr().cast_mut(),
+                physical_base: child.base,
+                byte_len: child.words.len() * 8,
+            },
+        };
+        assert_eq!(
+            serve_delegated_anonymous(
+                &mut frame,
+                &carrick_el1_abi::Counters::default(),
+                &task,
+                SpaceAccess::source_free(&spaces),
+                region.table(),
+                &mut editor,
+                None
+            ),
+            DelegatedAnonymous::Served
+        );
+        let grandchild = Tables::new(ROOT + 0x300000, 0, 0);
+        let grand_supply = Tables::new(ROOT + 0x400000, 0, 0);
+        let request = fork_request(
+            &region,
+            &spaces,
+            receipt.child.mm(),
+            79,
+            &grandchild,
+            &grand_supply,
+        );
+        let all = [&parent_tables, &child, &supply, &grandchild, &grand_supply];
+        let words = ForkWords {
+            arenas: &all,
+            loads: core::cell::Cell::new(0),
+        };
+        let mut transfer = portal
+            .begin(
+                receipt.child,
+                GuestVa::new(VA),
+                4,
+                TransferIntent::UserRead,
+                0,
+            )
+            .unwrap();
+        let selected = selected(select(&portal, &transfer, &child));
+        let mut fence = Some(
+            portal
+                .revalidate(&transfer, selected, &words, 0)
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            matches!(
+                portal.prepare_fork(
+                    request,
+                    ForkScratch::new(
+                        request,
+                        portal.fork_mapping_count(receipt.child.mm(), 0).unwrap()
+                    )
+                    .unwrap(),
+                    &words,
+                    1
+                ),
+                Err(MmError::Busy)
+            ),
+            "the real copy fence refuses fork publication"
+        );
+        assert!(
+            grandchild.words[1536..1538]
+                .iter()
+                .all(|word| word.load(Ordering::Acquire) == 0),
+            "the fixture has structural tables, but no child user leaf is armed"
+        );
+
+        struct Journal<'a> {
+            table: &'a carrick_el1::memory::reservations::SharedReservations,
+            index: usize,
+            mm: ReservationMm,
+        }
+        impl ReturnJournalAccess for Journal<'_> {
+            type Error = carrick_el1_abi::Refusal;
+            fn with_journal<R>(
+                &self,
+                step: impl FnOnce(&mut dyn ReturnJournal) -> Result<R, Self::Error>,
+            ) -> Result<R, Self::Error> {
+                step(&mut self.table.lock(self.index, self.mm)?)
+            }
+        }
+        struct Returns<'a, W> {
+            words: &'a W,
+            root: u64,
+            pool: &'a carrick_el1_abi::CowGrantPool,
+            applied: usize,
+        }
+        impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
+            carrick_el1_abi::OwedReturnRetirement for Returns<'_, W>
+        {
+            type Prepared = Vec<RetiredTerminal>;
+            type Error = ();
+            fn prepare(
+                &mut self,
+                request: &ReturnSettlementRequest,
+            ) -> Result<Vec<RetiredTerminal>, ()> {
+                assert!(
+                    !self.pool.has_completions_for(78),
+                    "COW must settle before returns are staged"
+                );
+                let mut terminals = Vec::new();
+                for owed in request.iter() {
+                    carrick_el1::memory::owed_retired_terminals::<
+                        carrick_el1::memory::ArmAnonymousDecode,
+                    >(
+                        &|pa| self.words.load(pa).ok(),
+                        self.root,
+                        owed.range.start(),
+                        owed.range.len(),
+                        &mut |terminal| terminals.push(terminal),
+                    )
+                    .unwrap();
+                }
+                Ok(terminals)
+            }
+            fn apply(&mut self, terminals: Vec<RetiredTerminal>) {
+                assert!(carrick_el1::memory::clear_retired_terminals(
+                    &|pa, old, new| self.words.compare_exchange(pa, old, new).ok(),
+                    &terminals
+                ));
+                self.applied += terminals.len();
+            }
+        }
+        struct Drain<'a, W> {
+            journal: Journal<'a>,
+            returns: Returns<'a, W>,
+            lock: &'a SettlementLock,
+            replacement: u64,
+            completions: usize,
+        }
+        impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> ExclusionSettlement
+            for Drain<'_, W>
+        {
+            type Error = ();
+            type Returns = ();
+            fn settle_cow_completions(
+                &mut self,
+                excluded: &carrick_sched_core::ExcludedEditor<'_>,
+            ) -> Result<(), ()> {
+                for completion in self.returns.pool.completions(excluded) {
+                    assert_eq!(completion.new_ipa, self.replacement);
+                    // The replacement still has its real retired descriptor:
+                    // clearing it first would violate the COW publication postcondition.
+                    let mut terminals = Vec::new();
+                    carrick_el1::memory::owed_retired_terminals::<
+                        carrick_el1::memory::ArmAnonymousDecode,
+                    >(
+                        &|pa| self.returns.words.load(pa).ok(),
+                        self.returns.root,
+                        VA + 4096,
+                        4096,
+                        &mut |terminal| terminals.push(terminal),
+                    )
+                    .unwrap();
+                    assert_eq!(terminals.len(), 1);
+                    assert!(self.returns.pool.finish(excluded, &completion.grant));
+                    self.completions += 1;
+                }
+                Ok(())
+            }
+            fn settle_owed_returns(
+                &mut self,
+                excluded: &carrick_sched_core::ExcludedEditor<'_>,
+                cow: &CowSettled<'_>,
+            ) -> Result<(), ()> {
+                let guard = self.lock.lock(excluded);
+                let outcome = settle_ring_owned_returns(
+                    excluded,
+                    cow,
+                    &guard,
+                    false,
+                    &self.journal,
+                    &mut self.returns,
+                )
+                .unwrap();
+                assert!(
+                    matches!(outcome, carrick_el1_abi::SettlementOutcome::Settled(receipt)
+                    if receipt.freed == 1)
+                );
+                Ok(())
+            }
+        }
+        let access = SpaceAccess::source_free(&spaces);
+        let index = spaces.find(78).unwrap();
+        let exclusion = match access.try_exclude_editor(index, 78) {
+            Ok(exclusion) => exclusion,
+            Err(ExclusionRefusal::Busy) => {
+                fence.take().unwrap().complete(&mut transfer).unwrap();
+                access.try_exclude_editor(index, 78).unwrap()
+            }
+            Err(reason) => panic!("live holder exclusion: {reason:?}"),
+        };
+        let lock = SettlementLock::new();
+        let mut drain = Drain {
+            journal: Journal {
+                table: region.table(),
+                index: index.index(),
+                mm: receipt.child.mm(),
+            },
+            returns: Returns {
+                words: &words,
+                root: child.base,
+                pool: &pool,
+                applied: 0,
+            },
+            lock: &lock,
+            replacement: replacement_ipa,
+            completions: 0,
+        };
+        settle_cow_then_returns(&mut drain, exclusion.proof()).unwrap();
+        drop(exclusion);
+        assert_eq!((drain.completions, drain.returns.applied), (1, 1));
+        assert!(!pool.has_completions_for(78));
+        if let Some(fence) = fence.take() {
+            fence.complete(&mut transfer).unwrap();
+        }
+        // The intervening copy consumed a newer owner sequence. The old
+        // fork attempt must remain unarmed; its owned syscall starts a fresh
+        // internal transaction after the fence/settlement release.
+        assert!(matches!(
+            portal.prepare_fork(
+                request,
+                ForkScratch::new(
+                    request,
+                    portal.fork_mapping_count(receipt.child.mm(), 0).unwrap()
+                )
+                .unwrap(),
+                &words,
+                1
+            ),
+            Err(MmError::Stale)
+        ));
+        assert_eq!(grandchild.words[1536].load(Ordering::Acquire), 0);
+        let mut request = request;
+        {
+            let mut root = region
+                .table()
+                .lock_el1_resolved(index.index(), receipt.child.mm(), &view, 1)
+                .unwrap();
+            request.operation.sequence = root.next_transfer_sequence().unwrap();
+            request.parent_generation = root.generation();
+        }
+        let plan = portal
+            .prepare_fork(
+                request,
+                ForkScratch::new(
+                    request,
+                    portal.fork_mapping_count(receipt.child.mm(), 0).unwrap(),
+                )
+                .unwrap(),
+                &words,
+                1,
+            )
+            .unwrap();
+        portal
+            .publish_fork(plan, &words, 1)
+            .unwrap()
+            .commit(&portal, 1)
+            .unwrap();
+        assert_eq!(fork_translate(&words, grandchild.base, VA), replacement_ipa);
+        assert_eq!(
+            grandchild.words[1537].load(Ordering::Acquire),
+            0,
+            "the retired replacement page must not arm in the grandchild"
+        );
     }
     assert_eq!(original, [0x5a; 8192]);
     assert_eq!(fork_translate(&words, ROOT, VA), IPA);
