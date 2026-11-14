@@ -11211,6 +11211,59 @@ fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
     );
 }
 
+/// #2354: the native process owner's `sched_yield` (x86's yield) keeps the
+/// CPU while nothing waits on its slot, and otherwise requeues its caller,
+/// with the call completed as 0, behind the runnable sibling that runs next.
+#[test]
+#[cfg(test)]
+fn native_yield_requeues_its_caller_behind_a_runnable_sibling() {
+    let fixture = native_exec_fixture();
+    let (zone, slot) = (fixture.zone, fixture.slot);
+    let mut service = fixture.service();
+    let context = words(fixture.address).with_syscall_return(24);
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource { zone, slot },
+            fixture.task,
+            fixture.address,
+            &context,
+            &mut service,
+        )
+        .unwrap();
+    let caller = entry.record.id;
+    assert!(
+        entry.native_yield().is_none(),
+        "nothing waits: keep the CPU"
+    );
+    assert!(entry.take_handoff_receipt().is_none());
+
+    let mut identity = zone.record(caller).identity();
+    identity.tid += 1;
+    identity.serial += 1;
+    let sibling = zone.alloc_record(identity).unwrap();
+    assert!(zone.requeue_preempted(slot, sibling).is_queued());
+    assert!(matches!(
+        entry.native_yield(),
+        Some(LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            ..
+        })
+    ));
+    assert!(entry.take_handoff_receipt().is_some());
+    assert_eq!(zone.slot(slot).current(), None);
+    assert_eq!(zone.switch_in(slot), Some(sibling), "the sibling runs next");
+    assert_eq!(
+        zone.runnable_head(slot),
+        Some(caller),
+        "the caller waits behind it"
+    );
+    // SAFETY: the caller is queued; nothing runs it while the test reads it.
+    let saved = unsafe { *zone.record(caller).ctx_mut() };
+    assert_eq!(saved.syscall_return(), 0, "the yield completed with 0");
+}
+
 #[test]
 #[cfg(test)]
 fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {

@@ -1,3 +1,10 @@
+# #2354: a guest sched_yield is a turn boundary on every ISA. The shared
+# policy is sched-core's `YieldTurn` (rotate while a runnable thread waits on
+# the caller's slot); ARM's EL1 scheduler and x86's native process owner
+# apply it, and only the save and switch differ. On x86 a yield used to
+# complete in place, and with no x86 slice timer a sibling queued behind a
+# yielding thread ran only on a stray IRQ: the real-KVM three-thread witness
+# was red on every run. Existing bindings and budgets are unchanged.
 # #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
 # owner-service continuation. The host fixture gains a status-copy refusal
 # and a real fork/exit/wait witness under kernel.memory.owner-wait.
@@ -79,7 +86,7 @@
 schema_version = 1
 id = "kernel.scheduler.runnable-progress"
 title = "Runnable scheduler affinity and preemption progress"
-guest_surfaces = ["syscall:clone", "syscall:sched_setaffinity", "syscall:sched_getaffinity", "scheduler:preemption", "scheduler:rotation", "scheduler:executor-pool", "scheduler:native-service"]
+guest_surfaces = ["syscall:clone", "syscall:sched_yield", "syscall:sched_setaffinity", "syscall:sched_getaffinity", "scheduler:preemption", "scheduler:rotation", "scheduler:executor-pool", "scheduler:native-service"]
 semantic_authority = [
   "man 2 clone: a refused clone publishes no new thread; Carrick reservation rollback releases registry and settlement guards before notifying reservation subscribers",
   "man 7 sched",
@@ -132,6 +139,9 @@ vm_free = [
   "carrick-runtime::vcpu_loop::zone::affinity_tests::{production_venue_remote_set_prompts_a_record_without_host_residency,production_venue_host_route_migrates_running_sibling_without_tick,production_venue_remote_affinity_migrates_running_sibling_without_tick,production_venue_switched_self_exclusion_migrates_before_return_without_irq,production_venue_affinity_survives_host_affinity_round_trip} (real entry authority, both kick transports; self exclusion retains Completed host boundary and host claims migrate before guest reentry)",
   "carrick-sched-core::affinity::tests (exact residency epochs and bounded notification)",
   "carrick-sched-core::affinity_source::tests (retained dual aliases)",
+  "carrick-sched-core::tests::a_yield_hands_the_slot_to_a_queued_sibling_and_back (#2354: YieldTurn rotates exactly while a runnable thread waits; two live threads take three turns by yields alone)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::native_yield_requeues_its_caller_behind_a_runnable_sibling (#2354: x86's yield through the native process owner keeps the CPU with nothing queued, else saves the completed call as 0 and requeues the caller behind the sibling that runs next)",
+  "carrick-el1-linux::lifecycle::tests::raw_clone_sibling_runs_when_parent_only_sched_yields (#2354 ARM coverage: the production EL1 yield hands a raw clone the CPU and the clone's yield hands it back)",
   "carrick-sched-core::tests::host_only_affinity_is_not_an_el1_residency",
   "carrick-sched-core::tests::switched_affinity_change_prompts_only_the_exact_excluded_owner",
   "carrick-el1-linux::native_process_runtime::host_test_support::{ipc_busy_yield_retains_operation_and_pin_through_carrier_work,ipc_preparation_busy_once_requeues_then_completes_exact_operation,native_service_exit_busy_requeues_and_resumes_the_record,native_service_exit_busy_retains_ipc_operation_and_pin,native_service_exit_deferred_preparation_is_not_quarantined,native_service_exit_refusal_policy_preserves_retry_and_authentication,native_service_exit_missing_unowned_receipt_remains_an_invariant,native_service_exit_exec_bridge_keeps_its_existing_refusal} (owned-yield reply typing and exact token/pin custody only)",
@@ -168,5 +178,5 @@ statistic = "p50"
 minimum_samples = 20
 
 [bindings.unresolved]
-kvm = "Live witnesses: carrick-vmm-kvm::cpl0_progress::{entry_kick_and_timer_preempt_two_private_contexts,return_kick_and_timer_preempt_two_private_contexts}. One vCPU, two private contexts, 16 turns; unchanged wake, IRQ, preemption and host-exit budgets. Compile-time layout bounds keep scheduler, observation and page-table records disjoint. The contract evaluator has no registered KVM observation layer; these tests do not confer broader scheduler acceptance."
+kvm = "Live witnesses: carrick-vmm-kvm::cpl0_initial_mm::production_sched_yield_hands_the_cpu_to_a_queued_sibling (#2354: three threads on two vCPUs, the root pinned to CPU 0, take 192 turns waiting only in sched_yield, each wait bounded by one TSC second; red on every main run, exit 91). carrick-vmm-kvm::cpl0_progress::{entry_kick_and_timer_preempt_two_private_contexts,return_kick_and_timer_preempt_two_private_contexts}. One vCPU, two private contexts, 16 turns; unchanged wake, IRQ, preemption and host-exit budgets. Compile-time layout bounds keep scheduler, observation and page-table records disjoint. The contract evaluator has no registered KVM observation layer; these tests do not confer broader scheduler acceptance."
 x86_cpl0 = "Order 3 custody components now have a VM-free binding. Exact in-CPL0 X3 remains pending order 4, release-before-enroll, default-pool exhaustion and exec/clear-tid; no KVM or signed acceptance is conferred."
