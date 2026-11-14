@@ -4011,6 +4011,12 @@ fn trusted_dirfd_stat_matches_slow_path() {
         .create_device("/walk/dev0", LINUX_S_IFCHR | 0o600, 0x0103)
         .unwrap();
 
+    let errno = |result: Result<StatRecord, DispatchError>| {
+        result.map_err(|error| match error {
+            DispatchError::Errno(errno) => errno,
+            other => panic!("stat must answer with an errno, got {other:?}"),
+        })
+    };
     for name in ["file.txt", "sub", "link", "fifo", "dev0"] {
         let fast = dispatcher.path_stat_record(
             &dispatcher.exact_signal_context_for_test(),
@@ -4024,7 +4030,11 @@ fn trusted_dirfd_stat_matches_slow_path() {
             &format!("/walk/{name}"),
             LINUX_AT_SYMLINK_NOFOLLOW,
         );
-        assert_eq!(fast, slow, "fast/slow stat divergence for {name:?}");
+        assert_eq!(
+            errno(fast),
+            errno(slow),
+            "fast/slow stat divergence for {name:?}"
+        );
     }
     let dev = dispatcher
         .path_stat_record(
@@ -4038,12 +4048,12 @@ fn trusted_dirfd_stat_matches_slow_path() {
     assert_eq!(dev.rdev, 0x0103);
     // Missing child: authoritative ENOENT, identical to the slow path.
     assert_eq!(
-        dispatcher.path_stat_record(
+        errno(dispatcher.path_stat_record(
             &dispatcher.exact_signal_context_for_test(),
             root as u64,
             "gone",
             0
-        ),
+        )),
         Err(LINUX_ENOENT)
     );
 }
