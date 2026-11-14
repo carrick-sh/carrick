@@ -2026,6 +2026,20 @@ pub struct ServiceTicket<P: Deref<Target = ServiceCell>> {
     reason = "the linear ticket must be returned on refusal so exact service custody is never lost"
 )]
 impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
+    /// Observe cancellation of this exact claimed operation while its owner
+    /// retains the ticket across a deferred host service. The owner must
+    /// acknowledge cancellation rather than wait for its resource to free.
+    pub fn cancellation_requested(&self) -> Result<bool, ServiceError> {
+        let state = self.cell.state.load(Ordering::Acquire);
+        if !matches!(state, SERVICING | CANCEL_REQUESTED) {
+            return Err(ServiceError::Busy);
+        }
+        if !self.cell.same(self.request.identity) {
+            return Err(ServiceError::Stale);
+        }
+        Ok(state == CANCEL_REQUESTED)
+    }
+
     pub fn reply_address(&self) -> Option<carrick_guest_arch::KernelVa> {
         self.reply
             .map(|address| carrick_guest_arch::KernelVa::new(address.get()))
