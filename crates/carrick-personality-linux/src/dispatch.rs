@@ -1081,7 +1081,8 @@ impl OperandSpec {
 /// copy-on-write destination would answer EFAULT where Linux succeeds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputOperand {
-    /// Writes no guest memory, or its venue stages the output itself.
+    /// No output declared. The ABI census rejects this for output-writing
+    /// crossings, including calls whose existing venue stages their output.
     None,
     /// A fixed-size record at argument `ptr`.
     Record { ptr: u8, bytes: u64 },
