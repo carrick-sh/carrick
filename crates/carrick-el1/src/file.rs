@@ -258,7 +258,7 @@ pub struct HardwareValidator;
 fn host_validator_access(user_va: u64, len: usize, access: carrick_guest_arch::Access) -> bool {
     #[cfg(any(test, feature = "host-test"))]
     {
-        return TEST_VALIDATOR_ACCESS.with(|hook| {
+        TEST_VALIDATOR_ACCESS.with(|hook| {
             hook.borrow().as_ref().is_none_or(|check| {
                 check(
                     carrick_guest_arch::UserVa::new(user_va),
@@ -266,7 +266,7 @@ fn host_validator_access(user_va: u64, len: usize, access: carrick_guest_arch::A
                     access,
                 )
             })
-        });
+        })
     }
     #[cfg(not(any(test, feature = "host-test")))]
     {
