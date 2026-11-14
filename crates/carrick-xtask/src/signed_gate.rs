@@ -95,6 +95,17 @@ pub enum SignedGateAction {
         #[arg(long, env = "GITHUB_OUTPUT")]
         github_output: Option<PathBuf>,
     },
+    /// Watch a run's `gate` job (#2335): cancel the run when a gate routed to one
+    /// Mac hasn't started within the limit, so the group fails fast and the
+    /// re-queued group routes to the shared label. Exits non-zero after cancelling.
+    Watchdog {
+        #[arg(long)]
+        run_id: u64,
+        #[arg(long, default_value_t = route::WATCHDOG_SECS / 60)]
+        minutes: u64,
+        #[arg(long, default_value_t = 30)]
+        poll_seconds: u64,
+    },
     /// Run the merge base and the candidate on macOS, each in a new detached
     /// worktree, under one exclusive host lease and one fixture bundle.
     Execute {
@@ -2016,6 +2027,11 @@ pub fn run(root: &Path, args: SignedGateArgs) -> Result<(), ReceiptError> {
             request,
             github_output,
         } => route::route(root, &request, github_output.as_deref()),
+        SignedGateAction::Watchdog {
+            run_id,
+            minutes,
+            poll_seconds,
+        } => route::watchdog(run_id, minutes * 60, poll_seconds),
         SignedGateAction::Execute {
             request,
             output,

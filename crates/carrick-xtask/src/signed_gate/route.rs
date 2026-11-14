@@ -13,8 +13,15 @@
 //!
 //! A per-Mac route must never strand the required gate (#2341 review): the workflow token can't
 //! list runners, so a Mac is routable only with evidence it can read. It served a `gate` job within
-//! [`LIVE_WINDOW_SECS`], and no gate job has sat queued on its own label for longer than
-//! [`STRANDED_AFTER_SECS`] (which catches an offline Mac and a missing label alike).
+//! [`LIVE_WINDOW_SECS`], and no gate job on its own label has sat queued for longer than
+//! [`STRANDED_AFTER_SECS`] or ended without starting within that window (which catches an offline
+//! Mac and a missing label alike).
+//!
+//! Recovery for a gate already routed when its Mac goes away (#2341 re-review): GitHub can't move a
+//! queued job, so `watchdog` (a hosted job beside the gate) cancels the run when a routed gate hasn't
+//! started within [`WATCHDOG_SECS`]. The group fails in minutes instead of waiting out GitHub's 24 h
+//! queue limit, and its never-started job is the evidence that sends the re-queued group to the
+//! shared label.
 use super::{Request, RequestKind};
 use serde_json::Value;
 use std::fs;
@@ -29,6 +36,8 @@ pub const RUNNERS_FILE: &str = ".github/signed-gate-runners.txt";
 pub const LIVE_WINDOW_SECS: u64 = 12 * 3600;
 /// A gate job queued this long on a per-Mac label means that label isn't being served.
 pub const STRANDED_AFTER_SECS: u64 = 15 * 60;
+/// How long `watchdog` lets a routed gate wait for its Mac before cancelling the run.
+pub const WATCHDOG_SECS: u64 = 20 * 60;
 
 /// `secs` since the Unix epoch as GitHub's `YYYY-MM-DDTHH:MM:SSZ`, so timestamps compare as strings.
 pub fn iso_utc(secs: u64) -> String {
@@ -59,17 +68,20 @@ pub fn availability(runner: &str, gate_jobs: &[Value], now: u64) -> Result<(), S
     let stranded_before = iso_utc(now.saturating_sub(STRANDED_AFTER_SECS));
     let live_since = iso_utc(now.saturating_sub(LIVE_WINDOW_SECS));
     let stranded = gate_jobs.iter().any(|job| {
-        job["status"] == "queued"
-            && job["labels"]
-                .as_array()
-                .is_some_and(|labels| labels.iter().any(|l| l.as_str() == Some(label.as_str())))
+        let on_label = job["labels"]
+            .as_array()
+            .is_some_and(|labels| labels.iter().any(|l| l.as_str() == Some(label.as_str())));
+        let waited = job["status"] == "queued"
             && job["created_at"]
                 .as_str()
-                .is_some_and(|t| t < stranded_before.as_str())
+                .is_some_and(|t| t < stranded_before.as_str());
+        // A routed gate the watchdog cancelled (or that ended any other way) before it started.
+        let never_started = job["status"] == "completed" && job["started_at"].as_str().is_none();
+        on_label && (waited || never_started)
     });
     if stranded {
         return Err(format!(
-            "a gate job has waited over {} min for {label}: that label isn't being served",
+            "a gate job for {label} waited over {} min or ended unstarted: that label isn't being served",
             STRANDED_AFTER_SECS / 60
         ));
     }
@@ -189,6 +201,92 @@ pub fn decide(
         }
     }
     Route::Shared(last)
+}
+
+/// What the watchdog does about a run's `gate` job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Watch {
+    /// Nothing to watch: it started, ended, or runs on the shared label.
+    Done(String),
+    /// A routed gate is still queued, within the limit.
+    Wait,
+    /// A routed gate waited past the limit: cancel the run.
+    Cancel(String),
+}
+
+/// The watchdog's decision for `gate` (a jobs-API row, or `None` before GitHub lists it).
+pub fn watch_decision(gate: Option<&Value>, now: u64, limit_secs: u64) -> Watch {
+    let Some(job) = gate else {
+        return Watch::Wait;
+    };
+    let routed = job["labels"].as_array().and_then(|labels| {
+        labels
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|l| l.starts_with("carrick-signed-gate-"))
+            .map(str::to_owned)
+    });
+    let Some(label) = routed else {
+        return Watch::Done("the gate runs on the shared label".into());
+    };
+    if job["status"] != "queued" || job["started_at"].as_str().is_some() {
+        return Watch::Done(format!("the gate on {label} has started"));
+    }
+    let deadline = iso_utc(now.saturating_sub(limit_secs));
+    match job["created_at"].as_str() {
+        Some(created) if created < deadline.as_str() => Watch::Cancel(format!(
+            "the gate has waited over {} min for {label}, which no runner is serving; cancelling the run so the \
+             group fails now and the re-queued group routes to the shared label",
+            limit_secs / 60
+        )),
+        _ => Watch::Wait,
+    }
+}
+
+/// `signed-gate watchdog`: watch run `run_id`'s `gate` job; cancel the run when a routed gate hasn't
+/// started within `limit_secs`. Exits non-zero after cancelling.
+pub fn watchdog(run_id: u64, limit_secs: u64, poll_secs: u64) -> Result<(), super::ReceiptError> {
+    let repo = crate::ci_scaler::REPOSITORY;
+    let started = std::time::Instant::now();
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let jobs = super::api(&format!(
+            "repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"
+        ));
+        let gate = jobs
+            .as_ref()
+            .ok()
+            .and_then(|v| v["jobs"].as_array().cloned())
+            .and_then(|jobs| jobs.into_iter().find(|job| job["name"] == "gate"));
+        match watch_decision(gate.as_ref(), now, limit_secs) {
+            Watch::Done(why) => {
+                eprintln!("signed-gate watchdog: {why}");
+                return Ok(());
+            }
+            Watch::Cancel(why) => {
+                eprintln!("signed-gate watchdog: {why}");
+                super::checked(
+                    "gh",
+                    &["run", "cancel", &run_id.to_string(), "--repo", repo],
+                    None,
+                )?;
+                return Err(super::fail(why));
+            }
+            Watch::Wait => {}
+        }
+        // A gate GitHub never lists, or a jobs API that keeps failing, ends the watch too.
+        if started.elapsed().as_secs() > limit_secs + 600 {
+            eprintln!(
+                "signed-gate watchdog: no routed gate to watch after {} min; stopping",
+                started.elapsed().as_secs() / 60
+            );
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(poll_secs.max(1)));
+    }
 }
 
 /// The runner name a downloaded reuse package's `base-seal.json` records.
@@ -544,6 +642,77 @@ mod tests {
             matches!(route, Route::Shared(ref why) if why.contains("no gate job")),
             "{route:?}"
         );
+    }
+
+    #[test]
+    fn a_routed_gate_that_never_started_makes_its_mac_unroutable() {
+        // The watchdog cancelled it (or it ended some other way) before any runner took it.
+        let now = 1_794_700_000;
+        let jobs = [
+            json!({"name": "gate", "runner_name": "carrick-m4", "status": "completed",
+                "started_at": iso_utc(now - 3600), "created_at": iso_utc(now - 3700), "labels": ["x"]}),
+            json!({"name": "gate", "runner_name": "", "status": "completed", "conclusion": "cancelled",
+                "started_at": null, "created_at": iso_utc(now - 1800),
+                "labels": ["carrick-signed-gate-carrick-m4"]}),
+        ];
+        assert!(availability("carrick-m4", &jobs, now).is_err());
+        assert_eq!(
+            availability(
+                "cloudmac-gate",
+                &[json!({"name": "gate", "runner_name": "cloudmac-gate",
+            "status": "completed", "started_at": iso_utc(now - 60), "created_at": iso_utc(now - 90), "labels": ["x"]})],
+                now
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_watchdog_cancels_only_a_routed_gate_past_its_limit() {
+        let now = 1_794_700_000;
+        let gate = |labels: &[&str], status: &str, started: Option<u64>, created: u64| {
+            json!({"name": "gate", "status": status, "labels": labels,
+                "started_at": started.map(iso_utc), "created_at": iso_utc(created)})
+        };
+        let routed = [
+            "self-hosted",
+            "macOS",
+            "ARM64",
+            "carrick-signed-gate-carrick-m4",
+        ];
+        assert_eq!(watch_decision(None, now, WATCHDOG_SECS), Watch::Wait);
+        assert!(matches!(
+            watch_decision(
+                Some(&gate(&SHARED_LABELS, "queued", None, now - 3600)),
+                now,
+                WATCHDOG_SECS
+            ),
+            Watch::Done(_)
+        ));
+        assert!(matches!(
+            watch_decision(
+                Some(&gate(&routed, "in_progress", Some(now - 60), now - 3600)),
+                now,
+                WATCHDOG_SECS
+            ),
+            Watch::Done(_)
+        ));
+        assert_eq!(
+            watch_decision(
+                Some(&gate(&routed, "queued", None, now - 600)),
+                now,
+                WATCHDOG_SECS
+            ),
+            Watch::Wait
+        );
+        assert!(matches!(
+            watch_decision(
+                Some(&gate(&routed, "queued", None, now - 1500)),
+                now,
+                WATCHDOG_SECS
+            ),
+            Watch::Cancel(_)
+        ));
     }
 
     #[test]
