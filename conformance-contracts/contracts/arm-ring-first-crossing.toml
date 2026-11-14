@@ -41,6 +41,7 @@ changing either live policy.
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::born_thread_entry_tests::arm_gettimeofday_second_output_retains_owner_preparation",
   "carrick-personality-linux::crossing::tests::all_crossings_declare_abi_output_arguments",
   "carrick-el1-linux::production_x86_family_absences_obey_crossings_without_user_memory",
   "carrick-personality-linux::dispatch::service_owner_tests::service_owner_agrees_with_tsv_crossings_and_retains_wired_families",
