@@ -186,6 +186,13 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
         .as_hash()
         .expect("scoreboard job permissions");
     assert_eq!(sb_perms.len(), 2, "unexpected permissions: {sb_perms:?}");
+    for key in ["contents", "actions"] {
+        assert_eq!(
+            sb_perms.get(&Yaml::from_str(key)),
+            Some(&Yaml::from_str("read")),
+            "the scoreboard job's {key} permission must be read"
+        );
+    }
     let steps = sb["steps"].as_vec().expect("hvf-scoreboard-nightly steps");
     let (download_idx, download) = step_by_name(steps, "Download the signed binary");
     assert_eq!(download["with"]["name"], binary_step["with"]["name"]);
