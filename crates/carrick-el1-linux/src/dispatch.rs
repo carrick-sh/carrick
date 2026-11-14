@@ -5797,17 +5797,6 @@ impl<
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Complete(0);
         };
-        let Some(slot) = self.frame.slot() else {
-            return FamilyCompletion::Complete(0);
-        };
-        let Some(zone) = &mut self.zone else {
-            return FamilyCompletion::Complete(0);
-        };
-        let Some(frame) = self.frame.arm_frame() else {
-            // x86 ordinal 24 maps to this shared canonical call. It has no
-            // ARM frame to rotate, but still completes in ring.
-            return FamilyCompletion::Complete(0);
-        };
         if task.linux.has_pending_host_work()
             || task.lifecycle_refs().is_some_and(|(page, control)| {
                 page.pending().load().0 != 0 || control.pending().load().0 != 0
@@ -5815,7 +5804,31 @@ impl<
         {
             return FamilyCompletion::CompleteWithWork(0);
         }
-        if zone.tables.runnable_head(slot).is_none() {
+        if !self.frame.arm_scheduler() {
+            // x86 ordinal 24 maps to this shared canonical call. Its process
+            // owner rotates the caller behind a runnable sibling, and the
+            // lane's scheduler runs the head (#2354).
+            let Some(process) = self.process.as_deref_mut().filter(|process| {
+                process.binding() == super::common_entry::execution_binding(task)
+            }) else {
+                return FamilyCompletion::Complete(0);
+            };
+            return process
+                .native_yield()
+                .map_or(FamilyCompletion::Complete(0), |outcome| {
+                    lifecycle::lifecycle_effect(&outcome)
+                });
+        }
+        let Some(slot) = self.frame.slot() else {
+            return FamilyCompletion::Complete(0);
+        };
+        let Some(zone) = &mut self.zone else {
+            return FamilyCompletion::Complete(0);
+        };
+        let Some(frame) = self.frame.arm_frame() else {
+            return FamilyCompletion::Complete(0);
+        };
+        if zone.tables.yield_turn(slot) == carrick_sched_core::YieldTurn::Keep {
             return FamilyCompletion::Complete(0);
         }
         match native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
