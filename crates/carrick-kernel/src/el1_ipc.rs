@@ -1177,6 +1177,26 @@ impl HostIpc {
         })
     }
 
+    /// Hold the exact description a shared table's slot names now: the
+    /// returned [`HostDescription`] keeps that OFD (and so its backing) live
+    /// until it drops, as an admitted one does.
+    pub(crate) fn retain_description(
+        self: &std::sync::Arc<Self>,
+        table: fd::TableId,
+        target: fd::Fd,
+    ) -> Result<(HostDescription, fd::Description), fd::Error> {
+        let (pin, description) = self.region().fd(HostLockWait).pin(table, target)?;
+        Ok((
+            HostDescription {
+                flags: std::sync::Arc::new(HostDescriptionFlags {
+                    owner: std::sync::Arc::clone(self),
+                    state: Mutex::new(HostDescriptionState::Live(pin)),
+                }),
+            },
+            description,
+        ))
+    }
+
     pub fn create_table(
         &self,
         limit: usize,

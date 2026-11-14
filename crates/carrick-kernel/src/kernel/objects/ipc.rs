@@ -25,6 +25,16 @@ impl core::ops::Deref for IpcTableMapBinding {
     }
 }
 
+/// A ring-created description found in a published slot
+/// ([`FileTable::ipc_ring_description`]).
+pub(crate) struct RingDescription {
+    pub(crate) owner: Arc<HostIpc>,
+    /// Holds the slot's OFD (and its backing) while this lives.
+    pub(crate) held: HostDescription,
+    pub(crate) backing: IpcBacking,
+    pub(crate) cloexec: bool,
+}
+
 /// The host slot map and stdio markers serialize publication. This binding
 /// owns only their shared projection; pipe/eventfd descriptions and flags
 /// already use the same OFD authority in both venues.
@@ -465,6 +475,36 @@ impl FileTable {
         {
             *ipc = Some(Err(error));
         }
+    }
+
+    /// The ring-created description a published slot names (a run root's
+    /// EL1 `pipe2`, `eventfd2` or `epoll_create1`; #1671): a hold on the
+    /// slot's exact OFD, its backing and the slot's close-on-exec. `None`
+    /// when the slot is empty, unpublished, or host-backed (the host's own).
+    pub(crate) fn ipc_ring_description(&self, number: i32) -> Option<RingDescription> {
+        let (owner, table) = {
+            let ipc = self.ipc.lock();
+            let Some(Ok(binding)) = &*ipc else {
+                return None;
+            };
+            (Arc::clone(&binding.owner), binding.table.id())
+        };
+        let (held, description) = owner.retain_description(table, fd::Fd(number)).ok()?;
+        let backing = IpcBacking::decode(description.backing)?;
+        if matches!(backing, IpcBacking::Host(_)) {
+            return None;
+        }
+        let cloexec = owner
+            .region()
+            .fd(crate::el1_zone::HostLockWait)
+            .getfd(table, fd::Fd(number))
+            .ok()?;
+        Some(RingDescription {
+            owner,
+            held,
+            backing,
+            cloexec,
+        })
     }
 
     pub(crate) fn ipc_fd_flags(
