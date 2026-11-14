@@ -41,7 +41,7 @@ fn collect_yaml_strings(node: &Yaml, out: &mut Vec<String>) {
 
 fn step_by_name<'a>(steps: &'a [Yaml], name: &str) -> (usize, &'a Yaml) {
     let pos = steps.iter().position(|s| s["name"].as_str() == Some(name));
-    assert!(pos.is_some(), "missing step `{name}` in hvf-kernel");
+    assert!(pos.is_some(), "missing step `{name}`");
     let idx = pos.expect("checked above");
     (idx, &steps[idx])
 }
@@ -149,26 +149,53 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
         Some(&Yaml::from_str("read"))
     );
 
-    let steps = hvf["steps"].as_vec().expect("hvf-kernel steps");
-    let build_idx = steps
+    // #2347: hvf-kernel uploads the binary signed acceptance built, before the
+    // long embedded tests; the nightly scoreboard is its own job with its own
+    // budget, scoring that binary whether or not the embedded tests pass.
+    let kernel_steps = hvf["steps"].as_vec().expect("hvf-kernel steps");
+    let (receipt_idx, _) = step_by_name(kernel_steps, "Signed acceptance receipt");
+    let (binary_idx, binary_step) = step_by_name(
+        kernel_steps,
+        "Upload the signed binary for the nightly scoreboard",
+    );
+    let (embed_idx, _) = step_by_name(kernel_steps, "Signed embedded guest tests");
+    assert!(
+        receipt_idx < binary_idx && binary_idx < embed_idx,
+        "the binary uploads after acceptance ({receipt_idx}) and before the embedded tests ({embed_idx}): {binary_idx}"
+    );
+    assert_nightly_or_owner_dispatch_guard("binary upload", binary_step);
+    assert_eq!(
+        binary_step["with"]["path"].as_str(),
+        Some("target/release/carrick")
+    );
+
+    let sb = &workflow["jobs"]["hvf-scoreboard-nightly"];
+    assert_nightly_or_owner_dispatch_guard("hvf-scoreboard-nightly", sb);
+    let needs: Vec<&str> = sb["needs"]
+        .as_vec()
+        .expect("hvf-scoreboard-nightly needs")
         .iter()
-        .position(|s| {
-            s["run"]
-                .as_str()
-                .is_some_and(|r| r.lines().any(|line| line.trim() == "just build"))
-        })
-        .expect("step running `just build` in hvf-kernel");
-    let (_, failure_evidence_step) = step_by_name(steps, "Upload signed failure evidence");
-    let failure_idx = steps
-        .iter()
-        .position(|s| std::ptr::eq(s, failure_evidence_step))
-        .expect("failure evidence step index");
+        .filter_map(Yaml::as_str)
+        .collect();
+    assert_eq!(needs, ["hvf-kernel"]);
+    assert!(
+        sb["timeout-minutes"].as_i64().is_some_and(|t| t >= 60 + 10),
+        "the scoreboard job's budget covers the 60-min lease wait plus its run"
+    );
+    let sb_perms = sb["permissions"]
+        .as_hash()
+        .expect("scoreboard job permissions");
+    assert_eq!(sb_perms.len(), 2, "unexpected permissions: {sb_perms:?}");
+    let steps = sb["steps"].as_vec().expect("hvf-scoreboard-nightly steps");
+    let (download_idx, download) = step_by_name(steps, "Download the signed binary");
+    assert_eq!(download["with"]["name"], binary_step["with"]["name"]);
+    let (verify_idx, _) = step_by_name(steps, "Verify the signed binary");
 
     let (run_idx, run_step) = step_by_name(steps, RUN_STEP_NAME);
     let (upload_idx, upload_step) = step_by_name(steps, UPLOAD_STEP_NAME);
     assert!(
-        build_idx < run_idx && run_idx < upload_idx && upload_idx < failure_idx,
-        "expected step order: just build ({build_idx}) < run ({run_idx}) < upload ({upload_idx}) < failure evidence ({failure_idx})"
+        download_idx < verify_idx && verify_idx < run_idx && run_idx < upload_idx,
+        "expected step order: download ({download_idx}) < verify ({verify_idx}) < run ({run_idx}) < upload ({upload_idx})"
     );
 
     // Every step in the workflow that touches scoreboard is one of the known ones.
@@ -188,14 +215,16 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
                     "trusted-hardware-ok",
                     "kvm-scoreboard",
                     "scoreboard-post",
+                    "hvf-scoreboard-nightly",
                 ]
                 .contains(&id)
                 {
                     continue;
                 }
                 assert_eq!(id, "hvf-kernel", "unexpected scoreboard step in job {id}");
-                assert!(
-                    [run_idx, upload_idx].contains(&idx),
+                assert_eq!(
+                    idx,
+                    binary_idx,
                     "unexpected scoreboard reference in hvf-kernel step index {idx}: {:?}",
                     step["name"].as_str()
                 );
@@ -215,7 +244,7 @@ fn hvf_kernel_wires_nightly_scoreboard_with_event_guards_and_token_isolation() {
         "run step must pass `--sha \"$GITHUB_SHA\"` and `--out target/scoreboard/receipt.json`: {run_script}"
     );
     assert_scoring_script_discipline(
-        "hvf-kernel run step",
+        "hvf-scoreboard-nightly run step",
         run_script,
         "target/scoreboard/table.txt",
     );
@@ -355,7 +384,7 @@ fn scoreboard_post_publishes_both_isas_and_runs_no_repository_code() {
         .iter()
         .filter_map(Yaml::as_str)
         .collect();
-    assert_eq!(needs, ["hvf-kernel", "kvm-scoreboard"]);
+    assert_eq!(needs, ["hvf-scoreboard-nightly", "kvm-scoreboard"]);
     assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));
     let perms = job["permissions"]
         .as_hash()
@@ -405,9 +434,9 @@ fn scoreboard_post_publishes_both_isas_and_runs_no_repository_code() {
 #[test]
 fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
     let workflow = load_kernel_runtime_workflow();
-    let steps = workflow["jobs"]["hvf-kernel"]["steps"]
+    let steps = workflow["jobs"]["hvf-scoreboard-nightly"]["steps"]
         .as_vec()
-        .expect("hvf-kernel steps");
+        .expect("hvf-scoreboard-nightly steps");
     let (_, run_step) = step_by_name(steps, RUN_STEP_NAME);
     let run_script = run_step["run"].as_str().expect("run script");
     let post_steps = workflow["jobs"]["scoreboard-post"]["steps"]

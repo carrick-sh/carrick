@@ -380,6 +380,19 @@ jobs:
           path: target/ci-receipts/receipt.json
           if-no-files-found: error
 
+      # The nightly scoreboard runs in its own job (#2347): it scores the
+      # binary signed acceptance just built, uploaded here, before the long
+      # embedded tests, so their duration or failure never decides whether
+      # the scoreboard posts.
+      - name: Upload the signed binary for the nightly scoreboard
+        if: ${{ !cancelled() && steps.signed-receipt.outcome == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoreboard-binary-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/release/carrick
+          if-no-files-found: error
+          retention-days: 3
+
       # After publishing the receipt, run the full signed coverage, reusing
       # target/release (including .dSYM bundles) from signed acceptance.
       - name: Signed embedded guest tests
@@ -409,33 +422,6 @@ jobs:
             RUST_TEST_THREADS=1 just test-embed
             RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes
           ' signed-fixtures "${bundles[0]}"
-
-      - name: Goal scoreboard (nightly)
-        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          test -n "${CARRICK_XTASK_BIN:-}"
-          test -x "$CARRICK_XTASK_BIN"
-          test -x target/release/carrick
-          rm -rf target/scoreboard
-          mkdir -p target/scoreboard
-          export CARRICK_RUN_ID="scoreboard-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          just lease gate "$CARRICK_XTASK_BIN" scoreboard --carrick target/release/carrick \
-            --sha "$GITHUB_SHA" \
-            --out target/scoreboard/receipt.json \
-            | tee target/scoreboard/table.txt
-          test -s target/scoreboard/receipt.json
-          test -s target/scoreboard/table.txt
-
-      - name: Upload scoreboard receipt
-        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: scoreboard-${{ github.sha }}-${{ github.run_attempt }}
-          path: target/scoreboard/
-          if-no-files-found: warn
 
       - name: Upload signed failure evidence
         if: ${{ failure() || steps.signed-receipt.outputs.failed == 'true' }}
@@ -959,14 +945,98 @@ jobs:
   # lane that produced no table is reported as missing with its job result,
   # never silently dropped. Each table line leads with its ISA column, so
   # `director/scoreboard-rows.sh` (carrick-sh/agy-director) reads both blocks.
+  # The nightly scoreboard (#2347): its own job and budget. It used to be a
+  # step at the end of hvf-kernel, sharing that job's 180 min with signed
+  # acceptance, the embedded tests (82 min in schedule run 43610026307) and
+  # its own wait for the gate lease (44 min there): every nightly was
+  # cancelled before it posted. It scores the binary hvf-kernel signed
+  # (uploaded right after acceptance), so it runs whether or not the
+  # embedded tests pass, and holds the gate lease only for its run.
+  hvf-scoreboard-nightly:
+    name: HVF · goal scoreboard (nightly)
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.hvf-kernel.result != 'skipped' &&
+          (github.event_name == 'schedule' ||
+           (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) }}
+    needs: [hvf-kernel]
+    runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
+    # The lease wait limit (HOST_LEASE_WAIT_LIMIT, 60 min) plus checkout, the
+    # xtask build and the run (2.4 min in 43610068372), with headroom.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Verify installed host-lease supervisor
+        run: |
+          set -euo pipefail
+          xtask=/usr/local/bin/carrick-xtask
+          if [ ! -x "$xtask" ] || [ -L "$xtask" ] || [ "$(/usr/bin/stat -f %u "$xtask")" != 0 ]; then
+            echo "::error title=host-lease supervisor missing::$xtask is not an installed root-owned binary; install it per docs/ci/mac-hvf-runner.md, setup step 3 (Root-owned carrick-xtask)"
+            exit 1
+          fi
+          "$xtask" host-lease --help >/dev/null
+
+      - uses: actions/checkout@v4
+
+      - name: Install just
+        uses: ./.github/actions/install-tools
+        with:
+          tools: just
+
+      - name: Build checkout xtask under shared lease
+        run: |
+          /usr/local/bin/carrick-xtask host-lease --mode carrick -- cargo build --locked -p carrick-xtask --target-dir target/lease-tools
+          echo "CARRICK_XTASK_BIN=$GITHUB_WORKSPACE/target/lease-tools/debug/carrick-xtask" >> "$GITHUB_ENV"
+
+      - name: Download the signed binary
+        uses: actions/download-artifact@v4
+        with:
+          name: scoreboard-binary-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/release
+
+      - name: Verify the signed binary
+        run: |
+          set -euo pipefail
+          chmod +x target/release/carrick
+          codesign -d --entitlements - target/release/carrick 2>&1 | grep -q com.apple.security.hypervisor
+          otool -l target/release/carrick | grep -q __dof_carrick
+
+      - name: Goal scoreboard (nightly)
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          test -n "${CARRICK_XTASK_BIN:-}"
+          test -x "$CARRICK_XTASK_BIN"
+          test -x target/release/carrick
+          rm -rf target/scoreboard
+          mkdir -p target/scoreboard
+          export CARRICK_RUN_ID="scoreboard-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          just lease gate "$CARRICK_XTASK_BIN" scoreboard --carrick target/release/carrick \
+            --sha "$GITHUB_SHA" \
+            --out target/scoreboard/receipt.json \
+            | tee target/scoreboard/table.txt
+          test -s target/scoreboard/receipt.json
+          test -s target/scoreboard/table.txt
+
+      - name: Upload scoreboard receipt
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoreboard-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/scoreboard/
+          if-no-files-found: warn
+
   scoreboard-post:
     name: "Scoreboard · post both ISAs to #231"
     if: >-
       ${{ !cancelled() && github.ref == 'refs/heads/main' &&
           (github.event_name == 'schedule' ||
            (github.event_name == 'workflow_dispatch' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' && inputs.scoreboard_branch == '')) &&
-          (needs.hvf-kernel.result != 'skipped' || needs.kvm-scoreboard.result != 'skipped') }}
-    needs: [hvf-kernel, kvm-scoreboard]
+          (needs.hvf-scoreboard-nightly.result != 'skipped' || needs.kvm-scoreboard.result != 'skipped') }}
+    needs: [hvf-scoreboard-nightly, kvm-scoreboard]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -991,7 +1061,7 @@ jobs:
       - name: "Post scoreboard to #231"
         env:
           GH_TOKEN: ${{ github.token }}
-          HVF_RESULT: ${{ needs.hvf-kernel.result }}
+          HVF_RESULT: ${{ needs.hvf-scoreboard-nightly.result }}
           KVM_RESULT: ${{ needs.kvm-scoreboard.result }}
         run: |
           set -euo pipefail
