@@ -371,4 +371,4 @@ bootstrap gap still requiring closure before cloudmac returns to the pool.
 
 ## Note on `just test-embed`
 
-Moved from `AGENTS.md` (#2118): `just test-embed` is not in `just ci`; it runs in the merge queue on the self-hosted cloudmac lane.
+Moved from `AGENTS.md` (#2118): `just test-embed` (`scripts/test-signed.sh carrick-embed`) is not in `just ci`, and it doesn't run in the merge queue either: the queue's signed gate runs `just accept --phase signed`. It runs in `kernel-runtime.yml`'s `hvf-kernel` job (the nightly schedule and owner dispatches on main), followed by `just conformance-probes`. Both suites always run, and the step fails if either did.
