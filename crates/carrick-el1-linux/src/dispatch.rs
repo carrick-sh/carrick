@@ -2341,14 +2341,13 @@ pub(super) fn arm_signal_return_gate(
         control,
     );
     // An already closing member retains terminal execution authority even if
-    // the ordinary entry venue has fallen back to Host after admission closed.
+    // the ordinary entry venue has fallen back to Host after admission closed,
+    // but only where the ring can hand its exact record to the host.
     let terminal_checkpoint =
         arm_signal_return_admission(source.zone, page, control, fatal_owner_cancel)?;
     if venue == carrick_el1::substrate::sched::NativeEntryVenue::Host
         && !(fatal_owner_cancel && control.native_signal_owner())
-        && !(terminal_checkpoint
-            && task.owns_lifecycle_page(page)
-            && task.owns_control_slot(control))
+        && !(terminal_checkpoint && closing_member_record_on_cpu(source, task, page, control))
     {
         return None;
     }
@@ -2362,6 +2361,30 @@ pub(super) fn arm_signal_return_gate(
         return None;
     }
     Some(terminal_checkpoint)
+}
+
+/// A closing member on a Host venue is the ring's to retire only as a
+/// registered native signal owner whose own zone record is switched in: that
+/// `OnCpu` record is what `yield_current_to_host` hands to its host owner. A
+/// host-loaded member with no switched record, or an unregistered host birth,
+/// is already its executor's: the host's control kick forwards it at the next
+/// EL0 boundary, so it never claims a free home record or registers through
+/// the closed gate.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn closing_member_record_on_cpu(
+    source: carrick_el1_abi::BornInZoneSource<'_, carrick_el1_abi::Aarch64ParkedContext>,
+    task: &CurrentTask,
+    page: &carrick_el1_abi::ThreadLifecyclePage,
+    control: &carrick_el1_abi::ThreadControlSlot,
+) -> bool {
+    task.owns_lifecycle_page(page)
+        && task.owns_control_slot(control)
+        && control.native_signal_owner()
+        && source
+            .zone
+            .slot(source.slot)
+            .current()
+            .is_some_and(|current| control.zone_record() == Some(source.zone.record_ref(current)))
 }
 
 /// The signal checkpoint's process admission and delivery, shared by the EL1
