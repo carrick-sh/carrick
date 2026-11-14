@@ -1,0 +1,6 @@
+# Gate Macs that carry their own runner label `carrick-signed-gate-<runner name>` (#2335), one runner name
+# per line, exactly as the runner registered (`RUNNER_NAME`). `signed-gate route` sends a gate to a Mac only
+# when its name is listed here, so a typo or a retired Mac can never strand a job on a label nobody serves:
+# it falls back to the shared `carrick-signed-gate` label every gate Mac also keeps.
+carrick-m4
+cloudmac-gate
