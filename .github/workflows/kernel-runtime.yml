@@ -406,8 +406,14 @@ jobs:
             grep -q com.apple.security.hypervisor target/fixtures/signed-entitlements.txt
             otool -l target/release/carrick > target/fixtures/signed-load-commands.txt
             grep -q __dof_carrick target/fixtures/signed-load-commands.txt
-            RUST_TEST_THREADS=1 just test-embed
-            RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes
+            # Both suites run, then the step fails if either did (#1448): under
+            # `set -e` a red test-embed used to skip conformance-probes entirely.
+            embed=0
+            RUST_TEST_THREADS=1 just test-embed || embed=$?
+            probes=0
+            RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes || probes=$?
+            echo "test-embed exited $embed; conformance-probes exited $probes"
+            [ "$embed" -eq 0 ] && [ "$probes" -eq 0 ]
           ' signed-fixtures "${bundles[0]}"
 
       - name: Goal scoreboard (nightly)
