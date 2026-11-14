@@ -1128,7 +1128,33 @@ gate-containers: build
 # image, so it is an opt-in guest lane like conformance-quick — deliberately
 # NOT part of `just ci`.
 test-embed *ARGS: build
+    #!/usr/bin/env bash
+    set -euo pipefail
     env -u CARRICK_TEST_TARGET {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-embed {{ARGS}}
+    # The full run also covers the conformance-metrics contract targets (#2348);
+    # a filtered run is a focused one, and runs `just test-embed-contracts` itself.
+    if [ -z "{{ARGS}}" ]; then
+        just --justfile {{justfile()}} test-embed-contracts
+    fi
+
+# carrick-embed's conformance-metrics contract targets (#2348): built with that
+# feature, given the checkout's source identity (`investigate source-identity`)
+# and observation paths under target/contract-observations/. Each target is one
+# signed run (`CARRICK_TEST_TARGET`), with the package's negative control.
+test-embed-contracts *ARGS: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source="$({{_cargo}} run --locked -q -p carrick-investigation --bin investigate -- source-identity)"
+    [[ "$source" =~ ^[0-9a-f]{64}$ ]] || { echo "test-embed-contracts: bad source identity: $source" >&2; exit 1; }
+    out="$PWD/target/contract-observations"
+    mkdir -p "$out"
+    for target in write_seek_contract inotify_hotpath_contract; do
+        CARRICK_OBSERVATION_SOURCE="$source" \
+        CARRICK_WRITE_SEEK_OBSERVATIONS="$out/write-seek.json" \
+        CARRICK_INOTIFY_HOTPATH_OBSERVATIONS="$out/inotify-hotpath.json" \
+        CARRICK_TEST_SIGNED_FEATURES=conformance-metrics CARRICK_TEST_TARGET="$target" \
+            {{_lease_runner}} host-lease --mode carrick -- ./scripts/test-signed.sh carrick-embed {{ARGS}}
+    done
 
 # Signed first-boot smoke (#893), about 30 s on a warm build: builds only the
 # carrick-embed `smoke_signed` target, signs it and runs bootstrap -> clean root
