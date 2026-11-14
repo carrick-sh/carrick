@@ -525,6 +525,12 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
         fs::create_dir_all(&d).expect("mkdir artifact");
         fs::write(d.join("table.txt"), table).expect("write table");
     }
+    // The x86 receipt carries a failing row's key stderr line (#2327: exit code and key stderr per row).
+    fs::write(
+        temp.join("scoreboard/x86_64/receipt.json"),
+        r#"{"rows":[{"name":"py-version","key_stderr_line":""},{"name":"py-thread","key_stderr_line":"carrick: guest killed by SIGSEGV $(echo injected)"}]}"#,
+    )
+    .expect("write x86 receipt");
     let ok_post = post("success", "success");
     assert!(
         ok_post.status.success(),
@@ -564,6 +570,16 @@ fn scoreboard_workflow_scripts_execute_expected_run_and_post_paths() {
         "{body}"
     );
     assert!(body.contains("x86_64  py-thread        exit=139"), "{body}");
+    assert!(
+        body.contains(
+            "```stderr\npy-thread: carrick: guest killed by SIGSEGV $(echo injected)\n```"
+        ),
+        "the x86 block lists the failing row's key stderr, verbatim and unexpanded: {body}"
+    );
+    assert!(
+        !body.contains("py-version: "),
+        "rows without stderr are not listed: {body}"
+    );
     assert!(
         !body.contains("canary-secret-token-value")
             && !String::from_utf8_lossy(&ok_post.stdout).contains("canary-secret-token-value")
