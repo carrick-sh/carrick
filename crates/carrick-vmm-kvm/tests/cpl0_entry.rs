@@ -1204,11 +1204,12 @@ fn production_user_fault_editor_busy_once_parks_and_reruns() {
 }
 
 /// #2263 review P0: a syscall's staged user copy meets the MM editor held by
-/// another owner. `write(1, buf, 16)` gathers from a fresh, never-touched
-/// page, so staging asks the owner fault path to supply it while the editor
-/// is held. Contention is "not now": the call parks on the editor's release
-/// once and reruns whole, writing all 16 bytes. It is never EFAULT or a
-/// short write. A wrong result exits with the write's own return value.
+/// another owner. A write to a guest-opened host file (not a delegated
+/// stdio stream) gathers from a fresh, never-touched page, so staging asks
+/// the owner fault path to supply it while the editor is held. Contention
+/// is "not now": the call parks on the editor's release once and reruns
+/// whole, writing all 16 bytes. It is never EFAULT or a short write. A
+/// wrong result exits with the write's own return value.
 #[test]
 fn production_staged_copy_editor_busy_once_parks_and_reruns() {
     const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
@@ -1247,11 +1248,22 @@ fn production_staged_copy_editor_busy_once_parks_and_reruns() {
     code.extend_from_slice(&[0x0f, 0x05, 0x4c, 0x39, 0xe0, 0x0f, 0x85]); // cmp rax,r12; jne
     failures.push(code.len());
     code.extend_from_slice(&0_i32.to_le_bytes());
+    // openat(AT_FDCWD, "/dev/null", O_WRONLY) into r13.
+    append_mov(&mut code, &[0x48, 0xbf], (-100_i64) as u64);
+    code.extend_from_slice(&[0x48, 0x8d, 0x35]); // lea rsi,[rip+path]
+    let path_reference = code.len();
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    append_mov(&mut code, &[0x48, 0xba], 1);
+    append_mov(&mut code, &[0x48, 0xb8], 257);
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc5]); // mov r13,rax
     append_mov(&mut code, &[0x48, 0xb8], INJECT_EDITOR_BUSY_ONCE);
     code.extend_from_slice(&[0x0f, 0x05]);
     append_result_check(&mut code, &mut failures, 0);
-    // write(1, r12, 16): the gather's first read meets the held editor.
-    append_mov(&mut code, &[0x48, 0xbf], 1);
+    // write(r13, r12, 16): the gather's first read meets the held editor.
+    code.extend_from_slice(&[0x4c, 0x89, 0xef]); // mov rdi,r13
     code.extend_from_slice(&[0x4c, 0x89, 0xe6]); // mov rsi,r12
     append_mov(&mut code, &[0x48, 0xba], 16);
     append_mov(&mut code, &[0x48, 0xb8], 1);
@@ -1276,6 +1288,10 @@ fn production_staged_copy_editor_busy_once_parks_and_reruns() {
         let delta = i32::try_from(failure - (branch + 4)).unwrap();
         code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
     }
+    let path = code.len();
+    code.extend_from_slice(b"/dev/null\0");
+    let delta = i32::try_from(path - (path_reference + 4)).unwrap();
+    code[path_reference..path_reference + 4].copy_from_slice(&delta.to_le_bytes());
 
     let outcome = try_run_instrumented_pool_fixture(&production_probe_elf(&code), 32)
         .unwrap_or_else(|failure| panic!("a held editor refused the staged copy: {failure}"));
