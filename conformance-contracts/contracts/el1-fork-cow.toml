@@ -1,3 +1,12 @@
+# #2276 round 5: fork arms a wholly private block (AArch64 L1/L2, x86
+# 2M/1G) in place, at block granularity: zero split tables, one live edit
+# and one custody record per block, whatever its size. Its first COW write
+# splits exactly the covering block inside the descriptor executor's
+# CowRepoint, with at most two host-granted tables carried by the COW grant,
+# and copies only the fault's granule; later writes in the block split
+# nothing. Fork-time splits that remain (mixed/structural) link table
+# attributes only. Settlement orders one MM's completions causally (#1801).
+# Witnesses below; the signed Go rows on #2278 remain the production proof.
 # #1733: the EL0 fault arm settles USED grant completions before the host
 # refill. Adds one VM-free binding; budgets and signed bindings unchanged.
 # #1394: additional ABI bookkeeping witness only; existing semantic and
@@ -54,6 +63,17 @@ vm_free = [
   "carrick-core-abi::executable_publication::{tests::publication_is_bounded_and_acknowledges_cancellation_before_reuse,layout_manifest::portal_executable_publication,layout_manifest::portal_executable_slot}",
   "carrick-el1-abi::mm_portal::layout_manifest::mm_portal_slots (neutral executable-publication ownership move only: retained wire sizes, offsets, bounded single-flight acknowledgment and cancellation/reuse; existing semantic and work bindings above remain required, no broader or signed acceptance claim)",
   "carrick-el1-linux::mm_portal::tests::native_child_tid_cow::native_child_tid_copy_supplies_its_empty_cow_pool_before_writing",
+  "carrick-el1-linux::mm_portal::tests::{owner_fork_private_blocks_arm_in_place_without_table_work,owner_fork_one_gib_private_block_forks_without_table_work} (#2276 structural budget through the production owner fork: 32 private 2 MiB blocks census zero parent table words, child tables only for the hierarchy above them, and one 2 MiB custody record each; a 1 GiB block forks without table work; both red at round 4 with NoMemory)",
+  "carrick-el1-linux::mm_portal::tests::{owner_fork_private_block_splits_once_on_first_cow_write,owner_fork_abort_keeps_a_block_split_by_a_pending_parent_write} (#2276: the first write into an armed block splits only that block with one granted table and copies only its 16 KiB granule, 508 pages stay armed, a later write links no table, a table-less grant declines PoolEmpty; a pending-fork parent write keeps its split across abort)",
+  "carrick-el1-linux::mm_portal::x86_tests::x86_owner_fork_arms_private_parent_and_restores_on_abort (#2276: an x86 private large page is armed in place; a mixed read-only NX large page splits with directory attributes PRESENT|WRITE|USER; abort restores both exactly)",
+  "carrick-core::aarch64_fork_geometry::{test_arm_fork_geometry_and_cow_lifecycle,arm_fork_split_tables_never_inherit_leaf_upper_bits} (#2276 P0-1: the private L2 block stays an armed block; a split fork must still do links a plain table descriptor, never leaf bit 59 as PXNTable)",
+  "carrick-el1::cow::x86_cow_tests::x86_cow_splits_an_armed_large_page_with_the_grant_table",
+  "carrick-mmu-core::aarch64::descriptor_txn::guest_cow::tests::an_armed_private_block_moves_the_fault_granule_and_names_its_split",
+  "carrick-core-abi::mm::cow_pool::tests::split_tables_travel_with_one_grant_and_only_a_block_spends_them",
+  "carrick-core-abi::mm::cow::settlement_order_tests::{a_repeated_move_settles_after_the_move_it_continues,two_runs_of_one_compound_keep_it_until_the_last_settles} (#1801)",
+  "carrick-hal::fork_stock::tests::native_cow_split_tables_settle_their_linked_prefix_exactly_once",
+  "carrick-aarch64::stage1_authority::tests::guest_owned_authority_reserves_and_returns_cow_split_tables",
+  "carrick-vmm-hvf::trap::foreign_mm::tests::guest_cow::a_repeated_cow_of_one_granule_settles_in_one_batch (#1801, production settle_guest_cow_completions; macOS-only, not yet run on a Mac)",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-runtime::vcpu_loop::binding::tests::serial_host_el0_cow_fault_refills_a_chain_full_of_used_grants (#1733: the production EL0 fault arm settles the faulting MM's 64 USED grant completions and keeps EL1 excluded while the resolver refills, with a live forked child's completions left to the child; the resolver is a test stand-in for the HVF refill; red before the fix with (excluded, published) = (false, false); VM-free only, signed py-fork acceptance pending)",
 ]
@@ -62,6 +82,7 @@ embed = [
 ]
 
 [bindings.unresolved]
+kvm = "Executing x86 production-entry binding: carrick-vmm-kvm::cpl0_entry::shared_kernel_x86_cow_splits_an_armed_large_page_on_first_write. A real KVM carrier maps a private 2 MiB user page, arms it in place, and its first write through dispatch_x86_fault_with_prepared splits only that PDE with one granted table and copies one page (red with the large-page classifier arm removed); the contract evaluator has no registered KVM observation layer."
 docker = "Native arm64 Docker differential verification for the multi-worker fork-COW fixture across 16, 64, and 256 pages; automated same-source binding remains open."
 embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts, outside the contract evaluator, the absolute exit ceiling `exits <= forks*pages/4+64` and the incremental exit slope < 0.125 exits per added COW page (fractional, so not expressible as an integer affine budget). Intent: assert a zero carrier-scoped host COW resolution delta (with the ledger having admitted at least one MM per fork), guest fault entries covering the pages written, balanced frame accounting, and incremental exit slope < 0.125 exits per added page across scales."
 production = "Implement in-guest frame allocation, copy, and leaf upgrade in HardwareCowResolver, reducing the host cow_engine to background backing services."
