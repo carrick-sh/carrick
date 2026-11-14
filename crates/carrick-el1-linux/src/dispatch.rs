@@ -2429,7 +2429,9 @@ pub(super) fn arm_signal_user_return_entry<X: super::aarch64_process::ForkStockC
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[allow(clippy::too_many_arguments)]
-fn arm_signal_user_return_admitted_entry<X: super::aarch64_process::ForkStockCrossing>(
+pub(super) fn arm_signal_user_return_admitted_entry<
+    X: super::aarch64_process::ForkStockCrossing,
+>(
     source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
     task: &'static CurrentTask,
     native: &carrick_sched_core::ThreadCtx,
