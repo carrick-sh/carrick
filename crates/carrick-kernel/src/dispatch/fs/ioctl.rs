@@ -230,7 +230,10 @@ fn procmap_query(
         return DispatchOutcome::errno(LINUX_EINVAL);
     }
 
-    let proc_context = this.synthetic_proc_context(context);
+    let proc_context = match this.synthetic_proc_context(context) {
+        Ok(proc_context) => proc_context,
+        Err(busy) => return busy.into_owner_wait(),
+    };
     let executable_path = proc_context.executable_path;
     let mut maps = proc_context.address_space_regions.unwrap_or_default();
     let brk_current = proc_context.brk_current;

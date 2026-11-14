@@ -23,6 +23,29 @@ pub struct ReservationBusy {
     pub holder: RootHolder,
 }
 
+/// A read-only observation of this MM's memory owner found the root held by
+/// another execution of the same MM: an EL1 thread, which an ordinary
+/// (non-mutation) syscall does not pause. That is "not now", never a broken
+/// invariant: the syscall commits nothing, parks on the holder's release and
+/// reruns ([`Self::into_owner_wait`]; the dispatch boundary lowers
+/// [`crate::dispatch::DispatchError::ObservationBusy`] the same way).
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct ObservationBusy(pub ReservationBusy);
+impl ObservationBusy {
+    pub(in crate::dispatch) fn into_owner_wait(self) -> crate::dispatch::DispatchOutcome {
+        crate::dispatch::DispatchOutcome::OwnerMemoryWait {
+            wait: self.0.wait,
+            committed: 0,
+        }
+    }
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
