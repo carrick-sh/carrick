@@ -1052,8 +1052,8 @@ impl OperandSpec {
 /// copy-on-write destination would answer EFAULT where Linux succeeds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputOperand {
-    /// No output declared. The ABI census rejects this for output-writing
-    /// crossings, including calls whose existing venue stages their output.
+    /// No output declared. The ABI census counts missing output-writing
+    /// arguments, including calls whose existing venue stages their output.
     None,
     /// A fixed-size record at argument `ptr`.
     Record { ptr: u8, bytes: u64 },
@@ -1246,7 +1246,8 @@ impl OperandSpec {
 
     /// The first direct output range. Preparation must use `output_ranges`
     /// to cover every operand of a multi-output crossing.
-    pub fn output_range(self, args: &[u64; 6]) -> Option<(u64, u64)> {
+    #[cfg(test)]
+    pub(crate) fn output_range(self, args: &[u64; 6]) -> Option<(u64, u64)> {
         self.output_ranges(args).next()
     }
 }

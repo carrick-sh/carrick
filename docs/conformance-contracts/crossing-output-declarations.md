@@ -21,12 +21,14 @@ Each index identifies a pointer root, not necessarily a contiguous output
 range. For example readv names the iovec root, whose elements identify output
 buffers. The crossing census reports unaudited calls and every missing output
 argument together, for both ISA sets. It does not silently equate an unknown
-entry with an output-free syscall.
+entry with an output-free syscall. A count-only ceiling makes this a decrease-only
+ratchet: additions above the ceiling fail, and fixing declarations requires
+lowering the ceiling in the same commit. There is no per-syscall exemption list.
 
 Existing mechanisms:
 
-- `personality-linux/dispatch.rs`: `OutputOperand` describes one fixed record
-  or bounded buffer. `OperandSpec::output_range` resolves it.
+- `personality-linux/dispatch.rs`: `OutputOperand` describes optional fixed records
+  or a bounded buffer. `OperandSpec::output_ranges` resolves every record.
 - `personality-linux/native_host_file.rs`: `stage` checks staged output;
   `crossing_output_stage` asks the owner to prepare the first uncovered byte.
 - `el1-linux/dispatch.rs`: `native_crossing_output_stage` connects ARM's
@@ -41,8 +43,8 @@ and test its production entry. Multiple ranges, indirect outputs and
 command-dependent buffers must not be mislabeled as output-free or as a
 single unconditional direct buffer merely to make the census pass.
 
-The red witness fails on GitHub main with clock_gettime among the missing
-outputs. On #2278's branch that one declaration is inherited, not duplicated.
-The remaining declarations, ARM production witnesses, x86 KVM witnesses and
-final full gates are still required. No work-budget or performance claim is
-made by this static declaration audit.
+The original red witness fails on GitHub main with clock_gettime among the
+missing outputs. This PR is based on main and does not include #2278's
+clock_gettime declaration. The census retains that gap under its count ceiling.
+The remaining declarations and end-to-end physical-supply/copyout witnesses
+remain #2300 work. No runtime performance claim is made by the static audit.

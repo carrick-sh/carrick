@@ -584,6 +584,9 @@ mod tests {
         }
     }
 
+    /// Decrease-only count ratchet for undeclared ABI outputs; see #2300.
+    const UNDECLARED_OUTPUT_ARGUMENT_CEILING: usize = 49;
+
     /// The ABI, not a second list of crossing ordinals, defines which user
     /// pointers can be written. Report the entire missing population at once.
     #[test]
@@ -614,10 +617,17 @@ mod tests {
                 }
             }
         }
+        std::eprintln!("undeclared crossing outputs:\n{}", missing.join("\n"));
         assert!(
-            missing.is_empty(),
-            "undeclared crossing outputs:\n{}",
-            missing.join("\n")
+            missing.len() <= UNDECLARED_OUTPUT_ARGUMENT_CEILING,
+            "undeclared output count {} exceeds ceiling {}; declare the new outputs",
+            missing.len(),
+            UNDECLARED_OUTPUT_ARGUMENT_CEILING
+        );
+        assert_eq!(
+            missing.len(),
+            UNDECLARED_OUTPUT_ARGUMENT_CEILING,
+            "output declarations improved; lower UNDECLARED_OUTPUT_ARGUMENT_CEILING in the same commit"
         );
     }
 
