@@ -34,13 +34,11 @@ fn node(script: &str) -> String {
 }
 
 #[test]
-#[ignore = "flaky: glibc futex abort in 30-50% of runs (#2288); run with --include-ignored for populations"]
 fn el1_node_version() {
     assert!(node("console.log(process.version)").starts_with("v22."));
 }
 
 #[test]
-#[ignore = "red on main: spawnSync /bin/sh ENOSYS then uv__io_poll (#1671, ARM Node lane next stop); run with --include-ignored"]
 fn el1_node_child() {
     assert_eq!(
         node("console.log(require('child_process').execSync('echo child-ok').toString().trim())"),
