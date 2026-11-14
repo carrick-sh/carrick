@@ -100,6 +100,10 @@ pub(crate) struct ZoneEpoll {
     _primer: Arc<dyn Fn() + Send + Sync>,
     /// Whose turn reports first on a mixed set (true: the host half).
     host_turn: std::sync::atomic::AtomicBool,
+    /// Whether the file table publishes this description as the record's
+    /// own OFD (EL1 then serves its fds), or as a host-backed hold (an
+    /// adopted ring epoll, whose fds the host now owns: [`Self::adopt`]).
+    published: bool,
 }
 
 impl std::fmt::Debug for ZoneEpoll {
@@ -141,6 +145,34 @@ impl ZoneEpoll {
                 return Err(ZoneEpollRefusal::Exhausted);
             }
         };
+        Ok(Self::bind(
+            owner, object, lifetime, true, kqueue, wait_queue,
+        ))
+    }
+
+    /// The host half of a ring-created epoll record (#1671). The ring built
+    /// the record and its OFD in a run root's table, so the host had no
+    /// description for a host-backed item (a socket) to live in. `lifetime`
+    /// is a hold on the ring's own OFD: the record lives while the host
+    /// description does, whoever closes the ring's last descriptor.
+    pub(crate) fn adopt(
+        owner: &Arc<HostIpc>,
+        object: IpcObjectHandle,
+        lifetime: HostDescription,
+        kqueue: Weak<crate::dispatch::EpollKqueue>,
+        wait_queue: Weak<crate::kernel::WaitQueue>,
+    ) -> Arc<Self> {
+        Self::bind(owner, object, lifetime, false, kqueue, wait_queue)
+    }
+
+    fn bind(
+        owner: &Arc<HostIpc>,
+        object: IpcObjectHandle,
+        lifetime: HostDescription,
+        published: bool,
+        kqueue: Weak<crate::dispatch::EpollKqueue>,
+        wait_queue: Weak<crate::kernel::WaitQueue>,
+    ) -> Arc<Self> {
         let publisher: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if let Some(kqueue) = kqueue.upgrade() {
                 kqueue.wake_parked();
@@ -151,19 +183,24 @@ impl ZoneEpoll {
         });
         let primer: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
         owner.register_host_waker(object, &publisher, &primer);
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             owner: Arc::clone(owner),
             object,
             lifetime: Mutex::new(Some(lifetime)),
             _publisher: publisher,
             _primer: primer,
             host_turn: std::sync::atomic::AtomicBool::new(false),
-        }))
+            published,
+        })
     }
 
     /// The epoll description's shared flags (its OFD), for file-table
     /// publication: EL1 resolves an epoll fd to this record through it.
+    /// `None` for an adopted record: its fds publish as host-backed holds.
     pub(crate) fn status_flags(&self) -> Option<Arc<HostDescriptionFlags>> {
+        if !self.published {
+            return None;
+        }
         self.lifetime.lock().as_ref().map(HostDescription::flags)
     }
 
