@@ -19,6 +19,7 @@ use carrick_fatal::carrick_fatal;
 
 mod ipc;
 pub use ipc::IpcTableMapBinding;
+pub(crate) use ipc::RingDescription;
 pub use ipc::{FileTableStdioGuard, ImplicitHostStdio};
 pub mod credentials;
 mod file_cursor;
