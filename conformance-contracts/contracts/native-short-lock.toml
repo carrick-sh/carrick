@@ -1,3 +1,7 @@
+# #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
+# owner-service continuation. The host fixture gains a status-copy refusal
+# and a real fork/exit/wait witness under kernel.memory.owner-wait.
+# This family's contract expectations, bindings and budgets are unchanged.
 # #2070: shared signal-frame setup defers PortalOwnerWait/Busy contention via
 # PendingSignalDelivery under kernel.el1.signal-delivery-owner; short-lock
 # acquisition, IRQ custody, guest redispatch policy and work budgets are unchanged.
