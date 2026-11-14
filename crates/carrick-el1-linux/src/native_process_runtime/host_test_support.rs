@@ -30,6 +30,14 @@ std::thread_local! {
     };
 }
 
+// One-shot wait-status copy refusals, consumed before `child_copy_error`.
+#[cfg(test)]
+std::thread_local! {
+    static STATUS_COPY_ERRORS: std::cell::RefCell<std::collections::VecDeque<NativeProcessError>> = const {
+        std::cell::RefCell::new(std::collections::VecDeque::new())
+    };
+}
+
 #[cfg(test)]
 type ServicePublishedHook = Option<(usize, Box<dyn FnOnce()>)>;
 
@@ -428,6 +436,10 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         address: UserVa,
         status: LinuxWaitStatus,
     ) -> Result<(), NativeProcessError> {
+        #[cfg(test)]
+        if let Some(error) = STATUS_COPY_ERRORS.with(|errors| errors.borrow_mut().pop_front()) {
+            return Err(error);
+        }
         if let Some(error) = self.child_copy_error {
             return Err(error);
         }
@@ -12430,4 +12442,174 @@ fn wait4_rusage_owner_wait_retains_reaped_answer_until_release() {
         copies[0].1.len(),
         core::mem::size_of::<carrick_abi::LinuxRusage>()
     );
+}
+
+/// #2321: the MM owner releases after the status copy sampled its gate and
+/// before the waiter enrolls, so the owner park reports `Changed`. The
+/// unconsumed zombie must be rescanned in the same wait; returning the
+/// synchronous redispatch from the owned wait continuation is invalid, and
+/// from a direct wait4 it leaves the syscall unanswered and the zombie
+/// unreaped. `direct` re-executes wait4 on a zombie already exited; otherwise
+/// the blocking wait4 continuation resumes through the production checkpoint.
+#[cfg(test)]
+fn wait4_status_owner_released_before_enrolment(direct: bool) {
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let (_, address, saved) = capacity.select().unwrap();
+    let child_pid = fixture.task.visible_pid().unwrap();
+    let mut service = fixture.service();
+    {
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+    }
+    let (_, address, mut saved) = capacity.select().unwrap();
+    let handle = service.service_mm_handle(&address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.defer_handbacks();
+            },
+        )
+        .unwrap();
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    let gate_wait = || {
+        let observed = space
+            .notifications(handle.incarnation())
+            .unwrap()
+            .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+        access.raise(space.index());
+        // SAFETY: the receipt names this exact MM and the revision its gate
+        // had when the refusal sampled it.
+        unsafe {
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                handle,
+                carrick_core_abi::PortalWaitCause::Gate,
+                observed.revision(),
+            )
+        }
+    };
+    if direct {
+        // The blocking wait parks on a held gate, then its release retries
+        // the exact wait4 syscall against the still-unreaped zombie.
+        let wait = gate_wait();
+        STATUS_COPY_ERRORS.with(|errors| {
+            errors
+                .borrow_mut()
+                .push_back(NativeProcessError::OwnerWait(wait))
+        });
+        {
+            let mut parent = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    source,
+                    fixture.task,
+                    address,
+                    &saved,
+                    &mut service,
+                )
+                .unwrap();
+            assert!(matches!(
+                parent.resume_checkpoint(|_| Ok(None)),
+                Ok(NativeResume::Left(None))
+            ));
+        }
+        assert!(service.copies.is_empty());
+        access.lower(space.index());
+        assert_eq!(
+            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            fixture.record.id
+        );
+        saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+            .unwrap()
+            .words;
+    }
+    // The holder releases before this waiter can enroll on its gate.
+    let wait = gate_wait();
+    access.lower(space.index());
+    STATUS_COPY_ERRORS.with(|errors| {
+        errors
+            .borrow_mut()
+            .push_back(NativeProcessError::OwnerWait(wait))
+    });
+    let mut parent = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    if direct {
+        assert!(matches!(
+            parent.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::RetrySyscall
+        ));
+        let outcome = parent.wait4(
+            ProcessWaitPid::from_syscall_argument(u64::MAX),
+            UserVa::new(0x1000),
+            LinuxWaitOptions::empty(),
+            UserVa::new(0),
+        );
+        assert!(
+            matches!(outcome, LifecycleOutcome::Returned { result, .. } if result.raw() == i64::from(child_pid)),
+            "a released owner must rescan the zombie, never redispatch the syscall"
+        );
+    } else {
+        let resumed = parent.resume_checkpoint(|_| Ok(None));
+        assert!(
+            matches!(resumed, Ok(NativeResume::Returned(result)) if result.raw() == i64::from(child_pid)),
+            "a released owner must rescan the zombie, never resume as invalid: {}",
+            match resumed {
+                Ok(NativeResume::Invalid) => "Invalid",
+                Ok(_) => "another resume",
+                Err(_) => "run failure",
+            }
+        );
+    }
+    assert!(STATUS_COPY_ERRORS.with(|errors| errors.borrow().is_empty()));
+    assert!(matches!(parent.wait4(
+        ProcessWaitPid::from_syscall_argument(u64::MAX), UserVa::new(0x1000),
+        LinuxWaitOptions::empty(), UserVa::new(0),
+    ), LifecycleOutcome::Returned { result, .. } if result.raw() == -10));
+    drop(parent);
+    assert_eq!(service.copies, vec![LinuxWaitStatus::exited(7)]);
+}
+
+#[cfg(test)]
+#[test]
+fn wait4_blocking_status_owner_released_before_enrolment_rescans() {
+    wait4_status_owner_released_before_enrolment(false);
+}
+
+#[cfg(test)]
+#[test]
+fn wait4_exited_zombie_status_owner_released_before_enrolment_rescans() {
+    wait4_status_owner_released_before_enrolment(true);
 }
