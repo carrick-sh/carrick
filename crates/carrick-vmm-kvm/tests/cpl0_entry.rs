@@ -1126,6 +1126,319 @@ fn production_anonymous_root_busy_once_parks_and_completes() {
     );
 }
 
+/// #2141: Go's heap shape (a `PROT_NONE` reserve, a `MAP_FIXED` read/write
+/// commit over it, then the first store) meets the MM editor held by another
+/// owner, as a sibling Go thread's fault or mmap on the other vCPU holds it.
+/// The user #PF parks on the editor's release once and reruns the store; it
+/// is never a carrier fault refusal (`kernel fault policy refused: reason 9`).
+#[test]
+fn production_user_fault_editor_busy_once_parks_and_reruns() {
+    const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    // mmap(NULL, two pages, PROT_NONE, PRIVATE|ANONYMOUS, -1, 0), retain in r12.
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x2000),
+        (&[0x48, 0xba], 0),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12,rax
+    // mmap(r12, one page, RW, FIXED|PRIVATE|ANONYMOUS, -1, 0) == r12.
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi,r12
+    for (register, value) in [
+        (&[0x48, 0xbe][..], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x32),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x4c, 0x39, 0xe0, 0x0f, 0x85]); // cmp rax,r12; jne
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_EDITOR_BUSY_ONCE);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    // The first store faults into the held editor, then reads back.
+    code.extend_from_slice(&[0x41, 0xc6, 0x04, 0x24, 0x5a]); // mov byte [r12],0x5a
+    code.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x04, 0x24]); // movzx eax,byte [r12]
+    append_result_check(&mut code, &mut failures, 0x5a);
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 1);
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+
+    let outcome = try_run_instrumented_pool_fixture(&production_probe_elf(&code), 32)
+        .unwrap_or_else(|failure| panic!("a held editor refused the user fault: {failure}"));
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "the store must rerun after one editor park: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// #2263 review P0: a syscall's staged user copy meets the MM editor held by
+/// another owner. A write to a guest-opened host file (not a delegated
+/// stdio stream) gathers from a fresh, never-touched page, so staging asks
+/// the owner fault path to supply it while the editor is held. Contention
+/// is "not now": the call parks on the editor's release once and reruns
+/// whole, writing all 16 bytes. It is never EFAULT or a short write. A
+/// wrong result exits with the write's own return value.
+#[test]
+fn production_staged_copy_editor_busy_once_parks_and_reruns() {
+    const INJECT_EDITOR_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe11;
+    const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+
+    let mut code = Vec::new();
+    let mut failures = Vec::new();
+    // mmap(NULL, two pages, PROT_NONE, PRIVATE|ANONYMOUS, -1, 0), retain in r12.
+    for (register, value) in [
+        (&[0x48, 0xbf][..], 0),
+        (&[0x48, 0xbe], 0x2000),
+        (&[0x48, 0xba], 0),
+        (&[0x49, 0xba], 0x22),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12,rax
+    // mmap(r12, one page, RW, FIXED|PRIVATE|ANONYMOUS, -1, 0) == r12.
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi,r12
+    for (register, value) in [
+        (&[0x48, 0xbe][..], 0x1000),
+        (&[0x48, 0xba], 3),
+        (&[0x49, 0xba], 0x32),
+        (&[0x49, 0xb8], u64::MAX),
+        (&[0x49, 0xb9], 0),
+        (&[0x48, 0xb8], 9),
+    ] {
+        append_mov(&mut code, register, value);
+    }
+    code.extend_from_slice(&[0x0f, 0x05, 0x4c, 0x39, 0xe0, 0x0f, 0x85]); // cmp rax,r12; jne
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    // openat(AT_FDCWD, "/dev/null", O_WRONLY) into r13.
+    append_mov(&mut code, &[0x48, 0xbf], (-100_i64) as u64);
+    code.extend_from_slice(&[0x48, 0x8d, 0x35]); // lea rsi,[rip+path]
+    let path_reference = code.len();
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    append_mov(&mut code, &[0x48, 0xba], 1);
+    append_mov(&mut code, &[0x48, 0xb8], 257);
+    code.extend_from_slice(&[0x0f, 0x05, 0x48, 0x85, 0xc0, 0x0f, 0x88]);
+    failures.push(code.len());
+    code.extend_from_slice(&0_i32.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x89, 0xc5]); // mov r13,rax
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_EDITOR_BUSY_ONCE);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 0);
+    // write(r13, r12, 16): the gather's first read meets the held editor.
+    code.extend_from_slice(&[0x4c, 0x89, 0xef]); // mov rdi,r13
+    code.extend_from_slice(&[0x4c, 0x89, 0xe6]); // mov rsi,r12
+    append_mov(&mut code, &[0x48, 0xba], 16);
+    append_mov(&mut code, &[0x48, 0xb8], 1);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    // cmp rax,16; je over the exit(rax) below.
+    let mut wrong = vec![0x48, 0x89, 0xc7]; // mov rdi,rax
+    append_mov(&mut wrong, &[0x48, 0xb8], 231);
+    wrong.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    code.extend_from_slice(&[0x48, 0x83, 0xf8, 0x10, 0x74, wrong.len() as u8]);
+    code.extend_from_slice(&wrong);
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    append_result_check(&mut code, &mut failures, 1);
+    append_mov(&mut code, &[0x48, 0xbf], 7);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 9);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in failures {
+        let delta = i32::try_from(failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+    let path = code.len();
+    code.extend_from_slice(b"/dev/null\0");
+    let delta = i32::try_from(path - (path_reference + 4)).unwrap();
+    code[path_reference..path_reference + 4].copy_from_slice(&delta.to_le_bytes());
+
+    let outcome = try_run_instrumented_pool_fixture(&production_probe_elf(&code), 32)
+        .unwrap_or_else(|failure| panic!("a held editor refused the staged copy: {failure}"));
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "the write must rerun whole after one editor park (EFAULT exits 242, a \
+         short write its count): {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// The root and every member it forks or clones may run only on CPU 0.
+const ROOT_AFFINITY_CPU0: u64 = 1;
+
+/// #2141 review: an owner fault that meets MM contention after its physical
+/// supply crossing returned, before the guest applied the supplied grant.
+/// `native_post_supply_busy.S` documents each variant; every one exits 7.
+/// Bounded in a child test process: a lost wake must fail, never hang CI.
+fn post_supply_busy_witness(test: &str, flag: &str, affinity: u64) {
+    const CHILD: &str = "CARRICK_POST_SUPPLY_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "60"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
+            .output()
+            .expect("bounded post-supply witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture("native_post_supply_busy.S", &[flag]);
+    let outcome =
+        kvm_pool_fixture::try_run_instrumented_pool_fixture_with_root_affinity(&elf, 128, affinity)
+            .map_err(|failure| failure.to_string())
+            .expect("a post-supply Busy was a carrier fault");
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "exit 92 is a clobbered RAX canary, 93 a Busy that missed its supply, \
+         100 + n a child's exit n: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// #2332: the root's post-supply Busy is released by the other vCPU's
+/// scheduler while that vCPU's task is the fork child, another MM. The
+/// release must wake the root on its own MM's Editor queue, never publish
+/// on the releasing task's MM (a lost wake: both vCPUs halt).
+#[test]
+fn production_post_supply_release_from_another_mm_wakes_its_waiter() {
+    post_supply_busy_witness(
+        "production_post_supply_release_from_another_mm_wakes_its_waiter",
+        "-DPOST_SUPPLY_PEER_RELEASE",
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+    );
+}
+
+/// #2332: a held post-supply Busy belongs to the member that armed it. The
+/// root arms it and never faults; its fork child's own COW write on the
+/// other vCPU must not take it, or the child parks on a synthetic holder no
+/// one releases and both vCPUs halt (the witness's 1-in-15 hang).
+#[test]
+fn production_post_supply_busy_lands_only_on_its_arming_member() {
+    post_supply_busy_witness(
+        "production_post_supply_busy_lands_only_on_its_arming_member",
+        "-DPOST_SUPPLY_FOREIGN_FAULT",
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+    );
+}
+
+/// P0 1: the root's COW write is Busy after its COW supply, on two vCPUs
+/// with a second live member (its fork child, which takes its own COW
+/// grant). The parked write reruns, wherever it is rescheduled, and keeps
+/// RAX and its byte.
+#[test]
+fn production_cow_busy_after_supply_parks_and_reruns() {
+    post_supply_busy_witness(
+        "production_cow_busy_after_supply_parks_and_reruns",
+        "-DPOST_SUPPLY_COW",
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+    );
+}
+
+/// P0 1: as above with every member on CPU 0, so the fork child runs on the
+/// parked root's CPU and needs its own COW grant there while the root's
+/// supplied grant is unapplied. A grant held by the CPU, not by its fault,
+/// refuses the child (`owner grant stale execution/root`).
+#[test]
+fn production_cow_parked_after_supply_frees_its_cpu_for_another_grant() {
+    post_supply_busy_witness(
+        "production_cow_parked_after_supply_frees_its_cpu_for_another_grant",
+        "-DPOST_SUPPLY_COW",
+        ROOT_AFFINITY_CPU0,
+    );
+}
+
+/// P0 1: a fork child's worker thread parks after its COW supply and the
+/// child's main thread calls `exit_group` with that worker parked. The root
+/// then needs a COW grant on the same CPU. Ignored: on x86 CPL0 a fork
+/// child's `exit_group` with any second live member (a runnable yielder, or
+/// one blocked in `futex`, on main too) never completes cleanly (#418 class).
+#[test]
+#[ignore = "x86 CPL0 exit_group with a second live member fails on main (followup-4)"]
+fn production_cow_parked_after_supply_survives_exit_group() {
+    post_supply_busy_witness(
+        "production_cow_parked_after_supply_survives_exit_group",
+        "-DPOST_SUPPLY_EXIT_GROUP",
+        ROOT_AFFINITY_CPU0,
+    );
+}
+
+/// P0 1: as above, but the main thread raw-exits (a non-last exit) while the
+/// worker is parked; the worker reruns its store and ends the child.
+#[test]
+fn production_cow_parked_after_supply_survives_a_non_last_raw_exit() {
+    post_supply_busy_witness(
+        "production_cow_parked_after_supply_survives_a_non_last_raw_exit",
+        "-DPOST_SUPPLY_RAW_EXIT",
+        ROOT_AFFINITY_CPU0,
+    );
+}
+
+/// P0 2: the root's first touch of fresh anonymous memory is Busy after its
+/// Prepare supply, on two vCPUs with a second live member touching its own
+/// copy. The access waits and reruns; it is never carrier reason 9.
+#[test]
+fn production_prepare_busy_after_supply_parks_and_reruns() {
+    post_supply_busy_witness(
+        "production_prepare_busy_after_supply_parks_and_reruns",
+        "-DPOST_SUPPLY_PREPARE",
+        kvm_pool_fixture::ROOT_AFFINITY_ANY,
+    );
+}
+
 /// A real munmap reaches the shared editor admission, parks on one injected
 /// owner, and replays without falling out to the host or refusal accounting.
 #[test]
@@ -4026,4 +4339,183 @@ fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
         outcome.run
     );
     assert_eq!(outcome.run.terminating_signal, None);
+}
+
+/// Exercise the real exclusion, then release its editor only after a real
+/// Editor wait is enrolled. Reuse #2250's editor hold/release fixture.
+fn owner_crossing_busy_witness(
+    crossing: carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    let elf = kvm_pool_fixture::assemble_fixture("native_concurrent_cow_faults.S", &[]);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = kvm_pool_fixture::try_run_pool_fixture_with(&elf, 128, |carrier| {
+            held_tx
+                .send(carrier.fixture_hold_fault_editor(crossing))
+                .unwrap();
+        })
+        .map_err(|error| error.to_string());
+        tx.send(result).unwrap();
+    });
+    let bound = std::time::Duration::from_secs(20);
+    let hold = held_rx
+        .recv_timeout(bound)
+        .expect("fault exclusion hold armed");
+    assert!(
+        hold.wait_claimed(bound),
+        "the selected exclusion must be reached"
+    );
+    assert_eq!(hold.held().len(), 1, "one exact MM editor is held");
+    let deadline = std::time::Instant::now() + bound;
+    let mut early_result = None;
+    let enrolled = loop {
+        if hold.enrolled().expect("Editor queue census") > 0 {
+            break true;
+        }
+        if let Ok(result) = rx.try_recv() {
+            early_result = Some(result);
+            break false;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+    let released = hold.release();
+    let result = early_result.unwrap_or_else(|| rx.recv_timeout(bound).expect("fault resumed"));
+    assert!(
+        enrolled,
+        "Busy must enroll before release: {:?}",
+        result.as_ref().err()
+    );
+    assert_eq!(released.expect("publish exact Editor release"), 1);
+    let outcome = result.expect("Busy is not a fatal carrier fault");
+    assert_eq!(outcome.run.exit_code, 7, "{:?}", outcome.run);
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+    outcome
+}
+
+/// The selected fault's COW supply crossing meets the held editor: the
+/// carrier answers EditorBusy, the lane withdraws its selection, parks on
+/// the Editor release and reruns the write, which selects afresh.
+#[test]
+fn production_cow_supply_exclusion_busy_once_then_success() {
+    owner_crossing_busy_witness(
+        carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::CowSupply,
+    );
+}
+
+/// The applied COW's settlement crossing meets the held editor: the write
+/// is served, its completion stays the MM's and the MM's next exclusion
+/// publishes it. The lane waits for nothing; the Editor wait the witness
+/// observes is a sibling's later fault on the held MM.
+#[test]
+fn production_cow_settlement_exclusion_busy_once_then_success() {
+    let outcome = owner_crossing_busy_witness(
+        carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::CowSettlement,
+    );
+    let counts = outcome.physical.return_settlement_counters().unwrap();
+    // The held settlement defers; a sibling's later settlement may meet
+    // that sibling-held editor too.
+    assert!(counts.deferred_cow_completions >= 1, "{counts:?}");
+}
+
+/// The selected first touch's Prepare crossing meets the held editor before
+/// any backing is staged: EditorBusy, then the same park and rerun.
+#[test]
+fn production_prepare_planning_exclusion_busy_once_then_success() {
+    owner_crossing_busy_witness(
+        carrick_x86_cpl0_host::cpl0_boot::FaultExclusionCrossing::PreparePlanning,
+    );
+}
+
+/// Run an instrumented fixture in a bounded child test process, so a lost
+/// wake fails rather than hangs, and require exit 7.
+fn bounded_instrumented_fixture_witness(test: &str, fixture: &str, legend: &str) {
+    const CHILD: &str = "CARRICK_BOUNDED_FIXTURE_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "60"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
+            .output()
+            .expect("bounded fixture witness");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture(fixture, &[]);
+    let outcome = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 128)
+        .map_err(|failure| failure.to_string())
+        .expect("MM contention was a carrier fault");
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "{legend}: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+}
+
+/// A signal arrives for a thread parked on its contended user fault
+/// (FaultRetry). After the release the fault resumes with the signal
+/// pending: the handler runs once before the store reruns, and the rerun
+/// completes with its RAX canary and byte intact. No wake value becomes a
+/// result.
+#[test]
+fn production_signal_for_a_parked_user_fault_runs_before_its_rerun() {
+    bounded_instrumented_fixture_witness(
+        "production_signal_for_a_parked_user_fault_runs_before_its_rerun",
+        "native_parked_fault_signal.S",
+        "91 a failed check, 92 a clobbered RAX canary, 93 a missing park, \
+         94 a handler that had not run exactly once before the store",
+    );
+}
+
+/// #2226 cause B: a second thread's first stack and TLS touch, on the vCPU
+/// its spinning main thread leaves idle, meets a held MM editor. The touch
+/// parks once and reruns; it is never `kernel fault policy refused`.
+#[test]
+fn production_idle_peer_thread_first_touch_parks_on_a_held_editor() {
+    bounded_instrumented_fixture_witness(
+        "production_idle_peer_thread_first_touch_parks_on_a_held_editor",
+        "native_idle_peer_first_touch.S",
+        "91 a failed check, 93 a touch that never parked, 95 a worker that \
+         never ran beside its spinning main thread",
+    );
+}
+
+/// #2295: another vCPU's host exclusion raises the gate of the address
+/// space a switched-in record is about to install. The install is refused
+/// once, "not now": the record keeps its owned futex result, and runs once
+/// the holder lowers the gate. It is never a carrier fault at
+/// `native_execution::schedule`.
+#[test]
+fn production_install_refused_by_a_raised_gate_busy_once_then_success() {
+    bounded_instrumented_fixture_witness(
+        "production_install_refused_by_a_raised_gate_busy_once_then_success",
+        "native_install_gate_once.S",
+        "91 a failed check, 92 a lost or wrong futex result, 93 an install \
+         not refused exactly once",
+    );
+}
+
+#[test]
+fn production_two_threads_of_forked_mm_fault_cow_concurrently() {
+    let elf = kvm_pool_fixture::assemble_fixture("native_concurrent_cow_faults.S", &[]);
+    let outcome = kvm_pool_fixture::try_run_pool_fixture_with(&elf, 128, |_| {})
+        .expect("concurrent faults retain their MM operations");
+    assert_eq!(outcome.run.exit_code, 7, "{:?}", outcome.run);
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }

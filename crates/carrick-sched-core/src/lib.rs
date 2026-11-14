@@ -2039,7 +2039,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
                         && (cancelled
                             || (rec.is_cancelled()
                                 && rec.object_wait_census().is_some_and(|census| {
-                                    census.has_anonymous_edit_operation()
+                                    census.has_space_replay_operation()
                                 }))) =>
                 {
                     rec.retire_terminal_metadata_operation();
@@ -4313,6 +4313,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.counters.el1_switches.fetch_add(1, Ordering::Relaxed);
         let result = match rec.handback() {
             Some(Handback::Resumed) => None,
+            // A parked user fault reruns its instruction: no wake value is
+            // its result, whoever owns the record.
+            Some(_)
+                if rec.object_operation_kind() == Some(object_wait::OperationKind::FaultRetry) =>
+            {
+                None
+            }
             Some(Handback::Signal | Handback::Timeout)
                 if rec.is_native_owned()
                     && matches!(
@@ -5284,6 +5291,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             self.counters.el1_switches.fetch_add(1, Ordering::Relaxed);
             let result = match rec.handback() {
                 Some(Handback::Resumed) => None,
+                // A parked user fault reruns its instruction: no wake value is
+                // its result, whoever owns the record.
+                Some(_)
+                    if rec.object_operation_kind()
+                        == Some(object_wait::OperationKind::FaultRetry) =>
+                {
+                    None
+                }
                 Some(Handback::Signal | Handback::Timeout)
                     if rec.is_native_owned()
                         && matches!(

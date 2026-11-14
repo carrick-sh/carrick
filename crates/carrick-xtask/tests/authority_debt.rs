@@ -3553,6 +3553,30 @@ fn anonymous_space_wait_is_typed_without_hiding_untyped_contention() {
         census.contention_variants[0].owner,
         "carrick_el1::memory::DelegatedAnonymous"
     );
+    // #2141: a handle-less user fault's owner outcome carries the same typed
+    // cause into its park; an untyped payload stays counted debt.
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod fault { pub enum OwnerFaultSupplyOutcome { Contended(SpaceWaitCause) } }",
+    )
+    .unwrap();
+    assert!(
+        load_census(temp.path())
+            .unwrap()
+            .contention_variants
+            .is_empty()
+    );
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod fault { pub enum OwnerFaultSupplyOutcome { Contended(u64) } }",
+    )
+    .unwrap();
+    let census = load_census(temp.path()).unwrap();
+    assert_eq!(census.contention_variants.len(), 1);
+    assert_eq!(
+        census.contention_variants[0].owner,
+        "carrick_el1::fault::OwnerFaultSupplyOutcome"
+    );
 }
 
 #[test]

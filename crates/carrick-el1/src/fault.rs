@@ -1031,6 +1031,10 @@ impl<'a> GrantMailboxes<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnerFaultSupplyOutcome {
     Wait(carrick_el1_abi::PortalOwnerWait),
+    /// A lane without an owner-wait handle met this contention cause. It is
+    /// "not now": the lane enrols on the cause's release and reruns the
+    /// fault (#2141), never a refusal.
+    Contended(carrick_sched_core::spaces::notification::SpaceWaitCause),
     Unavailable,
     PolicyDeclined,
     Selected,
@@ -1095,20 +1099,27 @@ impl<'s> FaultSupply<'s> {
         let Some(owner) = self.owner() else {
             return probe().ok();
         };
+        // Without an owner-wait handle, name the cause to the lane, which
+        // owns the park on its own release source.
+        let mut handle_less = || {
+            probe()
+                .map_err(|cause| owner.outcome.set(OwnerFaultSupplyOutcome::Contended(cause)))
+                .ok()
+        };
         let Some(handle) = owner.handle.filter(|handle| {
             handle.mm().raw() == mm && owner.slots.carrier() == Some(handle.carrier())
         }) else {
-            return probe().ok();
+            return handle_less();
         };
         let Some(venue) = spaces.venue() else {
-            return probe().ok();
+            return handle_less();
         };
         let Some(source) = venue
             .zone
             .space_entry(NonZeroU64::new(mm)?)
             .and_then(|entry| entry.notifications(handle.incarnation()).ok())
         else {
-            return probe().ok();
+            return handle_less();
         };
         match source.contend(|| {
             probe().map_err(|cause| Attempt::<()>::Contended(ReleaseCause::Space(cause)))

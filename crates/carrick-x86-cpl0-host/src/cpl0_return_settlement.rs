@@ -65,6 +65,9 @@ pub struct ReturnSettlementCounters {
     pub holder_waits: u64,
     /// Drains that found only retiring holders (no live source to wait on).
     pub drain_retiring: u64,
+    /// COW settlement crossings that met a held EL1 editor and left their
+    /// completion to the MM's next exclusion (#2141).
+    pub deferred_cow_completions: u64,
 }
 
 /// One exclusion of an MM's EL1 editor that has settled the MM's owed
@@ -287,19 +290,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         let reply = self.settle_excluded(release, pause.proof())?;
         Ok(Ok((pause, reply)))
-    }
-
-    /// [`Self::settled_pause`] for callers that treat a refused exclusion
-    /// as a carrier fault.
-    pub(super) fn settled_pause_or_fail<'a>(
-        &mut self,
-        release: SpaceReleaseVenue<'a, carrick_sched_core::ParkedContextWords>,
-        mm: u64,
-    ) -> Result<CowPause<'a>, TrapError> {
-        let mm = carrick_el1_abi::ReservationMm::new(mm).ok_or_else(|| fail("owner COW MM"))?;
-        self.settled_pause(release, mm)?
-            .map(|(pause, _)| pause)
-            .map_err(|reason| fail(format!("owner COW editor exclusion refused: {reason:?}")))
     }
 
     /// Every exclusion's settlement: COW completions, then owed returns.

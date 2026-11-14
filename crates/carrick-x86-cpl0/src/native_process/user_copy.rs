@@ -30,11 +30,16 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         }
     }
     fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error> {
-        if self.pool.has_completions_for(request.handle.mm().raw()) {
-            carrick_x86_carrier::entry::cross_owner_grant(
+        // A held editor defers these MM-owned completions to the MM's next
+        // exclusion (#2141); the copy needs nothing more from them.
+        if self.pool.has_completions_for(request.handle.mm().raw())
+            && carrick_x86_carrier::entry::cross_owner_grant(
                 carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
                 self.address,
-            );
+            )
+            .is_none()
+        {
+            return Err(NativeProcessError::Stale);
         }
         Ok(())
     }
@@ -42,19 +47,28 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<(), Self::Error> {
-        if !self
+        use carrick_el1::isa::x86::context::native::OwnerGrantReply;
+        let slot = self
             .slots
             .grant(usize::from(self.slot.raw()))
-            .ok_or(NativeProcessError::Stale)?
-            .publish_cow_fault_selection(window.operation.sequence.get(), window)
-        {
+            .ok_or(NativeProcessError::Stale)?;
+        if !slot.publish_cow_fault_selection(window.operation.sequence.get(), window) {
             return Err(NativeProcessError::Busy);
         }
-        carrick_x86_carrier::entry::cross_owner_grant(
+        match carrick_x86_carrier::entry::cross_owner_grant(
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
             self.address,
-        );
-        Ok(())
+        ) {
+            Some(OwnerGrantReply::Done) => Ok(()),
+            // A held MM editor: withdraw the exact demand, so this CPU keeps
+            // no selection, and report the contention as Busy (#2141).
+            Some(OwnerGrantReply::EditorBusy)
+                if slot.cancel_cow_fault_selection(window, window.operation.sequence.get()) =>
+            {
+                Err(NativeProcessError::Busy)
+            }
+            Some(OwnerGrantReply::EditorBusy) | None => Err(NativeProcessError::Stale),
+        }
     }
     fn supply_backing(
         &mut self,

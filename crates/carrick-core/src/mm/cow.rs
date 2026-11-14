@@ -210,7 +210,13 @@ where
         }
     };
 
-    let Some(grant) = pool.claim(mm_key) else {
+    // A grant supplied for this exact source, or an unreserved one: a grant
+    // reserved for another page or source is never consumed here.
+    let source = carrick_core_abi::CowClaimSource {
+        va: run.va,
+        old_ipa: run.old_ipa,
+    };
+    let Some(grant) = pool.claim_for(mm_key, source) else {
         pool.note_declined(CowDecline::PoolEmpty);
         return Ok(GuestCowOutcome::Declined(CowDecline::PoolEmpty));
     };

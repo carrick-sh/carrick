@@ -204,6 +204,22 @@ impl PortalGrantSlot {
             .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+    /// The selecting lane withdraws its own exact COW demand that the carrier
+    /// left unserved ("not now", #2141); no replacement loan was published.
+    pub fn cancel_cow_fault_selection(
+        &self,
+        window: PortalGrantWindow,
+        request_generation: u64,
+    ) -> bool {
+        if self.pending_cow_fault_selection(window.operation.mm.raw(), window.fault_page)
+            != Some((request_generation, window))
+        {
+            return false;
+        }
+        self.state
+            .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
     pub fn fault_selection(
         &self,
         mm_key: u64,
@@ -385,6 +401,32 @@ mod layout_manifest {
         assert!(slot.publish_fault_selection(4, window));
         assert!(slot.pending_cow_fault_selection(77, 0x4000).is_none());
         assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((4, window)));
+    }
+
+    /// #2141: a lane withdraws only its own exact unserved COW demand, once,
+    /// and the slot is then free for a fresh selection.
+    #[test]
+    fn cow_selection_is_withdrawn_exactly_once() {
+        let window =
+            PortalGrantWindow::decode([1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0])
+                .unwrap();
+        let slot = PortalGrantSlot::new();
+        assert!(slot.publish_cow_fault_selection(3, window));
+        assert!(
+            !slot.cancel_fault_selection(window, 3),
+            "not a backing demand"
+        );
+        assert!(
+            !slot.cancel_cow_fault_selection(window, 4),
+            "stale generation"
+        );
+        let mut stale = window;
+        stale.operation.incarnation = core::num::NonZeroU64::new(9).unwrap();
+        assert!(!slot.cancel_cow_fault_selection(stale, 3));
+        assert!(slot.cancel_cow_fault_selection(window, 3));
+        assert!(!slot.cancel_cow_fault_selection(window, 3));
+        assert!(slot.pending_cow_fault_selection(77, 0x4000).is_none());
+        assert!(slot.publish_cow_fault_selection(5, window));
     }
 
     #[test]

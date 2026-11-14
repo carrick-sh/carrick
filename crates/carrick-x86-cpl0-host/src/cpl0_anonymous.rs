@@ -17,6 +17,7 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 };
 use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
+use carrick_sched_core::spaces::notification::ExclusionRefusal;
 
 fn decode_fork_custody(bytes: &[u8]) -> Option<carrick_el1_abi::PortalForkCustody> {
     if bytes.len() != 32 {
@@ -244,6 +245,14 @@ impl PendingPrepare {
     }
 }
 
+/// A physical COW replacement supplied for one exact source (#2141). It is
+/// the MM's, not the supplying CPU's or lane's: its pool grant is reserved
+/// for that page and source frame, so whichever lane of the MM next breaks
+/// that COW consumes it, on any CPU, and settles it here. A lane parked
+/// between supply and application therefore leaves its CPU free for any
+/// other member's grant, and an exit while parked strands nothing a CPU
+/// owns. A grant whose source no longer exists is revoked under the MM's
+/// next supply exclusion.
 pub(super) struct PendingCow {
     window: PortalGrantWindow,
     inventory: InitialInventory,
@@ -252,18 +261,16 @@ pub(super) struct PendingCow {
     source: FrameGpa,
     source_identity: BackingIdentity,
     grant: carrick_el1_abi::CowGrant,
+    /// Its lane's settlement crossing met a held editor and returned
+    /// without one; publication records no receipt for that lane to take.
+    acknowledged: bool,
 }
 
-pub(super) enum PendingGrant {
-    Prepare(PendingPrepare),
-    Cow(PendingCow),
-}
-impl PendingGrant {
-    fn execution(&self) -> GrantExecution {
-        match self {
-            Self::Prepare(pending) => pending.execution,
-            Self::Cow(pending) => pending.execution,
-        }
+impl PendingCow {
+    /// Whether a lane of the same MM context, crossing for `address`,
+    /// settles this supply's completion.
+    fn settles_at(&self, execution: GrantExecution, address: u64) -> bool {
+        self.execution.context == execution.context && self.window.fault_page == address & !4095
     }
 }
 
@@ -1665,12 +1672,28 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         .map_err(|error| fail(error.to_string()))
     }
 
+    /// Fixture only: hold `mm`'s real editor word at the armed crossing,
+    /// just before that crossing's exclusion.
+    #[cfg(feature = "test-support")]
+    fn hold_fault_editor(
+        &self,
+        crossing: super::FaultExclusionCrossing,
+        mm: carrick_el1_abi::ReservationMm,
+    ) -> Result<(), TrapError> {
+        if let Some((armed, hold)) = &self.fixture_fault_hold
+            && *armed == crossing
+        {
+            hold.claim_once(retained_cow_zone(&self.ram)?, &[mm]);
+        }
+        Ok(())
+    }
+
     fn supply_cow_grant(
         &mut self,
         index: usize,
         execution: GrantExecution,
         window: PortalGrantWindow,
-    ) -> Result<(), TrapError> {
+    ) -> Result<OwnerGrantReply, TrapError> {
         let mm = execution.context.mm.raw();
         if !window.valid()
             || self.grant_portal()?.carrier() != Some(window.operation.carrier)
@@ -1681,25 +1704,32 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         {
             return Err(fail("owner COW selection identity"));
         }
-        let ram = Arc::clone(&self.ram);
-        let zone = retained_cow_zone(&ram)?;
-        let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
-        let delivery = |zone: &X86Cpl0Zone,
-                        waker: Waker,
-                        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-            '_,
-            carrick_sched_core::ParkedContextWords,
-        >| wake.deliver(zone, waker, owned);
-        let pause = self.settled_pause_or_fail(
-            SpaceReleaseVenue {
-                zone,
-                waker: Waker::Host,
-                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
-                    &delivery,
-                ),
-            },
-            mm.get(),
+        #[cfg(feature = "test-support")]
+        self.hold_fault_editor(
+            super::FaultExclusionCrossing::CowSupply,
+            window.operation.mm,
         )?;
+        match self.try_excluding_editor(window.operation.mm, |this, excluded| {
+            this.supply_excluded_cow(index, execution, window, excluded)
+        })? {
+            Ok(()) => Ok(OwnerGrantReply::Done),
+            // The selection stays this lane's to withdraw; nothing was staged.
+            Err(ExclusionRefusal::Busy) => Ok(OwnerGrantReply::EditorBusy),
+            Err(refusal) => Err(fail(format!(
+                "owner COW editor exclusion refused: {refusal:?}"
+            ))),
+        }
+    }
+
+    /// [`Self::supply_cow_grant`] under the MM's settled exclusion.
+    fn supply_excluded_cow(
+        &mut self,
+        index: usize,
+        execution: GrantExecution,
+        window: PortalGrantWindow,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        let mm = execution.context.mm.raw();
         let run = carrick_mmu_core::x86::descriptor_txn::classify_guest_cow_write(
             &self._vm.words(),
             execution.context.root,
@@ -1739,6 +1769,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         {
             return Err(fail("owner COW source custody mismatch"));
         }
+        self.revoke_stranded_cow(excluded, execution.context)?;
         let size = carrick_el1_abi::COW_GRANT_SIZE;
         let physical = self
             .anonymous_next_gpa
@@ -1781,7 +1812,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             )
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
-        let Some(grant) = self.cow_pool()?.publish(mm.get(), physical, backing) else {
+        let Some(grant) = self.cow_pool()?.publish_reserved(
+            mm.get(),
+            carrick_el1_abi::CowClaimSource {
+                va: window.fault_page,
+                old_ipa: run.old_ipa.raw(),
+            },
+            physical,
+            backing,
+        ) else {
             // SAFETY: no grant exposed this fresh physical extent to the guest.
             unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
                 .map_err(|error| fail(error.to_string()))?;
@@ -1791,7 +1830,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         // subsequent failure retain the extent through carrier teardown.
         inventory.expected = 1;
         inventory.guest_exposed = true;
-        self.anonymous_pending[index] = Some(PendingGrant::Cow(PendingCow {
+        self.cow_pending.push(PendingCow {
             window,
             inventory,
             handle,
@@ -1799,7 +1838,8 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             source: run.old_ipa,
             source_identity,
             grant,
-        }));
+            acknowledged: false,
+        });
         if !self
             .grant_portal()?
             .grant(index)
@@ -1808,8 +1848,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         {
             return Err(fail("owner COW demand changed during physical publication"));
         }
-        drop(pause);
-        wake.finish()
+        Ok(())
     }
 
     /// The faulting CPU's settlement crossing for its COW grant. Its
@@ -1819,89 +1858,83 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     /// its completion was published, by this exclusion or an earlier one.
     fn settle_cow_grant(
         &mut self,
-        index: usize,
         execution: GrantExecution,
+        address: u64,
     ) -> Result<(), TrapError> {
-        let ram = Arc::clone(&self.ram);
-        let zone = retained_cow_zone(&ram)?;
-        let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
-        let delivery = |zone: &X86Cpl0Zone,
-                        waker: Waker,
-                        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-            '_,
-            carrick_sched_core::ParkedContextWords,
-        >| wake.deliver(zone, waker, owned);
-        let pause = self.settled_pause_or_fail(
-            SpaceReleaseVenue {
-                zone,
-                waker: Waker::Host,
-                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
-                    &delivery,
-                ),
-            },
-            execution.context.mm.raw().get(),
-        )?;
-        drop(pause);
-        wake.finish()?;
-        self.take_published_cow(index, execution)
-    }
-
-    /// The faulting CPU's record that its COW completion was published:
-    /// consumed by its settlement crossing.
-    fn take_published_cow(
-        &mut self,
-        index: usize,
-        execution: GrantExecution,
-    ) -> Result<(), TrapError> {
-        if self.cow_published[index]
-            .take()
-            .is_some_and(|published| published.matches(execution))
-        {
-            Ok(())
-        } else {
-            Err(fail("owner COW exact completed receipt absent"))
+        let mm = carrick_el1_abi::ReservationMm::new(execution.context.mm.raw().get())
+            .ok_or_else(|| fail("owner COW settlement MM"))?;
+        #[cfg(feature = "test-support")]
+        self.hold_fault_editor(super::FaultExclusionCrossing::CowSettlement, mm)?;
+        match self.try_excluding_editor(mm, |_, _| Ok(()))? {
+            Ok(()) => self.take_published_cow(execution, address),
+            // A held EL1 editor (#2141). The access is served and the
+            // completion is the MM's: the MM's next exclusion publishes it,
+            // and every supply takes one before it needs pool space. The lane
+            // acknowledges it now, so it waits for nothing.
+            Err(ExclusionRefusal::Busy) => {
+                let pending = self
+                    .cow_pending
+                    .iter_mut()
+                    .find(|pending| pending.settles_at(execution, address))
+                    .ok_or_else(|| fail("owner COW deferred completion absent"))?;
+                pending.acknowledged = true;
+                self.return_settlement_counters.deferred_cow_completions += 1;
+                Ok(())
+            }
+            Err(refusal) => Err(fail(format!(
+                "owner COW settlement exclusion refused: {refusal:?}"
+            ))),
         }
     }
 
-    /// The CPL0 venue's COW step of every exclusion (#1482 P0-3): publish
-    /// each pending COW grant of the excluded MM whose guest completion is in
-    /// the pool, on whichever CPU it is pending. A sibling may already have
-    /// retired its replacement leaf; that retirement is an owed return the
-    /// same exclusion settles only after this. A grant whose guest copy has
-    /// not completed stays pending.
+    fn take_published_cow(
+        &mut self,
+        execution: GrantExecution,
+        address: u64,
+    ) -> Result<(), TrapError> {
+        let position = self
+            .cow_published
+            .iter()
+            .position(|(published, page)| {
+                published.context == execution.context && *page == address & !4095
+            })
+            .ok_or_else(|| fail("owner COW exact completed receipt absent"))?;
+        self.cow_published.swap_remove(position);
+        Ok(())
+    }
+
     pub(super) fn settle_cow_completions(
         &mut self,
         excluded: &carrick_el1_abi::ExcludedEditor<'_>,
     ) -> Result<(), TrapError> {
-        for index in 0..self.anonymous_pending.len() {
-            let Some(PendingGrant::Cow(pending)) = &self.anonymous_pending[index] else {
-                continue;
-            };
+        let mut position = 0;
+        while position < self.cow_pending.len() {
+            let pending = &self.cow_pending[position];
             if pending.execution.context.mm.raw().get() != excluded.key() {
+                position += 1;
                 continue;
             }
             let grant = pending.grant;
-            let Some(receipt) = self
+            let receipt = self
                 .cow_pool()?
                 .completions(excluded)
-                .find(|receipt| receipt.grant == grant)
-            else {
-                continue;
-            };
-            self.publish_cow_completion(index, excluded, receipt)?;
+                .find(|receipt| receipt.grant == grant);
+            if let Some(receipt) = receipt {
+                self.publish_cow_completion(position, excluded, receipt)?;
+            } else {
+                position += 1;
+            }
         }
         Ok(())
     }
 
     fn publish_cow_completion(
         &mut self,
-        index: usize,
+        position: usize,
         excluded: &carrick_el1_abi::ExcludedEditor<'_>,
         receipt: carrick_el1_abi::CowGrantCompletion,
     ) -> Result<(), TrapError> {
-        let Some(PendingGrant::Cow(pending)) = self.anonymous_pending[index].as_ref() else {
-            return Err(fail("owner COW pending identity"));
-        };
+        let pending = &self.cow_pending[position];
         let execution = pending.execution;
         if self
             ._vm
@@ -1978,9 +2011,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         let publication = GuestMmuPublication::from_x86_cow_completion(&txn, &receipt)
             .ok_or_else(|| fail("owner COW publication identity"))?;
-        let Some(PendingGrant::Cow(mut pending)) = self.anonymous_pending[index].take() else {
-            return Err(fail("owner COW pending disappeared"));
-        };
+        let mut pending = self.cow_pending.swap_remove(position);
         self._vm
             .publish(&txn, publication, &mut pending.inventory)
             .map_err(|error| fail(error.to_string()))?;
@@ -1989,7 +2020,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return Err(fail("owner COW completion changed after settlement"));
         }
         let _retained = pending.handle;
-        self.cow_published[index] = Some(execution);
+        if !pending.acknowledged {
+            self.cow_published
+                .push((execution, pending.window.fault_page));
+        }
         Ok(())
     }
 
@@ -2087,61 +2121,87 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             binding,
             context,
         };
+        self.cancel_withdrawn_grants()?;
         if let Some(pending) = &self.anonymous_pending[index]
-            && !pending.execution().matches(execution)
+            && !pending.execution.matches(execution)
         {
             return Err(fail("owner grant stale execution/root"));
         }
-        // Another exclusion published this CPU's COW completion before its
-        // settlement crossing arrived (#1482 P0-3): the crossing that names
-        // no new selection is that settlement, and finds it settled. Any
-        // other crossing drops the record.
-        if self.cow_published[index].is_some() && self.anonymous_pending[index].is_none() {
-            let far = lane.get_gpr(X86Reg::Rdi)?;
-            let slot = self
-                .grant_portal()?
-                .grant(index)
-                .ok_or_else(|| fail("owner grant slot"))?;
-            let settlement = far != OWNER_GRANT_SETTLE_RETURNS
-                && slot.pending_cow_fault_selection(mm.get(), far).is_none()
-                && slot.pending_fault_selection(mm.get(), far).is_none();
-            if settlement {
-                return self.take_published_cow(index, execution);
-            }
-            self.cow_published[index] = None;
-        }
-        // The settlement op names no selected address; a CPU with a grant
-        // still pending never rings it (its syscall path holds none).
-        if lane.get_gpr(X86Reg::Rdi)? == OWNER_GRANT_SETTLE_RETURNS {
+        let far = lane.get_gpr(X86Reg::Rdi)?;
+        if far == OWNER_GRANT_SETTLE_RETURNS {
             if self.anonymous_pending[index].is_some() {
                 return Err(fail("owed-return settlement with a grant pending"));
             }
             return self.service_return_settlement(lease, execution);
         }
-        if matches!(self.anonymous_pending[index], Some(PendingGrant::Cow(_))) {
-            return self.settle_cow_grant(index, execution);
+        let reply = self.serve_selected_grant(execution, far, file)?;
+        let physical = self.stack_record_physical::<u64, I>(
+            lease,
+            execution.context,
+            lane.get_gpr(X86Reg::Rsi)?,
+        )?;
+        self._vm
+            .write(physical, &reply.word().to_ne_bytes())
+            .map_err(|error| fail(error.to_string()))
+    }
+
+    /// One owner-grant crossing at a selected address. `EditorBusy`: an EL1
+    /// editor held the MM where this crossing needed its exclusion; the
+    /// selection and every journal are unchanged (#2141).
+    fn serve_selected_grant(
+        &mut self,
+        execution: GrantExecution,
+        far: u64,
+        file: Option<FileSupply>,
+    ) -> Result<OwnerGrantReply, TrapError> {
+        let index = execution.cpu.raw() as usize;
+        let mm = execution.context.mm.raw();
+        let fresh_selection = self
+            .grant_portal()?
+            .grant(index)
+            .ok_or_else(|| fail("owner grant slot"))?;
+        if fresh_selection
+            .pending_cow_fault_selection(mm.get(), far)
+            .is_none()
+            && fresh_selection
+                .pending_fault_selection(mm.get(), far)
+                .is_none()
+            && self.cow_published.iter().any(|(published, page)| {
+                published.context == execution.context && *page == far & !4095
+            })
+        {
+            self.take_published_cow(execution, far)?;
+            return Ok(OwnerGrantReply::Done);
         }
-        if let Some(PendingGrant::Prepare(pending)) = self.anonymous_pending[index].take() {
+        if let Some(pending) = self.anonymous_pending[index].take() {
             let reply = self
                 .grant_portal()?
                 .grant(index)
                 .ok_or_else(|| fail("owner grant slot"))?
                 as *const carrick_el1_abi::PortalGrantSlot;
             // SAFETY: the carrier retains this initialized physical reply.
-            if !self.settle_backing_grant(pending, unsafe { &*reply }, None)? {
-                return Err(fail("owner grant refused"));
-            }
-            return Ok(());
+            self.settle_backing_grant(pending, unsafe { &*reply }, None)?;
+            return Ok(OwnerGrantReply::Done);
         }
         // Hardware faults and kernel-owned user copies share this crossing.
         // Its selected address is explicit; CR2 may name an unrelated fault.
-        let far = lease.io.get_gpr(X86Reg::Rdi)?;
-        if let Some((_, window)) = self
+        let cow_selection = self
             .grant_portal()?
             .grant(index)
             .ok_or_else(|| fail("owner COW slot"))?
-            .pending_cow_fault_selection(mm.get(), far)
+            .pending_cow_fault_selection(mm.get(), far);
+        // A completed COW supply of this page settles on whichever lane of
+        // its MM consumed it; a fresh COW selection is never a settlement.
+        if cow_selection.is_none()
+            && self
+                .cow_pending
+                .iter()
+                .any(|pending| pending.settles_at(execution, far))
         {
+            self.settle_cow_grant(execution, far)?;
+            return Ok(OwnerGrantReply::Done);
+        }
+        if let Some((_, window)) = cow_selection {
             return self.supply_cow_grant(index, execution, window);
         }
         let (_, window) = self
@@ -2155,9 +2215,165 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .grant(index)
             .ok_or_else(|| fail("owner grant slot"))?
             as *const carrick_el1_abi::PortalGrantSlot;
-        // SAFETY: the carrier retains this initialized slot across staging.
-        let pending = self.prepare_backing_grant(execution, window, file, unsafe { &*reply })?;
-        self.anonymous_pending[index] = pending.map(PendingGrant::Prepare);
+        #[cfg(feature = "test-support")]
+        self.hold_fault_editor(
+            super::FaultExclusionCrossing::PreparePlanning,
+            window.operation.mm,
+        )?;
+        // Keep one exclusion through allocation and the read-only table
+        // plan, as the native lane does: a contended fault answers before
+        // any physical journal exists.
+        let prepared = self.try_excluding_editor(window.operation.mm, |this, excluded| {
+            // SAFETY: the carrier retains this initialized slot across staging.
+            this.prepare_backing_grant(execution, window, file, unsafe { &*reply }, excluded)
+        })?;
+        match prepared {
+            Ok(pending) => {
+                self.anonymous_pending[index] = pending;
+                Ok(OwnerGrantReply::Done)
+            }
+            Err(ExclusionRefusal::Busy) => Ok(OwnerGrantReply::EditorBusy),
+            Err(refusal) => Err(fail(format!(
+                "owner grant editor exclusion refused: {refusal:?}"
+            ))),
+        }
+    }
+
+    /// Run `f` while this carrier excludes `mm`'s EL1 editor, after that
+    /// exclusion settled the MM. `Ok(Err(Busy))`: an EL1 editor holds the MM
+    /// now, which is contention, never a refusal; `f` did not run and the
+    /// caller keeps its custody. Other refusals say the MM retired.
+    fn try_excluding_editor<R>(
+        &mut self,
+        mm: carrick_el1_abi::ReservationMm,
+        f: impl FnOnce(&mut Self, &carrick_el1_abi::ExcludedEditor<'_>) -> Result<R, TrapError>,
+    ) -> Result<Result<R, ExclusionRefusal>, TrapError> {
+        let ram = Arc::clone(&self.ram);
+        let zone = retained_cow_zone(&ram)?;
+        let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
+        let delivery = |zone: &X86Cpl0Zone,
+                        waker: Waker,
+                        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >| wake.deliver(zone, waker, owned);
+        let release = SpaceReleaseVenue {
+            zone,
+            waker: Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                &delivery,
+            ),
+        };
+        let pause = match self.settled_pause(release, mm)? {
+            Ok((pause, _)) => pause,
+            Err(refusal) => {
+                wake.finish()?;
+                return Ok(Err(refusal));
+            }
+        };
+        let result = f(self, pause.proof());
+        drop(pause);
+        wake.finish()?;
+        result.map(Ok)
+    }
+
+    /// Return a withdrawn Prepare supply's fresh backing and table loan. The
+    /// exact withdrawal proves no guest descriptor names these bytes; the
+    /// MM exclusion orders the release against every EL1 editor.
+    fn cancel_withdrawn_grant(
+        &mut self,
+        mut pending: PendingPrepare,
+        _proof: &carrick_el1_abi::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        pending.inventory.guest_exposed = false;
+        // SAFETY: the withdrawn or refused receipt proves that none of these
+        // fresh bytes are named by a guest descriptor.
+        unsafe {
+            self._vm
+                .cancel_prepared(&[pending.handle], &mut pending.inventory)
+        }
+        .map_err(|error| fail(error.to_string()))?;
+        self.prepare_table_stock
+            .as_mut()
+            .ok_or_else(|| fail("Prepare stock absent on cancellation"))?
+            .return_unused(pending.tables, 0)
+    }
+
+    /// A lane withdrew its Prepare supply before applying it: it met MM
+    /// contention after the supply and parks on that cause (#2141). Cancel
+    /// the supply under the MM's exclusion now, or, while an editor holds
+    /// the MM, keep it carrier-owned until a later crossing can.
+    fn withdraw_grant(&mut self, pending: PendingPrepare) -> Result<(), TrapError> {
+        let mm = pending.window.operation.mm;
+        let mut held = Some(pending);
+        let cancelled = self.try_excluding_editor(mm, |this, proof| {
+            let pending = held.take().ok_or_else(|| fail("withdrawn grant"))?;
+            this.cancel_withdrawn_grant(pending, proof)
+        })?;
+        if cancelled.is_err() {
+            self.withdrawn_pending
+                .push(held.take().ok_or_else(|| fail("withdrawn grant"))?);
+        }
+        Ok(())
+    }
+
+    /// Cancel every withdrawn supply whose MM editor is free now. A retired
+    /// MM's supply stays retained through carrier teardown.
+    fn cancel_withdrawn_grants(&mut self) -> Result<(), TrapError> {
+        for pending in core::mem::take(&mut self.withdrawn_pending) {
+            self.withdraw_grant(pending)?;
+        }
+        Ok(())
+    }
+
+    /// Under the MM's supply exclusion: revoke and return each COW supply of
+    /// `context` that no lane can consume any more, because its page no
+    /// longer maps the exact source it was reserved for. Its lane parked
+    /// and then exited, or the mapping changed, before breaking that COW.
+    fn revoke_stranded_cow(
+        &mut self,
+        proof: &carrick_el1_abi::ExcludedEditor<'_>,
+        context: AddressContext<RootGpa>,
+    ) -> Result<(), TrapError> {
+        let mm = context.mm.raw();
+        let mut kept = Vec::with_capacity(self.cow_pending.len());
+        for mut pending in core::mem::take(&mut self.cow_pending) {
+            let live = pending.execution.context != context
+                || !self
+                    .cow_pool()?
+                    .ready(mm.get())
+                    .any(|grant| grant == pending.grant)
+                || carrick_mmu_core::x86::descriptor_txn::classify_guest_cow_write(
+                    &self._vm.words(),
+                    context.root,
+                    UserVa::new(pending.window.fault_page),
+                    false,
+                )
+                .is_ok_and(|run| {
+                    run.va == pending.window.fault_page
+                        && run.old_ipa == pending.source
+                        && self
+                            ._vm
+                            .frame_identity(mm, pending.source)
+                            .is_ok_and(|identity| identity == pending.source_identity)
+                });
+            if live {
+                kept.push(pending);
+                continue;
+            }
+            if !self.cow_pool()?.revoke(proof, &pending.grant) {
+                return Err(fail("owner COW stranded grant changed under exclusion"));
+            }
+            // SAFETY: the revoked READY grant was never claimed, so no guest
+            // copy or descriptor ever named this fresh replacement.
+            pending.inventory.guest_exposed = false;
+            unsafe {
+                self._vm
+                    .cancel_prepared(&[pending.handle], &mut pending.inventory)
+            }
+            .map_err(|error| fail(error.to_string()))?;
+        }
+        self.cow_pending = kept;
         Ok(())
     }
 
@@ -2225,7 +2441,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         mut pending: PendingPrepare,
         reply: &carrick_el1_abi::PortalGrantSlot,
         exclusion: Option<&CowPause<'_>>,
-    ) -> Result<bool, TrapError> {
+    ) -> Result<(), TrapError> {
         use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
         let index = pending.execution.cpu.raw() as usize;
         let receipt = reply.take_receipt(pending.window, &pending.txn);
@@ -2244,22 +2460,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             None => return Err(fail("owner grant receipt absent")),
         };
         if undo {
-            let _proof = exclusion
-                .ok_or_else(|| fail("owner grant refused"))?
-                .proof();
-            // The exact withdrawn or rolled-back receipt proves that none of
-            // these fresh bytes are named by a guest descriptor.
-            pending.inventory.guest_exposed = false;
-            unsafe {
-                self._vm
-                    .cancel_prepared(&[pending.handle], &mut pending.inventory)
-            }
-            .map_err(|error| fail(error.to_string()))?;
-            self.prepare_table_stock
-                .as_mut()
-                .ok_or_else(|| fail("Prepare stock absent on cancellation"))?
-                .return_unused(pending.tables, 0)?;
-            return Ok(false);
+            return match exclusion {
+                Some(pause) => self.cancel_withdrawn_grant(pending, pause.proof()),
+                // A CPU lane crossed without applying its supply: contention
+                // after supply (#2141), never a refusal.
+                None if receipt.is_none() => self.withdraw_grant(pending),
+                None => Err(fail("owner grant refused")),
+            };
         }
         let receipt = receipt.ok_or_else(|| fail("owner grant applied receipt absent"))?;
         let publication = GuestMmuPublication::from_x86_owner_grant(&pending.txn, &receipt)
@@ -2308,7 +2515,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .return_unused(pending.tables, used)?;
         // Retained stage-2 custody now belongs to the live guest graph.
         let _retained = pending.handle;
-        Ok(true)
+        Ok(())
     }
 
     pub(super) fn prepare_native_backing_grant(
@@ -2371,24 +2578,30 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         };
         // Keep this exclusion through allocation and the read-only table plan:
         // a contended native call waits before creating any physical journal.
-        let pending = self.prepare_backing_grant(execution, window, file, reply)?;
+        let pending = self.prepare_backing_grant(execution, window, file, reply, pause.proof())?;
         drop(pause);
         wake.finish()?;
         Ok(Ok(pending))
     }
 
+    /// Stage and plan one selected backing grant under the caller's settled
+    /// exclusion of its MM, which the caller keeps through allocation and
+    /// the read-only table plan.
     pub(super) fn prepare_backing_grant(
         &mut self,
         execution: GrantExecution,
         window: PortalGrantWindow,
         file: Option<FileSupply>,
         reply: &carrick_el1_abi::PortalGrantSlot,
+        excluded: &carrick_el1_abi::ExcludedEditor<'_>,
     ) -> Result<Option<PendingPrepare>, TrapError> {
         let index = execution.cpu.raw() as usize;
         let context = execution.context;
         let mm = context.mm.raw();
         if self.grant_portal()?.carrier() != Some(window.operation.carrier)
             || window.range.len() > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
+            || excluded.key() != mm.get()
+            || window.operation.mm.raw() != mm.get()
         {
             return Err(fail("owner grant selection identity"));
         }
@@ -2496,35 +2709,13 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             },
             tables: TableGrants::new(&tables).ok_or_else(|| fail("owner table grant encoding"))?,
         };
-        let ram = Arc::clone(&self.ram);
         let demand = (|| -> Result<usize, TrapError> {
-            let zone = retained_cow_zone(&ram)?;
-            let wake = HostCowWake::new(&ram, self._vm.clone_vm())?;
-            let delivery = |zone: &X86Cpl0Zone,
-                            waker: Waker,
-                            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-                '_,
-                carrick_sched_core::ParkedContextWords,
-            >| wake.deliver(zone, waker, owned);
-            let pause = self.settled_pause_or_fail(
-                SpaceReleaseVenue {
-                    zone,
-                    waker: Waker::Host,
-                    deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
-                        &delivery,
-                    ),
-                },
-                mm.get(),
-            )?;
-            let planned = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
+            X86Mmu::project_grant(root.address().raw(), &txn, |native| {
                 self._vm.admit_guest_edit(native).map_err(|error| fail(error.to_string()))?;
                 carrick_mmu_core::x86::descriptor_txn::plan_descriptor_txn(&self._vm.words(), native, root)
                     .map(|plan| plan.tables_linked)
                     .map_err(|error| fail(format!("owner grant physical table plan refused: {error:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} available_tables={}", execution.cpu.raw(), mm, root.address().raw(), window.range.start(), len, tables.len())))
-            }).map_err(|error| fail(format!("owner grant table plan projection: {error:?}")));
-            drop(pause);
-            wake.finish()?;
-            planned?
+            }).map_err(|error| fail(format!("owner grant table plan projection: {error:?}")))?
         })();
         let required = match demand {
             Ok(required) => required,

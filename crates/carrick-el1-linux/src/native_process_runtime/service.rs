@@ -454,7 +454,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     ) -> Result<(), NativeProcessError> {
         let member = self.zone.record(record.id);
         if let Some(census) = member.object_wait_census()
-            && census.is_anonymous_edit()
+            && census.is_space_replay()
         {
             let terminal = {
                 let graph = self.graph.lock();

@@ -80,12 +80,13 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 17;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 18;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
         PREPARED_EDIT_OPERATION_TAG,
         ANONYMOUS_EDIT_OPERATION_TAG,
+        FAULT_RETRY_OPERATION_TAG,
         OBJECT_EXPIRED as u64,
         OBJECT_HOST_CONTINUATION as u64,
         OWNER_CONTINUATION as u64,
@@ -373,7 +374,11 @@ pub struct OperationToken {
 
 const PREPARED_EDIT_OPERATION_TAG: u64 = 1 << 63;
 const ANONYMOUS_EDIT_OPERATION_TAG: u64 = 1 << 62;
-const EDIT_OPERATION_TAGS: u64 = PREPARED_EDIT_OPERATION_TAG | ANONYMOUS_EDIT_OPERATION_TAG;
+/// Qualifies [`ANONYMOUS_EDIT_OPERATION_TAG`]: the parked context reruns its
+/// faulting user instruction instead of replaying a syscall.
+const FAULT_RETRY_OPERATION_TAG: u64 = 1 << 61;
+const EDIT_OPERATION_TAGS: u64 =
+    PREPARED_EDIT_OPERATION_TAG | ANONYMOUS_EDIT_OPERATION_TAG | FAULT_RETRY_OPERATION_TAG;
 
 /// The operation authority, independent of the queue it currently waits on.
 /// Replay tokens own no adapter pin, even after their queue is unlinked.
@@ -389,6 +394,10 @@ pub enum OperationKind {
     Metadata,
     PreparedEdit,
     AnonymousEdit,
+    /// A user fault parked on one of its MM's published causes. Its saved
+    /// context is the faulting instruction: the wake reruns it, so a wake
+    /// value is never its result and no syscall is replayed.
+    FaultRetry,
 }
 
 impl OperationKind {
@@ -398,6 +407,12 @@ impl OperationKind {
             Self::Metadata | Self::PreparedEdit | Self::AnonymousEdit
         )
     }
+
+    /// A scheduler-owned replay on an address-space cause queue: it owns
+    /// no adapter pin, and cancellation retires it without a handback.
+    pub const fn is_space_replay(self) -> bool {
+        matches!(self, Self::AnonymousEdit | Self::FaultRetry)
+    }
 }
 
 const fn operation_kind(index: u64) -> OperationKind {
@@ -405,6 +420,8 @@ const fn operation_kind(index: u64) -> OperationKind {
         OperationKind::Metadata
     } else if index & PREPARED_EDIT_OPERATION_TAG != 0 {
         OperationKind::PreparedEdit
+    } else if index & FAULT_RETRY_OPERATION_TAG != 0 {
+        OperationKind::FaultRetry
     } else if index & ANONYMOUS_EDIT_OPERATION_TAG != 0 {
         OperationKind::AnonymousEdit
     } else {
@@ -463,6 +480,17 @@ impl OperationToken {
         })
     }
 
+    /// A user fault rerun parked on one of the MM's published causes.
+    pub const fn fault_retry(key: ObjectWaitKey) -> Option<Self> {
+        if !anonymous_edit_key(key.index) || key.generation == 0 {
+            return None;
+        }
+        Some(Self {
+            index: ANONYMOUS_EDIT_OPERATION_TAG | FAULT_RETRY_OPERATION_TAG | key.index as u64,
+            generation: key.generation,
+        })
+    }
+
     pub const fn is_anonymous_edit_for(&self, key: ObjectWaitKey) -> bool {
         matches!(self.kind(), OperationKind::AnonymousEdit)
             && self.index & !EDIT_OPERATION_TAGS == key.index as u64
@@ -493,7 +521,9 @@ impl OperationToken {
         if key == 0
             || key > u32::MAX as u64
             || generation == 0
-            || index & EDIT_OPERATION_TAGS == EDIT_OPERATION_TAGS
+            || index & (PREPARED_EDIT_OPERATION_TAG | ANONYMOUS_EDIT_OPERATION_TAG)
+                == PREPARED_EDIT_OPERATION_TAG | ANONYMOUS_EDIT_OPERATION_TAG
+            || (index & FAULT_RETRY_OPERATION_TAG != 0 && index & ANONYMOUS_EDIT_OPERATION_TAG == 0)
             || (index & ANONYMOUS_EDIT_OPERATION_TAG != 0 && !anonymous_edit_key(key as u32))
         {
             None
@@ -1746,17 +1776,17 @@ pub struct ObjectWaitCensus {
 }
 
 impl ObjectWaitCensus {
-    pub(crate) const fn has_anonymous_edit_operation(&self) -> bool {
-        matches!(operation_kind(self.operation), OperationKind::AnonymousEdit)
+    pub(crate) const fn has_space_replay_operation(&self) -> bool {
+        operation_kind(self.operation).is_space_replay()
             && self.operation_generation != 0
             && self.operation_generation == self.generation
     }
 
-    /// Whether this census names an anonymous reservation edit on its exact
-    /// address-space notification incarnation.
-    pub const fn is_anonymous_edit(&self) -> bool {
+    /// Whether this census names an anonymous reservation edit or a user
+    /// fault rerun on its exact address-space notification incarnation.
+    pub const fn is_space_replay(&self) -> bool {
         (self.operation & !EDIT_OPERATION_TAGS) == self.queue as u64
-            && self.has_anonymous_edit_operation()
+            && self.has_space_replay_operation()
     }
 }
 
@@ -1900,7 +1930,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         );
     }
 
-    /// Retire an anonymous-edit replay token after its queue link is removed.
+    /// Retire an anonymous-edit or fault-rerun replay token after its queue link is removed.
     /// The retained operation index and generation preserve the typed identity
     /// until the transfer owner settles cancellation. Unlike adapter operations
     /// it owns no external pin and needs no host handback.
@@ -1911,7 +1941,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         let Some(census) = self.object_wait_census() else {
             return;
         };
-        if !census.has_anonymous_edit_operation() {
+        if !census.has_space_replay_operation() {
             return;
         }
         let _ = self.object.operation.compare_exchange(
@@ -3396,6 +3426,106 @@ mod host_tests {
         assert!(!zone.record(record).has_object_operation());
     }
 
+    /// #2141: a user fault parked on an MM cause keeps its typed kind through
+    /// the record and switches in with no wake value as its result.
+    #[test]
+    fn fault_retry_round_trips_and_takes_no_wake_value() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::address_space(0, 17).unwrap();
+        let operation = OperationToken::fault_retry(key).unwrap();
+        assert_eq!(operation.kind(), OperationKind::FaultRetry);
+        assert!(operation.kind().is_space_replay());
+        assert!(!operation.kind().replays_syscall());
+        assert!(!operation.is_anonymous_edit_for(key));
+        assert!(
+            OperationToken::fault_retry(ObjectWaitKey::metadata_request(17).unwrap()).is_none()
+        );
+        zone.bind_object_wait(key, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
+        let record = allocate(&zone, 101);
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+        queue.park(queue.snapshot(), record, operation).unwrap();
+        queue
+            .notify_object(SLOT, &mut WakeEffects::default())
+            .unwrap();
+        drop(queue);
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(switched.record, record);
+        assert_eq!(switched.result, None);
+        assert_eq!(
+            zone.record(record).object_operation_kind(),
+            Some(OperationKind::FaultRetry)
+        );
+        let taken = unsafe { zone.record(record).take_object_operation() }.unwrap();
+        assert_eq!(taken.kind(), OperationKind::FaultRetry);
+    }
+
+    /// #2141 review P1: a signal interrupts a native member parked on a user
+    /// fault. Its handback places it back on the native owner, and it switches
+    /// in with no wake value as its result: the saved context is the faulting
+    /// instruction, which reruns (or takes the signal) as it is, never with
+    /// a syscall result written over RAX. The typed operation survives for
+    /// the resume checkpoint to consume.
+    #[test]
+    fn fault_retry_signal_handback_takes_no_wake_value() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::address_space(0, 17).unwrap();
+        zone.bind_object_wait(key, &SpinForever, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
+        let record = allocate(&zone, 101);
+        assert!(zone.mark_native_owned(record));
+        let exact = zone.record_ref(record);
+        // SAFETY: the unpublished record is exclusively this fixture's.
+        unsafe { zone.record(record).ctx_mut().x[0] = 0x1122_3344_5566_7788 };
+        let queue = zone
+            .object_wait(key, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            })
+            .unwrap();
+        queue
+            .park(
+                queue.snapshot(),
+                record,
+                OperationToken::fault_retry(key).unwrap(),
+            )
+            .unwrap();
+        drop(queue);
+        assert_eq!(
+            zone.claim_for_host(exact, None, Handback::Signal, &SpinForever, &|owned| {
+                let _ = owned.into_parts();
+            }),
+            HostClaim::Claimed
+        );
+        let rec = zone.record(record);
+        assert_eq!(rec.handback(), Some(Handback::Signal));
+        assert!(rec.needs_native_handback());
+        assert!(
+            !rec.needs_host(),
+            "a native fault retry never crosses to the host"
+        );
+        assert!(matches!(
+            zone.place_native_handback(exact),
+            Some(crate::NativePlacement::Placed(_))
+        ));
+        let switched = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(switched.record, record);
+        assert_eq!(switched.result, None, "no wake value replaces the context");
+        // SAFETY: the switched-in slot owns the record.
+        assert_eq!(unsafe { rec.ctx_mut() }.x[0], 0x1122_3344_5566_7788);
+        assert_eq!(rec.object_operation_kind(), Some(OperationKind::FaultRetry));
+        // SAFETY: the switched-in slot owns the record's operation.
+        let taken = unsafe { rec.take_object_operation() }.unwrap();
+        assert_eq!(taken.kind(), OperationKind::FaultRetry);
+    }
+
     #[test]
     fn cancellation_preserves_operation_token_domains() {
         use spaces::notification::SpaceWaitCause;
@@ -3425,6 +3555,10 @@ mod host_tests {
                 },
                 cause != SpaceWaitCause::Metadata,
             ));
+            if let Some(operation) = OperationToken::fault_retry(key) {
+                // #2141: a parked user fault owns no pin, like an anonymous edit.
+                cases.push(("fault", key, operation, true));
+            }
         }
         for index in [
             1,

@@ -87,6 +87,137 @@ mod test_support {
     /// Release a held birth from its waiter's own call; 0 also when the
     /// waiter's park already released it.
     pub const INJECT_RELEASE_HELD_BIRTH: u64 = 0xffff_ffff_ffff_fe21;
+    /// The calling member's next owner fault's application step is Busy
+    /// once (#2141): after its physical supply crossing returns, before the
+    /// guest applies it. Another member's fault never takes it (#2332).
+    /// The synthetic editor holder releases once the faulting member parks.
+    pub const INJECT_POST_SUPPLY_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe30;
+    /// Post-supply Busies injected so far: COW supplies in the high 32 bits,
+    /// Prepare supplies in the low 32 bits.
+    pub const INJECT_POST_SUPPLY_CENSUS: u64 = 0xffff_ffff_ffff_fe31;
+    /// As [`INJECT_POST_SUPPLY_BUSY_ONCE`], but the synthetic holder stays
+    /// held after the faulting member parks, until another member's
+    /// [`INJECT_RELEASE_POST_SUPPLY_HOLD`].
+    pub const INJECT_POST_SUPPLY_BUSY_HELD: u64 = 0xffff_ffff_ffff_fe32;
+    /// Release a held post-supply holder from another member: publish the
+    /// held MM's Editor release, as a real holder's drop does, whether or
+    /// not its waiter has parked yet. 1 if released.
+    pub const INJECT_RELEASE_POST_SUPPLY_HOLD: u64 = 0xffff_ffff_ffff_fe33;
+    /// 1 once a member parked on an injected contention and no release has
+    /// taken that park yet: a fixture orders its release after the park.
+    pub const INJECT_POST_SUPPLY_PARKED: u64 = 0xffff_ffff_ffff_fe36;
+    /// The next scheduler install of an address space meets its gate raised
+    /// once (#2295), between the record's switch-in and the install, as a
+    /// host exclusion on another vCPU raises it. The holder lowers it, with
+    /// its Gate release, on the refused slot's next scheduler pass.
+    pub const INJECT_INSTALL_GATE_ONCE: u64 = 0xffff_ffff_ffff_fe34;
+    /// Injected install gates: raised in the high 32 bits, lowered in the
+    /// low 32 bits.
+    pub const INJECT_INSTALL_GATE_CENSUS: u64 = 0xffff_ffff_ffff_fe35;
+    static INSTALL_GATE_ARMED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    /// The raised space's index plus one, or 0.
+    static INSTALL_GATE_RAISED: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+    static INSTALL_GATE_CENSUS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// Called after a record's switch-in, before its space is installed:
+    /// raise that space's gate, if armed.
+    pub fn raise_gate_before_install(
+        zone: &carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>,
+        mm: u64,
+    ) {
+        if !INSTALL_GATE_ARMED.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let Some(index) = zone.spaces.find(mm) else {
+            carrick_x86_carrier::entry::fatal_boot();
+        };
+        zone.spaces.raise(index);
+        INSTALL_GATE_PASSES.store(2, Ordering::Release);
+        INSTALL_GATE_RAISED.store(index.index() + 1, Ordering::Release);
+        INSTALL_GATE_CENSUS.fetch_add(1 << 32, Ordering::AcqRel);
+    }
+
+    /// Scheduler passes left before the holder lowers an injected gate.
+    static INSTALL_GATE_PASSES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// Called on each scheduler pass: on the second pass after the refusal
+    /// (the first sees the refused record queued behind the raised gate),
+    /// the holder lowers the injected gate through the production release,
+    /// which publishes its Gate release.
+    pub fn lower_injected_install_gate(
+        source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+    ) {
+        if INSTALL_GATE_RAISED.load(Ordering::Acquire) == 0
+            || INSTALL_GATE_PASSES
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok_and(|left| left > 1)
+        {
+            return;
+        }
+        let raised = INSTALL_GATE_RAISED.swap(0, Ordering::AcqRel);
+        let Some(index) = raised
+            .checked_sub(1)
+            .and_then(carrick_sched_core::spaces::SpaceIndex::from_index)
+        else {
+            return;
+        };
+        carrick_core::wait::space_access(source.zone, source.slot, crate::native_process::release)
+            .lower(index);
+        INSTALL_GATE_CENSUS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The member that armed the next post-supply Busy (#2332): only its
+    /// own fault takes it. A fork child's first COW fault on the other vCPU
+    /// would otherwise take a held Busy no one releases.
+    static POST_SUPPLY_BUSY: carrick_el1::lock::SpinLock<
+        Option<carrick_core_abi::ExecutionBinding>,
+    > = carrick_el1::lock::SpinLock::new(None);
+
+    /// Arm the next post-supply Busy for the member running on `binding`.
+    fn arm_post_supply_busy(
+        binding: &carrick_el1::isa::x86::context::native::CpuBinding,
+    ) -> Option<u64> {
+        // SAFETY: dispatch runs on the CPU that owns this task binding.
+        let task = unsafe { &*(binding.task_address as *const carrick_el1_abi::CurrentTask) };
+        let mut armed = POST_SUPPLY_BUSY.lock();
+        if armed.is_some() {
+            return None;
+        }
+        *armed = Some(carrick_el1_linux::common_entry::execution_binding(task));
+        Some(0)
+    }
+    static POST_SUPPLY_HOLD: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// Whether a held post-supply holder must outlive its waiter's park.
+    pub fn post_supply_held() -> bool {
+        POST_SUPPLY_HOLD.load(Ordering::Acquire)
+    }
+    static POST_SUPPLY_CENSUS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// Called once an owner fault's supply crossing returned: hold this
+    /// MM's editor (only this MM's) for the application step that follows,
+    /// if armed.
+    pub fn hold_editor_after_supply(task: &carrick_el1_abi::CurrentTask, mm: u64, cow: bool) {
+        let binding = carrick_el1_linux::common_entry::execution_binding(task);
+        if POST_SUPPLY_BUSY
+            .lock()
+            .take_if(|armed| *armed == binding)
+            .is_none()
+        {
+            return;
+        }
+        if !carrick_sched_core::spaces::inject_editor_busy_once_for(mm) {
+            carrick_x86_carrier::entry::fatal_boot();
+        }
+        POST_SUPPLY_CENSUS.fetch_add(if cow { 1 << 32 } else { 1 }, Ordering::AcqRel);
+    }
     const BIRTH_ARMED: u8 = 1;
     const BIRTH_HELD: u8 = 2;
     const BIRTH_RELEASED: u8 = 3;
@@ -227,6 +358,10 @@ mod test_support {
 
     pub fn take_edit_park() -> bool {
         EDIT_PARK_PUBLISHED.swap(false, Ordering::AcqRel)
+    }
+
+    fn edit_park_published() -> bool {
+        EDIT_PARK_PUBLISHED.load(Ordering::Acquire)
     }
 
     static REPLAY_SETTLEMENT_REFUSAL: core::sync::atomic::AtomicBool =
@@ -453,6 +588,30 @@ mod test_support {
                         )
                     });
                 Some(0)
+            }
+            INJECT_POST_SUPPLY_BUSY_ONCE => arm_post_supply_busy(binding),
+            INJECT_INSTALL_GATE_ONCE => {
+                (!INSTALL_GATE_ARMED.swap(true, Ordering::AcqRel)).then_some(0)
+            }
+            INJECT_INSTALL_GATE_CENSUS => Some(INSTALL_GATE_CENSUS.load(Ordering::Acquire)),
+            INJECT_POST_SUPPLY_CENSUS => Some(POST_SUPPLY_CENSUS.load(Ordering::Acquire)),
+            INJECT_POST_SUPPLY_PARKED => Some(u64::from(edit_park_published())),
+            INJECT_POST_SUPPLY_BUSY_HELD => {
+                if POST_SUPPLY_HOLD.swap(true, Ordering::AcqRel) {
+                    return None;
+                }
+                arm_post_supply_busy(binding)
+            }
+            INJECT_RELEASE_POST_SUPPLY_HOLD => {
+                let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+                    carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                )?;
+                if !POST_SUPPLY_HOLD.swap(false, Ordering::AcqRel) {
+                    return None;
+                }
+                Some(u64::from(crate::anonymous::release_held_editor(
+                    carrick_x86_carrier::native_execution::source(slot),
+                )))
             }
             INJECT_OWNED_COPY_BUSY_ONCE => {
                 (!OWNED_COPY_BUSY.swap(true, Ordering::AcqRel)).then_some(0)

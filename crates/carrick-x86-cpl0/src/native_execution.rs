@@ -33,6 +33,8 @@ pub fn schedule(slot: SlotId) -> ! {
         if crate::test_support::peer_release_pending(slot) {
             crate::anonymous::release_injected_edit_wait(source, current);
         }
+        #[cfg(feature = "test-support")]
+        crate::test_support::lower_injected_install_gate(source);
         expire_signal_timer(slot);
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
@@ -49,10 +51,30 @@ pub fn schedule(slot: SlotId) -> ! {
             if source.zone.installed_space(slot) != state.address.mm.raw().get() {
                 leave_space(source);
             }
-            source
+            #[cfg(feature = "test-support")]
+            crate::test_support::raise_gate_before_install(
+                source.zone,
+                state.address.mm.raw().get(),
+            );
+            if source
                 .zone
                 .install_space(slot, state.address.mm.raw().get())
-                .unwrap_or_else(|| fatal_boot());
+                .is_none()
+            {
+                // Not now (#2295): another vCPU's host exclusion raised the
+                // space's gate after the switch-in's open-gate hint. Nothing
+                // of the record ran here, so it goes back to the head of the
+                // queue with its claim, handback, result and operation as
+                // they were, and runs on a later pass once the holder's
+                // lowering reopens the gate. The vCPU returns to the
+                // maintenance root, so the cleared occupancy word never
+                // names a root this vCPU still runs.
+                leave_space(source);
+                if !source.zone.unswitch(slot, selected.record) {
+                    fatal_boot();
+                }
+                continue;
+            }
             settle_current_work(current);
             current.set(
                 carrick_el1_abi::El1TaskId::from_linux_tid(

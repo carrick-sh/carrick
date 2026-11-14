@@ -718,7 +718,56 @@ pub fn handle_user_page_fault_prepared(
             code,
             address,
         } => deliver_page_fault_signal(frame, fpstate, signum, code, address),
+        UserFaultSupply::Contended(cause) => park_contended_user_fault(prep, frame, fpstate, cause),
         UserFaultSupply::Unresolved(reason) => reason,
+    }
+}
+
+/// A user #PF that met MM contention is "not now" (#2141): save the faulting
+/// context, park on the cause's release and leave for the scheduler; the wake
+/// reruns the access. A contention that ended first reruns it at once.
+fn park_contended_user_fault(
+    prep: &carrick_x86_carrier::entry::PreparedUserPageFault<'_>,
+    frame: &PageFaultStack,
+    fpstate: &XsaveArea,
+    cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
+) -> u64 {
+    use carrick_el1::isa::x86::context;
+    if !native_process::is_admitted() {
+        return 9;
+    }
+    let Some(address) =
+        carrick_el1_abi::ReservationMm::new(prep.task.mm.key.load(Ordering::Acquire))
+            .and_then(anonymous::live_words)
+            .and_then(|words| words.context)
+    else {
+        return 9;
+    };
+    // The #PF entry pushes the same GPR order as the IRQ entry's frame.
+    let native = rust_alloc::boxed::Box::new(context::scheduler::NativeContext {
+        frame: context::scheduler::InterruptFrame {
+            gpr: frame.saved_gprs,
+            rip: frame.rip,
+            cs: frame.cs,
+            flags: frame.rflags,
+            rsp: frame.rsp,
+            ss: frame.ss,
+        },
+        address,
+        fs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0100),
+        gs_base: carrick_x86_carrier::native_execution::read_msr(0xc000_0102),
+        xsave: fpstate.clone(),
+    });
+    let saved = rust_alloc::boxed::Box::new(context::context_words::from_native(&native));
+    drop(native);
+    match anonymous::park_contended_fault(prep.task, prep.slot, cause, &saved) {
+        anonymous::ContendedFault::Parked => {
+            drop(saved);
+            carrick_x86_carrier::entry::leave_user_page_fault(prep.binding);
+            native_execution::schedule(prep.slot)
+        }
+        anonymous::ContendedFault::Rerun => 0,
+        anonymous::ContendedFault::Refused => 9,
     }
 }
 
@@ -733,6 +782,9 @@ pub enum UserFaultSupply {
         code: i32,
         address: UserVa,
     },
+    /// Another owner holds this MM's editor, root or gate: not now. The
+    /// access reruns after that cause's release, never a refusal.
+    Contended(carrick_sched_core::spaces::notification::SpaceWaitCause),
     /// No owner could supply the access: the #PF entry reports this reason.
     Unresolved(u64),
 }
@@ -836,10 +888,16 @@ fn supply_user_fault(
         if cow.completion.is_some() {
             #[cfg(feature = "test-support")]
             crate::test_support::hold_armed_cow_settle();
-            cross_owner_grant(
+            // A held editor defers the MM-owned completion to the MM's next
+            // exclusion; the access is already served either way.
+            if cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
-            );
+            )
+            .is_none()
+            {
+                return UserFaultSupply::Unresolved(9);
+            }
         }
         return UserFaultSupply::Served;
     }
@@ -856,14 +914,22 @@ fn supply_user_fault(
         },
         // This lane has no native-service birth handle, so it cannot mint
         // an owner wait. Refuse any such mismatched outcome at the boundary.
+        OwnerFaultSupplyOutcome::Contended(cause) => UserFaultSupply::Contended(cause),
         OwnerFaultSupplyOutcome::Wait(_) | OwnerFaultSupplyOutcome::Unavailable => {
             UserFaultSupply::Unresolved(9)
         }
         OwnerFaultSupplyOutcome::CowSelected => {
-            cross_owner_grant(
-                carrick_guest_arch::CpuId::new(binding.cpu_slot),
+            if let Err(refused) = cross_selected_supply(
+                portal,
+                binding.cpu_slot,
+                mm_key,
                 fault.address,
-            );
+                SelectedSupply::Cow,
+            ) {
+                return refused;
+            }
+            #[cfg(feature = "test-support")]
+            crate::test_support::hold_editor_after_supply(task, mm_key, true);
             let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
             let mut cow = carrick_el1_linux::cow_resolver::X86CowResolver {
                 words: &words,
@@ -886,22 +952,40 @@ fn supply_user_fault(
                 }),
                 &mut cow,
             );
+            // The supplied COW replacement is the MM's, reserved for this
+            // exact source (#2141): the parked rerun, or any lane of the MM
+            // that breaks this COW first, claims and settles it on any CPU,
+            // and this CPU keeps no grant while the fault waits.
+            if let OwnerFaultSupplyOutcome::Contended(cause) = supply.outcome()
+                && result != Action::Served
+            {
+                return UserFaultSupply::Contended(cause);
+            }
             if result != Action::Served || cow.completion.is_none() {
                 return UserFaultSupply::Unresolved(9);
             }
             #[cfg(feature = "test-support")]
             crate::test_support::hold_armed_cow_settle();
-            cross_owner_grant(
+            match cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
-            );
-            UserFaultSupply::Served
+            ) {
+                Some(_) => UserFaultSupply::Served,
+                None => UserFaultSupply::Unresolved(9),
+            }
         }
         OwnerFaultSupplyOutcome::Selected => {
-            cross_owner_grant(
-                carrick_guest_arch::CpuId::new(binding.cpu_slot),
+            if let Err(refused) = cross_selected_supply(
+                portal,
+                binding.cpu_slot,
+                mm_key,
                 fault.address,
-            );
+                SelectedSupply::Backing,
+            ) {
+                return refused;
+            }
+            #[cfg(feature = "test-support")]
+            crate::test_support::hold_editor_after_supply(task, mm_key, false);
             let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
                 return UserFaultSupply::Unresolved(9);
             };
@@ -924,12 +1008,28 @@ fn supply_user_fault(
             let Some(index) = spaces.find(mm_key) else {
                 return UserFaultSupply::Unresolved(9);
             };
-            let Ok(mut root) =
-                roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot)
-            else {
-                return UserFaultSupply::Unresolved(9);
+            // MM contention between the supply and its application is "not
+            // now" (#2141): cross without applying, so the carrier withdraws
+            // the exact supplied submission and this CPU keeps no grant, then
+            // wait on the cause and rerun the access, which selects afresh.
+            let withdraw = |cause| match cross_owner_grant(
+                carrick_guest_arch::CpuId::new(binding.cpu_slot),
+                fault.address,
+            ) {
+                Some(_) => UserFaultSupply::Contended(cause),
+                None => UserFaultSupply::Unresolved(9),
             };
-            let Ok(target) = carrick_core::mm::frames::grant_target_in(
+            let mut root =
+                match roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot) {
+                    Ok(root) => root,
+                    Err(carrick_el1::memory::reservations::Refusal::Busy) => {
+                        return withdraw(
+                            carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+                        );
+                    }
+                    Err(_) => return UserFaultSupply::Unresolved(9),
+                };
+            let target = match carrick_core::mm::frames::grant_target_in(
                 match portal.carrier() {
                     Some(carrier) => carrier,
                     None => return UserFaultSupply::Unresolved(9),
@@ -938,8 +1038,17 @@ fn supply_user_fault(
                 spaces,
                 binding.cpu_slot,
                 &mut root,
-            ) else {
-                return UserFaultSupply::Unresolved(9);
+            ) {
+                Ok(target) => target,
+                Err(carrick_core::mm::transaction::MmError::Busy) => {
+                    drop(root);
+                    return withdraw(if spaces.table().gate(index) != 0 {
+                        carrick_sched_core::spaces::notification::SpaceWaitCause::Gate
+                    } else {
+                        carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
+                    });
+                }
+                Err(_) => return UserFaultSupply::Unresolved(9),
             };
             let receipt = carrick_core::mm::frames::apply_grant::<
                 carrick_mmu_core::x86::owner_mmu::X86Mmu,
@@ -952,16 +1061,66 @@ fn supply_user_fault(
                     carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
                 )
             });
-            cross_owner_grant(
+            let settled = cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),
                 fault.address,
-            );
-            if applied {
+            )
+            .is_some();
+            if applied && settled {
                 UserFaultSupply::Served
             } else {
                 UserFaultSupply::Unresolved(9)
             }
         }
+    }
+}
+
+/// Which demand a selected owner fault published in its CPU's grant slot.
+#[derive(Clone, Copy)]
+enum SelectedSupply {
+    Cow,
+    Backing,
+}
+
+/// Cross for the supply this CPU's slot selected. A carrier that met a held
+/// MM editor answers `EditorBusy` and changed nothing (#2141): withdraw the
+/// exact selection, so this CPU keeps no grant while the fault waits, and
+/// name the cause. The rerun selects afresh.
+fn cross_selected_supply(
+    portal: &carrick_el1_abi::MmPortalSlots,
+    cpu_slot: u32,
+    mm: u64,
+    address: UserVa,
+    supply: SelectedSupply,
+) -> Result<(), UserFaultSupply> {
+    use carrick_el1::isa::x86::context::native::OwnerGrantReply;
+    match cross_owner_grant(carrick_guest_arch::CpuId::new(cpu_slot), address) {
+        Some(OwnerGrantReply::Done) => Ok(()),
+        Some(OwnerGrantReply::EditorBusy) => {
+            let slot = portal
+                .grant(cpu_slot as usize)
+                .ok_or(UserFaultSupply::Unresolved(9))?;
+            let withdrawn = match supply {
+                SelectedSupply::Cow => slot
+                    .pending_cow_fault_selection(mm, address.raw())
+                    .is_some_and(|(generation, window)| {
+                        slot.cancel_cow_fault_selection(window, generation)
+                    }),
+                SelectedSupply::Backing => {
+                    slot.pending_fault_selection(mm, address.raw()).is_some_and(
+                        |(generation, window)| slot.cancel_fault_selection(window, generation),
+                    )
+                }
+            };
+            Err(if withdrawn {
+                UserFaultSupply::Contended(
+                    carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                )
+            } else {
+                UserFaultSupply::Unresolved(9)
+            })
+        }
+        None => Err(UserFaultSupply::Unresolved(9)),
     }
 }
 
@@ -1307,11 +1466,30 @@ impl Personality for LinuxPersonality {
                 // the bytes gathered before it, as Linux's user copy does.
                 let mut retry = false;
                 let mut crosses = false;
+                let mut parked = false;
                 let stage = match stage.fault() {
                     Some((address, access)) => {
                         match supply_syscall_fault(binding, task, counters, slot, address, access) {
                             UserFaultSupply::Served => {
                                 retry = true;
+                                None
+                            }
+                            // MM contention is "not now", never a refusal:
+                            // park the unchanged call on the cause's release
+                            // through the FaultRetry wait a user #PF takes,
+                            // and rerun it whole from its `syscall`.
+                            UserFaultSupply::Contended(cause) => {
+                                use carrick_guest_arch::ProcessContext;
+                                let mut rerun = words;
+                                rerun.restart_syscall();
+                                rerun.set_syscall_return(call.native.raw());
+                                match anonymous::park_contended_fault(task, slot, cause, &rerun) {
+                                    anonymous::ContendedFault::Parked => parked = true,
+                                    anonymous::ContendedFault::Rerun => retry = true,
+                                    // The caller's own live MM refused the
+                                    // wait: a broken invariant, as on #PF.
+                                    anonymous::ContendedFault::Refused => fatal_boot(),
+                                }
                                 None
                             }
                             // The owner refused or could not supply the
@@ -1387,7 +1565,9 @@ impl Personality for LinuxPersonality {
                         Some(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
                     }
                 };
-                route = if retry {
+                route = if parked {
+                    CompletionRoute::Suspended
+                } else if retry {
                     // Rewind to the `syscall` instruction with the original
                     // number, exactly as a restarted call re-enters.
                     frame.rax = call.native.raw();
