@@ -2786,74 +2786,151 @@ fn owner_fork_prepares_copyout_without_publishing_bytes() {
     fork_child_write_preparation(true);
 }
 
-/// #2276: the production owner fork must split a wholly-private block before
-/// arming COW.  Otherwise the block is read-only but remains untagged, and a
-/// host copyout into any page in it is misclassified as EFAULT instead of
-/// selecting the existing COW supply owner.
-#[test]
-fn owner_fork_private_block_copyout_selects_cow_supply_instead_of_efault() {
-    use carrick_core::mm::transaction::SelectionVenues;
-    use carrick_el1::fault::{CowResolution, CowResolver};
+/// Selection's view of a COW write whose physical replacement must be
+/// supplied: the owner returns its typed COW supply step.
+struct NeedsCowSupply;
+impl carrick_el1::fault::CowResolver for NeedsCowSupply {
+    fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
+        panic!("the owner must retain the typed COW supply result")
+    }
 
-    struct NeedsCowSupply;
-    impl CowResolver for NeedsCowSupply {
-        fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
-            panic!("the owner must retain the typed COW supply result")
+    fn resolve_cow_outcome(&mut self, _: u64, _: u64, _: u64) -> carrick_el1::fault::CowResolution {
+        carrick_el1::fault::CowResolution::NeedsSupply
+    }
+}
+
+/// A parent whose private anonymous heap is mapped by `blocks` 2 MiB L2
+/// blocks (or one 1 GiB L1 block), forked through the production owner.
+struct BlockFork {
+    region: Region,
+    spaces: AddressSpaces,
+    parent: ReservationMm,
+    parent_tables: Tables,
+    child: Tables,
+    supply: Tables,
+    request: carrick_el1_abi::PortalForkRequest,
+}
+
+const BLOCK_IPA: u64 = 0x1_0000_0000;
+const COPY_L2: u64 = ROOT + 0x4000;
+const COPY_L3: u64 = ROOT + 0x5000;
+
+impl BlockFork {
+    /// `blocks == 0` maps one 1 GiB L1 block instead.
+    fn new(blocks: usize) -> Self {
+        let region = Region::new();
+        let spaces = AddressSpaces::new();
+        let pages = if blocks == 0 { 1 << 18 } else { blocks * 512 };
+        let parent = admit(&region, &spaces, 77, ROOT, pages, 0);
+        let parent_tables = Tables::new(ROOT, IPA, 0);
+        // The MM's COW copy window, as the host provisions it.
+        let indices = carrick_mmu_core::aarch64::indices(carrick_el1_abi::EL1_COW_COPY_BASE);
+        assert_eq!(indices[0], 0);
+        assert_ne!(
+            indices[1], 1,
+            "the copy window must not share the heap's L1 entry"
+        );
+        parent_tables.words[512 + indices[1]].store(COPY_L2 | 3, Ordering::Release);
+        parent_tables.words[2048 + indices[2]].store(COPY_L3 | 3, Ordering::Release);
+        for page in 0..2 {
+            parent_tables.words[2560 + indices[3] + page].store(
+                carrick_el1_abi::EL1_COW_COPY_BASE + page as u64 * 4096,
+                Ordering::Release,
+            );
         }
-
-        fn resolve_cow_outcome(&mut self, _: u64, _: u64, _: u64) -> CowResolution {
-            CowResolution::NeedsSupply
+        if blocks == 0 {
+            parent_tables.words[512 + 1].store(BLOCK_IPA | (RW & !2), Ordering::Release);
+        } else {
+            for block in 0..blocks {
+                parent_tables.words[1024 + block].store(
+                    (BLOCK_IPA + ((block as u64) << 21)) | (RW & !2),
+                    Ordering::Release,
+                );
+            }
+        }
+        let child = Tables::new(ROOT + 0x100000, 0, 0);
+        let supply = Tables::new(ROOT + 0x200000, 0, 0);
+        let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
+        Self {
+            region,
+            spaces,
+            parent,
+            parent_tables,
+            child,
+            supply,
+            request,
         }
     }
 
-    const BLOCK_PAGES: usize = 512;
-    let region = Region::new();
-    let spaces = AddressSpaces::new();
-    let parent = admit(&region, &spaces, 77, ROOT, BLOCK_PAGES, 0);
-    let view = nodes(&region);
-    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view);
-    let parent_tables = Tables::new(ROOT, IPA, BLOCK_PAGES);
-    let child = Tables::new(ROOT + 0x100000, 0, 0);
-    let supply = Tables::new(ROOT + 0x200000, 0, 0);
-    parent_tables.words[1024].store((IPA & !0x1f_ffff) | (RW & !2), Ordering::Release);
-    let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
-    let arenas = [&parent_tables, &child, &supply];
-    let words = ForkWords {
-        arenas: &arenas,
-        loads: core::cell::Cell::new(0),
-    };
+    fn words(&self) -> ForkWords<'_> {
+        ForkWords {
+            arenas: Box::leak(Box::new([&self.parent_tables, &self.child, &self.supply])),
+            loads: core::cell::Cell::new(0),
+        }
+    }
+}
+
+/// #2276 structural budget, production owner fork: a 64 MiB private heap of
+/// 2 MiB blocks forks with table work independent of its block count. Each
+/// block is armed in place (one live edit, one custody record, no table),
+/// and a copyout into any of them selects the existing COW supply instead of
+/// EFAULT. Round 4's fork-time split linked 512 + 512 table words per block.
+#[test]
+fn owner_fork_private_blocks_arm_in_place_without_table_work() {
+    use carrick_core::mm::transaction::{SelectionVenues, TransferStep};
+    const BLOCKS: usize = 32;
+    let fork = BlockFork::new(BLOCKS);
+    let view = nodes(&fork.region);
+    let portal = MmPortal::new(NonZeroU64::MIN, fork.region.table(), &fork.spaces, &view);
+    let words = fork.words();
+    let scratch = portal.census_fork(fork.request, &words, 0).unwrap();
+    let (child_words, parent_words, _, custody) = scratch.allocation_counts();
+    assert_eq!(parent_words, 0, "no parent table for any private block");
+    assert_eq!(
+        child_words,
+        5 * 512,
+        "the child copies the root, L1, heap L2 and copy-window L2/L3 only"
+    );
+    assert_eq!(custody, BLOCKS, "one frame record per block");
     let plan = portal
-        .prepare_fork(
-            request,
-            ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
-            &words,
-            0,
-        )
+        .prepare_fork(fork.request, scratch, &words, 0)
         .unwrap();
+    let block_custody = plan
+        .custody()
+        .iter()
+        .filter(|record| {
+            matches!(record, carrick_el1_abi::PortalForkCustody::Frame { len, shared: false, .. }
+                if *len == 1 << 21)
+        })
+        .count();
+    assert_eq!(block_custody, BLOCKS);
     let completion = portal
         .publish_fork(plan, &words, 0)
         .unwrap()
         .commit(&portal, 0)
         .unwrap();
-    assert_ne!(
-        completion.parent_tables_used, 0,
-        "a private L2 block must become L3 leaves in the live parent"
-    );
-    assert_ne!(
-        completion.child_tables_used, 0,
-        "the child must inherit the same page-granular COW shape"
-    );
+    assert_eq!(completion.parent_tables_used, 0);
+    for block in 0..BLOCKS {
+        for (graph, name) in [(&fork.parent_tables, "parent"), (&fork.child, "child")] {
+            let word = graph.words[1024 + block].load(Ordering::Acquire);
+            assert!(
+                carrick_mmu_core::aarch64::descriptor_txn::guest_cow::is_guest_cow_write_leaf(
+                    2, word
+                ),
+                "{name} block {block} is an armed EL1-private block: {word:#x}"
+            );
+        }
+    }
 
     let transfer = portal
         .begin(
-            portal.admitted_handle(parent, 0).unwrap(),
-            GuestVa::new(VA + 0x2d_ed0),
+            portal.admitted_handle(fork.parent, 0).unwrap(),
+            GuestVa::new(VA + (5 << 21) + 0x2_ded0),
             16,
             TransferIntent::UserWrite,
             0,
         )
         .unwrap();
-    let mut cow = NeedsCowSupply;
     let residency = residency();
     let step = portal
         .select(
@@ -2861,19 +2938,41 @@ fn owner_fork_private_block_copyout_selects_cow_supply_instead_of_efault() {
             &words,
             SelectionVenues {
                 prepared: &mut NoopPreparedResolver,
-                cow: &mut cow,
+                cow: &mut NeedsCowSupply,
                 residency: &residency,
                 slot: 0,
             },
         )
         .unwrap();
     assert!(
-        matches!(
-            step,
-            carrick_core::mm::transaction::TransferStep::CowSupply(_)
-        ),
-        "valid block-backed output must select COW supply, got {step:?}"
+        matches!(step, TransferStep::CowSupply(_)),
+        "a block-backed output selects COW supply, got {step:?}"
     );
+}
+
+/// #2276: a 1 GiB private block forks with no table work and no ENOMEM.
+/// Round 4 needed 513 + 513 table pages for it and refused the fork.
+#[test]
+fn owner_fork_one_gib_private_block_forks_without_table_work() {
+    let fork = BlockFork::new(0);
+    let view = nodes(&fork.region);
+    let portal = MmPortal::new(NonZeroU64::MIN, fork.region.table(), &fork.spaces, &view);
+    let words = fork.words();
+    let scratch = portal.census_fork(fork.request, &words, 0).unwrap();
+    let (child_words, parent_words, _, _) = scratch.allocation_counts();
+    assert_eq!(parent_words, 0);
+    assert_eq!(child_words, 4 * 512, "root, L1 and copy-window L2/L3 only");
+    let plan = portal
+        .prepare_fork(fork.request, scratch, &words, 0)
+        .unwrap();
+    let completion = portal
+        .publish_fork(plan, &words, 0)
+        .unwrap()
+        .commit(&portal, 0)
+        .unwrap();
+    assert_eq!(completion.parent_tables_used, 0);
+    let word = fork.parent_tables.words[512 + 1].load(Ordering::Acquire);
+    assert!(carrick_mmu_core::aarch64::descriptor_txn::guest_cow::is_guest_cow_write_leaf(1, word));
 }
 
 fn fork_child_write_preparation(prepare_first: bool) {
