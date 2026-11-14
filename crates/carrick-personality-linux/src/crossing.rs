@@ -598,11 +598,14 @@ mod tests {
                 continue;
             };
             let declared = match crossing.operand_spec().output_operand() {
-                OutputOperand::None => None,
-                OutputOperand::Record { ptr, .. } | OutputOperand::Buffer { ptr, .. } => Some(ptr),
+                OutputOperand::None => std::vec::Vec::new(),
+                OutputOperand::Record { ptr, .. } | OutputOperand::Buffer { ptr, .. } => {
+                    std::vec![ptr]
+                }
+                OutputOperand::Records(records) => records.iter().map(|&(ptr, _)| ptr).collect(),
             };
             for ptr in outputs {
-                if declared != Some(*ptr) {
+                if !declared.contains(ptr) {
                     missing.push(std::format!(
                         "{}: missing output argument {}",
                         abi.name,
