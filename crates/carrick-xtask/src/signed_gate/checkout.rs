@@ -189,7 +189,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             for line in std::io::BufReader::new(stdout).lines() {
                 let line = line.unwrap();
-                if let Some(path) = line.strip_prefix("READY:") {
+                if let Some((_, path)) = line.split_once("READY:") {
                     tx.send(PathBuf::from(path)).unwrap();
                     break;
                 }
