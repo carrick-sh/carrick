@@ -135,6 +135,11 @@
       "from": "carrick_runtime::runtime::exec::load_execve_image",
       "to": "carrick_runtime::runtime::exec::acquire_exec_source",
       "issue": 1093
+    },
+    {
+      "from": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::epoll_create1",
+      "to": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::epoll_description",
+      "issue": 1671
     }
   ],
   "authority_debt_admissions": [
