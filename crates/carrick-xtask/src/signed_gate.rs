@@ -1,4 +1,5 @@
 //! Actions plumbing for the signed lane. Only the authorized execution job runs PR code.
+pub mod checkout;
 use crate::accept::{
     AcceptReceipt, ArtifactIdentity, CleanupCount, NO_DOCKER_EXCLUSIONS, inspect_artifact,
     parse_cleanup_count,
@@ -1550,7 +1551,11 @@ fn execute_one(
         || run_checked("git", ["fetch", "--no-tags", "origin", commit], Some(root)),
         std::thread::sleep,
     )?;
-    let temp = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
+    let temp = checkout::GateCheckout::acquire(
+        &std::env::temp_dir().join("carrick-gate"),
+        &checkout::run_name(),
+    )
+    .map_err(|e| fail(e.to_string()))?;
     let tree = temp.path().join("checkout");
     checked(
         "git",
