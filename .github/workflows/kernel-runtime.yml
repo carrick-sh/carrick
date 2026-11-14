@@ -1004,8 +1004,8 @@ jobs:
               printf '```text\n'
               cat "$d/$1/table.txt"
               printf '```\n\n'
-              # Each row's key stderr line (#2327): why a failing row died, from the receipt (data, never run).
-              if [ -s "$d/$1/receipt.json" ] && keys=$(jq -r '.rows[] | select(.key_stderr_line != "") |
+              # Each failing row's key stderr line (#2327): why it died, from the receipt (data, never run).
+              if [ -s "$d/$1/receipt.json" ] && keys=$(jq -r '.rows[] | select(.passed == false and .key_stderr_line != "") |
                   "\(.name): \(.key_stderr_line)"' "$d/$1/receipt.json" 2>/dev/null) && [ -n "$keys" ]; then
                 printf 'Key stderr:\n\n```stderr\n%s\n```\n\n' "$keys"
               fi
