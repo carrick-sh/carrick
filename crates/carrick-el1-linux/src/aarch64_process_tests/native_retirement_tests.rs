@@ -545,7 +545,7 @@ impl PhysicalStock {
                 .supplied
                 .as_mut()
             {
-                self.settled += grants.settle(pool, exclusion.proof()).unwrap();
+                self.settled += grants.settle(pool, exclusion.proof()).unwrap().len();
             }
             pool.release_mm(exclusion.proof());
         }
