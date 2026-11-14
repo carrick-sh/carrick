@@ -32,3 +32,10 @@ The inherited sampler still suppresses positive non-wait results broadly;
 requeue count validation and waitv sampling are outside this immediate-return
 claim. No carrier completion instrumentation is added. Signed Node acceptance
 and paired population evidence remain outstanding.
+
+Result publication and host-return checkpoints are separate decisions. Futex
+completions are marked with an in-zone return venue in the shared owner, so
+installing their result does not add a native host checkpoint. Explicit owed
+work is still honored. The existing mapping-owner and fork-child EINVAL
+witnesses exposed an unintended Served-to-WithWork change during verification;
+they retain their exact Served assertions after the venue distinction.

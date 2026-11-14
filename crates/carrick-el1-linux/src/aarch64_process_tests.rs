@@ -13177,10 +13177,7 @@ fn native_descriptor_argument_witness(
                 .unwrap();
             let (route, result) =
                 run_in_child_full(0, sys_fcntl, [3, carrick_abi::LINUX_F_GETPIPE_SZ, 0, 0]);
-            assert!(matches!(
-                route,
-                CompletionRoute::Served | CompletionRoute::WithWork
-            ));
+            assert_eq!(route, CompletionRoute::Served);
             assert_eq!(result, 65536);
             holder.join().unwrap();
         });
