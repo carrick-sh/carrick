@@ -62,6 +62,7 @@ vm_free = [
   "carrick-core-abi::mm::return_settlement::bound_tests (#1482 P0-2: the chunk bound covers at most 512 pages across every extent of one exclusion, cuts on the 2 MiB grid, always advances the first extent; the host venue alone keeps the whole request)",
 ]
 embed = [
+  "carrick-vmm-kvm::cpl0_initial_mm::production_full_owed_return_table_reclaims_exited_fork_holders (#1482 P0-1: 64 owed-return slots held by eight killed and reaped fork children, no later fork; the parent's retirement must reclaim quarantine and finish within the existing exit budget; native Linux exits zero)",
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",
   "carrick-vmm-kvm::cpl0_entry::production_anonymous_release_to_idle_peer_preserves_wake (real KVM pool, ordered remote synthetic holder release; one park, zero handbacks/forwards, exact exit 7)",
   "carrick-vmm-kvm::cpl0_initial_mm::production_brk_regrows_over_its_released_pages (#2217/#1482, real KVM pool, red on main with exit 3: a brk shrink then regrowth over the released pages is served with exactly one settlement doorbell and zero-filled pages)",

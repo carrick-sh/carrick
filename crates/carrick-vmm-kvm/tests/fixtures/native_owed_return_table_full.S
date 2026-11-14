@@ -68,9 +68,11 @@ fork_holder:
     call await_hangup
     jnz exit
 
+#ifndef REAP_BEFORE_RETIRE
     call retire_one_page           /* the root needs a slot too */
     test %edi, %edi
     jnz exit
+#endif
 
     xor %r15d, %r15d               /* release the holders */
 release_holders:
@@ -102,6 +104,11 @@ reap:
     jne exit
     dec %r15d
     jnz reap
+#ifdef REAP_BEFORE_RETIRE
+    call retire_one_page           /* the root needs a slot too */
+    test %edi, %edi
+    jnz exit
+#endif
     xor %edi, %edi
     jmp exit
 

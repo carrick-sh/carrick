@@ -4129,3 +4129,25 @@ fn production_exclusion_settles_an_outstanding_cow_before_its_retired_leaf() {
         "the competing COW and retirement exclusions acknowledge the one owed range once: {counts:?}"
     );
 }
+
+/// A full journal held by exited children must reclaim their fork quarantine
+/// without depending on another fork to drive the existing reclaim path.
+#[test]
+fn production_full_owed_return_table_reclaims_exited_fork_holders() {
+    let elf = native_exit_fixture("native_owed_return_retired_holders.S");
+    let dir = tempfile::tempdir().expect("oracle directory");
+    let oracle = dir.path().join("oracle");
+    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("Linux oracle");
+    assert_eq!(native.status.code(), Some(0), "native Linux oracle");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
+        .unwrap_or_else(|error| panic!("retired holder settlement: {error:?}"));
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (0, None)
+    );
+}

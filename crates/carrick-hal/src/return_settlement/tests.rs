@@ -748,6 +748,38 @@ fn a_table_of_retiring_holders_has_no_wait_authority() {
     );
 }
 
+/// A host-served root, or a holder whose retirement has begun, can retain
+/// a live release source while the native settlement venue answers Stale.
+/// The full table must wait for that release rather than claim progress.
+#[test]
+fn a_full_table_waits_on_a_live_holder_outside_the_native_venue() {
+    struct HostRoot(TableDrain);
+    impl OwedReturnDrain for HostRoot {
+        type Error = ();
+        fn table_full(&self) -> bool {
+            self.0.table_full()
+        }
+        fn observe(&mut self, mm: ReservationMm) -> Option<HolderRevisions> {
+            self.0.observe(mm)
+        }
+        fn settle(&mut self, _: ReservationMm) -> Result<SettlementDoorbellReply, ()> {
+            Ok(SettlementDoorbellReply::Stale)
+        }
+    }
+    let mut drain = HostRoot(TableDrain::full(&[1]));
+    let holders = drain.0.holders();
+    let outcome = drain_owed_return_table(&mut drain, &holders).unwrap();
+    let DrainOutcome::Wait(wait) = outcome else {
+        panic!("the root still owns the full table: {outcome:?}");
+    };
+    assert_eq!(wait.mm().raw(), 1);
+    assert_eq!(
+        wait.refusal(),
+        carrick_core_abi::HolderRefusal::Reservations
+    );
+    assert_eq!(wait.revision(), 0);
+}
+
 /// A venue recording the order of its two settlements.
 #[derive(Default)]
 struct Ordered {
