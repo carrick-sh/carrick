@@ -17817,7 +17817,6 @@ fn with_arm_root_host_dispatch<R>(
     };
 
     let result = body(&mut call_root);
-    drop(call_root);
     (result, dispatcher.stdout())
 }
 
