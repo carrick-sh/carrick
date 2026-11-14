@@ -1,3 +1,7 @@
+# #2306: wait_query parks pre-reap status-copy OwnerWait via the existing
+# owner-service continuation. The host fixture gains a status-copy refusal
+# and a real fork/exit/wait witness under kernel.memory.owner-wait.
+# This family's contract expectations, bindings and budgets are unchanged.
 # #1093 S4c slice a: `native_process_runtime/service.rs` splits
 # `kill_refused_exec` into `exec_past_no_return` (`ExecPastNoReturn::SIGNAL`)
 # and `retire_lost_exec_race` (witnesses bound under process.exec.custody).
