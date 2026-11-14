@@ -1044,6 +1044,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if self.physical_execution(lease)?.context != pending.execution.context {
             return Err(fail("native exec completion context changed"));
         }
+        self.drain_fork_quarantine(pending.execution)?;
         match loaded {
             Err(errno) => self.fail_native_exec(lease.cpu, pending, errno),
             Ok(image) => {
@@ -1095,6 +1096,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         cpu: carrick_guest_arch::CpuId,
     ) -> Result<(), TrapError> {
         for parked in core::mem::take(&mut self.parked_execs) {
+            if parked
+                .pending
+                .ticket
+                .cancellation_requested()
+                .map_err(|_| fail("parked native exec ticket changed"))?
+            {
+                let anonymous_owner::native_service::PendingNativeExec { ticket, key, .. } =
+                    *parked.pending;
+                self.acknowledge_native_exec(cpu, key, || {
+                    ticket
+                        .complete(false)
+                        .map_err(|_| fail("parked native exec cancellation acknowledgment"))
+                })?;
+                continue;
+            }
             if !parked.woken.load(std::sync::atomic::Ordering::Acquire) {
                 self.parked_execs.push(parked);
                 continue;
@@ -1121,10 +1137,29 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             '_,
             carrick_sched_core::ParkedContextWords,
         >| self.complete_object_wake(cpu, owned);
-        let _queue = zone
+        let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin, &completion)
             .map_err(|_| fail("native exec acknowledgment queue"))?;
-        acknowledge()
+        acknowledge()?;
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        queue
+            .notify_object(
+                carrick_sched_core::SlotId::new(cpu.raw() as u8),
+                &mut effects,
+            )
+            .map_err(|_| fail("native exec acknowledgment wake"))?;
+        drop(queue);
+        if effects.queued_own || effects.owes_host_boundary() {
+            self.task(cpu).linux.mark_pending_host_work();
+        }
+        let sink = self.carrier_zone_wake()?;
+        for target in effects.sgi_slots() {
+            sink.resched(target);
+        }
+        if sink.take_undelivered().is_some() {
+            return Err(fail("native exec reschedule not delivered"));
+        }
+        Ok(())
     }
 
     /// A pre-arm refusal: the exec returns `errno` and the caller runs on.
