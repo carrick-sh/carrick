@@ -613,14 +613,54 @@ fn native_fork_child_exec_default_terminate_while_parked() {
 /// cancelled exec must end the group without calling the old-image handler.
 #[test]
 fn native_fork_child_exec_fatal_signal_beats_caught_signal_while_parked() {
+    native_parked_exec_linux_oracle(
+        "one",
+        "case=caught_then_fatal seccomp_exec_parked=1 threads=1 signaled=1 signal=15 old_image_bytes=0\n",
+    );
     parked_exec_signal_witness("-DTWO_SIGNALS_PARKED", b"");
 }
 
 /// A real sibling can consume group-directed SIGTERM while the exec caller
-/// remains parked. Its group exit must retire the caller without RAX=59.
+/// remains parked. Cancellation must retire the caller without RAX=59 even
+/// if the pending signal has already been dequeued by that sibling.
 #[test]
 fn native_fork_child_exec_sibling_fatal_signal_retires_parked_caller() {
+    native_parked_exec_linux_oracle(
+        "two",
+        "case=sibling_fatal seccomp_exec_parked=1 threads=2 signaled=1 signal=15 old_image_bytes=0\n",
+    );
     parked_exec_signal_witness("-DTWO_THREAD_TERM_PARKED", b"S\n");
+}
+
+fn native_parked_exec_linux_oracle(case: &str, expected: &str) {
+    let dir = tempfile::tempdir().expect("native oracle directory");
+    let binary = dir.path().join("native_exec_signal_oracle");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/native_exec_signal_oracle.c");
+    let compile = std::process::Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-pthread"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("compile native Linux oracle");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let oracle = std::process::Command::new("timeout")
+        .args(["--kill-after=1", "10"])
+        .arg(&binary)
+        .arg(case)
+        .output()
+        .expect("run native Linux oracle");
+    assert!(
+        oracle.status.success(),
+        "{}",
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    assert_eq!(oracle.stdout, expected.as_bytes(), "native Linux oracle");
 }
 
 fn parked_exec_signal_witness(flag: &str, stdout: &[u8]) {

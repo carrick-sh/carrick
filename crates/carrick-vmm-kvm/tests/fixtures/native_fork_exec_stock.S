@@ -218,6 +218,11 @@ sibling:
     syscall
     test %eax, %eax
     jnz clone_failure
+    mov $1, %eax
+    mov $1, %edi
+    lea sibling_live_marker(%rip), %rsi
+    mov $2, %edx
+    syscall
     movl $1, sibling_ready(%rip)
     lea term_mask(%rip), %rdi
     xor %esi, %esi
@@ -227,11 +232,6 @@ sibling:
     syscall
     cmp $15, %eax
     jne clone_failure
-    mov $1, %eax
-    mov $1, %edi
-    lea sibling_consumed_marker(%rip), %rsi
-    mov $2, %edx
-    syscall
     xor %edi, %edi
     mov $60, %eax
     syscall
@@ -325,7 +325,7 @@ old_handler_marker: .ascii "H\n"
 #ifdef TWO_THREAD_TERM_PARKED
 .section .rodata
 old_exec_return_marker: .ascii "R\n"
-sibling_consumed_marker: .ascii "S\n"
+sibling_live_marker: .ascii "S\n"
 term_mask: .quad (1 << 14)
 #endif
 #ifdef TWO_THREAD_TERM_PARKED
