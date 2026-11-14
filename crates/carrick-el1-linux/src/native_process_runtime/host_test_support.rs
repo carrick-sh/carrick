@@ -1755,6 +1755,10 @@ pub struct NativeServiceCapacityFixture {
 
 impl NativeServiceCapacityFixture {
     pub fn new(children: usize) -> Self {
+        Self::new_with_rusage(children, UserVa::new(0))
+    }
+
+    fn new_with_rusage(children: usize, rusage: UserVa) -> Self {
         let fixture = NativeSignalFixture::new(
             ExecutionBinding {
                 task: carrick_core_abi::EntryTaskKey::from_raw(7001),
@@ -1767,10 +1771,14 @@ impl NativeServiceCapacityFixture {
                 NonZeroU64::MIN,
             )),
         );
-        Self::from_fixture(fixture, children)
+        Self::from_fixture_rusage(fixture, children, rusage)
     }
 
     fn from_fixture(fixture: NativeSignalFixture, children: usize) -> Self {
+        Self::from_fixture_rusage(fixture, children, UserVa::new(0))
+    }
+
+    fn from_fixture_rusage(fixture: NativeSignalFixture, children: usize, rusage: UserVa) -> Self {
         let source = BornInZoneSource {
             zone: fixture.zone,
             slot: fixture.slot,
@@ -1815,7 +1823,7 @@ impl NativeServiceCapacityFixture {
                 ProcessWaitPid::from_syscall_argument(u64::MAX),
                 UserVa::new(0x1000),
                 LinuxWaitOptions::empty(),
-                UserVa::new(0),
+                rusage,
             ),
             LifecycleOutcome::Transferred { .. }
         ));
@@ -12293,4 +12301,125 @@ fn wait4_status_owner_wait_retains_zombie_until_release() {
     ), LifecycleOutcome::Returned { result, .. } if result.raw() == i64::from(child_pid)));
     drop(parent);
     assert_eq!(service.copies, vec![LinuxWaitStatus::exited(7)]);
+}
+
+#[cfg(test)]
+#[test]
+fn wait4_rusage_owner_wait_retains_reaped_answer_until_release() {
+    let capacity = NativeServiceCapacityFixture::new_with_rusage(1, UserVa::new(0x2000));
+    take_signal_copies();
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let (_, address, saved) = capacity.select().unwrap();
+    let child_pid = fixture.task.visible_pid().unwrap();
+    let mut service = fixture.service();
+    {
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+    }
+    let (_, address, saved) = capacity.select().unwrap();
+    let handle = service.service_mm_handle(&address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.defer_handbacks();
+            },
+        )
+        .unwrap();
+    let observed = space
+        .notifications(handle.incarnation())
+        .unwrap()
+        .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    access.raise(space.index());
+    // SAFETY: the fixture holds this exact MM gate through enrollment.
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    SIGNAL_COPY_ERRORS.with(|errors| errors.borrow_mut().push_back(NativeProcessError::OwnerWait(wait)));
+    {
+        let mut parent = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                parent.resume_owned_continuation(),
+                Some(LifecycleOutcome::Transferred { .. })
+            ),
+            "owner contention must release execution, never return EFAULT"
+        );
+        assert!(parent.take_handoff_receipt().is_some());
+    }
+    assert_eq!(service.copies, vec![LinuxWaitStatus::exited(7)]);
+    assert!(take_signal_copies().is_empty());
+    assert!(fixture.task.service_notice.take().unwrap().is_none());
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    service.child_copy_error = None;
+    access.lower(space.index());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut parent = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        parent.resume_checkpoint(|_| Ok(None)).unwrap(),
+        NativeResume::Returned(result) if result.raw() == i64::from(child_pid)
+    ));
+    assert!(matches!(parent.wait4(
+        ProcessWaitPid::from_syscall_argument(u64::MAX), UserVa::new(0x1000),
+        LinuxWaitOptions::empty(), UserVa::new(0x2000),
+    ), LifecycleOutcome::Returned { result, .. } if result.raw() == -10));
+    drop(parent);
+    assert_eq!(service.copies, vec![LinuxWaitStatus::exited(7)]);
+    let copies = take_signal_copies();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(copies[0].0, UserVa::new(0x2000));
+    assert_eq!(copies[0].1.len(), core::mem::size_of::<carrick_abi::LinuxRusage>());
 }
