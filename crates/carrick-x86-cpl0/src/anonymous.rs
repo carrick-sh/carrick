@@ -104,7 +104,18 @@ pub(super) fn release_injected_edit_wait(
     if crate::test_support::take_caught_signal_on_park() {
         crate::native_process::inject_caught_signal_on_park(source, task);
     }
-    let mm = task.mm.key.load(Ordering::Acquire);
+    // A holder's release names the MM it held, and this scheduler's task
+    // may be another MM's member (#2332). Only an unkeyed holder, which
+    // single-MM fixtures arm, falls back to this task's MM.
+    let held = match cause {
+        SpaceWaitCause::Editor => carrick_sched_core::spaces::injected_editor_busy_key(),
+        _ => 0,
+    };
+    let mm = if held != 0 {
+        held
+    } else {
+        task.mm.key.load(Ordering::Acquire)
+    };
     let Some(notifications) = NonZeroU64::new(mm)
         .and_then(|mm| source.zone.space_entry(mm))
         .and_then(|entry| entry.live_notifications().ok())
