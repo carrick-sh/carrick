@@ -1256,6 +1256,11 @@ pub enum DispatchError {
     ReservationAuthority(carrick_el1::memory::reservations::Refusal),
     #[error("reservation root busy: {0:?}")]
     ReservationBusy(super::mem::ReservationBusy),
+    /// A read-only memory-owner observation met a live holder: lowered to
+    /// [`DispatchOutcome::OwnerMemoryWait`] at the dispatch boundary
+    /// ([`lower_handler_result`]), so the syscall parks and reruns.
+    #[error("memory owner observation busy: {0:?}")]
+    ObservationBusy(super::mem::ObservationBusy),
     #[error("MM executor admission failed: {0}")]
     MmExecutorAdmission(crate::kernel::MmOccupancyError),
     #[error("MM mutation requires a page-table pause while a peer executor is active")]
@@ -1285,6 +1290,12 @@ pub enum DispatchError {
 impl From<crate::file_authority::AuthorityFatal> for DispatchError {
     fn from(fatal: crate::file_authority::AuthorityFatal) -> Self {
         DispatchError::FileAuthorityFatal(fatal)
+    }
+}
+
+impl From<super::mem::ObservationBusy> for DispatchError {
+    fn from(busy: super::mem::ObservationBusy) -> Self {
+        DispatchError::ObservationBusy(busy)
     }
 }
 
@@ -1318,6 +1329,7 @@ pub(crate) fn lower_handler_result(
 ) -> Result<DispatchOutcome, DispatchError> {
     match result {
         Err(DispatchError::Errno(errno)) => Ok(DispatchOutcome::Errno { errno }),
+        Err(DispatchError::ObservationBusy(busy)) => Ok(busy.into_owner_wait()),
         other => other,
     }
 }
