@@ -4027,3 +4027,77 @@ fn production_wait4_reaps_zombie_while_sibling_fork_holds_birth_reservation() {
     );
     assert_eq!(outcome.run.terminating_signal, None);
 }
+
+/// #2321 on x86 CPL0: blocking wait4 on a production fork child that is
+/// already a zombie, with the pre-reap status copy contended once. An editor
+/// holder parks the caller once on the existing owner wait; a Busy copy is
+/// not-now. Either way the caller then reaps the child with its status,
+/// exactly once, never EFAULT (114) or EAGAIN (111).
+#[test]
+fn production_wait4_status_editor_busy_once_parks_then_reaps() {
+    instrumented_wait4_output_witness(
+        "production_wait4_status_editor_busy_once_parks_then_reaps",
+        &["-DWAIT_STATUS=1", "-DWAIT_EDITOR=1"],
+    );
+}
+
+#[test]
+fn production_wait4_status_copy_busy_once_then_reaps() {
+    instrumented_wait4_output_witness(
+        "production_wait4_status_copy_busy_once_then_reaps",
+        &["-DWAIT_STATUS=1", "-DWAIT_BUSY=1"],
+    );
+}
+
+/// #2321 on x86 CPL0: as above with the post-reap rusage copy contended once.
+/// The child is already consumed, so the answer (pid and accounting) stays
+/// retained and is written after the contention; the Busy census requires
+/// one refusal and one owned rerun, which a replayed wait4 cannot produce.
+#[test]
+fn production_wait4_rusage_editor_busy_once_parks_then_writes() {
+    instrumented_wait4_output_witness(
+        "production_wait4_rusage_editor_busy_once_parks_then_writes",
+        &["-DWAIT_RUSAGE=1", "-DWAIT_EDITOR=1"],
+    );
+}
+
+#[test]
+fn production_wait4_rusage_copy_busy_once_retains_the_reaped_answer() {
+    instrumented_wait4_output_witness(
+        "production_wait4_rusage_copy_busy_once_retains_the_reaped_answer",
+        &["-DWAIT_RUSAGE=1", "-DWAIT_BUSY=1"],
+    );
+}
+
+fn instrumented_wait4_output_witness(test: &str, flags: &[&str]) {
+    // Bounded in a child test process: a lost wake must fail, never hang CI.
+    const CHILD: &str = "CARRICK_WAIT4_OUTPUT_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "20"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test)
+            .output()
+            .expect("bounded wait4 output witness");
+        // The child must have run exactly this witness, not filtered it out.
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture("native_wait4_output_contention.S", flags);
+    let outcome = run_instrumented_pool_fixture(&elf, 128);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "wait4 output contention (100 + n is errno n; 90..94 a wrong answer): {:?}",
+        outcome.run
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert!(outcome.run.stdout.is_empty());
+}
