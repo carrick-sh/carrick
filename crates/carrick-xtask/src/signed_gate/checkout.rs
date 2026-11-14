@@ -173,6 +173,7 @@ mod tests {
     #[test]
     fn killed_checkout_is_reaped_but_live_checkout_is_kept() {
         let root = tempfile::tempdir().unwrap();
+        let live = GateCheckout::acquire(root.path(), "live-1").unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -200,7 +201,6 @@ mod tests {
         reader.join().unwrap();
         let stale = ready.unwrap();
         assert!(stale.join("checkout").exists());
-        let live = GateCheckout::acquire(root.path(), "live-1").unwrap();
         let next = GateCheckout::acquire(root.path(), "next-1").unwrap();
         assert!(
             !stale.exists(),
