@@ -235,6 +235,32 @@ impl<M: CarrierMemoryIo> OwedReturnDrain for Cpl0Drain<'_, M> {
     }
 }
 
+struct Cpl0Doorbell<'a, M: CarrierMemoryIo>(&'a mut Cpl0HostCustody<M>);
+impl<M: CarrierMemoryIo> carrick_hal::return_settlement::SettlementDoorbellService
+    for Cpl0Doorbell<'_, M>
+{
+    type Error = TrapError;
+    fn settle(
+        &mut self,
+        mm: carrick_el1_abi::ReservationMm,
+    ) -> Result<SettlementDoorbellAnswer, TrapError> {
+        self.0.ring_settlement(mm).and_then(|reply| {
+            if reply == SettlementDoorbellReply::Settled {
+                self.0.drain_owed_return_table(mm)
+            } else {
+                Ok(reply.into())
+            }
+        })
+    }
+    fn release(
+        &mut self,
+        mm: carrick_el1_abi::ReservationMm,
+        claim: carrick_el1_abi::SettlementClaim,
+    ) -> Result<(), TrapError> {
+        self.0.release_settlement_claim(mm, claim)
+    }
+}
+
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     /// Exclude `mm`'s EL1 editor and settle its owed returns under that
     /// exclusion: the only way this carrier obtains an exclusion, so every
@@ -364,27 +390,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }?;
         self.return_settlement_counters.doorbells += 1;
         let answer = match record.decode() {
-            Some((mm, claim)) => {
-                let settled = if mm.raw() == execution.context.mm.raw().get() {
-                    self.ring_settlement(mm).and_then(|reply| {
-                        if reply == SettlementDoorbellReply::Settled {
-                            self.drain_owed_return_table(mm)
-                        } else {
-                            Ok(reply.into())
-                        }
-                    })
-                } else {
-                    // Not the stopped execution's MM: no effect.
-                    Ok(SettlementDoorbellReply::Stale.into())
-                };
-                // The epilogue releases the claim the record names whatever
-                // happened: an exact-word compare-and-swap, so a stale word
-                // never releases a newer claim.
-                let released = self.release_settlement_claim(mm, claim);
-                let answer = settled?;
-                released?;
-                answer
-            }
+            Some((mm, claim)) => carrick_hal::return_settlement::service_settlement_doorbell(
+                &mut Cpl0Doorbell(self),
+                mm,
+                claim,
+                mm.raw() == execution.context.mm.raw().get(),
+            )?,
             None => SettlementDoorbellReply::Stale.into(),
         };
         match answer {

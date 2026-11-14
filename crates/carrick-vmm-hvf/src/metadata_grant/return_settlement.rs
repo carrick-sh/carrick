@@ -276,28 +276,56 @@ pub(super) fn service_return_settlement(
         && child_root.is_some_and(|root| {
             root.address().raw() == ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
         });
-    let answer = if own {
-        settle_at_doorbell(custody, zone, mm).and_then(|reply| {
-            if reply == SettlementDoorbellReply::Settled {
-                drain_owed_return_table(custody, region, zone, mm)
-            } else {
-                Ok(reply.into())
-            }
-        })
-    } else {
-        // Not the stopped native child's own MM: no effect.
-        Ok(SettlementDoorbellReply::Stale.into())
-    };
-    // The epilogue releases the claim the record names whatever happened:
-    // an exact-word compare-and-swap, so a stale word never releases a
-    // newer claim.
-    let released = release_settlement_claim(custody, region, zone, mm, claim);
-    match (answer, released) {
-        (Ok(answer), true) => {
+    let answer = carrick_hal::return_settlement::service_settlement_doorbell(
+        &mut NativeDoorbell {
+            custody,
+            region,
+            zone,
+        },
+        mm,
+        claim,
+        own,
+    );
+    match answer {
+        Ok(answer) => {
             let [word, holder, revision] = answer.to_words();
             [METADATA_GRANT_SUCCESS, word, holder, revision]
         }
         _ => [METADATA_GRANT_ERR_DENIED, 0, 0, 0],
+    }
+}
+
+struct NativeDoorbell<'a> {
+    custody: &'a std::sync::Arc<crate::trap::CarrierVmCustody>,
+    region: RetainedAbiRegion<'a>,
+    zone: &'a Zone,
+}
+impl carrick_hal::return_settlement::SettlementDoorbellService for NativeDoorbell<'_> {
+    type Error = TrapError;
+    fn settle(
+        &mut self,
+        mm: carrick_el1_abi::ReservationMm,
+    ) -> Result<SettlementDoorbellAnswer, TrapError> {
+        settle_at_doorbell(self.custody, self.zone, mm).and_then(|reply| {
+            if reply == SettlementDoorbellReply::Settled {
+                drain_owed_return_table(self.custody, self.region, self.zone, mm)
+            } else {
+                Ok(reply.into())
+            }
+        })
+    }
+    fn release(
+        &mut self,
+        mm: carrick_el1_abi::ReservationMm,
+        claim: carrick_el1_abi::SettlementClaim,
+    ) -> Result<(), TrapError> {
+        if release_settlement_claim(self.custody, self.region, self.zone, mm, claim) {
+            Ok(())
+        } else {
+            Err(TrapError::Hypervisor(
+                "settlement claim release failed".into(),
+            ))
+        }
     }
 }
 

@@ -50,6 +50,42 @@ use carrick_core_abi::{
     SettlementOutcome, SkipReason,
 };
 
+/// The carrier-owned part of a decoded settlement doorbell. The wire venue
+/// authenticates the stopped execution; this entry owns service and the exact
+/// claim epilogue, including a failed service. Neither ISA has a second path.
+pub trait SettlementDoorbellService {
+    type Error;
+    fn settle(
+        &mut self,
+        mm: ReservationMm,
+    ) -> Result<carrick_core_abi::SettlementDoorbellAnswer, Self::Error>;
+    fn release(
+        &mut self,
+        mm: ReservationMm,
+        claim: carrick_core_abi::SettlementClaim,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Serve a decoded doorbell and release its claim before propagating either
+/// service or epilogue failure. A mismatched owner has no settlement effect.
+/// Release uses the original exact claim, never a newly observed claim word.
+pub fn service_settlement_doorbell<V: SettlementDoorbellService>(
+    venue: &mut V,
+    mm: ReservationMm,
+    claim: carrick_core_abi::SettlementClaim,
+    own: bool,
+) -> Result<carrick_core_abi::SettlementDoorbellAnswer, V::Error> {
+    let settled = if own {
+        venue.settle(mm)
+    } else {
+        Ok(SettlementDoorbellReply::Stale.into())
+    };
+    let released = venue.release(mm, claim);
+    let answer = settled?;
+    released?;
+    Ok(answer)
+}
+
 /// One MM's settlement lock: serializes every settlement of the MM's owed
 /// returns, since two host exclusions of one MM may overlap (a pause and a
 /// mutation guard) and two concurrent retirements of the same frames are
