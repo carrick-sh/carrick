@@ -926,6 +926,8 @@ mod tests {
     }
 
     mod native_source;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod owed_returns;
 
     fn native_stock_retirement_race(dynamic_custody: bool) {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();

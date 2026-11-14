@@ -4150,4 +4150,20 @@ fn production_full_owed_return_table_reclaims_exited_fork_holders() {
         (outcome.run.exit_code, outcome.run.terminating_signal),
         (0, None)
     );
+    let stock = outcome
+        .physical
+        .fork_stock_counters()
+        .expect("fork stock census");
+    assert_eq!(
+        stock.returned_children, 8,
+        "every exited holder is reclaimed"
+    );
+    let settlement = outcome
+        .physical
+        .return_settlement_counters()
+        .expect("settlement census");
+    assert_eq!(
+        settlement.drain_retiring, 0,
+        "no empty-progress Retiring rerun"
+    );
 }

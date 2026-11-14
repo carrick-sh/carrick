@@ -429,8 +429,8 @@ impl OwedReturnDrain for NativeDrain<'_> {
 /// time. When none could free a slot, the answer is the oldest refusing
 /// holder's wait authority, so the caller waits on the holder that prevents
 /// progress (#1482 P0-1). The host-served root's slots settle at its host
-/// venue (it answers stale here); retired MMs' slots wait for their release
-/// receipts.
+/// venue: its live Reservations source owns that release. The preceding
+/// exclusion drives the existing quarantine reclaim for retired holders.
 fn drain_owed_return_table(
     custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     region: RetainedAbiRegion<'_>,
