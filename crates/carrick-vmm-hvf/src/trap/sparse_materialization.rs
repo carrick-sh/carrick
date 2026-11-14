@@ -2504,22 +2504,38 @@ impl PublicationContext<'static> {
                 TrapError::Hypervisor(format!("owner maintenance settlement: {error}"))
             })
     }
-    pub(super) fn refill_transfer_cow(&self) -> Result<bool, TrapError> {
+    /// `fault_page` is the COW write's page, or `None` for owner maintenance
+    /// (retired backing never splits a block).
+    pub(super) fn refill_transfer_cow(&self, fault_page: Option<u64>) -> Result<bool, TrapError> {
         let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
             return Ok(false);
         };
-        self.refill_transfer_cow_in(pool)
+        self.refill_transfer_cow_in(pool, fault_page)
     }
     pub(super) fn refill_transfer_cow_in(
         &self,
         pool: &carrick_el1_abi::CowGrantPool,
+        fault_page: Option<u64>,
     ) -> Result<bool, TrapError> {
-        if pool.ready(self.mm_key.get()).next().is_some() {
+        // The exact EL1 receipt classified a live COW run. Supply physical
+        // inventory, and the split tables a first write into an armed block
+        // needs (#2276); the live terminal names how many.
+        let split_tables = fault_page
+            .and_then(|page| super::guest_cow::guest_cow_fault_split(&self.state, page))
+            .unwrap_or(0);
+        if pool
+            .ready(self.mm_key.get())
+            .any(|grant| grant.serves(split_tables))
+        {
             return Ok(true);
         }
-        // The exact EL1 receipt classified a live COW run. Supply physical
-        // inventory only; do not reclassify through the host table mirror.
-        Ok(super::guest_cow::provision_guest_cow_grants(&self.state, &self.custody, pool, 1)? != 0)
+        Ok(super::guest_cow::provision_guest_cow_grants(
+            &self.state,
+            &self.custody,
+            pool,
+            1,
+            split_tables,
+        )? != 0)
     }
     /// Publish an already prepared page without allocating replacement backing.
     /// Residency, inventory, alias and physical owner must agree under the same

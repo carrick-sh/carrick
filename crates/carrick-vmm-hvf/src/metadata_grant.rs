@@ -2055,11 +2055,18 @@ fn service_native_cow_supply(
     let Ok(Some(state)) = custody.guest_cow_state(mm) else {
         return Ok(denied);
     };
-    let supplied = pool.ready(mm).next().is_some()
+    // A first write into an armed block is served only by a grant carrying
+    // its split tables (#2276); an unarmed fault takes any ready grant.
+    let split_tables = crate::trap::guest_cow_fault_split(&state, address);
+    let usable = || {
+        pool.ready(mm)
+            .any(|grant| split_tables.is_none_or(|split| grant.serves(split)))
+    };
+    let supplied = usable()
         || crate::trap::refill_guest_cow_pool(&state, custody, pool, address, |candidate| {
             candidate == mm && slots.carrier() == Some(window.operation.carrier)
         })?
-        || pool.ready(mm).next().is_some();
+        || usable();
     if !supplied || !slot.take_cow_fault_selection(window) {
         return Ok(denied);
     }

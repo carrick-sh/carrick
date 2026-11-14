@@ -529,33 +529,66 @@ impl Stage1Authority {
             op,
             source,
         )?;
-        // A grant from a grown arena is usable only once its backing and
-        // owner are published, before EL1 can touch it. An arena whose
-        // publication was refused stays in the image, so membership, not
-        // growth during this call, decides.
-        let arenas = manager.extension_arena_bases();
-        if let Some(&unpublished) = arenas
-            .iter()
-            .find(|base| !inner_ref.published_arenas.contains(base))
-        {
-            let published = inner_ref
-                .arena_publisher
-                .as_ref()
-                .is_some_and(|publisher| publisher.publish_extension_arenas(manager).is_ok());
-            if !published {
-                let _ = manager.abandon_guest_descriptor_txn(&txn);
-                return Err(GuestTxnPrepareError::Manager(
-                    PageTableError::UnresolvedArena(unpublished),
-                ));
-            }
-            for base in arenas {
-                if !inner_ref.published_arenas.contains(&base) {
-                    inner_ref.published_arenas.push(base);
-                }
-            }
+        if let Err(unpublished) = publish_grown_arenas(
+            manager,
+            &mut inner_ref.published_arenas,
+            inner_ref.arena_publisher.as_deref(),
+        ) {
+            let _ = manager.abandon_guest_descriptor_txn(&txn);
+            return Err(GuestTxnPrepareError::Manager(
+                PageTableError::UnresolvedArena(unpublished),
+            ));
         }
         inner.txn_generation = generation.get();
         Ok(txn)
+    }
+
+    /// Reserve `count` unlinked table pages that one EL1 COW repoint may
+    /// link to split the armed block it writes into (#2276). They come from
+    /// this image's allocator exactly as a descriptor transaction's grants
+    /// do; the completion's settlement returns the ones it did not link
+    /// ([`Self::release_cow_split_tables`]).
+    pub fn reserve_cow_split_tables(
+        &self,
+        count: usize,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::TableGrants, GuestTxnPrepareError> {
+        let mut inner = self.inner.lock();
+        if inner.live_owner != LiveDescriptorOwner::Guest {
+            return Err(GuestTxnPrepareError::NotGuestOwned);
+        }
+        let inner_ref = &mut *inner;
+        let manager = inner_ref
+            .manager
+            .as_mut()
+            .ok_or(GuestTxnPrepareError::NotLive)?;
+        let source: Option<&mut dyn TableArenaSource> = match inner_ref.arena_source.as_mut() {
+            Some(source) => Some(source.as_mut()),
+            None => None,
+        };
+        let tables = manager
+            .reserve_table_grants(count, source)
+            .map_err(GuestTxnPrepareError::Manager)?;
+        if let Err(unpublished) = publish_grown_arenas(
+            manager,
+            &mut inner_ref.published_arenas,
+            inner_ref.arena_publisher.as_deref(),
+        ) {
+            let _ = manager.release_table_grants(tables.as_slice());
+            return Err(GuestTxnPrepareError::Manager(
+                PageTableError::UnresolvedArena(unpublished),
+            ));
+        }
+        Ok(tables)
+    }
+
+    /// Return split tables an EL1 COW repoint did not link.
+    pub fn release_cow_split_tables(&self, pages: &[u64]) -> Result<(), PageTableError> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock();
+        let manager = inner.manager.as_mut().ok_or(PageTableError::BadAddress)?;
+        manager.release_table_grants(pages)
     }
 
     /// Execute a prepared guest transaction with the host as the MM's
@@ -1451,6 +1484,29 @@ impl Stage1Authority {
     pub fn emit_absent_probe(&self, site: u32) {
         carrick_observability::probes::stage1_arena_absent(site, self.authority_id());
     }
+}
+
+/// A grant from a grown arena is usable only once its backing and owner are
+/// published, before EL1 can touch it. An arena whose publication was refused
+/// stays in the image, so membership, not growth during this call, decides.
+/// `Err` names an arena that is still unpublished.
+fn publish_grown_arenas(
+    manager: &PageTableManager,
+    published_arenas: &mut Vec<u64>,
+    publisher: Option<&dyn TableArenaPublisher>,
+) -> Result<(), u64> {
+    let arenas = manager.extension_arena_bases();
+    if let Some(&unpublished) = arenas.iter().find(|base| !published_arenas.contains(base)) {
+        if publisher.is_none_or(|publisher| publisher.publish_extension_arenas(manager).is_err()) {
+            return Err(unpublished);
+        }
+        for base in arenas {
+            if !published_arenas.contains(&base) {
+                published_arenas.push(base);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A borrowed editor over the stage-1 page tables and optional arena source.
@@ -3792,6 +3848,36 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert!(!again);
+    }
+
+    /// #2276: an armed block's split tables come from the image's own table
+    /// allocator, exactly as a guest transaction's grants do, and only on
+    /// the guest-owned lane. A released reservation is reused.
+    #[test]
+    fn guest_owned_authority_reserves_and_returns_cow_split_tables() {
+        let host = Stage1Authority::new_with_manager(Some(test_manager()));
+        assert!(matches!(
+            host.reserve_cow_split_tables(1),
+            Err(GuestTxnPrepareError::NotGuestOwned)
+        ));
+        let authority = Stage1Authority::new_with_manager(Some(test_manager()));
+        authority.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
+        let tables = authority.reserve_cow_split_tables(2).unwrap();
+        assert_eq!(tables.len(), 2);
+        assert_ne!(tables.as_slice()[0], tables.as_slice()[1]);
+        let again = authority.reserve_cow_split_tables(2).unwrap();
+        assert!(
+            again
+                .as_slice()
+                .iter()
+                .all(|page| !tables.as_slice().contains(page)),
+            "a reservation is exclusive until it is returned"
+        );
+        authority
+            .release_cow_split_tables(&tables.as_slice()[1..])
+            .unwrap();
+        let reused = authority.reserve_cow_split_tables(1).unwrap();
+        assert_eq!(reused.as_slice(), &tables.as_slice()[1..]);
     }
 
     #[test]
