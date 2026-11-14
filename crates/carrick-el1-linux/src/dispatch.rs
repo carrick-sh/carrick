@@ -2325,9 +2325,6 @@ pub(super) fn arm_signal_return_admission(
     control: &carrick_el1_abi::ThreadControlSlot,
     fatal_owner_cancel: bool,
 ) -> Option<bool> {
-    if !fatal_owner_cancel && !carrick_el1_abi::Lifecycle::gate(page).serves_ring() {
-        return None;
-    }
     let needed = control.zone_record().is_some_and(|record| {
         super::aarch64_process::registry().signal_checkpoint_needed(zone, record)
     });
