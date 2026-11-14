@@ -6,7 +6,7 @@ use carrick_sched_core::ParkedContextWords;
 
 #[cfg(test)]
 std::thread_local! {
-    static FUTEX_MAPPING: core::cell::Cell<Option<Result<bool, NativeProcessError>>> = const { core::cell::Cell::new(None) };
+    pub(crate) static FUTEX_MAPPING: core::cell::Cell<Option<Result<bool, NativeProcessError>>> = const { core::cell::Cell::new(None) };
 }
 
 std::thread_local! {
