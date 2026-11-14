@@ -1,27 +1,116 @@
-//! Lifetime of a signed gate's build checkout.
-use std::path::Path;
+//! Crash-recoverable lifetime of a signed gate's build checkout.
+use crate::lock_file::OwnedFileLock;
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
-pub fn run_name() -> String {
+pub(super) fn run_name() -> String {
     format!(
         "{}-{}",
-        std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| std::process::id().to_string()),
+        std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| format!("manual-{}", std::process::id())),
         std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_else(|_| "1".into())
     )
 }
 
+/// The lock is held before the directory exists and through drop-time removal.
+/// A killed owner releases it in the kernel; the next gate can then reap it.
+/// Sidecar lock files are permanent, so no contender can lock an unlinked inode.
 pub struct GateCheckout {
-    directory: tempfile::TempDir,
+    directory: PathBuf,
+    _lock: OwnedFileLock,
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+fn lock_file(root: &Path, name: &str) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join(format!("{name}.lock")))
+}
+
+fn remove(directory: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 impl GateCheckout {
-    pub fn acquire(root: &Path, _run: &str) -> std::io::Result<Self> {
-        std::fs::create_dir_all(root)?;
+    /// Production allocation entry, also exercised by the killed-child witness.
+    pub fn acquire(root: &Path, run: &str) -> io::Result<Self> {
+        if !valid_name(run) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid gate run name",
+            ));
+        }
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root)?;
+        let metadata = fs::symlink_metadata(root)?;
+        // SAFETY: geteuid has no preconditions.
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(io::Error::other(
+                "gate root must be an owned directory without group/other write permission",
+            ));
+        }
+        let root = root.canonicalize()?;
+        // Claim our name before scanning: concurrent gates may see our directory
+        // only once its liveness lock is already held. Duplicate live runs fail.
+        let file = lock_file(&root, run)?;
+        file.try_lock().map_err(io::Error::from)?;
+        let lock = OwnedFileLock::from_locked(file);
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str().filter(|name| valid_name(name)) else {
+                continue;
+            };
+            if name == run || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let file = lock_file(&root, name)?;
+            match file.try_lock() {
+                Ok(()) => {
+                    let _stale = OwnedFileLock::from_locked(file);
+                    remove(&entry.path())?;
+                }
+                Err(fs::TryLockError::WouldBlock) => (),
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+        let directory = root.join(run);
+        remove(&directory)?;
+        fs::create_dir(&directory)?;
         Ok(Self {
-            directory: tempfile::tempdir_in(root)?,
+            directory,
+            _lock: lock,
         })
     }
+
     pub fn path(&self) -> &Path {
-        self.directory.path()
+        &self.directory
+    }
+}
+
+impl Drop for GateCheckout {
+    fn drop(&mut self) {
+        // Failed removal remains discoverable on the next start, under its lock.
+        let _ = remove(&self.directory);
     }
 }
 
