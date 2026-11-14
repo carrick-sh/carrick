@@ -28,6 +28,8 @@ use super::aarch64_process::{
     Mm, admit_entry, map_resume, observed_entry_address, process_record_for_call, registry,
     resume_selected, with_process_entry,
 };
+#[cfg(test)]
+use super::native_process_runtime::{NativeContention, NativeFailure};
 use super::native_process_runtime::{NativeProcessError, NativeProcessRuntime};
 #[cfg(test)]
 use super::native_process_runtime::{NativeProcessRegistry, NativeProcessService};
@@ -3121,7 +3123,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
     );
     assert!(matches!(
         re_wait,
-        LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::NoChild.errno()
+        LifecycleOutcome::Returned { result, .. } if result.raw() == NativeFailure::NoChild.errno()
     ));
     let no_children = parent_entry.wait4(
         ProcessWaitPid::from_syscall_argument(u64::MAX),
@@ -3565,7 +3567,7 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
     );
     assert!(matches!(
         re_wait,
-        LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::NoChild.errno()
+        LifecycleOutcome::Returned { result, .. } if result.raw() == NativeFailure::NoChild.errno()
     ));
 }
 
@@ -3797,7 +3799,8 @@ fn fork_reserve_refusal_retains_diagnostic_stage_and_retryable_errno() {
             MmGeneration::new(NonZeroU64::new(2).unwrap()),
         )
         .expect_err("reservation refusal must stop preparation");
-    assert_eq!(error.errno(), NativeProcessError::Busy.errno());
+    // Pool inventory is "not now", never EAGAIN (#2306).
+    assert_eq!(error.failure(), Err(NativeContention::Busy));
     let NativeProcessError::ForkRefused(refusal) = error else {
         panic!("Reserve refusal lost its diagnostic stage: {error:?}");
     };
@@ -3843,11 +3846,12 @@ fn native_fork_busy_diagnostic_names_parent_space_editor() {
         )
         .expect_err("an outstanding editor must retain its exclusion");
     drop(editor);
-    assert_eq!(error.errno(), -11);
-    assert_eq!(
-        error.run_failure_reason(),
-        NativeProcessError::Busy.run_failure_reason()
-    );
+    // The fork enrols on the editor's release, never retries a bare Busy.
+    assert!(matches!(
+        error.failure(),
+        Err(NativeContention::OwnerWait(wait))
+            if wait.cause() == carrick_core_abi::PortalWaitCause::Editor
+    ));
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 0);
     let NativeProcessError::ForkRefused(refusal) = error else {
         panic!("space edit refusal lost its site: {error:?}");
@@ -3887,11 +3891,7 @@ fn native_fork_busy_diagnostic_names_unsettled_parent_fork() {
         )
         .expect_err("a prepared fork must retain parent publication custody");
     service.abort_mm(prepared).unwrap();
-    assert_eq!(error.errno(), -11);
-    assert_eq!(
-        error.run_failure_reason(),
-        NativeProcessError::Busy.run_failure_reason()
-    );
+    assert_eq!(error.failure(), Err(NativeContention::Busy));
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
     assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 1);
     let NativeProcessError::ForkRefused(refusal) = error else {
@@ -12019,10 +12019,7 @@ fn serial_host_native_fork_concurrent_sibling_table_publish_does_not_einval() {
             let res = service.fork_fd_table(5, child_ft);
             if let Err(e) = res {
                 stop.store(true, Ordering::Release);
-                panic!(
-                    "concurrent sibling table publish caused fork_fd_table failure with errno {}",
-                    -e.errno()
-                );
+                panic!("concurrent sibling table publish caused fork_fd_table failure: {e:?}");
             }
             service.retire_fd_table(child_ft);
             assert_eq!(

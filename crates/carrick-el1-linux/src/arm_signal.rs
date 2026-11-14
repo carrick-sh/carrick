@@ -230,7 +230,7 @@ pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkSt
             super::native_process_runtime::NativeResume::Left(process.take_root_exit()),
         )),
         Some(_) => {
-            Err(super::native_process_runtime::NativeProcessError::Quarantined.run_failure_reason())
+            Err(super::native_process_runtime::NativeFailure::Quarantined.run_failure_reason())
         }
     }
 }

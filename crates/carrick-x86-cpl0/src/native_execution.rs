@@ -94,18 +94,18 @@ pub fn schedule(slot: SlotId) -> ! {
                 match entry
                     .resume_checkpoint(|entry| {
                         use carrick_el1_linux::native_process_runtime::{
-                            NativeProcessError, NativeResume,
+                            NativeFailure, NativeResume,
                         };
                         let native = context::context_words::into_native(
                             *entry.resume_context(),
                             state.address,
                         )
-                        .map_err(|_| NativeProcessError::Quarantined.run_failure_reason())?;
+                        .map_err(|_| NativeFailure::Quarantined.run_failure_reason())?;
                         let mut frame = context::context_words::syscall_frame_from_native(
                             &native,
                             state.address,
                         )
-                        .map_err(|_| NativeProcessError::Quarantined.run_failure_reason())?;
+                        .map_err(|_| NativeFailure::Quarantined.run_failure_reason())?;
                         match deliver_signal_on_syscall_return(
                             current,
                             entry,
@@ -122,16 +122,14 @@ pub fn schedule(slot: SlotId) -> ! {
                                         native.gs_base,
                                         &native.xsave,
                                     )
-                                    .map_err(|_| {
-                                        NativeProcessError::Quarantined.run_failure_reason()
-                                    })?,
+                                    .map_err(|_| NativeFailure::Quarantined.run_failure_reason())?,
                                 );
                                 Ok(None)
                             }
                             Some(
                                 carrick_personality_linux::dispatch::CompletionRoute::Suspended,
                             ) => Ok(Some(NativeResume::Left(entry.take_root_exit()))),
-                            Some(_) => Err(NativeProcessError::Quarantined.run_failure_reason()),
+                            Some(_) => Err(NativeFailure::Quarantined.run_failure_reason()),
                         }
                     })
                     .unwrap_or_else(|reason| complete_run_failure(current, reason))
