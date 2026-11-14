@@ -35,15 +35,3 @@ test = "cpl0_initial_mm::in_zone_child_pipe_write_without_ipc_execution_is_count
 reason = "#1671: an in-zone child's pipe write on x86 CPL0 is now served through the shared IPC owner instead of returning a counted ENOSYS, so the refusal witness became a witness that the write is served (9968c4138)."
 replaced_by = "cpl0_initial_mm::in_zone_child_pipe_write_uses_shared_ipc_execution"
 pr = 2153
-
-[[retired]]
-test = "carrick_el1::memory::tests::delegated::delegated_owed_return_forwards_until_ack_then_completes"
-reason = "#1482: a MAP_FIXED over an owed return no longer forwards; it asks for the owed-return settlement (DelegatedAnonymous::Settle) and completes once settled, so the witness was renamed for what it proves."
-replaced_by = "carrick_el1::memory::tests::delegated::delegated_owed_return_needs_settlement_until_ack_then_completes"
-pr = 2250
-
-[[retired]]
-test = "carrick_el1::memory::tests::delegated::delegated_full_return_journal_forwards_the_next_resident_retirement"
-reason = "#1482: a resident retirement that finds the owed-return journal full no longer forwards; it asks for the settlement (which frees or drains the journal) and reruns, so the witness was renamed for what it proves."
-replaced_by = "carrick_el1::memory::tests::delegated::delegated_full_return_journal_settles_before_the_next_resident_retirement"
-pr = 2250

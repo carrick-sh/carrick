@@ -74,6 +74,7 @@ queue or owner. The unchanged kernel binding
 Busy before acknowledgement and successful reuse afterwards. Its failure was
 isolated to the proposal refusal change in `98c3b9941`; restoring just that
 line on the PR head makes it pass. The complementary production ring binding
-`delegated_owed_return_forwards_until_ack_then_completes` requires Forward
-before acknowledgement and Served afterwards. Pending-edit and prepared-edit
+`delegated_owed_return_forwards_until_ack_then_completes` retains its historical
+receipt identity and requires an owed-return settlement before acknowledgement,
+then Served afterwards. Pending-edit and prepared-edit
 contention bindings still require in-ring replay, without polling.
