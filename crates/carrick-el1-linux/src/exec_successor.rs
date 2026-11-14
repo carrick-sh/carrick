@@ -4,7 +4,7 @@
 //! identity its space table sealed.
 extern crate alloc;
 
-use crate::native_process_runtime::{ExecSuccessorSlot, NativeProcessError};
+use crate::native_process_runtime::{ExecSuccessorSlot, NativeFailure, NativeProcessError};
 use alloc::boxed::Box;
 use carrick_core::mm::reservation::{ReservationGeometry, ReservationPolicy};
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue};
@@ -287,13 +287,13 @@ pub fn adopt_closed_exec_successor<C: ProcessContext>(
 pub fn cancel_prepared_exec(
     receipt: ExecAdoptionReceipt,
     cross: impl FnOnce(u64) -> Result<(), NativeProcessError>,
-) -> Result<(), NativeProcessError> {
+) -> Result<(), NativeFailure> {
     let mut cancellation = carrick_el1_abi::NativeExecCancellation::new(receipt);
     let crossed = cross(&raw mut cancellation as *mut _ as u64);
     let accepted = cancellation.take(receipt);
     if crossed.is_ok() && accepted == Some(Ok(())) {
         Ok(())
     } else {
-        Err(NativeProcessError::Stale)
+        Err(NativeFailure::Stale)
     }
 }
